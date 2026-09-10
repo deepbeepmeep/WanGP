@@ -150,6 +150,13 @@ Result: the reference voice workflow uses your ID-LoRA file and weight.
 ```
 """
 
+LTX2_SOL_INFOS = """
+## Sol-Attn Sparse Attention
+
+In **Advanced Mode > Misc. > Override Attention Mode**, select **sol** to route the large self-attention blocks of the LTX2 video stream (sequences of 8192 tokens or more with 128-dim heads) through the bundled Triton Sol-Attn kernels. The **Start Tau** slider then appears below the attention selector and shows that End Tau is fixed at `0.8`: the value is used on the first denoising step of each phase and decreases linearly to `0.8` on the final step. The default is `1.3`; use `1.0` for the Sol-Attn paper starting value, increase it to route more attention blocks through the approximate path for greater speed, or lower it for denser attention and higher fidelity. Cross-attention, audio self-attention, masked self-attention, and short sequences always keep the regular attention backend. Sol-Attn requires BF16, Triton 3.6 or newer, and a CUDA NVIDIA GPU using SM86, SM89, SM90, SM100, SM120, or SM121 (such as RTX 30/40/50-series, H100/H200, B100/B200, or DGX Spark); the dropdown reports whether it is available on the current system.
+"""
+
+
 LTX2_25_INFOS = LTX2_INFOS + """
 Reference Voice (ID-LoRA) is unavailable for LTX-2.5.
 
