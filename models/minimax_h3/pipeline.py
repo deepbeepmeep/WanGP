@@ -571,7 +571,7 @@ class MiniMaxH3Pipeline:
                 digest.update(repr(tuple(item["timestamps"])).encode())
         return "minimax_h3", str(self.dtype), prompt, digest.digest()
 
-    def _encode_prompt(self, prompt, presentation):
+    def _encode_prompt(self, prompt, presentation, min_tokens=0):
         if self.fixed_prompt is not None:
             return self.fixed_prompt.prompt_embeds.to(device=self.device, dtype=self.dtype), self.fixed_prompt.text_token_tags
         if self.image_model == "p_h3_image" and presentation and not prompt.lstrip().startswith(("Edit <Picture 1>.", "subject_definitions:")):
@@ -579,10 +579,18 @@ class MiniMaxH3Pipeline:
         picture_label = H3_IMAGE_PICTURE_LABEL if self.h3_image else None  # H3-Image labels its references without angle brackets
 
         def encode_fn(prompts):
-            return [self.text_encoder.encode(prompts[0], presentation, self.device, self.dtype, picture_label=picture_label)]
+            return [self.text_encoder.encode(prompts[0], presentation, self.device, self.dtype, picture_label=picture_label, min_tokens=min_tokens)]
 
-        cache_key = self._prompt_cache_key(prompt, presentation)
+        cache_key = self._prompt_cache_key(prompt, presentation) + ((min_tokens,) if min_tokens else ())
         return self.text_encoder_cache.encode(encode_fn, prompt, device=self.device, cache_keys=cache_key)[0]
+
+    def _nag_payload(self, negative_prompt, NAG_scale, NAG_tau, NAG_alpha, text_tags):
+        negative_prompt = (negative_prompt or "").strip()
+        if float(NAG_scale) <= 1.0 or not negative_prompt or self.fixed_prompt is not None or self.audio_only:
+            return None
+        # Padded to the positive caption's token count: a shorter negative caption guides by its length alone.
+        context, _ = self._encode_prompt(negative_prompt, [], min_tokens=text_tags.numel())
+        return {"scale": float(NAG_scale), "tau": float(NAG_tau), "alpha": float(NAG_alpha), "context": context}
 
     def _configure_tiling(self, _tile_size):
         self.vae.enable_tiling(tile_sample_min_height=256, tile_sample_min_width=256)
@@ -863,7 +871,8 @@ class MiniMaxH3Pipeline:
                  guide_phases=1, switch_threshold=H3_PHASE_2_NOISE_LEVEL_START_DEFAULT, loras_slists=None, loras_selected=None, set_progress_status=None,
                  starting_sigma=None, preserve_input_mask_values=False, refinement_mode=False,
                  custom_settings=None, duration_seconds=None, verbose_level=0, dialogue_segment=False, image_mode=0,
-                 context_scale=None, overlapped_latents=None, window_start_frame_no=0, batch_size=1, **kwargs):
+                 context_scale=None, overlapped_latents=None, window_start_frame_no=0, batch_size=1,
+                 n_prompt="", NAG_scale=1.0, NAG_tau=3.5, NAG_alpha=0.5, **kwargs):
         if self.audio_only and H3_DIALOGUE_GENERATION and not dialogue_segment and is_dialogue_prompt(input_prompt):
             self._early_stop = False
             return generate_dialogue(
@@ -1006,6 +1015,8 @@ class MiniMaxH3Pipeline:
         control_start_frame = None
         if grouped_masked_denoising and video_to_video and input_masks is not None and not preserve_input_mask_values and offload.shared_state.get("_attention") == "sol":
             raise ValueError("MiniMax H3 Grouped Rows mask denoising is not compatible with Sol Attention; select Shared Timestep or another attention mode")
+        if float(NAG_scale) > 1.0 and (n_prompt or "").strip() and offload.shared_state.get("_attention") == "sol":
+            raise ValueError("MiniMax H3 NAG is not compatible with Sol Attention; select another attention mode or set NAG Scale to 1")
 
         waveform = self._waveform(input_waveform, input_waveform_sample_rate)
         history_waveform = None
@@ -1284,6 +1295,7 @@ class MiniMaxH3Pipeline:
             set_progress_status("Encoding H3 prompt and references")
         context, text_tags = self._encode_prompt(input_prompt, presentation)
         presentation = None  # the frames shown to the text encoder are no longer needed (phase 2 builds its own)
+        nag = self._nag_payload(n_prompt, NAG_scale, NAG_tau, NAG_alpha, text_tags)
         self._check_abort()
         self._use_transformer()
         # PTD changes the token-refiner adapters at every denoising step. Keep the
@@ -1335,7 +1347,7 @@ class MiniMaxH3Pipeline:
                    "cond_audio_rows": cond_audio_rows, "frame_count": aligned_target_frames, "text_token_tags": text_tags,
                    "fps": fps, "audio_time_offset": audio_time_offset, "target_audio_condition_latents": target_audio_condition_latents,
                    "target_video_condition_frames": target_video_condition_frames,
-                   "attention_sparsity": float(attention_sparsity), "hyperflow_lora": (hyperflow_lora, hyperflow_lora_1) if hyperflow_lora_1 else None}
+                   "attention_sparsity": float(attention_sparsity), "hyperflow_lora": (hyperflow_lora, hyperflow_lora_1) if hyperflow_lora_1 else None, "NAG": nag}
         if control_rows is not None:
             payload.update(control_rows=control_rows, control_scale=float(context_scale[0]), control_anchor_frames=control_anchor_frames)
         control_rows = None
@@ -1722,6 +1734,7 @@ class MiniMaxH3Pipeline:
             context, text_tags = self._encode_prompt(f"{H3_REGENERATE_IC_TASK}\n\nScene description: {input_prompt}" if regenerate_ic else input_prompt,
                                                      phase_2_presentation)
             payload["hyperflow_lora"] = (hyperflow_lora, hyperflow_lora_2) if hyperflow_lora_2 else None
+            payload["NAG"] = self._nag_payload(n_prompt, NAG_scale, NAG_tau, NAG_alpha, text_tags)
             self._check_abort()
             phase_2_generator = torch.Generator(device="cpu").manual_seed(int(seed))
             phase_2_sigmas_video = (torch.tensor((float(switch_threshold), *H3_PHASE_2_SIGMAS[1:]), dtype=torch.float32, device=self.device)
@@ -1940,6 +1953,7 @@ class MiniMaxH3Pipeline:
                 set_progress_status(f"Audio Refinement Extra Phase ({refinement_steps} steps, denoising {H3_AUDIO_REFINEMENT_DENOISE:g})")
             self._use_shared_components()
             context, text_tags = self._encode_prompt(input_prompt, [])
+            nag = self._nag_payload(n_prompt, NAG_scale, NAG_tau, NAG_alpha, text_tags)
             self._check_abort()
             self._use_transformer()
             context = self.transformer.preprocess_text_embeds(context)
@@ -1950,7 +1964,7 @@ class MiniMaxH3Pipeline:
                        "cond_audio_rows": None, "frame_count": aligned_target_frames, "text_token_tags": text_tags,
                        "fps": fps, "audio_time_offset": audio_time_offset, "target_audio_condition_latents": 0,
                        "target_video_condition_frames": target_video_condition_frames,
-                       "attention_sparsity": float(attention_sparsity)}
+                       "attention_sparsity": float(attention_sparsity), "NAG": nag}
             active_loras = list(getattr(self.transformer, "_loras_active_adapters", ()))
             lora_scaling = dict(getattr(self.transformer, "_loras_scaling", {}) or {})
             lora_step = getattr(self.transformer, "_lora_step_no", 0)

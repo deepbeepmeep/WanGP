@@ -345,6 +345,11 @@ class VDNHybridAttention(nn.Module):
         if not self.use_triton:
             _notify_slow()
 
+    def shift_caption(self, shift):
+        # NAG's negative pass: a caption of another length moves every later row, the window keys with them.
+        self.video_start += shift
+        self.text_indices = torch.arange(self.text_indices.numel() + shift)
+
     def forward(self, x_handoff, qkv, norm_rope, original_out, input_again=None):
         """x is handed off. qkv: the q, k, v projection modules, each computed when needed (q twice: normalized in place for the window
         attention, then raw again for the readout), or the raw q, k, v tensors (1, tokens, heads, head_dim) of a fused projection.

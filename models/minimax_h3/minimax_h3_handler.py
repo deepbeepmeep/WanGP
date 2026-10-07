@@ -737,7 +737,7 @@ class family_handler:
                 "prompt_infos": "Viggle uses a fixed prompt. Prepare the character replacement in the Edited Reference Frame; generation prompt text is ignored.",
                 "deepy_infos": "Viggle combines `video_guide` with one edited frame from that video in `image_refs` (reference mode `I`, Control Video mode `VU`). Edit the character while preserving that frame's pose, props, background, framing and dimensions; any clear source frame works. The video supplies motion/camera, the edited frame supplies appearance. Windows are fixed at 124 frames with 18-frame overlap by default. `audio_prompt_type`: empty = model audio; `A` = `audio_guide`; `K` = control-video soundtrack. Audio conditioning is experimental: use synchronized audio. A full input track is reused; a shorter one allows generated audio afterward.",
                 "deepy_prompt_infos": "Express the replacement through the Edited Reference Frame. Viggle uses a fixed built-in prompt; generation text is ignored.",
-                "text_encoder_URLs": [], "text_encoder_folder": None, "system_configs": {},
+                "text_encoder_URLs": [], "text_encoder_folder": None, "system_configs": {}, "NAG": False, "no_negative_prompt": True,
                 "prompt_enhancer_def": {"selection": [], "labels": {}, "default": ""},
                 "image_outputs": False, "v2i_switch_supported": False, "sliding_window": True, "video_continuation": False,
                 "sliding_window_size_locked": True,
@@ -939,7 +939,8 @@ class family_handler:
                 "inc": 0.05,
             },
             "sample_solvers": [("Euler", "euler")] if fixed_schedule else [("Euler", "euler"), ("RES Multistep", "res_multistep"), ("Ralston 2S (~2x slower)", "ralston_2s")] + ([("Pika Re-noise (6 Steps)", PIKA_SOLVER), ("DMAD Re-noise", DMAD_SOLVER)] if pika_supported else []),
-            "no_negative_prompt": True,
+            "NAG": True,
+            "no_negative_prompt": False,
             "returns_audio": True,
             "spoken_line_prompt": {"line": "{speaker}{note} says ({id}) <d>[{language}] {line}</d>", "before": "overall_soundscape:"},  # a line for H3 to voice, and the section of a structured prompt it goes before
             "audio_window_alignment": True,
@@ -1747,6 +1748,9 @@ class family_handler:
             "audio_prompt_type": "",
             "video_prompt_type": "",
             "image_mode": 0,
+            "NAG_scale": 1.0,
+            "NAG_tau": 3.5,
+            "NAG_alpha": 0.5,
         })
         if reference_mode:
             ui_defaults.update({"image_refs_relative_size": 100, "remove_background_images_ref": 0})
