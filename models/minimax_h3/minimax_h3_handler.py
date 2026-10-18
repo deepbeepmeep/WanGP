@@ -650,6 +650,7 @@ class family_handler:
             "returns_audio": True,
             "audio_window_alignment": True,
             "audio_overlap_repair_ms": 25,  # one audio latent, plus the measured waveform shortfall
+            "audio_overlap_repair_frames": 1,  # native continuation regenerates the join frame's audio only
             "multimedia_generation": True,
             "image_end_frame_position": True,
             "control_video_trim_disabled": True,
