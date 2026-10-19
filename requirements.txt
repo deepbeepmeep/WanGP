@@ -2,7 +2,7 @@
 mmgp==3.7.6
 # Core AI stack
 diffusers==0.36.0
-transformers==4.54.0 #4.53.1
+transformers>=4.56.0 # LTX-2 erfordert >= 4.56 (vorher 4.54.0)
 tokenizers>=0.20.3
 accelerate>=1.1.1
 tqdm

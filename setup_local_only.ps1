@@ -165,6 +165,33 @@ $cfg | ConvertTo-Json -Depth 10 | Set-Content $cfgFile -Encoding UTF8
 Write-Host "[OK] wgp_config.json: local_only=true, use_models_txt=true" -ForegroundColor Green
 
 # ---------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 4b) requirements.txt: transformers-Pin pruefen (LTX-2 braucht >= 4.56)
+# ---------------------------------------------------------------------------
+Write-Host "`n[4b] Pruefe requirements.txt (transformers-Pin fuer LTX-2)..." -ForegroundColor Cyan
+$req = Join-Path $root "requirements.txt"
+if (Test-Path $req) {
+    $txt = Get-Content $req -Raw -Encoding UTF8
+    if ($txt -match '(?m)^transformers\s*==\s*(\d+\.\d+)') {
+        $ver = [version]"$($Matches[1]).0"
+        if ($ver -lt [version]"4.56") {
+            Write-Host ("  transformers == {0} ist ZU ALT fuer LTX-2 (Modelle starten mit Fehler 'FLUXTransformer2DModel has no attribute _no_split_modules')." -f $Matches[1]) -ForegroundColor Yellow
+            $newTxt = [regex]::Replace($txt, '(?m)^transformers\s*==\s*[^\r\n]+', 'transformers>=4.56.0 # LTX-2 erfordert >= 4.56 (war ' + $Matches[1] + ')')
+            $bak = "$req.bak_$ts"
+            Copy-Item $req $bak
+            Set-Content -Path $req -Value $newTxt -Encoding UTF8 -NoNewline
+            Write-Host "  Anforderung aktualisiert auf 'transformers>=4.56.0' (Backup: $(Split-Path $bak -Leaf))." -ForegroundColor Green
+            Write-Host "  => Bitte installiere anschl. das Update: pip install -U transformers" -ForegroundColor Yellow
+        } else {
+            Write-Host ("  transformers-Pin {0} ist OK fuer LTX-2." -f $Matches[2]) -ForegroundColor Green
+        }
+    } else {
+        Write-Host "  Kein transformers-Pin gefunden - nichts zu tun." -ForegroundColor DarkGray
+    }
+} else {
+    Write-Host "  requirements.txt nicht gefunden - uebersprungen." -ForegroundColor DarkGray
+}
+
 # 5) Syntax-Check der gepatchten Dateien
 # ---------------------------------------------------------------------
 python -m py_compile "$root\wgp.py" "$root\shared\utils\files_locator.py"
