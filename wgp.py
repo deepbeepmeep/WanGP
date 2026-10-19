@@ -2099,8 +2099,8 @@ for src_name, tgt_name in zip(src_move, tgt_move):
             pass
     
 
-if not Path(config_load_filename).is_file():
-    server_config = {
+def _default_server_config():
+    return {
         "attention_mode" : "auto",  
         "transformer_types": [], 
         "transformer_quantization": "int8",
@@ -2140,12 +2140,53 @@ if not Path(config_load_filename).is_file():
         "audio_save_path": "outputs",
     }
 
-    with open(server_config_filename, "w", encoding="utf-8") as writer:
-        writer.write(json.dumps(server_config))
-else:
-    with open(config_load_filename, "r", encoding="utf-8") as reader:
-        text = reader.read()
-    server_config = json.loads(text)
+def _write_server_config(path, config):
+    try:
+        with open(path, "w", encoding="utf-8") as writer:
+            writer.write(json.dumps(config))
+        return True
+    except Exception as write_error:
+        print(f"WARNING: Konnte '{path}' nicht schreiben: {write_error}")
+        return False
+
+def _load_server_config():
+    """Laedt wgp_config.json BOM-tolerant und heilt defekte / unvollstaendige Dateien."""
+    if not Path(config_load_filename).is_file():
+        config = _default_server_config()
+        _write_server_config(server_config_filename, config)
+        return config
+
+    try:
+        with open(config_load_filename, "r", encoding="utf-8-sig") as reader:
+            config = json.load(reader)
+        if not isinstance(config, dict):
+            raise ValueError(f"Top-Level ist kein JSON-Objekt, sondern {type(config).__name__}")
+    except Exception as config_error:
+        backup_filename = config_load_filename + ".corrupt.bak"
+        print(f"WARNING: '{config_load_filename}' ist defekt ({type(config_error).__name__}: {config_error}).")
+        try:
+            shutil.copy2(config_load_filename, backup_filename)
+            print(f"WARNING: Defekte Konfiguration gesichert als '{backup_filename}'.")
+        except Exception as backup_error:
+            print(f"WARNING: Backup der defekten Konfiguration fehlgeschlagen: {backup_error}")
+        config = _default_server_config()
+        _write_server_config(server_config_filename, config)
+        print("WARNING: Starte mit Standardwerten.")
+        return config
+
+    # Fehlende Schluessel aus aelteren / abgeschnittenen Configs ergaenzen
+    missing_keys = []
+    for key, value in _default_server_config().items():
+        if key not in config:
+            config[key] = value
+            missing_keys.append(key)
+    if len(missing_keys) > 0:
+        print(f"WARNING: wgp_config.json war unvollstaendig, Standardwerte ergaenzt: {', '.join(missing_keys)}")
+        _write_server_config(server_config_filename, config)
+
+    return config
+
+server_config = _load_server_config()
 
 server_config.setdefault("prompt_enhancer_quantization", "quanto_int8")
 server_config.setdefault(gradio_queue_focus_patch.FOCUS_QUEUE_SERVER_CONFIG_KEY, 1)
@@ -2162,21 +2203,8 @@ if server_config.get("use_models_txt", True):
     if len(expanded) > 0:
         checkpoints_paths = expanded + list(checkpoints_paths)
         server_config["checkpoints_paths"] = checkpoints_paths
-if server_config.get("local_only", False) or fl.is_local_only():
+if server_config.get("local_only", False):
     fl.set_local_only(True)
-    server_config["local_only"] = True
-    # [LOCAL-ONLY] Quantisierte Varianten koennen nicht heruntergeladen werden, daher
-    # automatisch auf bf16 umschalten, damit die lokal vorhandenen Modelle verwendet werden.
-    if server_config.get("transformer_quantization", "int8") not in ("bf16", "fp16"):
-        server_config["transformer_quantization"] = "bf16"
-    if server_config.get("text_encoder_quantization", "int8") not in ("bf16", "fp16"):
-        server_config["text_encoder_quantization"] = "bf16"
-    # Persistiere den erzwungenen Local-Only-Modus, damit spaetere Config-Saves ihn nicht verlieren.
-    try:
-        with open(server_config_filename, "w", encoding="utf-8") as writer:
-            writer.write(json.dumps(server_config))
-    except Exception as _e:
-        print(f"[LOCAL-ONLY] Warnung: Konfiguration konnte nicht gespeichert werden: {_e}")
 # -------------------------------------------------------------------
 fl.set_checkpoints_paths(checkpoints_paths)
 three_levels_hierarchy = server_config.get("model_hierarchy_type", 1) == 1
@@ -2509,26 +2537,6 @@ def get_model_filename(model_type, quantization ="int8", dtype_policy = "", modu
             raw_filename = sub_choices[0]
         else:
             raw_filename = choices[0]
-
-    # --- LOCAL-ONLY FALLBACK: never reference a remote URL that cannot be downloaded.
-    # If the selected candidate (typically a quantized variant like '*_quanto_bf16_int8.safetensors')
-    # is not available locally, fall back to any other listed variant whose base filename exists
-    # in the local model folders (see docs/docs/models.txt), so preinstalled workflows keep working.
-    if fl.is_local_only() and isinstance(raw_filename, str) and raw_filename.startswith("http"):
-        candidates = [raw_filename] + [name for name in choices if name != raw_filename]
-        fallback = None
-        for name in candidates:
-            if not isinstance(name, str) or not name.startswith("http"):
-                continue
-            if fl.locate_file(os.path.basename(name.split("|")[0]), error_if_none=False) is not None:
-                fallback = name
-                break
-        if fallback is not None:
-            if fallback != raw_filename:
-                print(f"[LOCAL-ONLY] '{os.path.basename(raw_filename)}' nicht lokal gefunden - verwende lokales Modell '{os.path.basename(fallback)}' fuer Model '{model_type}'.")
-            raw_filename = fallback
-        else:
-            print(f"[LOCAL-ONLY] Warnung: keines der lokalen Modelle fuer '{model_type}' gefunden: {[os.path.basename(n) for n in candidates if isinstance(n, str)]}")
 
     return raw_filename
 

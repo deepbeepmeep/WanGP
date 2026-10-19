@@ -1,0 +1,1 @@
+python -c "from pathlib import Path; root=Path(r'D:\claudeAgent\wan2gp\finetunes'); [f.write_text(f.read_text(encoding='utf-8-sig',errors='replace').encode('ascii','backslashreplace').decode('ascii'),encoding='ascii') for f in root.rglob('*.json')]; print('FERTIG')"
