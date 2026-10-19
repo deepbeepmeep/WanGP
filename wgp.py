@@ -2154,6 +2154,17 @@ gradio_queue_focus_patch.install()
 
 checkpoints_paths = server_config.get("checkpoints_paths", None)
 if checkpoints_paths is None: checkpoints_paths = server_config["checkpoints_paths"] = fl.default_checkpoints_paths
+# --- LOCAL-ONLY MODE: add roots parsed from docs/docs/models.txt ---
+if server_config.get("use_models_txt", True):
+    _wgp_root = os.path.dirname(os.path.abspath(__file__))
+    extra_roots = fl.load_local_paths_from_file(os.path.join(_wgp_root, "docs", "docs", "models.txt"))
+    expanded = [r for r in extra_roots if os.path.isdir(r)]
+    if len(expanded) > 0:
+        checkpoints_paths = expanded + list(checkpoints_paths)
+        server_config["checkpoints_paths"] = checkpoints_paths
+if server_config.get("local_only", False):
+    fl.set_local_only(True)
+# -------------------------------------------------------------------
 fl.set_checkpoints_paths(checkpoints_paths)
 three_levels_hierarchy = server_config.get("model_hierarchy_type", 1) == 1
 
@@ -2967,6 +2978,9 @@ def get_loras_preprocessor(transformer, model_type):
 
 
 def process_files_def(repoId = None, sourceFolderList = None, fileList = None, targetFolderList = None):
+    if fl.is_local_only():
+        print(f"[LOCAL-ONLY] Downloads deaktiviert - ueberspringe HF-Repo '{repoId}'. Nur lokale Modelle werden verwendet.")
+        return
     if targetFolderList is None:
         targetFolderList = [None] * len(sourceFolderList)
     for targetFolder, sourceFolder, files in zip(targetFolderList, sourceFolderList,fileList ):
@@ -3001,6 +3015,8 @@ def download_mmaudio():
 
 
 def download_file(url,filename):
+    if fl.is_local_only():
+        raise Exception(f"[LOCAL-ONLY] Download deaktiviert fuer '{url}'. Bitte lege die Datei manuell in deinen lokalen Modellordern ab (siehe docs/docs/models.txt).")
     url = url.split("|")[0]
     if url.startswith("https://huggingface.co/") and "/resolve/main/" in url:
         base_dir = os.path.dirname(filename)
