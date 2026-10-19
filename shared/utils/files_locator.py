@@ -5,6 +5,31 @@ from typing import Iterable, List, Optional, Union
 
 default_checkpoints_paths = ["ckpts", "."]
 
+# --- LOCAL-ONLY MODE (no downloads, only local models) ---
+import re as _re
+_local_only = os.environ.get("WGP_LOCAL_ONLY", "").strip().lower() in ("1", "true", "yes")
+
+def set_local_only(v):
+    global _local_only
+    _local_only = bool(v)
+
+def is_local_only():
+    return _local_only
+
+def load_local_paths_from_file(paths_file="models.txt"):
+    """Extract model root folders (e.g. D:\\ComfyUiCuda\\models) from a models.txt file."""
+    roots = []
+    if not os.path.isfile(paths_file):
+        return roots
+    with open(paths_file, encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            m = _re.match(r"^([A-Za-z]:[\\/].+?[\\/](?:checkpoints|diffusion_models|loras|vae|text_encoders|LLM|unet|model_patches|controlnet|clip|vae_approx))[\\/]", line, _re.I)
+            if m and m.group(1) not in roots:
+                roots.append(m.group(1))
+    return roots
+# ----------------------------------------------------------
+
 _checkpoints_paths = default_checkpoints_paths
 
 def set_checkpoints_paths(checkpoints_paths):
