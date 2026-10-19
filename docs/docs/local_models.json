@@ -1,0 +1,168 @@
+{
+  "_comment": [
+    "Локальный реестр уже скачанных моделей (открывается как обычный JSON).",
+    "install.py читает этот файл и НЕ скачивает модели, которые уже есть на диске.",
+    "Источники: docs/models.txt и docs/models.md (полный список файлов на диске).",
+    "roots      - корневые папки models (ComfyUI-инсталляции); проверяются все по очереди.",
+    "subdir     - подпапка внутри корня; '' означает корень напрямую.",
+    "candidates - возможные имена файла (установщик берёт первое существующее).",
+    "aliases    - имя alias для OpenAI-совместимого API (llama-server --alias), если нужен.",
+    "Запуск с нуля (копирование в local-stack/models): python install.py --copy-models",
+    "Принудительно скачать недостающее с Hugging Face: python install.py --download-models"
+  ],
+  "roots": [
+    "C:/ai_diffusion/models",
+    "D:/ComfyUiCuda/models",
+    "D:/ComfyUiVideo/models",
+    "D:/ComfyUi2/models",
+    "C:/Users/Startklar/.lmstudio/models",
+    "D:/SillyTavernAiO/KoboldCPP/models",
+    "D:/claudeAgent/Coder/models"
+  ],
+  "models": {
+    "llm": [
+      {
+        "name": "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf",
+        "role": "coding",
+        "alias": "qwen2.5-coder-7b",
+        "candidates": [
+          {"subdir": "LLM/GGUF", "filename": "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf"},
+          {"subdir": "", "root": "D:/SillyTavernAiO/KoboldCPP/models", "filename": "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf"},
+          {"subdir": "", "root": "D:/claudeAgent/Coder/models", "filename": "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf"},
+          {"subdir": "", "root": "C:/Users/Startklar/.lmstudio/models", "glob": "**/Qwen2.5-Coder-7B-Instruct-GGUF/**/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf"}
+        ]
+      },
+      {
+        "name": "Qwen3-8B-Q4_K_M.gguf",
+        "role": "default",
+        "alias": "qwen3-8b",
+        "candidates": [
+          {"subdir": "LLM/GGUF", "filename": "Qwen3-8B-Q4_K_M.gguf"},
+          {"subdir": "", "root": "D:/SillyTavernAiO/KoboldCPP/models", "glob": "**/Qwen3-8B-Q4_K_M*.gguf"}
+        ],
+        "optional": true,
+        "use_as_default_if_present": true,
+        "note": "Qwen3-8B не найден в локальном списке; если появится на диске — станет моделью по умолчанию."
+      },
+      {
+        "name": "Qwen2.5-7B-Instruct-q8_0.gguf",
+        "role": "general",
+        "alias": "qwen2.5-7b-instruct",
+        "candidates": [
+          {"subdir": "LLM/GGUF", "filename": "Qwen2.5-7B-Instruct-q8_0.gguf"},
+          {"subdir": "", "root": "D:/SillyTavernAiO/KoboldCPP/models", "filename": "Qwen2.5-7B-Instruct-q8_0.gguf"}
+        ]
+      },
+      {
+        "name": "gemma-3n-E4B-it-QAT-Q4_K_XL.gguf",
+        "role": "general",
+        "alias": "gemma-3n-e4b",
+        "candidates": [
+          {"subdir": "LLM/GGUF", "filename": "gemma-3n-E4B-it-QAT-Q4_K_XL.gguf"}
+        ],
+        "optional": true,
+        "note": "gemma-3n не найден локально; общая роль закрывает Qwen2.5-7B-Instruct-q8_0."
+      },
+      {
+        "name": "Qwen3-4B-Instruct-2507-Q8_0.gguf",
+        "role": "general",
+        "alias": "qwen3-4b",
+        "candidates": [
+          {"subdir": "LLM/GGUF", "filename": "Qwen3-4B-Instruct-2507-Q8_0.gguf"}
+        ],
+        "optional": true,
+        "note": "Не найден локально; опционален (стек работает на других LLM), не качаем."
+      },
+      {
+        "name": "gemma-3-4b-it-qat-q4_0-gguf.gguf",
+        "role": "vision",
+        "alias": "gemma-3-4b",
+        "candidates": [
+          {"subdir": "LLM/GGUF", "filename": "gemma-3-4b-it-qat-q4_0-gguf.gguf"}
+        ],
+        "optional": true,
+        "mmproj": "mmproj-gemma-3-4b-it-qat-F16.gguf",
+        "note": "Не найден локально; vision-роль закрывает Qwen3-VL-4B (см. ниже)."
+      },
+      {
+        "name": "Qwen3-VL-4B-Instruct-abliterated.Q8_0.gguf",
+        "role": "vision",
+        "alias": "qwen3-vl-4b",
+        "candidates": [
+          {"subdir": "LLM", "filename": "Qwen3-VL-4B-Instruct-abliterated.Q8_0.gguf"},
+          {"subdir": "LLM/GGUF", "filename": "Qwen3-VL-4B-Instruct-abliterated.Q8_0.gguf"},
+          {"subdir": "", "root": "D:/SillyTavernAiO/KoboldCPP/models", "filename": "Qwen3-VL-4B-Instruct-abliterated.Q8_0.gguf"}
+        ],
+        "mmproj": "mmproj-F16.gguf",
+        "mmproj_candidates": [
+          {"subdir": "LLM", "filename": "mmproj-F16.gguf"},
+          {"subdir": "LLM/GGUF", "filename": "mmproj-F16.gguf"}
+        ]
+      },
+      {
+        "name": "workflow-generator-q8_0.gguf",
+        "role": "specialist",
+        "alias": "workflow-generator",
+        "candidates": [
+          {"subdir": "LLM/GGUF", "filename": "workflow-generator-q8_0.gguf"},
+          {"subdir": "", "root": "D:/SillyTavernAiO/KoboldCPP/models", "filename": "workflow-generator-q8_0.gguf"}
+        ]
+      }
+    ],
+    "embeddings": [
+      {
+        "name": "embeddinggemma-300m-qat-Q8_0.gguf",
+        "primary": true,
+        "dim": 768,
+        "candidates": [
+          {"subdir": "LLM/GGUF", "filename": "embeddinggemma-300m-qat-Q8_0.gguf"}
+        ],
+        "optional": true,
+        "note": "embeddinggemma-300m не найден локально; используется embeddinggemma-2-Q8_0 (+ mmproj-Q8_0)."
+      },
+      {
+        "name": "embeddinggemma-2-Q8_0.gguf",
+        "primary": false,
+        "use_as_embed_if_present": true,
+        "candidates": [
+          {"subdir": "LLM/GGUF", "filename": "embeddinggemma-2-Q8_0.gguf"},
+          {"subdir": "", "root": "D:/claudeAgent/Coder/models", "glob": "**/embeddinggemma-2-Q8_0/embeddinggemma-2-Q8_0.gguf"}
+        ],
+        "mmproj": "mmproj-Q8_0.gguf",
+        "mmproj_candidates": [
+          {"subdir": "", "root": "D:/claudeAgent/Coder/models", "glob": "**/embeddinggemma-2-Q8_0/mmproj-Q8_0.gguf"}
+        ]
+      },
+      {
+        "name": "bge-m3-Q8_0.gguf",
+        "primary": false,
+        "candidates": [
+          {"subdir": "LLM/GGUF", "filename": "bge-m3-Q8_0.gguf"}
+        ],
+        "optional": true,
+        "note": "Не найден локально; опциональный фолбэк, не качаем."
+      }
+    ],
+    "comfyui": {
+      "image": [
+        {"name": "moss_image_sft_int8_convrot.safetensors", "subdirs": ["diffusion_models"]},
+        {"name": "qwen3.5_9b_int8_convrot.safetensors", "subdirs": ["text_encoders", "diffusion_models"]},
+        {"name": "flux2_vae.safetensors", "subdirs": ["vae"]},
+        {"name": "MOSS-Image-SFT-8-steps-dmd.safetensors", "subdirs": ["loras"], "glob": "**/MOSS-Image-SFT-8-steps-dmd*.safetensors"},
+        {"name": "flux3_image_klein_base_int8_convrot.safetensors", "subdirs": ["diffusion_models"]},
+        {"name": "qwen_image_2.1_int8_convrot.safetensors", "subdirs": ["diffusion_models"]},
+        {"name": "Qwen-Image-2.1-Turbo-INT8-ConvRot.safetensors", "subdirs": ["diffusion_models"]},
+        {"name": "krea2Turbo18For_v2.safetensors", "subdirs": ["checkpoints"]},
+        {"name": "flux2Klein_9b.safetensors", "subdirs": ["checkpoints"]},
+        {"name": "z-image-turbo-fp8-aio.safetensors", "subdirs": ["checkpoints"]}
+      ],
+      "video": [
+        {"name": "minimax_h3_fl2va_pruned_w6a8.safetensors", "subdirs": ["diffusion_models"]},
+        {"name": "wan_1.3B_exp_e14.safetensors", "subdirs": ["diffusion_models"]},
+        {"name": "redgraftLTX25Fast2K_ltx25RedgraftNSFW.safetensors", "subdirs": ["diffusion_models"], "glob": "**/redgraftLTX25Fast2K*.safetensors"},
+        {"name": "ltx-2-spatial-upscaler-x2-1.0.safetensors", "subdirs": ["latent_upscale_models"]},
+        {"name": "ltx-2-temporal-upscaler-x2-1.0.safetensors", "subdirs": ["latent_upscale_models"]}
+      ]
+    }
+  }
+}

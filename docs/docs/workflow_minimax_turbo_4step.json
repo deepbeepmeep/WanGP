@@ -1,0 +1,70 @@
+{
+  "last_node": "101",
+  "last_link_id": 207,
+  "nodes": [
+    {
+      "class_type": "KSampler",
+      "_id": 101
+    },
+    {
+      "class_type": "VAEDecode",
+      "_id": 102
+    },
+    {
+      "class_type": "SaveAnimatedPNG",
+      "_id": 103
+    },
+    {
+      "class_type": "CLIPTextEncode",
+      "_id": 104
+    },
+    {
+      "class_type": "CLIPTextEncode",
+      "_id": 105
+    },
+    {
+      "class_type": "CheckpointLoaderSimple",
+      "_id": 106
+    },
+    {
+      "class_type": "EmptyLatentImage",
+      "_id": 107
+    },
+    {
+      "class_type": "PrepImagesForCFG",
+      "_id": 108
+    },
+    {
+      "class_type": "CFGDataCombine",
+      "_id": 109
+    },
+    {
+      "class_type": "SetLatentNoiseMask",
+      "_id": 110
+    },
+    {
+      "class_type": "LoraLoader",
+      "_id": 111
+    },
+    {
+      "class_type": "VAEEncode",
+      "_id": 112
+    },
+    {
+      "class_type": "ImageScale",
+      "_id": 113
+    },
+    {
+      "class_type": "SaveImage",
+      "_id": 114
+    }
+  ],
+  "links": [
+    [203, 106, 24, 111, 0, "CLIP"],
+    [204, 106, 25, 105, 1, "CLIP"],
+    [205, 107, 0, 113, 0, "LATENT"],
+    [206, 113, 0, 112, 0, "LATENT"],
+    [207, 112, 0, 102, 1, "LATENT"]
+  ],
+  "version": 0.1
+}

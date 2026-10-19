@@ -1,0 +1,94 @@
+{
+  "1": {
+    "inputs": {
+      "ckpt_name": "z-image-turbo-Q8_0.gguf"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "_id": 1
+  },
+  "2": {
+    "inputs": {
+      "text": "Two adorable squirrel friends running through a magical enchanted forest, glowing mushrooms, fireflies, sparkling lights, cinematic, fantasy atmosphere, highly detailed, 8k, magical realism, animated style, smooth motion, fluid animation",
+      "clip": ["10", 1]
+    },
+    "class_type": "CLIPTextEncode",
+    "_id": 2
+  },
+  "3": {
+    "inputs": {
+      "text": "blurry, low quality, distorted, deformed, ugly, bad anatomy, static, frozen, jerky, stuttering",
+      "clip": ["10", 1]
+    },
+    "class_type": "CLIPTextEncode",
+    "_id": 3
+  },
+  "4": {
+    "inputs": {
+      "width": 1280,
+      "height": 720,
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage",
+    "_id": 4
+  },
+  "5": {
+    "inputs": {
+      "lora_name": "Qwen-Image-2.1-viggle-turbo-4step-lora-r64.safetensors",
+      "strength_clip": 1.0,
+      "strength_model": 1.0,
+      "model": ["1", 0],
+      "clip": ["1", 2]
+    },
+    "class_type": "LoraLoader",
+    "_id": 5
+  },
+  "6": {
+    "inputs": {
+      "samples": ["9", 0],
+      "vae": ["5", 3]
+    },
+    "class_type": "VAEDecode",
+    "_id": 6
+  },
+  "7": {
+    "inputs": {
+      "filename_prefix": "magical_squirrel_video",
+      "images": ["6", 0],
+      "fps": 24,
+      "format": "mp4",
+      "crf": 15,
+      "codec": "h264",
+      "audio": "",
+      "extra_pnginfo": {
+        "workflow_description": "Magical squirrel escape video"
+      }
+    },
+    "class_type": "SaveAnimatedMP4",
+    "_id": 7
+  },
+  "8": {
+    "inputs": {
+      "clip_name": "qwen3vl_4b_fp8_scaled.safetensors"
+    },
+    "class_type": "CLIPSetLastLayer",
+    "_id": 8
+  },
+  "9": {
+    "inputs": {
+      "seed": 12345,
+      "steps": 4,
+      "cfg": 6.5,
+      "sampler_name": "euler",
+      "scheduler": "normal",
+      "denoise": 1.0,
+      "frames": 480,
+      "frame_rate": 24,
+      "latent_image": ["4", 0],
+      "model": ["5", 0],
+      "positive": ["2", 0],
+      "negative": ["3", 0]
+    },
+    "class_type": "KSampler",
+    "_id": 9
+  }
+}

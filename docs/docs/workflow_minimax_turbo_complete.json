@@ -1,0 +1,100 @@
+{
+  "1": {
+    "inputs": {
+      "ckpt_name": "z-image-turbo-Q8_0.gguf"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "_id": 1
+  },
+  "2": {
+    "inputs": {
+      "text": "two squirrels running through a magical fairy forest, animated, cinematic, 8k, highly detailed",
+      "clip": ["10", 1]
+    },
+    "class_type": "CLIPTextEncode",
+    "_id": 2
+  },
+  "3": {
+    "inputs": {
+      "text": "",
+      "clip": ["10", 1]
+    },
+    "class_type": "CLIPTextEncode",
+    "_id": 3
+  },
+  "4": {
+    "inputs": {
+      "width": 1280,
+      "height": 720,
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage",
+    "_id": 4
+  },
+  "5": {
+    "inputs": {
+      "lora_name": "Qwen-Image-2.1-viggle-turbo-4step-lora-r64.safetensors",
+      "strength_clip": 1.0,
+      "strength_model": 1.0,
+      "model": ["1", 0],
+      "clip": ["1", 2]
+    },
+    "class_type": "LoraLoader",
+    "_id": 5
+  },
+  "7": {
+    "inputs": {
+      "pixels": ["8", 0],
+      "vae": ["5", 3]
+    },
+    "class_type": "VAEEncode",
+    "_id": 7
+  },
+  "8": {
+    "inputs": {
+      "image": "placeholder.png",
+      "upload": "image"
+    },
+    "class_type": "LoadImage",
+    "_id": 8
+  },
+  "9": {
+    "inputs": {
+      "seed": 42,
+      "steps": 4,
+      "cfg": 7.0,
+      "sampler_name": "euler",
+      "scheduler": "normal",
+      "denoise": 1.0,
+      "latent_image": ["4", 0],
+      "model": ["5", 0],
+      "positive": ["2", 0],
+      "negative": ["3", 0]
+    },
+    "class_type": "KSampler",
+    "_id": 9
+  },
+  "10": {
+    "inputs": {
+      "clip_name": "qwen3vl_4b_fp8_scaled.safetensors"
+    },
+    "class_type": "CLIPSetLastLayer",
+    "_id": 10
+  },
+  "11": {
+    "inputs": {
+      "samples": ["9", 0],
+      "vae": ["5", 3]
+    },
+    "class_type": "VAEDecode",
+    "_id": 11
+  },
+  "12": {
+    "inputs": {
+      "filename_prefix": "squirrel_escape",
+      "images": ["11", 0]
+    },
+    "class_type": "SaveImage",
+    "_id": 12
+  }
+}
