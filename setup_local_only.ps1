@@ -192,18 +192,78 @@ if (Test-Path $req) {
     Write-Host "  requirements.txt nicht gefunden - uebersprungen." -ForegroundColor DarkGray
 }
 
-# 5) Syntax-Check der gepatchten Dateien
+# 5) Patch shared/attention.py: CUDA-Fallback, damit kein Absturz bei
+#    "Torch not compiled with CUDA enabled" (CPU-Torch / falsches venv).
 # ---------------------------------------------------------------------
-python -m py_compile "$root\wgp.py" "$root\shared\utils\files_locator.py"
+$att = "$root\shared\attention.py"
+if (Test-Path $att) {
+    $attSrc = Get-Content $att -Raw
+    if ($attSrc -notmatch 'LOCAL-ONLY-CUDA-FALLBACK') {
+        $badLine = 'major, minor = torch.cuda.get_device_capability(None)'
+        $goodBlock = @'
+# LOCAL-ONLY-CUDA-FALLBACK: stabile Geraete-Erkennung (CUDA oder CPU)
+try:
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability(None)
+    else:
+        raise RuntimeError("CUDA nicht verfuegbar")
+except Exception:
+    major, minor = 8, 0   # Fallback wie Ampere (bf16 unterstuetzt)
+'@
+        if ($attSrc.Contains($badLine)) {
+            $attSrc = $attSrc.Replace($badLine, $goodBlock)
+            Set-Content $att $attSrc -NoNewline -Encoding UTF8
+            Write-Host "[OK] shared/attention.py: CUDA-Fallback eingefuegt." -ForegroundColor Green
+        } else {
+            Write-Host "  attention.py: Zeile nicht gefunden - manuell pruefen." -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "[SKIP] attention.py bereits gepatcht." -ForegroundColor DarkGray
+    }
+}
+
+# 6) Umgebungs-Check: venv-Python mit echtem CUDA-Torch verwenden
+# ---------------------------------------------------------------------
+$venvPy = $null
+foreach ($c in @("$root\venv\Scripts\python.exe", "$root\.venv\Scripts\python.exe")) {
+    if (Test-Path $c) { $venvPy = $c; break }
+}
+if (-not $venvPy) { $venvPy = (Get-Command python -ErrorAction SilentlyContinue).Source }
+Write-Host ""
+Write-Host "--- Umgebungs-Check ---" -ForegroundColor Cyan
+Write-Host "Python: $venvPy"
+& "$venvPy" -m pip --version | Out-Null
+$torchStatus = & "$venvPy" -c "import torch; print('CUDA_BUILD' if torch.version.cuda else 'CPU_ONLY')" 2>$null
+$gpuVisible = & "$venvPy" -c "import torch; print('GPU_VISIBLE' if torch.cuda.is_available() else 'NO_GPU')" 2>$null
+Write-Host "Torch-Build : $torchStatus"
+Write-Host "GPU-Erkennung: $gpuVisible"
+if ($torchStatus -match 'CPU_ONLY') {
+    Write-Host ">>> Installiere PyTorch mit CUDA 12.4 in das venv ..." -ForegroundColor Yellow
+    & "$venvPy" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+    $gpuVisible = & "$venvPy" -c "import torch; print('GPU_VISIBLE' if torch.cuda.is_available() else 'NO_GPU')" 2>$null
+    Write-Host "Neuer Status: $gpuVisible"
+}
+if ($gpuVisible -match 'NO_GPU') {
+    Write-Host ">>> ACHTUNG: Keine NVIDIA-GPU sichtbar! Pruefen:" -ForegroundColor Red
+    Write-Host "    - Nvidia-Treiber installiert? (im Terminal: nvidia-smi)" -ForegroundColor White
+    Write-Host "    - korrektes venv? Start immer mit:" -ForegroundColor White
+    Write-Host "      .\venv\Scripts\python.exe wgp.py --listen" -ForegroundColor White
+    Write-Host "    (Dank attention.py-Patch laeuft Wan2GP jetzt auch auf CPU weiter," -ForegroundColor DarkGray
+    Write-Host "     aber ohne GPU ist LTX/Flux extrem langsam.)" -ForegroundColor DarkGray
+}
+
+# 7) Syntax-Check der gepatchten Dateien
+# ---------------------------------------------------------------------
+& "$venvPy" -m py_compile "$root\wgp.py" "$root\shared\utils\files_locator.py" "$root\shared\attention.py"
 if ($LASTEXITCODE -ne 0) { throw "Python-Syntaxfehler nach Patch - Abbruch!" }
 Write-Host "[OK] Syntax-Check bestanden" -ForegroundColor Green
 
 Write-Host ""
 Write-Host "===============================================================" -ForegroundColor Green
 Write-Host " FERTIG! Start mit:" -ForegroundColor Green
-Write-Host "   python wgp.py --listen" -ForegroundColor White
+Write-Host "   .\venv\Scripts\python.exe wgp.py --listen" -ForegroundColor White
 Write-Host " oder Umgebungsvariable (zusicherer Schutz):" -ForegroundColor White
-Write-Host "   `$env:WGP_LOCAL_ONLY='1'; python wgp.py" -ForegroundColor White
+Write-Host "   `$env:WGP_LOCAL_ONLY='1'; .\venv\Scripts\python.exe wgp.py" -ForegroundColor White
 Write-Host "===============================================================" -ForegroundColor Green
 Write-Host " Rueckgaengig machen: finetunes\*_backup_*.json loeschen," -ForegroundColor DarkGray
 Write-Host " .\setup_local_only.ps1 -Undo nicht verfuegbar - stattdessen" -ForegroundColor DarkGray
