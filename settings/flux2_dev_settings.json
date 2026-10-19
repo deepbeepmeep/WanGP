@@ -1,0 +1,12 @@
+{
+    "settings_version": 2.58,
+    "prompt": "draw a hat on top of a hat inside a hat",
+    "resolution": "1024x1024",
+    "flow_shift": 5.0,
+    "embedded_guidance_scale": 4,
+    "denoising_strength": 1.0,
+    "masking_strength": 0.25,
+    "remove_background_images_ref": 0,
+    "batch_size": 1,
+    "sampling_steps": 30
+}

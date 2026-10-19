@@ -1,4 +1,4 @@
-﻿############# WanGP Copyright DeepBeepMeep 2025-2026 #############
+############# WanGP Copyright DeepBeepMeep 2025-2026 #############
 import os, sys
 os.environ["GRADIO_LANG"] = "en"
 from shared.default_device import set_default_cuda_device_from_arg; set_default_cuda_device_from_arg("gpu")
@@ -2099,8 +2099,8 @@ for src_name, tgt_name in zip(src_move, tgt_move):
             pass
     
 
-if not Path(config_load_filename).is_file():
-    server_config = {
+def _default_server_config():
+    return {
         "attention_mode" : "auto",  
         "transformer_types": [], 
         "transformer_quantization": "int8",
@@ -2140,12 +2140,53 @@ if not Path(config_load_filename).is_file():
         "audio_save_path": "outputs",
     }
 
-    with open(server_config_filename, "w", encoding="utf-8") as writer:
-        writer.write(json.dumps(server_config))
-else:
-    with open(config_load_filename, "r", encoding="utf-8") as reader:
-        text = reader.read()
-    server_config = json.loads(text)
+def _write_server_config(path, config):
+    try:
+        with open(path, "w", encoding="utf-8") as writer:
+            writer.write(json.dumps(config))
+        return True
+    except Exception as write_error:
+        print(f"WARNING: Konnte '{path}' nicht schreiben: {write_error}")
+        return False
+
+def _load_server_config():
+    """Laedt wgp_config.json BOM-tolerant und heilt defekte / unvollstaendige Dateien."""
+    if not Path(config_load_filename).is_file():
+        config = _default_server_config()
+        _write_server_config(server_config_filename, config)
+        return config
+
+    try:
+        with open(config_load_filename, "r", encoding="utf-8-sig") as reader:
+            config = json.load(reader)
+        if not isinstance(config, dict):
+            raise ValueError(f"Top-Level ist kein JSON-Objekt, sondern {type(config).__name__}")
+    except Exception as config_error:
+        backup_filename = config_load_filename + ".corrupt.bak"
+        print(f"WARNING: '{config_load_filename}' ist defekt ({type(config_error).__name__}: {config_error}).")
+        try:
+            shutil.copy2(config_load_filename, backup_filename)
+            print(f"WARNING: Defekte Konfiguration gesichert als '{backup_filename}'.")
+        except Exception as backup_error:
+            print(f"WARNING: Backup der defekten Konfiguration fehlgeschlagen: {backup_error}")
+        config = _default_server_config()
+        _write_server_config(server_config_filename, config)
+        print("WARNING: Starte mit Standardwerten.")
+        return config
+
+    # Fehlende Schluessel aus aelteren / abgeschnittenen Configs ergaenzen
+    missing_keys = []
+    for key, value in _default_server_config().items():
+        if key not in config:
+            config[key] = value
+            missing_keys.append(key)
+    if len(missing_keys) > 0:
+        print(f"WARNING: wgp_config.json war unvollstaendig, Standardwerte ergaenzt: {', '.join(missing_keys)}")
+        _write_server_config(server_config_filename, config)
+
+    return config
+
+server_config = _load_server_config()
 
 server_config.setdefault("prompt_enhancer_quantization", "quanto_int8")
 server_config.setdefault(gradio_queue_focus_patch.FOCUS_QUEUE_SERVER_CONFIG_KEY, 1)
@@ -9316,7 +9357,7 @@ def get_modal_image(image_base64, label):
     return f"""
     <div class="modal-flex-container" onclick="closeImageModal()">
         <div class="modal-content-wrapper" onclick="event.stopPropagation()">
-            <div class="modal-close-btn" onclick="closeImageModal()">Ã—</div>
+            <div class="modal-close-btn" onclick="closeImageModal()">×</div>
             <div class="modal-label">{label}</div>
             <img src="{image_base64}" class="modal-image" alt="{label}">
         </div>
@@ -10846,7 +10887,7 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                                     else:
                                         refiner_range = gr.Textbox(value="1-10", label="Step Range", info="Start-End", scale=3)
                                     refiner_mult = gr.Slider(label="Iterations", value=3, minimum=1, maximum=5, step=1, scale=2)
-                                    refiner_add_btn = gr.Button("âž• Add", variant="primary", scale=0, min_width=100)
+                                    refiner_add_btn = gr.Button("➕ Add", variant="primary", scale=0, min_width=100)
                                 
                                 if not update_form:
                                     refiner_add_btn.click(fn=add_refiner_rule, inputs=[self_refiner_plan, refiner_range, refiner_mult], outputs=[self_refiner_plan])
@@ -10861,7 +10902,7 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                                             with gr.Row(elem_classes="rule-row"):
                                                 text_display = f"Steps **{rule['start']} - {rule['end']}** : **{rule['steps']}x** iterations"
                                                 gr.Markdown(text_display, elem_classes="rule-card")
-                                                gr.Button("âœ–", variant="stop", scale=0, elem_classes="delete-btn").click(
+                                                gr.Button("✖", variant="stop", scale=0, elem_classes="delete-btn").click(
                                                     fn=remove_refiner_rule, 
                                                     inputs=[self_refiner_plan, gr.State(i)], 
                                                     outputs=[self_refiner_plan]

@@ -8,7 +8,7 @@ REM venv aktivieren
 call "%VENV_PATH%\Scripts\activate.bat"
 
 REM wgp.py starten auf Port 8734
-python wgp.py --port 8734
+python wgp.py --server-port 8734 --listen
 
 REM Konsole blockiert, bis Python beendet
 pause

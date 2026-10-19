@@ -1,0 +1,12 @@
+{
+    "settings_version": 2.58,
+    "prompt": "a cozy reading nook with warm sunlight, soft textiles, and a cup of tea on a wooden side table",
+    "resolution": "1024x1024",
+    "flow_shift": 5.0,
+    "embedded_guidance_scale": 1,
+    "denoising_strength": 1.0,
+    "masking_strength": 0.25,
+    "remove_background_images_ref": 0,
+    "num_inference_steps": 4,
+    "batch_size": 1
+}

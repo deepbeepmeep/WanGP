@@ -1,0 +1,10 @@
+{
+    "settings_version": 2.58,
+    "prompt": "draw a hat",
+    "resolution": "1280x720",
+    "flow_shift": 5.0,
+    "embedded_guidance_scale": 2.5,
+    "guidance_scale": 3.0,
+    "num_inference_steps": 20,
+    "batch_size": 1
+}
