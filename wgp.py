@@ -2162,8 +2162,21 @@ if server_config.get("use_models_txt", True):
     if len(expanded) > 0:
         checkpoints_paths = expanded + list(checkpoints_paths)
         server_config["checkpoints_paths"] = checkpoints_paths
-if server_config.get("local_only", False):
+if server_config.get("local_only", False) or fl.is_local_only():
     fl.set_local_only(True)
+    server_config["local_only"] = True
+    # [LOCAL-ONLY] Quantisierte Varianten koennen nicht heruntergeladen werden, daher
+    # automatisch auf bf16 umschalten, damit die lokal vorhandenen Modelle verwendet werden.
+    if server_config.get("transformer_quantization", "int8") not in ("bf16", "fp16"):
+        server_config["transformer_quantization"] = "bf16"
+    if server_config.get("text_encoder_quantization", "int8") not in ("bf16", "fp16"):
+        server_config["text_encoder_quantization"] = "bf16"
+    # Persistiere den erzwungenen Local-Only-Modus, damit spaetere Config-Saves ihn nicht verlieren.
+    try:
+        with open(server_config_filename, "w", encoding="utf-8") as writer:
+            writer.write(json.dumps(server_config))
+    except Exception as _e:
+        print(f"[LOCAL-ONLY] Warnung: Konfiguration konnte nicht gespeichert werden: {_e}")
 # -------------------------------------------------------------------
 fl.set_checkpoints_paths(checkpoints_paths)
 three_levels_hierarchy = server_config.get("model_hierarchy_type", 1) == 1
@@ -2496,6 +2509,26 @@ def get_model_filename(model_type, quantization ="int8", dtype_policy = "", modu
             raw_filename = sub_choices[0]
         else:
             raw_filename = choices[0]
+
+    # --- LOCAL-ONLY FALLBACK: never reference a remote URL that cannot be downloaded.
+    # If the selected candidate (typically a quantized variant like '*_quanto_bf16_int8.safetensors')
+    # is not available locally, fall back to any other listed variant whose base filename exists
+    # in the local model folders (see docs/docs/models.txt), so preinstalled workflows keep working.
+    if fl.is_local_only() and isinstance(raw_filename, str) and raw_filename.startswith("http"):
+        candidates = [raw_filename] + [name for name in choices if name != raw_filename]
+        fallback = None
+        for name in candidates:
+            if not isinstance(name, str) or not name.startswith("http"):
+                continue
+            if fl.locate_file(os.path.basename(name.split("|")[0]), error_if_none=False) is not None:
+                fallback = name
+                break
+        if fallback is not None:
+            if fallback != raw_filename:
+                print(f"[LOCAL-ONLY] '{os.path.basename(raw_filename)}' nicht lokal gefunden - verwende lokales Modell '{os.path.basename(fallback)}' fuer Model '{model_type}'.")
+            raw_filename = fallback
+        else:
+            print(f"[LOCAL-ONLY] Warnung: keines der lokalen Modelle fuer '{model_type}' gefunden: {[os.path.basename(n) for n in candidates if isinstance(n, str)]}")
 
     return raw_filename
 
