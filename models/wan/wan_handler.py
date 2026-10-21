@@ -365,6 +365,8 @@ class family_handler():
                             ("flowmatch causvid", "causvid"),
                             ("lcm + ltx", "lcm"), ]
         })
+        if base_model_type == "ti2v_2_2":
+            extra_model_def["sample_solvers"].append(("FastWan DMD (3 steps)", "fastwan_dmd"))
         extra_model_def["sub_parallel_windows"] = scail2
 
         extra_model_def["self_refiner"] = True
