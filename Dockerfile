@@ -1,92 +1,161 @@
-FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
-
-# Build arg for GPU architectures - specify which CUDA compute capabilities to compile for
-# Common values:
-#   7.0  - Tesla V100
-#   7.5  - RTX 2060, 2070, 2080, Titan RTX
-#   8.0  - A100, A800 (Ampere data center)
-#   8.6  - RTX 3060, 3070, 3080, 3090 (Ampere consumer)
-#   8.9  - RTX 4070, 4080, 4090 (Ada Lovelace)
-#   9.0  - H100, H800 (Hopper data center)
-#   12.0 - RTX 5070, 5080, 5090 (Blackwell) - Note: sm_120 architecture
+# syntax=docker/dockerfile:1.4
+# Multi-stage Dockerfile for cloud/RunPod deployment.
 #
-# Examples:
-#   RTX 3060: --build-arg CUDA_ARCHITECTURES="8.6"
-#   RTX 4090: --build-arg CUDA_ARCHITECTURES="8.9"
-#   Multiple: --build-arg CUDA_ARCHITECTURES="8.0;8.6;8.9"
+# Stages:
+#   sage-compile — apt + uv + PyTorch + SageAttention two-pass NVCC build.
+#                  Cache-stable; only rebuilds when these deps change.
+#                  Preserves dist/*.whl for use by the deps stage and
+#                  for wheel extraction by the sage-wheels.yml workflow.
+#   deps         — installs SageAttention wheel + project requirements
+#                  on top of sage-compile. Rebuilds on requirements.txt changes.
+#   runtime      — source copy + SSH + filebrowser + entrypoint.
 #
-# Note: Including 8.9 or 9.0 may cause compilation issues on some setups
-# Default includes 8.0 and 8.6 for broad Ampere compatibility
-ARG CUDA_ARCHITECTURES="8.0;8.6"
+# Build args (set at build time):
+#   CUDA_ARCHITECTURES   Semicolon-separated SM targets. Default covers
+#                        Ampere, Ada, Hopper, and Blackwell via PTX.
+#   FILEBROWSER_VERSION  filebrowser release tag to install.
+#
+# Runtime env vars (set on pod, no image rebuild needed):
+#   SSH_PUBLIC_KEY       Ed25519/RSA public key injected into /root/.ssh/authorized_keys
+#   SSH_PORT             Port for sshd. sshd is skipped if unset.
+#   FILEBROWSER_PORT     Port for filebrowser. Skipped if unset.
+#   WGP_PROFILE          Override auto-detected WanGP profile (1-5)
+#   WGP_ATTENTION        Override auto-detected attention mode (sage2/sage/sdpa)
+#   WGP_ARGS             Extra arguments passed to wgp.py
 
+ARG CUDA_ARCHITECTURES="8.0;8.6;8.9;9.0;10.0;12.0+PTX"
+ARG FILEBROWSER_VERSION="2.32.0"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage: base
+# Common base for both tools (compiler) and production images.
+# ─────────────────────────────────────────────────────────────────────────────
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04 AS base
+
+ARG CUDA_ARCHITECTURES
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install system dependencies
-RUN apt update && \
-    apt install -y \
-    python3 python3-pip git wget curl cmake ninja-build \
-    libgl1 libglib2.0-0 ffmpeg && \
-    apt clean
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-dev python3-pip \
+    git wget curl cmake ninja-build \
+    libgl1 libglib2.0-0 ffmpeg \
+    openssh-server \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /usr/lib/python3.*/EXTERNALLY-MANAGED
 
-WORKDIR /workspace
+RUN pip install --no-cache-dir uv==0.6.2
+ENV PATH="/root/.local/bin:${PATH}"
+ENV UV_HTTP_TIMEOUT=300
 
-COPY requirements.txt .
+# Install PyTorch cu128 (RTX 30/40)
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system \
+    torch==2.10.0+cu128 \
+    torchvision==0.25.0+cu128 \
+    torchaudio==2.10.0+cu128 \
+    torchao==0.16.0+cu128 \
+    --index-url https://download.pytorch.org/whl/cu128
 
-# Upgrade pip first
-RUN pip install --upgrade pip setuptools wheel
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage: sage-tools
+# Full NVCC compiler stage. Targeted ONLY by the sage-wheels.yml robot.
+# ─────────────────────────────────────────────────────────────────────────────
+FROM base AS sage-tools
 
-# First install torch with the versions we want, so that stuff in requirements.txt doesn't pull in the generic versions
-# If you change CUDA 12.8 here, you also need to change the FROM docker image at the top
-RUN pip install torch==2.10.0+cu128 torchvision==0.25.0+cu128 torchaudio==2.10.0+cu128 --index-url https://download.pytorch.org/whl/cu128
-
-# Install requirements if exists
-RUN pip install -r requirements.txt
-
-# Install SageAttention from git (patch GPU detection)
-ENV TORCH_CUDA_ARCH_LIST="${CUDA_ARCHITECTURES}"
 ENV FORCE_CUDA="1"
-ENV MAX_JOBS="8"
+ARG CUDA_ARCHITECTURES
+RUN pip install wheel packaging && \
+    git clone --branch v2.2.0 --depth 1 \
+    https://github.com/thu-ml/SageAttention.git /tmp/SageAttention && \
+    cd /tmp/SageAttention && \
+    export TORCH_CUDA_ARCH_LIST="${CUDA_ARCHITECTURES}" && \
+    MAX_JOBS=1 python3 setup.py bdist_wheel && \
+    mkdir -p /tmp/sa_dist && cp dist/*.whl /tmp/sa_dist/ && \
+    pip install --no-deps /tmp/sa_dist/*.whl && \
+    rm -rf /tmp/SageAttention
 
-COPY <<EOF /tmp/patch_setup.py
-import os
-with open('setup.py', 'r') as f:
-    content = f.read()
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage: sage-compile
+# Fast production stage. Downloads pre-built wheels from GitHub Releases.
+# ─────────────────────────────────────────────────────────────────────────────
+FROM base AS sage-compile
 
-# Get architectures from environment variable
-arch_list = os.environ.get('TORCH_CUDA_ARCH_LIST')
-arch_set = '{' + ', '.join([f'"{arch}"' for arch in arch_list.split(';')]) + '}'
+RUN ssh-keygen -A && \
+    sed -i \
+    -e 's/#\?\(PermitRootLogin\).*/\1 yes/' \
+    -e 's/#\?\(PubkeyAuthentication\).*/\1 yes/' \
+    -e 's/#\?\(PasswordAuthentication\).*/\1 no/' \
+    /etc/ssh/sshd_config && \
+    mkdir -p /run/sshd
 
-# Replace the GPU detection section
-old_section = '''compute_capabilities = set()
-device_count = torch.cuda.device_count()
-for i in range(device_count):
-    major, minor = torch.cuda.get_device_capability(i)
-    if major < 8:
-        warnings.warn(f"skipping GPU {i} with compute capability {major}.{minor}")
-        continue
-    compute_capabilities.add(f"{major}.{minor}")'''
+# ── SageAttention 2++ ────────────────────────────────────────────────────────
+# We download ALL parallel factory wheels. entrypoint.sh installs the best match.
+ARG SAGE_VERSION="2.2.0"
+# REPO_OWNER defines where optimized wheels and kernel assets are hosted.
+# Overridden by CI (${{ github.repository }}) or build_local.sh (git remote).
+ARG REPO_OWNER="deepbeepmeep/Wan2GP"
+RUN mkdir -p /opt/sage_wheels && \
+    cd /opt/sage_wheels && \
+    VTAG="v${SAGE_VERSION}" && \
+    WURL="https://github.com/${REPO_OWNER}/releases/download/sage-${VTAG}-cu128-cp312" && \
+    curl -L -O "${WURL}/sageattention-${SAGE_VERSION}+ampere.ada.rtx30.40-cp312-cp312-linux_x86_64.whl" && \
+    curl -L -O "${WURL}/sageattention-${SAGE_VERSION}+hopper.h100.h200-cp312-cp312-linux_x86_64.whl" && \
+    curl -L -O "${WURL}/sageattention-${SAGE_VERSION}+blackwell.rtx50-cp312-cp312-linux_x86_64.whl"
 
-new_section = 'compute_capabilities = ' + arch_set + '''
-print(f"Manually set compute capabilities: {compute_capabilities}")'''
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage: deps
+# Adds project requirements on top of the sage-compile base.
+# The sage-compile stage is a cache hit; only this stage rebuilds when
+# requirements.txt changes.
+# ─────────────────────────────────────────────────────────────────────────────
+FROM sage-compile AS deps
 
-content = content.replace(old_section, new_section)
+# SageAttention is already installed in sage-compile's site-packages.
+# /tmp/sa_dist/*.whl is preserved for sage-wheels.yml extraction.
 
-with open('setup.py', 'w') as f:
-    f.write(content)
-EOF
+# Project requirements.
+# --index-strategy unsafe-best-match: uv stops at the first index that has a
+# package name; this flag enables cross-index version resolution matching pip's
+# default behaviour. Needed because the aiinfra nightly index appears first but
+# does not have all versions (e.g. onnxruntime-gpu==1.22.0 is only on PyPI).
+COPY requirements.txt /tmp/requirements.txt
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system \
+    --index-strategy unsafe-best-match \
+    -r /tmp/requirements.txt && \
+    uv pip install -U --system --force-reinstall "huggingface-hub==0.36.2" git+https://github.com/huggingface/diffusers@main
 
-RUN git clone https://github.com/thu-ml/SageAttention.git /tmp/sageattention && \
-    cd /tmp/sageattention && \
-    python3 /tmp/patch_setup.py && \
-    pip install --no-build-isolation .
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage: runtime
+# Source copy + optional services + entrypoint.
+# Rebuilds on every source-code push; deps stage is a cache hit.
+# ─────────────────────────────────────────────────────────────────────────────
+FROM deps AS runtime
 
-RUN useradd -u 1000 -ms /bin/bash user
+ARG FILEBROWSER_VERSION
+ARG CUDA_ARCHITECTURES
+ENV CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}
 
-RUN chown -R user:user /workspace
+# Filebrowser — lightweight browser-based file manager (optional, env-gated)
+RUN curl -fsSL \
+    "https://github.com/filebrowser/filebrowser/releases/download/v${FILEBROWSER_VERSION}/linux-amd64-filebrowser.tar.gz" \
+    -o /tmp/fb.tar.gz && \
+    tar -xzf /tmp/fb.tar.gz -C /usr/local/bin/ filebrowser && \
+    rm /tmp/fb.tar.gz
 
-RUN mkdir /home/user/.cache && \
-    chown -R user:user /home/user/.cache
+# Project source baked into image (no host bind mount for cloud deployments).
+# /workspace/ maps to the pod network volume and persists across restarts.
+WORKDIR /workspace/wan2gp
+COPY . .
 
-COPY entrypoint.sh /workspace/entrypoint.sh
+RUN mkdir -p \
+    /workspace/models \
+    /workspace/outputs \
+    /workspace/.cache/huggingface \
+    /workspace/.cache/triton
 
-ENTRYPOINT ["/workspace/entrypoint.sh"]
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 7860 22
+ENTRYPOINT ["/entrypoint.sh"]

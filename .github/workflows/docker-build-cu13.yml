@@ -1,0 +1,64 @@
+# docker-build-cu13.yml
+# Builds and pushes the CUDA 13.0 Wan2GP image.
+# Improves fp4 support at the expense of machine availability (cloud providers
+# are often very slow to update their drivers). 
+#
+# Triggers:
+#   push to fng-infra or main/master  -> build + push image
+#   pull_request targeting main/master -> build only (merge gate, no push)
+#
+# Image: ghcr.io/deepbeepmeep/wan2gp
+# Cache: GitHub Actions cache (type=gha) via BuildKit
+---
+name: Docker Build & Push (cu130)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - fng-infra
+    paths:
+      - 'Dockerfile.cu13'
+      - 'entrypoint.sh'
+      - '.github/workflows/docker-build-cu13.yml'
+
+jobs:
+  build-and-push:
+    name: Build image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lowercase Repository Name
+        id: repo
+        run: echo "nameslc=${GITHUB_REPOSITORY,,}" >> $GITHUB_OUTPUT
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.cu13
+          push: true
+          tags: |
+            ghcr.io/${{ steps.repo.outputs.nameslc }}:latest-cu13
+            ghcr.io/${{ steps.repo.outputs.nameslc }}:${{ github.sha }}-cu13
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            CUDA_ARCHITECTURES=8.0;8.6;8.9;9.0;10.0;12.0+PTX
+            REPO_OWNER=${{ steps.repo.outputs.nameslc }}

@@ -1,0 +1,121 @@
+# sage-wheels-cu13.yml
+# Manually-triggered factory for CUDA 13.0 SageAttention wheels.
+#
+# Release: sage-v<version>-cu130-cp312
+---
+name: SageAttention Factory (cu130)
+
+on:
+  workflow_dispatch:
+    inputs:
+      sage_tag:
+        description: SageAttention git tag
+        required: true
+        default: v2.2.0
+
+permissions:
+  contents: write
+
+jobs:
+  initialize-release:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
+      sage_version: ${{ steps.vars.outputs.sage_version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set Variables
+        id: vars
+        run: |
+          SAGE_VERSION=$(grep -oP 'ARG SAGE_VERSION="\K[v0-9.]+' Dockerfile.cu13 | head -1)
+          VTAG=$(echo "$SAGE_VERSION" | grep -q '^v' && echo "$SAGE_VERSION" || echo "v$SAGE_VERSION")
+          TAG="sage-${VTAG}-cu130-cp312"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "sage_version=$SAGE_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create Base Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.vars.outputs.tag }}"
+          SAGE_VERSION="${{ steps.vars.outputs.sage_version }}"
+          
+          if gh release view "$TAG" 1>/dev/null 2>&1; then
+            echo "Refreshing existing release..."
+            gh release delete "$TAG" --yes || true
+          fi
+          
+          gh release create "$TAG" \
+            --title "SageAttention ${SAGE_VERSION} Parallel Factory (CUDA 13.0 | P3.12)" \
+            --notes "Parallel architecture-specific wheels for Wan2GP. (Native sm_8x/9x/10x/12x | Python 3.12)" \
+            --prerelease --latest=false
+
+  build-wheels:
+    name: Build ${{ matrix.name }}
+    needs: initialize-release
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ampere-ada-rtx-30-40
+            arch: "8.0;8.6;8.9"
+            suffix: ampere.ada.rtx30.40
+          - name: hopper-h100-h200
+            arch: "9.0;10.0"
+            suffix: hopper.h100.h200
+          - name: blackwell-rtx-50
+            arch: "12.0+PTX"
+            suffix: blackwell.rtx50
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Lowercase Repository Name
+        id: repo
+        run: echo "nameslc=${GITHUB_REPOSITORY,,}" >> $GITHUB_OUTPUT
+
+      - name: Build sage-tools-cu13 stage
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.cu13
+          target: sage-tools
+          load: true
+          push: false
+          tags: sage-tools-cu13-${{ matrix.name }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            CUDA_ARCHITECTURES=${{ matrix.arch }}
+            REPO_OWNER=${{ steps.repo.outputs.nameslc }}
+
+      - name: Extract and rename wheel
+        run: |
+          mkdir -p dist
+          docker run --rm \
+            -v "$(pwd)/dist:/out" \
+            sage-tools-cu13-${{ matrix.name }}:latest \
+            bash -c "cp /tmp/sa_dist/*.whl /out/"
+          
+          ORIG_WHEEL=$(ls dist/*.whl | head -1)
+          SAGE_VERSION="${{ needs.initialize-release.outputs.sage_version }}"
+          SAGE_VER_CLEAN=$(echo "$SAGE_VERSION" | sed 's/^v//')
+          NEW_WHEEL="sageattention-${SAGE_VER_CLEAN}+${{ matrix.suffix }}-cp312-cp312-linux_x86_64.whl"
+          
+          mv "$ORIG_WHEEL" "dist/$NEW_WHEEL"
+          
+      - name: Upload asset to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.initialize-release.outputs.tag }}"
+          WHEEL=$(ls dist/*.whl | head -1)
+          gh release upload "$TAG" "$WHEEL" --clobber

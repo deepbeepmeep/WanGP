@@ -22,6 +22,9 @@ unidic-lite>=1.0.0
 open_clip_torch>=2.29.0
 numpy==2.1.2
 num2words==0.5.14
+scipy
+safetensors
+# torchao managed in Dockerfile base stage for index alignment
 
 # Video & media
 moviepy==1.0.3
