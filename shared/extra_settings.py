@@ -346,7 +346,8 @@ def _sliding_window_size_max(model_def: dict[str, Any] | None, context: dict[str
         raw_max = int(raw_max)
     except Exception:
         raw_max = 257
-    return int(_get_context_get_max_frames(context)(raw_max))
+    # global lower bound so any video model can use a Sliding Window of up to 999 frames
+    return max(int(_get_context_get_max_frames(context)(raw_max)), 999)
 
 
 def _sliding_window_size_step(model_def: dict[str, Any] | None, _context: dict[str, Any]) -> int:
