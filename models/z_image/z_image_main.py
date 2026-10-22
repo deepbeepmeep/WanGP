@@ -70,6 +70,28 @@ def _build_qwen3_state_dict_preprocessor(config_path: str):
 
     return preprocess_state_dict
 
+def _fix_qwen_fp8_sd(sd):
+    # Find the actual key for embed tokens in the VL checkpoint
+    embed_key = next((k for k in sd.keys() if "embed_tokens.weight" in k), None)
+    
+    if embed_key is not None:
+        # 1. Provide it at the root (standard behavior)
+        sd["lm_head.weight"] = sd[embed_key]
+        
+        # 2. Provide it at common Vision-Language nested levels
+        sd["language_model.lm_head.weight"] = sd[embed_key]
+        sd["model.language_model.lm_head.weight"] = sd[embed_key]
+        
+        # 3. Provide it dynamically based on however the checkpoint prefixes the embed tokens
+        prefix_a = embed_key.replace("model.embed_tokens.weight", "")
+        prefix_b = embed_key.replace("embed_tokens.weight", "")
+        
+        if prefix_a:
+            sd[prefix_a + "lm_head.weight"] = sd[embed_key]
+        if prefix_b:
+            sd[prefix_b + "lm_head.weight"] = sd[embed_key]
+            
+    return sd
 
 def conv_state_dict(sd: dict) -> dict:
     if "x_embedder.weight" not in sd and "model.diffusion_model.x_embedder.weight" not in sd:
@@ -95,8 +117,7 @@ def conv_state_dict(sd: dict) -> dict:
         out_sd[new_key] = tensor
 
     return out_sd
-
-
+    
 _ZIMAGE_FUSED_SPLIT_MAP = {
     "attention.to_qkv": {"mapped_modules": ("attention.to_q", "attention.to_k", "attention.to_v")},
     "attention.qkv": {"mapped_modules": ("attention.to_q", "attention.to_k", "attention.to_v")},
@@ -190,14 +211,25 @@ class model_factory:
             text_encoder_path = os.path.dirname(text_encoder_filename)
         text_encoder_config = os.path.join(text_encoder_path, "config.json")
 
+        qwen3_preprocessor = _build_qwen3_state_dict_preprocessor(text_encoder_config)
+
+        def unified_preprocessor(sd, qm=None, twm=None):
+            if qwen3_preprocessor is not None:
+                sd, qm, twm = qwen3_preprocessor(sd, qm, twm)
+            sd = _fix_qwen_fp8_sd(sd)
+            return sd, qm, twm
+
         text_encoder = offload.fast_load_transformers_model(
             text_encoder_filename,
             writable_tensors=False,
             modelClass=Qwen3ForCausalLM,
             defaultConfigPath=text_encoder_config,
-            preprocess_sd=_build_qwen3_state_dict_preprocessor(text_encoder_config),
+            preprocess_sd=unified_preprocessor,
         )
 
+        # Resolve SDPA dtype mismatch for GGUF text encoders
+        text_encoder.to(dtype)
+        
         # Tokenizer
         tokenizer = AutoTokenizer.from_pretrained(text_encoder_path, trust_remote_code=True)
 

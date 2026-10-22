@@ -303,6 +303,12 @@ class ZImagePipeline(DiffusionPipeline, FromSingleFileMixin):
             )
             text_input_ids = text_inputs.input_ids.to(device)
             prompt_masks = text_inputs.attention_mask.to(device).bool()
+            prompt_embeds = self.text_encoder(input_ids=text_input_ids, attention_mask=prompt_masks, output_hidden_states=True).hidden_states[-2]
+            
+            # Strip the GGUF tensor subclass so torch.compile doesn't crash on Q8_0
+            if hasattr(prompt_embeds, "as_subclass"):
+                prompt_embeds = prompt_embeds.as_subclass(torch.Tensor)
+            
             with text_encoding_progress(self.text_encoder.model.layers, prompt_count=len(prompts)):
                 prompt_embeds = self.text_encoder(input_ids=text_input_ids, attention_mask=prompt_masks, output_hidden_states=True).hidden_states[-2]
             embeddings_list = []
