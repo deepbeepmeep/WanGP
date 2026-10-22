@@ -285,6 +285,7 @@ SYSTEM_PLUGINS = [
     "about",
 ]
 BUNDLED_PLUGINS = {
+    "agent_orchestrator",
     "downloads",
     "media_flow",
     "models_manager",
@@ -1689,6 +1690,9 @@ class WAN2GPApplication:
             migrate_bundled_plugin_ids(server_config, server_config_filename)
         if not safe_mode and not server_config.get("motion_designer_bundled_migrated", 0):
             server_config["enabled_plugins"] = server_config.get("enabled_plugins", []) + ([] if "motion_designer" in server_config.get("enabled_plugins", []) else ["motion_designer"]); server_config["motion_designer_bundled_migrated"] = 1
+            self.plugin_manager._save_server_config()
+        if not safe_mode and not server_config.get("agent_orchestrator_bundled_migrated", 0):
+            server_config["enabled_plugins"] = server_config.get("enabled_plugins", []) + ([] if "agent_orchestrator" in server_config.get("enabled_plugins", []) else ["agent_orchestrator"]); server_config["agent_orchestrator_bundled_migrated"] = 1
             self.plugin_manager._save_server_config()
         self.plugin_manager.cleanup_pending_deletions()
 
