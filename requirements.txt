@@ -20,7 +20,7 @@ tiktoken
 fugashi>=1.2.0
 unidic-lite>=1.0.0
 open_clip_torch>=2.29.0
-numpy==2.1.2
+numpy==1.26.4
 num2words==0.5.14
 
 # Video & media
