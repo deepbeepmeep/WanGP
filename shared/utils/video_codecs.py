@@ -5,6 +5,7 @@ SDR_VIDEO_CODEC_CHOICES = [
     ("x265 CRF 8 (High Quality)", "libx265_8"),
     ("x264 Level 10 (High Quality)", "libx264_10"),
     ("x264 Lossless", "libx264_lossless"),
+    ("x264 MJPEG", "libx264_mjpeg"),
     ("ProRes 422 (editing)", "prores_422"),
     ("DNxHR HQ (editing)", "dnxhr_hq"),
 ]
@@ -60,6 +61,9 @@ def _get_video_codec_spec(codec_key: str | None, container: str | None) -> tuple
         if container == "mkv":
             return "ffv1", "rgb24", []
         return "libx264", "yuv444p", ["-crf", "0"]
+    if codec_key == "libx264_mjpeg":
+        # Intra-frame-only x264 (every frame an IDR keyframe): an MJPEG-like lossy YUV 4:2:0 encode
+        return "libx264", "yuv420p", ["-crf", "10", "-x264-params", "keyint=1:minkeyint=1:scenecut=0"]
     if codec_key == "prores_422":
         return "prores_ks", "yuv422p10le", ["-profile:v", "2"]
     if codec_key == "prores_4444":
