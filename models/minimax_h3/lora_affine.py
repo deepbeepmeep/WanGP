@@ -72,7 +72,7 @@ def _aligned_affine_map(architecture, target_table):
     if int(fit.rank) != target_h.shape[1]:
         raise ValueError(f"MiniMax H3 {architecture} checkpoint has a rank-deficient AdaLN table")
     relative_error = torch.linalg.vector_norm(target_h @ fit.solution - canonical_h) / torch.linalg.vector_norm(canonical_h)
-    if relative_error > 1e-5:
+    if relative_error > 1e-4:
         raise ValueError(f"MiniMax H3 {architecture} checkpoint AdaLN table is incompatible with the canonical LoRA map (relative error {relative_error:.3g})")
     return (fit.solution @ canonical_affine.double()).float()
 

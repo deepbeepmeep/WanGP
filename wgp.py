@@ -14347,6 +14347,39 @@ def create_ui():
         if isinstance(plugin_js, str) and plugin_js.strip():
             js += f"\n{plugin_js}\n"
     js += """
+    (() => {
+        let timer = null;
+        function sync() {
+            const el = document.querySelector('#wangp_main_output_trigger textarea, #wangp_main_output_trigger input');
+            if (el) {
+                el.value = String(Date.now());
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+        }
+        function startSync() {
+            sync();
+            if (!timer) {
+                timer = setInterval(() => {
+                    const abortBtn = Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === 'Abort');
+                    if (abortBtn && abortBtn.offsetParent !== null) {
+                        sync();
+                    } else {
+                        clearInterval(timer);
+                        timer = null;
+                        setTimeout(sync, 500);
+                    }
+                }, 2000);
+            }
+        }
+        window.addEventListener('unhandledrejection', (e) => {
+            if (String(e.reason || '').includes('Connection errored out')) {
+                e.preventDefault();
+                startSync();
+            }
+        });
+        window.addEventListener('offline', startSync);
+        window.addEventListener('online', startSync);
+    })();
     }
     """
     if server_config.get("display_stats", 0) == 1:
