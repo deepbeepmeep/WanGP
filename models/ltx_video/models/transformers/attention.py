@@ -350,7 +350,7 @@ class BasicTransformerBlock(nn.Module):
             skip_layer_mask is not None
             and skip_layer_strategy == SkipLayerStrategy.TransformerBlock
         ):
-            skip_layer_mask = skip_layer_mask.view(-1, 1, 1)
+            skip_layer_mask = skip_layer_mask.view(-1, 1, 1).to(hidden_states.device)
             hidden_states = hidden_states * skip_layer_mask + original_hidden_states * (
                 1.0 - skip_layer_mask
             )
@@ -1014,7 +1014,11 @@ class AttnProcessor2_0:
         )
 
         if skip_layer_mask is not None:
-            skip_layer_mask = skip_layer_mask.reshape(batch_size, 1, 1)
+            # The mask is created on the transformer's device, which is cpu when
+            # mmgp offloading is active, so follow the activations' device here.
+            skip_layer_mask = skip_layer_mask.reshape(batch_size, 1, 1).to(
+                hidden_states.device
+            )
 
         if (attention_mask is not None) and (not attn.use_tpu_flash_attention):
             attention_mask = attn.prepare_attention_mask(
