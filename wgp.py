@@ -14754,6 +14754,20 @@ if __name__ == "__main__":
     server_port = int(args.server_port)
     if server_port == 0:
         server_port = int(os.getenv("SERVER_PORT", "7860"))
+    # The requested port can be squatted (e.g. a stale launcher proxy) — slide to
+    # the next free one instead of crashing; the launcher reads the real URL from
+    # the Gradio banner.
+    import socket as _socket
+    for _p in range(server_port, server_port + 50):
+        try:
+            with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as _s:
+                _s.bind(("127.0.0.1", _p))
+            if _p != server_port:
+                print(f"Port {server_port} is busy — using {_p} instead.")
+            server_port = _p
+            break
+        except OSError:
+            continue
     server_name = args.server_name
     if args.listen:
         server_name = "0.0.0.0"

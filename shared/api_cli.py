@@ -69,7 +69,7 @@ def run_cli_job(session, job: SessionJob, tasks: list[dict[str, Any]]) -> None:
                 if item is None:
                     if worker_done.is_set() and not worker_thread.is_alive():
                         break
-                    time.sleep(0.01)
+                    time.sleep(0.05)
                     continue
                 command, data = item
                 if command == "worker_exit":
@@ -203,6 +203,12 @@ def _handle_command(session, job: SessionJob, wgp, tasks: list[dict[str, Any]], 
         session._emit_callback("on_progress", progress, job=job)
         return
     if command == "preview":
+        callback = job._callbacks if job._callbacks is not None else session._callbacks
+        # Preview images are expensive to build; skip them entirely when the
+        # callbacks object consumes neither previews nor raw events. A session
+        # without callbacks keeps them so events-queue consumers still see them.
+        if callback is not None and not (hasattr(callback, "on_preview") or hasattr(callback, "on_event")):
+            return
         preview = session._build_preview_update(wgp, tasks, data)
         if preview is not None:
             job.events.put("preview", preview)
