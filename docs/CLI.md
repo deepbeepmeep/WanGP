@@ -471,6 +471,48 @@ python wgp.py --lora-preset anime_style.lset
 python wgp.py --loras /shared/loras --lora-preset mystyle.lset
 ```
 
+## Console Guard (`--console-guard`)
+
+WanGP hands the terminal back the way it received it. It starts helper programs -- ffmpeg, ffprobe,
+the TTS and other native runtimes -- and they inherit the terminal, keyboard included. A tool that
+reads the keyboard switches echo, line editing and Ctrl+C off on that shared terminal; WanGP's
+children live in their own process groups, so a Ctrl+C never reaches them and they are killed without
+a chance to clean up, leaving the terminal in that state. The shell prompt stops answering, typed keys
+make no sound, and `reset` is the only way back.
+
+The guard takes the terminal settings at startup and writes them back when the run ends: at exit, on
+Ctrl+C and SIGTERM, and from the app's own Save and Quit / Restart paths. A terminal that arrives
+broken -- an earlier run left it raw -- is repaired at startup, so WanGP starts on a console that can
+be typed in. The guard is on by default, and a healthy run never notices it: no line is printed,
+nothing is written, and no key is ever sent. There is nothing to guard when the output is a pipe, a
+file, or the MCP server over stdio, and `--console-guard=off` leaves the terminal untouched.
+
+The same rule is applied to the children themselves: the ffmpeg and ffprobe launches WanGP makes now
+start with their standard input closed and in a process group of their own -- ffmpeg's own
+documentation prescribes `-nostdin` / `< /dev/null` for exactly this, and imageio-ffmpeg, which drives
+the video writing, does the same. The launches that pipe data (raw frames to ffmpeg, the DLSS runtime)
+keep their pipes.
+
+```bash
+# The default: the terminal is restored when the run ends, repaired if it arrives broken
+python wgp.py --process my_queue.zip
+
+# Leave the terminal alone (a wrapper that manages the terminal itself)
+python wgp.py --process my_queue.zip --console-guard=off
+
+# Log the terminal settings at the start and at the end, to see what changed them
+WAN2GP_CONSOLE_GUARD_LOG=1 python wgp.py --process my_queue.zip
+```
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--console-guard` (`on` / `off`) | on | Put the terminal back the way WanGP found it at exit, on Ctrl+C and SIGTERM, on Save and Quit and on Restart; repair a terminal left unusable. `off` leaves the terminal untouched |
+
+On Windows the same rule uses the console mode (`GetConsoleMode` / `SetConsoleMode`) instead of the
+terminal settings.
+
+
+
 ## Environment Variables
 
 While not command line options, these environment variables can affect behavior:
@@ -479,6 +521,8 @@ While not command line options, these environment variables can affect behavior:
 - `TRITON_CACHE_DIR` - Triton cache directory (for Sage attention) 
 - `WAN2GP_DEEPY_TELEMETRY=1` - Enable detailed Deepy decode, MTP, CUDA-memory, and GPU telemetry when verbose level 2 is active (disabled by default)
 - `WAN2GP_FFMPEG_TIMEOUT` - Timeout in seconds when finalizing ffmpeg containers or merging continuation segments in Media Flow (default: `300.0`)
+- `WAN2GP_CONSOLE_GUARD=0` - Turn the console guard off in every mode (the default is on: the terminal is put back the way WanGP found it); the per-run `--console-guard=on|off` decides one run
+- `WAN2GP_CONSOLE_GUARD_LOG=1` - Report the terminal settings at the start and, when they had been changed, at the end of the run: the way to see which helper program took the terminal over
 
 ---
 

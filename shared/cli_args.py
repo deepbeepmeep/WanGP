@@ -13,6 +13,15 @@ def _arg_provided(argv: Sequence[str], name: str) -> bool:
     return any(one_arg == name or str(one_arg).startswith(f"{name}=") for one_arg in argv)
 
 
+def _arg_on_off(raw: str) -> bool:
+    value = str(raw).strip().lower()
+    if value in ("on", "yes", "true", "1"):
+        return True
+    if value in ("off", "no", "false", "0"):
+        return False
+    raise argparse.ArgumentTypeError(f"expected on, off, yes or no, got {raw!r}")
+
+
 def parse_wgp_args(config_filename: str, argv: Sequence[str] | None = None):
     from shared.deepy.config import normalize_deepy_voice_language
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -40,6 +49,12 @@ def parse_wgp_args(config_filename: str, argv: Sequence[str] | None = None):
     add("--config", type=str, default="", help=f"Path to config folder for {config_filename} and queue.zip")
     add("--profile", type=str, default=-1, help="Profile No")
     add("--verbose", type=str, default=1, help="Verbose level")
+    add("--console-guard", dest="console_guard", type=_arg_on_off, nargs="?", const=True, default=True, metavar="on|off",
+        help="Put the terminal back the way WanGP found it when the run ends: exit, Ctrl+C, SIGTERM, quit and restart. "
+             "Default: on - a healthy run never notices it, and a terminal a helper program left unusable (echo and "
+             "Ctrl+C off) is repaired at startup and restored at the end. 'off' leaves the terminal untouched. "
+             "Nothing is done when the output is a pipe or a file. WAN2GP_CONSOLE_GUARD=0 sets the default to off, "
+             "WAN2GP_CONSOLE_GUARD_LOG=1 logs the terminal settings at the start and at the end")
     add("--debug-deepy", type=str, default=None, help="Enable Deepy verbose debug logging and write it to the given folder")
     add("--deepy-sessions-dir", type=str, default="", metavar="FOLDER", help="Store persistent Deepy sessions in FOLDER (default: ./deepy_sessions)")
     add("--workspaces-dir", type=str, default="", metavar="FOLDER", help="Workspace manifests and dedicated media folders (overrides Configuration / Outputs; default: ./workspaces)")

@@ -12,6 +12,7 @@ import numpy as np
 from PIL import Image, ImageOps
 
 from shared.utils.plugins import WAN2GPPlugin
+from shared.utils.subprocess_stdin import child_kwargs
 
 
 class MotionDesignerPlugin(WAN2GPPlugin):
@@ -427,7 +428,7 @@ class MotionDesignerPlugin(WAN2GPPlugin):
             str(video_path),
         ]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False, **child_kwargs())
             output = (result.stdout or "").strip().splitlines()
             # Expected output: nb_read_frames, nb_frames, avg_frame_rate, r_frame_rate (all may be present)
             frame_count = None

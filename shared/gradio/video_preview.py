@@ -15,6 +15,7 @@ import gradio as gr
 from gradio.data_classes import FileData
 
 from shared.utils.video_decode import _build_hdr_tonemap_filter, probe_video_stream_metadata, resolve_media_binary
+from shared.utils.subprocess_stdin import child_kwargs
 
 
 _BROWSER_VIDEO_EXTENSIONS = {".mp4", ".webm", ".ogg", ".ogv"}
@@ -243,7 +244,7 @@ def ensure_fast_video_preview(video_path, cache_dir=None):
             _remember_preview(source_path, preview_path)
             return str(preview_path)
         try:
-            result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False)
+            result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False, **child_kwargs())
         except OSError:
             result = None
         if result is None or result.returncode != 0 or not tmp_path.is_file():

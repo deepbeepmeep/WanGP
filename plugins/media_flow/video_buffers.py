@@ -13,6 +13,7 @@ from shared.utils.hdr import iter_hdr_gbrpf32_frames, tonemap_hdr_tensor_to_uint
 from shared.utils.utils import get_video_info_details
 from shared.utils.video_decode import decode_video_frames_ffmpeg, resolve_media_binary
 from shared.utils.virtual_media import build_virtual_media_path, clear_virtual_media_source, get_virtual_video, store_virtual_video
+from shared.utils.subprocess_stdin import child_kwargs
 
 PROCESS_FULL_VIDEO_VSOURCE = "process_full_video"
 PROCESS_FULL_VIDEO_VFILE = "last_frames.mp4"
@@ -82,7 +83,7 @@ def _extract_exact_frame_image(video_path: str, frame_no: int) -> Image.Image:
     with tempfile.TemporaryDirectory(prefix="wangp_tail_frame_") as temp_dir:
         output_path = os.path.join(temp_dir, "frame.png")
         command = [ffmpeg_path, "-v", "error", "-y", "-i", video_path, "-an", "-sn", "-vf", f"select=eq(n\\,{int(frame_no)})", "-frames:v", "1", output_path]
-        result = subprocess.run(command, capture_output=True, text=True)
+        result = subprocess.run(command, capture_output=True, text=True, **child_kwargs())
         if result.returncode != 0 or not os.path.isfile(output_path):
             raise gr.Error(f"Unable to decode frame {frame_no} from {video_path}")
         with Image.open(output_path) as frame_image:

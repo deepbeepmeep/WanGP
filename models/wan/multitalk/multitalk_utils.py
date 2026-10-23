@@ -17,6 +17,7 @@ import binascii
 import os.path as osp
 from skimage import color
 from mmgp.offload import get_cache, clear_caches
+from shared.utils.subprocess_stdin import child_kwargs
 
 VID_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv")
 ASPECT_RATIO_627 = {
@@ -297,7 +298,7 @@ def save_video_ffmpeg(gen_video_samples, save_path, vocal_audio_list, fps=25, qu
         f'{duration}',
         save_path_crop_audio,
     ]
-    subprocess.run(final_command, check=True)
+    subprocess.run(final_command, check=True, **child_kwargs())
 
     save_path = save_path + ".mp4"
     if high_quality_save:
@@ -313,7 +314,7 @@ def save_video_ffmpeg(gen_video_samples, save_path, vocal_audio_list, fps=25, qu
             "-shortest",
             save_path,
         ]
-        subprocess.run(final_command, check=True)
+        subprocess.run(final_command, check=True, **child_kwargs())
         os.remove(save_path_tmp)
         os.remove(save_path_crop_audio)
     else:
@@ -331,7 +332,7 @@ def save_video_ffmpeg(gen_video_samples, save_path, vocal_audio_list, fps=25, qu
             "-shortest",
             save_path,
         ]
-        subprocess.run(final_command, check=True)
+        subprocess.run(final_command, check=True, **child_kwargs())
         os.remove(save_path_tmp)
         os.remove(save_path_crop_audio)
 

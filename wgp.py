@@ -26,6 +26,18 @@ if os.name == "nt":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 if sys.platform.startswith("linux") and "NUMBA_THREADING_LAYER" not in os.environ:
     os.environ["NUMBA_THREADING_LAYER"] = "workqueue"
+
+# Console guard: remember how the terminal is set, and put it back when WanGP ends. WanGP's helper
+# programs (ffmpeg, ffprobe, the TTS and native runtimes) inherit the terminal, and a tool that reads
+# the keyboard switches echo, line editing and Ctrl+C off on it; WanGP's children live in their own
+# process groups, so an interrupt never reaches them and they are killed without cleanup, leaving the
+# terminal broken for the shell that comes after ('reset' being the only way back). The guard takes
+# the settings at startup -- repairing a terminal left broken by an earlier run -- and writes them back
+# at exit, on Ctrl+C and SIGTERM, and from the app's own quit / restart paths. Nothing is touched when
+# the output is a pipe or a file; --console-guard=off (WAN2GP_CONSOLE_GUARD=0) turns it off.
+from shared.utils import console_guard as _console_guard
+_console_guard.install_console_guard(sys.argv)
+
 from shared.asyncio_utils import silence_proactor_connection_reset
 silence_proactor_connection_reset()
 
@@ -2388,6 +2400,7 @@ def quit_application():
     print("Save and Quit requested...")
     clear_startup_lock()
     autosave_queue()
+    _console_guard.restore_console()    # the terminal goes back to the user before the interrupt
     import signal
     os.kill(os.getpid(), signal.SIGINT)
 
@@ -2398,6 +2411,7 @@ def restart_application():
     import sys
     sys.stdout.flush()
     sys.stderr.flush()
+    _console_guard.restore_console()    # os._exit skips the exit handlers: restore here
     os._exit(42)
 
 def start_quit_process():
@@ -2629,6 +2643,7 @@ attention_modes_supported = get_supported_attention_modes()
 override_attention_modes_installed = get_override_attention_modes()
 override_attention_modes_supported = get_supported_override_attention_modes()
 args = parse_wgp_args(CONFIG_FILENAME)
+_console_guard.configure_console_guard(args, sys.argv)
 migrate_loras_layout()
 
 gpu_major, gpu_minor = torch.cuda.get_device_capability(args.gpu if len(args.gpu) > 0 else None)
