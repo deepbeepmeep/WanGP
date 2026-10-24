@@ -44,6 +44,7 @@ tmp/
 deepy_sessions/
 /ComputeCache/
 /dlss5/
+scripts/dlssg_worker_linux/.cache/
 /settings/
 /user_skills/
 /envs.json
