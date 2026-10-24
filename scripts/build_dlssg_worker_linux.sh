@@ -14,9 +14,11 @@
 # official KhronosGroup/Vulkan-Headers repository into scripts/
 # dlssg_worker_linux/.cache (matching the installed loader's major series).
 #
-# Output: dlss5/dlssg/dlssg-worker (this is the binary WanGP's runtime
-# probes and spawns). The worker links the NGX runtime next to it via
-# rpath $ORIGIN, so it must stay in dlss5/dlssg/.
+# Output: dlss5/dlssg-native/dlssg-worker (this is the binary WanGP's runtime
+# probes and spawns for the native Linux variant). The worker links the NGX
+# runtime from its own directory, so the runtime is symlinked alongside it;
+# dlss5/dlssg keeps the upstream x2 layout untouched so both variants can be
+# installed at the same time and selected per generation (see docs/DLSS5.md).
 set -euo pipefail
 
 native="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,7 +27,8 @@ sdk_include="${root}/dlss5/sdk/include"
 sdk_lib="${root}/dlss5/sdk/lib"
 core_lib="${sdk_lib}/libnvsdk_ngx.a"
 dlssg_dir="${root}/dlss5/dlssg"
-output="${dlssg_dir}/dlssg-worker"
+native_dir="${root}/dlss5/dlssg-native"
+output="${native_dir}/dlssg-worker"
 source="${native}/dlssg_worker_linux/dlssg_worker_linux.cpp"
 
 fail() { echo "error: $*" >&2; exit 1; }
@@ -38,10 +41,15 @@ command -v g++ >/dev/null 2>&1 || fail "g++ not found; install a C++17 toolchain
 
 runtime_so="$(ls "${dlssg_dir}"/libnvidia-ngx-dlssg.so.* 2>/dev/null | sort -V | tail -n 1 || true)"
 [ -n "${runtime_so}" ] || fail "NGX DLSSG runtime not found in ${dlssg_dir}; run 'python scripts/install_dlss5.py' first"
-# The feature runtime is dlopen'd by the NGX core at load time (via the
-# worker's directory as PathListInfo); an unversioned symlink alongside the
-# versioned .so makes that lookup robust.
+# The feature runtime is dlopen'd by the NGX core at load time, from the
+# directory that holds the worker (see WorkerDir() in
+# scripts/dlssg_worker_linux/dlssg_worker_linux.cpp), so the versioned .so is
+# linked into the native directory; an unversioned symlink alongside it makes
+# that lookup robust.
+mkdir -p "${native_dir}"
 ln -sf "$(basename "${runtime_so}")" "${dlssg_dir}/libnvidia-ngx-dlssg.so"
+ln -sf "../dlssg/$(basename "${runtime_so}")" "${native_dir}/$(basename "${runtime_so}")"
+ln -sf "$(basename "${runtime_so}")" "${native_dir}/libnvidia-ngx-dlssg.so"
 
 # --- Vulkan headers -------------------------------------------------------
 vk_include=""
