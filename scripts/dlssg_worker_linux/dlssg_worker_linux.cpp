@@ -569,13 +569,22 @@ private:
 
     // Chooses the physical device: an explicit --gpu index wins; otherwise
     // the first NVIDIA discrete GPU is preferred, then any other NVIDIA
-    // device, then any non-CPU GPU. Every device is logged so a wrong pick
-    // shows up in the worker's stderr output.
+    // device, then any non-CPU GPU. Every device is logged, whether the index
+    // was given or picked, so a wrong pick shows up in the worker's stderr
+    // output and so WanGP can map each GPU name to its index: that is how it
+    // pins this worker to the GPU WanGP runs on, which Vulkan ignores.
     bool SelectPhysicalDevice(int gpu_index) {
         uint32_t count = 0;
         if (vkEnumeratePhysicalDevices(instance_, &count, nullptr) != VK_SUCCESS || count == 0) return false;
         std::vector<VkPhysicalDevice> devices(count);
         if (vkEnumeratePhysicalDevices(instance_, &count, devices.data()) != VK_SUCCESS) return false;
+
+        for (size_t index = 0; index < devices.size(); ++index) {
+            VkPhysicalDeviceProperties props = {};
+            vkGetPhysicalDeviceProperties(devices[index], &props);
+            Log("Device %zu: %s (%s, vendor 0x%04X)", index, props.deviceName,
+                PhysicalDeviceTypeName(props.deviceType), static_cast<unsigned>(props.vendorID));
+        }
 
         VkPhysicalDevice chosen = VK_NULL_HANDLE;
         if (gpu_index >= 0 && gpu_index < static_cast<int>(devices.size())) { // an explicit --gpu index is trusted as-is
@@ -584,8 +593,6 @@ private:
             for (size_t index = 0; index < devices.size(); ++index) {
                 VkPhysicalDeviceProperties props = {};
                 vkGetPhysicalDeviceProperties(devices[index], &props);
-                Log("Device %zu: %s (%s, vendor 0x%04X)", index, props.deviceName,
-                    PhysicalDeviceTypeName(props.deviceType), static_cast<unsigned>(props.vendorID));
                 if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) continue; // skip software ICDs (llvmpipe & co)
                 if (props.vendorID == NVIDIA_VENDOR_ID && props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) { // best case: a discrete NVIDIA GPU
                     chosen = devices[index];
@@ -1095,12 +1102,12 @@ private:
 // unavailability reason.
 int Probe(Worker &worker, bool initialized) {
     if (!initialized) { // a failed init still gets a structured JSON report
-        printf("{\"available\":false,\"multi_frame_count_max\":%u,\"runtime_version\":\"%s\",\"worker_version\":\"2\",\"detail\":\"Vulkan/NGX initialization failed; see stderr for diagnostics.\"}\n",
-            worker.maximum(), worker.runtime_version().c_str());
+        printf("{\"available\":false,\"multi_frame_count_max\":%u,\"runtime_version\":\"%s\",\"worker_version\":\"2\",\"gpu\":\"%s\",\"detail\":\"Vulkan/NGX initialization failed; see stderr for diagnostics.\"}\n",
+            worker.maximum(), worker.runtime_version().c_str(), worker.device_name().c_str());
         return 2;
     }
-    printf("{\"available\":%s,\"multi_frame_count_max\":%u,\"runtime_version\":\"%s\",\"worker_version\":\"2\",\"detail\":\"Open Vulkan NGX capability query completed on %s.\"}\n",
-        worker.available() ? "true" : "false", worker.maximum(), worker.runtime_version().c_str(), worker.device_name().c_str());
+    printf("{\"available\":%s,\"multi_frame_count_max\":%u,\"runtime_version\":\"%s\",\"worker_version\":\"2\",\"gpu\":\"%s\",\"detail\":\"Open Vulkan NGX capability query completed on %s.\"}\n",
+        worker.available() ? "true" : "false", worker.maximum(), worker.runtime_version().c_str(), worker.device_name().c_str(), worker.device_name().c_str());
     return worker.available() ? 0 : 2; // 0: frame generation usable, 2: unavailable
 }
 

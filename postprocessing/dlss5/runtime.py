@@ -186,16 +186,91 @@ def _missing(files: tuple[Path, ...]) -> list[Path]:
     return [path for path in files if not path.is_file()]
 
 
-@lru_cache(maxsize=None)
+_DLSSG_PROBES: dict[tuple[str, int], dict] = {}
+_DLSSG_PROBE_GPUS: dict[str, tuple[tuple[int, str], ...]] = {}
+_DLSSG_GPU_PINS: dict[str, int | None] = {}
+
+
+def _run_probe(variant: DlssgVariant, gpu_index: int) -> dict:
+    """One --probe run, remembered per GPU it was pinned to.
+
+    Unpinned, the worker prints "Device <i>: <name> ..." for every Vulkan GPU it
+    sees before picking one. That listing is what lets WanGP pin the worker to
+    the GPU WanGP runs on, because the Vulkan ICD ignores CUDA_VISIBLE_DEVICES.
+    """
+    key = (variant.method, gpu_index)
+    if key in _DLSSG_PROBES:
+        return _DLSSG_PROBES[key]
+    capabilities: dict = {}
+    devices: tuple[tuple[int, str], ...] = ()
+    if not _missing(variant.files) and (os.name == "nt" or DLSSG_LINUX):
+        command = [str(variant.worker), "--probe"] + (["--gpu", str(gpu_index)] if gpu_index >= 0 else [])
+        try:
+            result = subprocess.run(command, cwd=str(variant.dir), capture_output=True, text=True, timeout=15, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            parsed = json.loads(result.stdout.strip())
+            capabilities = parsed if isinstance(parsed, dict) and "available" in parsed else {}
+            if gpu_index < 0:
+                devices = tuple((int(index), name) for index, name in re.findall(r"^Device (\d+): (.+?) \(", result.stderr, re.MULTILINE))
+        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+            capabilities = {}
+    _DLSSG_PROBE_GPUS[variant.method] = devices or _DLSSG_PROBE_GPUS.get(variant.method, ())
+    _DLSSG_PROBES[key] = capabilities
+    return capabilities
+
+
+def _probe_gpu_name(capabilities: dict) -> str:
+    """The GPU the probe used, read out of its own report."""
+    gpu = str(capabilities.get("gpu", "") or "").strip()
+    if gpu:
+        return gpu
+    match = re.search(r"completed on (.+?)\.?$", str(capabilities.get("detail", "") or ""))
+    return match.group(1).strip() if match else ""
+
+
+def _pin_worker_gpu(variant: DlssgVariant, report: dict) -> int | None:
+    """The --gpu index putting the worker on WanGP's GPU, when there is one to pin.
+
+    None when the worker already chose that GPU, when WanGP is not restricted to
+    a GPU nvidia-smi can name, or when the worker's listing does not contain it.
+    """
+    if variant.method in _DLSSG_GPU_PINS:
+        return _DLSSG_GPU_PINS[variant.method]
+    wanted = _selected_gpu_names()[:1]
+    used = _probe_gpu_name(report)
+    pin = None
+    if wanted and used and used != wanted[0]:
+        for index, name in _DLSSG_PROBE_GPUS.get(variant.method, ()):
+            if name == wanted[0]:
+                pin = index
+                break
+    _DLSSG_GPU_PINS[variant.method] = pin
+    return pin
+
+
 def dlssg_capabilities(variant: DlssgVariant = DLSSG_UPSTREAM) -> dict:
-    if _missing(variant.files) or (os.name != "nt" and not DLSSG_LINUX):
+    """What the worker reports on the GPU WanGP runs on, not on the one it picks."""
+    report = _run_probe(variant, -1)
+    if not report:
         return {}
-    try:
-        result = subprocess.run([str(variant.worker), "--probe"], cwd=str(variant.dir), capture_output=True, text=True, timeout=15, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        capabilities = json.loads(result.stdout.strip())
-        return capabilities if isinstance(capabilities, dict) and "available" in capabilities else {}
-    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
-        return {}
+    pin = _pin_worker_gpu(variant, report)
+    return (_run_probe(variant, pin) or report) if pin is not None else report
+
+
+def dlssg_gpu_args(variant: DlssgVariant = DLSSG_UPSTREAM) -> list[str]:
+    """The worker arguments pinning it to the GPU WanGP runs on."""
+    pin = _pin_worker_gpu(variant, _run_probe(variant, -1))
+    return [] if pin is None else ["--gpu", str(pin)]
+
+
+def dlssg_gpu_note(variant: DlssgVariant = DLSSG_UPSTREAM) -> str:
+    """The GPU Frame Generation runs on, for the log line; empty when unknown."""
+    pin = _pin_worker_gpu(variant, _run_probe(variant, -1))
+    if pin is None:
+        return _probe_gpu_name(dlssg_capabilities(variant))
+    for index, name in _DLSSG_PROBE_GPUS.get(variant.method, ()):
+        if index == pin:
+            return f"{name} (GPU {index})"
+    return ""
 
 
 def _worker_version(variant: DlssgVariant) -> int:
@@ -244,37 +319,87 @@ def dlssg_variants() -> tuple[DlssgVariant, ...]:
     return (DLSSG_UPSTREAM,) + ((native,) if native is not None else ())
 
 
+def _visible_cuda_devices() -> list[str] | None:
+    """The GPUs WanGP may use, as CUDA_VISIBLE_DEVICES lists them (indices or UUIDs).
+
+    None when the variable is unset, meaning every GPU of the host is fair game.
+    WanGP pins a GPU with --default-device-id, which ends up here, so a multi-GPU
+    host has one GPU to tier Frame Generation on.
+    """
+    raw = str(os.environ.get("CUDA_VISIBLE_DEVICES", "")).strip()
+    if not raw:
+        return None
+    return [token.strip() for token in raw.split(",") if token.strip()]
+
+
+def _nvidia_smi_gpus(nvidia_smi: str) -> tuple[tuple[str, str, str], ...]:
+    """(index, uuid, name) of every GPU nvidia-smi lists; () when it cannot answer."""
+    try:
+        result = subprocess.run([nvidia_smi, "--query-gpu=index,uuid,name", "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.TimeoutExpired):
+        return ()
+    rows = []
+    for line in result.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",", 2)]
+        if len(parts) == 3 and parts[0].isdigit():
+            rows.append((parts[0], parts[1], parts[2]))
+    return tuple(rows)
+
+
+def _selected_gpu_names() -> list[str]:
+    """The GPUs WanGP can run on, in CUDA_VISIBLE_DEVICES order; the first is the one it uses.
+
+    Empty when the host cannot be queried, which leaves the tiering at 0.
+    """
+    rows = _nvidia_smi_gpus("/usr/lib/wsl/lib/nvidia-smi" if NR_WSL else "nvidia-smi")
+    if not rows:
+        return []
+    names = [name for _index, _uuid, name in rows]
+    visible = _visible_cuda_devices()
+    if visible is None:
+        return names
+    by_token = {index: name for index, _uuid, name in rows}
+    by_token.update({uuid: name for _index, uuid, name in rows})
+    chosen = [by_token[token] for token in visible if token in by_token]
+    return chosen or names
+
+
+def _gpu_tier(name: str) -> int:
+    """The RTX series of one GPU name; 50 is what unlocks x5/x6, 0 means unknown."""
+    match = re.search(r"GeForce\s+RTX\s+(\d{2})\d{2}", name, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    # Workstation / datacenter cards carry no GeForce tag (e.g. RTX PRO
+    # 5000 Blackwell, RTX 5000 Ada, RTX A6000, L40S), so the GeForce-only
+    # match above reads them as series 0 and they falsely report
+    # "RTX 30+/40+ required". Tier them by architecture instead; GeForce
+    # behavior is unchanged.
+    up = name.upper()
+    if any(key in up for key in ("PRO 6000", "PRO 5000", "PRO 4000", "B100", "B200", "GB100", "H100", "H200")):
+        return 50
+    if "ADA" in up or "L40" in up or " L4" in up:
+        return 40
+    if "RTX A" in up or any(key in up for key in (" A40", " A30", " A16", " A10", " A80")):
+        return 30
+    if "QUADRO" in up:
+        return 20
+    match = re.search(r"RTX\D*?(\d{2})\d{2}", up)
+    return int(match.group(1)) if match else 0
+
+
 @lru_cache(maxsize=None)
 def _gpu_series(variant: DlssgVariant = DLSSG_UPSTREAM) -> int:
     # nvidia-smi is available on Windows, Linux and WSL; the query is a no-op on
-    # hosts without an NVIDIA GPU (regex finds no series). Upstream tiers only
+    # hosts without an NVIDIA GPU (no series found). Upstream tiers only
     # Windows / WSL hosts: the native Linux variant tiers its GPU as well.
     if os.name != "nt" and not NR_WSL and not variant.native_linux:
         return 0
-    try:
-        result = subprocess.run(["/usr/lib/wsl/lib/nvidia-smi" if NR_WSL else "nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], capture_output=True, text=True, timeout=5, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    except (OSError, subprocess.TimeoutExpired):
-        return 0
-    series = [int(match.group(1)) for match in re.finditer(r"GeForce\s+RTX\s+(\d{2})\d{2}", result.stdout, re.IGNORECASE)]
-    if not series:
-        # Workstation / datacenter cards carry no GeForce tag (e.g. RTX PRO
-        # 5000 Blackwell, RTX 5000 Ada, RTX A6000, L40S), so the GeForce-only
-        # match above reads them as series 0 and they falsely report
-        # "RTX 30+/40+ required". Tier them by architecture instead; GeForce
-        # behavior is unchanged.
-        up = result.stdout.upper()
-        if any(k in up for k in ("PRO 6000", "PRO 5000", "PRO 4000", "B100", "B200", "GB100", "H100", "H200")):
-            return 50
-        if "ADA" in up or "L40" in up or " L4" in up:
-            return 40
-        if "RTX A" in up or any(k in up for k in (" A40", " A30", " A16", " A10", " A80")):
-            return 30
-        if "QUADRO" in up:
-            return 20
-        match = re.search(r"RTX\D*?(\d{2})\d{2}", up)
-        if match:
-            return int(match.group(1))
-    return max(series, default=0)
+    # Frame Generation runs on the GPU WanGP runs on, so the ceiling is the
+    # weakest GPU WanGP may pick: a 5090 + 3090 host pinned to the 3090 tops out
+    # at x4, and a host pinning nothing is capped by its oldest card, because
+    # WanGP is free to run the job on that one.
+    tiers = [tier for tier in (_gpu_tier(name) for name in _selected_gpu_names()) if tier]
+    return min(tiers, default=0)
 
 
 def is_rtx_50_series(variant: DlssgVariant = DLSSG_UPSTREAM) -> bool:
@@ -700,7 +825,7 @@ class FrameGenerationSession(Worker):
     FRAME_OUT_MAGIC = 0x314F4746
 
     def __init__(self, width: int, height: int, frames: int, generated_count: int, variant: DlssgVariant = DLSSG_UPSTREAM):
-        super().__init__([str(variant.worker), "--serve"], variant.dir)
+        super().__init__([str(variant.worker), "--serve", *dlssg_gpu_args(variant)], variant.dir)
         self.width, self.height = width, height
         self.generated_count = generated_count
         assert self.process.stdin is not None and self.process.stdout is not None
@@ -734,7 +859,8 @@ class FrameGenerationSession(Worker):
 def _interpolate(frame_count: int, width: int, height: int, frame_getter, fps: float, scale: int, motion_vector: str, abort_callback=None, progress_callback=None, variant: DlssgVariant = DLSSG_UPSTREAM) -> np.ndarray | None:
     generated_count = scale - 1
     session = FrameGenerationSession(width, height, frame_count, generated_count, variant)
-    print(f"[DLSS 5] Frame Generation: {frame_count} input frames at {width}x{height}, x{scale} ({generated_count} generated frame(s) per pair) using {variant.worker.name} from {variant.dir.name}")
+    gpu_note = dlssg_gpu_note(variant)
+    print(f"[DLSS 5] Frame Generation: {frame_count} input frames at {width}x{height}, x{scale} ({generated_count} generated frame(s) per pair) using {variant.worker.name} from {variant.dir.name}" + (f" on {gpu_note}" if gpu_note else ""))
     start = time.perf_counter()
     completed = False
     try:
