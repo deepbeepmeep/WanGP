@@ -51,6 +51,7 @@ def apply_mps_patch():
             _torch.cuda._device_props_cache = self
         multi_processor_count = 0
         warp_size = 32
+        L2_cache_size = 32 << 20  # read by shared/kernels to size MLP chunks; no CUDA L2 on MPS
 
     class _DummyEvent:
         def __init__(self, *a, **kw): pass
@@ -108,7 +109,7 @@ def apply_mps_patch():
     _cuda.is_available = lambda: False
     _cuda._is_compiled = lambda: False
     _cuda.empty_cache = _torch.mps.empty_cache
-    _cuda.synchronize = _torch.mps.synchronize
+    _cuda.synchronize = lambda device=None: _torch.mps.synchronize()  # CUDA's takes a device, MPS's takes none
     _cuda.get_device_capability = lambda device=None: dev_cap
     _cuda.manual_seed_all = lambda seed: None
     _cuda.manual_seed = lambda device_or_seed, seed=None: None
@@ -121,6 +122,13 @@ def apply_mps_patch():
     _cuda.device_count = lambda: 1
     _cuda.ipc_collect = lambda: None
     _cuda.device = _DummyDeviceContext
+    # mmgp/pinned.py locks RAM with cudaHostRegister; Apple Silicon memory is unified, so plain RAM needs no locking
+    _dummy_cudart = types.SimpleNamespace(
+        cudaHostRegister=lambda *a, **kw: 0,
+        cudaHostUnregister=lambda *a, **kw: 0,
+        cudaGetErrorString=lambda error: f"CUDA error {error} (MPS)",
+    )
+    _cuda.cudart = lambda: _dummy_cudart
 
     class _PatchedStream:
         priority = 0
