@@ -6116,7 +6116,7 @@ def {fname}(module, *args, **kwargs):
             if preload_total == 0:
                 print(f"Async loading plan for model '{model_id}' : base size of {(preload_total+base_size)/ONE_MB:0.2f} MB will be preloaded with a {max_blocks_fetch/ONE_MB:0.2f} MB async" + (" circular" if len(towers) == 1 else "") + f" shuttle, prefetch window {window}")
             else:
-                print(f"Async loading plan for model '{model_id}' : {(preload_total+base_size)/ONE_MB:0.2f} MB will be preloaded (base size of {base_size/ONE_MB:0.2f} MB + {towers_total/total_size*100:0.1f}% of recurrent layers data" + (f" + {others_total/ONE_MB:0.2f} MB of other blocks" if others_total else "") + f") with a {max_blocks_fetch/ONE_MB:0.2f} MB async" + (" circular" if len(towers) == 1 else "") + f" shuttle, prefetch window {window}")
+                print(f"Async loading plan for model '{model_id}' : {(preload_total+base_size)/ONE_MB:0.2f} MB will be preloaded (base size of {base_size/ONE_MB:0.2f} MB + {towers_total/total_size*100 if total_size > 0 else 0.0:0.1f}% of recurrent layers data" + (f" + {others_total/ONE_MB:0.2f} MB of other blocks" if others_total else "") + f") with a {max_blocks_fetch/ONE_MB:0.2f} MB async" + (" circular" if len(towers) == 1 else "") + f" shuttle, prefetch window {window}")
 
     def release(self):
         global last_offload_obj
