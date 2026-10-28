@@ -37,6 +37,7 @@ WanGP is a one-stop super app for the best open source generative models across 
 - **Per-model prompt enhancer**: improve prompts with model-specific syntax and expectations.
 - **Input preparation tools**: use the mask editor, background remover, pose/depth/flow extractors, speaker diarization, and background noise/song remover.
 - **Deepy low-VRAM offline agent**: orchestrate generation jobs and tedious tasks such as transcription, video splitting, and color-frame generation while you are away.
+- **AI Agent Orchestrator**: route high-level tasks to specialized agents, track their status, and expose explicit task tools for the existing Deepy/plugin system. See [docs/AGENT_ORCHESTRATOR.md](docs/AGENT_ORCHESTRATOR.md).
 - **Temporal and spatial upsampling**: improve outputs with RIFE, FlashVSR, and Lanczos.
 - **Audio postprocessing**: generate soundtracks with MMAudio, replace voices with SeedVC, or remux a video with any soundtrack.
 - **Ready-to-use plug-ins**: Gallery Browser, Motion Designer, Models/Checkpoints Manager, CivitAI browser and downloader, and more.

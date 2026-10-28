@@ -51,6 +51,7 @@ PLUGIN_ID_MIGRATIONS = {
 }
 PROTECTED_PLUGIN_IDS = {
     "about",
+    "agent_orchestrator",
     "configuration",
     "downloads",
     "guides",
