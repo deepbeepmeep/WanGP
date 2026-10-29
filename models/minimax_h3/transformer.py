@@ -691,11 +691,13 @@ class MiniMaxH3Model(nn.Module):
 
     def _layout(self, text_tags, latent_t, latent_h, latent_w, audio_t, payload):
         target_spatial_context = payload.get("target_spatial_context")
+        target_video_condition_anchor = payload.get("target_video_condition_anchor", "tail")
         signature = (text_tags.numel(), latent_t, latent_h, latent_w, audio_t,
                      payload["fps"], payload.get("audio_time_offset", 0.0),
                      target_spatial_context,
                      payload.get("target_audio_condition_latents", 0),
                      payload.get("target_video_condition_frames", 0),
+                     target_video_condition_anchor,
                      tuple((k["anchor"], k["latent_frame_count"], k.get("frame_index")) for k in payload.get("keyframes") or ()),
                      tuple((k["anchor"], k["latent_frame_count"]) for k in payload.get("audio_keyframes") or ()),
                      tuple((r["kind"], r.get("latent_t"), r.get("latent_h"), r.get("latent_w"), r.get("ref_audio_t"))
@@ -716,13 +718,17 @@ class MiniMaxH3Model(nn.Module):
                                                       keyframe_anchors=anchors, audio_condition_anchors=audio_anchors,
                                                       target_condition_audio_latents=target_audio_condition_latents,
                                                       target_condition_video_frames=target_video_condition_frames,
-                                                       target_spatial_context=target_spatial_context, audio_time_offset=payload.get("audio_time_offset", 0.0))
+                                                      target_condition_video_anchor=target_video_condition_anchor,
+                                                      target_spatial_context=target_spatial_context,
+                                                      audio_time_offset=payload.get("audio_time_offset", 0.0))
             else:
                 layout = build_packed_sequence(text_tags, latent_t, latent_h, latent_w, audio_t, self.patch_size,
                                                anchors, video_time_scale, audio_condition_anchors=audio_anchors,
                                                target_condition_audio_latents=target_audio_condition_latents,
                                                target_condition_video_frames=target_video_condition_frames,
-                                               target_spatial_context=target_spatial_context, audio_time_offset=payload.get("audio_time_offset", 0.0))
+                                               target_condition_video_anchor=target_video_condition_anchor,
+                                               target_spatial_context=target_spatial_context,
+                                               audio_time_offset=payload.get("audio_time_offset", 0.0))
         payload["layout_signature"], payload["layout"] = signature, layout
         return layout
 

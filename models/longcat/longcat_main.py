@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from transformers import AutoFeatureExtractor, Wav2Vec2FeatureExtractor, WhisperModel
 
 from shared.utils import files_locator as fl
+from shared.utils import latent_io
 from ..wan.modules.t5 import T5EncoderModel
 from .modules.longcat_video_dit import LongCatVideoTransformer3DModel
 from .modules.avatar.longcat_video_dit_avatar import LongCatVideoAvatarTransformer3DModel
@@ -80,6 +81,8 @@ class LongCatModel:
         self.VAE_dtype = VAE_dtype
         self.model_def = model_def or {}
         self.base_model_type = base_model_type
+        self.model_type = model_type
+        self.model_filename = model_filename
         self.is_avatar = base_model_type in LONGCAT_AVATAR_TYPES
         self.is_avatar_v1_5 = base_model_type == "longcat_avatar_v1_5"
         self.audio_encoder_name = None
@@ -160,6 +163,7 @@ class LongCatModel:
             preprocess_sd=preprocess_vae_sd,
             default_dtype=VAE_dtype,
         )
+        self.vae_file = vae_weights
         self.vae = self.vae.to(dtype=VAE_dtype, device="cpu")
         self.vae._model_dtype = VAE_dtype
         self.vae._dtype = VAE_dtype
@@ -621,7 +625,14 @@ class LongCatModel:
         ref_img_index=None,
         mask_frame_range=None,
         overlapped_latents=None,
+        prefix_latents=None,
+        prefix_kept_windows=None,
+        prefix_kept_frames=0,
+        prefix_is_i2v=False,
         return_latent_slice=None,
+        save_latents=False,
+        app_version=None,
+        latent_model_type=None,
         speakers_bboxes=None,
         window_no=None,
         offloadobj=None,
@@ -767,7 +778,54 @@ class LongCatModel:
             ):
                 use_overlap_latents = False
 
-        if use_overlap_latents:
+        # Latent branch (Phase 1): the kept latents of the sidecar's
+        # containing window, spliced verbatim at the tensor head instead of
+        # a fresh VAE encode of the guide pixels. The sidecar stores the
+        # loop's normalized latents (the same space the denoise loop runs
+        # in), so the prefix is injected as-is. The loop below only steps
+        # the latents after num_cond_latents, which keeps the kept portion
+        # frozen (bit-identical) for the whole run.
+        branch_prefix_latents = None
+        if torch.is_tensor(prefix_latents):
+            if prefix_latents.dim() == 4:
+                prefix_latents = prefix_latents.unsqueeze(0)
+            if prefix_latents.dim() == 5:
+                branch_prefix_latents = prefix_latents.to(device=self.device, dtype=torch.float32)
+        if branch_prefix_latents is not None:
+            lat_h_b = int(height) // self.vae_scale_factor_spatial
+            lat_w_b = int(width) // self.vae_scale_factor_spatial
+            num_latent_frames_b = (frame_num - 1) // self.vae_scale_factor_temporal + 1
+            if (
+                branch_prefix_latents.shape[1] != self.transformer.config.in_channels
+                or branch_prefix_latents.shape[3] != lat_h_b
+                or branch_prefix_latents.shape[4] != lat_w_b
+                or branch_prefix_latents.shape[2] > num_latent_frames_b
+            ):
+                print(
+                    f"Latent branch: the prefix shape {tuple(branch_prefix_latents.shape)} of the source latent file does not match the latent shape of this window "
+                    f"({self.transformer.config.in_channels}, {num_latent_frames_b}, {lat_h_b}, {lat_w_b}); the head window uses a fresh encode."
+                )
+                branch_prefix_latents = None
+
+        if branch_prefix_latents is not None:
+            num_latent_frames = (frame_num - 1) // self.vae_scale_factor_temporal + 1
+            lat_h = int(height) // self.vae_scale_factor_spatial
+            lat_w = int(width) // self.vae_scale_factor_spatial
+            latents = torch.randn(
+                batch_size,
+                self.transformer.config.in_channels,
+                num_latent_frames,
+                lat_h,
+                lat_w,
+                generator=generator,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            if branch_prefix_latents.shape[0] == 1 and batch_size > 1:
+                branch_prefix_latents = branch_prefix_latents.repeat(batch_size, 1, 1, 1, 1)
+            num_cond_latents = branch_prefix_latents.shape[2]
+            latents[:, :, :num_cond_latents] = branch_prefix_latents
+        elif use_overlap_latents:
             num_latent_frames = (frame_num - 1) // self.vae_scale_factor_temporal + 1
             shape = (
                 batch_size,
@@ -1042,12 +1100,92 @@ class LongCatModel:
             latent_slice = latents[:, :, return_latent_slice].detach().to("cpu")
 
         latents = latents.to(self.vae.dtype)
-        latents = self.denormalize_latents(latents)
-        video = self.vae.decode(latents, return_dict=False)[0].clamp(-1, 1)
+        # The sidecar stores these normalized latents (the Wan family
+        # convention: the VAE's latents_mean/latents_std are applied at the
+        # encode/decode boundary, so the decode job's rescale is their exact
+        # inverse). The raw VAE space is materialized only at decode.
+
+
+        latent_file_obj = None
+        if save_latents:
+            vae_file = getattr(self, "vae_file", None)
+            lora_names = []
+            if kwargs.get("loras_slists"):
+                for lora_entry in kwargs["loras_slists"]:
+                    name = lora_entry if isinstance(lora_entry, str) else (lora_entry[0] if isinstance(lora_entry, (list, tuple)) and len(lora_entry) > 0 else "")
+                    if len(str(name).strip()) > 0:
+                        lora_names.append(str(name))
+            try:
+                payload = latent_io.build_latent_payload(
+                    latents[0],
+                    app_version=str(app_version or ""),
+                    model_type=str(latent_model_type or self.model_type or ""),
+                    base_model_type=str(self.base_model_type or ""),
+                    model_filename=os.path.basename(str(self.model_filename or "")),
+                    loras=lora_names,
+                    vae_file=os.path.basename(str(vae_file)) if vae_file else "",
+                    vae_sha256=latent_io.sha256_file(vae_file) if vae_file and os.path.isfile(vae_file) else "",
+                    vae_z_dim=int(getattr(self.vae.config, "z_dim", 0) or 0),
+                    vae_dtype=str(self.VAE_dtype).replace("torch.", ""),
+                    frames=int(frame_num),
+                    fps=float(fps),
+                    seed=int(seed),
+                    prompt=str(input_prompt)[:1000],
+                    # LongCat currently always denoises from noise (no partial
+                    # denoising yet), so the captured latent is a full one.
+                    denoising_strength=1.0,
+                    steps=int(len(timesteps)),
+                    latent_stride=int(self.vae_scale_factor_temporal),
+                    frame_offset=1,
+                )
+                # The file itself is built by the caller (the all-latent
+                # sidecar: the job's windows stacked on one time dimension,
+                # the sidecar the sole content source of the video).
+                latent_file_obj = payload
+                print(f"Latent companion payload built (compression {payload['wgp_latent/1']['compression']}).")
+            except Exception as exc:
+                print(f"Warning: the latent companion file was not saved: {exc}")
+                latent_file_obj = None
+
+        video = self.vae.decode(self.denormalize_latents(latents), return_dict=False)[0].clamp(-1, 1)
         if video.dim() == 5:
             video = video[0]
         self._clear_runtime_caches()
 
-        if latent_slice is not None:
-            return {"x": video, "latent_slice": latent_slice}
+        decoded_prefix = None
+        if prefix_kept_windows is not None and int(prefix_kept_frames or 0) > 0:
+            # The branch job's kept region is a fresh decode of the source
+            # sidecar's kept windows (the same reconstruction the Latent
+            # Decode job performs: the per-window recorded trims, the
+            # family's grid), handed back as decoded_prefix so the job uses
+            # it as the output video's prefix instead of a re-extraction of
+            # the source video (source independence). Best effort: any
+            # failure keeps the source-pixel prefix the job extracted
+            # before the model call.
+            def _decode_kept_window(spec):
+                _lat = spec["latents"]
+                if _lat.dim() == 4:
+                    _lat = _lat.unsqueeze(0)
+                # The sidecar's kept latents are the loop's normalized
+                # ones; the VAE port decodes raw, so denormalize first.
+                _frames = self.vae.decode(
+                    self.denormalize_latents(_lat.to(device=self.device, dtype=self.VAE_dtype)),
+                    return_dict=False)[0]
+                return _frames[0].float().clamp_(-1.0, 1.0).to("cpu")
+            try:
+                decoded_prefix = latent_io.decode_kept_windows(
+                    _decode_kept_window, prefix_kept_windows, int(prefix_kept_frames),
+                    is_i2v=bool(prefix_is_i2v))
+            except Exception as exc:
+                print(f"Latent branch: the kept region could not be decoded ({exc}); the output keeps the source-pixel prefix.")
+
+        if latent_slice is not None or latent_file_obj is not None or decoded_prefix is not None:
+            ret = {"x": video}
+            if latent_slice is not None:
+                ret["latent_slice"] = latent_slice
+            if latent_file_obj is not None:
+                ret["latent_file_obj"] = latent_file_obj
+            if decoded_prefix is not None:
+                ret["decoded_prefix"] = decoded_prefix
+            return ret
         return video

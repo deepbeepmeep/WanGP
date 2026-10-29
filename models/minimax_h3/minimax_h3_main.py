@@ -336,6 +336,11 @@ def model_factory(model_filename, text_encoder_filename, qkv_splitting, dtype=to
         latent_upscaler = shared_h3_pipeline.latent_upscaler
     fixed_prompt = load_fixed_prompt(fixed_prompt_filename) if fixed_prompt_filename is not None else None
     pipeline = MiniMaxH3Pipeline(transformer, text_encoder, video_vae, audio_vae, latent_upscaler=latent_upscaler, reference_mode=reference_mode, audio_only=audio_only, dtype=dtype, fixed_prompt=fixed_prompt)
+    # Record the loaded VAE file names on the (per-model) pipeline object so
+    # the latent companion payload can tag the exact VAEs and the Media Flow
+    # Latent Decode job can reload them.
+    pipeline.video_vae_file = str(video_vae_filename)
+    pipeline.audio_vae_file = str(audio_vae_filename)
     if save_quantized:
         from wgp import save_quantized_model
         save_quantized_model(transformer, model_type, model_filename[0], dtype, None,

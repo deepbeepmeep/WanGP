@@ -126,6 +126,68 @@ def image_conditionings_by_adding_guiding_latent(
     return conditionings
 
 
+def prefix_video_latent_conditioning(
+    prefix: torch.Tensor,
+    height: int,
+    width: int,
+    num_frames: int,
+    video_encoder: VideoEncoder,
+    dtype: torch.dtype,
+    device: torch.device,
+    stage_1: bool = False,
+) -> VideoConditionByLatentIndex | None:
+    """A saved latent run as a frozen prefix at the window's first latent.
+
+    ``prefix`` is the sidecar's kept latents on the full-resolution latent
+    grid (``[c, t, h, w]`` or batched ``[1, c, t, h, w]``). ``height`` /
+    ``width`` are this stage's own output canvas: stage 2's is the
+    full-resolution canvas (the prefix grid must match it exactly and is
+    injected as-is) and stage 1's is the half-resolution canvas, whose
+    latent grid is half the prefix's, so the prefix is bilinearly
+    half-downsampled (the stage-2 upsampler carries the same content back
+    up). The injected tokens carry a zero denoise mask, so they stay clean
+    at every denoise step of the stage (the same mechanism that freezes a
+    start image). Returns ``None`` — the caller keeps its pixel-image
+    conditioning — when the prefix does not match the window's latent grid.
+    """
+    if prefix is None:
+        return None
+    p = prefix
+    if p.dim() == 4:
+        p = p.unsqueeze(0)
+    if p.dim() != 5:
+        return None
+    z = int(getattr(video_encoder, "latent_channels", 0) or 0)
+    t = (int(num_frames) - 1) // 8 + 1
+    h = int(height) // 32
+    w = int(width) // 32
+    spatial_scale = 2 if stage_1 else 1
+    # The prefix covers the first P latents of the window (P <= t); the
+    # remaining latents are freshly denoised on from it.
+    if z <= 0 or p.shape[1] != z or not 1 <= p.shape[2] <= t:
+        return None
+    if h <= 0 or w <= 0 or p.shape[3] != spatial_scale * h or p.shape[4] != spatial_scale * w:
+        return None
+    if stage_1:
+        b, c, pt, h2, w2 = p.shape
+        p = (
+            F.interpolate(
+                p.permute(0, 2, 1, 3, 4).reshape(b * pt, c, h2, w2),
+                size=(h, w),
+                mode="bilinear",
+                align_corners=False,
+            )
+            .reshape(b, pt, c, h, w)
+            .permute(0, 2, 1, 3, 4)
+            .contiguous()
+        )
+    return VideoConditionByLatentIndex(
+        latent=p.to(device=device, dtype=dtype),
+        strength=1.0,
+        latent_idx=0,
+    )
+
+
 def video_conditionings_by_keyframe(
     video_conditioning: list[tuple],
     height: int,

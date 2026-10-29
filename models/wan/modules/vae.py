@@ -1367,6 +1367,7 @@ class WanVAE:
         self.dtype = dtype
         self.device = device
         self.z_dim = z_dim
+        self.vae_pth = vae_pth
 
         mean = [
             -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,

@@ -40,6 +40,7 @@ from .utils.helpers import (
     image_conditionings_by_adding_guiding_latent,
     image_conditionings_by_replacing_latent,
     latent_conditionings_by_latent_sequence,
+    prefix_video_latent_conditioning,
     prepare_mask_injection,
     multi_modal_guider_denoising_func,
     res2s_audio_video_denoising_loop,
@@ -158,6 +159,7 @@ class TI2VidTwoStagesPipeline:
         video_conditioning_downscale_factor: int = 1,
         video_conditioning_stage2: list[tuple[str, float]] | None = None,
         latent_conditioning_stage2: torch.Tensor | None = None,
+        prefix_video_latent: torch.Tensor | None = None,
         tiling_config: TilingConfig | None = None,
         enhance_prompt: bool = False,
         audio_conditionings: list | None = None,
@@ -185,6 +187,7 @@ class TI2VidTwoStagesPipeline:
         ltx2_22B_class: bool = False,
         hdr_transform: str | None = None,
         skip_audio: bool = False,
+        latent_capture: dict | None = None,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
         assert_resolution(height=height, width=width, is_two_stage=not skip_stage_2)
 
@@ -456,15 +459,31 @@ class TI2VidTwoStagesPipeline:
                 tiling_config=tiling_config,
             )
         else:
-            stage_1_conditionings = image_conditionings_by_replacing_latent(
-                images=images,
+            # Latent Branch (Phase 2): the sidecar's kept latents freeze the
+            # head of the window instead of a fresh encode of the guide
+            # pixels (stage 1 takes the bilinear half-resolution form).
+            prefix_cond = prefix_video_latent_conditioning(
+                prefix=prefix_video_latent,
                 height=stage_1_output_shape.height,
                 width=stage_1_output_shape.width,
+                num_frames=num_frames,
                 video_encoder=video_encoder,
                 dtype=dtype,
                 device=self.device,
-                tiling_config=tiling_config,
+                stage_1=True,
             )
+            if prefix_cond is not None:
+                stage_1_conditionings = [prefix_cond]
+            else:
+                stage_1_conditionings = image_conditionings_by_replacing_latent(
+                    images=images,
+                    height=stage_1_output_shape.height,
+                    width=stage_1_output_shape.width,
+                    video_encoder=video_encoder,
+                    dtype=dtype,
+                    device=self.device,
+                    tiling_config=tiling_config,
+                )
         stage_1_conditionings += stage_1_ref_conditionings
         if frozen_video_conditioning is None and guiding_images:
             stage_1_conditionings += image_conditionings_by_adding_guiding_latent(
@@ -530,6 +549,11 @@ class TI2VidTwoStagesPipeline:
             latent_slice = None
             if return_latent_slice is not None:
                 latent_slice = video_state.latent[:, :, return_latent_slice].detach().to("cpu")
+            if latent_capture is not None:
+                # Capture the final pre-decode latents (same tensors the VAE
+                # is about to decode) for the latent companion file.
+                latent_capture["video"] = video_state.latent.detach().to("cpu")
+                latent_capture["audio"] = audio_state.latent.detach().to("cpu") if audio_state is not None else None
             if frozen_output_video is None:
                 video_latent = [video_state.latent]
                 video_state = None
@@ -667,15 +691,30 @@ class TI2VidTwoStagesPipeline:
                 tiling_config=tiling_config,
             )
         else:
-            stage_2_conditionings = image_conditionings_by_replacing_latent(
-                images=stage_2_images,
+            # Latent Branch (Phase 2): the full-resolution kept latents are
+            # frozen as-is at the head of the window (no re-encode).
+            prefix_cond = prefix_video_latent_conditioning(
+                prefix=prefix_video_latent,
                 height=stage_2_output_shape.height,
                 width=stage_2_output_shape.width,
+                num_frames=num_frames,
                 video_encoder=video_encoder,
                 dtype=dtype,
                 device=self.device,
-                tiling_config=tiling_config,
+                stage_1=False,
             )
+            if prefix_cond is not None:
+                stage_2_conditionings = [prefix_cond]
+            else:
+                stage_2_conditionings = image_conditionings_by_replacing_latent(
+                    images=stage_2_images,
+                    height=stage_2_output_shape.height,
+                    width=stage_2_output_shape.width,
+                    video_encoder=video_encoder,
+                    dtype=dtype,
+                    device=self.device,
+                    tiling_config=tiling_config,
+                )
         stage_2_conditionings += stage_2_ref_conditionings
         if frozen_video_conditioning is None and guiding_images_stage2:
             stage_2_conditionings += image_conditionings_by_adding_guiding_latent(
@@ -753,6 +792,11 @@ class TI2VidTwoStagesPipeline:
         latent_slice = None
         if return_latent_slice is not None:
             latent_slice = video_state.latent[:, :, return_latent_slice].detach().to("cpu")
+        if latent_capture is not None:
+            # Capture the final pre-decode latents (same tensors the VAE
+            # is about to decode) for the latent companion file.
+            latent_capture["video"] = video_state.latent.detach().to("cpu")
+            latent_capture["audio"] = audio_state.latent.detach().to("cpu") if audio_state is not None else None
         if frozen_output_video is None:
             video_latent = [video_state.latent]
             video_state = None

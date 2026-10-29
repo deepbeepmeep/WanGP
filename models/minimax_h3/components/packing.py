@@ -38,6 +38,7 @@ class MiniMaxH3PackedSequence:
     num_target_condition_video_rows: int = 0
     dense_spans: tuple = ()  # (start, stop) of every non-video-region row range in sequence order: text, keyframes, image references, audio
     reference_video_spans: tuple = ()  # (start, stop, (t, h, w)) of every reference video's rows, in sequence order
+    target_condition_video_anchor: str = "tail"
 
 
 @dataclass
@@ -151,7 +152,7 @@ def _fill_audio_condition_positions(position_ids, start, anchors, history_origin
 def build_packed_sequence(text_token_tags, num_latent_frames, latent_height, latent_width, num_audio_latents,
                           patch_size, keyframe_anchors=(), video_time_scale=1.0, audio_condition_anchors=(),
                           target_condition_audio_latents=0, target_condition_video_frames=0,
-                          target_spatial_context=None, audio_time_offset=0.0):
+                          target_condition_video_anchor="tail", target_spatial_context=None, audio_time_offset=0.0):
     _, patch_h, patch_w = patch_size
     rows_per_frame = (latent_height // patch_h) * (latent_width // patch_w)
     text_len = int(text_token_tags.shape[0])
@@ -208,13 +209,15 @@ def build_packed_sequence(text_token_tags, num_latent_frames, latent_height, lat
     return MiniMaxH3PackedSequence(sequence_length, position_ids, token_tags, video_indices, audio_indices,
                                    text_indices, condition_video_rows, condition_audio_rows,
                                    target_condition_audio_latents, target_condition_video_frames * rows_per_frame,
-                                   tuple(span for span in ((0, text_len), (condition_video_start, condition_audio_start), (condition_audio_start, audio_start), (audio_start, video_start)) if span[1] > span[0]))
+                                   tuple(span for span in ((0, text_len), (condition_video_start, condition_audio_start), (condition_audio_start, audio_start), (audio_start, video_start)) if span[1] > span[0]),
+                                   (), target_condition_video_anchor)
 
 
 def build_ref2va_packed_sequence(text_token_tags, references, num_latent_frames, latent_height, latent_width,
                                  num_audio_latents, patch_size, video_time_scale=1.0, keyframe_anchors=(),
                                  audio_condition_anchors=(), target_condition_audio_latents=0,
-                                 target_condition_video_frames=0, target_spatial_context=None, audio_time_offset=0.0):
+                                 target_condition_video_frames=0, target_condition_video_anchor="tail",
+                                 target_spatial_context=None, audio_time_offset=0.0):
     _, patch_h, patch_w = patch_size
     text_len = int(text_token_tags.shape[0])
     target_frame_grid, target_width_grid = _frame_grid(latent_height, latent_width, patch_h, patch_w,
@@ -319,7 +322,7 @@ def build_ref2va_packed_sequence(text_token_tags, references, num_latent_frames,
                                    text_indices, condition_video_rows, condition_audio_rows,
                                    target_condition_audio_latents,
                                    target_condition_video_frames * rows_per_target_frame,
-                                   tuple(dense_spans + [(audio_start, video_start)]), tuple(reference_video_spans))
+                                   tuple(dense_spans + [(audio_start, video_start)]), tuple(reference_video_spans), target_condition_video_anchor)
 
 
 def build_row_timesteps(layout, video_timestep, audio_timestep, condition_video_timestep,
@@ -330,7 +333,12 @@ def build_row_timesteps(layout, video_timestep, audio_timestep, condition_video_
     for start, stop, timestep in keyframe_timesteps:  # softened keyframes keep their own noise level
         timesteps[layout.video_indices[start:stop]] = timestep
     if layout.num_target_condition_video_rows:
-        timesteps[layout.video_indices[-layout.num_target_condition_video_rows:]] = target_condition_timestep
+        # The frozen target rows sit at the clip's tail (the frozen-control
+        # video mode) or at its head (the latent-branch Case A prefix);
+        # everything else in the target block stays on the solver schedule.
+        target_video_start = layout.num_condition_video_rows if layout.target_condition_video_anchor == "head" else \
+            layout.video_indices.numel() - layout.num_target_condition_video_rows
+        timesteps[layout.video_indices[target_video_start:target_video_start + layout.num_target_condition_video_rows]] = target_condition_timestep
     timesteps[layout.audio_indices[layout.num_condition_audio_rows:]] = audio_timestep
     timesteps[layout.audio_indices[:layout.num_condition_audio_rows]] = condition_audio_timestep
     condition_latents = layout.num_target_condition_audio_latents

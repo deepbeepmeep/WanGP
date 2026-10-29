@@ -27,4 +27,7 @@ def get_system_handler(name: str | None) -> Any:
     if name in ("rife", "dlssg", "dlss5"):
         from .system_upsampler_handler import DLSS5_HANDLER, DLSSG_HANDLER, RIFE_HANDLER
         return {"rife": RIFE_HANDLER, "dlssg": DLSSG_HANDLER, "dlss5": DLSS5_HANDLER}[name]
+    if name == "latent_decode":
+        from .latent_process_handler import LATENT_DECODE_HANDLER
+        return LATENT_DECODE_HANDLER
     return None
