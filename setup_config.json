@@ -91,7 +91,7 @@
                 "label": "Sparge Attention 0.1.0 (CUDA 13 / Torch 2.9+ ABI)",
                 "cmd": {
                     "win": "https://github.com/woct0rdho/SpargeAttn/releases/download/v0.1.0-windows.post4/spas_sage_attn-0.1.0%2Bcu130torch2.9.0andhigher.post4-cp39-abi3-win_amd64.whl",
-                    "linux": "{pip} ninja wheel packaging && {pip} --no-build-isolation git+https://github.com/woct0rdho/SpargeAttn.git"
+                    "linux": "{pip} ninja wheel packaging && NVCC_PREPEND_FLAGS='-DNDEBUG' {pip} --no-build-isolation git+https://github.com/woct0rdho/SpargeAttn.git"
                 }
             }
         },
