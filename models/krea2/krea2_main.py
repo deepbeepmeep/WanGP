@@ -522,6 +522,7 @@ class Krea2Pipeline:
                     step_mask = image_mask_latents
                 elif outpainting_mask_latents is None and i < masked_steps:
                     step_mask = image_mask_latents
+            preview_x0 = img - tcurr * v if callback is not None and getattr(callback, "tiny_vae", False) else None
             if step_mask is not None and lanpaint_proc is None:
                 v.mul_(step_mask)
             img = img + (tprev - tcurr) * v
@@ -530,9 +531,13 @@ class Krea2Pipeline:
                 latent_noise_factor = tprev
                 noisy_image = original_image_latents * (1.0 - latent_noise_factor) + randn * latent_noise_factor
                 img = noisy_image * (1 - step_mask) + step_mask * img
+                if preview_x0 is not None:
+                    preview_x0 = original_image_latents * (1 - step_mask) + step_mask * preview_x0
             if callback is not None:
-                preview = rearrange(img, "b (h w) (c ph pw) -> b c (h ph) (w pw)", ph=patch, pw=patch, h=height // align, w=width // align)
+                preview = rearrange(preview_x0 if preview_x0 is not None else img, "b (h w) (c ph pw) -> b c (h ph) (w pw)", ph=patch, pw=patch, h=height // align, w=width // align)
                 callback(i, preview.transpose(0, 1), False, preview_meta=None)
+                del preview
+            del preview_x0
         if self._interrupt:
             return None
         latents = rearrange(img, "b (h w) (c ph pw) -> b c (h ph) (w pw)", ph=patch, pw=patch, h=height // align, w=width // align)

@@ -117,13 +117,16 @@ class model_factory:
             pred_video, pred_audio = transformer(model_input, audio, text["text_embeds"], text["pooled_embed"], sigma * 1000, ropes, token_types)
             del model_input
             segment = torch.full((1,), float(segment_size), device=device, dtype=sigma.dtype)
+            # The last PiFlow grid entry predicts x0 at the current source time.
+            preview = video.float() - sigma * pred_video[:, -1].float() if getattr(callback, "tiny_vae", False) else None
             video = _piflow_step(pred_video, video, sigma, segment, tau_src, tau_dst, piflow)
             del pred_video
             audio = _piflow_step(pred_audio, audio, sigma, segment, tau_src, tau_dst, piflow)
             del pred_audio
             raw_t_src = tau_dst
             if callback is not None:
-                callback(step, video[0, :latent_frames].permute(3, 0, 1, 2), False)
+                callback(step, (preview if preview is not None else video)[0, :latent_frames].permute(3, 0, 1, 2), False)
+            del preview
             check_abort()
         del text, ropes
 

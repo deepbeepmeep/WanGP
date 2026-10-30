@@ -1019,6 +1019,17 @@ class LongCatModel:
 
                 noise_pred = -noise_pred
 
+                preview_latents = None
+                if callback is not None and getattr(callback, "tiny_vae", False):
+                    sigma_index = self.scheduler.step_index
+                    if sigma_index is None:
+                        sigma_index = self.scheduler.index_for_timestep(t)
+                    # The scheduler consumes the negated flow; keep conditioning fixed.
+                    preview_latents = latents[0, :, num_ref_latents:].float().clone()
+                    preview_latents[:, num_cond_latents - num_ref_latents:] -= (
+                        self.scheduler.sigmas[sigma_index] * noise_pred[0, :, num_cond_latents:].float()
+                    )
+
                 if num_cond_latents > 0:
                     latents[:, :, num_cond_latents:] = self.scheduler.step(
                         noise_pred[:, :, num_cond_latents:],
@@ -1030,7 +1041,8 @@ class LongCatModel:
                     latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
                 if callback is not None:
-                    callback(i, latents[0, :, num_ref_latents:])
+                    callback(i, preview_latents if preview_latents is not None else latents[0, :, num_ref_latents:])
+                del preview_latents
                 progress_bar.update()
 
         if num_ref_latents > 0:

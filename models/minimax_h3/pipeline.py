@@ -1300,6 +1300,7 @@ class MiniMaxH3Pipeline:
 
             def denoise_pass(pass_description, pass_extra):
                 nonlocal video, audio
+                tiny_vae_preview = bool(getattr(callback, "tiny_vae", False)) and not self.audio_only and (not offline_spectrum or spectrum.replaying)
                 old_video_denoised = old_audio_denoised = None
                 old_video_denoised_d = old_audio_denoised_d = None
                 er_generator = torch.Generator(device=video.device).manual_seed(int(seed)) if stage_solver == "er_sde" else None
@@ -1307,6 +1308,7 @@ class MiniMaxH3Pipeline:
                 for step in tqdm(range(model_steps), desc=pass_description):
                     self._set_interrupt_state()
                     self._check_abort()
+                    video_denoised = None
                     payload["attention_sparsity"] = tau_start + (SOL_ATTN_TAU_END - tau_start) * step / tau_denominator
                     offload.set_step_no_for_lora(self.transformer, step)
                     if pdd:
@@ -1435,6 +1437,7 @@ class MiniMaxH3Pipeline:
                             stage_video_velocity.mul_(stage_sigma_video).add_(stage_video)
                             if effective_sigmas_video is None and source_latents is not None and step_editable_mask is not None:
                                 _blend_video_source(stage_video_velocity, source_latents, step_editable_mask)
+                            video_denoised = stage_video_velocity.clone() if tiny_vae_preview else None
                             stage_video_velocity.sub_(video).div_(sigma_video)
                             video_velocity.mul_(0.25).add_(stage_video_velocity, alpha=0.75).mul_(step_size)
                             video.add_(video_velocity)
@@ -1453,12 +1456,14 @@ class MiniMaxH3Pipeline:
                         keep_grouped_rows_fixed = grouped_masking and denoising_start_step <= step and step + 1 < mask_end_step
                         _reinject_video_source(source_video, source_latents, source_noise, source_mask, stage_sigmas_video[step + 1], source_buffer,
                                                1.0 - VISUAL_COND_TIMESTEP if preserve_input_mask_values or keep_grouped_rows_fixed else None)
-                    video_velocity = audio_velocity = video_denoised = audio_velocity_tail = None
+                    video_velocity = audio_velocity = audio_velocity_tail = None
                     if control_anchor_indices is not None and not target_video_condition_frames:
                         video.index_copy_(2, control_anchor_indices, control_anchor_latents if step == model_steps - 1 else control_anchor_noised)
                     if callback is not None:
-                        preview = video[0].detach() if not self.audio_only and (not offline_spectrum or spectrum.replaying) else None
+                        preview = (video_denoised if tiny_vae_preview and video_denoised is not None else video)[0].detach() if not self.audio_only and (not offline_spectrum or spectrum.replaying) else None
                         callback(step, preview, False, denoising_extra=pass_extra, **({"pass_no": pass_no} if pass_no >= 0 else {}))
+                        del preview
+                    video_denoised = None
 
             try:
                 if callback is not None:
@@ -1696,9 +1701,11 @@ class MiniMaxH3Pipeline:
                         _reinject_video_source(phase_2_latent_canvas[:, :, :phase_2_source_latents.shape[2]], phase_2_source_latents,
                                                phase_2_source_noise, phase_2_source_mask, float(sigma_video_next), phase_2_source_buffer,
                                                1.0 - VISUAL_COND_TIMESTEP if preserve_input_mask_values or keep_grouped_rows_fixed else None)
-                    phase_2_accumulator = None
                     if callback is not None:
-                        callback(progress_step - 1, phase_2_latent_canvas[0].detach(), False, denoising_extra=phase_extra, pass_no=2)
+                        preview_latents = phase_2_accumulator if getattr(callback, "tiny_vae", False) else phase_2_latent_canvas
+                        callback(progress_step - 1, preview_latents[0].detach(), False, denoising_extra=phase_extra, pass_no=2)
+                        del preview_latents
+                    phase_2_accumulator = None
 
                 video = phase_2_latent_canvas.to(self.device)
                 payload.pop("target_spatial_context", None)

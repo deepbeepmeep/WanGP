@@ -1756,6 +1756,18 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                         noise_pred = rescale_noise_cfg( noise_pred, noise_pred_text, guidance_rescale=self.guidance_rescale, )
 
                 # compute the previous noisy sample x_t -> x_t-1
+                preview_latents = None
+                if getattr(callback, "tiny_vae", False):
+                    preview_step_index = self.scheduler.step_index
+                    if preview_step_index is None:
+                        preview_step_index = self.scheduler.begin_index
+                    if preview_step_index is None:
+                        preview_step_index = self.scheduler.index_for_timestep(t)
+                    preview_sigma = self.scheduler.sigmas[preview_step_index]
+                    if i2v_mode and i2v_condition_type == "token_replace":
+                        preview_latents = torch.cat([img_latents, latents[:, :, 1:].float() - preview_sigma * noise_pred.unsqueeze(0)[:, :, 1:].float()], dim=2)
+                    else:
+                        preview_latents = latents.float() - preview_sigma * noise_pred.float()
                 if i2v_mode and i2v_condition_type == "token_replace":
                     noise_pred = noise_pred.unsqueeze(0)
                     latents = self.scheduler.step(
@@ -1773,7 +1785,8 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                 noise_pred_uncond, noise_pred_text, noise_pred, noise_pred_ip, ret = None, None, None, None, None
 
                 if callback is not None:
-                    callback(i, latents.squeeze(0), False)         
+                    callback(i, (preview_latents if preview_latents is not None else latents).squeeze(0), False)
+                    preview_latents = None
 
         if self.interrupt:
             return [None]

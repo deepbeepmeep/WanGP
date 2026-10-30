@@ -120,10 +120,12 @@ class MOSSImagePipeline:
                     if self._interrupt:
                         raise GenerationAborted
                     velocity = predictions[0] + guide_scale * (predictions[1] - predictions[0]) if len(texts) == 2 else predictions[0]
+                    preview_x0 = latents - schedule[step] * velocity if callback is not None and getattr(callback, "tiny_vae", False) else None
                     latents = latents + (schedule[step + 1] - schedule[step]) * velocity
                     del predictions, velocity
                     if callback is not None:
-                        callback(step, self.preview_latents(latents), False)
+                        callback(step, self.preview_latents(preview_x0 if preview_x0 is not None else latents), False)
+                    del preview_x0
         finally:
             for cache in caches:
                 cache.clear()

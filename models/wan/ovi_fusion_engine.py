@@ -304,6 +304,12 @@ class OviFusionEngine:
                 pred_audio_guided = pred_audio_neg + audio_cfg_scalecale * (pred_audio_pos - pred_audio_neg)
                 pred_audio_neg = pred_audio_pos = pred_vid_neg = pred_vid_pos = None
                 # Update noise using scheduler
+                preview_latents = None
+                if getattr(callback, "tiny_vae", False):
+                    preview_step_index = scheduler_video.step_index
+                    if preview_step_index is None:
+                        preview_step_index = scheduler_video.index_for_timestep(t_v)
+                    preview_latents = video_noise.float() - scheduler_video.sigmas[preview_step_index] * pred_video_guided.float()
                 video_noise = scheduler_video.step(
                     pred_video_guided.unsqueeze(0), t_v, video_noise.unsqueeze(0), return_dict=False
                 )[0].squeeze(0)
@@ -313,9 +319,9 @@ class OviFusionEngine:
                 )[0].squeeze(0)
                 pred_audio_guided = None
                 if callback is not None:
-                    latents_preview = video_noise
+                    latents_preview = preview_latents if preview_latents is not None else video_noise
                     callback(i, latents_preview, False )
-                    latents_preview = None
+                    latents_preview = preview_latents = None
             ret()
 
             if is_i2v:

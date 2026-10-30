@@ -148,6 +148,10 @@ class PrismPipeline:
                     vn, an = predictions[1]
                     vp = vn.float() + scale * (vp - vn.float())
                     ap = an.float() + scale * (ap - an.float())
+                preview_video = None
+                if callback is not None and getattr(callback, "tiny_vae", False):
+                    # Predict x0 at model time; Euler endpoints use a separate snapped grid.
+                    preview_video = video - visual_sigma[step].to(device) * vp
                 video.add_(vp, alpha=float(visual_steps[step + 1] - visual_steps[step]))
                 if lightx2v:
                     # FreeVideo Light recipe: conditional student's video K/V,
@@ -160,7 +164,8 @@ class PrismPipeline:
                     audio.add_(ap, alpha=float(audio_steps[step + 1] - audio_steps[step]))
                 del predictions, vp, ap
                 if callback is not None:
-                    callback(step, video[0], False)
+                    callback(step, (preview_video if preview_video is not None else video)[0], False)
+                del preview_video
                 check_abort()
             del condition, contexts, embeddings
             video.mul_(self.vae.std[None, :, None, None, None]).add_(self.vae.mean[None, :, None, None, None])

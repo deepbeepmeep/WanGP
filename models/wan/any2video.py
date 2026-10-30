@@ -1398,8 +1398,12 @@ class WanAny2V:
                 weight[-ramp:] = torch.linspace(1, 1e-6, ramp, dtype=dtype, device=device)
             return weight.view(1, 1, -1, 1, 1)
 
+        tiny_vae_preview = getattr(callback, "tiny_vae", False)
+        preview_latents = None
+
         def _sub_parallel_denoise(latents, denoise_fn):
-            nonlocal extended_latents, y_cond, y_uncond, conditions, conditions_null
+            nonlocal extended_latents, y_cond, y_uncond, conditions, conditions_null, preview_latents
+            preview_latents = None
             noise_pred = torch.zeros_like(latents)
             weight_sum = torch.zeros(1, 1, latents.shape[2], 1, 1, dtype=latents.dtype, device=latents.device)
             for start, end in sub_parallel_windows:
@@ -1451,6 +1455,8 @@ class WanAny2V:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             noise_pred.div_(weight_sum.clamp_min_(1e-6))
+            if tiny_vae_preview:
+                preview_latents = latents - preview_sigma * noise_pred[:, :, :latents.shape[2]]
             return noise_pred
 
 
@@ -1594,7 +1600,18 @@ class WanAny2V:
                     for zz in z:
                         zz[0:16, ref_images_count:extended_overlapped_latents.shape[2] ]   = extended_overlapped_latents[0, :, ref_images_count:]  * (1.0 - overlap_noise_factor) + torch.randn_like(extended_overlapped_latents[0, :, ref_images_count:] ) * overlap_noise_factor 
 
+            if tiny_vae_preview:
+                if isinstance(sample_scheduler, EulerScheduler):
+                    preview_sigma = sample_scheduler._timestep_to_index(t)[1] / sample_scheduler.num_train_timesteps
+                else:
+                    preview_step_index = getattr(sample_scheduler, "_step_index", None)
+                    if preview_step_index is None:
+                        preview_step_index = sample_scheduler.index_for_timestep(t) if hasattr(sample_scheduler, "index_for_timestep") else torch.argmin((sample_scheduler.timesteps - t).abs()).item()
+                    preview_sigma = sample_scheduler.sigmas[preview_step_index]
+
             def denoise_with_cfg_fn(latents):
+                nonlocal preview_latents
+                preview_latents = None
 
                 if extended_input_dim > 0:
                     latent_model_input = torch.cat([latents, extended_latents.expand(*expand_shape)], dim=extended_input_dim)
@@ -1790,6 +1807,9 @@ class WanAny2V:
                                 noise_pred_uncond *= alpha
                         noise_pred = noise_pred_uncond + guide_scale * (noise_pred_text - noise_pred_uncond)            
                 ret_values = noise_pred_uncond = noise_pred_cond = noise_pred_text = neg  = None
+                if tiny_vae_preview and sub_parallel_windows is None:
+                    # Capture before stepping, including each self-refinement prediction.
+                    preview_latents = latents - preview_sigma * noise_pred[:, :, :latents.shape[2]]
                 return noise_pred
 
             denoise_fn = partial(_sub_parallel_denoise, denoise_fn=denoise_with_cfg_fn) if sub_parallel_windows is not None else denoise_with_cfg_fn
@@ -1807,16 +1827,18 @@ class WanAny2V:
                 sigma = 0 if i == len(timesteps)-1 else timesteps[i+1]/1000
                 noisy_image = randn[:, :, :source_latents.shape[2]] * sigma + (1 - sigma) * source_latents
                 latents[:, :, :source_latents.shape[2]] = noisy_image * (1-image_mask_latents) + image_mask_latents * latents[:, :, :source_latents.shape[2]]  
+                if tiny_vae_preview:
+                    preview_latents[:, :, :source_latents.shape[2]] = source_latents * (1-image_mask_latents) + image_mask_latents * preview_latents[:, :, :source_latents.shape[2]]
 
 
             if callback is not None:
-                latents_preview = latents
+                latents_preview = preview_latents if tiny_vae_preview else latents
                 if ref_images_before and ref_images_count > 0: latents_preview = latents_preview[:, :, ref_images_count: ] 
                 if trim_frames > 0:  latents_preview=  latents_preview[:, :,:-trim_frames]
                 if image_outputs: latents_preview= latents_preview[:, :,-1:] if last_latent_preview else latents_preview[:, :,:1]
                 if len(latents_preview) > 1: latents_preview = latents_preview.transpose(0,2)
                 callback(i, latents_preview[0], False, denoising_extra =denoising_extra )
-                latents_preview = None
+                latents_preview = preview_latents = None
 
         clear()
         if timestep_injection:

@@ -472,8 +472,10 @@ class Ideogram4WanPipeline:
             prev_denoised = denoised
             prev_sigma = sigma
             if callback is not None:
-                preview = self._unpack_vae_latents(z[:1], grid_h, grid_w)[0].unsqueeze(1)
+                preview_x0 = denoised if getattr(callback, "tiny_vae", False) else z
+                preview = self._unpack_vae_latents(preview_x0[:1], grid_h, grid_w)[0].unsqueeze(1)
                 callback(step_idx, preview, False, denoising_extra=denoising_extra)
+                del preview, preview_x0
 
         if self._interrupt:
             return None

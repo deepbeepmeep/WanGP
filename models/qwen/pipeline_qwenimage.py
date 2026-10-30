@@ -992,6 +992,11 @@ class QwenImagePipeline(): #DiffusionPipeline
             if noise_pred == None: return None
             noise_pred = cfg_predictions(noise_pred, neg_noise_pred, true_cfg_scale, t)
             neg_noise_pred = None
+            preview_x0 = None
+            if callback is not None and getattr(callback, "tiny_vae", False):
+                if self.scheduler.step_index is None:
+                    self.scheduler._init_step_index(t)
+                preview_x0 = latents.float() - self.scheduler.sigmas[self.scheduler.step_index].to(latents.device) * noise_pred.float()
             # compute the previous noisy sample x_t -> x_t-1
             latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
             noise_pred = None
@@ -1002,6 +1007,8 @@ class QwenImagePipeline(): #DiffusionPipeline
                 noisy_image  = original_image_latents  * (1.0 - latent_noise_factor) + randn * latent_noise_factor 
                 latents  =  noisy_image * (1-image_mask_latents)  + image_mask_latents * latents
                 noisy_image = None
+                if preview_x0 is not None:
+                    preview_x0 = original_image_latents * (1-image_mask_latents) + image_mask_latents * preview_x0
 
             if latents.dtype != latents_dtype:
                 if torch.backends.mps.is_available():
@@ -1009,13 +1016,15 @@ class QwenImagePipeline(): #DiffusionPipeline
                     latents = latents.to(latents_dtype)
 
             if callback is not None:
-                preview_latents = latents
+                preview_latents = preview_x0 if preview_x0 is not None else latents
                 if num_layers > 1:
                     seq_len = latents.shape[1] // num_layers
-                    preview_latents = latents[:, :seq_len, :]
+                    preview_latents = preview_latents[:, :seq_len, :]
                 preview = self._unpack_latents(preview_latents, height, width, self.vae_scale_factor)
                 preview = preview.transpose(0,2).squeeze(0)
-                callback(i, preview, False)         
+                callback(i, preview, False)
+                del preview, preview_latents
+            del preview_x0
 
 
         self._current_timestep = None
