@@ -159,7 +159,10 @@ def resolve_prompt_enhancer_speculative_decoding(enhancer_enabled: Any, value: A
     model_label = {4: "Qwen3.5-9B", 6: "Qwen3.8-9B"}.get(enhancer_no, "Qwen3.8-27B")
     if float(total_vram_gb) <= 8:  # 8 GB GPUs: the drafter, its caches and graphs would take room from the model's blocks
         return 0, f"Speculative Decoding disabled automatically for {model_label}: {max(0.0, float(total_vram_gb)):.2f} GiB VRAM detected (8 GiB or less)."
-    sizes = None if fit is None else fit()
+    try:
+        sizes = None if fit is None else fit()
+    except Exception:  # the fit is a hint about the model's fit in VRAM: a probe that cannot read the checkpoints falls back to the model's VRAM size, it is never a reason to fail the prompt enhancer
+        sizes = None
     if sizes is not None:
         needed, extra, available = sizes
         gib = lambda nbytes: f"{nbytes / 2**30:.1f}"

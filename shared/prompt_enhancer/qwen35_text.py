@@ -144,18 +144,63 @@ def _qwen35_kv_bytes(config, kv_cache_layout: str, tokens: int) -> int:
     return layout.body_bytes_per_token(layers, kv_heads, head_dim) * tokens + layout.overlay_bytes(layers, kv_heads, head_dim, 256, 1)
 
 
+QWEN35_MTP_SHARED_WEIGHTS = ("token_embd", "output", "mtp.embed_tokens", "mtp.lm_head")  # the tables a drafter shares with the text model, kept in RAM by _map_qwen35_token_table
+
+
 def _qwen35_mtp_filename(spec, backend, model_path, prism_metadata):
     # the MTP drafter's own checkpoint, None when the text checkpoint holds it
     q3_filename = spec.get("text_gguf_q3_filename")
     uses_separate_q3_mtp = backend == enhancer_quantization_GGUF and q3_filename and os.path.basename(str(model_path or "")).lower() == q3_filename.lower()
-    return spec["text_gguf_ptq1_mtp_filename"] if prism_metadata else spec.get("text_gguf_q3_mtp_filename" if uses_separate_q3_mtp else "text_mtp_filename")
+    return spec.get("text_gguf_ptq1_mtp_filename") if prism_metadata else spec.get("text_gguf_q3_mtp_filename" if uses_separate_q3_mtp else "text_mtp_filename")
 
 
-def qwen35_mtp_fit(assets_dir: str | None, variant: str | None, backend: str, model_path: str | None, kv_cache_layout: str):
+def _is_gguf_container(file_path: str) -> bool:
+    """True when a file opens with the GGUF magic. It tells a GGUF checkpoint apart from the safetensors
+    drafter of the Qwen3.5-9B variant, from a Git LFS pointer left by a download that never resolved the
+    large file, and from a truncated download, before the index parser raises "GGUF magic invalid" and
+    takes the prompt enhancer load down with it."""
+    try:
+        with open(file_path, "rb") as reader:
+            return reader.read(4) == b"GGUF"
+    except OSError:
+        return False
+
+
+def _safetensors_tensor_bytes(file_path: str) -> int | None:
+    """The bytes a safetensors checkpoint takes in VRAM, reading only its header. None when the file is not
+    safetensors. The token tables of the drafter are shared with the text model (the GGUF branch of the fit
+    skips "token_embd.weight" for the same reason), so the shared names below are not counted twice."""
+    try:
+        file_size = os.path.getsize(file_path)
+        with open(file_path, "rb") as reader:
+            header_size = int.from_bytes(reader.read(8), "little")
+            # a file that is not safetensors opens with text, and its first eight bytes read as a header
+            # size far beyond the file: the header is only read when the file is large enough to hold it
+            if header_size <= 0 or header_size > file_size - 8:
+                return None
+            header = json.loads(reader.read(header_size))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(header, dict):
+        return None
+    shared = tuple(f"{name}." for name in QWEN35_MTP_SHARED_WEIGHTS)
+    total = 0
+    for name, info in header.items():
+        if name == "__metadata__" or not isinstance(info, dict) or "data_offsets" not in info:
+            continue
+        if name == "token_embd.weight" or any(name.startswith(prefix) for prefix in shared):
+            continue
+        begin, end = info["data_offsets"]
+        total += max(0, int(end) - int(begin))
+    return total
+
+
+def _qwen35_mtp_fit_sizes(assets_dir: str | None, variant: str | None, backend: str, model_path: str | None, kv_cache_layout: str):
     """For speculative decoding Auto: (VRAM the text model needs without MTP, VRAM the MTP drafter adds, VRAM this process may hold), in
     bytes. The weights are the GGUF tensors the GPU holds (the token table is read in place from RAM), beside the KV cache of Deepy's
     context, the activations and the margins of MMGP's dynamic preload; the drafter adds its layer and its own BF16 KV cache. None when the
-    checkpoint is not GGUF or not downloaded yet."""
+    checkpoint is not GGUF, when the drafter ships as safetensors and its header cannot be read, and when the
+    files are not downloaded yet."""
     from mmgp import allocator, auto_preload, memory_pressure
     from shared.qtypes import gguf
     from shared.qtypes.prism import get_prism_metadata
@@ -177,11 +222,19 @@ def qwen35_mtp_fit(assets_dir: str | None, variant: str | None, backend: str, mo
     weights = sum(nbytes for name, nbytes in tensors if not drafter(name) and name != in_ram)
     mtp = sum(nbytes for name, nbytes in tensors if drafter(name))
     mtp_filename = _qwen35_mtp_filename(spec, backend, model_path, get_prism_metadata(model_path))
-    if mtp_filename:
-        mtp_path = _resolve_qwen35_checkpoint_file(assets_dir, mtp_filename, variant=variant)
+    if mtp_filename and not mtp:  # the drafter's own checkpoint, and only when the text checkpoint does not carry the MTP layer already
+        mtp_path = _resolve_qwen35_checkpoint_file(assets_dir, mtp_filename, variant=variant, error_if_none=False)
         if not mtp_path or not os.path.isfile(mtp_path):
             return None
-        mtp += sum(info.n_bytes for info in gguf._gguf_get_index(mtp_path).tensor_infos if info.name != "token_embd.weight")
+        if _is_gguf_container(mtp_path):
+            mtp += sum(info.n_bytes for info in gguf._gguf_get_index(mtp_path).tensor_infos if info.name != "token_embd.weight")
+        else:
+            # the drafter of the Qwen3.5-9B variant is the int8_convrot safetensors checkpoint the GGUF backend loads beside
+            # its GGUF weights, so its header gives the bytes, and the GGUF index parser would only raise "GGUF magic invalid"
+            drafter_bytes = _safetensors_tensor_bytes(mtp_path)
+            if drafter_bytes is None:
+                return None
+            mtp += drafter_bytes
     tokens = normalize_deepy_context_tokens(get_deepy_config_value(DEEPY_CONTEXT_TOKENS_KEY))
     kv_heads, head_dim = int(config.num_key_value_heads), int(getattr(config, "head_dim", int(config.hidden_size) // int(config.num_attention_heads)))
     work = _qwen35_kv_bytes(config, kv_cache_layout, tokens) + (QWEN35_LLM_ACTIVATIONS_MB << 20)
@@ -191,6 +244,16 @@ def qwen35_mtp_fit(assets_dir: str | None, variant: str | None, backend: str, mo
     else:
         available = torch.cuda.mem_get_info()[0] + torch.cuda.memory_reserved()
     return weights + work + margin, mtp + 2 * kv_heads * head_dim * 2 * tokens, available
+
+
+def qwen35_mtp_fit(assets_dir: str | None, variant: str | None, backend: str, model_path: str | None, kv_cache_layout: str):
+    """`_qwen35_mtp_fit_sizes` above, and None whenever the drafter's size cannot be measured: Auto then decides
+    on the model's VRAM size alone. The fit only steers a default choice, so a checkpoint it cannot read, a file
+    the asset manager has not downloaded and a card without CUDA are never a reason to fail the prompt enhancer."""
+    try:
+        return _qwen35_mtp_fit_sizes(assets_dir, variant, backend, model_path, kv_cache_layout)
+    except Exception:
+        return None
 
 
 def _map_qwen35_token_table(model) -> None:
