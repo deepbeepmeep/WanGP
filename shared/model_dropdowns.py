@@ -17,6 +17,7 @@ MODEL_STATUS_PREFIXES = {
 }
 MODEL_OUTPUT_FILTER_CONFIG_KEY = "model_output_filter"
 SHOW_ALL_MODEL_FILTER_CONFIG_KEY = "show_all_model_filter"
+INVERT_MODEL_SELECTION_CONFIG_KEY = "invert_model_selection"
 MODEL_OUTPUT_FILTER_ALL = "all"
 MODEL_OUTPUT_FILTER_VIDEO = "video"
 MODEL_OUTPUT_FILTER_IMAGE = "image"
@@ -122,7 +123,7 @@ def parse_model_selection(entry):
     return (int(level), key) if sep and level in ("1", "2") else (3, entry)
 
 
-def expand_model_selection(selection, model_types, get_parent_model_type, get_model_family):
+def expand_model_selection(selection, model_types, get_parent_model_type, get_model_family, inverted=False):
     expanded = []
     for entry in selection:
         level, key = parse_model_selection(entry)
@@ -131,12 +132,16 @@ def expand_model_selection(selection, model_types, get_parent_model_type, get_mo
         else:
             # a family: its group in the selector, or the handler's family (3D models are grouped by goal since 2026-10-29)
             expanded += [model_type for model_type in model_types if (key in (get_model_family(model_type, for_ui=True), get_model_family(model_type)) if level == 1 else get_parent_model_type(model_type) == key)]
+    if inverted:
+        excluded = set(expanded)
+        return [model_type for model_type in model_types if model_type not in excluded]
     return list(dict.fromkeys(expanded))
 
 
 def get_dropdown_model_types(deps):
-    dropdown_types = expand_model_selection(deps.transformer_types, deps.displayed_model_types, deps.get_parent_model_type, deps.get_model_family) if len(deps.transformer_types) > 0 else list(deps.displayed_model_types)
-    if deps.transformer_type not in dropdown_types:
+    inverted = bool(deps.server_config.get(INVERT_MODEL_SELECTION_CONFIG_KEY, False))
+    dropdown_types = expand_model_selection(deps.transformer_types, deps.displayed_model_types, deps.get_parent_model_type, deps.get_model_family, inverted=inverted) if len(deps.transformer_types) > 0 or inverted else list(deps.displayed_model_types)
+    if not inverted and deps.transformer_type not in dropdown_types:
         dropdown_types.append(deps.transformer_type)
     return list(dict.fromkeys(dropdown_types))
 
@@ -755,10 +760,19 @@ def get_sorted_dropdown(deps, dropdown_types, current_model_family, current_mode
     return sorted_familes, dropdown_types_list, dropdown_choices
 
 
-def generate_dropdown_model_list(deps, current_model_type, state=None):
+def generate_dropdown_model_list(deps, current_model_type, state=None, select_visible_model=False):
     model_filter = get_model_output_filter(deps, state)
-    dropdown_types = get_dropdown_model_types(deps)
-    dropdown_types = get_filtered_dropdown_model_types(deps, model_filter, dropdown_types)
+    selectable_dropdown_types = get_dropdown_model_types(deps)
+    dropdown_types = get_filtered_dropdown_model_types(deps, model_filter, selectable_dropdown_types)
+    if select_visible_model and deps.server_config.get(INVERT_MODEL_SELECTION_CONFIG_KEY, False):
+        if not selectable_dropdown_types:
+            return (
+                gr.Dropdown(choices=[], value=None, show_label=False, scale=2 if deps.three_levels_hierarchy else 1, elem_id="family_list", min_width=50, interactive=True),
+                gr.Dropdown(choices=[], value=None, show_label=False, scale=6, elem_id="model_base_types_list", visible=deps.three_levels_hierarchy, interactive=True),
+                gr.Dropdown(choices=[], value=None, show_label=False, scale=3, visible=not deps.three_levels_hierarchy, elem_id="model_list", interactive=True),
+            )
+        if current_model_type not in selectable_dropdown_types:
+            current_model_type = (dropdown_types or selectable_dropdown_types)[0]
     if current_model_type not in dropdown_types:
         dropdown_types.append(current_model_type)
     current_model_family = deps.get_model_family(current_model_type, for_ui=True)

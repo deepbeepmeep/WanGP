@@ -3642,7 +3642,11 @@ last_resolution = server_config.get("last_resolution_choice", None)
 if args.advanced: advanced = True 
 
 if transformer_type != None and not transformer_type in model_types and not transformer_type in models_def: transformer_type = None
-if transformer_type == None:
+if server_config.get(model_dropdowns.INVERT_MODEL_SELECTION_CONFIG_KEY, False):
+    selected_model_types = model_dropdowns.expand_model_selection(transformer_types, displayed_model_types, get_parent_model_type, get_model_family, inverted=True)
+    if transformer_type not in selected_model_types:
+        transformer_type = selected_model_types[0] if len(selected_model_types) > 0 else "t2v"
+elif transformer_type == None:
     selected_model_types = model_dropdowns.expand_model_selection(transformer_types, displayed_model_types, get_parent_model_type, get_model_family)
     transformer_type = selected_model_types[0] if len(selected_model_types) > 0 else "t2v"
 
@@ -14698,8 +14702,8 @@ def create_models_selector_hierarchy(dropdown_types=None):
 def get_sorted_dropdown(dropdown_types, current_model_family, current_model_type, three_levels = True):
     return model_dropdowns.get_sorted_dropdown(_get_dropdown_deps(), dropdown_types, current_model_family, current_model_type, three_levels)
 
-def generate_dropdown_model_list(current_model_type, state=None):
-    return model_dropdowns.generate_dropdown_model_list(_get_dropdown_deps(), current_model_type, state)
+def generate_dropdown_model_list(current_model_type, state=None, select_visible_model=False):
+    return model_dropdowns.generate_dropdown_model_list(_get_dropdown_deps(), current_model_type, state, select_visible_model=select_visible_model)
 
 def change_model_family_target(state, evt: gr.SelectData):
     current_model_family = evt.value
@@ -14859,7 +14863,7 @@ def create_ui():
                         model_choice = gr.Dropdown(visible=False, value= transformer_type, choices= [transformer_type])
                     else:
                         model_filter = model_output_filter.create_filter(model_dropdowns.get_model_output_filter(_get_dropdown_deps()), model_dropdowns.available_output_filters(_get_dropdown_deps()))
-                        model_family, model_base_type_choice, model_choice = generate_dropdown_model_list(transformer_type)
+                        model_family, model_base_type_choice, model_choice = generate_dropdown_model_list(transformer_type, select_visible_model=True)
                         model_toolbar = model_selector_toolbar.create_toolbar(is_finetune_editor=finetune_editor.is_finetune_model(_get_finetune_editor_deps(), transformer_type))
                 if model_toolbar is not None:
                     model_selector_toolbar.create_search_panel(model_toolbar)

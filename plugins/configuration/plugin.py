@@ -242,6 +242,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
         self.request_global("is_generation_in_progress")
         self.request_global("generate_header")
         self.request_global("generate_dropdown_model_list")
+        self.request_global("_model_choice_target_value")
         self.request_global("_get_dropdown_deps")
         self.request_global("create_models_selector_hierarchy")
         self.request_global("get_unique_id")
@@ -258,6 +259,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
         self.request_component("model_family")
         self.request_component("model_base_type_choice")
         self.request_component("model_choice")
+        self.request_component("model_choice_target")
         self.request_component("model_filter")
         self.request_component("refresh_form_trigger")      
         self.request_component("state")
@@ -291,6 +293,12 @@ class ConfigTabPlugin(WAN2GPPlugin):
                             sort_hierarchy=False,
                             search_empty_label="No matching models",
                             elem_classes=["block"],
+                            interactive=not self.args.lock_config,
+                        )
+                        self.invert_model_selection_choice = gr.Checkbox(
+                            value=self.server_config.get(model_dropdowns.INVERT_MODEL_SELECTION_CONFIG_KEY, False),
+                            label="Invert selection (hide selected models)",
+                            info="Show unselected and new entries. Selected families and models are hidden together with all their finetunes, including future finetunes.",
                             interactive=not self.args.lock_config,
                         )
                         self.show_all_model_filter_choice = gr.Checkbox(
@@ -1021,7 +1029,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
 
         inputs = [
             self.state,
-            self.transformer_types_choices, self.show_all_model_filter_choice, self.model_hierarchy_type_choice, self.fit_canvas_choice,
+            self.transformer_types_choices, self.invert_model_selection_choice, self.show_all_model_filter_choice, self.model_hierarchy_type_choice, self.fit_canvas_choice,
             self.attention_choice, self.generation_preview_choice, self.preload_model_policy_choice, self.clear_file_list_choice, self.multi_prompts_gen_type_choice, self.keep_intermediate_sliding_windows_choice,
             self.display_stats_choice, self.max_frames_multiplier_choice, self.keep_resolution_on_model_switch_choice, self.enable_4k_resolutions_choice, self.checkpoints_paths_choice, self.loras_root_choice, self.save_queue_if_crash_choice,
             self.UI_theme_choice, self.floating_generate_button_choice, self.queue_color_scheme_choice, self.process_queues_when_browser_unfocused_choice, self.prevent_power_throttling_choice, self.compute_cache_choice, self.compute_cache_path_choice,
@@ -1084,14 +1092,23 @@ class ConfigTabPlugin(WAN2GPPlugin):
         )
 
         if self.model_filter is not None:
-            def refresh_model_filters(state):
+            def refresh_model_filters(state, select_visible_model=False):
                 deps = self._get_dropdown_deps()
                 selected_filter, _ = model_dropdowns.reconcile_model_output_filter_for_model_type(deps, state, state["model_type"])
-                return gr.update(value=model_output_filter.render_filter(selected_filter, model_dropdowns.available_output_filters(deps))), *self.generate_dropdown_model_list(state["model_type"], state)
+                return gr.update(value=model_output_filter.render_filter(selected_filter, model_dropdowns.available_output_filters(deps))), *self.generate_dropdown_model_list(state["model_type"], state, select_visible_model=select_visible_model)
 
             filter_outputs = [self.model_filter.html, self.model_family, self.model_base_type_choice, self.model_choice]
-            saved.then(refresh_model_filters, inputs=[self.state], outputs=filter_outputs, show_progress="hidden")
+            save_event = saved.then(lambda state: refresh_model_filters(state, select_visible_model=True), inputs=[self.state], outputs=filter_outputs, show_progress="hidden")
             self.show_all_model_filter_choice.change(refresh_model_filters, inputs=[self.state], outputs=filter_outputs, show_progress="hidden")
+        else:
+            save_event = saved
+
+        def switch_to_visible_model(state, model_type):
+            if model_type is None or model_type == state["model_type"]:
+                return gr.update()
+            return self._model_choice_target_value(model_type)
+
+        save_event.then(switch_to_visible_model, inputs=[self.state, self.model_choice], outputs=[self.model_choice_target], show_progress="hidden")
 
         def release_ram_and_notify(state):
             unload_models_from_ram(
@@ -1133,7 +1150,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             fixed_args = args
 
         (
-            transformer_types_choices, show_all_model_filter_choice, model_hierarchy_type_choice, fit_canvas_choice,
+            transformer_types_choices, invert_model_selection_choice, show_all_model_filter_choice, model_hierarchy_type_choice, fit_canvas_choice,
             attention_choice, generation_preview_choice, preload_model_policy_choice, clear_file_list_choice, multi_prompts_gen_type_choice, keep_intermediate_sliding_windows_choice,
             display_stats_choice, max_frames_multiplier_choice, keep_resolution_on_model_switch_choice, enable_4k_resolutions_choice, checkpoints_paths_choice, loras_root_choice, save_queue_if_crash_choice,
             UI_theme_choice, floating_generate_button_choice, queue_color_scheme_choice, process_queues_when_browser_unfocused_choice, prevent_power_throttling_choice, compute_cache_choice, compute_cache_path_choice,
@@ -1267,6 +1284,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
         new_server_config = copy.deepcopy(old_server_config)
         new_server_config.update({
             "attention_mode": attention_choice, "transformer_types": transformer_types_choices,
+            model_dropdowns.INVERT_MODEL_SELECTION_CONFIG_KEY: invert_model_selection_choice,
             model_dropdowns.SHOW_ALL_MODEL_FILTER_CONFIG_KEY: show_all_model_filter_choice,
             "generation_preview": generation_preview_choice,
             "text_encoder_quantization": text_encoder_quantization_choice, "save_path": save_path_choice,
@@ -1489,7 +1507,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
 
         model_type = state["model_type"]
         model_dropdowns.reconcile_model_output_filter_for_model_type(self._get_dropdown_deps(), state, model_type)
-        model_family_update, model_base_type_update, model_choice_update = self.generate_dropdown_model_list(model_type, state)
+        model_family_update, model_base_type_update, model_choice_update = self.generate_dropdown_model_list(model_type, state, select_visible_model=True)
         description_update, header_update = self.generate_header(model_type, compile=new_server_config["compile"], attention_mode=new_server_config["attention_mode"], overrides=overrides)
 
         if gen_in_progress:
