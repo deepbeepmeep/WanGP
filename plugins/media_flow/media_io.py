@@ -19,6 +19,7 @@ from shared.utils.video_decode import resolve_media_binary
 from shared.utils.video_metadata import DEFAULT_RESERVED_VIDEO_METADATA_BYTES, write_reserved_video_ffmetadata
 
 from . import constants
+from shared.utils.subprocess_stdin import child_kwargs
 
 DEFAULT_FFMPEG_TIMEOUT_SECONDS = float(os.getenv("WAN2GP_FFMPEG_TIMEOUT", "300.0"))
 
@@ -29,7 +30,7 @@ class ContinuationMergeOutputLockedError(PermissionError):
 
 
 def probe_resume_frame_count(ffprobe_path: str, output_path: str, fps_float: float) -> tuple[int, str]:
-    probe = subprocess.run([ffprobe_path, "-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries", "stream=nb_read_packets", "-of", "json", output_path], capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False)
+    probe = subprocess.run([ffprobe_path, "-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries", "stream=nb_read_packets", "-of", "json", output_path], capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False, **child_kwargs())
     if probe.returncode == 0:
         try:
             frame_count = int((((json.loads(probe.stdout).get("streams") or [{}])[0]).get("nb_read_packets")) or 0)
@@ -37,7 +38,7 @@ def probe_resume_frame_count(ffprobe_path: str, output_path: str, fps_float: flo
             frame_count = 0
         if frame_count > 0:
             return frame_count, ""
-    probe = subprocess.run([ffprobe_path, "-v", "error", "-select_streams", "v:0", "-count_frames", "-show_entries", "stream=nb_read_frames", "-of", "json", output_path], capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False)
+    probe = subprocess.run([ffprobe_path, "-v", "error", "-select_streams", "v:0", "-count_frames", "-show_entries", "stream=nb_read_frames", "-of", "json", output_path], capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False, **child_kwargs())
     if probe.returncode == 0:
         try:
             frame_count = int((((json.loads(probe.stdout).get("streams") or [{}])[0]).get("nb_read_frames")) or 0)
@@ -82,7 +83,7 @@ def _get_live_mux_output_args(video_container: str | None) -> list[str]:
 
 
 def _probe_media_duration(ffprobe_path: str, media_path: str) -> float:
-    result = subprocess.run([ffprobe_path, "-v", "error", "-show_entries", "format=duration", "-of", "json", media_path], capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False)
+    result = subprocess.run([ffprobe_path, "-v", "error", "-show_entries", "format=duration", "-of", "json", media_path], capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False, **child_kwargs())
     if result.returncode != 0:
         return 0.0
     try:
@@ -93,7 +94,7 @@ def _probe_media_duration(ffprobe_path: str, media_path: str) -> float:
 
 def _probe_audio_end_time(ffprobe_path: str, media_path: str, audio_index: int) -> float:
     stream_selector = f"a:{max(0, int(audio_index))}"
-    result = subprocess.run([ffprobe_path, "-v", "error", "-select_streams", stream_selector, "-show_entries", "stream=start_time,duration", "-of", "json", media_path], capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False)
+    result = subprocess.run([ffprobe_path, "-v", "error", "-select_streams", stream_selector, "-show_entries", "stream=start_time,duration", "-of", "json", media_path], capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False, **child_kwargs())
     if result.returncode == 0:
         try:
             stream = (((json.loads(result.stdout) or {}).get("streams") or [{}])[0])
@@ -116,7 +117,7 @@ def _probe_audio_end_time(ffprobe_path: str, media_path: str, audio_index: int) 
             encoding="utf-8",
             errors="ignore",
             check=False,
-        )
+         **child_kwargs())
         if result.returncode != 0:
             continue
         last_end = 0.0
@@ -184,7 +185,7 @@ def probe_selected_audio_overhang(ffprobe_path: str, media_path: str, audio_trac
                 encoding="utf-8",
                 errors="ignore",
                 check=False,
-            )
+             **child_kwargs())
             if result.returncode != 0:
                 continue
             for raw_line in result.stdout.splitlines():
@@ -206,7 +207,7 @@ def probe_selected_audio_overhang(ffprobe_path: str, media_path: str, audio_trac
 
 
 def _probe_audio_stream_codecs(ffprobe_path: str, media_path: str) -> list[str]:
-    result = subprocess.run([ffprobe_path, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index,codec_name", "-of", "json", media_path], capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False)
+    result = subprocess.run([ffprobe_path, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index,codec_name", "-of", "json", media_path], capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False, **child_kwargs())
     if result.returncode != 0:
         raise gr.Error((result.stderr or result.stdout or f"ffprobe failed for {media_path}").strip())
     try:
@@ -566,7 +567,7 @@ def _make_output_temp_dir(output_path: str, prefix: str) -> str:
 
 
 def _probe_media_stream_layout(ffprobe_path: str, media_path: str) -> tuple[int, int]:
-    result = subprocess.run([ffprobe_path, "-v", "error", "-show_entries", "stream=codec_type", "-of", "json", media_path], capture_output=True, text=True)
+    result = subprocess.run([ffprobe_path, "-v", "error", "-show_entries", "stream=codec_type", "-of", "json", media_path], capture_output=True, text=True, **child_kwargs())
     if result.returncode != 0:
         raise gr.Error((result.stderr or result.stdout or f"ffprobe failed for {media_path}").strip())
     try:
@@ -579,7 +580,7 @@ def _probe_media_stream_layout(ffprobe_path: str, media_path: str) -> tuple[int,
 
 
 def _probe_primary_video_codec(ffprobe_path: str, media_path: str) -> str:
-    result = subprocess.run([ffprobe_path, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "json", media_path], capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False)
+    result = subprocess.run([ffprobe_path, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "json", media_path], capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False, **child_kwargs())
     if result.returncode != 0:
         raise gr.Error((result.stderr or result.stdout or f"ffprobe failed for {media_path}").strip())
     try:
@@ -592,7 +593,7 @@ def _probe_primary_video_codec(ffprobe_path: str, media_path: str) -> str:
 
 
 def _probe_primary_video_start_time(ffprobe_path: str, media_path: str) -> float:
-    result = subprocess.run([ffprobe_path, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=start_time", "-of", "json", media_path], capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False)
+    result = subprocess.run([ffprobe_path, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=start_time", "-of", "json", media_path], capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False, **child_kwargs())
     if result.returncode == 0:
         try:
             stream = (((json.loads(result.stdout) or {}).get("streams") or [{}])[0])
@@ -610,7 +611,7 @@ def _probe_video_packet_times(ffprobe_path: str, media_path: str, *, start_secon
     if start_seconds is not None and duration_seconds is not None and float(duration_seconds) > 0.0:
         command += ["-read_intervals", f"{max(0.0, float(start_seconds)):.6f}%+{max(0.05, float(duration_seconds)):.6f}"]
     command += ["-show_packets", "-show_entries", "packet=dts_time,pts_time", "-of", "json", media_path]
-    result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False)
+    result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False, **child_kwargs())
     if result.returncode != 0:
         raise gr.Error((result.stderr or result.stdout or f"ffprobe failed for {media_path}").strip())
     try:
@@ -704,12 +705,12 @@ def _concat_audio_segments(ffmpeg_path: str, segment_paths: list[str], output_pa
             if duration_seconds is not None and duration_seconds > 0.0:
                 command += ["-t", f"{duration_seconds:.12g}"]
             command += ["-map", f"0:a:{audio_stream_index}?", "-c", "copy", "-avoid_negative_ts", "make_zero", extracted_path]
-            result = subprocess.run(command, capture_output=True, text=True)
+            result = subprocess.run(command, capture_output=True, text=True, **child_kwargs())
             if result.returncode != 0 or not os.path.isfile(extracted_path):
                 raise gr.Error((result.stderr or result.stdout or f"ffmpeg failed to extract audio from {segment_path}").strip())
             extracted_paths.append(extracted_path)
         _write_concat_list(list_path, extracted_paths)
-        result = subprocess.run([ffmpeg_path, "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", output_path], capture_output=True, text=True)
+        result = subprocess.run([ffmpeg_path, "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", output_path], capture_output=True, text=True, **child_kwargs())
         if result.returncode != 0 or not os.path.isfile(output_path):
             raise gr.Error((result.stderr or result.stdout or "ffmpeg failed to concatenate audio streams").strip())
     finally:
@@ -795,7 +796,7 @@ def concat_video_segments(
                 if mux_process.stdin is None:
                     raise gr.Error("ffmpeg source-audio merge did not expose a writable video pipe.")
                 for segment_path in segment_paths:
-                    segment_process = subprocess.Popen([ffmpeg_path, "-v", "error", "-i", segment_path, "-map", "0:v:0", "-c", "copy", "-bsf:v", reconstructed_video_bsf, "-f", "mpegts", "-"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+                    segment_process = subprocess.Popen([ffmpeg_path, "-v", "error", "-i", segment_path, "-map", "0:v:0", "-c", "copy", "-bsf:v", reconstructed_video_bsf, "-f", "mpegts", "-"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, **child_kwargs())
                     try:
                         if segment_process.stdout is None:
                             raise gr.Error(f"ffmpeg failed to expose the TS stream for {segment_path}.")
@@ -828,7 +829,7 @@ def concat_video_segments(
             ts_paths: list[str] = []
             for index, segment_path in enumerate(segment_paths, start=1):
                 ts_path = os.path.join(concat_dir, f"segment_{index}.ts")
-                result = subprocess.run([ffmpeg_path, "-y", "-v", "error", "-i", segment_path, "-map", "0:v:0", "-c", "copy", "-bsf:v", reconstructed_video_bsf, "-f", "mpegts", ts_path], capture_output=True, text=True)
+                result = subprocess.run([ffmpeg_path, "-y", "-v", "error", "-i", segment_path, "-map", "0:v:0", "-c", "copy", "-bsf:v", reconstructed_video_bsf, "-f", "mpegts", ts_path], capture_output=True, text=True, **child_kwargs())
                 if result.returncode != 0 or not os.path.isfile(ts_path):
                     raise gr.Error((result.stderr or result.stdout or f"ffmpeg failed to prepare {segment_path} for concat").strip())
                 ts_paths.append(ts_path)
@@ -836,7 +837,7 @@ def concat_video_segments(
                 for ts_path in ts_paths:
                     with open(ts_path, "rb") as ts_file:
                         shutil.copyfileobj(ts_file, handle, length=1024 * 1024)
-            result = subprocess.run([ffmpeg_path, "-y", "-v", "error", "-i", concat_ts_path, "-map", "0:v:0", "-c", "copy", merged_video_path], capture_output=True, text=True)
+            result = subprocess.run([ffmpeg_path, "-y", "-v", "error", "-i", concat_ts_path, "-map", "0:v:0", "-c", "copy", merged_video_path], capture_output=True, text=True, **child_kwargs())
             if result.returncode != 0 or not os.path.isfile(merged_video_path):
                 raise gr.Error((result.stderr or result.stdout or "ffmpeg failed to concatenate video stream").strip())
             command = [ffmpeg_path, "-y", "-v", "error", "-i", merged_video_path]
@@ -868,7 +869,7 @@ def concat_video_segments(
             if is_quicktime_output_container(video_container):
                 command += ["-movflags", "+faststart"]
             command += [temp_output_path]
-            result = subprocess.run(command, capture_output=True, text=True)
+            result = subprocess.run(command, capture_output=True, text=True, **child_kwargs())
             if result.returncode != 0 or not os.path.isfile(temp_output_path):
                 raise gr.Error((result.stderr or result.stdout or "ffmpeg concat failed").strip())
         timeline_gap = _probe_video_frame_gap(ffprobe_path, temp_output_path, fps_value, near_time=_probe_media_duration(ffprobe_path, segment_paths[0]))

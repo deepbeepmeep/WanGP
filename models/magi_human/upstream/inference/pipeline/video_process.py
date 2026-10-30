@@ -26,6 +26,7 @@ from scipy.signal import resample
 from torch.nn import functional as F
 
 from inference.utils import print_rank_0
+from shared.utils.subprocess_stdin import child_kwargs
 
 
 def merge_video_and_audio(video_path: str, audio_path: str, save_path: str):
@@ -50,7 +51,7 @@ def merge_video_and_audio(video_path: str, audio_path: str, save_path: str):
         "error",
     ]
     try:
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, **child_kwargs())
         os.remove(video_path)
         os.remove(audio_path)
     except subprocess.CalledProcessError as e:
