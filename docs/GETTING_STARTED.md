@@ -90,6 +90,20 @@ Let's generate a simple text-to-video:
 
 ## Basic Settings Explained
 
+### Output File Names
+
+Generated files are named automatically by default (timestamp, seed and a short version of the prompt). The name can be customized with a template in two places:
+
+- **Misc tab → Output Filename**: applies to one model and is saved in `settings/<model>_settings.json` (via *Set Settings as Default*)
+- **Configuration → Outputs → Default Output Filename (all models)**: a global default saved in `wgp_config.json`, used for every model that does not have its own value
+
+Resolution order per generation: the Misc box value (if not empty) → the model settings file value → the global default → the automatic naming. Both templates use the placeholders listed in the Misc tab hint.
+
+Notes:
+
+- No GUI restart is needed for filename changes: the model settings file is re-read on every generation and the global default is read from the current server configuration. The Misc box keeps the value it was initialized with until the form is rebuilt (model switch or restart).
+- A template in the model settings file or the global default that uses a placeholder that does not exist, such as `{model}`, is skipped with a console warning and the automatic naming is used instead. A template typed directly in the Misc box stops the generation with an error, so a typo is noticed at once. A date format that `{date(...)}` does not recognize is not an error: the default timestamp is used.
+
 ### Generation Settings
 - **Frames**: Number of frames (more = longer video)
   - 25 frames ≈ 1 second

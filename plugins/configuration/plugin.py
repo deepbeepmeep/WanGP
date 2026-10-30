@@ -884,6 +884,11 @@ class ConfigTabPlugin(WAN2GPPlugin):
                         value=self.server_config.get("keep_intermediate_sliding_windows", 1),
                         label="Keep Intermediate Sliding Windows"
                     )
+                    self.output_filename_default_choice = gr.Textbox(
+                        value=self.server_config.get("output_filename_default", ""),
+                        label="Default Output Filename (all models)",
+                        info="Template used when a model has no Output Filename set in the Misc tab. Same placeholders as the Misc box (see docs/GETTING_STARTED.md)."
+                    )
                     self.workspace_storage_choice = gr.Radio(choices=[('Shared Output Folders', 'shared'), ('Dedicated Folder per Workspace', 'dedicated')], value=self.server_config.get('workspace_storage_mode', 'shared'), label='Default Storage for New Workspaces', info='Existing workspaces keep their storage mode. Convert them in the workspace manager. Dedicated workspaces use the Workspaces Root instead of the shared output folders below.')
                     self.workspaces_root_choice = gr.Textbox(label='Workspaces Root (requires restart)', value=self.server_config.get('workspaces_dir', 'workspaces'), info='Contains workspace JSON files and dedicated media folders. Move the complete existing root before changing this path. --workspaces-dir overrides this value.')
                     gr.Markdown('### Shared Workspace Output Folders\nExisting shared workspaces keep using these folders, even when new workspaces use dedicated folders. To move an existing workspace, convert it in Workspace Manager; changing the default above does not move its media.')
@@ -1043,7 +1048,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             self.deepy_type_choice, self.deepy_vram_mode_choice, self.deepy_voice_language_choice, self.voice_mode_choice, self.deepy_allow_read_file_system_choice, self.deepy_file_system_paths_choice, self.deepy_read_everywhere_choice,
             self.deepy_context_tokens_choice, self.deepy_kv_cache_quantization_choice, self.deepy_kv_cache_exact_choice, self.deepy_compaction_type_choice, self.deepy_repetition_penalty_choice, self.deepy_zero_custom_system_prompt_choice, self.deepy_prime_custom_system_prompt_choice, self.deepy_prime_mcp_servers_choice, self.deepy_mcp_auto_discover_paths_choice, self.deepy_python_sandbox_choice, self.python_apps_choice, self.deepy_web_search_choice, self.civitai_api_key_choice, self.civitai_api_key_secure_choice, self.huggingface_token_choice, self.huggingface_token_secure_choice,
             self.video_container_choice, self.video_output_codec_choice, self.rgba_video_output_choice, self.hdr_video_crf_choice, self.image_output_codec_choice, self.audio_output_codec_choice, self.audio_stand_alone_output_codec_choice,
-            self.metadata_choice, self.embed_source_images_choice,
+            self.metadata_choice, self.embed_source_images_choice, self.output_filename_default_choice,
             self.video_save_path_choice, self.image_save_path_choice, self.audio_save_path_choice, self.mesh_save_path_choice,
             self.workspace_storage_choice, self.workspaces_root_choice, self.mcp_workspace_mode_choice, self.mcp_port_choice, self.mcp_webui_choice, self.mcp_workspace_visibility_choice, self.mcp_visual_inspection_choice,
             self.notification_sound_enabled_choice, self.notification_sound_volume_choice, self.notification_apprise_urls_choice, self.notification_secure_storage_choice, self.notification_on_generation_choice, self.notification_on_queue_complete_choice, self.notification_on_queue_interrupted_choice,
@@ -1155,7 +1160,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             deepy_type_choice, deepy_vram_mode_choice, deepy_voice_language_choice, voice_mode_choice, deepy_allow_read_file_system_choice, deepy_file_system_paths_choice, deepy_read_everywhere_choice,
             deepy_context_tokens_choice, deepy_kv_cache_quantization_choice, deepy_kv_cache_exact_choice, deepy_compaction_type_choice, deepy_repetition_penalty_choice, deepy_zero_custom_system_prompt_choice, deepy_prime_custom_system_prompt_choice, deepy_prime_mcp_servers_choice, deepy_mcp_auto_discover_paths_choice, deepy_python_sandbox_choice, python_apps_choice, deepy_web_search_choice, civitai_api_key_choice, civitai_api_key_secure_choice, huggingface_token_choice, huggingface_token_secure_choice,
             video_container_choice, video_output_codec_choice, rgba_video_output_choice, hdr_video_crf_choice, image_output_codec_choice, audio_output_codec_choice, audio_stand_alone_output_codec_choice,
-            metadata_choice, embed_source_images_choice,
+            metadata_choice, embed_source_images_choice, output_filename_default_choice,
             save_path_choice, image_save_path_choice, audio_save_path_choice, mesh_save_path_choice,
             workspace_storage_choice, workspaces_root_choice, mcp_workspace_mode_choice, mcp_port_choice, mcp_webui_choice, mcp_workspace_visibility_choice, mcp_visual_inspection_choice,
             notification_sound_enabled_choice, notification_sound_volume_choice, notification_apprise_urls_choice, notification_secure_storage_choice, notification_on_generation_choice, notification_on_queue_complete_choice, notification_on_queue_interrupted_choice,
@@ -1319,6 +1324,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             COMPUTE_CACHE_KEY: compute_cache_choice, COMPUTE_CACHE_PATH_KEY: compute_cache_path_choice,
             "embed_source_images": embed_source_images_choice,
             "video_container": video_container_choice,
+            "output_filename_default": output_filename_default_choice,
         })
         # Preserve saved values for controls hidden by the selected engine or Deepy mode.
         if not deepy_remote:
@@ -1418,7 +1424,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             "prompt_enhancer_temperature", "prompt_enhancer_top_p", "prompt_enhancer_randomize_seed", "prompt_enhancer_quantization", PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY, "enhancer_mode",
             DEEPY_ENABLED_KEY, DEEPY_TYPE_KEY, DEEPY_VRAM_MODE_KEY, DEEPY_ALLOW_READ_FILE_SYSTEM_KEY, DEEPY_FILE_SYSTEM_PATHS_KEY, DEEPY_READ_EVERYWHERE_KEY, DEEPY_CONTEXT_TOKENS_KEY, DEEPY_KV_CACHE_QUANTIZATION_KEY, DEEPY_COMPACTION_TYPE_KEY, DEEPY_COMPACTION_THINKING_KEY, DEEPY_REPETITION_PENALTY_KEY, DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY, DEEPY_PRIME_CUSTOM_SYSTEM_PROMPT_KEY, DEEPY_PRIME_MCP_SERVERS_KEY, DEEPY_MCP_AUTO_DISCOVER_PATHS_KEY, PYTHON_APPS_KEY,
             LLM_CONFIG_KEY,
-            "max_frames_multiplier", "display_stats", "keep_resolution_on_model_switch", "enable_4k_resolutions", "max_reserved_loras", "video_output_codec", "hdr_video_crf", "video_container",
+            "max_frames_multiplier", "display_stats", "keep_resolution_on_model_switch", "enable_4k_resolutions", "max_reserved_loras", "video_output_codec", "hdr_video_crf", "video_container", "output_filename_default",
             "embed_source_images", "image_output_codec", "audio_output_codec", "audio_stand_alone_output_codec", "checkpoints_paths", "loras_root", "save_queue_if_crash",
             "model_hierarchy_type", "UI_theme", "floating_generate_button", "queue_color_scheme", gradio_queue_focus_patch.FOCUS_QUEUE_SERVER_CONFIG_KEY, "prevent_power_throttling",
             COMPUTE_CACHE_KEY, COMPUTE_CACHE_PATH_KEY,

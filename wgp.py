@@ -3328,6 +3328,128 @@ def get_transformer_dtype(model_type, transformer_dtype_policy):
 def get_settings_file_name(model_type):
     return  os.path.join(args.settings, model_type + "_settings.json")
 
+def get_saved_output_filename(model_type):
+    """Return the Output Filename template saved in the model settings file, or "" if absent."""
+    try:
+        with open(get_settings_file_name(model_type), "r", encoding="utf-8") as f:
+            return json.load(f).get("output_filename", "") or ""
+    except (OSError, json.JSONDecodeError):
+        return ""
+
+def stored_output_filename_templates(model_type):
+    """(label, template) pairs of the stored Output Filename templates, in resolution order.
+
+    The model settings file value first, then the global Configuration >
+    Outputs default. They only apply when the Misc Output Filename box is
+    left empty.
+    """
+    return (
+        ("model settings file", get_saved_output_filename(model_type)),
+        ("Configuration > Outputs default", server_config.get("output_filename_default", "")),
+    )
+
+def precheck_output_filename(model_type, output_filename):
+    """Check output filename template compliance before a generation starts.
+
+    A template typed in the Misc Output Filename box must only use known
+    placeholders: if it is not compliant, fail now with a clear error instead
+    of only when the finished video is saved, where the failure would lose
+    the whole generation (which may have taken hours).
+
+    When the Misc box is empty, the stored templates cannot make a generation
+    fail: they are skipped with a console warning at save time (see
+    resolve_stored_output_filename). The same warning is printed here as well
+    so the user is informed before a long generation starts.
+    """
+    from shared.utils.filename_formatter import FilenameFormatter
+    if not len(output_filename or ""):
+        for label, template in stored_output_filename_templates(model_type):
+            if not len(template):
+                continue
+            try:
+                FilenameFormatter(template)
+            except ValueError as exc:
+                print(f"[Wan2GP] Ignoring {label} output filename template {template!r}: {exc}; using default naming")
+        return
+    try:
+        FilenameFormatter(output_filename)
+    except ValueError as exc:
+        raise ValueError(f"Invalid Output Filename template {output_filename!r}: {exc}. Fix the template or leave the box empty for auto naming, then start the generation again.")
+
+def resolve_stored_output_filename(model_type, settings):
+    """Fallback filename template for generations whose Misc Output Filename box is empty.
+
+    Resolution order: the model settings file value, then the global
+    Configuration > Outputs default. A stored template that cannot be formatted
+    is skipped with a console warning (and the next source tried) instead of
+    failing the generation, unlike a template typed in the Misc box.
+
+    Returns the formatted filename (without extension) or None, in which case
+    the caller falls back to the default auto naming.
+    """
+    from shared.utils.filename_formatter import FilenameFormatter
+    for label, template in stored_output_filename_templates(model_type):
+        if not len(template):
+            continue
+        try:
+            return FilenameFormatter.format_filename(template, settings)
+        except ValueError as exc:
+            print(f"[Wan2GP] Ignoring {label} output filename template {template!r}: {exc}; using default naming")
+    return None
+
+def validate_startup_output_filename():
+    """Report non-compliant stored output filename templates at server start.
+
+    The global default (Configuration > Outputs, "output_filename_default" in
+    wgp_config.json) is only loaded into the in-memory server config at
+    startup, and the per-model templates (settings/<model>_settings.json) are
+    only re-read when a generation for that model starts: this check is the
+    earliest moment a typo in them can be reported, before any video is
+    generated. It prints a console warning for each non-compliant template.
+    It never aborts the startup: per the stored-template policy, generations
+    still proceed with the next source in the chain (or automatic naming).
+    """
+    from shared.utils.filename_formatter import FilenameFormatter
+
+    def check(label, template, fallback_hint):
+        if not isinstance(template, str) or not len(template):
+            return
+        try:
+            FilenameFormatter(template)
+        except ValueError as exc:
+            print(f"[Wan2GP] WARNING: the {label} is not compliant and will be skipped at generation time:")
+            print(f"[Wan2GP]   template: {template!r}")
+            print(f"[Wan2GP]   {exc}")
+            print(f"[Wan2GP]   {fallback_hint}")
+
+    check(
+        "global default output filename template (Configuration > Outputs, \"output_filename_default\" in wgp_config.json)",
+        server_config.get("output_filename_default", ""),
+        "Generations with an empty Misc Output Filename box use the model settings file value or automatic naming. Fix the template in Configuration > Outputs or in wgp_config.json.",
+    )
+    settings_dir = args.settings
+    if os.path.isdir(settings_dir):
+        for file_name in sorted(os.listdir(settings_dir)):
+            if not file_name.endswith("_settings.json"):
+                continue
+            try:
+                with open(os.path.join(settings_dir, file_name), "r", encoding="utf-8") as f:
+                    stored = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(stored, dict):
+                continue
+            check(
+                f"output filename template in the model settings file {file_name}",
+                stored.get("output_filename", ""),
+                f"Generations with an empty Misc Output Filename box use the Configuration > Outputs default or automatic naming. Fix {file_name} via the Misc tab (Set Settings as Default).",
+            )
+
+
+# Report invalid stored output filename templates at server start, before any
+# generation can be started with them.
+validate_startup_output_filename()
+
 def fix_postprocess_audio_settings(ui_defaults, settings_version):
     return audio_processor_api.fix_settings(ui_defaults, settings_version, attachment_has_path_values=_attachment_has_path_values)
 
@@ -3723,6 +3845,7 @@ if not "max_reserved_loras" in server_config: server_config["max_reserved_loras"
 if not "image_output_codec" in server_config: server_config["image_output_codec"]= "jpeg_95"
 if not "audio_output_codec" in server_config: server_config["audio_output_codec"]= "aac_128"
 if not "audio_stand_alone_output_codec" in server_config: server_config["audio_stand_alone_output_codec"]= "wav"
+if not "output_filename_default" in server_config: server_config["output_filename_default"] = ""
 upsampler_api.require_upsampler_by_method("flashvsr").normalize_config()
 if "loras_root" not in server_config: server_config["loras_root"] = DEFAULT_LORA_ROOT
 if "save_queue_if_crash" not in server_config: server_config["save_queue_if_crash"] = 1
@@ -7562,6 +7685,10 @@ def generate_media(
                 video_length = min_frames_if_references if "I" in video_prompt_type or "V" in video_prompt_type else 1 
     else:
         batch_size = 1
+    # Check the output filename template before doing any work: a template
+    # with unknown placeholders would otherwise only fail when the finished
+    # video is saved, losing the whole generation (which may take hours).
+    precheck_output_filename(model_type, output_filename)
     temp_filenames_list = []
 
     if image_guide is not None:
@@ -9099,8 +9226,15 @@ def generate_media(
                     file_name = f"{sanitize_file_name(truncate_for_filesystem(os.path.splitext(os.path.basename(file_name))[0])).strip()}.{extension}"
                     file_name = os.path.basename(get_available_filename(output_dir, file_name))
                 else:
-                    prompt_name = sanitize_file_name(truncate_for_filesystem(save_prompt)).strip()
-                    file_name = f"{time_flag}_seed{seed}{'_' + prompt_name if prompt_name else ''}.{extension}"
+                    # No Misc box template: model settings file, then the global
+                    # Configuration > Outputs default, then the default auto naming
+                    file_name = resolve_stored_output_filename(model_type, inputs)
+                    if file_name is None:
+                        prompt_name = sanitize_file_name(truncate_for_filesystem(save_prompt)).strip()
+                        file_name = f"{time_flag}_seed{seed}{'_' + prompt_name if prompt_name else ''}.{extension}"
+                    else:
+                        file_name = f"{sanitize_file_name(truncate_for_filesystem(os.path.splitext(os.path.basename(file_name))[0])).strip()}.{extension}"
+                        file_name = os.path.basename(get_available_filename(output_dir, file_name))
                 video_path = os.path.join(output_dir, file_name)
                 saving_status = f"Saving File {file_name if len(file_name) <= 50 else file_name[:12] + '...' + file_name[-35:]}"
 
