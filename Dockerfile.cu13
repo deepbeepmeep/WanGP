@@ -1,0 +1,154 @@
+# Dockerfile.cu13
+# Specialized CUDA 13.0 build for Blackwell (sm_12x) and optimized FP8/FP4 support.
+#
+# Stages:
+#   sage-tools       — apt + uv + PyTorch + SageAttention cu130 NVCC build.
+#   blackwell-tools  — one-time NVFP4 kernel build (lightx2v_kernel).
+#   sage-compile     — production stage, downloads wheels from GitHub.
+#   deps             — installs wheels + requirements.txt.
+#   runtime          — source + SSH + filebrowser + entrypoint.
+
+ARG CUDA_ARCHITECTURES="8.0;8.6;8.9;9.0;10.0;12.0+PTX"
+ARG SAGE_VERSION="2.2.0"
+# REPO_OWNER defines where optimized wheels and kernel assets are hosted.
+# Overridden by CI (${{ github.repository }}) or build_local.sh (git remote).
+ARG REPO_OWNER="deepbeepmeep/Wan2GP"
+ARG FILEBROWSER_VERSION="2.32.0"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage: base
+# ─────────────────────────────────────────────────────────────────────────────
+FROM nvidia/cuda:13.0.0-cudnn-devel-ubuntu24.04 AS base
+
+ARG CUDA_ARCHITECTURES
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CONTAINER_CUDA_VERSION=13.0
+ENV LD_LIBRARY_PATH=""
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-dev python3-pip \
+    git wget curl cmake ninja-build \
+    libgl1 libglib2.0-0 ffmpeg \
+    openssh-server \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /usr/lib/python3.*/EXTERNALLY-MANAGED
+
+RUN pip install --no-cache-dir uv==0.6.2
+ENV PATH="/root/.local/bin:${PATH}"
+ENV UV_HTTP_TIMEOUT=300
+
+# Install PyTorch cu130 
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system \
+    torch==2.10.0+cu130 \
+    torchvision==0.25.0+cu130 \
+    torchaudio==2.10.0+cu130 \
+    torchao==0.16.0+cu130 \
+    --index-url https://download.pytorch.org/whl/cu130
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage: sage-tools
+# NVCC compiler for SageAttention. Only targeted by Factory CI.
+# ─────────────────────────────────────────────────────────────────────────────
+FROM base AS sage-tools
+ENV FORCE_CUDA="1"
+ARG CUDA_ARCHITECTURES
+ARG SAGE_VERSION
+
+RUN pip install wheel packaging && \
+    git clone --branch v${SAGE_VERSION} --depth 1 \
+    https://github.com/thu-ml/SageAttention.git /tmp/SageAttention && \
+    cd /tmp/SageAttention && \
+    export TORCH_CUDA_ARCH_LIST="${CUDA_ARCHITECTURES}" && \
+    MAX_JOBS=1 python3 setup.py bdist_wheel && \
+    mkdir -p /tmp/sa_dist && cp dist/*.whl /tmp/sa_dist/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage: blackwell-tools
+# One-time build for LightX2V kernels. Only targeted by Static Factory.
+# ─────────────────────────────────────────────────────────────────────────────
+FROM base AS blackwell-tools
+ARG CUDA_ARCHITECTURES
+
+RUN pip install scikit_build_core wheel && \
+    git clone https://github.com/NVIDIA/cutlass.git /opt/cutlass && \
+    git clone https://github.com/ModelTC/LightX2V.git /tmp/LightX2V && \
+    cd /tmp/LightX2V/lightx2v_kernel && \
+    export CUTLASS_PATH=/opt/cutlass && \
+    MAX_JOBS=1 CMAKE_BUILD_PARALLEL_LEVEL=1 \
+    uv build --wheel \
+      -Cbuild-dir=build . \
+      -Ccmake.define.CUTLASS_PATH=/opt/cutlass \
+      --no-build-isolation && \
+    mkdir -p /tmp/bw_dist && cp dist/*.whl /tmp/bw_dist/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage: sage-compile
+# Fast production base. Downloads wheels from GitHub Releases.
+# ─────────────────────────────────────────────────────────────────────────────
+FROM base AS sage-compile
+
+RUN ssh-keygen -A && \
+    sed -i \
+    -e 's/#\?\(PermitRootLogin\).*/\1 yes/' \
+    -e 's/#\?\(PubkeyAuthentication\).*/\1 yes/' \
+    -e 's/#\?\(PasswordAuthentication\).*/\1 no/' \
+    /etc/ssh/sshd_config && \
+    mkdir -p /run/sshd
+
+# Download SageAttention wheels (cu130)
+ARG SAGE_VERSION
+ARG REPO_OWNER
+RUN mkdir -p /opt/sage_wheels && \
+    cd /opt/sage_wheels && \
+    WURL="https://github.com/${REPO_OWNER}/releases/download/sage-v${SAGE_VERSION}-cu130-cp312" && \
+    curl -L -O "${WURL}/sageattention-${SAGE_VERSION}+ampere.ada.rtx30.40-cp312-cp312-linux_x86_64.whl" && \
+    curl -L -O "${WURL}/sageattention-${SAGE_VERSION}+hopper.h100.h200-cp312-cp312-linux_x86_64.whl" && \
+    curl -L -O "${WURL}/sageattention-${SAGE_VERSION}+blackwell.rtx50-cp312-cp312-linux_x86_64.whl"
+
+# Download Static Blackwell Kernels (NVFP4)
+RUN mkdir -p /opt/bw_wheels && \
+    cd /opt/bw_wheels && \
+    BURL="https://github.com/${REPO_OWNER}/releases/download/blackwell-kernels" && \
+    curl -L -O "${BURL}/lightx2v_kernel-0.0.1-cp39-abi3-linux_x86_64.whl" || echo "Optional BW Kernels"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage: deps
+# ─────────────────────────────────────────────────────────────────────────────
+FROM sage-compile AS deps
+COPY requirements.txt /workspace/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system -r /workspace/requirements.txt && \
+    uv pip install -U --system --force-reinstall "huggingface-hub==0.36.2" git+https://github.com/huggingface/diffusers@main
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage: runtime
+# ─────────────────────────────────────────────────────────────────────────────
+FROM deps AS runtime
+
+ARG FILEBROWSER_VERSION
+ARG CUDA_ARCHITECTURES
+ENV CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}
+
+# Filebrowser — lightweight browser-based file manager (optional, env-gated)
+RUN curl -fsSL \
+    "https://github.com/filebrowser/filebrowser/releases/download/v${FILEBROWSER_VERSION}/linux-amd64-filebrowser.tar.gz" \
+    -o /tmp/fb.tar.gz && \
+    tar -xzf /tmp/fb.tar.gz -C /usr/local/bin/ filebrowser && \
+    rm /tmp/fb.tar.gz
+
+# Project source baked into image (no host bind mount for cloud deployments).
+# /workspace/ maps to the pod network volume and persists across restarts.
+WORKDIR /workspace/wan2gp
+COPY . .
+
+RUN mkdir -p \
+    /workspace/models \
+    /workspace/outputs \
+    /workspace/.cache/huggingface \
+    /workspace/.cache/triton
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+EXPOSE 7860 22
+ENTRYPOINT ["/entrypoint.sh"]
