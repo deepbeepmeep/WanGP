@@ -542,7 +542,7 @@ class family_handler:
             "uint8_guides": ltx2_uint8_guides,
             "ltx2_22B_class": base_model_type in LTX2_22B_CLASS or ltx25,
             "ltx2_edit_anything": editanything_ref,
-            "infos": model_def.get("infos", LTX2_25_MSR_INFOS if ltx25 and msr else LTX2_25_INFOS if ltx25 else LTX2_MSR_V2_INFOS if msr_v2 else LTX2_MSR_INFOS if msr else LTX2_INFOS) + LTX2_SOL_INFOS,
+            "infos": (model_def.get("infos") or (LTX2_25_MSR_INFOS if ltx25 and msr else LTX2_25_INFOS if ltx25 else LTX2_MSR_V2_INFOS if msr_v2 else LTX2_MSR_INFOS if msr else LTX2_INFOS)) + LTX2_SOL_INFOS,
             "text_encoder_folder": gemma_folder,
             "text_encoder_URLs": [
                 build_hf_url("DeepBeepMeep/LTX-2", gemma_folder, gemma_files[0]),
@@ -569,7 +569,7 @@ class family_handler:
             "self_refiner_max_plans": 2,
             "custom_settings": [_PROMPT_RELAY_CUSTOM_SETTING.copy()],
             "custom_attention_modes": {
-                "sol": {"label": "Sol sparse attention, requires Triton and RTX 30xx or newer", "supports_sparsity": True},
+                "sol": {"label": "Sol sparse attention, requires Triton and an NVIDIA RTX 30/40/50-series GPU or newer", "supports_sparsity": True},
             },
             "attention_sparsity": {
                 "label": "Start Tau (higher = more sparse/faster; lower = more faithful; End Tau = 0.8)",
