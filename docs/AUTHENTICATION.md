@@ -58,7 +58,11 @@ Browser microphone recording can require trusted HTTPS even over a VPN. Native p
 
 By default, WanGP accepts browser origins using **HTTP or HTTPS** when the hostname and any explicit port match the request's Host header. This lets an HTTPS proxy forward HTTP to WanGP without a scheme mismatch. Different hostnames and explicit ports remain rejected. The rule applies to HTTP requests and shared WebSocket connections, with or without password authentication.
 
-If Nginx, Traefik, Cloudflare, RunPod, or another proxy preserves the public Host header, no public URL option is needed. WanGP accepts either browser scheme for that host, and the Gradio page corrects its API root to the browser's scheme. To restrict browser access to one exact origin, or handle a proxy that rewrites the Host header, set `--public-url`:
+If Nginx, Traefik, Cloudflare, RunPod, or another proxy preserves the public Host header, no public URL option is needed. WanGP accepts either browser scheme for that host, and the Gradio page corrects its API root to the browser's scheme.
+
+On HTTPS pages, the Gradio frontend also adds a `Content-Security-Policy` meta policy with `upgrade-insecure-requests`. This makes the browser upgrade HTTP subresource URLs, including absolute media URLs returned by later Gradio events, before requesting them. The policy applies to all insecure subresources, including third-party URLs; their HTTPS endpoints must be available because there is no HTTP fallback. Direct LAN access over HTTP does not receive this policy. This does not enable TLS on the backend, change authentication or origin checks, or replace HTTPS termination at the proxy. Test both audio/video playback and API requests after configuring a proxy.
+
+To restrict browser access to one exact origin, or handle a proxy that rewrites the Host header, set `--public-url`:
 
 ```bash
 python wgp.py --listen --public-url https://wangp.example.com
