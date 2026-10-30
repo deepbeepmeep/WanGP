@@ -25,6 +25,7 @@ class MyTemporalUpsampler:
             "description": "Interpolate smoother video frames.", # optional discovery fallback
             "method_descriptions": {"mytemporal": "..."},    # optional per-method descriptions
             "method_parameters": {"mytemporal": [...]},      # optional extra parameter descriptors
+            "method_short_labels": {"mytemporal": "MyTemp"}, # optional compact labels per method
         }
 
     def is_upsampling(self, value): ...                       # does this handler own the value?
@@ -82,10 +83,14 @@ Position is independent of multiplier; expanded choices such as `mytemporal*2`
 and `mytemporal*4` share the `mytemporal` method position.
 
 Discovery consumers infer the required `multiplier` parameter from
-`multipliers`. Optional `description`, `method_descriptions`, and
-`method_parameters` fields add reusable presentation and parameter metadata.
-The Post Processing and Late Postprocessing information popup automatically
-lists registered handlers using `description` and any per-method details from
+`multipliers`. Optional `description`, `method_descriptions`,
+`method_parameters` and `method_short_labels` fields add reusable presentation
+and parameter metadata. `method_short_labels` maps a method id to the compact
+name used by status lines and video metadata through
+`format_temporal_upsampling_label()`; methods without a short label keep their
+dropdown label, so handlers that predate this field are unaffected. The Post
+Processing and Late Postprocessing information popup automatically lists
+registered handlers using `description` and any per-method details from
 `method_descriptions`.
 Each `method_parameters` entry is a list of dictionaries with at least `name`;
 it may also define `type`, `description`, `required`, `default`, `enum`, and a

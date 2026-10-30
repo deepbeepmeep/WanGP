@@ -885,7 +885,7 @@ print(result.generated_files)
 
 Postprocessing values use the registered postprocessor value strings:
 
-- `temporal_upsampling`: registered temporal upsamplers such as `rife*2` or `dlssg*4` for videos, or texturers such as `supratex` for meshes.
+- `temporal_upsampling`: registered temporal upsamplers such as `rife*2`, `dlssg*4` or `dlssg_native*4` for videos, or texturers such as `supratex` for meshes.
 - `spatial_upsampling`: registered decoded-media upsamplers such as `lanczos*2`, `flashvsr*2`, `coz*4`, or the no-scale visual refiner `h3facerefine`. VAE upsamplers are model-pipeline features and are not accepted for late postprocessing.
 - `spatial_postprocessing_parameters` / `temporal_postprocessing_parameters`: the options of the spatial and of the temporal processor, each a dictionary keyed by the parameter ids returned by postprocessing discovery. For example, H3 accepts `prompt`, `face_count` and `face_strength`; the texturers accept `texture_size` and `texture_max_faces`.
 - `postprocessing_reference_images`: the reference images shared by both processors: H3's face references, or the object image of Hi3D and the texturers (their `reference_images` parameter).

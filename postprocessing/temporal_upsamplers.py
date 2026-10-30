@@ -6,8 +6,10 @@ Handlers expose methods and supported multipliers through
 ``query_temporal_upsampler_def()`` and may expose config controls under
 ``wgp_config["temporal_upsamplers"][config_key]``.
 Definitions may also expose an optional ``description`` plus optional
-``method_descriptions`` and ``method_parameters`` mappings for reusable
-discovery interfaces. Existing handlers without these fields remain valid.
+``method_descriptions``, ``method_parameters`` and ``method_short_labels``
+mappings for reusable discovery interfaces; short labels drive compact status
+and metadata text, while method labels drive the pickers. Existing handlers
+without these fields remain valid.
 
 The slot also holds the texturers of 3D assets: a definition declares the media kinds it processes in ``media``
 (default ``("video",)``; ``("3d",)`` for a texturer) and its ``postprocessing_category`` (``interpolator`` by default,
@@ -128,6 +130,13 @@ def _method_choices(handler_def: dict[str, Any]) -> list[tuple[str, str]]:
 
 def _method_labels(handler_def: dict[str, Any]) -> dict[str, str]:
     return {method: label for label, method in _method_choices(handler_def)}
+
+
+def _method_short_labels(handler_def: dict[str, Any]) -> dict[str, str]:
+    short_labels = handler_def.get("method_short_labels", {})
+    if not isinstance(short_labels, dict):
+        return {}
+    return {str(method): str(label) for method, label in short_labels.items()}
 
 
 def _config_key_from_handler_def(handler_def: dict[str, Any], fallback_name: str) -> str:
@@ -326,7 +335,8 @@ def format_temporal_upsampling_label(value) -> str:
     if split is None:
         return text
     method, scale = split
-    label = _method_labels(handler.query_temporal_upsampler_def()).get(method)
+    handler_def = handler.query_temporal_upsampler_def()
+    label = _method_short_labels(handler_def).get(method) or _method_labels(handler_def).get(method)
     if not label:
         return text
     return format_method_scale_label(label, scale) if method_multipliers(method) else label

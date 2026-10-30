@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import collections
 import argparse
 import json
@@ -11,6 +12,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 from fractions import Fraction
 from functools import lru_cache
 from pathlib import Path
@@ -27,6 +29,7 @@ RUNTIME = Path(__file__).resolve().parents[2] / "dlss5"
 HOST_DIR = RUNTIME / "host"
 DLSS_DIR = RUNTIME / "dlss"
 DLSSG_DIR = RUNTIME / "dlssg"
+DLSSG_NATIVE_DIR = RUNTIME / "dlssg-native"
 USE_DEPTH_GUIDE = True
 DEPTH_MODEL_VARIANT = "vitl"
 LEGACY_NR_WORKER = HOST_DIR / "nvngx.dll"
@@ -34,7 +37,57 @@ DEPTH_NR_WORKER = HOST_DIR / "nr-depth-worker.exe"
 NR_WORKER = DEPTH_NR_WORKER if USE_DEPTH_GUIDE else LEGACY_NR_WORKER
 DLSSG_LINUX = sys.platform == "linux"
 NR_WSL = DLSSG_LINUX and "microsoft" in platform.release().lower()
-DLSSG_WORKER = DLSSG_DIR / ("dlssg-worker" if DLSSG_LINUX else "dlssg-worker.exe")
+DLSSG_MULTIPLIERS = (2.0, 3.0, 4.0, 5.0, 6.0)
+DLSSG_LINUX_RUNTIME = "libnvidia-ngx-dlssg.so.310.9.16"
+DLSSG_LINUX_RUNTIME_DEV = "libnvidia-ngx-dlssg.so.310.7.0"
+DLSSG_NATIVE_METHOD = "dlssg_native"
+DLSSG_NATIVE_NAME = "DLSS FG Linux"
+
+
+@dataclass(frozen=True)
+class DlssgVariant:
+    """One Frame Generation worker plus the NVIDIA runtime installed next to it.
+
+    The Linux worker resolves its own directory through /proc/self/exe and
+    loads the NGX runtime from there (scripts/dlssg_worker_linux), so every
+    variant keeps its own directory: dlss5/dlssg is the upstream layout (x2
+    only on native Linux), dlss5/dlssg-native the multi-multiplier worker from
+    scripts/build_dlssg_worker_linux.sh. Both variants are offered in the UI at
+    the same time and the multiplier range shown next to each name is the one
+    the installed worker and GPU report, so the choice is made per generation
+    with no restart and no environment variable.
+    """
+
+    method: str
+    name: str
+    dir: Path
+    worker: Path
+    runtime: Path
+    native_linux: bool = False
+
+    @property
+    def files(self) -> tuple[Path, Path]:
+        return (self.runtime, self.worker)
+
+    @property
+    def label_path(self) -> str:
+        try:
+            return str(self.worker.relative_to(RUNTIME))
+        except ValueError:
+            return str(self.worker)
+
+
+DLSSG_UPSTREAM = DlssgVariant(
+    method="dlssg",
+    name="DLSS Frame Generation",
+    dir=DLSSG_DIR,
+    worker=DLSSG_DIR / ("dlssg-worker" if DLSSG_LINUX else "dlssg-worker.exe"),
+    runtime=DLSSG_DIR / ("nvngx_dlssg.dll" if os.name == "nt" else DLSSG_LINUX_RUNTIME),
+)
+# Aliases for the Neural Rendering path and the spatial upsampler, which always
+# run on the upstream worker.
+DLSSG_WORKER = DLSSG_UPSTREAM.worker
+DLSSG_RUNTIME = DLSSG_UPSTREAM.runtime
 
 NR_FILES = (
     HOST_DIR / "dxgi.dll",
@@ -43,7 +96,7 @@ NR_FILES = (
     DLSS_DIR / "nvngx_dlss.dll",
     NR_WORKER,
 )
-DLSSG_FILES = (DLSSG_DIR / ("libnvidia-ngx-dlssg.so.310.9.16" if DLSSG_LINUX else "nvngx_dlssg.dll"), DLSSG_WORKER)
+DLSSG_FILES = (DLSSG_RUNTIME, DLSSG_WORKER)
 
 NR_MODES = {
     1.0: ("DLAA", 5),
@@ -133,50 +186,256 @@ def _missing(files: tuple[Path, ...]) -> list[Path]:
     return [path for path in files if not path.is_file()]
 
 
-@lru_cache(maxsize=1)
-def dlssg_capabilities() -> dict:
-    if _missing(DLSSG_FILES) or (os.name != "nt" and not DLSSG_LINUX):
+_DLSSG_PROBES: dict[tuple[str, int], dict] = {}
+_DLSSG_PROBE_GPUS: dict[str, tuple[tuple[int, str], ...]] = {}
+_DLSSG_GPU_PINS: dict[str, int | None] = {}
+
+
+def _run_probe(variant: DlssgVariant, gpu_index: int) -> dict:
+    """One --probe run, remembered per GPU it was pinned to.
+
+    Unpinned, the worker prints "Device <i>: <name> ..." for every Vulkan GPU it
+    sees before picking one. That listing is what lets WanGP pin the worker to
+    the GPU WanGP runs on, because the Vulkan ICD ignores CUDA_VISIBLE_DEVICES.
+    """
+    key = (variant.method, gpu_index)
+    if key in _DLSSG_PROBES:
+        return _DLSSG_PROBES[key]
+    capabilities: dict = {}
+    devices: tuple[tuple[int, str], ...] = ()
+    if not _missing(variant.files) and (os.name == "nt" or DLSSG_LINUX):
+        command = [str(variant.worker), "--probe"] + (["--gpu", str(gpu_index)] if gpu_index >= 0 else [])
+        try:
+            result = subprocess.run(command, cwd=str(variant.dir), capture_output=True, text=True, timeout=15, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            parsed = json.loads(result.stdout.strip())
+            capabilities = parsed if isinstance(parsed, dict) and "available" in parsed else {}
+            if gpu_index < 0:
+                devices = tuple((int(index), name) for index, name in re.findall(r"^Device (\d+): (.+?) \(", result.stderr, re.MULTILINE))
+        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+            capabilities = {}
+    _DLSSG_PROBE_GPUS[variant.method] = devices or _DLSSG_PROBE_GPUS.get(variant.method, ())
+    _DLSSG_PROBES[key] = capabilities
+    return capabilities
+
+
+def _probe_gpu_name(capabilities: dict) -> str:
+    """The GPU the probe used, read out of its own report."""
+    gpu = str(capabilities.get("gpu", "") or "").strip()
+    if gpu:
+        return gpu
+    match = re.search(r"completed on (.+?)\.?$", str(capabilities.get("detail", "") or ""))
+    return match.group(1).strip() if match else ""
+
+
+def _pin_worker_gpu(variant: DlssgVariant, report: dict) -> int | None:
+    """The --gpu index putting the worker on WanGP's GPU, when there is one to pin.
+
+    None when the worker already chose that GPU, when WanGP is not restricted to
+    a GPU nvidia-smi can name, or when the worker's listing does not contain it.
+    """
+    if variant.method in _DLSSG_GPU_PINS:
+        return _DLSSG_GPU_PINS[variant.method]
+    wanted = _selected_gpu_names()[:1]
+    used = _probe_gpu_name(report)
+    pin = None
+    if wanted and used and used != wanted[0]:
+        for index, name in _DLSSG_PROBE_GPUS.get(variant.method, ()):
+            if name == wanted[0]:
+                pin = index
+                break
+    _DLSSG_GPU_PINS[variant.method] = pin
+    return pin
+
+
+def dlssg_capabilities(variant: DlssgVariant = DLSSG_UPSTREAM) -> dict:
+    """What the worker reports on the GPU WanGP runs on, not on the one it picks."""
+    report = _run_probe(variant, -1)
+    if not report:
         return {}
+    pin = _pin_worker_gpu(variant, report)
+    return (_run_probe(variant, pin) or report) if pin is not None else report
+
+
+def dlssg_gpu_args(variant: DlssgVariant = DLSSG_UPSTREAM) -> list[str]:
+    """The worker arguments pinning it to the GPU WanGP runs on."""
+    pin = _pin_worker_gpu(variant, _run_probe(variant, -1))
+    return [] if pin is None else ["--gpu", str(pin)]
+
+
+def dlssg_gpu_note(variant: DlssgVariant = DLSSG_UPSTREAM) -> str:
+    """The GPU Frame Generation runs on, for the log line; empty when unknown."""
+    pin = _pin_worker_gpu(variant, _run_probe(variant, -1))
+    if pin is None:
+        return _probe_gpu_name(dlssg_capabilities(variant))
+    for index, name in _DLSSG_PROBE_GPUS.get(variant.method, ()):
+        if index == pin:
+            return f"{name} (GPU {index})"
+    return ""
+
+
+def _worker_version(variant: DlssgVariant) -> int:
     try:
-        result = subprocess.run([str(DLSSG_WORKER), "--probe"], cwd=str(DLSSG_DIR), capture_output=True, text=True, timeout=15, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        capabilities = json.loads(result.stdout.strip())
-        return capabilities if isinstance(capabilities, dict) and "available" in capabilities else {}
-    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
-        return {}
-
-
-@lru_cache(maxsize=1)
-def _gpu_series() -> int:
-    if os.name != "nt" and not NR_WSL:
+        return int(dlssg_capabilities(variant).get("worker_version", 0) or 0)
+    except (TypeError, ValueError):
         return 0
+
+
+def _linux_runtime_version(name: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in name.removeprefix("libnvidia-ngx-dlssg.so.").split(".") if part.isdigit())
+
+
+def _newest_linux_runtime(directory: Path) -> Path:
+    # The worker loads the runtime sitting next to it, so the glob picks the
+    # newest version in the worker's own directory and falls back to the file
+    # scripts/build_dlssg_worker_linux.sh links in, for a clear "missing" report.
+    installed = [path for path in directory.glob("libnvidia-ngx-dlssg.so.*") if path.is_file()]
+    if not installed:
+        return directory / DLSSG_LINUX_RUNTIME_DEV
+    return max(installed, key=lambda path: _linux_runtime_version(path.name))
+
+
+def _native_variant() -> DlssgVariant | None:
+    if not DLSSG_LINUX:
+        return None
+    worker = DLSSG_NATIVE_DIR / "dlssg-worker"
+    directory = DLSSG_NATIVE_DIR
+    if not worker.is_file():
+        # No dedicated directory: dlss5/dlssg may hold a native worker built by
+        # scripts/build_dlssg_worker_linux.sh. The upstream Linux release is an
+        # x2-only worker, so sharing its directory requires a v2+ (multi-frame)
+        # worker; the probe reports that, and its result is cached.
+        worker, directory = DLSSG_DIR / "dlssg-worker", DLSSG_DIR
+        if not worker.is_file():
+            return None
+        candidate = DlssgVariant(DLSSG_NATIVE_METHOD, DLSSG_NATIVE_NAME, directory, worker, _newest_linux_runtime(directory), native_linux=True)
+        return candidate if _worker_version(candidate) >= 2 else None
+    return DlssgVariant(DLSSG_NATIVE_METHOD, DLSSG_NATIVE_NAME, directory, worker, _newest_linux_runtime(directory), native_linux=True)
+
+
+@lru_cache(maxsize=1)
+def dlssg_variants() -> tuple[DlssgVariant, ...]:
+    """Every Frame Generation worker installed on this host, in UI order."""
+    native = _native_variant()
+    return (DLSSG_UPSTREAM,) + ((native,) if native is not None else ())
+
+
+def _visible_cuda_devices() -> list[str] | None:
+    """The GPUs WanGP may use, as CUDA_VISIBLE_DEVICES lists them (indices or UUIDs).
+
+    None when the variable is unset, meaning every GPU of the host is fair game.
+    WanGP pins a GPU with --default-device-id, which ends up here, so a multi-GPU
+    host has one GPU to tier Frame Generation on.
+    """
+    raw = str(os.environ.get("CUDA_VISIBLE_DEVICES", "")).strip()
+    if not raw:
+        return None
+    return [token.strip() for token in raw.split(",") if token.strip()]
+
+
+def _nvidia_smi_gpus(nvidia_smi: str) -> tuple[tuple[str, str, str], ...]:
+    """(index, uuid, name) of every GPU nvidia-smi lists; () when it cannot answer."""
     try:
-        result = subprocess.run(["/usr/lib/wsl/lib/nvidia-smi" if NR_WSL else "nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], capture_output=True, text=True, timeout=5, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        result = subprocess.run([nvidia_smi, "--query-gpu=index,uuid,name", "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.TimeoutExpired):
+        return ()
+    rows = []
+    for line in result.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",", 2)]
+        if len(parts) == 3 and parts[0].isdigit():
+            rows.append((parts[0], parts[1], parts[2]))
+    return tuple(rows)
+
+
+def _selected_gpu_names() -> list[str]:
+    """The GPUs WanGP can run on, in CUDA_VISIBLE_DEVICES order; the first is the one it uses.
+
+    Empty when the host cannot be queried, which leaves the tiering at 0.
+    """
+    rows = _nvidia_smi_gpus("/usr/lib/wsl/lib/nvidia-smi" if NR_WSL else "nvidia-smi")
+    if not rows:
+        return []
+    names = [name for _index, _uuid, name in rows]
+    visible = _visible_cuda_devices()
+    if visible is None:
+        return names
+    by_token = {index: name for index, _uuid, name in rows}
+    by_token.update({uuid: name for _index, uuid, name in rows})
+    chosen = [by_token[token] for token in visible if token in by_token]
+    return chosen or names
+
+
+def _gpu_tier(name: str) -> int:
+    """The RTX series of one GPU name; 50 is what unlocks x5/x6, 0 means unknown."""
+    match = re.search(r"GeForce\s+RTX\s+(\d{2})\d{2}", name, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    # Workstation / datacenter cards carry no GeForce tag (e.g. RTX PRO
+    # 5000 Blackwell, RTX 5000 Ada, RTX A6000, L40S), so the GeForce-only
+    # match above reads them as series 0 and they falsely report
+    # "RTX 30+/40+ required". Tier them by architecture instead; GeForce
+    # behavior is unchanged.
+    up = name.upper()
+    if any(key in up for key in ("PRO 6000", "PRO 5000", "PRO 4000", "B100", "B200", "GB100", "H100", "H200")):
+        return 50
+    if "ADA" in up or "L40" in up or " L4" in up:
+        return 40
+    if "RTX A" in up or any(key in up for key in (" A40", " A30", " A16", " A10", " A80")):
+        return 30
+    if "QUADRO" in up:
+        return 20
+    match = re.search(r"RTX\D*?(\d{2})\d{2}", up)
+    return int(match.group(1)) if match else 0
+
+
+@lru_cache(maxsize=None)
+def _gpu_series(variant: DlssgVariant = DLSSG_UPSTREAM) -> int:
+    # nvidia-smi is available on Windows, Linux and WSL; the query is a no-op on
+    # hosts without an NVIDIA GPU (no series found). Upstream tiers only
+    # Windows / WSL hosts: the native Linux variant tiers its GPU as well.
+    if os.name != "nt" and not NR_WSL and not variant.native_linux:
         return 0
-    series = [int(match.group(1)) for match in re.finditer(r"GeForce\s+RTX\s+(\d{2})\d{2}", result.stdout, re.IGNORECASE)]
-    if not series:
-        # Workstation / datacenter cards carry no GeForce tag (e.g. RTX PRO
-        # 5000 Blackwell, RTX 5000 Ada, RTX A6000, L40S), so the GeForce-only
-        # match above reads them as series 0 and they falsely report
-        # "RTX 30+/40+ required". Tier them by architecture instead; GeForce
-        # behavior is unchanged.
-        up = result.stdout.upper()
-        if any(k in up for k in ("PRO 6000", "PRO 5000", "PRO 4000", "B100", "B200", "GB100", "H100", "H200")):
-            return 50
-        if "ADA" in up or "L40" in up or " L4" in up:
-            return 40
-        if "RTX A" in up or any(k in up for k in (" A40", " A30", " A16", " A10", " A80")):
-            return 30
-        if "QUADRO" in up:
-            return 20
-        match = re.search(r"RTX\D*?(\d{2})\d{2}", up)
-        if match:
-            return int(match.group(1))
-    return max(series, default=0)
+    # Frame Generation runs on the GPU WanGP runs on, so the ceiling is the
+    # weakest GPU WanGP may pick: a 5090 + 3090 host pinned to the 3090 tops out
+    # at x4, and a host pinning nothing is capped by its oldest card, because
+    # WanGP is free to run the job on that one.
+    tiers = [tier for tier in (_gpu_tier(name) for name in _selected_gpu_names()) if tier]
+    return min(tiers, default=0)
 
 
-def is_rtx_50_series() -> bool:
-    return _gpu_series() == 50
+def is_rtx_50_series(variant: DlssgVariant = DLSSG_UPSTREAM) -> bool:
+    return _gpu_series(variant) == 50
+
+
+def hardware_limit(variant: DlssgVariant = DLSSG_UPSTREAM) -> int:
+    # Upstream treats native Linux as an x2-only path; the native variant is
+    # tiered exactly like the Windows path.
+    if DLSSG_LINUX and not variant.native_linux:
+        return 2
+    return 6 if is_rtx_50_series(variant) else 4
+
+
+def multiplier_range(variant: DlssgVariant = DLSSG_UPSTREAM) -> tuple[float, float]:
+    """The xN..xM range this worker, runtime and GPU currently support."""
+    capabilities = dlssg_capabilities(variant)
+    worker_version = int(capabilities.get("worker_version", 0) or 0)
+    maximum = int(capabilities.get("multi_frame_count_max", 1) or 1)
+    cap = min(hardware_limit(variant), maximum + 1, 6 if worker_version >= 2 else 2)
+    return 2.0, float(min(6, max(2, cap)))
+
+
+def multipliers_for(variant: DlssgVariant = DLSSG_UPSTREAM) -> tuple[float, ...]:
+    low, high = multiplier_range(variant)
+    return tuple(scale for scale in DLSSG_MULTIPLIERS if low <= scale <= high)
+
+
+def nominal_multiplier_range(variant: DlssgVariant = DLSSG_UPSTREAM) -> tuple[float, float]:
+    """The xN..xM ceiling for this GPU; computable without a working probe."""
+    return 2.0, float(min(6, max(2, hardware_limit(variant))))
+
+
+def format_multiplier_range(variant: DlssgVariant = DLSSG_UPSTREAM, nominal: bool = False) -> str:
+    low, high = nominal_multiplier_range(variant) if nominal else multiplier_range(variant)
+    return f"x{low:g}" if high <= low else f"x{low:g}-x{high:g}"
 
 
 @lru_cache(maxsize=1)
@@ -193,22 +452,30 @@ def _hags_enabled() -> bool | None:
         return None
 
 
-def unavailable_reason(*, temporal: bool) -> str:
-    missing = _missing(DLSSG_FILES if temporal else NR_FILES)
+def unavailable_reason(*, temporal: bool, variant: DlssgVariant | None = None, short: bool = False) -> str:
+    if not temporal and os.name != "nt":
+        return "Windows only: ReShade/RenoDX"
+    variant = variant or DLSSG_UPSTREAM
+    missing = _missing(variant.files if temporal else NR_FILES)
     if missing:
         return f"missing {missing[0].name}"
     if temporal and DLSSG_LINUX:
-        capabilities = dlssg_capabilities()
+        capabilities = dlssg_capabilities(variant)
         if not capabilities:
-            return "Linux DLSS Frame Generation probe failed (run dlss5/dlssg/dlssg-worker --probe)"
-        return "" if capabilities["available"] else capabilities.get("reason", "NVIDIA Vulkan Frame Generation unavailable")
+            return f"Linux probe failed, run {variant.label_path} --probe" if short else f"Linux DLSS Frame Generation probe failed (run {variant.label_path} --probe)"
+        if capabilities["available"]:
+            return ""
+        detail = capabilities.get("reason") or capabilities.get("detail") or ""
+        if short:
+            return (detail.split(";")[0].strip() if detail else "") or "Linux Frame Generation unavailable"
+        return detail or "NVIDIA Vulkan Frame Generation unavailable"
     if not temporal and NR_WSL:
         interop = Path("/proc/sys/fs/binfmt_misc/WSLInterop")
         if not interop.is_file() or not interop.read_text().startswith("enabled\n"):
             return "WSL Windows interoperability must be enabled for Neural Rendering"
     elif os.name != "nt":
         return "Windows 11 required"
-    series = _gpu_series()
+    series = _gpu_series(variant)
     minimum = 40 if temporal else 30
     if series < minimum:
         return f"RTX {minimum}+ required"
@@ -216,14 +483,14 @@ def unavailable_reason(*, temporal: bool) -> str:
         hags_enabled = _hags_enabled()
         if hags_enabled is False:
             return "HAGS disabled"
-        capabilities = dlssg_capabilities()
+        capabilities = dlssg_capabilities(variant)
         if capabilities and not capabilities["available"]:
             return "DLSS Frame Generation unavailable (check HAGS and NVIDIA driver)"
     return ""
 
 
-def require_runtime(*, temporal: bool) -> None:
-    reason = unavailable_reason(temporal=temporal)
+def require_runtime(*, temporal: bool, variant: DlssgVariant | None = None) -> None:
+    reason = unavailable_reason(temporal=temporal, variant=variant)
     if reason:
         raise RuntimeError(f"DLSS {'Frame Generation' if temporal else 'Neural Rendering'} is unavailable: {reason}. See docs/DLSS5.md.")
 
@@ -557,8 +824,8 @@ class FrameGenerationSession(Worker):
     FRAME_MAGIC = 0x31464746
     FRAME_OUT_MAGIC = 0x314F4746
 
-    def __init__(self, width: int, height: int, frames: int, generated_count: int):
-        super().__init__([str(DLSSG_WORKER), "--serve"], DLSSG_DIR)
+    def __init__(self, width: int, height: int, frames: int, generated_count: int, variant: DlssgVariant = DLSSG_UPSTREAM):
+        super().__init__([str(variant.worker), "--serve", *dlssg_gpu_args(variant)], variant.dir)
         self.width, self.height = width, height
         self.generated_count = generated_count
         assert self.process.stdin is not None and self.process.stdout is not None
@@ -589,9 +856,12 @@ class FrameGenerationSession(Worker):
         return generated
 
 
-def _interpolate(frame_count: int, width: int, height: int, frame_getter, fps: float, scale: int, motion_vector: str, abort_callback=None, progress_callback=None) -> np.ndarray | None:
+def _interpolate(frame_count: int, width: int, height: int, frame_getter, fps: float, scale: int, motion_vector: str, abort_callback=None, progress_callback=None, variant: DlssgVariant = DLSSG_UPSTREAM) -> np.ndarray | None:
     generated_count = scale - 1
-    session = FrameGenerationSession(width, height, frame_count, generated_count)
+    session = FrameGenerationSession(width, height, frame_count, generated_count, variant)
+    gpu_note = dlssg_gpu_note(variant)
+    print(f"[DLSS 5] Frame Generation: {frame_count} input frames at {width}x{height}, x{scale} ({generated_count} generated frame(s) per pair) using {variant.worker.name} from {variant.dir.name}" + (f" on {gpu_note}" if gpu_note else ""))
+    start = time.perf_counter()
     completed = False
     try:
         guides = FlowGuides(width, height, motion_vector)
@@ -599,33 +869,48 @@ def _interpolate(frame_count: int, width: int, height: int, frame_getter, fps: f
         for index in range(frame_count):
             if abort_callback is not None and abort_callback():
                 return None
+            frame_start = time.perf_counter()
             frame = frame_getter(index)
             motion, reset = guides.process(frame)
             target_index = index * scale
             output[target_index] = frame
+            generated = 0
             if index == 0:
-                session.process_frame(index, frame, motion, Fraction(index, 1) / Fraction(str(fps)), reset)
+                generated = session.process_frame(index, frame, motion, Fraction(index, 1) / Fraction(str(fps)), reset)
             else:
                 generated_output = output[target_index - generated_count:target_index]
                 generated = session.process_frame(index, frame, motion, Fraction(index, 1) / Fraction(str(fps)), reset, generated_output)
                 if reset or not generated:
                     generated_output[:] = output[target_index - scale]
+            if reset:
+                status = "reset"
+            elif generated:
+                status = f"generated {generated} frame(s)"
+            else:
+                status = "disabled, carried previous frame forward"
+            print(f"[DLSS 5] Frame Generation {index + 1}/{frame_count}: {status} in {time.perf_counter() - frame_start:.2f} s")
             if progress_callback is not None:
                 progress_callback("DLSS Frame Generation", index + 1, frame_count)
             del frame, motion
         if abort_callback is not None and abort_callback():
             return None
         completed = True
+        elapsed = time.perf_counter() - start
     finally:
         try:
             session.close(abort=not completed)
         finally:
             offload_registry.unload_vram(list(_GUIDE_OFFLOADS))
+    if completed:
+        print(f"[DLSS 5] Frame Generation finished: {frame_count} input frames -> {output.shape[0]} output frames in {elapsed:.1f} s ({frame_count / elapsed:.1f} input fps -> {output.shape[0] / elapsed:.1f} output fps)")
+        for line in session.logs:
+            print(f"[DLSS 5] worker: {line}")
     return output
 
 
-def frame_generate(sample: torch.Tensor, previous_last_frame: torch.Tensor | None, fps: float, scale: int, *, motion_vector: str, abort_callback=None, progress_callback=None) -> tuple[torch.Tensor | None, torch.Tensor, float]:
-    require_runtime(temporal=True)
+def frame_generate(sample: torch.Tensor, previous_last_frame: torch.Tensor | None, fps: float, scale: int, *, motion_vector: str, abort_callback=None, progress_callback=None, variant: DlssgVariant | None = None) -> tuple[torch.Tensor | None, torch.Tensor, float]:
+    variant = variant or DLSSG_UPSTREAM
+    require_runtime(temporal=True, variant=variant)
     dtype, device, channels, frame_count, height, width = _sample_info(sample)
     next_previous = sample[:, -1:].clone()
     has_previous = previous_last_frame is not None
@@ -634,7 +919,7 @@ def frame_generate(sample: torch.Tensor, previous_last_frame: torch.Tensor | Non
     def input_frame(index):
         return _frame_to_rgba(previous_last_frame if has_previous and index == 0 else sample, index - 1 if has_previous else index)
 
-    output = _interpolate(input_count, width, height, input_frame, fps, scale, motion_vector, abort_callback=abort_callback, progress_callback=progress_callback)
+    output = _interpolate(input_count, width, height, input_frame, fps, scale, motion_vector, abort_callback=abort_callback, progress_callback=progress_callback, variant=variant)
     if output is None:
         return None, next_previous, fps * scale
     if has_previous:
