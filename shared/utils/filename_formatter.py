@@ -10,6 +10,11 @@ Example usage:
     filename = FilenameFormatter.format_filename(template, settings)
     # Result: "2025-01-15-14h30m45s-A_beautiful_sunset_over_the_ocean-12345"
 
+    Placeholder syntax:
+        {key}                -> value from the settings
+        {key(arg)}           -> optional argument (date format, or max length for {prompt})
+        {key:fmt}            -> Python format spec applied to the value, e.g. {scale:.2f}, {steps:.0f}
+
 Date format examples:
     {date}                      -> 2025-01-15-14h30m45s (default)
     {date(YYYY-MM-DD)}          -> 2025-01-15
@@ -33,12 +38,22 @@ class FilenameFormatter:
     - {date(YYYY-MM-DD)} - date with custom format and separator
     - {date(YYYY-MM-DD_HH-mm-ss)} - date and time with custom separators
     - {seed} - generation seed
-    - {resolution} - video resolution (e.g., "1280x720")
+    - {model} or {model_type} - model type (e.g., "ltx2.5", "wan1.3")
+    - {resolution} - selected resolution (e.g., "1280x720 (16:9)")
+    - {width} / {height} - effective output dimensions (after spatial upsampling)
+    - {fps} - effective output fps (after temporal upsampling)
+    - {scale} - spatial upsampling factor (1 when no spatial upsampler is used)
     - {num_inference_steps} or {steps} - number of inference steps
     - {prompt} or {prompt(50)} - prompt text with optional max length
     - {flow_shift} - flow shift value
-    - {video_length} or {frames} - video length in frames
+    - {video_length} or {frames} - output frame count
     - {guidance_scale} or {cfg} - guidance scale value
+    - {teacache} - TeaCache tag (e.g., "tc1.00"), empty when TeaCache is disabled
+    - {sliding_window_size} / {sliding_window_overlap} - sliding window size/overlap in frames
+    - {temporal_upsampling} / {spatial_upsampling} - selected upsampler (empty when unused)
+
+    A Python format spec can be appended to any placeholder: {key:fmt}
+    (e.g., {scale:.2f}, {steps:.0f}, {fps:.0f}).
 
     Date format tokens:
     - YYYY: 4-digit year (2025)
@@ -61,18 +76,22 @@ class FilenameFormatter:
     ALLOWED_KEYS = {
         'date', 'seed', 'resolution', 'num_inference_steps', 'steps',
         'prompt', 'flow_shift', 'video_length', 'frames',
-        'guidance_scale', 'cfg'
+        'guidance_scale', 'cfg',
+        'model', 'model_type', 'fps', 'scale', 'width', 'height',
+        'teacache', 'sliding_window_size', 'sliding_window_overlap',
+        'temporal_upsampling', 'spatial_upsampling'
     }
 
     # Map aliases to actual setting keys
     KEY_ALIASES = {
         'steps': 'num_inference_steps',
         'frames': 'video_length',
-        'cfg': 'guidance_scale'
+        'cfg': 'guidance_scale',
+        'model': 'model_type'
     }
 
-    # Pattern to match placeholders: {key}, {key(arg)}, or {key(%format)}
-    PLACEHOLDER_PATTERN = re.compile(r'\{(\w+)(?:\(([^)]*)\))?\}')
+    # Pattern to match placeholders: {key}, {key(arg)}, {key:fmt}, or {key(arg):fmt}
+    PLACEHOLDER_PATTERN = re.compile(r'\{(\w+)(?:\(([^)]*)\))?(:([^}]*))?\}')
 
     # Date token to strftime mapping (order matters - longer tokens first)
     DATE_TOKENS = [
@@ -216,16 +235,42 @@ class FilenameFormatter:
         def replace_placeholder(match):
             key = match.group(1)
             arg = match.group(2)  # Optional argument in parentheses
+            fmt_spec = match.group(4)  # Optional Python format spec (e.g. ".2f"), None when absent
 
             # Handle date specially
             if key == 'date':
                 return self._format_date(arg)
+
+            # Teacache: composed of the skip-steps cache type and its multiplier
+            # (e.g. "tc1.00"); empty when the cache is disabled
+            if key == 'teacache':
+                cache_type = settings.get('skip_steps_cache_type')
+                if not cache_type:
+                    return ''
+                multiplier = settings.get('skip_steps_multiplier')
+                try:
+                    return self._sanitize_for_filename(f"{cache_type}{float(multiplier):.2f}")
+                except (TypeError, ValueError):
+                    return self._sanitize_for_filename(str(cache_type))
 
             # Resolve aliases
             actual_key = self.KEY_ALIASES.get(key, key)
 
             # Get value from settings
             value = settings.get(actual_key)
+
+            # Apply Python format spec if requested (e.g. {scale:.2f})
+            if fmt_spec is not None:
+                try:
+                    if value is None:
+                        value = ''
+                    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                        value = format(value, fmt_spec)
+                    else:
+                        value = format(str(value), fmt_spec)
+                except (ValueError, TypeError):
+                    value = '' if value is None else str(value)
+                return self._sanitize_for_filename(value)
 
             # Convert to string
             if value is None:

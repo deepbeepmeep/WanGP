@@ -9094,6 +9094,18 @@ def generate_media(
                 if overridden_inputs is not None: inputs.update(overridden_inputs)
                 if scheduler_active and output_frame_count is not None:
                     inputs["video_length"] = output_frame_count
+                # Expose the effective output parameters to the filename template: they are
+                # function locals (not generate_media arguments), so they are not part of
+                # the settings dict built from the function arguments above.
+                inputs["fps"] = output_fps
+                out_height, out_width = height, width
+                if not audio_only and is_image and sample is not None:
+                    out_height, out_width = sample.shape[-2], sample.shape[-1]
+                elif not audio_only and not is_image and frames_already_processed:
+                    out_height, out_width = frames_already_processed[-1].shape[-2], frames_already_processed[-1].shape[-1]
+                inputs["width"] = int(out_width)
+                inputs["height"] = int(out_height)
+                inputs["scale"] = round(int(out_height) / int(height), 2) if height else 1
                 if filename_formatter is not None:
                     file_name = filename_formatter.format(inputs)
                     file_name = f"{sanitize_file_name(truncate_for_filesystem(os.path.splitext(os.path.basename(file_name))[0])).strip()}.{extension}"
@@ -13710,7 +13722,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                         )
 
                     with gr.Column():
-                        gr.Markdown('<B>Customize the Output Filename using Settings Values (<I>date, seed, resolution, num_inference_steps, prompt, flow_shift, video_length, guidance_scale</I>). For Instance:<BR>"<I>{date(YYYY-MM-DD_HH-mm-ss)}_{seed}_{prompt(50)}, {num_inference_steps}</I>"</B>')
+                        gr.Markdown('<B>Customize the Output Filename using Settings Values (<I>date, seed, model, resolution, width, height, video_length, fps, scale, steps, prompt, flow_shift, guidance_scale, teacache, sliding_window_size, sliding_window_overlap, temporal_upsampling, spatial_upsampling</I>). Each placeholder can take a Python format spec, e.g. <I>{scale:.2f}</I> (full list and examples in <I>docs/GETTING_STARTED.md</I>). For Instance:<BR>"<I>{date(YYYY-MM-DD_HH-mm-ss)}_{seed}_{prompt(50)}, {num_inference_steps}</I>"</B>')
                         output_filename = gr.Text( label= " Output Filename (Leave Blank for Auto Naming)", value= ui_get("output_filename"))
 
                 with gr.Tab("Configs"):

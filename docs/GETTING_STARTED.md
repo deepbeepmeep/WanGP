@@ -111,6 +111,46 @@ Let's generate a simple text-to-video:
 - **Fixed Seed**: Reproducible results
 - **Use same seed + prompt**: Generate variations
 
+### Custom Output Filenames
+
+Generated files are named automatically by default (timestamp, seed and prompt). You can customize the name: in the **Misc** tab, fill the **Output Filename (Leave Blank for Auto Naming)** text box with a template. Placeholders are written in curly braces and replaced with the actual values of the current generation; anything else in the template is kept as literal text. Leave the box empty to keep the automatic naming.
+
+Formatting options:
+
+- a **Python format spec** can be appended to any placeholder to control the number formatting, e.g. `{scale:.2f}`, `{steps:.0f}`, `{fps:.0f}`
+- `{prompt(n)}` truncates the prompt to *n* characters
+- `{date(...)}` accepts date/time tokens: `YYYY` `YY` `MM` `DD` `HH` `hh` `mm` `ss`, with any separator among `- _ . : /` and the letters `h` (e.g. `{date(YYYY-MM-DD_HH-mm-ss)}` → `2025-01-15_14-30-45`)
+- unknown placeholders are rejected when the generation starts
+
+Supported placeholders:
+
+| Placeholder | Description |
+|---|---|
+| `{date}` | Timestamp, default format `YYYY-MM-DD-HHhMMmSSs` (e.g. `2025-01-15-14h30m45s`) |
+| `{date(YYYY-MM-DD_HH-mm-ss)}` | Timestamp with a custom format, see tokens above |
+| `{seed}` | Generation seed |
+| `{model}` (alias `{model_type}`) | Model type, e.g. `ltx2.5`, `wan1.3` |
+| `{resolution}` | Selected resolution label, e.g. `1280x720 (16:9)` |
+| `{width}` / `{height}` | Effective output dimensions in pixels (after spatial upsampling) |
+| `{video_length}` (alias `{frames}`) | Output frame count |
+| `{fps}` | Effective output fps (after temporal upsampling) |
+| `{scale}` | Spatial upsampling factor (`1` when no spatial upsampler is used) |
+| `{num_inference_steps}` (alias `{steps}`) | Number of inference steps |
+| `{prompt}` / `{prompt(50)}` | Prompt text, optionally truncated to the given number of characters |
+| `{flow_shift}` | Flow shift value |
+| `{guidance_scale}` (alias `{cfg}`) | Guidance scale |
+| `{teacache}` | TeaCache tag (`tc<multiplier>`, e.g. `tc1.00`), empty when TeaCache is disabled |
+| `{sliding_window_size}` / `{sliding_window_overlap}` | Sliding window size / overlap in frames |
+| `{temporal_upsampling}` / `{spatial_upsampling}` | Selected upsampler method, empty when unused |
+
+Examples:
+
+```
+{date(YYYY-MM-DD_HH-mm-ss)}_{seed}_{prompt(50)}, {num_inference_steps}
+{date}_{model}_seed{seed}_steps{steps}{teacache}_{width}x{height}x{frames}@{fps:.0f}_scale{scale:.2f}
+```
+
+
 ## Common Beginner Issues
 
 ### "Out of Memory" Errors
