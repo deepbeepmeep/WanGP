@@ -30,7 +30,7 @@ def prepare_decoder(name, gen=None):
     if path is None:
         path = fl.get_smart_download_location(config['filename'], 'preview_decoders')
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        download_file(f"https://huggingface.co/{config['repo']}/resolve/main/{relative}", path, gen=gen)
+        download_file(config.get('url', f"https://huggingface.co/{config['repo']}/resolve/main/{relative}"), path, gen=gen)
     check_download_cancelled(gen)
     if hashlib.sha256(Path(path).read_bytes()).hexdigest() != config['sha256']:
         raise ValueError(f'TinyVAE checkpoint checksum mismatch: {path}')
@@ -103,7 +103,10 @@ def load_decoder(name, path):
     from mmgp import offload
     config = REGISTRY['decoders'][name]
     with torch.device('meta'):
-        if config['kind'] == 'image':
+        if name == 'taeqi2_1':
+            from .taesd import F16Decoder
+            net = F16Decoder()
+        elif config['kind'] == 'image':
             from .taesd import Decoder
             net = Decoder(config['channels'], use_midblock_gn=name == 'taef2')
         elif config['kind'] == 'h3':
@@ -118,7 +121,14 @@ def load_decoder(name, path):
         model = TinyVAE(name, net)
 
     def decoder_weights(state):
-        if config['kind'] == 'video':
+        if name == 'taeqi2_1':
+            decoder_state = {}
+            for key, value in state.items():
+                if key.startswith('decoder.layers.'):
+                    index, suffix = key.removeprefix('decoder.layers.').split('.', 1)
+                    decoder_state[f'{int(index) + 1}.{suffix}'] = value
+            state = decoder_state
+        elif config['kind'] == 'video':
             state = net.patch_tgrow_layers({key: value for key, value in state.items() if key.startswith('decoder.')})
         return {'net.' + key: value for key, value in state.items()}
 

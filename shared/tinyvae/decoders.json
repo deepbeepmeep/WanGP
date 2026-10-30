@@ -1,5 +1,15 @@
 {
   "decoders": {
+    "taeqi2_1": {
+      "filename": "taeqi2_1.safetensors",
+      "channels": 64,
+      "patch": 1,
+      "temporal": [],
+      "kind": "image",
+      "repo": "madebyollin/taeqi2_1",
+      "url": "https://huggingface.co/madebyollin/taeqi2_1/resolve/5d62f11fee0068b4df7bd699ddab685e32174010/taeqi2_1.safetensors",
+      "sha256": "6578b31cc5e336233a2c842eba61b56425bbcac97c7088705f7c7db93291887e"
+    },
     "taeltx_2": {
       "filename": "taeltx_2.safetensors",
       "channels": 128,
@@ -111,6 +121,7 @@
     }
   },
   "architectures": {
+    "qwen_image_21": "taeqi2_1",
     "ltx2_19B": "taeltx_2",
     "ltx2_22B": "taeltx2_3",
     "flux2_klein_4b": "taef2",

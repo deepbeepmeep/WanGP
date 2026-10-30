@@ -382,6 +382,10 @@ class Qwen21Pipeline(QwenImage21Pipeline):
                     latents = unpack(lanpaint(packed_denoise, combine, guide_scale, 1.0, pack(latents), pack(original), pack(noise_source), timestep / 1000, pack(latent_mask.expand(batch_size, -1, 64)), height=height, width=width, vae_scale_factor=16))
                 positive, negative = denoise(latents, guide_scale)
                 noise = combine(positive, negative, guide_scale, timestep)
+                preview_latents = None
+                if callback and getattr(callback, "tiny_vae", False):
+                    # TinyVAE expects clean latents in the normalized model space.
+                    preview_latents = latents.float() - scheduler.sigmas[step_offset + i] * noise.float()
                 latents = scheduler.step(noise, timestep, latents, return_dict=False)[0]
                 absolute_step = step_offset + i
                 step_mask = latent_mask
@@ -407,8 +411,13 @@ class Qwen21Pipeline(QwenImage21Pipeline):
                         sigma = scheduler.sigmas[absolute_step + 1]
                     known = original * (1 - sigma) + noise_source * sigma
                     latents = known * (1 - step_mask) + latents * step_mask
+                    if preview_latents is not None:
+                        preview_latents = original * (1 - step_mask) + preview_latents * step_mask
                 if callback:
-                    callback(i, latents.transpose(1, 2).reshape(batch_size, 64, height // 16, width // 16).transpose(0, 1), False)
+                    if preview_latents is None:
+                        preview_latents = latents
+                    callback(i, preview_latents.transpose(1, 2).reshape(batch_size, 64, height // 16, width // 16).transpose(0, 1), False)
+                del preview_latents
             for cache in caches:
                 cache.clear()
             caches.clear()
