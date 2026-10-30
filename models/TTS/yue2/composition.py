@@ -16,7 +16,11 @@ def resolve_source(source, custom_guide=None, custom_guide_used=False, custom_se
     if not source:
         source = "1" if custom_guide or custom_guide_used else "0"
     if source not in SOURCE_LABELS:
-        raise ValueError("Choose one of the five YuE2 composition sources.")
+        # Older outputs (and settings imported from other tools) can carry a
+        # non-empty value this version does not know, such as "AV". Startup
+        # migrates every gallery entry, so raising here makes one stale file
+        # abort the whole UI. Fall back to the same default as an empty source.
+        source = "1" if custom_guide or custom_guide_used else "0"
     if custom_settings is not None and custom_settings.get("extend_score") == 1:
         source = {"1": "12", "A": "A2"}.get(source, source)
     return source
