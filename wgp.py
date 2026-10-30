@@ -8327,7 +8327,8 @@ def generate_media(
                     repair_ms = 0 if model_def.get("audio_tail_ms") else model_def.get("audio_overlap_repair_ms", 0)
                 else:
                     repair_ms = source_audio_repair_ms(model_def.get("audio_overlap_repair_ms", 0), source_audio_tracks[0], source_audio_metadata[0].get("codec"), source_video_frames_count / fps)
-                window_audio_repair_seconds = audio_overlap_repair_seconds(audio_overlap_frames, fps, repair_ms, overlap_audio, overlap_rate)
+                window_audio_repair_seconds = audio_overlap_repair_seconds(audio_overlap_frames, fps, repair_ms, overlap_audio, overlap_rate,
+                                                                          model_def.get("audio_overlap_repair_frames"))
             audio_conditioning_end = audio_overlap_frames / fps - window_audio_repair_seconds if input_audio_is_overlap and window_audio_repair_seconds > 0 else None
             if fantasy and audio_guide is not None:
                 audio_proj_split , audio_context_lens = parse_audio(audio_guide, start_frame = aligned_window_start_frame, num_frames= current_video_length, fps= fps,  device= processing_device  )

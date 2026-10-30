@@ -94,9 +94,11 @@ def append_sliding_window_audio(existing_audio_data, existing_audio_path, genera
     join_sample = committed_audio_samples - repair_samples
     prefix_audio = prefix_audio[:join_sample + (generated_audio.shape[0] if keep_existing else 0)]
     if align_to_video and not keep_existing and prefix_audio.shape[0] < join_sample:
+        # The preceding soundtrack ends before the join, so there is no audio left to repair there: retain
+        # its timestamp with silence to keep video and audio in sync (a deliberate cut behaves the same way).
         if repair_samples:
-            raise ValueError("Audio overlap is too short to repair the previous window; increase the video overlap.")
-        # A deliberate cut has no overlap to regenerate: retain its timestamp with silence.
+            print(f"WanGP: the previous soundtrack ends {(join_sample - prefix_audio.shape[0]) / audio_sampling_rate * 1000:.1f} ms before the join; "
+                  f"the generated audio covers that ending")
         prefix_audio = np.pad(prefix_audio, [(0, join_sample - prefix_audio.shape[0])] + [(0, 0)] * (prefix_audio.ndim - 1))
     if prefix_audio.size == 0:
         return generated_audio
@@ -117,13 +119,20 @@ def source_audio_repair_ms(repair_ms, audio_path, codec, video_seconds):
     return 0 if info.frames / info.samplerate - video_seconds >= clear_ms / 1000 else repair_ms
 
 
-def audio_overlap_repair_seconds(overlap_frames, video_fps, repair_ms, overlap_audio=None, sample_rate=0):
+def audio_overlap_repair_seconds(overlap_frames, video_fps, repair_ms, overlap_audio=None, sample_rate=0, repair_frames=None):
     overlap_seconds = overlap_frames / video_fps
     shortfall = max(0.0, overlap_seconds - len(overlap_audio) / sample_rate) if overlap_audio is not None else 0.0
     repair_seconds = repair_ms / 1000 + shortfall
-    if repair_seconds > overlap_seconds + 1e-9:
-        raise ValueError(f"Audio continuation needs more than {overlap_frames} overlap frames at {video_fps:g} FPS; increase the video overlap (repair requires {repair_seconds * 1000:.1f} ms).")
-    return min(repair_seconds, overlap_seconds)
+    # repair_frames: the number of overlap frames whose audio the model regenerates at the join. A source
+    # soundtrack ending inside the overlap leaves nothing to repair there: cap the request at that span, let
+    # the model generate the rest and retain the timing with silence instead of failing the whole window.
+    budget = overlap_seconds if repair_frames is None else min(overlap_seconds, repair_frames / video_fps)
+    if repair_seconds > budget + 1e-9:
+        if repair_frames is None:
+            raise ValueError(f"Audio continuation needs more than {overlap_frames} overlap frames at {video_fps:g} FPS; increase the video overlap (repair requires {repair_seconds * 1000:.1f} ms).")
+        print(f"WanGP: the source soundtrack ends {shortfall * 1000:.1f} ms before the overlap end at {video_fps:g} FPS; "
+              f"the model regenerates the audio of its last {repair_frames} overlap frame(s)")
+    return min(repair_seconds, budget)
 
 
 def create_silent_wav_file(output_dir=None, duration_seconds=0.0, sample_rate=16000, prefix="null_audio_"):
