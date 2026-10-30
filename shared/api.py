@@ -356,21 +356,73 @@ def store_api_output_artifact(gen: dict[str, Any], client_id: str, video_path: A
 
 
 class SessionStream:
+    # Events that must never be shed under back-pressure — dropping them would
+    # lose results; everything else is a transient UI update.
+    _NEVER_DROP_KINDS = ("output", "result", "error", "completed")
+    # Stale progress/preview updates are the first candidates for eviction.
+    _DROP_FIRST_KINDS = ("progress", "preview")
+
     def __init__(self) -> None:
-        self._queue: queue.Queue[SessionEvent | object] = queue.Queue()
+        # Bounded so undrained streams (fire-and-forget consumers that only call
+        # job.result()) cannot grow without limit; drained consumers never hit it.
+        self._queue: queue.Queue[SessionEvent | object] = queue.Queue(maxsize=256)
         self._closed = threading.Event()
         self._sentinel = object()
+
+    def _drop_oldest_droppable(self) -> bool:
+        # Evict the oldest progress/preview event first, then any other
+        # non-critical event; never touch _NEVER_DROP_KINDS or the sentinel.
+        with self._queue.mutex:
+            items = self._queue.queue
+            for restrict in (self._DROP_FIRST_KINDS, None):
+                for index, item in enumerate(items):
+                    kind = getattr(item, "kind", None)
+                    if item is self._sentinel or kind in self._NEVER_DROP_KINDS:
+                        continue
+                    if restrict is not None and kind not in restrict:
+                        continue
+                    del items[index]
+                    self._queue.not_full.notify()
+                    return True
+        return False
+
+    def _force_append(self, item: Any) -> None:
+        # Last resort for must-deliver items when the queue holds only other
+        # must-keep events: grow past maxsize rather than block or drop.
+        with self._queue.mutex:
+            self._queue.queue.append(item)
+            self._queue.unfinished_tasks += 1
+            self._queue.not_empty.notify()
 
     def put(self, kind: str, data: Any = None) -> None:
         if self._closed.is_set():
             return
-        self._queue.put(SessionEvent(kind=kind, data=data))
+        event = SessionEvent(kind=kind, data=data)
+        while True:
+            try:
+                self._queue.put_nowait(event)
+                return
+            except queue.Full:
+                if self._drop_oldest_droppable():
+                    continue
+                if kind in self._NEVER_DROP_KINDS:
+                    self._force_append(event)
+                return
 
     def close(self) -> None:
         if self._closed.is_set():
             return
         self._closed.set()
-        self._queue.put(self._sentinel)
+        try:
+            self._queue.put_nowait(self._sentinel)
+        except queue.Full:
+            if self._drop_oldest_droppable():
+                try:
+                    self._queue.put_nowait(self._sentinel)
+                    return
+                except queue.Full:
+                    pass
+            self._force_append(self._sentinel)
 
     def clear(self) -> None:
         while True:
