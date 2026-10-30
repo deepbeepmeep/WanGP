@@ -926,6 +926,28 @@ user-select: text;
 .wangp-prompt-enhancer-row > .form { flex: 1 1 0 !important; min-width: 0 !important; }
 .wangp-prompt-enhancer-row > .btn_centered, .wangp-prompt-enhancer-row > .form > :is(.cbx_centered, .cbx_bottom) { flex: 0 0 auto !important; min-width: 0 !important; }
 
+/* The video pickers' label: Gradio 5 draws the component label as a floating
+   tab pinned to the top-left corner of the block. Wan2GP relabels these
+   pickers with long dynamic text (e.g. "Detected companion video file
+   (used for preview only) (832x448, 24 fps, 241 frames)"), and the floating
+   tab runs on across the preview. Park the label in a static row above the
+   player instead: the block is a fixed-height flex column, so the player
+   container simply takes the remaining height (min-height: 0 lets it
+   shrink; the block's overflow:hidden keeps the layout stable). */
+:is(#video_input, #video_input2, #video_input_mask) label[data-testid="block-label"] {
+    position: static !important;
+    flex: 0 0 auto !important;
+    align-self: flex-start !important;
+    margin: var(--block-label-margin) var(--block-label-margin) 0 !important;
+    max-width: calc(100% - var(--block-label-margin) * 2) !important;
+    white-space: normal !important;
+    overflow-wrap: anywhere !important;
+}
+:is(#video_input, #video_input2, #video_input_mask) > *,
+:is(#video_input, #video_input2, #video_input_mask) .wrap {
+    min-height: 0 !important;
+}
+
 /* Shared inputs of the post-processing parameters: two per line, whichever of them the selected processors show. */
 /* a post-processing slot: its selector and its processor's parameters, set apart from the other slot */
 div.wangp-postprocessing-slot, .postprocess div.wangp-postprocessing-slot { border: 1px solid var(--border-color-primary) !important; border-radius: var(--radius-lg) !important; margin-bottom: var(--spacing-lg) !important; }

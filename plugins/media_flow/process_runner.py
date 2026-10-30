@@ -947,7 +947,7 @@ class ProcessRunner:
                                     continue_cache = system_handler.continue_cache_from_tail_frames(fallback_tail, system_target_control)
                                     if continue_cache is None:
                                         continue_cache = system_handler.load_continue_cache(output_path)
-                                    common.plugin_info("FlashVSR continuation sidecar is missing; continuing from decoded output tail frames. The first resumed chunk may have lower temporal continuity.")
+                                    common.plugin_info("FlashVSR continuation cache is missing; continuing from decoded output tail frames. The first resumed chunk may have lower temporal continuity.")
                             completed_chunks, _ = frames.count_completed_written_chunks(full_plans, resumed_unique_frames)
                             exact_start_seconds = (start_frame + resumed_unique_frames) / fps_float
                             resume_overlap_frames = min(overlap_frames, resumed_unique_frames) if system_crossfades_overlap_outputs else 0
@@ -1266,7 +1266,7 @@ class ProcessRunner:
             elif system_handler is not None and continue_cache is not None and hasattr(system_handler, "save_continue_cache"):
                 system_handler.save_continue_cache(continue_cache, metadata_target_path, metadata=output_process_metadata)
             if not metadata_written:
-                raise gr.Error(f"Failed to write WanGP metadata to {metadata_target_path}. The partial output was kept, but continuation may require the sidecar cache.")
+                raise gr.Error(f"Failed to write WanGP metadata to {metadata_target_path}. The partial output was kept, but resuming the process may require the continuation cache file.")
             kept_artifact_paths, gallery_refresh = self._prune_generated_artifacts(request.state)
             kept_artifact_set = set(kept_artifact_paths)
             chunk_output_paths = [path for path in chunk_output_paths if str(Path(path).resolve()) in kept_artifact_set]

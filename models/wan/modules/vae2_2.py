@@ -1214,6 +1214,7 @@ class Wan2_2_VAE:
 
         self.dtype = dtype
         self.device = device
+        self.vae_pth = vae_pth
         assert upsampler_factor == 1
         mean = torch.tensor(
             [

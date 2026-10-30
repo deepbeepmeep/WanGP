@@ -1,0 +1,8 @@
+{
+  "model_type": "__latent_decode",
+  "model_label": "Latent Decode",
+  "system_handler": "latent_decode",
+  "chunk_size_seconds": 86400,
+  "sliding_window_overlap": 0,
+  "prompt": ""
+}

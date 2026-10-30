@@ -26,6 +26,8 @@ from .modules.t5 import T5EncoderModel
 from .modules.vae import WanVAE
 from .modules.vae2_2 import Wan2_2_VAE
 
+from shared.utils import latent_io
+
 from .modules.clip import CLIPModel
 from shared.utils.fm_solvers import (FlowDPMSolverMultistepScheduler,
                                get_sampling_sigmas, retrieve_timesteps)
@@ -85,9 +87,30 @@ def timestep_transform(t, shift=5.0, num_timesteps=1000 ):
     new_t = shift * t / (1 + (shift - 1) * t)
     new_t = new_t * num_timesteps
     return new_t
-    
+
+
+def branch_prefix_for_t2v(branch_prefix_latents, z_dim, lat_frames, lat_h, lat_w):
+    """The t2v frozen-prefix shape check (Phase 3).
+
+    A branch's kept latents may become the frozen head of the denoise tensor
+    (the timestep-0 injection) only when they match this window's VAE grid:
+    the latent channel count, the spatial grid, and a time length no longer
+    than the window's latent count. Returns the prefix (4D, unbatched) when
+    it fits, ``None`` otherwise (the head window then uses a fresh
+    generation).
+    """
+    if branch_prefix_latents is None:
+        return None
+    if (branch_prefix_latents.shape[0] == z_dim
+            and branch_prefix_latents.shape[-2:] == (lat_h, lat_w)
+            and branch_prefix_latents.shape[1] <= lat_frames):
+        return branch_prefix_latents
+    return None
+
 
 class WanAny2V:
+
+    latent_io_capable = True
 
     def __init__(
         self,
@@ -464,7 +487,14 @@ class WanAny2V:
         audio_context_lens=None,
         alt_guide_scale = 1.0,
         overlapped_latents  = None,
+        prefix_latents = None,
+        prefix_kept_windows=None,
+        prefix_kept_frames=0,
+        prefix_is_i2v=False,
         return_latent_slice = None,
+        save_latents = False,
+        app_version = None,
+        latent_model_type = None,
         overlap_noise = 0,
         overlap_size = 0,
         sub_parallel_window_size=0,
@@ -681,11 +711,26 @@ class WanAny2V:
         timestep_injection = False
         ps_t, ps_h, ps_w = self.model.patch_size
 
+        # Latent branch (Phase 1): the kept latents of the sidecar's
+        # containing window, injected verbatim at the tensor head instead
+        # of a fresh VAE encode of the source tail (the "from latent"
+        # substitution; the kept portion stays frozen for the whole run).
+        branch_prefix_latents = None
+        if torch.is_tensor(prefix_latents):
+            branch_prefix_latents = prefix_latents
+            if branch_prefix_latents.dim() == 5:
+                branch_prefix_latents = branch_prefix_latents[0]
+            if branch_prefix_latents.dim() != 4:
+                branch_prefix_latents = None
+        if branch_prefix_latents is not None:
+            branch_prefix_latents = branch_prefix_latents.to(device=self.device, dtype=torch.float32)
+
         lat_frames = int((frame_num - 1) // self.vae_stride[0]) + 1
         extended_input_dim = 0
         ref_images_before = False            
-        # image2video 
-        if model_def.get("i2v_class", False) and not (animate or animate2 or scail or scail2 or fun_camera):
+        # image2video
+        i2v_class_path = model_def.get("i2v_class", False) and not (animate or animate2 or scail or scail2 or fun_camera)
+        if i2v_class_path:
             any_end_frame = False
             if infinitetalk:
                 new_shot = "0" in video_prompt_type
@@ -778,7 +823,17 @@ class WanAny2V:
 
             if not svi_pro:
                 lat_y = self.vae.encode([enc], VAE_tile_size, any_end_frame= any_end_frame and add_frames_for_end_image)[0]
-
+                # The branch's kept latents replace the fresh encode of the
+                # prefix pixels: they are the sidecar's own (already frozen
+                # in the original job) so the kept portion keeps its exact
+                # latent values instead of a re-encoded approximation.
+                if branch_prefix_latents is not None:
+                    if branch_prefix_latents.shape[0] == lat_y.shape[0] and branch_prefix_latents.shape[-2:] == (lat_h, lat_w) and branch_prefix_latents.shape[1] <= lat_y.shape[1]:
+                        lat_y[:, :branch_prefix_latents.shape[1]] = branch_prefix_latents.to(lat_y.dtype)
+                        branch_prefix_latents = lat_y[:, :branch_prefix_latents.shape[1]].clone().to(torch.float32)
+                    else:
+                        print(f"Latent branch: the prefix shape {tuple(branch_prefix_latents.shape)} of the source latent file does not match the latent shape of this window {tuple(lat_y.shape)}; the head window uses a fresh encode.")
+                        branch_prefix_latents = None
 
             msk = torch.ones(1, frame_num + ref_images_count * 4, lat_h, lat_w, device=self.device)
             if any_end_frame:
@@ -817,6 +872,11 @@ class WanAny2V:
                 if infinitetalk:
                     lat_y = self.vae.encode([input_video], VAE_tile_size)[0]
                 extended_overlapped_latents = lat_y[:, :overlapped_latents_frames_num].clone().unsqueeze(0)
+                if branch_prefix_latents is not None:
+                    # The frozen run is the sidecar's kept latents, exactly P
+                    # of them (the decoded prefix is the branch's own head
+                    # trim), whatever the guide's pixel count implies.
+                    extended_overlapped_latents = branch_prefix_latents.unsqueeze(0)
 
             lat_y = None
             kwargs.update({ 'y': y})
@@ -1075,9 +1135,9 @@ class WanAny2V:
                 color_reference_frame = guide_to_float(input_frames[:, -1:]).clone()
                 if prefix_frames_count > 0:
                     overlapped_frames_num = prefix_frames_count
-                    overlapped_latents_frames_num = (overlapped_frames_num -1 // 4) + 1 
-                    # overlapped_latents_frames_num = overlapped_latents.shape[2]
-                    # overlapped_frames_num = (overlapped_latents_frames_num-1) * 4 + 1
+                    # overlap frame count -> latent frame count for the (1 + 4(n-1)) frame layout (e.g. 5 frames = 2 latent frames)
+                    overlapped_latents_frames_num = int(1 + (overlapped_frames_num - 1) // self.vae_stride[0])
+                    # inverse: overlapped_frames_num = (overlapped_latents_frames_num - 1) * self.vae_stride[0] + 1
                 else: 
                     overlapped_latents_frames_num = overlapped_frames_num  = 0
                 if len(keep_frames_parsed) == 0  or image_outputs or  (overlapped_frames_num + len(keep_frames_parsed)) == input_frames.shape[1] and all(keep_frames_parsed) : keep_frames_parsed = [] 
@@ -1130,10 +1190,45 @@ class WanAny2V:
                 height, width = (height // 32) * 32, (width // 32) * 32 
             else:
                 height, width = input_video.shape[-2:]
-                source_latents = self.vae.encode([input_video], tile_size = VAE_tile_size)[0].unsqueeze(0)
+                source_latents = None
+                if branch_prefix_latents is not None:
+                    # The branch's kept latents replace the fresh encode of
+                    # the guide pixels (timestep-0 injection below keeps
+                    # them frozen through the whole denoise loop).
+                    lat_h_t = height // self.vae_stride[1]
+                    lat_w_t = width // self.vae_stride[2]
+                    if branch_prefix_latents.shape[0] == self.vae.model.z_dim and branch_prefix_latents.shape[-2:] == (lat_h_t, lat_w_t) and branch_prefix_latents.shape[1] <= lat_frames:
+                        source_latents = branch_prefix_latents
+                    else:
+                        print(f"Latent branch: the prefix shape {tuple(branch_prefix_latents.shape)} of the source latent file does not match the VAE latent shape; the head window uses a fresh encode.")
+                        branch_prefix_latents = None
+                if source_latents is None:
+                    source_latents = self.vae.encode([input_video], tile_size = VAE_tile_size)[0].unsqueeze(0)
+                else:
+                    source_latents = source_latents.unsqueeze(0)
                 timestep_injection = True
                 if extended_input_dim > 0:
                     extended_latents[:, :, :source_latents.shape[2]] = source_latents
+
+        # t2v (Phase 3): the standard text-to-video flow conditions on the
+        # prompt only (no guide latents, no source video), so the branch's
+        # kept latents enter as the frozen head of the denoise tensor
+        # through the same timestep-0 injection as the ti2v class (the head
+        # stays clean at t = 0 through the whole denoise loop and only the
+        # new tail is denoised); a mismatched prefix falls back to a fresh
+        # generation with a logged warning.
+        if not ti2v and not i2v_class_path and branch_prefix_latents is not None:
+            _t2v_lat_h = height // self.vae_stride[1]
+            _t2v_lat_w = width // self.vae_stride[2]
+            _t2v_prefix = branch_prefix_for_t2v(
+                branch_prefix_latents, self.vae.model.z_dim, lat_frames, _t2v_lat_h, _t2v_lat_w)
+            if _t2v_prefix is not None:
+                source_latents = _t2v_prefix.unsqueeze(0)
+                timestep_injection = True
+            else:
+                print(f"Latent branch: the prefix shape {tuple(branch_prefix_latents.shape)} of the source latent file does not match the latent shape of this window "
+                      f"({self.vae.model.z_dim}, {lat_frames}, {_t2v_lat_h}, {_t2v_lat_w}); the head window uses a fresh generation.")
+                branch_prefix_latents = None
 
         # Lynx
         if lynx :
@@ -1594,6 +1689,13 @@ class WanAny2V:
                     for zz in z:
                         zz[0:16, ref_images_count:extended_overlapped_latents.shape[2] ]   = extended_overlapped_latents[0, :, ref_images_count:]  * (1.0 - overlap_noise_factor) + torch.randn_like(extended_overlapped_latents[0, :, ref_images_count:] ) * overlap_noise_factor 
 
+            if branch_prefix_latents is not None:
+                # The kept latents stay bit-identical through the loop: the
+                # extended-run injection above may re-noise its head (the
+                # continuation behavior), but a branch must never re-denoise
+                # the kept portion, so the exact sidecar values win.
+                latents[:, :, :branch_prefix_latents.shape[1]] = branch_prefix_latents
+
             def denoise_with_cfg_fn(latents):
 
                 if extended_input_dim > 0:
@@ -1823,6 +1925,8 @@ class WanAny2V:
             latents[:, :, :source_latents.shape[2]] = source_latents
         if extended_overlapped_latents != None:
             latents[:, :, :extended_overlapped_latents.shape[2]]   = extended_overlapped_latents 
+        if branch_prefix_latents is not None:
+            latents[:, :, :branch_prefix_latents.shape[1]] = branch_prefix_latents
 
         if ref_images_before and ref_images_count > 0: latents = latents[:, :, ref_images_count:]
         if trim_frames > 0:  latents=  latents[:, :,:-trim_frames]
@@ -1830,6 +1934,44 @@ class WanAny2V:
             latent_slice = latents[:, :, return_latent_slice].clone()
 
         x0 =latents.unbind(dim=0)
+
+        latent_file_obj = None
+        if save_latents and not image_outputs:
+            vae_pth = getattr(self.vae, "vae_pth", None)
+            vae_model = getattr(self.vae, "model", None)
+            lora_names = []
+            if loras_slists:
+                for lora_entry in loras_slists:
+                    name = lora_entry if isinstance(lora_entry, str) else (lora_entry[0] if isinstance(lora_entry, (list, tuple)) and len(lora_entry) > 0 else "")
+                    if len(str(name).strip()) > 0:
+                        lora_names.append(str(name))
+            try:
+                payload = latent_io.build_latent_payload(
+                    latents[0],
+                    app_version=app_version or "",
+                    model_type=latent_model_type or model_type or "",
+                    base_model_type=str(model_type or ""),
+                    model_filename=str(bbargs.get("model_filename") or ""),
+                    loras=lora_names,
+                    vae_file=os.path.basename(vae_pth) if vae_pth else "",
+                    vae_sha256=latent_io.sha256_file(vae_pth) if vae_pth and os.path.isfile(vae_pth) else "",
+                    vae_z_dim=int(getattr(self.vae, "z_dim", 0) or getattr(vae_model, "z_dim", 0)),
+                    vae_dtype=str(getattr(self.vae, "dtype", "")).replace("torch.", ""),
+                    frames=int(frame_num),
+                    fps=float(fps),
+                    seed=int(seed),
+                    prompt=str(input_prompt)[:1000],
+                    denoising_strength=float(denoising_strength),
+                    steps=int(len(timesteps)),
+                )
+                # The file itself is built by the caller (the all-latent
+                # sidecar: the job's windows stacked on one time dimension,
+                # the sidecar the sole content source of the video).
+                latent_file_obj = payload
+                print(f"Latent companion payload built (compression {payload['wgp_latent/1']['compression']}).")
+            except Exception as exc:
+                print(f"Warning: the latent companion file was not saved: {exc}")
+                latent_file_obj = None
 
         if chipmunk:
             self.model.release_chipmunk() # need to add it at every exit when in prod
@@ -1877,6 +2019,36 @@ class WanAny2V:
             videos = videos.clamp_(-1, 1).add_(1.0).mul_(127.5).round_().clamp_(0, 255).to(torch.uint8)
 
         ret = { "x" : videos, "latent_slice" : latent_slice}
+        if prefix_kept_windows is not None and int(prefix_kept_frames or 0) > 0:
+            # The branch job's kept region is a fresh decode of the source
+            # sidecar's kept windows (the same reconstruction the Latent
+            # Decode job performs: the per-window recorded trims, the
+            # family's grid), handed back as decoded_prefix so the job uses
+            # it as the output video's prefix instead of a re-extraction of
+            # the source video (source independence). Best effort: any
+            # failure keeps the source-pixel prefix the job extracted
+            # before the model call.
+            _vae_dtype = getattr(self.vae, "dtype", None) or torch.float32
+            def _decode_kept_window(spec):
+                _lat = spec["latents"].to(device=self.device, dtype=_vae_dtype)
+                _videos = self.vae.decode_to_cpu_uint8([_lat], VAE_tile_size)
+                if not _videos or _videos[0] is None:
+                    return None
+                return _videos[0].to("cpu")
+            try:
+                decoded_prefix = latent_io.decode_kept_windows(
+                    _decode_kept_window, prefix_kept_windows, int(prefix_kept_frames),
+                    is_i2v=bool(prefix_is_i2v))
+                if decoded_prefix is not None:
+                    ret["decoded_prefix"] = decoded_prefix
+            except Exception as exc:
+                print(f"Latent branch: the kept region could not be decoded ({exc}); the output keeps the source-pixel prefix.")
+        if latent_file_obj is not None:
+            # Hand the payload to the caller instead of the side-files dict: the
+            # caller owns the companion file (it must accumulate the windows of
+            # a sliding-window job) and the raw bytes are never echoed to API
+            # responses.
+            ret["latent_file_obj"] = latent_file_obj
         if post_decode_pre_trim > 0:
             ret["post_decode_pre_trim"] = post_decode_pre_trim
 

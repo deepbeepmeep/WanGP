@@ -14,6 +14,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from mmgp import offload
+from shared.utils import latent_io
 from shared.utils.loras_mutipliers import extract_loras_side, parse_loras_multipliers, update_loras_slists
 from shared.utils.text_encoder_cache import TextEncoderCache
 from shared.utils.phase_progress import control_video_encoding, generation_progress
@@ -52,6 +53,12 @@ H3_PHASE_2_TILE_COUNT = 4
 H3_PHASE_2_TILE_OVERLAP_RATIO = 0.25
 H3_PHASE_2_TILE_ALIGNMENT = 32
 H3_PHASE_2_TILING_FLAG = "~"
+# Two-phase branch splice: when the first new latent's seam jump
+# exceeds this multiple of the surrounding frame-to-frame motion, it is
+# blended partway (this weight) toward the last frozen latent before
+# capture, so the saved sidecar and the decoded video stay in agreement.
+H3_BRANCH_SPLICE_JUMP_RATIO = 2.0
+H3_BRANCH_SPLICE_BLEND_ALPHA = 0.5
 H3_TURBO_LORA_KEY = "minimax_h3_lora_turbo"
 # Per-window control videos (Depth / In-Context Guide): True = aligned guide, packed as a keyframe clip on the target's own
 # RoPE time/space grid (guide frame i on output frame i) and not shown to the prompt encoder; False = reference video placed
@@ -111,6 +118,103 @@ def _crop_spatial_tile(tensor, top, left, tile_height, tile_width):
     return F.pad(tile, (0, pad_width, 0, pad_height), mode="replicate") if pad_height or pad_width else tile
 
 
+def _halve_video_latents(latents, target_h, target_w):
+    """Resize a latent run's spatial grid to a stage's own grid (LTX2-style).
+
+    The two-phase phase-1 stage works on a half-resolution canvas, so the
+    sidecar's kept latents (on the full-resolution latent grid) are
+    bilinearly resized per latent frame to that stage's own grid; the
+    phase-2 stage keeps the kept latents as-is. ``target_h`` / ``target_w``
+    are the stage's latent grid (not necessarily an exact half: the canvas
+    rounding to /32 can shift it); when it already matches the input, the
+    input is returned unchanged. Accepts ``[c, t, h, w]`` or batched
+    ``[1, c, t, h, w]`` and preserves the input's dimensionality.
+    """
+    batched = torch.as_tensor(latents).dim() == 5
+    latent = torch.as_tensor(latents)
+    if not batched:
+        latent = latent.unsqueeze(0)
+    if latent.shape[-2] == int(target_h) and latent.shape[-1] == int(target_w):
+        return latents
+    b, c, t, h, w = latent.shape
+    resized = (F.interpolate(latent.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w),
+                             size=(int(target_h), int(target_w)),
+                             mode="bilinear",
+                             align_corners=False)
+               .reshape(b, t, c, int(target_h), int(target_w))
+               .permute(0, 2, 1, 3, 4)
+               .contiguous())
+    return resized if batched else resized[0]
+
+
+def _upscaler_conditioned_head(latents, upscaler, stage_h, stage_w, full_h, full_w, device,
+                               abort_callback=None, progress_callback=None):
+    """Return the latent upscaler's own form of a kept-latent run on a stage grid.
+
+    The two-phase phase-1 stage (LTX2-style) conditions on a halved form of
+    the sidecar's kept latents. A raw bilinear photocopy is not the form
+    the learned upscaler (and the phase-2 LoRA) expect, so the run is
+    round-tripped through the upscaler: halve to the stage grid, upscale at
+    the model's native scale (its trained regime), then bring the output
+    back to the stage grid. Every two-phase stage then sees one consistent
+    head representation; the exact sidecar values are restored later,
+    unchanged. The scale and ``target_size`` are computed exactly like the
+    main between-phase upscaler call. Accepts ``[c, t, h, w]`` or batched
+    ``[1, c, t, h, w]`` and preserves the input's dimensionality; the
+    result is float32 on ``device``.
+    """
+    batched = torch.as_tensor(latents).dim() == 5
+    latent = torch.as_tensor(latents, dtype=torch.float32, device=device)
+    if not batched:
+        latent = latent.unsqueeze(0)
+    halved = _halve_video_latents(latent, int(stage_h), int(stage_w)).to(torch.bfloat16)
+    mean = halved.new_tensor(LATENTS_MEAN, dtype=torch.bfloat16).view(1, -1, 1, 1, 1)
+    std = halved.new_tensor(LATENTS_STD, dtype=torch.bfloat16).view(1, -1, 1, 1, 1)
+    normalized = (halved - mean) / std
+    scale = (int(full_h) / int(stage_h) + int(full_w) / int(stage_w)) / 2.0
+    up = upscaler(normalized, scale, target_size=(int(latent.shape[2]), int(full_h), int(full_w)),
+                 abort_callback=abort_callback, progress_callback=progress_callback)
+    out = (up * std + mean).float()
+    down = _halve_video_latents(out, int(stage_h), int(stage_w))
+    return down if batched else down[0]
+
+
+def _branch_splice_blend(video, head_latents):
+    """Blend the first new latent toward the frozen head when a splice pop
+    survives into the final tensor.
+
+    In a two-phase branch job the first new latent is denoised against the
+    phase-1 head form; when the seam jump at the splice is clearly above
+    the surrounding frame-to-frame motion (a baseline of a few adjacent
+    latent diffs in the frozen head and in the clean tail, both excluding
+    the contested latent itself), the first new latent is blended partway
+    toward the last frozen latent in place, so the saved sidecar and the
+    decoded video keep the same values. Returns ``(jump, baseline)`` when
+    a blend was applied, ``None`` when the seam is clean or there is no
+    new latent.
+    """
+    t = int(video.shape[2])
+    n = int(head_latents)
+    if n <= 0 or n >= t:
+        return None
+    jump = float((video[:, :, n] - video[:, :, n - 1]).abs().mean())
+    baselines = []
+    k = min(4, n - 1)
+    if k:
+        head_diffs = [float((video[:, :, n - i] - video[:, :, n - 1 - i]).abs().mean()) for i in range(1, k + 1)]
+        baselines.append(sum(head_diffs) / k)
+    m = min(4, t - n - 2)
+    if m > 0:
+        new_diffs = [float((video[:, :, n + 1 + j] - video[:, :, n + j]).abs().mean()) for j in range(1, m + 1)]
+        baselines.append(sum(new_diffs) / m)
+    baseline = max(baselines) if baselines else 1e-3
+    baseline = max(baseline, 1e-3)
+    if jump <= H3_BRANCH_SPLICE_JUMP_RATIO * baseline:
+        return None
+    video[:, :, n].lerp_(video[:, :, n - 1], H3_BRANCH_SPLICE_BLEND_ALPHA)
+    return (jump, baseline)
+
+
 def _phase_2_tile_weights(height, width, top_overlap=0, bottom_overlap=0,
                           left_overlap=0, right_overlap=0):
     height_weights = torch.ones(height, dtype=torch.float32, device="cpu")
@@ -135,6 +239,60 @@ def _video_to_uint8_cpu(video, max_buffer_mb=64):
         pixels = video[:, start:end].add(1.0).mul(127.5).round_().clamp_(0, 255).to(torch.uint8)
         output[:, start:end].copy_(pixels.to(device="cpu", non_blocking=False))
     return output
+
+
+def h3_decode_prefix_frames(video_vae, kept_specs, kept_frames, *, device, vae_dtype, is_i2v=False):
+    """The branch job's kept region as a fresh decode of the source sidecar's
+    kept windows (the first ``kept_frames`` frames of the sidecar's decode).
+
+    Mirrors the Latent Decode job's per-window video reconstruction exactly
+    (the recorded target cap, the previous window's decoded tail re-decoded
+    as the history condition, the recorded head/tail trims, the i2v window-1
+    head-trim exemption), so the branch's kept region is the same pixels the
+    decode job produces for the sidecar — a fresh VAE decode of the exact
+    generated latents, never a re-encode of the source video. ``kept_specs``
+    are the source sidecar's kept windows (1..K, the containing window of the
+    branch cut included) as :func:`shared.utils.latent_io.entry_window_specs`
+    specs; the result is the first ``kept_frames`` frames of their assembled
+    decoded runs (the committed runs tiled in window order), as a float
+    ``[3, T, h, w]`` tensor in ``[-1, 1]``.
+    """
+    window_frames = []
+    prev_video = None
+    for spec in kept_specs:
+        window_no = int(spec["window_no"])
+        h3 = int(spec.get("h3_history_frames") or 0)
+        target = int(spec.get("h3_target_frames") or 0)
+        head_trim = int(spec["head_trim"])
+        tail_trim = int(spec["tail_trim"])
+        latent = spec["latents"].to(device=device, dtype=vae_dtype)
+        if latent.dim() == 4:
+            latent = latent.unsqueeze(0)
+        decoded = video_vae.decode(latent)
+        if decoded is None or decoded.numel() == 0:
+            raise ValueError(f"window {window_no} could not be decoded")
+        frames = decoded[0].float().clamp_(-1.0, 1.0)
+        if target > 0 and frames.shape[1] > target:
+            frames = frames[:, :target]
+        history_cat = False
+        if h3 > 0:
+            if window_no > 1 and prev_video is not None:
+                history = prev_video[:, -(h3 + 1):-1].to(frames.device)
+                frames = torch.cat([history, frames], dim=1)
+                history_cat = True
+            elif window_no > 1:
+                print(f"Latent branch: window {window_no} records a history prefix but no earlier window decoded; continuing without it.")
+        if tail_trim > 0:
+            frames = frames[:, :max(0, frames.shape[1] - tail_trim)]
+        prev_video = frames.cpu()
+        if head_trim > 0 and not (window_no == 1 and is_i2v):
+            frames = frames[:, head_trim:] if history_cat else frames[:, max(0, head_trim - h3):]
+        window_frames.append(frames)
+    assembled = torch.cat(window_frames, dim=1) if len(window_frames) > 1 else window_frames[0]
+    kept_frames = int(kept_frames)
+    if assembled.shape[1] < kept_frames:
+        raise ValueError(f"the kept windows of the source latent file decode to {int(assembled.shape[1])} frames, fewer than the branch cut ({kept_frames})")
+    return assembled[:, :kept_frames].float().cpu()
 
 
 def _build_frozen_control_video(input_frames, input_video, frame_num, prefix_frames_count):
@@ -607,6 +765,16 @@ class MiniMaxH3Pipeline:
         visual_latents.append(latent)
         keyframes.append({"anchor": "history", "latent_frame_count": latent.shape[2]})
 
+    def _add_video_history_latents(self, latents, visual_latents, keyframes):
+        # Latent Branch (Phase 3) latent-input variant of _add_video_history:
+        # the history condition rows come from saved latents (a sidecar),
+        # not from a VAE encode of decoded pixels.
+        latent = torch.as_tensor(latents)
+        if latent.dim() == 4:
+            latent = latent.unsqueeze(0)
+        visual_latents.append(latent.float())
+        keyframes.append({"anchor": "history", "latent_frame_count": latent.shape[2]})
+
     def _add_audio_condition(self, latent, anchor, audio_latents, audio_keyframes):
         audio_latents.append(latent)
         audio_keyframes.append({"anchor": anchor, "latent_frame_count": latent.shape[-1]})
@@ -776,6 +944,8 @@ class MiniMaxH3Pipeline:
                  input_masks=None, outpainting_dims=None, denoising_strength=1.0, masking_strength=1.0,
                  input_video=None, input_waveform=None, input_waveform_sample_rate=None, audio_conditioning_end=None,
                  video_guide=None, audio_guide=None, audio_guide2=None, audio_guide3=None, prefix_frames_count=0,
+                 prefix_latents=None, prefix_audio_latents=None,
+                 prefix_kept_windows=None, prefix_kept_frames=0, prefix_is_i2v=False,
                  frame_num=124, height=768, width=1344, shift=12.0, sampling_steps=30, sampling_steps2=3, seed=0,
                  callback=None, VAE_tile_size=None, audio_prompt_type="", video_prompt_type="", fps=24,
                  sample_solver="euler", attention_sparsity=1.0, custom_sigmas=None,
@@ -839,19 +1009,129 @@ class MiniMaxH3Pipeline:
         if image_outputs:
             prefix_frames_count = 0
         audio_from_control_video = not image_outputs and not self.reference_mode and "2" in (audio_prompt_type or "")
+        # Latent Branch (Phase 3): the head window of a branch job takes the
+        # sidecar's kept latents verbatim, so the overlap is never re-encoded
+        # through the VAE. Case A freezes the kept latents at the head of the
+        # tensor (the window keeps the containing window's own geometry);
+        # Case B feeds them as the "history" condition rows of a standard
+        # window. The branch overlap stays raw: it sits on the piecewise
+        # 5+17k grid that the standard 1+17k overlap normalizer would shift.
+        branch_case = None
+        branch_prefix = None
+        branch_audio = None
+        _prefix_frames_count = int(prefix_frames_count or 0)
+        _prefix_video = torch.as_tensor(prefix_latents) if prefix_latents is not None else None
+        if _prefix_video is not None:
+            if _prefix_video.dim() == 5:
+                _prefix_video = _prefix_video[0]
+        if _prefix_video is not None and not self.audio_only and _prefix_frames_count > 0:
+            _latent_h, _latent_w = math.ceil(int(height) / 16), math.ceil(int(width) / 16)
+            _window_latent_t = video_latent_frames(frame_num)
+            _prefix_t = int(_prefix_video.shape[1]) if _prefix_video.dim() == 4 else -1
+            if _prefix_video.dim() != 4 or int(_prefix_video.shape[0]) != 24 or _prefix_video.shape[2] != _latent_h or _prefix_video.shape[3] != _latent_w:
+                print(f"[WanGP][H3] The branch prefix {tuple(int(u) for u in _prefix_video.shape)} does not match this window's latent grid ([24, <{_window_latent_t}>, {_latent_h}, {_latent_w}]); the head window uses a fresh encode for this run.")
+            elif not (2 <= _prefix_t < _window_latent_t and (_prefix_t - 2) % 5 == 0):
+                print(f"[WanGP][H3] The branch prefix's {_prefix_t} latents do not sit on the 2+5k latent grid inside this {_window_latent_t}-latent window; the head window uses a fresh encode for this run.")
+            elif int(guide_phases) > 1 and H3_PHASE_2_TILING_FLAG in (video_prompt_type or ""):
+                print("[WanGP][H3] Two-phase generation with tiling does not support the latent branch prefix yet; the head window uses a fresh encode for this run.")
+            elif self.transformer.pdd_num_steps is not None:
+                print("[WanGP][H3] PDD generation does not support the latent branch prefix yet; the head window uses a fresh encode for this run.")
+            elif audio_from_control_video:
+                print("[WanGP][H3] The control-video audio mode freezes the whole tensor; the latent branch prefix is not supported there; the head window uses a fresh encode for this run.")
+            elif (refinement_mode or "G" in (video_prompt_type or "")) and (float(denoising_strength) < 1.0 or input_masks is not None):
+                print("[WanGP][H3] The control-video refinement mode re-encodes the guide into the tensor; the latent branch prefix is not supported there; the head window uses a fresh encode for this run.")
+            elif outpainting_dims is not None:
+                print("[WanGP][H3] Outpainting changes the window canvas; the latent branch prefix is not supported there; the head window uses a fresh encode for this run.")
+            else:
+                _prefix_decoded = latent_io.h3_video_latent_pixel_frames(_prefix_t)
+                branch_case = "A" if _prefix_decoded == _prefix_frames_count else "B"
+                branch_prefix = _prefix_video.detach().to(dtype=torch.float32, device="cpu")
+                _prefix_audio = prefix_audio_latents
+                if isinstance(_prefix_audio, dict):
+                    # The values are tensors: ``tensor or None`` would call
+                    # bool() on a multi-element tensor and raise, so test
+                    # for None explicitly.
+                    _batched_raw = _prefix_audio.get("batched")
+                    _batched = torch.as_tensor(_batched_raw) if _batched_raw is not None else None
+                    if _batched is not None and _batched.dim() == 4 and tuple(int(u) for u in _batched.shape[:3]) == (1, 32, 2):
+                        _flat_raw = _prefix_audio.get("flat")
+                        _flat = torch.as_tensor(_flat_raw) if _flat_raw is not None else None
+                        branch_audio = {"batched": _batched.detach().to(dtype=torch.float32, device="cpu"),
+                                        "flat": _flat.detach().to(dtype=torch.float32, device="cpu")}
+        # The branch job's kept region is a fresh decode of the source
+        # sidecar's kept windows (the same reconstruction the Latent Decode
+        # job performs), not a re-extraction of the source video (source
+        # independence); the job uses it as the output video's prefix. The
+        # kept windows' specs and the cut are passed by the job loop; the
+        # return field below hands the decoded pixels back to it. The
+        # decode is independent of the prefix acceptance decided above: a
+        # run whose head window the blocked / mis-shaped prefix falls back
+        # to a fresh i2v encode (the else branch) conditions that encode on
+        # the decoded tail instead of the re-extracted source segment, so
+        # the output video stays the sidecar's own content end to end. For
+        # a Case B branch the same decode also supplies the one-shot slice
+        # (the guide): its tail is the committed kept region, a length the
+        # plan derives from the sidecar's recorded totals — for a capped
+        # window the decoded run's tail sits past the committed end, so the
+        # slice comes from the plan, never from the window's recorded trims.
+        # Best effort: a decode that fails keeps the source-pixel path the
+        # job set up before the model call.
+        branch_decoded_prefix = None
+        if prefix_kept_windows:
+            try:
+                branch_decoded_prefix = h3_decode_prefix_frames(
+                    self.vae, prefix_kept_windows, prefix_kept_frames,
+                    device=self.device, vae_dtype=self.vae._model_dtype, is_i2v=prefix_is_i2v)
+            except Exception as exc:
+                print(f"[WanGP][H3] The branch's kept region could not be decoded ({exc}); the output keeps the source-video prefix.")
         # The disabled experiment aligns target overlap with the previous VAE grid (5 + 17n).
         # Retain support for legacy 1 + 17n prefixes when encoding an external continuation.
-        overlap_offset = 5 if H3_CONTROL_LATENT_CONTINUATION and self.transformer.control_layers and int(prefix_frames_count or 0) % 17 == 5 else 1
-        prefix_frames_count, overlap_error = normalize_overlap(int(prefix_frames_count or 0), 17, overlap_offset)
-        if overlap_error:
-            raise ValueError(overlap_error)
-        continuation = _as_video(input_video) if input_video is not None and prefix_frames_count > 0 else None
-        continuation_count = min(prefix_frames_count, continuation.shape[1]) if continuation is not None and image_start is None else 0
-        if continuation_count and continuation_count < prefix_frames_count:
+        overlap_offset = 5 if H3_CONTROL_LATENT_CONTINUATION and self.transformer.control_layers and int(_prefix_frames_count or 0) % 17 == 5 else 1
+        if branch_case == "A":
+            if image_start is not None:
+                print("[WanGP][H3] The latent branch prefix owns the window's first frame; the start image is ignored.")
+                image_start = None
+            prefix_frames_count = 0
+            continuation = None
+        elif branch_case == "B":
+            prefix_frames_count = _prefix_frames_count
+            if branch_decoded_prefix is not None and _prefix_frames_count > 0:
+                # The guide (the model's conditioning region) is the tail of
+                # the committed kept region: the last ``guide_frames`` of the
+                # sidecar's decode, so the slice's last frame is the shared
+                # frame the fresh window re-anchors on (the image condition).
+                # For a window-1 end (the only Case B the live flow accepts)
+                # that tail is the containing window's committed contribution.
+                continuation = branch_decoded_prefix[:, -_prefix_frames_count:].float().to("cpu")
+            else:
+                # The kept windows did not resolve to decode specs (the job
+                # would use the source-pixel path for the kept region): fall
+                # back to a one-shot decode of the kept latents, sliced from
+                # its tail by the guide length (the committed region's
+                # length).
+                _decoded_prefix = self.vae.decode(branch_prefix.unsqueeze(0).to(device=self.device, dtype=self.vae._model_dtype)).clamp_(-1.0, 1.0)[0]
+                _head_trim = max(0, int(_decoded_prefix.shape[1]) - _prefix_frames_count)
+                continuation = _decoded_prefix[:, _head_trim:_head_trim + _prefix_frames_count].float().to("cpu")
+                _decoded_prefix = None
+        else:
+            prefix_frames_count, overlap_error = normalize_overlap(_prefix_frames_count, 17, overlap_offset)
+            if overlap_error:
+                raise ValueError(overlap_error)
+            if branch_decoded_prefix is not None and prefix_frames_count > 0:
+                # A branch job whose prefix this run rejected (a blocked or
+                # mis-shaped head window) still owns its kept region: the
+                # fresh i2v encode conditions on the tail of the sidecar's
+                # decoded kept windows (the cut's last frame is the i2v
+                # start), not a re-extraction of the source video.
+                continuation = branch_decoded_prefix[:, -prefix_frames_count:].float().to("cpu")
+            else:
+                continuation = _as_video(input_video) if input_video is not None and prefix_frames_count > 0 else None
+        continuation_count = min(prefix_frames_count, continuation.shape[1]) if continuation is not None and (image_start is None or branch_case is not None) else 0
+        if continuation_count and continuation_count < prefix_frames_count and branch_case is None:
             continuation_count = floor_frame_count(continuation_count, 1, 17, overlap_offset if continuation_count >= overlap_offset else 1)
         # ControlNet continuation keeps the overlap on the target timeline, both as fixed video latents
         # and as visible pixels in its inpainting input. Native H3 history alone loses that appearance constraint.
-        control_target_anchors = bool(self.transformer.control_layers) and not audio_from_control_video and not refinement_mode
+        control_target_anchors = bool(self.transformer.control_layers) and not audio_from_control_video and not refinement_mode and branch_case is None
         control_known_frames = None
         if control_target_anchors and continuation_count:
             control_known_frames, continuation_count = continuation[:, -continuation_count:], 0
@@ -987,7 +1267,17 @@ class MiniMaxH3Pipeline:
 
             if continuation_count:
                 if history_frames is not None:
-                    self._add_video_history(prepare_stage_video(history_frames), stage_latents, stage_keyframes)
+                    if branch_case == "B":
+                        # Latent Branch (Phase 3): the history condition rows
+                        # are the sidecar's kept latents verbatim (no VAE
+                        # encode of the decoded overlap pixels); the two-phase
+                        # phase-1 stage (LTX2-style) takes the bilinear
+                        # half-resolution form on its own grid, the phase-2
+                        # stage the kept latents as-is.
+                        _branch_history = _halve_video_latents(branch_prefix, math.ceil(stage_height / 16), math.ceil(stage_width / 16))
+                        self._add_video_history_latents(_branch_history, stage_latents, stage_keyframes)
+                    else:
+                        self._add_video_history(prepare_stage_video(history_frames), stage_latents, stage_keyframes)
                 add_image_condition(prepare_stage_video(continuation[:, -1:]), 0)
             elif image_start is not None and not audio_from_control_video:
                 add_image_condition(prepare_stage_video(image_start), 0)
@@ -1014,7 +1304,19 @@ class MiniMaxH3Pipeline:
         if not self.reference_mode and (input_ref_images or input_frames is not None and not (control_video or audio_from_control_video or video_references or fun_control) or input_frames2 is not None):
             raise ValueError("Image, video, and audio references require the Ref2VA checkpoint")
         if continuation_count:
-            if waveform is not None:
+            if branch_case == "B" and branch_audio is not None:
+                # Latent Branch (Phase 3): the audio condition rows are the
+                # sidecar's kept audio latents (the time-ratio splice), so
+                # the source waveform is not re-encoded for them.
+                _branch_audio = branch_audio["batched"].to(device=self.device, dtype=self.dtype)
+                _branch_audio = _branch_audio[..., :min(_branch_audio.shape[-1],
+                                                        max(1, round(continuation_count / fps * AUDIO_LATENT_FPS)))]
+                boundary_latents = min(_branch_audio.shape[-1], max(1, round(AUDIO_LATENT_FPS / fps)))
+                history_latents = _branch_audio.shape[-1] - boundary_latents
+                if history_latents:
+                    self._add_audio_condition(_branch_audio[..., :history_latents], "history", audio_latents, audio_keyframes)
+                self._add_audio_condition(_branch_audio[..., history_latents:], "first", audio_latents, audio_keyframes)
+            elif waveform is not None:
                 overlap_samples = round(continuation_count / fps * AUDIO_SAMPLE_RATE)
                 continuation_waveform = _fit_audio_samples(waveform[0], overlap_samples).unsqueeze(0)
                 history_samples = round(audio_start_seconds * AUDIO_SAMPLE_RATE)
@@ -1092,7 +1394,7 @@ class MiniMaxH3Pipeline:
                 reference_sources.append(self._waveform(audio, sample_rate))
         for reference_audio in self._prepare_audio_references(reference_sources):
             self._add_audio_reference(reference_audio, presentation, audio_latents, refs)
-        if (refinement_mode or soundtrack or not self.reference_mode or self.fixed_prompt is not None) and any(flag in (audio_prompt_type or "") for flag in "AK") and waveform is not None:
+        if (refinement_mode or soundtrack or not self.reference_mode or self.fixed_prompt is not None) and any(flag in (audio_prompt_type or "") for flag in "AK") and waveform is not None and branch_case is None:
             condition_start = round(audio_start_seconds * AUDIO_SAMPLE_RATE)
             condition_samples = round((target_frames / fps - audio_time_offset / AUDIO_LATENT_FPS) * AUDIO_SAMPLE_RATE)
             condition_waveform = waveform[..., condition_start:condition_start + condition_samples]
@@ -1179,6 +1481,47 @@ class MiniMaxH3Pipeline:
                   torch.randn((1, 24, latent_t, latent_h, latent_w), generator=generator, dtype=torch.float32, device="cpu"))
                  if target_video_condition is None else target_video_condition).to(self.device)
         target_video_condition = None
+        branch_head_latents = 0
+        branch_video_prefix = None
+        branch_video_prefix_full = None
+        if branch_case == "A":
+            # Latent Branch (Phase 3) Case A: the head of the tensor is the
+            # sidecar's kept latents verbatim. They stay frozen at t=1.0
+            # (the "head" target-condition anchor) and the solver re-freezes
+            # them at every step; only the new tail is denoised. The two-phase
+            # phase-1 stage (LTX2-style) works on the half-resolution canvas,
+            # so it takes the bilinear half-resolution form of the kept
+            # latents; the exact full-resolution form is restored after the
+            # latent upscaler and is what the phase-2 stage (and the final
+            # re-freeze) use.
+            branch_head_latents = branch_prefix.shape[1]
+            branch_video_prefix_full = branch_prefix.to(device=self.device, dtype=video.dtype)
+            branch_video_prefix = branch_video_prefix_full if not two_phase else _halve_video_latents(branch_prefix, latent_h, latent_w).to(device=self.device, dtype=video.dtype)
+            video[:, :, :branch_head_latents].copy_(branch_video_prefix.unsqueeze(0))
+            target_video_condition_frames = branch_head_latents
+            if two_phase and not tiled_phase_2:
+                # The phase-1 stage conditions on the kept latents in the
+                # latent upscaler's own form (round trip: stage grid ->
+                # native-scale upscale -> stage grid) instead of the raw
+                # bilinear photocopy, so the phase-1 transformer, the
+                # upscaler and the phase-2 LoRA all see one consistent
+                # head; the exact sidecar values are restored after the
+                # upscaler as before.
+                if set_progress_status is not None:
+                    set_progress_status("Preparing H3 branch head (latent upscaler)")
+
+                def branch_upscaler_progress(_phase, current_step, total_steps):
+                    if set_progress_status is not None:
+                        set_progress_status(f"Preparing H3 branch head (latent upscaler {int(current_step) + 1}/{int(total_steps)})")
+
+                self._use_shared_components()
+                branch_video_prefix = _upscaler_conditioned_head(branch_video_prefix, self.latent_upscaler, latent_h, latent_w,
+                                                                  math.ceil(target_height / 16), math.ceil(target_width / 16), self.device,
+                                                                  abort_callback=lambda: self._interrupt,
+                                                                  progress_callback=branch_upscaler_progress).to(device=self.device, dtype=video.dtype)
+                video[:, :, :branch_head_latents].copy_(branch_video_prefix.unsqueeze(0))
+                self._use_transformer()
+                print("[WanGP][H3] Two-phase latent branch: the phase-1 stage conditions on the kept latents in the form of the latent upscaler; the exact values of the source latent file are restored after the upscaler.")
         if control_anchor_indices is not None:
             control_anchor_indices = control_anchor_indices.to(video.device)
             control_anchor_latents = control_anchor_latents.to(video)
@@ -1196,12 +1539,24 @@ class MiniMaxH3Pipeline:
         if target_audio_condition_latents:
             audio[..., :target_audio_condition_latents].copy_(target_audio_condition[..., :target_audio_condition_latents].to(audio))
         target_audio_condition = None
+        branch_audio_prefix = None
+        if branch_case == "A" and branch_audio is not None:
+            # Latent Branch (Phase 3) Case A: the head of the audio tensor is
+            # the sidecar's kept audio latents. The existing
+            # target_audio_condition_latents mechanism keeps the solver off
+            # them (it only steps the audio tail).
+            branch_audio_prefix = branch_audio["batched"].to(device=self.device, dtype=audio.dtype)
+            target_audio_condition_latents = min(audio_t, int(branch_audio_prefix.shape[-1]))
+            if target_audio_condition_latents:
+                audio[..., :target_audio_condition_latents].copy_(branch_audio_prefix[..., :target_audio_condition_latents])
         payload = {"keyframes": keyframes or None, "audio_keyframes": audio_keyframes or None,
                    "refs": refs or None, "cond_video_rows": cond_video_rows,
                    "cond_audio_rows": cond_audio_rows, "frame_count": aligned_target_frames, "text_token_tags": text_tags,
                    "fps": fps, "audio_time_offset": audio_time_offset, "target_audio_condition_latents": target_audio_condition_latents,
                    "target_video_condition_frames": target_video_condition_frames,
                    "attention_sparsity": float(attention_sparsity)}
+        if branch_case == "A":
+            payload["target_video_condition_anchor"] = "head"
         if control_rows is not None:
             payload.update(control_rows=control_rows, control_scale=float(context_scale[0]), control_anchor_frames=control_anchor_frames)
         control_rows = None
@@ -1372,7 +1727,7 @@ class MiniMaxH3Pipeline:
                             pika_renoise_(audio_tail, velocity_list, stage_sigmas_audio[step], stage_sigmas_audio[step + 1], renoise_generator, final=final, audio=True)
                     elif stage_solver == "euler":
                         video_ratio = sigma_video_next / sigma_video
-                        if not target_video_condition_frames:
+                        if target_video_condition_frames < video.shape[2]:
                             video_denoised = video_velocity.mul_(sigma_video).add_(video)
                             if effective_sigmas_video is None and source_latents is not None and step_editable_mask is not None:
                                 _blend_video_source(video_denoised, source_latents, step_editable_mask)
@@ -1387,7 +1742,7 @@ class MiniMaxH3Pipeline:
                             audio_tail.mul_(audio_ratio).add_(audio_velocity_tail, alpha=1.0 - audio_ratio)
                     elif stage_solver == "res_multistep":
                         coefficients = res_coefficients[step]
-                        if not target_video_condition_frames:
+                        if target_video_condition_frames < video.shape[2]:
                             video_denoised = video_velocity.mul_(sigma_video).add_(video)
                             if effective_sigmas_video is None and source_latents is not None and step_editable_mask is not None:
                                 _blend_video_source(video_denoised, source_latents, step_editable_mask)
@@ -1413,7 +1768,7 @@ class MiniMaxH3Pipeline:
                             video_velocity.mul_(sigma_video).add_(video)
                             _blend_video_source(video_velocity, source_latents, step_editable_mask)
                             video_velocity.sub_(video).div_(sigma_video)
-                        stage_video = video if target_video_condition_frames else video_velocity.to(dtype=video.dtype, copy=True).mul_(stage_size).add_(video)
+                        stage_video = video if target_video_condition_frames >= video.shape[2] else video_velocity.to(dtype=video.dtype, copy=True).mul_(stage_size).add_(video)
                         if effective_sigmas_video is None and source_latents is not None and not target_video_condition_frames and (step < denoising_start_step or step < mask_end_step):
                             stage_source_video = stage_video[:, :, :source_latents.shape[2]]
                             stage_source_mask = None if step < denoising_start_step else editable_mask
@@ -1433,7 +1788,7 @@ class MiniMaxH3Pipeline:
                         stage_model_sigma_video = condition_control_video(stage_video, stage_sigma_video)
                         stage_video_velocity, stage_audio_velocity = self.transformer(stage_video, stage_audio, stage_model_sigma_video, stage_sigma_audio.view(1), context, payload, first_block_cache=first_block_cache)
                         self._check_abort()
-                        if not target_video_condition_frames:
+                        if target_video_condition_frames < video.shape[2]:
                             stage_video_velocity.mul_(stage_sigma_video).add_(stage_video)
                             if effective_sigmas_video is None and source_latents is not None and step_editable_mask is not None:
                                 _blend_video_source(stage_video_velocity, source_latents, step_editable_mask)
@@ -1448,6 +1803,11 @@ class MiniMaxH3Pipeline:
                             audio_velocity_tail.mul_(0.25).add_(stage_audio_velocity_tail, alpha=0.75).mul_(carrier_step_size)
                             audio_tail.add_(audio_velocity_tail)
                         stage_video = stage_audio = stage_video_velocity = stage_audio_velocity = None
+                    if branch_video_prefix is not None:
+                        # Latent Branch (Phase 3) Case A: the solvers step the
+                        # whole tensor, so the frozen prefix is put back after
+                        # every step (all four solvers converge here).
+                        video[:, :, :branch_video_prefix.shape[1]].copy_(branch_video_prefix.unsqueeze(0))
                     final_masked_er_step = preserve_input_mask_values and stage_solver == "er_sde" and not bool(sigma_video_next.any())
                     if effective_sigmas_video is None and source_latents is not None and not final_masked_er_step and (step < denoising_start_step or step < mask_end_step):
                         source_video = video[:, :, :source_latents.shape[2]]
@@ -1514,6 +1874,16 @@ class MiniMaxH3Pipeline:
             video = (video * std + mean).float()
             normalized_video = mean = std = None
             self._check_abort()
+            if branch_video_prefix_full is not None:
+                # Latent Branch (Phase 3) Case A, two-phase: the latent
+                # upscaler is a learned model, so its output for the frozen
+                # head is an approximation; the exact sidecar values are
+                # restored before the phase-2 stage refines from them. The
+                # phase-2 stage works on the full-resolution grid, so from
+                # here on the per-step and final re-freezes use the kept
+                # latents as-is.
+                video[:, :, :branch_video_prefix_full.shape[1]].copy_(branch_video_prefix_full.unsqueeze(0))
+                branch_video_prefix = branch_video_prefix_full
 
             apply_phase_2_lora_policy()
             activate_lora_phase(2, int(sampling_steps2))
@@ -1580,6 +1950,11 @@ class MiniMaxH3Pipeline:
                 phase_2_noise = torch.randn(video.shape, generator=torch.Generator(device="cpu").manual_seed(int(seed)), dtype=torch.float32, device="cpu")
                 phase_2_latent_canvas = torch.lerp(phase_2_base_video, phase_2_noise, float(phase_2_sigmas_video[0]))
                 video = phase_2_base_video = None
+                # TODO(two-phase-tiling): the phase-2 re-noise mixed the whole
+                # canvas (frozen head included) with noise at the phase-2
+                # start; re-copy the branch prefix into the canvas head here:
+                #   if branch_video_prefix is not None:
+                #       phase_2_latent_canvas[..., :branch_video_prefix.shape[1]].copy_(branch_video_prefix.to(phase_2_latent_canvas))
                 row_tiles = _spatial_tiles(target_height)
                 column_tiles = _spatial_tiles(target_width)
                 tile_count = H3_PHASE_2_TILE_COUNT
@@ -1674,6 +2049,13 @@ class MiniMaxH3Pipeline:
                         for key in ("layout_signature", "layout", "rope"):
                             payload.pop(key, None)
                         tile_video = _crop_spatial_tile(phase_2_latent_canvas, latent_top, latent_left, latent_height, latent_width).to(self.device)
+                        # TODO(two-phase-tiling): re-freeze the tile head from
+                        # the corresponding spatial crop of the branch prefix
+                        # (cropped and padded exactly like _crop_spatial_tile)
+                        # before the transformer sees it:
+                        #   if branch_video_prefix is not None:
+                        #       _tile_prefix = _crop_spatial_tile(branch_video_prefix, latent_top, latent_left, latent_height, latent_width).to(tile_video)
+                        #       tile_video[..., :_tile_prefix.shape[1]].copy_(_tile_prefix)
                         if grouped_masking:
                             tile_editable_mask = _crop_spatial_tile(phase_2_editable_mask, latent_top, latent_left, latent_height, latent_width).to(self.device)
                             _set_grouped_video_rows(payload, tile_editable_mask, tile_video.shape[-3:], tile_video.device)
@@ -1692,6 +2074,10 @@ class MiniMaxH3Pipeline:
                         _blend_video_source(phase_2_accumulator, phase_2_source_latents, step_editable_mask)
                     video_ratio = float(sigma_video_next / sigma_video)
                     phase_2_latent_canvas.mul_(video_ratio).add_(phase_2_accumulator, alpha=1.0 - video_ratio)
+                    # TODO(two-phase-tiling): re-copy the branch prefix into
+                    # the canvas head after every step update:
+                    #   if branch_video_prefix is not None:
+                    #       phase_2_latent_canvas[..., :branch_video_prefix.shape[1]].copy_(branch_video_prefix.to(phase_2_latent_canvas))
                     if phase_2_source_latents is not None and (step < denoising_start_step or step < mask_end_step):
                         phase_2_source_mask = None if step < denoising_start_step else phase_2_editable_mask
                         keep_grouped_rows_fixed = grouped_masking and denoising_start_step <= step and step + 1 < mask_end_step
@@ -1723,6 +2109,13 @@ class MiniMaxH3Pipeline:
                 presentation, visual_latents, refs = phase_2_presentation, phase_2_visual_latents, phase_2_refs
                 phase_2_noise = torch.randn(video.shape, generator=torch.Generator(device="cpu").manual_seed(int(seed)), dtype=torch.float32, device="cpu").to(self.device)
                 video = torch.lerp(video, phase_2_noise, phase_2_sigmas_video[0])
+                if branch_video_prefix is not None:
+                    # Latent Branch (Phase 3) Case A, two-phase: the phase-2
+                    # re-noise mixed the whole tensor (frozen head included)
+                    # with noise at the phase-2 start; the exact kept latents
+                    # are restored before the three refinement steps (the
+                    # per-step re-freeze keeps them frozen through the loop).
+                    video[:, :, :branch_video_prefix.shape[1]].copy_(branch_video_prefix.unsqueeze(0))
                 if video_to_video:
                     self._use_shared_components()
                     source_video = _resize_video(control_source, target_height, target_width)
@@ -1786,6 +2179,60 @@ class MiniMaxH3Pipeline:
                 offload.activate_loras(self.transformer, active_loras, [lora_scaling[name] for name in active_loras])
                 offload.set_step_no_for_lora(self.transformer, lora_step)
 
+        if branch_video_prefix is not None:
+            # Latent Branch (Phase 3) Case A: the audio-refinement extra
+            # phase re-noised the whole audio tensor (it runs with
+            # target_audio_condition_latents = 0), so the frozen branch
+            # prefixes are put back before the latent capture and the VAE
+            # decodes.
+            if two_phase:
+                # Two-phase branch: the first new latent was denoised
+                # against the phase-1 head form; if a splice pop survives
+                # into the final tensor it is blended partway toward the
+                # frozen head here, before capture, so the saved sidecar
+                # and the decoded video keep the same values.
+                splice = _branch_splice_blend(video, branch_head_latents)
+                if splice is not None:
+                    jump, baseline = splice
+                    print(f"[WanGP][H3] Two-phase branch splice: the first new latent jumped {jump:.4f} against the frozen head (baseline {baseline:.4f}); it is blended {H3_BRANCH_SPLICE_BLEND_ALPHA:.2f} toward the head before capture.")
+            video[:, :, :branch_video_prefix.shape[1]].copy_(branch_video_prefix.unsqueeze(0))
+            if branch_audio_prefix is not None:
+                audio[..., :branch_audio_prefix.shape[-1]].copy_(branch_audio_prefix)
+
+        # Capture the final pre-decode latents for the optional latent
+        # companion file ('Save Latents'). The video latent is the final
+        # denoised [1, 24, t, h, w] state and the audio latent the final
+        # [1, 32, 2, t] state; both are captured right before their VAE
+        # decodes. Frozen-control-video jobs output the input video itself,
+        # so there is no latent worth saving there; audio-only (TTS) jobs
+        # have no video latent either.
+        # Latent Branch (Phase 3) Case B: the saved window is a fresh
+        # standard window whose first decoded frame re-anchors the carried
+        # window's last decoded frame (a shared frame, never new content),
+        # so the companion records it as a pure-new window: no re-decoded
+        # history and the anchor-head marker, which the sidecar writer and
+        # the decode job use to drop that one frame from the window's
+        # contribution (or commit it, when the window carries a one-frame
+        # head share).
+        latent_file_obj = None
+        if bool(kwargs.get("save_latents", False)) and not self.audio_only and frozen_target_video is None:
+            latent_file_obj = self._build_latent_file_obj(
+                video=video,
+                audio=audio,
+                frame_num=frame_num,
+                fps=fps,
+                target_frames=target_frames,
+                history_count=0 if branch_case == "B" else history_count,
+                window_no=int(kwargs.get("window_no") or 1),
+                window_start_frame_no=int(kwargs.get("window_start_frame_no") or 0),
+                seed=int(seed),
+                input_prompt=input_prompt,
+                sampling_steps=int(sampling_steps),
+                denoising_strength=float(denoising_strength),
+                loras_selected=loras_selected,
+                anchor_head=branch_case == "B",
+                kwargs=kwargs)
+
         if set_progress_status is not None:
             set_progress_status("VAE Decoding of Image" if image_outputs else "Decoding H3 Stereo Audio" if self.audio_only or decoded_video is not None or frozen_target_video is not None else "VAE Decoding of Video and Audio")
         self._check_abort()
@@ -1843,9 +2290,17 @@ class MiniMaxH3Pipeline:
         if self.audio_only:
             return {"x": torch.from_numpy(decoded_audio.T.copy()), "audio_sampling_rate": AUDIO_SAMPLE_RATE,
                     "overridden_inputs": {"resolution": "32x32", "video_length": frame_num, "duration_seconds": round(frame_num / fps, 3)}}
+        # The latent companion payload is handed to the caller instead of the
+        # side-files dict: the caller owns the companion file (it must
+        # accumulate the windows of a sliding-window job) and the raw bytes
+        # are never echoed to API responses.
         samples = {"x": decoded_video, "audio": decoded_audio, "audio_sampling_rate": AUDIO_SAMPLE_RATE}
         if latent_slice is not None:
             samples["latent_slice"] = latent_slice
+        if branch_decoded_prefix is not None:
+            samples["decoded_prefix"] = branch_decoded_prefix
+        if latent_file_obj is not None:
+            samples["latent_file_obj"] = latent_file_obj
         return samples
 
     def refine_video(self, video, *, prompt, strengths, denoising_strength=0.45, sampling_steps=4, shift=12.0,
@@ -1896,6 +2351,113 @@ class MiniMaxH3Pipeline:
             set_progress_status=set_progress_status,
         )
         return None if result is None else result["x"]
+
+    def _build_latent_file_obj(self, *, video, audio, frame_num, fps, target_frames, history_count,
+                               window_no, window_start_frame_no, seed, input_prompt, sampling_steps,
+                               denoising_strength, loras_selected, anchor_head=False, kwargs):
+        """Build the ``*_latent.pt`` companion payload from the final pre-decode latents.
+
+        Called right before the video/audio VAE decodes (see ``generate``) so
+        the latent can later be re-decoded without the diffusion model (Media
+        Flow Latent Decode). The video entry is a standard ``wgp_latent/1``
+        entry carrying the [24, t, h, w] latent plus H3-specific per-window
+        bookkeeping (the VAE's piecewise 5/17 latent-to-pixel mapping cannot
+        be expressed by the linear ``latent_stride``/``frame_offset`` layout):
+        ``frame_count`` (the window's output frames), ``h3_history_frames``
+        (input frames re-decoded at the head of the window and dropped from
+        its contribution), ``h3_target_frames`` (the pixel length the decoded
+        window is truncated to) and, when ``anchor_head`` is set (a Case B
+        latent-branch window), ``h3_anchor_head``: the window's first decoded
+        frame re-anchors the carried window's last decoded frame, a shared
+        frame the head trim drops from the window's contribution. The audio
+        entry carries the [32, 2, t] latent flattened to [64, t], decoded to
+        32 kHz stereo.
+        The file itself is written by the caller (the all-latent sidecar:
+        the job's windows stacked on one time dimension, the sidecar the
+        sole content source of the video).
+        """
+        from .minimax_h3_main import AUDIO_VAE_FILE, VIDEO_VAE_FILE
+
+        def vae_sha(name):
+            """SHA-256 of a VAE file on disk. The pipeline keeps only the
+            (possibly bare) filename, so a name that is not a path on its
+            own is resolved through the app's files locator (the ckpts/
+            folder) before hashing; an unlocatable file contributes no
+            hash (the readers treat an empty hash as unrecorded)."""
+            if not name:
+                return ""
+            from shared.utils import files_locator as fl
+            path = name if os.path.isabs(name) else fl.locate_file(name, error_if_none=False)
+            if not path or not os.path.isfile(str(path)):
+                return ""
+            return latent_io.sha256_file(str(path))
+
+        video_latent = video.detach().to(dtype=torch.float32, device="cpu")
+        if video_latent.dim() == 5:
+            video_latent = video_latent[0]
+        lora_names = [os.path.basename(str(lora)) for lora in (loras_selected or []) if str(lora).strip()]
+        video_vae_file = str(getattr(self, "video_vae_file", None) or VIDEO_VAE_FILE)
+        audio_vae_file = str(getattr(self, "audio_vae_file", None) or AUDIO_VAE_FILE)
+        window_extra = {
+            "frame_count": int(frame_num),
+            "h3_history_frames": int(history_count or 0),
+            "h3_target_frames": int(target_frames),
+        }
+        if anchor_head:
+            window_extra["h3_anchor_head"] = 1
+        video_payload = latent_io.build_latent_payload(
+            video_latent,
+            app_version=str(kwargs.get("app_version") or ""),
+            model_type=str(kwargs.get("latent_model_type") or ""),
+            base_model_type=str(kwargs.get("model_type") or ""),
+            model_filename=str(kwargs.get("model_filename") or ""),
+            loras=lora_names,
+            vae_file=os.path.basename(video_vae_file),
+            vae_sha256=vae_sha(video_vae_file),
+            vae_z_dim=int(video_latent.shape[0]),
+            vae_dtype=str(getattr(self.vae, "_model_dtype", torch.float32)).replace("torch.", ""),
+            frames=int(frame_num),
+            fps=float(fps),
+            seed=int(seed),
+            prompt=str(input_prompt)[:1000],
+            denoising_strength=float(denoising_strength),
+            steps=int(sampling_steps),
+            **window_extra,
+        )
+        payload = dict(video_payload)
+        audio_latent = audio.detach().to(dtype=torch.float32, device="cpu")
+        if audio_latent.dim() == 4:
+            audio_latent = audio_latent[0]
+        audio_flat = audio_latent.reshape(-1, int(audio_latent.shape[-1]))  # [32, 2, t] -> [64, t]
+        audio_samples = int(round(frame_num / fps * AUDIO_SAMPLE_RATE)) if fps > 0 else int(audio_flat.shape[-1])
+        audio_payload = latent_io.build_audio_latent_payload(
+            audio_flat,
+            [{
+                "window_no": int(window_no or 1),
+                "start_sample": int(round(window_start_frame_no / fps * AUDIO_SAMPLE_RATE)) if fps > 0 else 0,
+                "samples": audio_samples,
+            }],
+            app_version=str(kwargs.get("app_version") or ""),
+            model_type=str(kwargs.get("latent_model_type") or ""),
+            base_model_type=str(kwargs.get("model_type") or ""),
+            model_filename=str(kwargs.get("model_filename") or ""),
+            loras=lora_names,
+            audio_vae_file=os.path.basename(audio_vae_file),
+            audio_vae_sha256=vae_sha(audio_vae_file),
+            audio_vae_dtype=str(getattr(self.audio_vae, "_model_dtype", torch.float32)).replace("torch.", ""),
+            sample_rate=AUDIO_SAMPLE_RATE,
+            channels=2,
+            samples=audio_samples,
+            seed=int(seed),
+            prompt=str(input_prompt)[:1000],
+            denoising_strength=float(denoising_strength),
+            steps=int(sampling_steps),
+            total_windows=1,
+            **window_extra,
+        )
+        payload.update(audio_payload)
+        print(f"[WanGP][H3] Latent companion payload built (video {tuple(video_latent.shape)}, audio {tuple(audio_flat.shape)}).")
+        return payload
 
 
 __all__ = ["MiniMaxH3Pipeline", "video_latent_frames"]

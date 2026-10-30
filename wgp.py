@@ -93,7 +93,7 @@ from shared.utils.media_recording import record_file_metadata as shared_record_f
 from shared.utils.settings_bundle import is_wangp_settings_filename
 from shared.utils.video_decode import decode_video_frames_ffmpeg, probe_video_stream_metadata
 from shared.utils.virtual_media import get_virtual_image, get_virtual_media_entry, get_virtual_media_vsource, media_source_exists, parse_virtual_media_path, replace_virtual_media_source, strip_virtual_media_suffix
-from shared.utils.frame_scheduler import SLASH_BLOCK_RE, build_default_window_plan, build_extension_window, build_frame_scheduler, fit_video_length, floor_frame_count, has_slash_commands, normalize_frame_count, set_video_length_rounding, prepare_loras_mult_windows
+from shared.utils.frame_scheduler import SLASH_BLOCK_RE, build_default_window_plan, build_extension_window, build_frame_scheduler, fit_video_length, floor_frame_count, has_slash_commands, normalize_frame_count, set_video_length_rounding, prepare_loras_mult_windows, resolve_window_geometry
 from shared.match_archi import match_nvidia_architecture
 from shared.attention import ATTENTION_MODE_AVAILABILITY, get_attention_modes, get_supported_attention_modes, get_default_attention_mode, get_override_attention_modes, get_supported_override_attention_modes
 from shared.utils.utils import truncate_for_filesystem, sanitize_file_name, process_images_multithread, get_default_workers, resize_lanczos_frames, expand_or_shrink_mask, prepare_binary_mask_frame
@@ -114,7 +114,8 @@ from shared.remote_llm.config import LLM_CONFIG_KEY, is_remote_engine, normalize
 from shared.loras_migration import migrate_loras_layout
 from shared.lora_paths import resolve_lora_dir
 from shared.utils.wgp_config_migration import migrate_extension_defaults
-from shared.utils import files_locator as fl 
+from shared.utils import files_locator as fl
+from shared.utils import latent_io
 from shared.gradio.strip_gallery import StripGallery, STRIP_GALLERY_CLASSES
 from shared.utils.gallery_sources import GALLERY_SOURCES, STRIP_SOURCES, VIDEO, MESH, WORLD, APP, gallery_source, source_index, source_for_path, gallery_state_defaults
 from shared.utils.self_refiner import normalize_self_refiner_plan, ensure_refiner_list, add_refiner_rule, remove_refiner_rule
@@ -220,7 +221,7 @@ theme_radius_size = Size("0.9px", "1.8px", "3.6px", "5.4px", "7.2px", "10.8px", 
 app = None
 # All media attachment keys for queue save/load
 ATTACHMENT_KEYS = ["image_start", "image_end", "image_refs", "image_guide", "image_mask",
-                   "video_guide", "video_guide2", "video_guide3", "video_mask", "video_source", "audio_guide", "audio_guide2", "audio_guide3", "audio_source", "replace_voice_sample", "replace_voice_sample2", "custom_guide"]
+                   "video_guide", "video_guide2", "video_guide3", "video_mask", "video_source", "branch_latent_file", "audio_guide", "audio_guide2", "audio_guide3", "audio_source", "replace_voice_sample", "replace_voice_sample2", "custom_guide"]
 PRESERVE_MEDIA_ON_SETTINGS_IMPORT = True
 
 lock = threading.Lock()
@@ -2918,6 +2919,7 @@ resolution_preferences = resolution_utils.migrate_resolution_preferences(server_
 if resolution_preferences:
     update_config(server_config, server_config_filename, resolution_preferences)
 server_config.setdefault(gradio_queue_focus_patch.FOCUS_QUEUE_SERVER_CONFIG_KEY, 1)
+server_config.setdefault("save_latents", False)
 gradio_queue_focus_patch.BACKGROUND_SCHEDULER_DEFAULT_ENABLED = bool(server_config.get(gradio_queue_focus_patch.FOCUS_QUEUE_SERVER_CONFIG_KEY, 1))
 gradio_queue_focus_patch.install()
 gradio_model_switch_patch.install(verbose=ui_perf_debug)
@@ -7353,6 +7355,2214 @@ def record_file_metadata(video_path, configs, is_image, audio_only, gen, embedde
         notifications.record_generation(server_config, gen, video_path, configs, replace_last=replace_last_file, notify=notify_generation)
 
 
+
+
+
+def _prefix_to_frames_space(entry, prefix, frames_space, transform="logc3", device="cpu"):
+    """Convert prefix frames into the pixel space of the decoded window so
+    the two can be concatenated directly.
+
+    ``frames_space`` is ``"uint8"`` (SDR output), ``"vae"`` (Wan/LongCat HDR:
+    VAE range [-1, 1]) or ``"linear"`` (LTX-2 HDR: HDR-linear). The prefix is
+    uint8, VAE range or HDR-linear depending on how the original source was
+    read (today: the all-latent sidecar's embedded i2v start image, uint8
+    PNG bytes).
+    """
+    if prefix is None:
+        return None
+    from shared.utils.hdr import hdr_linear_to_vae_range, vae_range_to_hdr_linear
+    try:
+        if prefix.dtype == torch.float16:
+            prefix = prefix.float()
+        prefix = prefix.to(device=device)
+        prefix_is_linear = bool(entry.get("input_video_is_hdr")) and torch.is_floating_point(prefix)
+        if prefix.dtype == torch.uint8:
+            if frames_space == "uint8":
+                return prefix
+            if frames_space == "vae":
+                return prefix.float().div_(255.0).sub_(0.5)
+            return prefix.float().div_(255.0)
+        if prefix_is_linear:
+            if frames_space == "linear":
+                return prefix
+            if frames_space == "vae":
+                return hdr_linear_to_vae_range(prefix, transform=transform)
+            return prefix.clamp_(0.0, 1.0).mul_(255.0).round_().to(torch.uint8)
+        # VAE-range float prefix (float SDR source).
+        if frames_space == "vae":
+            return prefix
+        if frames_space == "linear":
+            return vae_range_to_hdr_linear(prefix, transform=transform)
+        return prefix.add_(1.0).mul_(0.5).clamp_(0.0, 1.0).mul_(255.0).round_().to(torch.uint8)
+    except Exception as exc:
+        print(f"Latent decode: the prefix frames could not be converted to the decoded sample's pixel space: {exc}")
+        return None
+
+
+_LTX2_BASE_TYPES = ("ltx2_19B", "ltx2_22B", "ltx2_25_22B", "ltx2_22B_edit_anything", "ltx2_22B_msr", "joyai_echo")
+_H3_BASE_TYPES = ("minimax_h3_fl2va", "minimax_h3_fl2va_pruned", "minimax_h3_ref2va",
+                  "minimax_h3_ref2va_pruned", "minimax_h3_tts_ref2va_pruned", "viggle_animate")
+# The Wan family's base types (the models.wan handlers' supported types):
+# the Wan 2.1 VAE's 8x 16-channel 4/1 layout for every type except the 5B
+# class (ti2v_2_2, lucy_edit, kiwi_edit), which loads the Wan 2.2 VAE
+# (16x spatial, a different checkpoint).
+_WAN_BASE_TYPES = ("multitalk", "infinitetalk", "fantasy", "vace_14B", "vace_14B_2_2", "vace_multitalk_14B",
+                   "vace_standin_14B", "vace_lynx_14B", "t2v_1.3B", "standin", "lynx_lite", "lynx", "t2v",
+                   "t2v_2_2", "vace_1.3B", "vace_ditto_14B", "phantom_1.3B", "phantom_14B", "recam_1.3B",
+                   "animate", "animate2", "alpha", "alpha2", "alpha_lynx", "chrono_edit", "shotplan_t2v",
+                   "shotplan_t2v_2_2", "i2v", "i2v_2_2", "i2v_2_2_multitalk", "ti2v_2_2", "lucy_edit",
+                   "kiwi_edit", "flf2v_720p", "fun_inp_1.3B", "fun_inp", "mocha", "steadydancer", "wanmove",
+                   "scail", "scail2_14B", "scail2_1.3B", "vista4d", "i2v_2_2_svi2pro", "bernini",
+                   "bernini_1.3B", "sky_df_1.3", "sky_df_14B")
+
+
+def _is_ltx2_family(base_model_type, model_def):
+    """Whether the latent's model family is LTX-2 (separate video/audio VAEs
+    and an optional vocoder; the set mirrors ltx2_handler.family_handler).
+    """
+    base_model_type = str(base_model_type or "")
+    if base_model_type in _LTX2_BASE_TYPES:
+        return True
+    return str((model_def or {}).get("architecture") or "").startswith("ltx2")
+
+
+def _is_h3_family(base_model_type, model_def):
+    """Whether the latent's model family is MiniMax H3 (separate video/audio
+    VAEs, 32 kHz stereo audio, and a piecewise 5/17 latent-to-pixel layout;
+    the set mirrors minimax_h3_handler.family_handler).
+    """
+    base_model_type = str(base_model_type or "")
+    if base_model_type in _H3_BASE_TYPES:
+        return True
+    return str((model_def or {}).get("architecture") or "") in _H3_BASE_TYPES
+
+
+def _is_wan_family(base_model_type, model_def):
+    """Whether the latent's model family is Wan (the models.wan handlers:
+    the Wan 2.1 / 2.2 video VAEs, the 4/1 latent layout; the set mirrors
+    the handlers' query_supported_types, with the model registry deciding
+    for types outside it).
+    """
+    base_model_type = str(base_model_type or "")
+    if base_model_type in _WAN_BASE_TYPES:
+        return True
+    handler = model_types_handlers.get(base_model_type)
+    if handler is not None and str(getattr(handler, "__name__", "")).startswith("models.wan"):
+        return True
+    architecture = str((model_def or {}).get("architecture") or "")
+    return architecture in _WAN_BASE_TYPES or architecture == "wan"
+
+
+# The LongCat family's base types (the models.longcat handler's supported
+# types): the 1.3B LongCat video / avatar models, all on the Wan 2.1 VAE
+# (16 channels, 4/1 temporal, 8x spatial).
+_LONGCAT_BASE_TYPES = ("longcat_video", "longcat_avatar", "longcat_avatar_v1_5")
+
+
+def _is_longcat_family(base_model_type, model_def):
+    """Whether the latent's model family is LongCat (the models.longcat
+    handler: the Wan 2.1 VAE, the 4/1 latent layout; the set mirrors
+    longcat_handler.family_handler.query_supported_types, with the model
+    registry deciding for types outside it).
+    """
+    base_model_type = str(base_model_type or "")
+    if base_model_type in _LONGCAT_BASE_TYPES:
+        return True
+    handler = model_types_handlers.get(base_model_type)
+    if handler is not None and str(getattr(handler, "__name__", "")).startswith("models.longcat"):
+        return True
+    return str((model_def or {}).get("architecture") or "") in _LONGCAT_BASE_TYPES
+
+
+def _is_all_latent_family(base_model_type, model_def):
+    """Whether the model family writes the all-latent sidecar (LTX2, Wan,
+    LongCat and MiniMax H3: the sidecar is the sole content source)."""
+    return (_is_ltx2_family(base_model_type, model_def)
+            or _is_wan_family(base_model_type, model_def)
+            or _is_longcat_family(base_model_type, model_def)
+            or _is_h3_family(base_model_type, model_def))
+
+
+# The *Misc.* tab's *Save Latents* choice (per generation): it overrides
+# the *Configuration* option's *Save Latents* for that one job.
+SAVE_LATENT_CHOICES = [
+    ("Configuration (global default)", 0),
+    ("On", 1),
+    ("Off", 2),
+]
+
+
+def effective_save_latents(choice, default):
+    """The *Save Latents* decision for one generation.
+
+    ``choice`` is the per-generation *Misc.* tab radio (0 follows the
+    *Configuration* option, 1 writes the companion file, 2 skips it).
+    ``None`` — a setting saved before the choice existed, or a Deepy /
+    API job, which has no such control — follows the *Configuration*
+    option as well.
+    """
+    try:
+        choice = int(choice)
+    except (TypeError, ValueError):
+        choice = 0
+    return bool(default) if choice <= 0 else choice == 1
+
+
+# The dtype string a sidecar records for its VAE, mapped to the torch dtype
+# the decode jobs use (the app writes "16"/"32" for the VAE precision); the
+# server config's vae_precision is the fallback for sidecars that do not
+# record the field.
+_DTYPE_MAP = {"float16": torch.float16, "16": torch.float16, "bfloat16": torch.bfloat16,
+             "float32": torch.float, "32": torch.float}
+
+def _h3_window_commit(entry, model_def, window):
+    """The pixel frames a window's latents commit to the sidecar's final video.
+
+    For MiniMax H3 the decoded length follows the VAE's piecewise 5/17
+    layout (``h3_video_latent_pixel_frames``), the window is truncated to its
+    recorded ``h3_target_frames`` and its ``head_trim``/``tail_trim`` are
+    dropped; other families fall back to the linear ``latent_stride``/
+    ``frame_offset`` layout (``window_pixel_frames``). Returns 0 when the
+    window's latents are absent.
+    """
+    latents = window.get("latents")
+    if latents is None or int(latents.shape[1]) <= 0:
+        return 0
+    if _is_h3_family(str(entry.get("base_model_type") or ""), model_def):
+        from shared.utils.latent_io import h3_video_latent_pixel_frames
+        decoded = h3_video_latent_pixel_frames(int(latents.shape[1]))
+        target = int(window.get("h3_target_frames") or 0)
+        if target > 0 and decoded > target:
+            decoded = target
+    else:
+        decoded = latent_io.window_pixel_frames(latents, int(entry.get("latent_stride") or 0), int(entry.get("frame_offset") or 0))
+    return max(0, int(decoded) - int(window.get("head_trim") or 0) - int(window.get("tail_trim") or 0))
+
+
+# ---------------------------------------------------------------------------
+# Latent Branch (Phase 0): the *From latent* checkbox makes a *Continue Video*
+# / *Continue Last Video* job branch from the source video's saved
+# ``*_latent.pt`` sidecar: the branch point (the keep-frames field) resolves
+# to a latent boundary of the sidecar (before the latent containing the
+# frame by default, after it when *Round branch frame* is checked), the
+# source video is truncated at that cut, and the kept latents carry over
+# into the job's sidecar. The frame math and the carry-over live in
+# shared/utils/latent_io.py.
+# ---------------------------------------------------------------------------
+
+KEEP_FRAMES_VIDEO_SOURCE_LABEL = "Truncate Video beyond this number of resampled Frames (empty=Keep All, negative truncates from End)"
+BRANCH_FRAMES_VIDEO_SOURCE_LABEL = "Branch after this number of resampled Frames (empty=Branch at the End, negative counts from the End); the latent containing the frame is regenerated, the latents before it are kept unchanged"
+BRANCH_FIT_LATENT_LABEL = "Round branch frame up to a latent boundary"
+# The pickers' labels switch with the *From latent* mode and with the
+# value's *origin*: off (the classic flow) the video is the continuation
+# source; on, the two pickers are the same pair seen from either end —
+# the latent file is the branch source (the primary input) and the video
+# is its companion (a preview of the cut; the branch reads the latent
+# file, so it is optional). Whichever picker the app itself filled (the
+# companion video of a picked latent file, or the latent file matched to
+# a selected video) carries the "Detected..." variant; a value the user
+# selected keeps the plain one.
+VIDEO_SOURCE_LABEL = "Video to Continue"
+COMPANION_VIDEO_LABEL = "Companion video file (used for preview only)"
+DETECTED_COMPANION_VIDEO_LABEL = "Detected companion video file (used for preview only)"
+# The latent file's picker is the primary input of the *From latent* mode:
+# the file names the branch source on its own (its companion video, when
+# found, is only a preview aid), so the label says so. The "Detected"
+# variant is the mirror of the companion video's: the file the app
+# matched to a selected video (the backward direction of the operation).
+BRANCH_LATENT_FILE_LABEL = "Select *_latent.pt file"
+DETECTED_LATENT_FILE_LABEL = "Detected latent file (matched to the selected video)"
+# The *From latent* checkbox's tooltip: which families the mode applies to
+# and the one re-compression caveat (the full support table is in
+# docs/SETTINGS.md).
+BRANCH_LATENT_TOOLTIP = ("Branch from a saved latent file (written by the 'Save Latents' option). "
+                         "LTX2 / Wan / LongCat / MiniMax H3 only. Some models keep the pre-cut section "
+                         "by re-compression, not bit-identically (see docs/SETTINGS.md). The frame count is "
+                         "the new segment added after the kept part, as in the classic continuation; the job "
+                         "log prints the planned total before generation.")
+
+
+def _branch_family_mismatch_error(entry, model_type, base_model_type):
+    """Error message when a sidecar's model family cannot serve a branch job
+    (the frozen prefix latents are VAE-specific and never cross families)."""
+    sidecar_model_type = str(entry.get("model_type") or "")
+    sidecar_base = str(entry.get("base_model_type") or "")
+    sidecar_def = get_model_def(sidecar_model_type) if len(sidecar_model_type) > 0 else None
+    job_def = get_model_def(model_type) if len(str(model_type or "")) > 0 else None
+    sidecar_ltx2 = _is_ltx2_family(sidecar_base, sidecar_def)
+    job_ltx2 = _is_ltx2_family(base_model_type, job_def)
+    sidecar_h3 = _is_h3_family(sidecar_base, sidecar_def)
+    job_h3 = _is_h3_family(base_model_type, job_def)
+    if sidecar_ltx2 != job_ltx2 or sidecar_h3 != job_h3:
+        return f"the latent file was saved by a different model family ({sidecar_model_type or sidecar_base}); a branch job must use the same family as the original job"
+    if not sidecar_ltx2 and not sidecar_h3 and len(sidecar_base) > 0 and len(str(base_model_type or "")) > 0 and sidecar_base != str(base_model_type):
+        return f"the latent file was saved by model family '{sidecar_base}' but this job runs family '{base_model_type}'"
+    return ""
+
+
+def _branch_latent_search_dirs():
+    """The folders a *From latent* name-based sidecar lookup searches,
+    besides the file's own directory: the app's save path, its ``videos``
+    subdirectory (kept for configs that use one), and each entry of the
+    ``branch_latent_search_dirs`` setting (with its ``videos``
+    subdirectory) — for example another instance's save folder, when the
+    media was selected from there."""
+    search_dirs = [save_path, os.path.join(save_path, "videos")]
+    for extra in primary_settings.get("branch_latent_search_dirs") or []:
+        extra = os.path.expanduser(str(extra or "").strip())
+        if len(extra) == 0:
+            continue
+        search_dirs += [extra, os.path.join(extra, "videos")]
+    return search_dirs
+
+
+def resolve_latent_branch(image_prompt_type, video_source, state, model_type, keep_frames="", fit=False, *, base_model_type=None, model_def=None, latent_file=None):
+    """Validate and resolve a *From latent* branch job.
+
+    ``fit`` selects the branch-point resolution (see
+    :func:`latent_io.branch_point_for_frame`): the mid-latent default
+    (unchecked) resolves to the boundary before the latent containing the
+    picked frame, the rounded (fit) resolution clamps to the boundary after
+    it. ``latent_file`` names the source latent file directly and is the
+    primary input: when it is present and readable the branch resolves from
+    the file's recorded windows alone, so the companion video (
+    ``video_source``) is only a preview / cross-check aid — the branch
+    works when the companion video is gone (deleted, moved, on another
+    machine). A named file that is no longer on disk (moved, deleted, or
+    an auto-detected value persisted from a previous session) is not a
+    hard error when a video is present: the classic video-based lookup
+    applies instead (the same sidecar, next to the video or by name).
+    Without a file the classic flow applies: the sidecar is found next to
+    the selected video (or by name across the save directories), and the
+    video is then required.
+
+    Returns ``(info, error)``: on success ``info`` carries the latent file
+    ``path`` and ``sidecar_obj``, the resolved branch point (see
+    :func:`latent_io.branch_point_for_frame`), the ``branch_frame`` the user
+    asked for, the effective ``video`` (in *Continue Last Video* the
+    auto-resolved last video when the picker is empty),
+    ``video_present`` (whether the companion video is resolvable — the
+    advisory frame-count cross-check runs only then), the
+    ``prefill_prompt``/``prefill_seed`` the form should pick up and the
+    identity ``warnings``; on failure ``info`` is None and ``error`` is a
+    user-facing message.
+    """
+    if len(filter_letters(str(image_prompt_type or ""), "VL")) == 0:
+        return None, "requires Continue Video / Continue Last Video to be selected"
+    video_source = str(video_source or "").strip()
+    if len(video_source) == 0 and "L" in str(image_prompt_type or ""):
+        # *Continue Last Video* with an empty picker: take the gallery's last
+        # video (the same list the form's picker fills from — see
+        # generate_media's resolve_continue_video). get_processed_queue returns
+        # one (files, settings) pair per gallery source, keyed by source id.
+        file_list, _ = get_processed_queue(get_gen_info(state) if state is not None else {})[VIDEO.id]
+        if len(file_list) > 0:
+            video_source = str(file_list[-1])
+        else:
+            video_files = glob.glob(os.path.join(save_path, "*.mp4")) + glob.glob(os.path.join(save_path, "*.mov")) + glob.glob(os.path.join(save_path, "*.mkv"))
+            video_source = max(video_files, key=os.path.getmtime) if video_files else ""
+    # The latent file is the primary input: an explicitly named file
+    # resolves the branch on its own, so it is looked up before the
+    # companion-video gate (a missing video is not an error once the file
+    # is resolved). A named file that is no longer on disk (moved,
+    # deleted, or an auto-detected value persisted from a previous session)
+    # is not a hard error when a video is present: the classic video-based
+    # lookup applies (the same sidecar, next to the video or by name).
+    explicit_latent = str(latent_file or "").strip()
+    sidecar_path = None
+    if len(explicit_latent) > 0 and media_source_exists(explicit_latent):
+        sidecar_path = latent_io.find_latent_file(explicit_latent)
+    if sidecar_path is None:
+        if len(explicit_latent) > 0:
+            if not media_source_exists(video_source):
+                return None, f"the selected latent file could not be found ({os.path.basename(explicit_latent)}) and no source video is present to look its sidecar up"
+            print(f"From latent: the latent file {os.path.basename(explicit_latent)} is no longer present; looking up the saved latent file of the selected video instead.", flush=True)
+        elif not media_source_exists(video_source):
+            return None, "no source video was found for the branch job"
+        # No explicit file (or the named one is gone): the classic flow,
+        # the sidecar is the video's own companion, found next to it.
+        sidecar_path = latent_io.find_latent_file(video_source)
+        if sidecar_path is None:
+            # The video was selected from outside the save path: its
+            # upload temp name was mangled by Gradio (the @ in the fps tag
+            # is stripped), so the next-to-file lookup misses. Match the
+            # name across the save directories instead.
+            sidecar_path = latent_io.find_latent_file_in_dirs(video_source, _branch_latent_search_dirs())
+            if sidecar_path is None:
+                search_dirs = _branch_latent_search_dirs()
+                print(f"From latent: no saved latent file matched {os.path.basename(video_source)} in {[os.path.abspath(d) for d in search_dirs if os.path.isdir(d)]}.", flush=True)
+                missing_file_clause = f"the selected latent file {os.path.basename(explicit_latent)} is no longer present, and " if len(explicit_latent) > 0 else ""
+                return None, (f"{missing_file_clause}no saved latent file was found for {os.path.basename(video_source)}; the original job must have been run with the 'Save Latents' option enabled, "
+                              f"and if the video was selected from outside the app save directory its *_latent.pt file can be picked with the 'Latent file' option "
+                              f"or its folder added to the 'branch_latent_search_dirs' setting")
+    try:
+        sidecar_obj = latent_io.load_latent_file(sidecar_path)
+        entry = latent_io.latent_payload(sidecar_obj)
+    except Exception as exc:
+        return None, f"the latent file {os.path.basename(sidecar_path)} could not be read ({exc})"
+    if entry is None:
+        return None, f"{os.path.basename(sidecar_path)} is not a WanGP latent file"
+    # Whether the companion video is resolvable (a virtual-media entry or
+    # an existing file): the advisory cross-checks below run only then.
+    video_present = media_source_exists(video_source)
+    family_error = _branch_family_mismatch_error(entry, model_type, base_model_type)
+    if family_error:
+        return None, family_error
+    # The branch flow only reads the all-latent layout (every kept frame
+    # stored as latents): it carries the sidecar's latents verbatim, so a
+    # file in any other layout is refused up front with the one generic
+    # message instead of silently dropping a kept region.
+    if not latent_io.is_all_latent_entry(entry):
+        return None, (latent_io.non_current_latent_message(f"{os.path.basename(sidecar_path)}")
+                      # Without a companion video there is no pixel fallback
+                      # to suggest (the branch has no video to run from).
+                      + (" Run this job without the latent file instead (it will then use the pixels of the source video)." if video_present else ""))
+    total_frames = latent_io.sidecar_total_frames(entry)
+    if total_frames < 1:
+        return None, "the latent file contains no decodable windows"
+    # A flagged file (its recorded committed length differs from the written
+    # video's length) has bookkeeping that cannot seed a branch cut: the cut
+    # is measured against the recorded length, so a mismatched file would
+    # place the branch at the wrong frame. Refuse it, naming both lengths.
+    _mismatch = latent_io.sidecar_length_mismatch(entry)
+    if _mismatch is not None:
+        return None, (f"the latent file's recorded length ({_mismatch[0]} frames) does not match the video it was written for "
+                      f"({_mismatch[1]} frames); the file was flagged at save time and a branch cut depends on that length, "
+                      f"so the branch is refused. Re-run the original job to fix the length, or run this job without the latent file.")
+    keep_text = str(keep_frames or "").strip()
+    if len(keep_text) == 0:
+        branch_frame = total_frames
+    else:
+        try:
+            branch_frame = int(keep_text)
+        except ValueError:
+            return None, f"the branch point '{keep_text}' is not a valid frame count"
+        if branch_frame < 0:
+            branch_frame = total_frames + branch_frame
+    branch_point = latent_io.branch_point_for_frame(entry, branch_frame, fit=bool(fit))
+    if branch_point is None:
+        return None, f"the branch point (frame {branch_frame}) is outside the range recorded in the latent file (1..{total_frames})"
+    warnings = latent_io.identity_warnings(entry, {"app_version": WanGP_version, "model_type": "", "base_model_type": "", "vae_sha256": ""})
+    if video_present:
+        # The latent file may not cover the whole selected video: a picked
+        # file can belong to a different job, or record fewer frames than
+        # the video has. Either way the branch starts from the latent
+        # file's last recorded frame, so flag the mismatch instead of
+        # failing the job.
+        try:
+            video_frame_count = get_video_info(video_source)[3]
+        except Exception:
+            video_frame_count = None
+        if video_frame_count is not None and total_frames > 0 and int(video_frame_count) != int(total_frames):
+            _same_job = "; they may not be the same job" if len(explicit_latent) > 0 else ""
+            warnings = list(warnings) + [f"the latent file records {int(total_frames)} frames but the selected video has {int(video_frame_count)}, so the branch starts from the last frame recorded in the file{_same_job}"]
+    else:
+        # No companion video: the file's records are the truth (there is no
+        # advisory frame cross-check without a video to check against), so
+        # say so.
+        warnings = list(warnings) + [f"no companion video was found for the latent file; the branch point is positioned from the {int(total_frames)} frames recorded in the file"]
+    info = {
+        "path": str(sidecar_path),
+        "video": video_source,
+        "sidecar_obj": sidecar_obj,
+        "entry": entry,
+        "branch": branch_point,
+        "branch_frame": branch_frame,
+        "video_present": video_present,
+        "prefill_prompt": latent_io.entry_window_prompt(entry, branch_point["window_no"]),
+        "prefill_seed": int(entry.get("seed") or 0),
+        "warnings": warnings,
+    }
+    return info, ""
+
+
+def validate_latent_branch_task(state, model_type, inputs):
+    """Queue-time validation for a *From latent* branch job.
+
+    Returns an error string to reject the task, or "" when the job is fine
+    (the job itself re-resolves the branch point at run time). Outside the
+    Continue locations the mode is dormant — the checkbox may sit hidden
+    but on, and it neither refuses nor affects such a job (the job
+    pipeline is gated on the same condition). The same dormancy applies to
+    models whose family does not write latent files: the mode is hidden
+    for them (the stored value is preserved), and a job started with it on
+    runs as a normal job, never a refusal.
+    """
+    if not inputs.get("branch_from_latent"):
+        return ""
+    if int(inputs.get("image_mode", 0) or 0) > 0 or len(filter_letters(str(inputs.get("image_prompt_type") or ""), "VL")) == 0:
+        return ""
+    if not _is_all_latent_family(get_base_model_type(model_type), get_model_def(model_type)):
+        # The family does not write latent files: the mode is dormant
+        # (treated as off), never a refusal.
+        return ""
+    image_prompt_type = str(inputs.get("image_prompt_type") or "")
+    _info, error = resolve_latent_branch(image_prompt_type, inputs.get("video_source"), state, model_type, keep_frames=inputs.get("keep_frames_video_source", ""), fit=bool(inputs.get("branch_fit_latent")), base_model_type=get_base_model_type(model_type), model_def=get_model_def(model_type), latent_file=inputs.get("branch_latent_file"))
+    if error == "no source video was found for the branch job" \
+            and len(str(inputs.get("video_source") or "").strip()) == 0 \
+            and len(str(inputs.get("branch_latent_file") or "").strip()) == 0:
+        return "From latent: select a source video or a latent file"
+    return f"From latent: {error}" if error else ""
+
+
+# ---------------------------------------------------------------------------
+# Latent Branch (Phase 1): the branch job reuses the sidecar's kept latents
+# as its head window's frozen prefix instead of re-encoding the source
+# pixels: the head window's denoised tensor is [the kept latents (verbatim
+# from the sidecar) | new latents], the kept portion stays bit-identical
+# through the whole run (the model re-freezes it at every denoise step),
+# and the sidecar's kept windows carry over into the branch job's own
+# companion file. The model-side substitution is per family (Wan: the i2v
+# guide latents or the ti2v source latents; LongCat: the cond latents run).
+# The frame math lives in shared/utils/latent_io.branch_head_window.
+# ---------------------------------------------------------------------------
+
+_BRANCH_PREFIX_MODEL_TYPES = {
+    # The 16-channel 4/1 Wan-VAE families the prefix substitution supports:
+    # the 14B i2v class (1.3 / 1.4 / 2.2 share the VAE), the 14B t2v class
+    # (1.3B / 14B / 2.2 / shotplan: the standard text-to-video flow, the
+    # frozen head enters through the timestep-0 injection) and the ti2v 5B
+    # (source-latent path), plus the LongCat family (Wan VAE, 4/1).
+    "i2v", "i2v_2_2", "ti2v_2_2",
+    "t2v", "t2v_1.3B", "t2v_2_2", "shotplan_t2v", "shotplan_t2v_2_2",
+    "longcat_video", "longcat_avatar", "longcat_avatar_v1_5",
+    # LTX2 Phase 2: 8/1 causal layout, 32x spatial compression. The latent
+    # channel count varies with the VAE version (128 for the 2.3/2.5 VAEs),
+    # so the VAE identity is checked through the checkpoint instead.
+    "ltx2_19B", "ltx2_22B", "ltx2_25_22B",
+    # MiniMax H3 Phase 3: the piecewise 5/17 latent-to-pixel layout (the
+    # linear stride/offset check is skipped for it), 16x spatial
+    # compression, family-stable 24-channel VAE.
+    "minimax_h3_fl2va", "minimax_h3_fl2va_pruned", "minimax_h3_ref2va",
+    "minimax_h3_ref2va_pruned", "minimax_h3_tts_ref2va_pruned", "viggle_animate",
+}
+
+
+# The branch-prefix substitution is VAE-specific: the kept latents must
+# decode with the job's own VAE, so each family pins the temporal layout,
+# the spatial divisor and (when the channel count is family-stable) the
+# latent channel count it accepts.
+_BRANCH_PREFIX_LAYOUTS = {
+    "i2v": (4, 1, 8, 16),
+    "i2v_2_2": (4, 1, 8, 16),
+    # The 5B class's Wan 2.2 VAE divides space by 16 (not the 14B class's 8)
+    # and carries a 48-channel latent (not the 14B class's 16): the two VAE
+    # generations are different checkpoints, so the VAE identity check on
+    # top decides between them.
+    "ti2v_2_2": (4, 1, 16, 48),
+    # The t2v class shares the 14B i2v VAE (the Wan 2.1 8x 16-channel 4/1
+    # one): same layout, the frozen head enters through the timestep-0
+    # injection instead of the i2v guide latents.
+    "t2v": (4, 1, 8, 16),
+    "t2v_1.3B": (4, 1, 8, 16),
+    "t2v_2_2": (4, 1, 8, 16),
+    "shotplan_t2v": (4, 1, 8, 16),
+    "shotplan_t2v_2_2": (4, 1, 8, 16),
+    "longcat_video": (4, 1, 8, 16),
+    "longcat_avatar": (4, 1, 8, 16),
+    "longcat_avatar_v1_5": (4, 1, 8, 16),
+    "ltx2_19B": (8, 1, 32, None),
+    "ltx2_22B": (8, 1, 32, None),
+    "ltx2_25_22B": (8, 1, 32, None),
+    # MiniMax H3 Phase 3: the piecewise 5/17 latent-to-pixel layout cannot
+    # be expressed as stride/offset, so (0, 0) is the sentinel that makes
+    # _prepare_branch_prefix skip the linear layout check; the canvas
+    # rounds up to the 16x grid and the 24 channel count is
+    # family-stable (the VAE identity is checked on top of it).
+    "minimax_h3_fl2va": (0, 0, 16, 24),
+    "minimax_h3_fl2va_pruned": (0, 0, 16, 24),
+    "minimax_h3_ref2va": (0, 0, 16, 24),
+    "minimax_h3_ref2va_pruned": (0, 0, 16, 24),
+    "minimax_h3_tts_ref2va_pruned": (0, 0, 16, 24),
+    "viggle_animate": (0, 0, 16, 24),
+}
+
+
+def _branch_prefix_advisory(model_type):
+    """The one-line advisory for the branch info box: the job's family
+    writes the all-latent sidecar, but its base type is not in
+    ``_BRANCH_PREFIX_LAYOUTS``, so the kept latents cannot be copied
+    bit-identically — the pre-cut section is kept by re-compression (a
+    fresh encode of a fresh decode of the source file's kept latents).
+    Returns "" when the prefix is bit-identical (or the family does not
+    write latent files at all).
+    """
+    base_model_type = get_base_model_type(model_type)
+    if _is_all_latent_family(base_model_type, get_model_def(model_type)) \
+            and str(base_model_type or "") not in _BRANCH_PREFIX_LAYOUTS:
+        return "Note: this model keeps the pre-cut section by re-compression, not bit-identically."
+    return ""
+
+
+def _runtime_model_def(model_type, model_def, config_id):
+    """The model definition as the job's model load resolves it (mirrors
+    ``load_models``): the raw definition with the selected config-group
+    values merged in, then the family's ``resolve_runtime_model_def``
+    applied (the *Auto* choices resolve from the runtime settings — the H3
+    Video VAE follows the transformer quantization). The branch VAE
+    identity checks must use this form: the sidecar recorded the VAE the
+    original job actually loaded, and comparing it against the raw
+    definition's default would refuse the branch on a VAE both runs use.
+    """
+    resolved = dict(model_def) if isinstance(model_def, dict) else {}
+    if config_id is not None and len(str(config_id)):
+        config_groups = get_model_config_groups(model_type, resolved)
+        for _, _, current_config in model_config_groups.selected_model_configs(config_groups, config_id):
+            resolved.update(current_config)
+    base_model_type = get_base_model_type(model_type)
+    handler = model_types_handlers.get(base_model_type) if base_model_type is not None else None
+    resolver = getattr(handler, "resolve_runtime_model_def", None) if handler is not None else None
+    if resolver is not None:
+        resolved = resolver(resolved, dict(server_config, transformer_quantization=transformer_quantization,
+                                           text_encoder_quantization=text_encoder_quantization,
+                                           mixed_precision=server_config.get("mixed_precision", "0"),
+                                           vae_precision=server_config.get("vae_precision", "16")))
+    return resolved
+
+
+def _ltx2_video_vae_identity(model_def, base_model_type):
+    """The job's LTX2 video VAE identity: (checkpoint filename, sha256).
+
+    The sha is empty when the checkpoint cannot be located (the fit check
+    then falls back to the filename comparison); the filename comes from the
+    model definition's override or the architecture spec.
+    """
+    from models.ltx2 import ltx2_handler
+    names = ltx2_handler._get_multi_file_names(model_def, base_model_type) or {}
+    vae_file = str(names.get("video_vae") or "")
+    vae_sha = ""
+    if vae_file:
+        path = fl.locate_file(vae_file, error_if_none=False)
+        if path is not None and os.path.isfile(str(path)):
+            try:
+                vae_sha = latent_io.sha256_file(str(path))
+            except Exception:
+                vae_sha = ""
+    return vae_file, vae_sha
+
+
+def _h3_video_vae_identity(model_def, base_model_type, vae_upsampling=None):
+    """The job's MiniMax H3 video VAE identity: (checkpoint basename, sha256).
+
+    The file is the one this job's pipeline decodes with: the model
+    definition's Video VAE (the caller passes the runtime-resolved
+    definition, so the *Auto* choice already follows the transformer
+    quantization), or the X2 decoder's ``x2_vae_file`` when the X2 VAE
+    upscaling replaces it — the same file the pipeline records in its
+    latent companion. The sha is empty when the checkpoint cannot be
+    located (the fit check then falls back to the filename comparison);
+    the returned name is the basename the sidecar records (the int8 and
+    X2 checkpoints live in a subfolder the raw setting carries).
+    """
+    from models.minimax_h3.minimax_h3_main import VIDEO_VAE_FILE
+    from models.minimax_h3.vae_upsampler import X2_VAE_FILE, X2_VAE_VALUE
+    model_def = model_def or {}
+    if vae_upsampling == X2_VAE_VALUE:
+        # the X2 decoder of the selected Video VAE replaces it for the decode
+        vae_file = str(model_def.get("x2_vae_file") or X2_VAE_FILE)
+    else:
+        vae_file = str(model_def.get("video_vae_file") or VIDEO_VAE_FILE)
+    vae_sha = ""
+    path = fl.locate_file(vae_file, error_if_none=False)
+    if path is not None and os.path.isfile(str(path)):
+        try:
+            vae_sha = latent_io.sha256_file(str(path))
+        except Exception:
+            vae_sha = ""
+    return os.path.basename(vae_file), vae_sha
+
+
+def _wan_video_vae_identity(model_def, base_model_type):
+    """The job's Wan video VAE identity: (checkpoint filename, sha256).
+
+    Mirrors models/wan/any2video.py's VAE selection: a model definition
+    VAE_URLs override wins, the 5B class loads the Wan 2.2 VAE (16x
+    spatial), the alpha variants their RGB-channel checkpoints, everything
+    else the Wan 2.1 VAE. The sha is empty when the checkpoint cannot be
+    located (the fit check then falls back to the filename comparison).
+    """
+    vae_urls = (model_def or {}).get("VAE_URLs", None)
+    if isinstance(vae_urls, str) and len(vae_urls) > 0:
+        vae_file = vae_urls
+    elif isinstance(vae_urls, list) and len(vae_urls) > 0:
+        vae_urls = [u for u in vae_urls if str(u).endswith((".pt", ".pth", ".safetensors"))]
+        vae_file = vae_urls[0] if len(vae_urls) > 0 else ""
+    elif (model_def or {}).get("wan_5B_class", False):
+        vae_file = "Wan2.2_VAE.safetensors"
+    elif (model_def or {}).get("alpha_class", False):
+        vae_file = "wan_alpha_2.1_vae_rgb_channel_v2.safetensors" if str(base_model_type or "") == "alpha2" else "wan_alpha_2.1_vae_rgb_channel.safetensors"
+    else:
+        vae_file = "Wan2.1_VAE.safetensors"
+    vae_file = os.path.basename(str(vae_file or ""))
+    vae_sha = ""
+    path = fl.locate_file(vae_file, error_if_none=False)
+    if path is not None and os.path.isfile(str(path)):
+        try:
+            vae_sha = latent_io.sha256_file(str(path))
+        except Exception:
+            vae_sha = ""
+    return vae_file, vae_sha
+
+
+def _longcat_video_vae_identity(model_def, base_model_type):
+    """The job's LongCat video VAE identity: (checkpoint filename, sha256).
+
+    Mirrors models/longcat/longcat_main.py's VAE selection: a model
+    definition ``vae_URL`` override wins, otherwise the first available
+    of the Wan 2.1 VAE family (the LongCat VAE is the Wan 2.1 VAE: 16
+    channels, 4/1 temporal, 8x spatial, a different checkpoint than the
+    2.2 one the 5B Wan class loads). The sha is empty when the
+    checkpoint cannot be located (the fit check then falls back to the
+    filename comparison).
+    """
+    candidates = []
+    override = str((model_def or {}).get("vae_URL") or "")
+    if len(override) > 0:
+        candidates.append(os.path.basename(override))
+    candidates += ["Wan2.1_VAE_bf16.safetensors", "Wan2.1_VAE.safetensors",
+                  "longcat_vae_bf16.safetensors"]
+    vae_file = ""
+    for candidate in candidates:
+        path = fl.locate_file(candidate, error_if_none=False)
+        if path is not None and os.path.isfile(str(path)):
+            vae_file = candidate
+            break
+    vae_sha = ""
+    if len(vae_file) > 0:
+        path = fl.locate_file(vae_file, error_if_none=False)
+        if path is not None and os.path.isfile(str(path)):
+            try:
+                vae_sha = latent_io.sha256_file(str(path))
+            except Exception:
+                vae_sha = ""
+    return vae_file, vae_sha
+
+
+def _prepare_branch_prefix(entry, branch_point, carried, *, base_model_type, video_length, height=None, width=None, fit_canvas=None, audio_entry=None, vae_file="", vae_sha256="", model_def=None):
+    """Phase 1/2/3 fit check + head-window plan for a sidecar-sourced prefix.
+
+    ``carried`` is the result of ``latent_io.carry_over_latent_windows`` for
+    the same sidecar / branch point. Returns ``(prefix, error)``: ``prefix``
+    is ``None`` unless the job model can take the sidecar's kept latents
+    verbatim (the family's layout and spatial size, a matching VAE identity,
+    and a head window that fits the kept run); then it carries the kept
+    latents, the head window geometry and the sidecar bookkeeping the new
+    job's companion file needs. The error string names the Phase 0 fallback
+    the job keeps when the fit fails.
+
+    For MiniMax H3 (Phase 3) the head window geometry comes from the
+    sidecar-only committed-totals plan (:func:`latent_io.h3_branch_head_plan`),
+    not the shared ``branch_head_window`` helper: every length routes
+    through the decode job's own arithmetic (the piecewise 5/17 decode capped
+    by the recorded target, the committed ranges), so the plan and the
+    decode cannot drift, and the plan is the source of the overlap /
+    guide / anchor values the job and the new sidecar use. The other
+    families keep the ``branch_head_window`` arithmetic.
+
+    ``audio_entry`` is the sidecar's ``wgp_latent/audio/1`` entry: for LTX2
+    jobs (Phase 2) the kept window's audio latents are additionally sliced
+    by time ratio and carried as ``prefix_audio_latents`` (a batched
+    ``[1, c, t, mel]`` tensor), so the head window's audio prefix does not
+    need a waveform re-encode; for MiniMax H3 jobs (Phase 3) the flat
+    ``[64, t]`` block is sliced the same way and carried as a
+    ``{"batched": [1, 32, 2, N], "flat": [64, N]}`` dict (Case A freezes the
+    batched prefix, Case B feeds the flat rows as the audio condition).
+    ``vae_file``/``vae_sha256`` are the job's LTX2, Wan, LongCat or
+    MiniMax H3 video VAE identity (see
+    :func:`_ltx2_video_vae_identity`, :func:`_wan_video_vae_identity`,
+    :func:`_longcat_video_vae_identity` and
+    :func:`_h3_video_vae_identity`).
+    """
+    layout = _BRANCH_PREFIX_LAYOUTS.get(str(base_model_type or ""))
+    if layout is None:
+        return None, f"model family '{base_model_type}' does not (yet) accept prefix latents carried over from the source latent file"
+    expected_stride, expected_offset, spatial_divisor, expected_channels = layout
+    # Phase 3 (MiniMax H3): (0, 0) is the sentinel for the piecewise 5/17
+    # latent-to-pixel layout, which the linear stride/offset check below
+    # cannot express (the sidecar carries per-window frame metadata
+    # instead); the channel check and the VAE identity check still apply.
+    is_h3 = expected_stride == 0
+    is_ltx2 = str(base_model_type or "").startswith("ltx2")
+    specs = latent_io.entry_window_specs(entry)
+    try:
+        k = latent_io.branch_window_position(entry, branch_point, specs)
+    except ValueError:
+        return None, "the source latent file has no readable window for the branch point"
+    if not 1 <= k <= len(specs) or carried is None:
+        return None, "the source latent file has no readable window for the branch point"
+    spec = specs[k - 1]
+    stride = int(entry.get("latent_stride") or 4)
+    offset = int(entry.get("frame_offset") or 1)
+    if not is_h3 and (stride, offset) != (expected_stride, expected_offset):
+        return None, (f"the {stride}/{offset} temporal layout recorded in the source latent file does not match the "
+                      f"{expected_stride}/{expected_offset} layout the '{base_model_type}' prefix substitution supports")
+    prefix_latents = carried["video_prefix"]["latents"]
+    if expected_channels is not None:
+        if int(prefix_latents.shape[0]) != expected_channels:
+            return None, f"the latent channel count recorded in the source latent file ({int(prefix_latents.shape[0])}) does not match the VAE of this job ({expected_channels})"
+    if is_h3 or expected_channels is None or (vae_file or vae_sha256):
+        # The checkpoint identity decides whether the kept latents belong
+        # to this job's VAE (the frozen prefix would decode with the wrong
+        # VAE otherwise): the LTX2 VAE's channel count varies with the
+        # version, the H3 fp16 and fp8-mixed video VAEs are different
+        # checkpoints behind the same 24-channel shape, and the Wan 2.1
+        # and 2.2 VAEs are different checkpoints behind an overlapping
+        # 16-channel 4/1 shape. The sha comparison wins; the filenames
+        # stand in when neither side recorded / has one.
+        sidecar_sha = str(entry.get("vae_sha256") or "")
+        sidecar_vae_file = str(entry.get("vae_file") or "")
+        if str(vae_sha256 or "") and sidecar_sha and sidecar_sha != str(vae_sha256):
+            return None, "the video VAE checkpoint of the source latent file does not match the video VAE of this job; the frozen prefix would decode with the wrong VAE"
+        if not (str(vae_sha256 or "") and sidecar_sha) and str(vae_file or "") and sidecar_vae_file and sidecar_vae_file != str(vae_file):
+            return None, "the video VAE checkpoint of the source latent file does not match the video VAE of this job; the frozen prefix would decode with the wrong VAE"
+    # The sizing mode decides whether the job's output canvas is the
+    # entered one: Exact output (2) keeps it (so does a direct None, the
+    # no-size-check caller); the pixel-budget (0) and max-box (1) modes
+    # resize it, so the size check applies only to the stable ones.
+    if fit_canvas in (None, 2) and height is not None and width is not None:
+        # H3 rounds its canvas up to the 16x grid; the other families sit
+        # on the grid, so plain division applies to them.
+        _latent_h = (int(height) + spatial_divisor - 1) // spatial_divisor if is_h3 else int(height) // spatial_divisor
+        _latent_w = (int(width) + spatial_divisor - 1) // spatial_divisor if is_h3 else int(width) // spatial_divisor
+        if int(prefix_latents.shape[2]) != _latent_h or int(prefix_latents.shape[3]) != _latent_w:
+            return None, (f"the latent size recorded in the source latent file ({int(prefix_latents.shape[2])}x{int(prefix_latents.shape[3])}) does not match the canvas of this job "
+                          f"({_latent_h}x{_latent_w})")
+    if is_h3:
+        # Phase 3 (MiniMax H3): the sidecar-only committed-totals plan
+        # (see the function docstring). It rejects points the shared
+        # helper would have planned silently (a cut claimed outside the
+        # containing window's committed range, a kept run off the
+        # 2+5k grid), and the Phase 0 fresh-encode fallback takes over
+        # for them.
+        try:
+            head = latent_io.h3_branch_head_plan(entry, branch_point, int(video_length or 0))
+        except ValueError as err:
+            return None, str(err)
+    else:
+        head = latent_io.branch_head_window(entry, branch_point, int(video_length or 0), stride=stride, offset=offset)
+    kept = int(head["prefix_latents"])
+    if is_h3 and head["cut_at_window_end"] and int(spec["latents"].shape[1]) != int(prefix_latents.shape[1]):
+        # Phase 3 (MiniMax H3): the committed end can sit inside the
+        # latent run (a h3_target_frames cap trims the window's tail
+        # share), and the Case B substitution freezes the window's full
+        # latent run, which decodes to the capped length — not the
+        # shorter kept-prefix slice the branch point records.
+        prefix_latents = spec["latents"]
+        kept = int(spec["latents"].shape[1])
+    if kept < 1 or kept != int(prefix_latents.shape[1]):
+        return None, "the branch point keeps no latents"
+    head_trim_k = int(spec.get("head_trim") or 0)
+    tail_trim_k = int(spec.get("tail_trim") or 0)
+    if head["cut_at_window_end"]:
+        # The whole containing window is kept and the new portion is a fresh
+        # standard window. That is clean only when the window commits its
+        # full decoded run minus at most a one-frame head share (a larger
+        # head share or any tail trim would land uncommitted frames inside
+        # the new segment, or drop committed ones from the decode).
+        # (For H3 the plan's ``clean_window_end`` is the same test over the
+        # same recorded trims.)
+        if is_h3 and not head["clean_window_end"] or not is_h3 and (tail_trim_k > 0 or head_trim_k > 1):
+            return None, f"the branch point ends a window trimmed by {head_trim_k} head / {tail_trim_k} tail frame(s); the prefix substitution only supports clean window ends"
+        decoded_window = int(head["decoded_window"])
+        if is_h3:
+            # The plan's Case B values: the overlap and the guide are the
+            # window's committed kept region (the fresh standard window
+            # re-decodes it as its head, and the one-shot decode slices
+            # it as the continuation). For a t2v window that equals the
+            # decoded run minus the head share the v2 arithmetic used;
+            # the i2v image slot counts in the committed region (one
+            # more frame).
+            assembly_overlap = int(head["assembly_overlap"])
+            guide_frames = int(head["guide_frames"])
+        else:
+            # The window starts at the sidecar window's own start frame (the
+            # frozen latents decode at their original absolute positions, no
+            # shift): the decoded head that duplicates what already precedes it
+            # is the head share (the previous window's tail, or the re-extracted
+            # source prefix for the sidecar's own window 1), so the overlap
+            # is the decoded run minus that share.
+            assembly_overlap = max(1, decoded_window - head_trim_k)
+            guide_frames = decoded_window
+        head_frame_num = None
+        head_output = None
+        head_trim_new = 0
+    else:
+        # The cut falls inside the window: the new latents complete it up to
+        # its committed end (clamped to the requested length, the overshoot
+        # absorbed as a tail trim so the output ends on the boundary).
+        if is_h3:
+            # The plan's Case A values: the overlap and the guide are the
+            # kept latents' decoded length (the model's conditioning
+            # region, capped at the committed end); the head window keeps
+            # the containing window's own geometry (its recorded frame
+            # count, the request clamped to the cut's committed tail, the
+            # overshoot absorbed as the new block's tail trim).
+            assembly_overlap = int(head["assembly_overlap"])
+            guide_frames = int(head["guide_frames"])
+            head_frame_num = int(head["head_frame_num"])
+            head_output = int(head["head_output"])
+            head_trim_new = int(head["head_trim_new"])
+        else:
+            decoded_prefix = int(head["decoded_prefix"])
+            assembly_overlap = max(1, decoded_prefix)
+            guide_frames = decoded_prefix
+            head_frame_num = int(head["frame_num"])
+            head_output = int(head["new_frames"])
+            head_trim_new = int(head["tail_trim_new"])
+    # Phase 2 (LTX2): the head window's audio prefix is the sidecar's kept
+    # audio latents sliced by time ratio, so the branch job does not
+    # re-encode the source waveform for it.
+    # Phase 3 (MiniMax H3): the same time-ratio splice on the flat
+    # [64, t] block, carried as {"batched": [1, 32, 2, N] frozen prefix,
+    # "flat": [64, N] condition rows}.
+    prefix_audio = None
+    if str(base_model_type or "").startswith("ltx2") and audio_entry is not None:
+        prefix_audio = latent_io.branch_audio_prefix_latents(audio_entry, entry, branch_point)
+    elif is_h3 and audio_entry is not None:
+        prefix_audio = latent_io.h3_branch_audio_prefix_latents(audio_entry, entry, branch_point)
+    # The all-latent sidecar (LTX2 / Wan / LongCat / H3) carries two
+    # head-side values in the prefix, each named for what it is.
+    # ``containing_window_head_trim`` is the containing window's own
+    # recorded head trim (0 for an all-latent t2v window 1, the i2v image
+    # slot for an i2v window 1, the window's own overlap for k > 1) — the
+    # shared field every family's writer records for a mid-window cut
+    # (H3's Case B anchor head overrides it with the one-frame
+    # shared-frame trim; the writer applies it to a frozen-head branch).
+    # ``assembly_overlap`` (above) is the prefix of the head window's
+    # decoded output that the assembly drops for a cut on a window
+    # boundary: the non-H3 writer records it as the branch head block's
+    # head trim (so the decode reassembles the written video), while H3
+    # never consumes it (its one-shot slice is positional, derived from
+    # the plan's committed totals).
+    containing_window_head_trim = int(head_trim_k)
+    # The LTX2 i2v start image is content, not a pointer: it
+    # propagates verbatim through every branch so a descendant's
+    # frame 0 stays the exact image (the new sidecar's decode splices
+    # it back in; the branch job itself never needs the original
+    # image file). A Wan / LongCat / H3 i2v sidecar embeds no image
+    # (its frame 0 is a decoded latent), so there is nothing to
+    # propagate for them.
+    carried_image = carried.get("i2v_image") if is_ltx2 and isinstance(carried, dict) else None
+    if not (isinstance(carried_image, dict)
+            and str(carried_image.get("kind")) == "image_png"
+            and isinstance(carried_image.get("data"), (bytes, bytearray))
+            and len(carried_image["data"]) > 0):
+        carried_image = None
+    else:
+        carried_image = {"kind": "image_png", "data": bytes(carried_image["data"])}
+    prefix = {
+        "prefix_latents": prefix_latents,
+        "prefix_audio_latents": prefix_audio,
+        "assembly_overlap": int(assembly_overlap),
+        "guide_frames": int(guide_frames),
+        "head_frame_num": head_frame_num,
+        "head_output": head_output,
+        "head_trim_new": int(head_trim_new),
+        "cut_at_window_end": bool(head["cut_at_window_end"]),
+        "kept_frames": int(branch_point.get("kept_frames") or 0),
+        "sidecar_window_no": int(k),
+        "sidecar_start_frame": int(spec.get("start_frame") or 0),
+        "containing_window_head_trim": int(containing_window_head_trim),
+        # Phase 3 (MiniMax H3): the plan's GAP-3 marker — the cut sits at
+        # a capped window's committed end, so the fresh branch window's
+        # first decoded frame re-anchors the carried window's last frame
+        # (False for every other family).
+        "anchor_head": bool(head.get("anchor_head") or False),
+        "carried_image": carried_image,
+    }
+    return prefix, ""
+
+
+def _branch_kept_window_specs(source_entry, branch_point):
+    """The source sidecar's kept windows (1..K, the branch cut's containing
+    window included) as decode-ready specs, plus the cut and the i2v flag —
+    the inputs to the branch job's kept-region decode (Step 2, every
+    latent-writing family).
+
+    ``source_entry`` is the branch source's ``wgp_latent/1`` entry and
+    ``branch_point`` the resolved branch point
+    (:func:`latent_io.branch_point_for_frame`: it carries the containing
+    window number and the resolved cut). Returns a tuple ``(specs,
+    kept_frames, is_i2v)`` where ``specs`` are the first K of the entry's
+    window specs (each with its full latents, the decode job's own
+    per-window bookkeeping intact) and ``is_i2v`` mirrors the Latent Decode
+    job's i2v test (the decode's window-1 image-slot handling follows it).
+    ``(None, 0, False)`` when the kept windows cannot be resolved (the job
+    keeps the source-pixel path).
+    """
+    if not isinstance(branch_point, dict) or not isinstance(source_entry, dict):
+        return None, 0, False
+    specs = latent_io.entry_window_specs(source_entry)
+    k = int(branch_point.get("window_no") or 0)
+    if not 1 <= k <= len(specs):
+        return None, 0, False
+    kept_frames = int(branch_point.get("kept_frames") or 0)
+    if kept_frames < 1:
+        return None, 0, False
+    # The same i2v test the Latent Decode job applies (the window-1 head
+    # trim exemption follows it).
+    is_i2v = bool(source_entry.get("image_source")) and len(str(source_entry.get("video_source") or "")) == 0
+    return specs[:k], kept_frames, is_i2v
+
+
+def _branch_kept_decode_compatible(entry, kept_specs, base_model_type, model_def, *, height, width, fit_canvas, vae_file="", vae_sha256=""):
+    """Whether the job's VAE can decode the sidecar's kept windows onto the
+    job's canvas — the canvas-compatibility test for the kept-region decode
+    (Step 2). It is the fit check's VAE-identity and latent-size checks
+    minus the per-family prefix plan: the decode only needs the kept
+    latents to belong to the job's VAE and to land on the job's latent
+    grid, not the head window's willingness to freeze them, so it decides
+    the decode even when the branch prefix itself is rejected. A job that
+    fits the canvas (``fit_canvas`` set) would resize the decode off its
+    grid, so it is never compatible.
+
+    Returns ``(True, "")`` when compatible, else ``(False, reason)`` with
+    a plain sentence naming the setting at fault (the refusal message,
+    Gate 1, is built from it).
+    """
+    layout = _BRANCH_PREFIX_LAYOUTS.get(str(base_model_type or ""))
+    if layout is None:
+        return False, f"model family '{base_model_type}' cannot decode the kept windows of the latent file"
+    stride, _offset, spatial_divisor, _channels = layout
+    if not spatial_divisor:
+        return False, f"model family '{base_model_type}' cannot decode the kept windows of the latent file"
+    if not kept_specs or height is None or width is None:
+        return False, "the kept windows could not be resolved from the latent file"
+    # The sizing mode decides whether the job's output canvas is the
+    # entered one: Exact output (2) keeps it (so does a direct None, the
+    # no-size-check caller); the pixel-budget (0) and max-box (1) modes
+    # resize it, which would take the kept latents off the job's grid.
+    if fit_canvas not in (None, 2):
+        return False, "this job resizes the canvas (Fit Canvas), so the kept latents would decode off the canvas grid of this job"
+    # The checkpoint identity decides whether the kept latents belong to
+    # this job's VAE (the decode would run with the wrong VAE otherwise):
+    # the sha comparison wins, the filenames stand in when neither side
+    # has one (the same tests the fit check applies to the prefix).
+    sidecar_sha = str(entry.get("vae_sha256") or "")
+    sidecar_vae_file = str(entry.get("vae_file") or "")
+    if str(vae_sha256 or "") and sidecar_sha and sidecar_sha != str(vae_sha256):
+        return False, "the video VAE checkpoint of the source latent file does not match the video VAE of this job"
+    if not (str(vae_sha256 or "") and sidecar_sha) and str(vae_file or "") and sidecar_vae_file and sidecar_vae_file != str(vae_file):
+        return False, "the video VAE checkpoint of the source latent file does not match the video VAE of this job"
+    # Every kept window sits on the sidecar's own grid; the first kept
+    # window's latent size is that grid. H3 rounds its canvas up to the
+    # 16x grid; the other families sit on the grid, so plain division
+    # applies to them (the same expressions the fit check uses).
+    _latent_h = (int(height) + spatial_divisor - 1) // spatial_divisor if stride == 0 else int(height) // spatial_divisor
+    _latent_w = (int(width) + spatial_divisor - 1) // spatial_divisor if stride == 0 else int(width) // spatial_divisor
+    lat = kept_specs[0]["latents"]
+    if int(lat.shape[-2]) != _latent_h or int(lat.shape[-1]) != _latent_w:
+        return False, (f"the resolution recorded in the source latent file does not match the canvas of this job "
+                       f"(the latents are {int(lat.shape[-2])}x{int(lat.shape[-1])}, the grid of this job is {_latent_h}x{_latent_w})")
+    return True, ""
+
+
+def _build_cumulative_audio_payload(audio_entries):
+    """Combine the per-window audio payloads of a multi-window job into one
+    ``wgp_latent/audio/1`` entry with all windows stacked on time (the same
+    layout a single-window job records, just with more windows), so the
+    decode job can reassemble the full audio track.
+    """
+    first = audio_entries[0]
+    latents = []
+    window_metas = []
+    for audio_entry in audio_entries:
+        entry_latents = latent_io.payload_latents(audio_entry)
+        entry_windows = audio_entry.get("windows") or []
+        if entry_windows:
+            for window in entry_windows:
+                start = int(window.get("latent_start") or 0)
+                length = int(window.get("latent_len") or 0)
+                latents.append(entry_latents[:, start:start + length].clone())
+                window_metas.append({k: window[k] for k in ("window_no", "start_sample", "samples") if k in window})
+        else:
+            latents.append(entry_latents)
+            window_metas.append({})
+    if not latents:
+        return None
+    total_samples = sum(int(m.get("samples") or 0) for m in window_metas)
+    if total_samples <= 0:
+        total_samples = int(first.get("samples") or 0)
+    return latent_io.build_audio_latent_payload(
+        latents,
+        window_metas,
+        app_version=str(first.get("app_version") or ""),
+        model_type=str(first.get("model_type") or ""),
+        base_model_type=str(first.get("base_model_type") or ""),
+        model_filename=str(first.get("model_filename") or ""),
+        loras=first.get("loras") or (),
+        audio_vae_file=str(first.get("audio_vae_file") or ""),
+        audio_vae_sha256=str(first.get("audio_vae_sha256") or ""),
+        audio_vae_dtype=str(first.get("audio_vae_dtype") or ""),
+        sample_rate=int(first.get("sample_rate") or 0),
+        channels=int(first.get("channels") or 0),
+        samples=total_samples,
+        seed=int(first.get("seed") or 0),
+        prompt=str(first.get("prompt") or ""),
+        denoising_strength=float(first.get("denoising_strength") or 1.0),
+        steps=int(first.get("steps") or 0),
+        total_windows=len(latents),
+        vocoder_file=str(first.get("vocoder_file") or ""),
+        mel_bins=int(first.get("mel_bins") or 0),
+    )
+
+
+def _all_latent_sidecar(latent_entry, latent_audio_entry, window_no, latent_windows, latent_audio_windows, *,
+                        branch_prefix, sliding_window, reuse_frames, post_decode_pre_trim, trim_first_frames,
+                        source_video_overlap_frames_count, discard_last_frames, automatic_trim_last_frames,
+                        window_prefix_is_image, fake_start_image, sample_is_hdr, image_start_tensor,
+                        written_frame_count, model_def,
+                        model_type="", base_model_type="", width=0, height=0,
+                        splices_exact_image=True, branch_carried_image=None,
+                        branch_cut_video_block=None, branch_cut_audio_block=None):
+    """Build the all-latent sidecar for one LTX2 / Wan / LongCat / MiniMax H3 job window.
+
+    The all-latent sidecar is the sole content source of the video: one
+    block per window with its own prompt/seed/steps/denoising strength, the
+    pixel-space trims and the decoded frame count, stacked on one time
+    dimension. ``splices_exact_image`` distinguishes the families: LTX2
+    splices the exact preprocessed start image into frame 0 of the written
+    video, so the sidecar embeds that image as lossless PNG bytes (a branch
+    job propagates the source sidecar's embedded image verbatim — content,
+    not a pointer) and its i2v head trim drops the decoded round-trip frame
+    the splice replaces; Wan, LongCat and MiniMax H3 keep the decoded
+    latent frame instead (the start image is a model condition, never
+    spliced into the video), so their sidecars embed no image block and
+    their i2v head trim keeps that frame. ``branch_carried_image`` is the same propagated block
+    for a branch whose prefix this run rejected (``branch_prefix`` is None):
+    the kept region's fresh decode spliced the source sidecar's image into
+    frame 0 of the written video, so the new sidecar carries the same block
+    for the decode to splice back in.
+
+    ``latent_windows`` / ``latent_audio_windows`` are the repeat's
+    accumulators (they already hold the branch's carried windows); this
+    window's block is appended and the whole sidecar is rebuilt. Returns the
+    sidecar file bytes, or ``None`` only when the sidecar cannot be written at
+    all (an i2v start image that could not be embedded). A committed length
+    that does not match the written video is not a drop: the file is written
+    flagged (``length_verified: false`` with the actual written length) so the
+    decode and branch flows can handle it, instead of destroying the only copy
+    of the model's latent view of the video.
+    """
+    is_h3 = _is_h3_family(str(base_model_type or ""), model_def)
+    layout = latent_io.latent_layout_for(model_def, base_model_type)
+    branch_sidecar = branch_prefix if (branch_prefix is not None and window_no == 1) else None
+    # Pixel-space trims applied to this window's decoded sample in the
+    # assembly (they must be recorded exactly so the decode job can
+    # re-assemble the original video).
+    head_trim = int(post_decode_pre_trim) + int(trim_first_frames)
+    # The H3 branch head window's mode (``None`` for non-H3 jobs, non-branch
+    # windows, and H3 jobs whose prefix this run rejected — those keep the
+    # Phase-0 bookkeeping): ``"frozen"`` — the pipeline froze the kept
+    # latents at the head of the window's tensor (a Case A mid-cut);
+    # ``"anchor"`` — the pipeline accepted the Case B window-end
+    # substitution (``h3_anchor_head``): a pure-new window whose first
+    # decoded frame re-anchors the carried window's last frame;
+    # ``"rejected-end"`` — the pipeline's grid check rejected the kept run
+    # (it fills the whole containing window), so the head window is a
+    # fresh encode whose decoded region the assembly replaced with the
+    # containing window's own decode.
+    _h3_branch_mode = None
+    if window_no == 1 and branch_sidecar is not None and is_h3:
+        _prefix = branch_sidecar.get("prefix_latents")
+        _head_latents = latent_io.payload_latents(latent_entry)
+        # The pipeline freezes the kept latents at the head of the tensor in
+        # its own working dtype, so the comparison is tolerant to the
+        # dtype round trip (a fresh-encode head differs at the ~1.0 scale
+        # and never matches).
+        _prefix_honored = (
+            _prefix is not None and _head_latents is not None
+            and int(_head_latents.shape[1]) >= int(_prefix.shape[1])
+            and torch.allclose(_head_latents[:, :int(_prefix.shape[1])].float(), _prefix.float(), rtol=2e-2, atol=1e-2))
+        if int(latent_entry.get("h3_anchor_head") or 0) == 1:
+            _h3_branch_mode = "anchor"
+        elif _prefix_honored:
+            _h3_branch_mode = "frozen"
+        elif branch_sidecar.get("cut_at_window_end"):
+            _h3_branch_mode = "rejected-end"
+    if window_no == 1 and branch_sidecar is not None:
+        # Branch head window: the decoded head is the source window's own
+        # decoded head, so the block records a head trim that lets the
+        # decode re-assemble the video the job wrote. The frozen prefix
+        # (the carried kept latents) is the assembly's kept region itself:
+        # step 3 splices a fresh decode of it into the written video (never a
+        # re-extracted source segment), and it sits at the head of this
+        # block's decoded sample, so it is not an external overlap to trim —
+        # only the block's own head (the continuation overlap, the i2v slot,
+        # or the anchor frame) is dropped on decode.
+        if is_h3:
+            if _h3_branch_mode == "frozen":
+                # The frozen head decodes the kept latents at its own head
+                # (the assembly splices a fresh decode of them into the
+                # written video in their place), so the recorded head trim
+                # is the window's own rebuilt history plus the kept
+                # latents' decoded length (the plan's assembly overlap): the
+                # block commits the new latents' decoded run only, and the
+                # kept region commits from its own cut block (below).
+                head_trim = int(latent_entry.get("h3_history_frames") or 0) + int(branch_sidecar.get("assembly_overlap") or 0)
+            elif _h3_branch_mode == "anchor":
+                # A Case B anchor head (the pipeline's h3_anchor_head: a
+                # branch at a window end whose kept run decodes past the
+                # committed region) is a pure-new window whose first decoded
+                # frame re-anchors the carried window's last frame (a shared
+                # frame), so the block records a one-frame head trim that
+                # drops that shared frame and no re-decoded history.
+                head_trim = 1
+            else:
+                # ``rejected-end`` records the containing window's own
+                # block instead (below); when that block is unavailable the
+                # block keeps the containing window's own recorded head
+                # trim (0 for an all-latent t2v window 1, the i2v image slot
+                # for an i2v window 1, the window's own overlap for k > 1).
+                head_trim = int(branch_sidecar.get("containing_window_head_trim") or 0)
+        else:
+            # LTX2 / Wan / LongCat: a mid-window cut keeps the containing
+            # window's own recorded head trim (0 for an all-latent t2v
+            # window 1, the i2v image slot for an LTX2 i2v window 1, the
+            # decoded image frame's slot for a Wan i2v window 1, the
+            # window's own overlap for k > 1); a cut on a window boundary
+            # is a fresh standard window, so the block records the
+            # assembly overlap the job trims from its decoded sample.
+            if bool(branch_sidecar.get("cut_at_window_end")):
+                head_trim = int(branch_sidecar.get("assembly_overlap") or 0)
+            else:
+                head_trim = int(branch_sidecar.get("containing_window_head_trim") or 0)
+    elif window_no == 1:
+        # The first window's decoded head overlaps the region the assembly
+        # keeps before it: the source prefix's trailing frames
+        # (continuation) or the frozen prefix's decoded run (branch: the
+        # overlap _prepare_branch_prefix resolved for this job).
+        if splices_exact_image:
+            # LTX2 i2v: the overlap is the one decoded image frame the
+            # spliced start image replaces, so the head trim is exactly the
+            # overlap and the decode splices the image back into frame 0.
+            head_trim += int(source_video_overlap_frames_count)
+        elif not window_prefix_is_image:
+            # Video prefix (a continuation): the decoded overlap is dropped
+            # in the assembly, as for LTX2. (A fresh Wan t2v has no prefix,
+            # so the overlap is 0.)
+            head_trim += int(source_video_overlap_frames_count)
+        # Wan i2v: frame 0 of the written video is the decoded latent (the
+        # start image's VAE round-trip); the assembly drops the image, not
+        # the decoded frame, so no overlap is trimmed here.
+    head_trim += int(reuse_frames) if (sliding_window and window_no > 1 and reuse_frames > 0) else 0
+    tail_trim = int(discard_last_frames) + int(automatic_trim_last_frames)
+    window_latents = latent_io.payload_latents(latent_entry)
+    i2v_image = None
+    if splices_exact_image and branch_prefix is not None:
+        # A branch job never owns the original start image: when the source
+        # sidecar is i2v-derived the embedded image propagates verbatim
+        # (those bytes are exactly the video's frame 0). It must be
+        # re-embedded on EVERY per-window rebuild of the sidecar, not only
+        # the first: a later window's rebuild would otherwise drop the
+        # block — and with it the +1 image slot in the committed total —
+        # leaving the sidecar one frame short of the written video. The
+        # branch head's recorded head trim keeps the image slot, so the
+        # decode job splices the propagated image back into frame 0.
+        i2v_image = branch_prefix.get("carried_image")
+    elif splices_exact_image and branch_carried_image is not None:
+        # The same propagation for a branch whose prefix this run rejected
+        # (no branch_prefix): the kept region's fresh decode spliced the
+        # source sidecar's image into frame 0 of the written video, so the
+        # new sidecar embeds the same block on every rebuild (the decode
+        # splices it back into the first window's run, the way it does for
+        # the source sidecar).
+        i2v_image = branch_carried_image
+    elif (splices_exact_image and window_no == 1 and window_prefix_is_image and not fake_start_image
+            and not sample_is_hdr and int(source_video_overlap_frames_count) == 1):
+        if image_start_tensor is not None:
+            try:
+                image_pil = convert_tensor_to_image(image_start_tensor)
+                image_buffer = io.BytesIO()
+                image_pil.save(image_buffer, format="PNG")
+                i2v_image = {"kind": "image_png", "data": image_buffer.getvalue()}
+            except Exception as exc:
+                print(f"Latent save: the i2v start image could not be embedded ({exc}); the latent file is not written.")
+                return None
+    window_meta = {
+        "prompt": str(latent_entry.get("prompt") or ""),
+        "seed": int(latent_entry.get("seed") or 0),
+        "steps": int(latent_entry.get("steps") or 0),
+        "denoising_strength": float(latent_entry.get("denoising_strength") or 1.0),
+        "head_trim": int(head_trim),
+        "tail_trim": int(tail_trim),
+        "frame_count": latent_io.window_pixel_frames(window_latents, layout["stride"], layout["offset"]),
+    }
+    if is_h3:
+        # The H3 VAE's piecewise 5/17 layout cannot be expressed by
+        # latent_stride/frame_offset, so the per-window bookkeeping the
+        # pipeline recorded travels with the window block. ``frame_count``
+        # keeps the pipeline's own output length (the decode's audio
+        # bookkeeping measures the window's full output, history included)
+        # while the committed arithmetic below applies the piecewise layout
+        # to the latents and caps it by the recorded target.
+        window_meta["frame_count"] = int(latent_entry.get("frames") or 0)
+        window_meta["h3_history_frames"] = int(latent_entry.get("h3_history_frames") or 0)
+        window_meta["h3_target_frames"] = int(latent_entry.get("h3_target_frames") or 0)
+        if int(latent_entry.get("h3_anchor_head") or 0) == 1:
+            window_meta["h3_anchor_head"] = 1
+            # The anchor-head window records no re-decoded history: its
+            # one-frame head trim drops the shared frame instead.
+            window_meta["h3_history_frames"] = 0
+    if _h3_branch_mode in ("frozen", "anchor") and branch_cut_video_block is not None:
+        # The kept region commits from its own block: the containing
+        # window's cut block (its kept latents, the decoded run capped at
+        # the cut — the full window itself for a window-end cut), whose
+        # stand-alone decode is exactly the kept region the assembly
+        # spliced into the written video. It is inserted ahead of this
+        # head window's block, which commits the new portion only.
+        latent_windows.append(dict(branch_cut_video_block))
+    if _h3_branch_mode == "rejected-end" and branch_cut_video_block is not None:
+        # The fresh head window's decoded region is not in the written
+        # video (the assembly spliced the containing window's own decode
+        # in its place), so the sidecar records the containing window's
+        # block instead of this fresh window — the sidecar stays
+        # self-contained and its committed tiling matches the written
+        # video.
+        latent_windows.append(dict(branch_cut_video_block))
+    elif _h3_branch_mode in (None, "frozen", "anchor"):
+        latent_windows.append({"latents": window_latents, **window_meta})
+    if latent_audio_entry is not None:
+        if _h3_branch_mode == "anchor" and branch_cut_audio_block is not None:
+            # The anchor's generated audio starts where the kept region's
+            # audio ends (the decoded shared frame's samples are dropped
+            # with its one-frame head trim), so the head entry's recorded
+            # window starts are rebased onto the cut block's span (the
+            # kept region's own audio rides in the preseeded carried entry).
+            _rebased = dict(latent_audio_entry)
+            _rebased["windows"] = [dict(_w) for _w in (latent_audio_entry.get("windows") or [])]
+            _cut_end = (int(branch_cut_audio_block.get("start_sample") or 0)
+                        + int(branch_cut_audio_block.get("samples") or 0))
+            for _w in _rebased["windows"]:
+                _head_start = int(_w.get("start_sample") or 0)
+                _w["start_sample"] = _head_start + (_cut_end - _head_start)
+            latent_audio_windows.append(_rebased)
+        elif _h3_branch_mode != "rejected-end":
+            # ``rejected-end``: the fresh head window's generated audio is
+            # not in the written video (the containing window's own audio
+            # covers the kept region, in the preseeded carried entry), so
+            # its audio entry is dropped with its video block.
+            latent_audio_windows.append(latent_audio_entry)
+    try:
+        payload = latent_io.build_latent_sidecar(
+            [window["latents"] for window in latent_windows],
+            [window for window in latent_windows],
+            app_version=WanGP_version,
+            model_type=str(model_type or ""),
+            base_model_type=str(base_model_type or ""),
+            model_filename=str(latent_entry.get("model_filename") or ""),
+            loras=list(latent_entry.get("loras") or []),
+            vae_file=str(latent_entry.get("vae_file") or ""),
+            vae_sha256=str(latent_entry.get("vae_sha256") or ""),
+            vae_z_dim=int(latent_entry.get("vae_z_dim") or 0),
+            vae_dtype=str(latent_entry.get("vae_dtype") or ""),
+            width=int(width or 0),
+            height=int(height or 0),
+            fps=float(latent_entry.get("fps") or 0.0),
+            latent_stride=int(layout["stride"]),
+            frame_offset=int(layout["offset"]),
+            is_hdr=bool(sample_is_hdr),
+            i2v_start_image=i2v_image,
+        )
+    except Exception as exc:
+        print(f"Latent save: the latent file could not be built ({exc}); it is not written.")
+        return None
+    file_obj = payload
+    if len(latent_audio_windows) > 0:
+        # The builder returns the format-tagged payload ({audio_id: entry});
+        # unpack it (the same merge the v2 writer uses) so the file object
+        # carries the entry itself - a doubly nested tag would be invisible
+        # to latent_io.audio_latent_payload and the decode job would drop
+        # the soundtrack.
+        audio_payload = _build_cumulative_audio_payload(latent_audio_windows)
+        if audio_payload is not None:
+            file_obj = {**payload, **audio_payload}
+    # Verify the committed length against the written video before the file
+    # goes out. A mismatch means a miscount by the app (the recorded total is
+    # what a decode and a branch cut are measured against), not user error -
+    # and the file holds the only unrecoverable copy of the model's latent
+    # view of this video. Write it anyway, flagged: the entry records the
+    # actual written length beside the recorded total (length_verified:
+    # false), a decode proceeds but says the decoded video has the recorded
+    # length, and a branch cut is refused on it.
+    committed_total = latent_io.sidecar_total_frames(file_obj[latent_io.LATENT_FORMAT_ID])
+    if int(written_frame_count) > 0 and committed_total != int(written_frame_count):
+        video_entry = file_obj[latent_io.LATENT_FORMAT_ID]
+        video_entry["length_verified"] = False
+        video_entry["written_frame_count"] = int(written_frame_count)
+        print(f"Latent save: the length recorded in the latent file ({committed_total} frames) does not match the written video "
+              f"({int(written_frame_count)} frames); the file is written but flagged (length_verified: false) - a decode "
+              f"will reproduce the recorded length, not the video's, and a branch cut is refused on it.")
+    return latent_io.build_latent_file_bytes(file_obj)
+
+def _ltx2_i2v_prefix_to_frames_space(entry, block, is_hdr, device):
+    """The all-latent sidecar's embedded i2v start image in the decoded
+    frames' pixel space (uint8 for SDR, the HDR linear mapping for HDR),
+    matching how the job's assembly wrote frame 0 from the preprocessed
+    image."""
+    from models.ltx2.ltx2 import LTX2_HDR_TRANSFORM
+    try:
+        image = Image.open(io.BytesIO(bytes(block["data"])))
+        if image.mode not in ("L", "RGB"):
+            image = image.convert("RGB")
+        prefix = convert_image_to_tensor(image).unsqueeze(1)
+        if torch.is_floating_point(prefix):
+            prefix = convert_video_tensor_to_uint8_chunked(prefix)
+        return _prefix_to_frames_space(entry, prefix, "linear" if is_hdr else "uint8",
+                                       str(entry.get("hdr_transform") or LTX2_HDR_TRANSFORM), device)
+    except Exception as exc:
+        print(f"Latent decode: the embedded i2v start image could not be read: {exc}")
+        return None
+
+
+def _ltx2_latent_decode_windows(send_cmd, gen, model_def, entry, window_specs, audio_entry, audio_windows, is_hdr, vae_dtype, decode_models, tiling_config):
+    """Decode every video (and matching audio) window of a saved LTX-2 latent.
+
+    Returns ``(window_frames_list, audio_waveform_chunks)``; sends the error
+    itself and returns ``None`` when the decode fails or is aborted.
+    """
+    from models.ltx2.ltx2 import LTX2_HDR_TRANSFORM
+    from models.ltx2.ltx_core.model.audio_vae import decode_audio
+    from models.ltx2.ltx_core.model.video_vae import decode_video_to_tensor
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    fps = float(entry.get("fps") or 0) or float(model_def.get("fps") or 24)
+    interrupt_check = lambda: gen.get("abort", False)
+    window_frames_list = []
+    audio_waveform_chunks = []
+    # The all-latent i2v sidecar splices the embedded start image into frame
+    # 0 of the video (content, not a pointer — no source re-extraction).
+    is_all_latent = latent_io.is_all_latent_entry(entry)
+    i2v_image = latent_io.entry_i2v_image(entry) if is_all_latent else None
+    try:
+        for idx, spec in enumerate(window_specs):
+            # The sidecar stores the canonical unbatched [c, t, h, w] layout;
+            # the LTX-2 VAE decoder (both tiled and full) expects the batched
+            # 5D [1, c, t, h, w] layout the generation pipelines feed it.
+            latent = spec["latents"].to(device=device, dtype=vae_dtype)
+            if latent.dim() == 4:
+                latent = latent.unsqueeze(0)
+            video = decode_video_to_tensor(
+                latent,
+                decode_models.video_decoder,
+                tiling_config,
+                interrupt_check=interrupt_check,
+                hdr_transform=str(entry.get("hdr_transform") or LTX2_HDR_TRANSFORM) if is_hdr else None,
+                output_dtype=torch.float16 if is_hdr else None,
+            )
+            latent = None
+            if video is None:
+                if gen.get("abort", False):
+                    return None
+                raise ValueError(f"window {spec['window_no']} could not be decoded")
+            frames = video.permute(3, 0, 1, 2).contiguous()
+            video = None
+            # Re-apply the exact pixel trims of the original assembly so the
+            # decoded windows re-assemble into the original video unchanged.
+            head_trim = int(spec["head_trim"])
+            tail_trim = int(spec["tail_trim"])
+            if head_trim > 0 or tail_trim > 0:
+                frames = frames[:, head_trim:max(head_trim, frames.shape[1] - tail_trim)]
+            if is_all_latent and i2v_image is not None and idx == 0:
+                # The all-latent i2v sidecar splices the embedded start image
+                # into frame 0: the recorded head trim already dropped the
+                # decoded round-trip the image replaces, so the exact image
+                # is placed in front of the trimmed decoded run (the way the
+                # job wrote it).
+                prefix = _ltx2_i2v_prefix_to_frames_space(entry, i2v_image, is_hdr, device)
+                if prefix is None:
+                    raise ValueError(
+                        f"window {int(spec.get('window_no') or idx + 1)}: the embedded i2v start image could not be read; "
+                        f"the decoded output would lose the video's first frame."
+                    )
+                # The decoded frames come back in the decoder's accumulation
+                # buffer (CPU for tiled decode) while the image helper
+                # materializes on ``device``: align the prefix to the
+                # frames' device before concatenating.
+                frames = torch.cat([prefix.to(device=frames.device, dtype=frames.dtype), frames], dim=1)
+            window_frames_list.append(frames)
+            if idx < len(audio_windows):
+                # The 2D [c, t*mel] stored latent goes back to the 4D
+                # [1, c, t, mel] layout the audio VAE expects (mel_bins was
+                # recorded at save time; 16 is the LTX-2 default).
+                mel_bins = int((audio_entry or {}).get("mel_bins") or 16)
+                audio_latent = audio_windows[idx]["latents"].to(device=device, dtype=vae_dtype)
+                if audio_latent.dim() == 2:
+                    audio_latent = audio_latent.reshape(1, audio_latent.shape[0], audio_latent.shape[1] // max(1, mel_bins), max(1, mel_bins))
+                waveform = decode_audio(audio_latent, decode_models.audio_decoder, decode_models.vocoder)
+                audio_latent = None
+                if waveform is not None and waveform.numel() > 0:
+                    audio_waveform_chunks.append(waveform.cpu())
+    except Exception as exc:
+        send_cmd("error", gr.Error(f"The saved latent could not be decoded: {exc}"))
+        return None
+    finally:
+        for module in (decode_models.video_decoder, getattr(decode_models, "audio_decoder", None), getattr(decode_models, "vocoder", None)):
+            if module is not None:
+                module.to("cpu")
+    return window_frames_list, audio_waveform_chunks
+
+
+def _edit_latent_job_ltx2(send_cmd, state, video_source, client_id, plugin_data, sidecar_obj, entry, model_def, window_specs,
+                          api_return_video_uint8, api_return_audio, api_suppress_metadata_images):
+    """Decode a saved LTX-2 latent back to pixels.
+
+    LTX-2 uses a different VAE stack than Wan/LongCat (separate video and
+    audio VAEs plus an optional vocoder, with HDR support), so the decode
+    job takes a family-specific path: load only the VAE components, decode
+    each window and hand the result to ``_save_ltx2_decoded_video``.
+    """
+    gen = get_gen_info(state)
+    if gen.get("abort", False):
+        return
+    model_type = str(entry.get("model_type") or "")
+    base_model_type = str(entry.get("base_model_type") or "") or str(model_def.get("architecture") or "")
+    fps = float(entry.get("fps") or 0) or float(model_def.get("fps") or 24)
+    is_hdr = bool(entry.get("is_hdr"))
+    # The sidecar records the dtype the VAE ran with at generation; decode
+    # with the same dtype (decoding with a different precision than the
+    # generation changes the decoded pixels slightly). The server config
+    # is the fallback for sidecars that do not record it.
+    _recorded_dtype = {"float16": torch.float16, "16": torch.float16,
+                       "bfloat16": torch.bfloat16,
+                       "float32": torch.float, "32": torch.float}.get(str(entry.get("vae_dtype") or ""))
+    vae_dtype = _recorded_dtype if _recorded_dtype is not None else (
+        torch.float16 if str(server_config.get("vae_precision", "16")) == "16" else torch.float)
+
+    from models.ltx2 import ltx2_handler
+    from models.ltx2.ltx2 import build_decode_tiling_config, load_ltx2_decode_models
+
+    audio_entry = latent_io.audio_latent_payload(sidecar_obj)
+    audio_windows = latent_io.audio_window_specs(audio_entry) if audio_entry is not None else []
+    needs_audio = len(audio_windows) > 0
+
+    # The VAE names recorded in the sidecar take precedence (they are the
+    # ones that produced this latent); the model definition provides the
+    # fallback (and the config files all-in-one checkpoints need).
+    resolved = {}
+    try:
+        resolved = ltx2_handler._resolve_multi_file_paths(model_def, base_model_type, include_spatial_upsampler=False) or {}
+    except Exception as exc:
+        print(f"Latent decode: the LTX2 model definition could not be fully resolved ({exc}); relying on the VAE names recorded in the latent file.")
+    vae_urls = model_def.get("VAE_URLs", None)
+    if isinstance(vae_urls, str) and len(vae_urls) > 0:
+        default_video_vae = vae_urls
+    elif isinstance(vae_urls, list) and len(vae_urls) > 0:
+        default_video_vae = vae_urls[0]
+    else:
+        default_video_vae = os.path.basename(str(resolved.get("video_vae") or ""))
+    video_vae_file = os.path.basename(str(entry.get("vae_file") or "")) or default_video_vae
+    if not video_vae_file:
+        send_cmd("error", gr.Error("Unable to determine which LTX2 video VAE is required to decode this latent."))
+        return
+    audio_vae_file = os.path.basename(str((audio_entry or {}).get("audio_vae_file") or ""))
+    if needs_audio and not audio_vae_file:
+        audio_vae_file = os.path.basename(str(resolved.get("audio_vae") or ""))
+    vocoder_file = os.path.basename(str((audio_entry or {}).get("vocoder_file") or ""))
+    if needs_audio and not vocoder_file:
+        vocoder_file = os.path.basename(str(resolved.get("vocoder") or ""))
+    config_fallback = str(resolved.get("video_vae_config") or resolved.get("model_config") or "")
+
+    try:
+        # Decode on the GPU when available (the latents are decoded there);
+        # the VAE/vocoder components are small and get moved back to CPU
+        # after the decode in _ltx2_latent_decode_windows.
+        decode_device = "cuda" if torch.cuda.is_available() else "cpu"
+        decode_models = load_ltx2_decode_models(
+            video_vae_file,
+            audio_vae_file if needs_audio else "",
+            vocoder_file if needs_audio else "",
+            VAE_dtype=vae_dtype,
+            device=decode_device,
+            config_fallback_path=config_fallback,
+        )
+    except Exception as exc:
+        send_cmd("error", gr.Error(f"Unable to load the VAE components required to decode this LTX2 latent: {exc}"))
+        return
+    if needs_audio and (not hasattr(decode_models, "audio_decoder") or not hasattr(decode_models, "vocoder")):
+        send_cmd("error", gr.Error("The LTX2 audio VAE and/or vocoder required to decode the audio part of this latent could not be loaded."))
+        return
+
+    device_mem_capacity = int(torch.cuda.get_device_properties(0).total_memory / 1048576) if torch.cuda.is_available() else 0
+    # Mirror the generation call exactly (same capacity, same
+    # vae_config, and the mixed-precision flag derived from the VAE
+    # precision the same way the generation derives it): a different
+    # tiling than the generation's decodes the same latents to slightly
+    # different pixels (the overlap blending differs), so the decode
+    # must use the generation's tiling to reproduce the video.
+    tiling_config = build_decode_tiling_config(
+        decode_models.video_decoder,
+        int(server_config.get("vae_config", 0) or 0),
+        device_mem_capacity,
+        str(server_config.get("vae_precision", "16")) == "32",
+        fps,
+        output_height=int(entry.get("height") or 0) or None,
+        output_width=int(entry.get("width") or 0) or None,
+    )
+
+    decoded = _ltx2_latent_decode_windows(send_cmd, gen, model_def, entry, window_specs, audio_entry, audio_windows, is_hdr, vae_dtype, decode_models, tiling_config)
+    del decode_models
+    if decoded is None:
+        return
+    window_frames_list, audio_waveform_chunks = decoded
+    if not window_frames_list:
+        send_cmd("error", gr.Error("The saved latent does not contain any decodable window."))
+        return
+    frames = torch.cat(window_frames_list, dim=1) if len(window_frames_list) > 1 else window_frames_list[0]
+    sample_rate = int((audio_entry or {}).get("sample_rate") or 0)
+    _save_ltx2_decoded_video(send_cmd, state, video_source, client_id, plugin_data, frames, audio_waveform_chunks, sample_rate, entry, audio_entry, fps, is_hdr,
+                             api_return_video_uint8, api_return_audio, api_suppress_metadata_images)
+
+
+def _save_ltx2_decoded_video(send_cmd, state, video_source, client_id, plugin_data, frames, audio_waveform_chunks, sample_rate, entry, audio_entry, fps, is_hdr,
+                             api_return_video_uint8, api_return_audio, api_suppress_metadata_images):
+    """Save a decoded LTX-2 latent: SDR goes through ``save_video`` (uint8),
+    HDR through ``save_hdr_video`` (HDR-linear float), and the decoded audio
+    waveform (when present) is muxed into the output container.
+    """
+    gen = get_gen_info(state)
+    source_dir = os.path.dirname(str(video_source or ""))
+    if len(source_dir) == 0:
+        source_dir = str(save_path)
+    source_stem = os.path.splitext(os.path.basename(str(video_source or "")))[0]
+    if len(source_stem) == 0:
+        source_stem = "latent_decode"
+    container = str(server_config.get("video_container", "mp4")).lstrip(".")
+    new_video_path = get_available_filename(source_dir, f"{source_stem}_latent_decode", force_extension=f".{container}")
+
+    audio_data = None
+    if audio_waveform_chunks:
+        if sample_rate <= 0:
+            sample_rate = 16000
+        windows = (audio_entry or {}).get("windows") or []
+        if len(windows) == len(audio_waveform_chunks):
+            # Multi-window job: mirror the generation-time assembly. The
+            # writer commits window 1 in full and, for every later window,
+            # drops its first reuse-frames (int(reuse_frames * sr / fps)
+            # samples, the same arithmetic as truncate_audio) before
+            # concatenating at the accumulated position — the written track
+            # has no inter-window overlap at all. Placing each decoded chunk
+            # at its recorded start_sample (the window's own timeline
+            # origin, one overlap earlier) instead shifts every post-first
+            # window by the overlap and re-adds the dropped head. For a
+            # post-first window the overlap frame count is its video block's
+            # recorded head_trim, capped by the job's sliding overlap (a
+            # zero-overlap job trimmed no audio head, and a window's head
+            # trim can carry video-only trims the audio never received).
+            video_windows = (entry or {}).get("windows") or []
+            overlap_frames = int((entry or {}).get("sliding_window_overlap") or 0)
+            head_trims = [0] * len(audio_waveform_chunks)
+            for idx in range(1, len(audio_waveform_chunks)):
+                if idx < len(video_windows) and fps > 0:
+                    frames = min(int((video_windows[idx] or {}).get("head_trim") or 0), overlap_frames)
+                    if frames > 0:
+                        head_trims[idx] = int(frames * sample_rate / fps)
+            waveform = latent_io.merge_audio_window_chunks(
+                audio_waveform_chunks, windows, int((audio_entry or {}).get("samples") or 0),
+                head_trims=head_trims)
+        else:
+            waveform = torch.cat([c.unsqueeze(0) if c.dim() == 1 else c for c in audio_waveform_chunks], dim=1)
+        video_duration = frames.shape[1] / fps if fps > 0 else 0
+        max_samples = int(round(video_duration * sample_rate)) if video_duration > 0 else 0
+        if max_samples > 0 and waveform.shape[1] > max_samples:
+            waveform = waveform[:, :max_samples]
+        if waveform.numel() > 0:
+            # .numpy() needs a CPU tensor (the decode models run on the
+            # accelerator and hand back accelerator tensors).
+            audio_data = waveform.float().t().cpu().numpy()
+    if audio_data is not None:
+        # Muxing reads the video from a separate file, so the decoded video
+        # is first written to a temp path, then combined with the audio into
+        # the final file.
+        time_flag = int(time.time())
+        temp_video_path = get_available_filename(save_path, f"tmp{time_flag}_ltx2_latent_decode", force_extension=f".{container}")
+        temp_audio_path = get_available_filename(save_path, f"tmp{time_flag}_ltx2_latent_audio", force_extension=".wav")
+        if is_hdr:
+            save_hdr_video(tensor=frames, save_file=temp_video_path, fps=fps, codec_type=server_config.get("hdr_video_crf", 8), container=container)
+        else:
+            save_video(tensor=frames, save_file=temp_video_path, fps=fps, codec_type=server_config.get("video_output_codec", None), container=container, nrow=1, normalize=False, value_range=(0, 255))
+        write_wav_file(temp_audio_path, audio_data, sample_rate)
+        combine_and_concatenate_video_with_audio_tracks(
+            new_video_path,
+            temp_video_path,
+            [],
+            [temp_audio_path],
+            0,
+            sample_rate,
+            new_audio_from_start=True,
+            audio_codec_key=server_config.get("audio_output_codec", "aac_128"),
+            verbose=verbose_level >= 2,
+        )
+        os.remove(temp_video_path)
+        os.remove(temp_audio_path)
+    else:
+        if is_hdr:
+            save_hdr_video(tensor=frames, save_file=new_video_path, fps=fps, codec_type=server_config.get("hdr_video_crf", 8), container=container)
+        else:
+            save_video(tensor=frames, save_file=new_video_path, fps=fps, codec_type=server_config.get("video_output_codec", None), container=container, nrow=1, normalize=False, value_range=(0, 255))
+    print(f"Latent decoded video saved to Path: {new_video_path}")
+
+    configs = {"type": get_model_record("Latent Decode"), "prompt": str(entry.get("prompt") or "")}
+    with lock:
+        gen["file_list"].append(new_video_path)
+        gen["file_settings_list"].append(configs)
+    if not api_suppress_metadata_images:
+        from shared.utils.video_metadata import save_video_metadata
+        save_video_metadata(new_video_path, configs, None, allow_inplace_update=True, verbose_level=verbose_level)
+    notifications.record_generation(server_config, gen, new_video_path, configs)
+    if api_return_video_uint8 or api_return_audio:
+        # Same layout as the generation flow's sample tensor ([c, f, h, w]).
+        store_api_output_artifact(gen, client_id, new_video_path, "video", frames if api_return_video_uint8 else None, audio_data if api_return_audio else None, sample_rate if audio_data is not None else None, fps, hdr=is_hdr)
+    gen["last_was_audio"] = False
+    send_cmd("output")
+    clear_status(state)
+
+
+def _h3_sidecar_vae_file(recorded, default):
+    """Resolve the VAE name a MiniMax H3 sidecar records back to the loader's
+    checkpoint path.
+
+    The sidecar keeps the checkpoint's bare file name (the identity the model
+    list shows), while the H3 loaders compare the name they are handed against
+    their own constants — several of which carry the family's ``minimax_h3/``
+    folder prefix — to decide the model's shape: the light VAE's shallow
+    decoder, the X2 VAE's upsampling path. Matching on the basename keeps the
+    recorded identity and the loader's expectations in step; an unrecognised
+    name is handed through untouched for ``fl.locate_file`` to search.
+    """
+    from models.minimax_h3.minimax_h3_main import (AUDIO_VAE_FILE, VIDEO_VAE_FILE, VIDEO_VAE_FP8MIX_FILE,
+                                                   VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_FILE,
+                                                   VIDEO_VAE_LIGHT_INT8_FILE, X2_VAE_FILE, X2_VAE_INT8_FILE)
+    recorded = str(recorded or "").strip()
+    if not recorded:
+        return str(default or "")
+    if os.path.sep in recorded:
+        return recorded
+    for candidate in (VIDEO_VAE_FILE, VIDEO_VAE_FP8MIX_FILE, VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_FILE,
+                      VIDEO_VAE_LIGHT_INT8_FILE, X2_VAE_FILE, X2_VAE_INT8_FILE, AUDIO_VAE_FILE):
+        if os.path.basename(str(candidate)) == recorded:
+            return str(candidate)
+    return recorded
+
+
+def _h3_fit_audio_samples(audio, sample_count):
+    """Pad or truncate a waveform to exactly ``sample_count`` samples on its
+    last dimension (the H3 pipeline's ``_fit_audio_samples``, kept local so
+    the decode job never imports the generation pipeline)."""
+    count = int(sample_count or 0)
+    if count <= 0:
+        return audio[..., :0]
+    length = int(audio.shape[-1])
+    if length >= count:
+        return audio[..., :count]
+    pad = torch.zeros(*audio.shape[:-1], count - length, dtype=audio.dtype, device=audio.device)
+    return torch.cat([audio, pad], dim=-1)
+
+
+def _edit_latent_job_h3(send_cmd, state, video_source, client_id, plugin_data, sidecar_obj, entry, model_def, window_specs,
+                        api_return_video_uint8, api_return_audio, api_suppress_metadata_images):
+    """Decode a saved MiniMax H3 latent back to pixels.
+
+    H3 decodes through two independent VAEs (video ``[1, 24, t, h, w]`` with
+    a piecewise 5/17 temporal layout, audio ``[1, 32, 2, t]`` to 32 kHz
+    stereo), so the job takes a family-specific path: load only the VAE
+    components (no diffusion transformer), decode every window, and re-apply
+    the generation pipeline's exact per-window assembly (decoded target
+    region plus the re-encoded history prefix and the recorded pixel
+    trims) so the decoded output matches the generated video, soundtrack
+    included.
+
+    Placement is fully positional (step 6, D5 of the h3branch plan): every
+    length comes from the window's own recorded fields (``h3_target_frames``,
+    ``h3_history_frames``, ``frame_count``, the head/tail trims) and the
+    windows tile in sidecar order — video by concatenation, audio on the
+    running cursor — so no derived offset or prefix bookkeeping is read
+    here. A branch
+    anchor window (``h3_anchor_head``: a Case B window whose first decoded
+    frame re-anchors the carried window's last frame) is the first sidecar
+    window after the carried ones (window 1 itself when nothing is carried),
+    so its one-frame head trim drops the re-decoded shared frame and its
+    audio starts exactly where the carried (committed) region's audio ends
+    — the prefix's tail, positionally.
+    """
+    gen = get_gen_info(state)
+    if gen.get("abort", False):
+        return
+    fps = float(entry.get("fps") or 0) or float(model_def.get("fps") or 24)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    from models.minimax_h3.minimax_h3_main import (AUDIO_VAE_FILE, VIDEO_VAE_FILE, X2_VAE_FILE, X2_VAE_INT8_FILE,
+                                                   _load_audio_vae, _load_video_vae)
+    from models.minimax_h3.pipeline import _video_to_uint8_cpu
+
+    audio_entry = latent_io.audio_latent_payload(sidecar_obj)
+    audio_windows = latent_io.audio_window_specs(audio_entry) if audio_entry is not None else []
+    needs_audio = len(audio_windows) > 0
+    sample_rate = int((audio_entry or {}).get("sample_rate") or 32000)
+
+    # The VAE names recorded in the sidecar take precedence (they produced
+    # this latent); the model definition and the family defaults fall back.
+    video_vae_file = _h3_sidecar_vae_file(entry.get("vae_file"), model_def.get("video_vae_file") or VIDEO_VAE_FILE)
+    audio_vae_file = _h3_sidecar_vae_file((audio_entry or {}).get("audio_vae_file"),
+                                          model_def.get("audio_vae_file") or AUDIO_VAE_FILE)
+    # The sidecar records the dtype each VAE ran with (the default video
+    # checkpoint is fp16, the audio VAE is locked to fp32); loading with the
+    # same dtype reproduces the generation decode.
+    vae_dtype = {"float16": torch.float16, "16": torch.float16, "bfloat16": torch.bfloat16}.get(str(entry.get("vae_dtype") or "float32"), torch.float32)
+    stored_vae_hash = str(entry.get("vae_sha256") or "")
+    stored_audio_hash = str((audio_entry or {}).get("audio_vae_sha256") or "")
+
+    # The H3 VAE's decoder blocks dispatch through the shared attention
+    # helper, which reads the job's attention mode from the offload state;
+    # a decode-only job (no prior generation in this process) must set it.
+    offload.shared_state["_attention"] = get_default_attention_mode()
+    try:
+        # The loader takes the checkpoint name and the offload layout flags —
+        # its compute dtype comes from the checkpoint itself (fp16 / bf16
+        # native, an fp32 checkpoint lowered to fp16), which is the dtype the
+        # generation recorded in the sidecar. qkv_splitting only re-partitions
+        # the official VAE's linear layers for offloading; the decode runs one
+        # un-offloaded forward pass, so the plain layout is loaded either way.
+        # The X2 VAEs decode through their upsampling path, the flag that
+        # builds that model shape.
+        video_vae = _load_video_vae(
+            video_vae_file, qkv_splitting=False,
+            upsampling=os.path.basename(video_vae_file) in (os.path.basename(X2_VAE_FILE), os.path.basename(X2_VAE_INT8_FILE)))
+        audio_vae = _load_audio_vae(audio_vae_file) if needs_audio else None
+    except Exception as exc:
+        send_cmd("error", gr.Error(f"The VAE checkpoint(s) required to decode this latent could not be loaded ({exc})."))
+        return
+    # The latents are cast to the dtype the loaded video VAE computes in (the
+    # sidecar's recorded dtype is the same one, the checkpoint being the
+    # identity that produced them); the audio VAE is always fp32.
+    loaded_vae_dtype = getattr(video_vae, "_model_dtype", None)
+    if loaded_vae_dtype is not None and loaded_vae_dtype != vae_dtype:
+        print(f"Latent decode identity warning: the video VAE computes in {loaded_vae_dtype}, "
+              f"the sidecar recorded {vae_dtype}; the latents follow the loaded VAE.")
+        vae_dtype = loaded_vae_dtype
+    if len(stored_vae_hash) > 0:
+        video_vae_pth = fl.locate_file(video_vae_file, error_if_none=False)
+        if os.path.isfile(video_vae_pth) and latent_io.sha256_file(video_vae_pth) != stored_vae_hash:
+            print("Latent decode identity warning: the video VAE checkpoint on disk differs from the one used at save time.")
+    if needs_audio and len(stored_audio_hash) > 0:
+        audio_vae_pth = fl.locate_file(audio_vae_file, error_if_none=False)
+        if os.path.isfile(audio_vae_pth) and latent_io.sha256_file(audio_vae_pth) != stored_audio_hash:
+            print("Latent decode identity warning: the audio VAE checkpoint on disk differs from the one used at save time.")
+    # Same spatial tiling the generation pipeline configures: it lowers the
+    # peak memory of one full-size decode pass.
+    video_vae.enable_tiling(tile_sample_min_height=256, tile_sample_min_width=256)
+    video_vae.to(device)
+    if audio_vae is not None:
+        audio_vae.to(device)
+
+    window_frames_list = []
+    audio_canvas_chunks = []  # (start_sample, [2, samples] waveform) per window
+    audio_cursor = 0  # next tiling position on the canvas (the production job
+                      # appends each window's trimmed audio in order)
+    prev_video = None  # previous window's [H | D] sample after the tail trim (float [-1, 1])
+    prev_audio = None  # previous window's decoded audio after the tail trim ([2, samples])
+    # i2v jobs never trimmed the audio (the start image carries no samples),
+    # unlike their video head trim, so window 1's recorded trim needs one
+    # frame back for the audio only.
+    image_source = entry.get("image_source")
+    is_i2v = bool(image_source) and len(str(entry.get("video_source") or "")) == 0
+    aborted = False
+    try:
+        for idx, spec in enumerate(window_specs):
+            if gen.get("abort", False):
+                aborted = True
+                break
+            window_no = int(spec["window_no"])
+            h3 = int(spec.get("h3_history_frames") or 0)
+            target = int(spec.get("h3_target_frames") or 0)
+            frame_count = int(spec.get("frame_count") or 0)
+            head_trim = int(spec["head_trim"])
+            tail_trim = int(spec["tail_trim"])
+
+            latent = spec["latents"].to(device=device, dtype=vae_dtype)
+            if latent.dim() == 4:
+                latent = latent.unsqueeze(0)
+            decoded = video_vae.decode(latent)
+            latent = None
+            if decoded is None or decoded.numel() == 0:
+                raise ValueError(f"window {window_no} could not be decoded")
+            frames = decoded[0].float().clamp_(-1.0, 1.0)  # [3, D, h, w]
+            decoded = None
+            if target > 0 and frames.shape[1] > target:
+                frames = frames[:, :target]
+            history_cat = False
+            if h3 > 0:
+                # The latent covers the target region only; the window's
+                # history frames are the continuation the generation job was
+                # handed, so they must be rebuilt here for the head trim and
+                # for the next window to chain its history from. Window 1
+                # has no earlier window to re-extract its history from: a
+                # branch head that is the sidecar's own window 1 re-decodes
+                # the carried region as its own head, so its block records
+                # no external history.
+                if window_no > 1 and prev_video is not None:
+                    history = prev_video[:, -(h3 + 1):-1].to(frames.device)
+                    frames = torch.cat([history, frames], dim=1)
+                    history_cat = True
+                elif window_no > 1:
+                    print(f"Latent decode: window {window_no} records a history prefix but no earlier window decoded; continuing without it.")
+                else:
+                    print("Latent decode: the history of window 1 came from the source video, which the latent file no longer records; the decoded window starts at its first decoded frame.")
+            # Tail trim first: the next window's history (video and audio) is
+            # taken from the tail-trimmed sample, before the head trim, like
+            # the original assembly.
+            if tail_trim > 0:
+                frames = frames[:, :max(0, frames.shape[1] - tail_trim)]
+            prev_video = frames.cpu()
+            # The recorded head trim counts the history frames too; when the
+            # history was not rebuilt it has to come off the target region
+            # only (the overlap minus what the decoded sample does not hold).
+            # The i2v window 1 trim belongs to the start-image prefix (which
+            # the original assembly dropped from itself), not to the decoded
+            # sample, so it is not applied here.
+            if head_trim > 0 and not (window_no == 1 and is_i2v):
+                frames = frames[:, head_trim:] if history_cat else frames[:, max(0, head_trim - h3):]
+            window_frames_list.append(_video_to_uint8_cpu(frames))
+
+            # ---- Audio for this window (same assembly as the pipeline) ----
+            if idx < len(audio_windows):
+                a_latent = audio_windows[idx]["latents"]
+                if a_latent.dim() == 3:
+                    a_latent = a_latent[0]
+                # The stored [64, t] flatten is the [32, 2, t] latent
+                # (channels, stereo, time) read row-major.
+                a_latent = a_latent.reshape(1, 32, 2, int(a_latent.shape[-1]))
+                a_decoded = audio_vae.decode(a_latent.to(device=device, dtype=torch.float32))[0]  # [2, samples]
+                a_latent = None
+                a_decoded = a_decoded.cpu().float()
+                target_samples = int(round(target / fps * sample_rate)) if (target > 0 and fps > 0) else int(a_decoded.shape[-1])
+                a_decoded = _h3_fit_audio_samples(a_decoded, target_samples)
+                if h3 > 0:
+                    # The latent covers the target region only, so the
+                    # window's [H | D] audio sample is rebuilt like the
+                    # pipeline does: the history region from the previous
+                    # window (silence for window 1, whose history came from
+                    # the source and is dropped by the head trim below).
+                    prefix_samples = int(round(h3 / fps * sample_rate)) if fps > 0 else 0
+                    overlap_samples = int(round((h3 + 1) / fps * sample_rate)) if fps > 0 else prefix_samples
+                    if window_no > 1 and prev_audio is not None:
+                        prefix_a = _h3_fit_audio_samples(prev_audio[:, -overlap_samples:][:, :prefix_samples], prefix_samples)
+                    else:
+                        prefix_a = a_decoded.new_zeros(2, prefix_samples)
+                    a_decoded = torch.cat([prefix_a, a_decoded], dim=1)
+                total_samples = int(round(frame_count / fps * sample_rate)) if (frame_count > 0 and fps > 0) else int(a_decoded.shape[-1])
+                a_decoded = a_decoded[:, :total_samples]
+                if tail_trim > 0 and fps > 0:
+                    tail_samples = int(round(tail_trim * sample_rate / fps))
+                    a_decoded = a_decoded[:, :max(0, a_decoded.shape[-1] - tail_samples)]
+                prev_audio = a_decoded
+                # The original flow trimmed the audio by the full head trim
+                # (history frames plus the anchor frame) except for i2v jobs,
+                # where the start image carries no samples.
+                audio_head_frames = head_trim - (1 if (window_no == 1 and is_i2v) else 0)
+                head_samples = int(round(max(0, audio_head_frames) * sample_rate / fps)) if fps > 0 else 0
+                final_audio = a_decoded[:, head_samples:]
+                if final_audio.shape[-1] > 0:
+                    # The production job appends each window's trimmed audio to
+                    # the running track in order, so the chunks tile the
+                    # canvas; the sidecar's per-window start_sample tracks the
+                    # job's guide position (which drifts for later windows),
+                    # not the assembled track, so it is not used here.
+                    # Step 6 (D5): an H3 branch anchor window (h3_anchor_head)
+                    # is the first sidecar window after the carried ones
+                    # (window 1 itself when nothing is carried), so the cursor
+                    # places its audio at the tail of the carried (committed)
+                    # region; its one-frame head trim (above) drops the
+                    # re-decoded shared frame's samples, so the committed
+                    # contribution starts at the committed end, positionally.
+                    audio_canvas_chunks.append((audio_cursor, final_audio))
+                    audio_cursor += int(final_audio.shape[-1])
+    except Exception as exc:
+        send_cmd("error", gr.Error(f"The saved latent could not be decoded: {exc}"))
+        return
+    finally:
+        if video_vae is not None:
+            video_vae.to("cpu")
+        if audio_vae is not None:
+            audio_vae.to("cpu")
+        del video_vae
+        del audio_vae
+    if aborted:
+        return
+    if len(window_frames_list) == 0:
+        send_cmd("error", gr.Error("The saved latent does not contain any decodable window."))
+        return
+    frames = torch.cat(window_frames_list, dim=1) if len(window_frames_list) > 1 else window_frames_list[0]
+
+    source_dir = os.path.dirname(str(video_source or ""))
+    if len(source_dir) == 0:
+        source_dir = str(save_path)
+    source_stem = os.path.splitext(os.path.basename(str(video_source or "")))[0]
+    if len(source_stem) == 0:
+        source_stem = "latent_decode"
+    container = str(server_config.get("video_container", "mp4")).lstrip(".")
+    codec_type = str(server_config.get("video_output_codec", "libx264_8"))
+    new_video_path = get_available_filename(source_dir, f"{source_stem}_latent_decode", force_extension=f".{container}")
+
+    # Place the decoded chunks on a canvas the way the production job built
+    # the track: window 1's trimmed audio starts at sample 0 (silence only
+    # where the original output had none, as for a continuation's source
+    # prefix) and each following window starts where the previous one ended.
+    audio_data = None
+    if len(audio_canvas_chunks) > 0:
+        canvas_end = max(offset + waveform.shape[1] for offset, waveform in audio_canvas_chunks)
+        video_samples = int(round(frames.shape[1] / fps * sample_rate)) if fps > 0 else 0
+        canvas_length = max(video_samples, canvas_end) if video_samples > 0 else canvas_end
+        canvas = torch.zeros(2, max(0, canvas_length), dtype=torch.float32)
+        for offset, waveform in audio_canvas_chunks:
+            offset = max(0, min(int(offset), canvas.shape[1]))
+            count = min(int(waveform.shape[1]), canvas.shape[1] - offset)
+            if count > 0:
+                canvas[:, offset:offset + count] = waveform[:, :count]
+        if video_samples > 0 and canvas.shape[1] > video_samples:
+            canvas = canvas[:, :video_samples]
+        if canvas.shape[1] > 0:
+            audio_data = canvas.t().cpu().numpy()  # sample-major [samples, 2]
+    if audio_data is not None:
+        # Muxing reads the video from a separate file, so the decoded video
+        # is first written to a temp path, then combined with the audio into
+        # the final file.
+        time_flag = int(time.time())
+        temp_video_path = get_available_filename(save_path, f"tmp{time_flag}_h3_latent_decode", force_extension=f".{container}")
+        temp_audio_path = get_available_filename(save_path, f"tmp{time_flag}_h3_latent_audio", force_extension=".wav")
+        save_video(tensor=frames, save_file=temp_video_path, fps=fps, codec_type=codec_type, container=container, nrow=1, normalize=False, value_range=(0, 255))
+        write_wav_file(temp_audio_path, audio_data, sample_rate)
+        combine_and_concatenate_video_with_audio_tracks(
+            new_video_path,
+            temp_video_path,
+            [],
+            [temp_audio_path],
+            0,
+            sample_rate,
+            new_audio_from_start=True,
+            audio_codec_key=server_config.get("audio_output_codec", "aac_128"),
+            verbose=verbose_level >= 2,
+        )
+        os.remove(temp_video_path)
+        os.remove(temp_audio_path)
+    else:
+        save_video(tensor=frames, save_file=new_video_path, fps=fps, codec_type=codec_type, container=container, nrow=1, normalize=False, value_range=(0, 255))
+    print(f"Latent decoded video saved to Path: {new_video_path}")
+
+    configs = {"type": get_model_record("Latent Decode"), "prompt": str(entry.get("prompt") or "")}
+    with lock:
+        gen["file_list"].append(new_video_path)
+        gen["file_settings_list"].append(configs)
+    if not api_suppress_metadata_images:
+        from shared.utils.video_metadata import save_video_metadata
+        save_video_metadata(new_video_path, configs, None, allow_inplace_update=True, verbose_level=verbose_level)
+    notifications.record_generation(server_config, gen, new_video_path, configs)
+    if api_return_video_uint8 or api_return_audio:
+        # Same layout as the generation flow's sample tensor ([c, f, h, w]).
+        store_api_output_artifact(gen, client_id, new_video_path, "video", frames if api_return_video_uint8 else None, audio_data if api_return_audio else None, sample_rate if audio_data is not None else None, fps)
+    gen["last_was_audio"] = False
+    send_cmd("output")
+    clear_status(state)
+
+
+
+def edit_latent_job(send_cmd, state, video_source, client_id="", plugin_data=None):
+    """Decode a saved pre-decode latent (Media Flow 'Latent Decode') back to pixels.
+
+    The latent companion file (``*_latent.pt``) was written next to the media
+    file when 'Save Latents' was enabled; this job re-decodes it with the same
+    VAE and writes a new video next to the source.
+    """
+    gen = get_gen_info(state)
+    if gen.get("abort", False):
+        return
+    api_options = plugin_data.get("api", {}) if isinstance(plugin_data, dict) and isinstance(plugin_data.get("api"), dict) else {}
+    api_return_video_uint8, api_return_audio = get_api_output_options(plugin_data)
+    api_suppress_metadata_images = bool(api_options.get("suppress_metadata_images"))
+
+    latent_source = str(api_options.get("latent_source") or "")
+    if len(latent_source) == 0:
+        latent_source = latent_io.find_latent_file(video_source) or ""
+    if len(latent_source) == 0 or not os.path.isfile(latent_source):
+        send_cmd("error", gr.Error("No saved latent companion file was found for this media. Latent decoding only works on media generated with the 'Save Latents' option enabled."))
+        return
+    try:
+        sidecar_obj = latent_io.load_latent_file(latent_source)
+        entry = latent_io.latent_payload(sidecar_obj)
+    except Exception as exc:
+        send_cmd("error", gr.Error(f"Unable to read the latent companion file {os.path.basename(latent_source)}: {exc}"))
+        return
+    if entry is None:
+        send_cmd("error", gr.Error(f"{os.path.basename(latent_source)} is not a WanGP latent companion file."))
+        return
+    # The latent decode reads the all-latent layout only (every kept frame
+    # stored as latents): a sidecar in any other layout cannot be
+    # faithfully decoded, so it is refused up front with the one generic
+    # message instead of writing a subtly wrong video.
+    if not latent_io.is_all_latent_entry(entry):
+        send_cmd("error", gr.Error(latent_io.non_current_latent_message(f"{os.path.basename(latent_source)}")))
+        return
+
+    for warning in latent_io.identity_warnings(entry, {"app_version": WanGP_version, "model_type": "", "base_model_type": "", "vae_sha256": ""}):
+        print(f"Latent decode identity warning: {warning}")
+    # A flagged sidecar (its recorded length differs from the written
+    # video's length) still decodes: say up front that the decoded video
+    # will have the file's recorded length, not the neighboring video's.
+    _mismatch = latent_io.sidecar_length_mismatch(entry)
+    if _mismatch is not None:
+        print(f"Latent decode: the file's recorded length ({_mismatch[0]} frames) differs from the video it was written for "
+              f"({_mismatch[1]} frames); the decoded video will have the file's recorded length, not the neighboring video's.")
+
+    model_type = str(entry.get("model_type") or "")
+    model_def = get_model_def(model_type) if len(model_type) > 0 else None
+    if model_def is None:
+        send_cmd("error", gr.Error(f"The model '{model_type}' that produced this latent is not available in this build."))
+        return
+
+    window_specs = latent_io.entry_window_specs(entry)
+    if not window_specs:
+        send_cmd("error", gr.Error(f"{os.path.basename(latent_source)} does not contain any readable latent windows."))
+        return
+    if len(window_specs) > 1:
+        print(f"Latent decode: reconstructing {len(window_specs)} windows from {os.path.basename(latent_source)}.")
+
+    if _is_h3_family(str(entry.get("base_model_type") or ""), model_def):
+        _edit_latent_job_h3(send_cmd, state, video_source, client_id, plugin_data, sidecar_obj, entry, model_def, window_specs,
+                            api_return_video_uint8, api_return_audio, api_suppress_metadata_images)
+        return
+    if _is_ltx2_family(str(entry.get("base_model_type") or ""), model_def):
+        _edit_latent_job_ltx2(send_cmd, state, video_source, client_id, plugin_data, sidecar_obj, entry, model_def, window_specs,
+                              api_return_video_uint8, api_return_audio, api_suppress_metadata_images)
+        return
+
+    # Resolve the VAE the same way the model loader does (the stored VAE name
+    # takes precedence over the current model definition, so a latent keeps
+    # decoding with the VAE that produced it).
+    from models.wan.modules.vae import WanVAE
+    from models.wan.modules.vae2_2 import Wan2_2_VAE
+    vae_candidate = None
+    vae_urls = model_def.get("VAE_URLs", None)
+    if isinstance(vae_urls, str) and len(vae_urls) > 0:
+        vae_candidate = vae_urls
+    elif isinstance(vae_urls, list) and len(vae_urls) > 0:
+        vae_urls = [u for u in vae_urls if str(u).endswith((".pt", ".pth", ".safetensors"))]
+        vae_candidate = vae_urls[0] if len(vae_urls) > 0 else None
+    if vae_candidate is None:
+        vae_candidate = "Wan2.2_VAE.safetensors" if model_def.get("wan_5B_class", False) else "Wan2.1_VAE.safetensors"
+    stored_vae_file = str(entry.get("vae_file") or "")
+    if len(stored_vae_file) > 0 and os.path.basename(str(vae_candidate)) != stored_vae_file:
+        vae_candidate = stored_vae_file
+    # The 2.2 (5B) VAE is a 16x-spatial checkpoint and the 2.1 VAE is 8x, and
+    # the two classes have different architectures: pick the class from the
+    # checkpoint actually loaded (its recorded name) so a latent keeps decoding
+    # with the VAE that produced it, even if the current model definition no
+    # longer matches it; the model definition is the fallback for custom VAE
+    # names that do not identify their generation. LongCat rides this path
+    # too: its sidecar stores the loop's normalized latents (the Wan family
+    # convention, the same Wan 2.1 VAE), so the wrapper's built-in
+    # latents_mean/latents_std rescale is the exact inverse of the writer's
+    # denormalize and no separate family branch is needed.
+
+    vae_basename = os.path.basename(str(vae_candidate)).lower()
+    if "2.2" in vae_basename:
+        vae_class = Wan2_2_VAE
+    elif "2.1" in vae_basename:
+        vae_class = WanVAE
+    else:
+        vae_class = Wan2_2_VAE if model_def.get("wan_5B_class", False) else WanVAE
+    vae_scale = 16 if vae_class is Wan2_2_VAE else 8
+    vae_pth = fl.locate_file(vae_candidate, error_if_none=False)
+    if not os.path.isfile(vae_pth):
+        send_cmd("error", gr.Error(f"The VAE checkpoint required for this latent is missing: {os.path.basename(str(vae_candidate))}"))
+        return
+    stored_vae_hash = str(entry.get("vae_sha256") or "")
+    if len(stored_vae_hash) > 0:
+        current_vae_hash = latent_io.sha256_file(vae_pth)
+        if current_vae_hash != stored_vae_hash:
+            print("Latent decode identity warning: the VAE checkpoint on disk differs from the one used at save time.")
+
+    # The sidecar records the dtype the VAE ran with at generation; decode
+    # with the same dtype (decoding with a different precision than the
+    # generation changes the decoded pixels slightly). The server config is
+    # the fallback for sidecars that predate the field.
+    _recorded_dtype = _DTYPE_MAP.get(str(entry.get("vae_dtype") or ""))
+    vae_dtype = _recorded_dtype if _recorded_dtype is not None else (
+        torch.float16 if str(server_config.get("vae_precision", "16")) == "16" else torch.float)
+    vae = vae_class(vae_pth=vae_pth, dtype=vae_dtype, device="cpu")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    vae.device = device
+    vae.model.to(device)
+    # Defensive: Wan/LongCat latents are SDR today, but if a sidecar ever
+    # records an HDR sample, decode it in VAE range (float) and save it as
+    # tagged HDR10 instead of clamping to 8 bits.
+    entry_is_hdr = bool(entry.get("is_hdr"))
+    window_frames_list = []
+    try:
+        for spec in window_specs:
+            latents = spec["latents"].to(device=device, dtype=vae_dtype)
+            # Tile only when the window's decoded canvas exceeds the tile
+            # threshold (spatial tiling is a memory measure and its overlap
+            # blending shifts the pixels, so it is used only when needed).
+            # The threshold is in pixel space, so it scales with the VAE's
+            # spatial compression (8x for the 2.1 VAE, 16x for the 2.2 / 5B VAE).
+            tile_size = 256 if (latents.shape[-1] * vae_scale > 256 or latents.shape[-2] * vae_scale > 256) else 0
+            videos = vae.decode([latents], tile_size) if entry_is_hdr else vae.decode_to_cpu_uint8([latents], tile_size)
+            latents = None
+            if len(videos) == 0 or videos[0] is None:
+                raise ValueError(f"window {spec['window_no']} could not be decoded")
+            frames = videos[0]
+            videos = None
+            # Re-apply the exact pixel trims of the original assembly so the
+            # decoded windows re-assemble into the original video unchanged.
+            head_trim = int(spec["head_trim"])
+            tail_trim = int(spec["tail_trim"])
+            if head_trim > 0 or tail_trim > 0:
+                frames = frames[:, head_trim:max(head_trim, frames.shape[1] - tail_trim)]
+            window_frames_list.append(frames)
+    except Exception as exc:
+        send_cmd("error", gr.Error(f"The saved latent could not be decoded: {exc}"))
+        return
+    finally:
+        vae.model.to("cpu")
+        del vae
+    if len(window_frames_list) == 0:
+        send_cmd("error", gr.Error("The saved latent does not contain any decodable window."))
+        return
+    frames = torch.cat(window_frames_list, dim=1) if len(window_frames_list) > 1 else window_frames_list[0]
+    fps = float(entry.get("fps") or 0) or float(model_def.get("fps") or 24)
+
+    source_dir = os.path.dirname(str(video_source or ""))
+    if len(source_dir) == 0:
+        source_dir = str(save_path)
+    source_stem = os.path.splitext(os.path.basename(str(video_source or "")))[0]
+    if len(source_stem) == 0:
+        source_stem = "latent_decode"
+    container = str(server_config.get("video_container", "mp4")).lstrip(".")
+    codec_type = str(server_config.get("video_output_codec", "libx264_8"))
+    new_video_path = get_available_filename(source_dir, f"{source_stem}_latent_decode", force_extension=f".{container}")
+    if entry_is_hdr:
+        # Tagged 10-bit HEVC HDR10 file, like the generation flow: the decoded
+        # VAE-range floats go straight into the HDR pipe without clamping.
+        save_hdr_video(tensor=frames, save_file=new_video_path, fps=fps, codec_type=server_config.get("hdr_video_crf", 8), container=container)
+    else:
+        save_video(tensor=frames, save_file=new_video_path, fps=fps, codec_type=codec_type, container=container, nrow=1, normalize=False, value_range=(0, 255))
+    print(f"Latent decoded video saved to Path: {new_video_path}")
+
+    configs = {"type": get_model_record("Latent Decode"), "prompt": str(entry.get("prompt") or "")}
+    with lock:
+        gen["file_list"].append(new_video_path)
+        gen["file_settings_list"].append(configs)
+    if not api_suppress_metadata_images:
+        from shared.utils.video_metadata import save_video_metadata
+        save_video_metadata(new_video_path, configs, None, allow_inplace_update=True, verbose_level=verbose_level)
+    notifications.record_generation(server_config, gen, new_video_path, configs)
+    if api_return_video_uint8 or api_return_audio:
+        store_api_output_artifact(gen, client_id, new_video_path, "video", frames, None, None, fps)
+    gen["last_was_audio"] = False
+    send_cmd("output")
+    clear_status(state)
+
+
 @workspace_storage.workspace_generation(headless=lambda state: workspace_storage.HeadlessWorkspaceHost(state, args.workspaces_dir or server_config.get('workspaces_dir') or os.path.join(wgp_root, 'workspaces'), lambda path: get_settings_from_file(state, path, False, False, False)[0], output_override=bool(args.output_dir)))
 @generation_downloads(get_gen_info, lambda: offloadobj)
 def generate_media(
@@ -7402,6 +9612,8 @@ def generate_media(
     model_mode,
     video_source,
     keep_frames_video_source,
+    branch_from_latent,
+    branch_fit_latent,
     input_video_strength,
     video_prompt_type,
     image_refs,
@@ -7481,6 +9693,10 @@ def generate_media(
     spatial_postprocessing_parameters=None,
     temporal_postprocessing_parameters=None,
     postprocessing_reference_images=None,
+    # VAE upsampler runtime parameters (the latent branch's head window).
+    spatial_upsampler_parameters=None,
+    branch_latent_file=None,
+    save_latents_choice=None,
 ):
     filename_formatter = None
     if output_filename:
@@ -7513,6 +9729,9 @@ def generate_media(
     torch.set_grad_enabled(False) 
     if mode == "edit_audio":
         edit_audio(send_cmd, state, audio_source, postprocess_audio, replace_voice_sample, replace_voice_sample2, client_id=client_id, plugin_data=plugin_data)
+        return True
+    if mode == "edit_latent":
+        edit_latent_job(send_cmd, state, video_source, client_id=client_id, plugin_data=plugin_data)
         return True
     if mode.startswith("edit_"):
         edit_media(send_cmd, state, mode, video_source, seed, temporal_upsampling, spatial_upsampling, film_grain_intensity, film_grain_saturation, postprocess_audio, postprocess_audio_prompt, postprocess_audio_neg_prompt, repeat_generation, audio_source, replace_voice_method, replace_voice_sample, replace_voice_sample2, prompt=prompt, image_refs=image_refs, image_refs_relative_size=image_refs_relative_size, spatial_postprocessing_parameters=spatial_postprocessing_parameters, temporal_postprocessing_parameters=temporal_postprocessing_parameters, postprocessing_reference_images=postprocessing_reference_images, client_id=client_id, plugin_data=plugin_data)
@@ -7586,6 +9805,73 @@ def generate_media(
     width, height = resolution.split("x")
     width, height = int(width) // block_size * block_size, int(height) // block_size * block_size
 
+    # The job's effective *Save Latents* decision: the *Misc.* tab
+    # choice for this generation when it is set to *On* or *Off*,
+    # otherwise the *Configuration* option's *Save Latents* — which is
+    # also the rule for Deepy and API jobs (they pass no choice).
+    save_latents_enabled = effective_save_latents(save_latents_choice, server_config.get("save_latents", False))
+
+    # Latent Branch: fail fast, before the model load. The branch's latent
+    # file is resolved from the selected video's name (the mangled upload
+    # temp name included) and its path reported in the job log; the
+    # kept-latents bookkeeping further down reuses this result. Outside
+    # the Continue locations the checkbox may still be on (hidden) — a job
+    # started there is not a branch job and skips this re-resolution. The
+    # same dormancy applies to models whose family does not write latent
+    # files: a hidden-but-on mode is treated as off (never a refusal).
+    branch_latent_info = None
+    if bool(branch_from_latent) and not is_image and len(filter_letters(str(image_prompt_type or ""), "VL")) > 0 and _is_all_latent_family(str(base_model_type or ""), model_def):
+        _pre_info, _pre_error = resolve_latent_branch(image_prompt_type, video_source, state, model_type, keep_frames=keep_frames_video_source, fit=bool(branch_fit_latent), base_model_type=base_model_type, model_def=model_def, latent_file=branch_latent_file)
+        if _pre_error:
+            raise gr.Error(f"From latent: {_pre_error}")
+        branch_latent_info = _pre_info
+        _pre_branch = _pre_info["branch"]
+        for _pre_warning in _pre_info["warnings"]:
+            print(f"From latent: {_pre_warning}", flush=True)
+        # The video the branch was resolved from is reported with the file
+        # (in *Continue Last Video* it is the auto-resolved last video, not
+        # necessarily the picker's value), so the pair is traceable in the
+        # job log whatever direction the match was determined from.
+        _pre_video = str(_pre_info.get("video") or "").strip()
+        _pre_video_part = f" for {_pre_video}" if len(_pre_video) > 0 else ""
+        if _pre_branch.get("mid_latent"):
+            print(f"From latent: using saved latent file {_pre_info['path']}{_pre_video_part} ({_pre_branch['total_frames']} frames recorded; you asked for frame {_pre_info['branch_frame']}, the cut lands at frame {_pre_branch['kept_frames']}).", flush=True)
+        else:
+            print(f"From latent: using saved latent file {_pre_info['path']}{_pre_video_part} ({_pre_branch['total_frames']} frames recorded; cut at frame {_pre_branch['kept_frames']}).", flush=True)
+    # LTX2 / Wan / LongCat / MiniMax H3 + Save Latents: the sidecar is the
+    # sole content source, so a continuation job that would record latents
+    # must also source its kept region from the source video's sidecar
+    # (copied latents, never re-extracted pixels) — a continuation left
+    # unconverted would write a sidecar whose committed length cannot match
+    # the written video (the kept prefix is not in it), so the job ends up
+    # without a companion file. The explicit *From latent* checkbox above
+    # covers the same flow when the user opts in directly; without it the
+    # keep-frames field's value is the cut. A latent-only continuation
+    # (an explicit latent file, no companion video) converts as well — the
+    # branch resolves from the file's records alone. The trigger is the
+    # job's location (a continuation), not the pickers' contents: a job
+    # started in any other location runs as a plain job whatever a
+    # previous job left in the pickers. Fail fast here, before the model
+    # load, when the sidecar chain is missing or unusable: the alternative
+    # would be to write a sidecar the current version cannot decode. The
+    # check uses the job's effective *Save Latents* decision (above).
+    if (branch_latent_info is None and not is_image and _is_all_latent_family(str(base_model_type or ""), model_def)
+            and save_latents_enabled
+            and len(filter_letters(str(image_prompt_type or ""), "VL")) > 0):
+        _pre_info, _pre_error = resolve_latent_branch(image_prompt_type, video_source, state, model_type, keep_frames=keep_frames_video_source, fit=False, base_model_type=base_model_type, model_def=model_def, latent_file=branch_latent_file)
+        if _pre_error:
+            raise gr.Error(f"Save Latents: {_pre_error} (disable 'Save Latents' for this job to run it from the source video pixels instead)")
+        branch_latent_info = _pre_info
+        branch_from_latent = True
+        _pre_branch = _pre_info["branch"]
+        for _pre_warning in _pre_info["warnings"]:
+            print(f"From latent: {_pre_warning}", flush=True)
+        _pre_video = str(_pre_info.get("video") or "").strip()
+        _pre_video_part = f" for {_pre_video}" if len(_pre_video) > 0 else ""
+        if _pre_branch.get("mid_latent"):
+            print(f"Save Latents: the source latent file {_pre_info['path']}{_pre_video_part} is the branch source ({_pre_branch['total_frames']} frames recorded; you asked for frame {_pre_info['branch_frame']}, the cut lands at frame {_pre_branch['kept_frames']}).", flush=True)
+        else:
+            print(f"Save Latents: the source latent file {_pre_info['path']}{_pre_video_part} is the branch source ({_pre_branch['total_frames']} frames recorded; cut at frame {_pre_branch['kept_frames']}).", flush=True)
     from preprocessing.processors import prepare_generation_assets
     prepare_generation_assets(model_def, base_model_type, locals(), server_config, process_map_video_guide, process_map_outside_mask)
     download_requested_postprocessing_assets(
@@ -7813,10 +10099,191 @@ def generate_media(
         speakers_bboxes = None        
     if "L" in image_prompt_type:
         video_source = prompt_enhancer_images.resolve_continue_video(video_source, image_prompt_type, get_processed_queue(gen)[VIDEO.id][0], save_path)
+    # Computed here (before the branch prefix is prepared below) because the
+    # *From latent* prefix path reads fit_canvas; defining it later in the
+    # function would leave it unbound at that point.
+    fit_canvas = 2 if model_def.get("lock_resolutions", False) else server_config.get("fit_canvas", 0)
+    fit_crop = fit_canvas == 2
+    if fit_crop and outpainting_dims is not None:
+        fit_crop = False
+        fit_canvas = 0
+    # Latent Branch (Phase 0 wiring): with the *From latent* checkbox this
+    # continuation job branches from the source video's saved *_latent.pt
+    # sidecar: the branch point (the keep-frames field) resolves to a latent
+    # boundary of the sidecar (the boundary before the latent containing the
+    # frame by default, the boundary after it when *Round branch frame* is
+    # checked), the source video is truncated at that cut so the new
+    # generation starts exactly on the boundary, and the kept latents carry
+    # over into this job's sidecar (model-side prefix substitution is added
+    # per model family in later phases).
+    branch_carried = None
+    branch_prefix = None
+    branch_decode = None
+    _branch_decode_reason = None
+    _all_latent_job = False
+    if branch_latent_info is not None and not is_image:
+        # The latent file was resolved and reported before the model load
+        # above (the branch only exists for the Continue locations); reuse
+        # that result for the kept-latents bookkeeping.
+        branch = branch_latent_info["branch"]
+        # The source video is truncated at the resolved latent boundary, not
+        # at the typed frame, so the new generation starts exactly there.
+        parsed_keep_frames_video_source = min(int(branch["kept_frames"]), max_source_video_frames)
+        overrun_note = f"; {branch['overrun']} frames past the video end come from the carried latents" if branch["overrun"] > 0 else ""
+        if branch.get("mid_latent"):
+            where = (f"you asked for frame {branch_latent_info['branch_frame']}, which falls inside the next latent block, so the cut lands "
+                     f"{int(branch_latent_info['branch_frame']) - int(branch['kept_frames'])} frames earlier, at frame {branch['kept_frames']} (window {branch['window_no']})")
+        elif branch.get("fit"):
+            if int(branch_latent_info["branch_frame"]) != int(branch["kept_frames"]):
+                where = f"the requested frame {branch_latent_info['branch_frame']} rounds up to frame {branch['kept_frames']} (window {branch['window_no']})"
+            else:
+                where = f"on a latent block boundary (window {branch['window_no']})"
+        else:
+            where = f"on a latent block boundary (window {branch['window_no']})"
+        print(f"From latent: branching from {os.path.basename(branch_latent_info['path'])}: cut at frame {branch['kept_frames']} of {branch['total_frames']} ({where}{overrun_note}).")
+        # An all-latent-family job (LTX2 / Wan / LongCat / MiniMax H3)
+        # that writes latents produces an all-latent sidecar: the kept
+        # latents must be carried into it (a carried-window failure is
+        # fatal — without them the file could not be self-contained),
+        # and where the branch prefix itself is rejected the head window
+        # falls back to a fresh encode over the kept region's fresh
+        # decode (Step 2) instead of the source video — the job is
+        # refused only when that decode is impossible (Gate 1).
+        _all_latent_job = _is_all_latent_family(str(base_model_type or ""), model_def) and save_latents_enabled
+        # The kept windows/latents carry over into this job's sidecar
+        # (Phase 0) whatever the fit below decides; Phase 1 goes further
+        # and hands the kept latents to the model as a frozen prefix.
+        try:
+            branch_carried = latent_io.carry_over_latent_windows(branch_latent_info["sidecar_obj"], branch)
+        except Exception as exc:
+            if _all_latent_job:
+                raise gr.Error(f"From latent: the kept latents could not be carried into the job's latent file ({exc})")
+            print(f"From latent: the kept windows could not be carried into the job's latent file ({exc}); the new latent file holds the job's windows only.")
+        if branch_carried is not None:
+            _branch_vae_file = _branch_vae_sha = ""
+            # The identity is the VAE this job actually loads: the runtime
+            # model definition (the config-group selection merged in, the
+            # *Auto* Video VAE resolved from the transformer quantization —
+            # the same resolution the model load applies) and, for MiniMax
+            # H3, the X2 decoder when the upscaling replaces the Video VAE.
+            # The raw definition would compare the sidecar against the
+            # family default and refuse the branch on a VAE both runs use.
+            _job_model_def = _runtime_model_def(model_type, model_def, config)
+            if str(base_model_type or "").startswith("ltx2"):
+                _branch_vae_file, _branch_vae_sha = _ltx2_video_vae_identity(_job_model_def, base_model_type)
+            elif _is_wan_family(base_model_type, model_def):
+                _branch_vae_file, _branch_vae_sha = _wan_video_vae_identity(_job_model_def, base_model_type)
+            elif _is_longcat_family(base_model_type, model_def):
+                _branch_vae_file, _branch_vae_sha = _longcat_video_vae_identity(_job_model_def, base_model_type)
+            elif _is_h3_family(base_model_type, model_def):
+                _branch_vae_file, _branch_vae_sha = _h3_video_vae_identity(_job_model_def, base_model_type, vae_upsampling=new_model_vae_upsampling)
+            # Step 2: the kept region is a fresh decode of the source
+            # sidecar's kept windows, whenever the job's VAE can decode
+            # them on the job's canvas (the fit check's VAE-identity and
+            # latent-size tests): the output video's prefix, in place of a
+            # re-extraction of the source segment, for every latent-writing
+            # family.
+            # The decision is independent of the branch prefix's own
+            # acceptance (a rejected prefix still owns its kept region).
+            # The reason on the incompatible path names the setting at
+            # fault (the Gate 1 refusal message, below, is built from it).
+            branch_decode = None
+            _branch_decode_reason = None
+            try:
+                _kept_specs, _kept_frames, _kept_is_i2v = _branch_kept_window_specs(
+                    branch_latent_info["entry"], branch)
+                if _kept_specs is None:
+                    _branch_decode_reason = "the source latent file has no readable window for the branch point"
+                else:
+                    _decode_ok, _branch_decode_reason = _branch_kept_decode_compatible(
+                        branch_latent_info["entry"], _kept_specs, base_model_type, model_def,
+                        height=height, width=width, fit_canvas=fit_canvas,
+                        vae_file=_branch_vae_file, vae_sha256=_branch_vae_sha)
+                    if _decode_ok:
+                        branch_decode = (_kept_specs, _kept_frames, _kept_is_i2v)
+                        print(f"From latent: the pre-cut part of the output video is rebuilt from the kept windows of the source latent file; the source video is not used for this run.")
+                    else:
+                        print(f"From latent: the source latent file could not be decoded for this job ({_branch_decode_reason}); the run falls back to the classic continuation: the pre-cut part of the output video is copied from the source video, and the new branch is generated from the cut frame of the source video.")
+            except Exception as exc:
+                _branch_decode_reason = str(exc)
+                print(f"From latent: the source latent file could not be decoded for this job ({exc}); the run falls back to the classic continuation: the pre-cut part of the output video is copied from the source video, and the new branch is generated from the cut frame of the source video.")
+            try:
+                branch_prefix, prefix_error = _prepare_branch_prefix(
+                    branch_latent_info["entry"], branch, branch_carried,
+                    base_model_type=base_model_type,
+                    video_length=int(video_length or 0),
+                    height=height, width=width,
+                    fit_canvas=fit_canvas,
+                    audio_entry=latent_io.audio_latent_payload(branch_latent_info["sidecar_obj"]),
+                    vae_file=_branch_vae_file,
+                    vae_sha256=_branch_vae_sha,
+                    model_def=model_def,
+                )
+            except Exception as exc:
+                if _all_latent_job and branch_decode is None:
+                    # The prefix preparation failed on a structural error
+                    # (not a clean fit rejection) and the kept region
+                    # cannot be decoded either: there is no self-contained
+                    # fallback left, so the job fails (Gate 1). With a
+                    # decodable kept region the head window simply uses a
+                    # fresh encode instead (Step 2) and the job proceeds.
+                    # Without a companion video the "run the job without
+                    # the latent file" option is not one (the pixel
+                    # fallback needs a video to re-encode from), so it is
+                    # dropped from the message.
+                    _option = ", or run the job without the latent file" if (branch_latent_info or {}).get("video_present", True) else ""
+                    raise gr.Error(f"From latent: the branch prefix could not be prepared ({exc}) and the kept region cannot be decoded either; the branch is refused; change the setting{_option}.")
+                branch_prefix, prefix_error = None, str(exc)
+            if branch_prefix is not None and _is_h3_family(base_model_type, model_def):
+                # The MiniMax H3 branch prefix freezes the tensor's head, so
+                # the job modes that overwrite it (or that change its latent
+                # grid) reject it here, before the head window is reshaped
+                # around it (the H3 branch job has no pixel prefix to fall
+                # back to, unlike the other families).
+                _h3_branch_blockers = []
+                if int(guidance_phases or 1) > 1:
+                    # LTX2-style: the plain two-phase job carries the branch
+                    # prefix (the phase-1 stage runs on a bilinear
+                    # half-resolution form of the kept latents, the phase-2
+                    # stage on them as-is); only the tiled phase-2 variant,
+                    # whose per-tile loop cannot re-freeze the head yet,
+                    # still falls back to a fresh encode.
+                    from models.minimax_h3.pipeline import H3_PHASE_2_TILING_FLAG
+                    if H3_PHASE_2_TILING_FLAG in (video_prompt_type or ""):
+                        _h3_branch_blockers.append("two-phase with tiling")
+                if model_def.get("pdd", False):
+                    _h3_branch_blockers.append("PDD")
+                _h3_ref2va = base_model_type in ("minimax_h3_ref2va", "minimax_h3_ref2va_pruned", "minimax_h3_tts_ref2va_pruned", "viggle_animate")
+                if "2" in (audio_prompt_type or "") and not _h3_ref2va:
+                    _h3_branch_blockers.append("the control-video audio mode")
+                if "G" in (video_prompt_type or "") and float(denoising_strength or 1.0) < 1.0:
+                    _h3_branch_blockers.append("the control-video refinement mode")
+                if outpainting_dims is not None:
+                    _h3_branch_blockers.append("outpainting")
+                if _h3_branch_blockers:
+                    branch_prefix = None
+                    print("From latent: this model keeps the pre-cut section by re-compression, not bit-identically (the branch prefix is not supported with " + " and ".join(_h3_branch_blockers) + "); the new branch is generated after the cut.")
+            if branch_prefix is not None:
+                _branch_audio_latents = branch_prefix.get("prefix_audio_latents")
+                if _branch_audio_latents is None:
+                    _branch_audio_note = ""
+                elif isinstance(_branch_audio_latents, dict):
+                    # Phase 3 (MiniMax H3): the splice carries the batched
+                    # frozen prefix and the flat condition rows.
+                    _branch_audio_note = f" (+ its audio prefix, {int(_branch_audio_latents['batched'].shape[3])} latent frames)"
+                else:
+                    _branch_audio_note = f" (+ its audio prefix, {int(_branch_audio_latents.shape[2])} latent frames)"
+                print(f"From latent: the pre-cut latents ({int(branch_prefix['prefix_latents'].shape[1])} latents, {branch_prefix['assembly_overlap']} decoded frames){_branch_audio_note} are copied unchanged from the source latent file; the new branch is generated after the cut.")
+            else:
+                # prefix_error is empty when the rejection above already
+                # announced itself (e.g. the two-phase tiling blocker); only
+                # print the fallback line when it carries a reason of its own.
+                if prefix_error:
+                    print(f"From latent: this model keeps the pre-cut section by re-compression, not bit-identically ({prefix_error}); the new branch is generated after the cut.")
     fps = 1 if is_image else get_computed_fps(force_fps, base_model_type , video_guide, video_source )
     gen_state = {}
     frame_scheduler = None
-    first_window_available_overlap = estimate_first_window_overlap_frames(None if fake_start_image else image_start, video_source, keep_frames_video_source, fps)
+    first_window_available_overlap = estimate_first_window_overlap_frames(None if fake_start_image else image_start, video_source, parsed_keep_frames_video_source, fps)
     scheduler_supported = frame_scheduler_supported(model_type, model_def, image_mode)
     if not scheduler_supported and has_slash_commands(prompts):
         raise gr.Error("Prompt slash window commands require a video model with Sliding Window support.")
@@ -7891,11 +10358,8 @@ def generate_media(
     custom_frames_injection = model_def.get("custom_frames_injection", False) and "F" in video_prompt_type and image_refs is not None and len(image_refs) > 0
     if "K" in video_prompt_type: 
         any_background_ref = 2 if model_def.get("all_image_refs_are_background_ref", False) or custom_frames_injection else 1
-    fit_canvas = 2 if model_def.get("lock_resolutions", False) else server_config.get("fit_canvas", 0)  # a locked resolution is the output size: inputs are cropped to it
-    fit_crop = fit_canvas == 2
-    if fit_crop and outpainting_dims is not None:
-        fit_crop = False
-        fit_canvas = 0
+    # fit_canvas and fit_crop were resolved before the latent-branch prefix
+    # preparation above; the crop rule is the same one applied there.
 
     joint_pass = boost ==1 #and profile != 1 and profile != 3  
     
@@ -8034,6 +10498,233 @@ def generate_media(
     default_windows = [dict(window) for window in default_windows_template]
     if not scheduler_active:
         sliding_window = len(default_windows) > 1 or default_windows[0]["overlap_frames"] > 0
+    # Latent Branch (Phase 1): determinism + head-window plan. The prompt
+    # and seed are prefilled from the sidecar (only when the fields are
+    # empty / random) so the branch reuses the source job's conditioning,
+    # and the first window is reshaped into the branch head window.
+    if branch_prefix is not None and branch_latent_info is not None:
+        _prefill_seed = int(branch_latent_info.get("prefill_seed") or 0)
+        if seed is None and _prefill_seed > 0:
+            seed = _prefill_seed
+            print(f"From latent: the seed is prefilled from the source job ({seed}).")
+        _prefill_prompt = str(branch_latent_info.get("prefill_prompt") or "").strip()
+        if len(str(prompt or "").strip()) == 0 and len(_prefill_prompt) > 0:
+            prompt = _prefill_prompt
+            if scheduler_active:
+                if len(scheduled_windows_template) > 0:
+                    scheduled_windows_template[0]["prompt"] = _prefill_prompt
+                    frame_scheduler["prompts"] = [w.get("prompt", "") for w in scheduled_windows_template]
+            else:
+                prompts = [_prefill_prompt]
+        _head_discard = int(sliding_window_discard_last_frames) if sliding_window else 0
+        _prefix_latent_count = int(branch_prefix["prefix_latents"].shape[1])
+        # The sidecar's temporal layout: the frozen prefix decodes to
+        # 1 + stride * (P - 1) frames (4/1 for Wan/LongCat, 8/1 for LTX2).
+        _branch_stride = int((branch_latent_info.get("entry") or {}).get("latent_stride") or 4)
+        # The user's requested new frames (the scheduler replaced video_length
+        # with its own predicted total, so the request is read back from it).
+        _request = int(frame_scheduler.get("requested_total_frames") or current_video_length or video_length or 0) if scheduler_active else int(current_video_length or video_length or 0)
+        if not branch_prefix["cut_at_window_end"]:
+            # Case A: the head window is [the frozen prefix | the new
+            # latents that complete the containing window]; its frame
+            # count is fixed by the cut and the later windows keep the
+            # standard shape (the remaining ones make up the request).
+            _head_window = {
+                "prompt": "",
+                "output_frames": int(branch_prefix["head_output"] or 1),
+                "overlap_frames": int(branch_prefix["assembly_overlap"]),
+                "discard_last_frames": _head_discard,
+                "trim_last_frames": int(branch_prefix["head_trim_new"]),
+                "frame_num": int(branch_prefix["head_frame_num"]),
+                "new_shot": False,
+                "requested_output_frames": _request,
+            }
+            if scheduler_active:
+                if len(scheduled_windows_template) == 0:
+                    branch_prefix = None
+                else:
+                    _w0 = dict(scheduled_windows_template[0])
+                    _w0.update({
+                        "output_frames": int(branch_prefix["head_output"] or 1),
+                        "overlap_frames": int(branch_prefix["assembly_overlap"]),
+                        "discard_last_frames": _head_discard,
+                        "trim_last_frames": int(branch_prefix["head_trim_new"]),
+                        "frame_num": int(branch_prefix["head_frame_num"]),
+                        "new_shot": False,
+                        "requested_output_frames": _request,
+                    })
+                    scheduled_windows_template[0] = _w0
+                    # The request is the new segment after the kept region
+                    # (the classic continuation's reading of the frame
+                    # count): the head window's new frames consume the first
+                    # part of it, the remaining windows make up the rest,
+                    # and the kept region is on top of the request (zero
+                    # collapses the plan to the head window alone).
+                    _remaining = max(0, int(_request) - int(_w0["output_frames"]))
+                    if _remaining <= 0:
+                        scheduled_windows_template = [_w0]
+                    else:
+                        _sub = build_default_window_plan(
+                            total_frames=_remaining,
+                            window_size=sliding_window_size,
+                            default_overlap=default_reuse_frames,
+                            discard_last_frames=sliding_window_discard_last_frames,
+                            minimum=frames_minimum,
+                            step=frames_steps,
+                            frame_offset=frames_offset,
+                            overlap_offset=sliding_window_defaults.get("overlap_offset", 1),
+                            max_overlap=sliding_window_defaults.get("overlap_max"),
+                            first_window_overlap=default_reuse_frames,
+                            first_window_available_overlap=None,
+                            initial_shared_frames=0,
+                            preserve_exact_output_frames=model_def.get("image_end_frame_position", False),
+                            output_frame_policy=model_def.get("frame_scheduler_output_policy"),
+                        )
+                        scheduled_windows_template = [_w0] + _sub
+                    frame_scheduler["predicted_total_frames"] = int(branch_prefix["kept_frames"]) + sum(int(w.get("output_frames") or 0) for w in scheduled_windows_template)
+                    print(f"From latent: the window containing the cut contributes {int(_w0['output_frames'])} new frames of the requested {_request}; the remaining {max(0, len(scheduled_windows_template) - 1)} window(s) make up the rest (the kept {int(branch_prefix['kept_frames'])} frames are on top).")
+            elif any_sliding_window:
+                # The request is the new segment after the kept region
+                # (the classic continuation's reading of the frame count):
+                # the head window's new frames consume the first part of
+                # it, the remaining windows make up the rest, and the kept
+                # region is on top of the request (zero collapses the plan
+                # to the head window alone).
+                _remaining = max(0, int(_request) - int(_head_window["output_frames"]))
+                if _remaining <= 0:
+                    default_windows_template = [_head_window]
+                    print(f"From latent: the window containing the cut covers the whole request ({int(_request)} new frames) after the {int(branch_prefix['kept_frames'])} kept frames; no further windows.")
+                else:
+                    _sub = build_default_window_plan(
+                        total_frames=_remaining,
+                        window_size=sliding_window_size,
+                        default_overlap=default_reuse_frames,
+                        discard_last_frames=sliding_window_discard_last_frames,
+                        minimum=frames_minimum,
+                        step=frames_steps,
+                        frame_offset=frames_offset,
+                        overlap_offset=sliding_window_defaults.get("overlap_offset", 1),
+                        max_overlap=sliding_window_defaults.get("overlap_max"),
+                        first_window_overlap=default_reuse_frames,
+                        first_window_available_overlap=None,
+                        initial_shared_frames=0,
+                        preserve_exact_output_frames=model_def.get("image_end_frame_position", False),
+                        output_frame_policy=model_def.get("frame_scheduler_output_policy"),
+                    )
+                    default_windows_template = [_head_window] + _sub
+                    print(f"From latent: the window containing the cut contributes {int(_head_window['output_frames'])} new frames of the requested {_request}; the remaining {len(_sub)} window(s) make up the rest (the kept {int(branch_prefix['kept_frames'])} frames are on top).")
+            else:
+                default_windows_template = [_head_window]
+            default_windows = [dict(window) for window in default_windows_template]
+            if not scheduler_active:
+                sliding_window = len(default_windows) > 1 or default_windows[0]["overlap_frames"] > 0
+        else:
+            # Case B: the standard first window keeps its geometry; its
+            # overlap becomes the frozen prefix's decoded length, so its
+            # new share is the small sliver left in the window's budget
+            # (the fit check already required the window to hold the kept
+            # run). The request is the new segment after the kept region
+            # (the classic continuation's reading of the frame count), so
+            # the tail windows make up the rest of it.
+            def _branch_case_b_window(w, discard):
+                _w = dict(w)
+                _w["overlap_frames"] = int(branch_prefix["assembly_overlap"])
+                _w["discard_last_frames"] = discard if not any_sliding_window else int(_w.get("discard_last_frames") or 0)
+                _w["output_frames"] = max(1, int(_w.get("frame_num") or 0) - int(_w["overlap_frames"]) - int(_w["discard_last_frames"]))
+                _w["new_shot"] = False
+                return _w
+            def _branch_case_b_tail(w0):
+                _remaining = max(0, int(_request) - int(w0["output_frames"]))
+                if _remaining <= 0:
+                    return []
+                return build_default_window_plan(
+                    total_frames=_remaining,
+                    window_size=sliding_window_size,
+                    default_overlap=default_reuse_frames,
+                    discard_last_frames=sliding_window_discard_last_frames,
+                    minimum=frames_minimum,
+                    step=frames_steps,
+                    frame_offset=frames_offset,
+                    overlap_offset=sliding_window_defaults.get("overlap_offset", 1),
+                    max_overlap=sliding_window_defaults.get("overlap_max"),
+                    first_window_overlap=default_reuse_frames,
+                    first_window_available_overlap=None,
+                    initial_shared_frames=0,
+                    preserve_exact_output_frames=model_def.get("image_end_frame_position", False),
+                    output_frame_policy=model_def.get("frame_scheduler_output_policy"),
+                )
+            _case_b_ok = True
+            if _is_h3_family(base_model_type, model_def):
+                # The piecewise 5/17 H3 layout decodes the kept run to
+                # 17k + 5 frames, not a linear stride/offset length; the
+                # capped window decodes to its target length, which the
+                # fit check already folded into guide_frames.
+                _prefix_decoded_frames = int(branch_prefix["guide_frames"])
+            else:
+                _prefix_decoded_frames = 1 + _branch_stride * (_prefix_latent_count - 1)
+            if scheduler_active:
+                if len(scheduled_windows_template) == 0 or int(scheduled_windows_template[0].get("frame_num") or 0) < _prefix_decoded_frames:
+                    _case_b_ok = False
+                else:
+                    scheduled_windows_template[0] = _branch_case_b_window(scheduled_windows_template[0], _head_discard)
+                    scheduled_windows_template = [scheduled_windows_template[0]] + _branch_case_b_tail(scheduled_windows_template[0])
+                    frame_scheduler["predicted_total_frames"] = int(branch_prefix["kept_frames"]) + sum(int(w.get("output_frames") or 0) for w in scheduled_windows_template)
+            elif any_sliding_window:
+                if len(default_windows_template) == 0 or int(default_windows_template[0].get("frame_num") or 0) < _prefix_decoded_frames:
+                    _case_b_ok = False
+                else:
+                    default_windows_template[0] = _branch_case_b_window(default_windows_template[0], _head_discard)
+                    default_windows_template = [default_windows_template[0]] + _branch_case_b_tail(default_windows_template[0])
+            else:
+                if len(default_windows_template) == 0 or int(default_windows_template[0].get("frame_num") or 0) < _prefix_decoded_frames:
+                    _case_b_ok = False
+                else:
+                    default_windows_template[0] = _branch_case_b_window(default_windows_template[0], _head_discard)
+            if not _case_b_ok:
+                branch_prefix = None
+                print("From latent: the first window is too small to hold the carried prefix, so it uses a fresh encode for this run (the pre-cut part of the output video is rebuilt from the kept windows of the source latent file).")
+            else:
+                print(f"From latent: the first {_prefix_latent_count} latents of the first window keep the values of the source latent file unchanged (the branch point is the committed end of the contained window).")
+            default_windows = [dict(window) for window in default_windows_template]
+            if not scheduler_active:
+                sliding_window = len(default_windows) > 1 or default_windows[0]["overlap_frames"] > 0
+    # Gate 1: a latent-writing branch job whose prefix this run
+    # rejected still proceeds when the kept region is a fresh decode of
+    # the sidecar's kept windows (the branch_decode above): the head
+    # window uses a fresh encode and the job writes a self-contained
+    # file. It is refused only when the kept region genuinely cannot
+    # come from the latent file (the canvas / VAE tests failed, e.g. a
+    # canvas-changing mode or a file from another resolution / job):
+    # the message names the setting at fault and the honest option(s) —
+    # the pixel fallback (running the job without the latent file) only
+    # when a companion video is present to re-encode from.
+    if _all_latent_job and branch_carried is not None and branch_prefix is None and branch_decode is None:
+        _refusal_reason = str(prefix_error or "").strip() or str(_branch_decode_reason or "").strip() or "the branch cannot use the kept region of the source latent file"
+        _option = ", or run the job without the latent file" if (branch_latent_info or {}).get("video_present", True) else ""
+        raise gr.Error(f"From latent: {_refusal_reason} The kept region cannot be reproduced from the latent file with this job's settings, so the branch is refused; change the setting{_option}.")
+    # The plan receipt: what this job will produce, in one line. Printed
+    # only for jobs with a kept prefix (continuation and branch):
+    # "From latent:" when the kept region comes from the sidecar,
+    # "From video:" when it comes from the source video (including the
+    # latent-file fallback, whose reason the line above announced). The
+    # final length is the kept prefix plus the new frames the windows
+    # generate (the plan's output totals).
+    if video_source is not None or branch_prefix is not None or branch_decode is not None:
+        if branch_prefix is not None:
+            _plan_prefix = "From latent"
+            _plan_kept = int(branch_prefix["kept_frames"])
+            _plan_kept_part = f"kept {_plan_kept} (verbatim)"
+        elif branch_decode is not None:
+            _plan_prefix = "From latent"
+            _plan_kept = int(branch_decode[1])
+            _plan_kept_part = f"kept {_plan_kept} (from the latent file)"
+        else:
+            _plan_prefix = "From video"
+            _plan_kept = int(estimate_first_window_overlap_frames(None, video_source, parsed_keep_frames_video_source, fps))
+            _plan_kept_part = f"{_plan_kept} source"
+        _plan_windows = scheduled_windows_template if scheduler_active else default_windows_template
+        _plan_new = sum(int(w.get("output_frames") or 0) for w in _plan_windows)
+        print(f"{_plan_prefix}: plan: {_plan_kept_part} + {_plan_new} new ({len(_plan_windows)} window(s)) = {_plan_kept + _plan_new} frames")
     seed = set_seed(seed)
 
     torch.set_grad_enabled(False) 
@@ -8091,6 +10782,108 @@ def generate_media(
         audio_window_alignment = model_def.get("audio_window_alignment", False) and not (audio_only or is_image or audio_source is not None or control_audio_tracks or audio_processor_api.AUDIO_PROCESSOR_TYPE_SOUNDTRACK in postprocess_audio_meta["types"])
         external_audio_trim_ranges = []
         overlapped_latents = None
+        # Companion file accumulation for this repeat: each window appends its
+        # saved pre-decode latent so the all-latent sidecar always holds every
+        # window so far (rebuilt after every window).
+        # The branch job's sidecar starts from the source sidecar's kept
+        # windows (they are part of the final video, verbatim); the job's
+        # own windows follow (the branch window is the sidecar's window K,
+        # not a new window 1). With a rejected prefix (Step 2, case 2) the
+        # containing window's kept portion is not part of any generated
+        # window, so the cut window block — the window's full latents with
+        # the committed range trimmed to end at the cut — carries it into
+        # the sidecar as a stand-alone window (the file stays
+        # self-contained: its decode is the kept region's fresh decode).
+        latent_windows = [dict(_block) for _block in (branch_carried["video_windows"] if branch_carried is not None else [])]
+        # Phase 3 (MiniMax H3): when the branch prefix is accepted, the
+        # containing window's cut block (the kept latents with the decoded
+        # run capped at the cut - the full window itself for a window-end
+        # cut) rides into the sidecar as its own stand-alone block, which
+        # the sidecar writer inserts ahead of the head window: the kept
+        # region commits from its own fresh decode, and the head window's
+        # recorded bookkeeping describes the seam the written video actually
+        # carries (a frozen head drops the kept latents' decoded length from
+        # its own decoded output; a head window the pipeline rejected at its
+        # grid check is replaced by the containing window, its fresh
+        # decoded region not being part of the written video).
+        _h3_cut_video_block = _h3_cut_audio_block = None
+        if (_is_h3_family(str(base_model_type or ""), model_def)
+                and branch_prefix is not None and branch_carried is not None and branch_latent_info is not None):
+            try:
+                _h3_cut_video_block = latent_io.branch_cut_window_block(branch_latent_info["sidecar_obj"], branch_latent_info["branch"])
+            except Exception:
+                _h3_cut_video_block = None
+            try:
+                _h3_cut_audio_block = latent_io.branch_cut_audio_window_block(branch_latent_info["sidecar_obj"], branch_latent_info["branch"])
+            except Exception:
+                _h3_cut_audio_block = None
+        _cut_audio_block = None
+        if branch_carried is not None and branch_prefix is None and branch_decode is not None:
+            try:
+                _cut_block = latent_io.branch_cut_window_block(branch_latent_info["sidecar_obj"], branch_latent_info["branch"])
+            except Exception as exc:
+                raise gr.Error(f"From latent: the kept region's window could not be carried into the job's latent file ({exc})")
+            if _cut_block is not None:
+                latent_windows.append(dict(_cut_block))
+                # The rejected prefix never freezes the containing
+                # window's audio either (the fresh head window generates
+                # its own), so the cut block carries it into the sidecar
+                # the same way it carries the video: the window's own
+                # pre-decode audio latents sliced at the cut. Without it
+                # the sidecar's audio entry skips the kept region, whose
+                # decode is silence (or a track shifted by one window).
+                try:
+                    _cut_audio_block = latent_io.branch_cut_audio_window_block(branch_latent_info["sidecar_obj"], branch_latent_info["branch"])
+                except Exception as exc:
+                    print(f"Latent save: the kept region's audio could not be carried into the job's latent file ({exc}); the audio of the latent file starts at the branch window.")
+        latent_audio_windows = []
+        if branch_carried is not None and branch_latent_info is not None:
+            _src_audio = latent_io.audio_latent_payload(branch_latent_info["sidecar_obj"])
+            if _src_audio is not None:
+                # The carried windows' audio (1..K-1) and, for a rejected
+                # prefix, the cut block's audio (the containing window's
+                # own audio sliced at the cut) go into one payload: one
+                # window per sidecar position, in order. For an accepted
+                # MiniMax H3 branch the cut block's audio rides here as
+                # well: the kept region commits its own audio ahead of the
+                # head window, the way its video does.
+                _carried_audio = branch_carried.get("audio_windows") or []
+                _audio_latents = [_block["latents"] for _block in _carried_audio]
+                _audio_metas = [{key: _block.get(key) for key in ("window_no", "start_sample", "samples") if key in _block} for _block in _carried_audio]
+                _cut_audio = _cut_audio_block if _cut_audio_block is not None else _h3_cut_audio_block
+                if _cut_audio is not None:
+                    _audio_latents.append(_cut_audio["latents"])
+                    _audio_metas.append({key: _cut_audio[key] for key in ("start_sample", "samples")})
+                if _audio_latents:
+                    try:
+                        latent_audio_windows.append(latent_io.build_audio_latent_payload(
+                            _audio_latents,
+                            _audio_metas,
+                            app_version=WanGP_version,
+                            model_type=str(_src_audio.get("model_type") or ""),
+                            base_model_type=str(_src_audio.get("base_model_type") or ""),
+                            model_filename=str(_src_audio.get("model_filename") or ""),
+                            loras=list(_src_audio.get("loras") or []),
+                            audio_vae_file=str(_src_audio.get("audio_vae_file") or ""),
+                            audio_vae_sha256=str(_src_audio.get("audio_vae_sha256") or ""),
+                            audio_vae_dtype=str(_src_audio.get("audio_vae_dtype") or ""),
+                            sample_rate=int(_src_audio.get("sample_rate") or 0),
+                            channels=int(_src_audio.get("channels") or 0),
+                            samples=int(_src_audio.get("samples") or 0),
+                            seed=int(_src_audio.get("seed") or 0),
+                            prompt=str(_src_audio.get("prompt") or ""),
+                            denoising_strength=float(_src_audio.get("denoising_strength") or 1.0),
+                            steps=int(_src_audio.get("steps") or 0),
+                            # The vocoder name and the mel-bins count are part of
+                            # the audio identity (the decode job reshapes the
+                            # stored latent with mel_bins); the source sidecar
+                            # records them, so the carried entry must keep them.
+                            vocoder_file=str(_src_audio.get("vocoder_file") or ""),
+                            mel_bins=int(_src_audio.get("mel_bins") or 0),
+                        )[latent_io.LATENT_FORMAT_ID_AUDIO])
+                    except Exception as exc:
+                        print(f"Latent save: the carried audio windows could not be re-stacked ({exc}); the audio of the latent file starts at the branch window.")
+        latent_prefix_meta = {}
         pre_video_guide_is_hdr = False
         context_scale = None
         window_no = 0
@@ -8233,6 +11026,11 @@ def generate_media(
             enable_RIFLEx = model_def.get("riflex", False) and image_mode == 0 and (RIFLEx_setting == 0 and current_video_length > (6 * fps + 1) or RIFLEx_setting == 1)
             return_latent_slice = None 
             frames_relative_positions_list = []
+            window_prefix_frames = 0 # source prefix frames prepended to this window's decoded pixels (window 1 only)
+            window_prefix_is_image = False # the prefix came from the start image, not a source video
+            window_prefix_fit_canvas = None # fit_canvas value used to preprocess that prefix (the loop variable is later reset)
+            window_prefix_input_is_hdr = False # HDR state of the source video the prefix was read from
+            trim_first_frames = 0 # head trim applied to this window's decoded sample when no frames are overlapped
             tail_trim_frames = discard_last_frames + automatic_trim_last_frames
             if next_overlap_frames > 0:
                 tail_trim_latents = tail_trim_frames // latent_size
@@ -8244,7 +11042,56 @@ def generate_media(
             if hasattr(model_handler, "custom_prompt_preprocess"):
                 prompt = model_handler.custom_prompt_preprocess(**locals())
             image_start_tensor = image_end_tensor = None
-            if window_no == 1 and (video_source is not None or (image_start is not None and not new_shot)):
+            _h3_branch_src_indep = (window_no == 1 and branch_prefix is not None
+                                    and _is_h3_family(str(base_model_type or ""), model_def))
+            if _h3_branch_src_indep:
+                # H3 branch (D3): the kept region is a fresh decode of the
+                # source sidecar's kept windows (the pipeline returns it as
+                # decoded_prefix for this window), so the source video is not
+                # re-extracted (the input video is optional for an H3 branch).
+                # The assembly bookkeeping comes from the plan; prefix_video is
+                # set once the pipeline returns the decoded prefix (below), and
+                # the model's own conditioning comes from the sidecar latents,
+                # not from any guide pixels.
+                source_video_overlap_frames_count = max(1, int(branch_prefix["assembly_overlap"]))
+                source_video_frames_count = int(branch_prefix["kept_frames"])
+                window_prefix_is_image = False
+                window_prefix_fit_canvas = sample_fit_canvas
+                window_prefix_frames = int(branch_prefix["kept_frames"])
+                window_prefix_input_is_hdr = False
+                guide_start_frame = int(branch_prefix["kept_frames"])
+                if sample_fit_canvas is not None:
+                    _kept_entry = (branch_latent_info or {}).get("entry") or {}
+                    if int(_kept_entry.get("height") or 0) > 0 and int(_kept_entry.get("width") or 0) > 0:
+                        image_size = (int(_kept_entry.get("height")), int(_kept_entry.get("width")))
+                    sample_fit_canvas = None
+            elif (window_no == 1 and image_start is None
+                    and len(str(video_source or "").strip()) == 0
+                    and (branch_prefix is not None or branch_decode is not None)):
+                # A branch without a companion video (any latent-writing
+                # family): the same source-independent bookkeeping as the
+                # H3 block - the prefix is the decoded kept region (the
+                # pipeline returns it as decoded_prefix for this window,
+                # below) and there is no video whose pixels the assembly
+                # could re-extract, so the window's leading overlap is the
+                # decoded prefix's length: the accepted prefix's frozen
+                # latents, or the classic one-frame conditioning overlap
+                # for a rejected prefix's fresh-encode head (the
+                # with-video case does the same through the pixel path).
+                _nov_kept = int(branch_latent_info["branch"]["kept_frames"])
+                source_video_overlap_frames_count = (max(1, int(branch_prefix["assembly_overlap"]))
+                                                     if branch_prefix is not None else 1)
+                source_video_frames_count = _nov_kept
+                window_prefix_is_image = False
+                window_prefix_fit_canvas = sample_fit_canvas
+                window_prefix_input_is_hdr = False
+                guide_start_frame = _nov_kept
+                if sample_fit_canvas is not None:
+                    _kept_entry = (branch_latent_info or {}).get("entry") or {}
+                    if int(_kept_entry.get("height") or 0) > 0 and int(_kept_entry.get("width") or 0) > 0:
+                        image_size = (int(_kept_entry.get("height")), int(_kept_entry.get("width")))
+                    sample_fit_canvas = None
+            elif window_no == 1 and (video_source is not None or (image_start is not None and not new_shot)):
                 if image_start is not None:
                     image_start_tensor, new_height, new_width = calculate_dimensions_and_resize_image(image_start, height, width, sample_fit_canvas, fit_crop, block_size = block_size)
                     if fit_crop: refresh_preview["image_start"] = image_start_tensor 
@@ -8268,6 +11115,36 @@ def generate_media(
                 pre_video_frame = convert_tensor_to_image(prefix_video[:, -1])
                 source_video_overlap_frames_count = source_overlap if video_source is not None else pre_video_guide.shape[1]
                 source_video_frames_count = prefix_video.shape[1]
+                if branch_prefix is not None and window_no == 1 and video_source is not None and prefix_video is not None:
+                    # The head window's frozen prefix: the sample's leading
+                    # frames decode the sidecar's kept latents (not the
+                    # re-encoded guide tail), so the assembly trims that
+                    # decoded length and the model is handed the exact
+                    # sidecar values instead of the guide pixels. The guide
+                    # pixels span the whole frozen run (case B decodes more
+                    # than the trim) so the model's conditioning mask covers
+                    # it exactly like a standard i2v head. The value stays
+                    # on the sidecar's own grid (MiniMax H3: 17k + 5, not
+                    # the model's normalized 17k + 1 overlap) and passes
+                    # through un-normalized; each family's model side
+                    # applies its own grid rules to it.
+                    source_video_overlap_frames_count = max(1, int(branch_prefix["assembly_overlap"]))
+                    _branch_guide_len = max(source_video_overlap_frames_count, int(branch_prefix["guide_frames"]))
+                    if prefix_video.shape[1] >= _branch_guide_len:
+                        pre_video_guide = prefix_video[:, -_branch_guide_len:].float()
+                        if prefix_video_is_hdr:
+                            pre_video_guide_is_hdr = True
+                        else:
+                            pre_video_guide = pre_video_guide.div_(127.5).sub_(1.)
+                # Remember how the prefix was built so the latent companion file
+                # can re-extract it at decode time: the prefix frames are
+                # prepended to window 1's decoded sample in the output video
+                # (the start image for i2v jobs, the source video frames for
+                # continuation jobs), so they must be part of the sidecar.
+                window_prefix_is_image = video_source is None
+                window_prefix_fit_canvas = sample_fit_canvas
+                window_prefix_frames = int(prefix_video.shape[1])
+                window_prefix_input_is_hdr = bool(locals().get("prefix_video_is_hdr", False))
 
                 if sample_fit_canvas != None: 
                     image_size = (pre_video_guide if pre_video_guide is not None else prefix_video).shape[-2:]
@@ -8630,6 +11507,12 @@ def generate_media(
                 input_video_for_model = None if new_shot else pre_video_guide
                 input_video_is_hdr = pre_video_guide_is_hdr
                 prefix_frames_count = 0 if new_shot else source_video_overlap_frames_count if window_no <= 1 else reuse_frames
+                if branch_prefix is not None and window_no == 1:
+                    # The frozen prefix may span more (case B: the whole
+                    # contained window) or fewer frames than the sample's
+                    # head trim; the model's conditioning region follows the
+                    # prefix's own decoded length.
+                    prefix_frames_count = int(branch_prefix["guide_frames"])
                 prefix_video_for_model = None if model_def.get("joyai_echo", False) or str(base_model_type).startswith("ltx2") else prefix_video
                 if new_shot:
                     prefix_video_for_model = None
@@ -8651,6 +11534,48 @@ def generate_media(
                 overridden_inputs = None
                 if vae_upsampler_handler is not None and vae_upsampler_session is None:
                     vae_upsampler_session = upsampler_api.prepare_vae_upsampler(vae_upsampler_handler, spatial_upsampling, send_cmd=send_cmd, process_files=process_files_def, init_pipe=partial(init_pipe, output_type=upsampler_api.profile_type_for_handler(vae_upsampler_handler), extension=upsampler_api), profile=compute_profile(override_profile, upsampler_api.profile_type_for_handler(vae_upsampler_handler)), attention_mode=attention_mode, parameter_values=parameter_ui.runtime_values(spatial_postprocessing_parameters, postprocessing_reference_images))
+                latent_gen_kwargs = {}
+                if image_mode == 0:
+                    latent_gen_kwargs["app_version"] = WanGP_version
+                    latent_gen_kwargs["latent_model_type"] = model_type
+                    if save_latents_enabled:
+                        latent_gen_kwargs["save_latents"] = True
+                if branch_prefix is not None and window_no == 1:
+                    # Phase 1: the head window takes the sidecar's kept
+                    # latents verbatim as its frozen prefix (the model
+                    # re-freezes them at every denoise step); the tail is
+                    # the only part that gets re-denoised.
+                    latent_gen_kwargs["prefix_latents"] = branch_prefix["prefix_latents"]
+                    if branch_prefix.get("prefix_audio_latents") is not None:
+                        # Phase 2 (LTX2): the head window's audio prefix is
+                        # the sidecar's kept audio latents (sliced by time
+                        # ratio), so the model skips the waveform re-encode.
+                        latent_gen_kwargs["prefix_audio_latents"] = branch_prefix["prefix_audio_latents"]
+                if branch_decode is not None and window_no == 1:
+                    # Step 2: the kept region is a fresh decode of the
+                    # source sidecar's kept windows (the pipeline returns
+                    # it as decoded_prefix; the job uses it as the output
+                    # video's prefix). Independent of the branch prefix
+                    # acceptance above: a rejected prefix still decodes.
+                    _kept_specs, _kept_frames, _kept_is_i2v = branch_decode
+                    latent_gen_kwargs["prefix_kept_windows"] = _kept_specs
+                    latent_gen_kwargs["prefix_kept_frames"] = _kept_frames
+                    latent_gen_kwargs["prefix_is_i2v"] = _kept_is_i2v
+                    if _is_ltx2_family(str(base_model_type or ""), model_def) and _kept_is_i2v:
+                        # The LTX2 all-latent i2v sidecar splices its
+                        # embedded start image into frame 0 of the decode
+                        # (content, not a pointer): hand it over in the
+                        # decoded frames' pixel space (the same conversion
+                        # the Latent Decode job applies).
+                        _src_entry = (branch_latent_info or {}).get("entry") or {}
+                        _i2v_image = latent_io.entry_i2v_image(_src_entry)
+                        if _i2v_image is not None:
+                            _img_frames = _ltx2_i2v_prefix_to_frames_space(
+                                _src_entry, _i2v_image, bool(_src_entry.get("is_hdr")),
+                                "cuda" if torch.cuda.is_available() else "cpu")
+                            if _img_frames is not None:
+                                latent_gen_kwargs["prefix_i2v_image_frames"] = _img_frames
+
                 samples = call_with_default_device(model_def, model_type, wan_model.generate,
                     input_prompt = prompt,
                     alt_prompt = current_alt_prompt,
@@ -8777,6 +11702,7 @@ def generate_media(
                     gen_cache=gen_cache,
                     vae_upsampler=vae_upsampler_session,
                     save_masks=args.save_masks,
+                    **latent_gen_kwargs,
                 )
                 if tiny_preview is not None:
                     tiny_preview.close()
@@ -8844,13 +11770,16 @@ def generate_media(
             side_files = {}
             meshes = splats = None
             post_decode_pre_trim = 0
+            branch_decoded_prefix = None
             output_audio_sampling_rate= audio_sampling_rate
             sample_is_hdr = False
+            latent_file_obj = None
             if samples != None:
                 if isinstance(samples, dict):
                     sample_is_hdr = samples.get("hdr", False)
                     overlapped_latents = samples.get("latent_slice", None)
                     side_files = samples.get("side_files", {})
+                    latent_file_obj = samples.get("latent_file_obj", None)
                     generated_audio = samples.get("audio", generated_audio)
                     overridden_inputs = samples.get("overridden_inputs", None)
                     output_audio_sampling_rate = samples.get("audio_sampling_rate", audio_sampling_rate)
@@ -8863,6 +11792,12 @@ def generate_media(
                     post_decode_pre_trim = samples.get("post_decode_pre_trim", 0) 
                     meshes = samples.get("meshes", None)
                     splats = samples.get("splats", None)
+                    # Step 2: the branch job's kept region (a fresh decode of
+                    # the source sidecar's kept windows — the same
+                    # reconstruction the Latent Decode job performs) is
+                    # returned by the pipeline so the job uses it as the
+                    # output video's prefix (source independence).
+                    branch_decoded_prefix = samples.get("decoded_prefix", None)
                     samples = samples.get("x", None)
 
                 if samples is not None and (audio_only or is_image or sample_is_hdr):
@@ -8881,6 +11816,14 @@ def generate_media(
             else:
                 sample = samples
                 samples = None
+                # Step 2: use the decoded prefix (a fresh decode of the
+                # source sidecar's kept windows — the same reconstruction
+                # the Latent Decode job performs) as the output video's
+                # prefix (source independence) instead of the re-extracted
+                # source segment, for every latent-writing family (a blocked
+                # prefix included: its kept region is its own decode).
+                if window_no == 1 and branch_decoded_prefix is not None:
+                    prefix_video = branch_decoded_prefix
                 stop_current_sample = stop_sample_scheduled or (not (is_image or audio_only) and sample.shape[1] < current_video_length)
                 # if True: # for testing
                 #     torch.save(sample, "output.pt")
@@ -8960,6 +11903,22 @@ def generate_media(
                             prefix_video = resize_lanczos_spatial(prefix_video, None, size=sample.shape[-2:])
                         # remove sliding window overlapped frames at the beginning of the generation
                         sample = torch.cat([ prefix_video, sample[: , source_video_overlap_frames_count:]], dim = 1)
+                    else:
+                        # remove source video overlapped frames at the beginning of the generation if there is only a start frame
+                        if (window_prefix_is_image and not fake_start_image
+                                and not sample_is_hdr
+                                and int(source_video_overlap_frames_count) == 1
+                                and _is_ltx2_family(str(base_model_type or ""), model_def)):
+                            # LTX2 i2v: the original output's frame 0 is the
+                            # preprocessed start image, not the decoded VAE
+                            # round-trip of it: splice the exact image in and
+                            # drop the decoded first frame (the all-latent
+                            # sidecar records the same splice -- head trim
+                            # +1 plus the embedded image -- so the latent
+                            # decode reproduces the written video).
+                            sample = torch.cat([prefix_video[:, :1], sample[:, 1:]], dim = 1)
+                        else:
+                            sample = torch.cat([ prefix_video[:, :-source_video_overlap_frames_count], sample], dim = 1)
                     prefix_video = None
                     guide_start_frame -= source_video_overlap_frames_count 
                     if generated_audio is not None:
@@ -9219,7 +12178,12 @@ def generate_media(
                         new_audio_from_start=new_audio_added_from_audio_start,
                         source_audio_metadata=source_audio_metadata,
                         audio_codec_key=server_config.get("audio_output_codec", "aac_128"),
-                        pad_audio_to_video=audio_window_alignment and full_generated_audio is not None,
+                        # A branch job's generated audio can end a frame or
+                        # two short of its video (the window-boundary audio
+                        # accounting rounds down); padding it instead lets
+                        # -shortest end on the video, so no written frame is
+                        # dropped (the file ends on the video's last frame).
+                        pad_audio_to_video=(audio_window_alignment and full_generated_audio is not None) or branch_prefix is not None,
                         verbose=verbose_level >= 2,
                         audio_tail_seconds=saved_audio_tail_seconds,
                     )
@@ -9273,9 +12237,111 @@ def generate_media(
                 # if sample_is_image: configs["is_image"] = True
                 keep_intermediate_windows = server_config.get("keep_intermediate_sliding_windows", 1)
                 record_file_metadata(video_path, configs, is_image, audio_only, gen, embedded_images=embedded_images, replace_last_file=sliding_window and window_no > 1 and not keep_intermediate_windows, notify_generation=not sliding_window or keep_intermediate_windows or window_no == total_windows, output_role="intermediate" if sliding_window and window_no < total_windows else "final")
-                output_side_files = process_side_files(video_path[0] if isinstance(video_path, list) else video_path, side_files, return_files=api_return_side_files)
+                media_path = video_path[0] if isinstance(video_path, list) else video_path
+                # The latent companion file is always written to disk (it is the
+                # handoff for Latent Decode) but never echoed in API responses,
+                # so it is kept out of the side-files dict.
+                # The all-latent sidecar is rebuilt from the accumulated window
+                # blocks after every window, so it is always decodable even
+                # mid-run; it is the file every latent-writing job produces.
+                latent_side_bytes = None
+                if latent_file_obj is not None:
+                    latent_entry = latent_file_obj.get(latent_io.LATENT_FORMAT_ID)
+                    latent_audio_entry = latent_file_obj.get(latent_io.LATENT_FORMAT_ID_AUDIO)
+                    if latent_entry is not None:
+                        # The all-latent writer: the sidecar is the sole
+                        # content source of the video, so every latent-writing
+                        # job writes the all-latent file. That is a fresh job
+                        # (no source video; an i2v start image is inside the
+                        # first window's latents, not an external prefix) or a
+                        # branch job — the latter whether its prefix was
+                        # accepted (the kept latents are carried) or rejected
+                        # with a kept-region decode (branch_decode set: the
+                        # head window is a fresh encode over the decoded
+                        # prefix, recorded like any i2v head, and the cut
+                        # window's kept portion rides in the accumulator as
+                        # its own stand-alone block, so the sidecar's
+                        # committed total matches the written video and the
+                        # file stays self-contained). A branch whose kept
+                        # region cannot come from the latents is refused
+                        # before generation (Gate 1), so it never reaches this
+                        # decision (with Save Latents on, a continuation is
+                        # turned into a branch before this point).
+                        # ``splices_exact_image`` is the only family
+                        # difference: True for LTX2 (the exact start image is
+                        # spliced into frame 0 and embedded) and False for
+                        # Wan / LongCat / MiniMax H3 (the decoded latent frame
+                        # is kept, no image block).
+                        _all_latent_splices = _is_ltx2_family(str(base_model_type or ""), model_def)
+                        # The i2v start image is embedded, the trims are
+                        # recorded per window, and the committed length
+                        # is validated against the written video. A
+                        # branch whose prefix this run rejected
+                        # (branch_prefix None) propagates the source
+                        # sidecar's embedded start image the same way
+                        # an accepted branch does: its kept region's
+                        # fresh decode spliced the image into frame 0
+                        # of the written video, so the new sidecar
+                        # embeds the block for the decode to splice
+                        # back in (the block only exists on LTX2
+                        # i2v-derived sidecars — None for every other
+                        # family, where the writer ignores it).
+                        _branch_carried_image = None
+                        if branch_prefix is None and branch_decode is not None:
+                            _branch_carried_image = (branch_carried or {}).get("i2v_image")
+                            if not (isinstance(_branch_carried_image, dict)
+                                    and str(_branch_carried_image.get("kind")) == "image_png"
+                                    and isinstance(_branch_carried_image.get("data"), (bytes, bytearray))
+                                    and len(_branch_carried_image["data"]) > 0):
+                                _branch_carried_image = None
+                            else:
+                                _branch_carried_image = {"kind": "image_png", "data": bytes(_branch_carried_image["data"])}
+                        # The sidecar's canvas: the generation's out_width/out_height
+                        # are not in scope in this block (the post-processing paths
+                        # rewrite them), so derive the canvas from the latent grid the
+                        # entry carries and the family's spatial factor (8 for the
+                        # Wan-VAE families, 16 for the 5B Wan 2.2 VAE and MiniMax H3,
+                        # 32 for LTX2 — the _BRANCH_PREFIX_LAYOUTS table).
+                        _latent_layout = _BRANCH_PREFIX_LAYOUTS.get(str(base_model_type or ""))
+                        _latent_canvas_factor = int(_latent_layout[2] if _latent_layout else 0)
+                        _latent_shape = [int(u) for u in (latent_entry.get("shape") or [])]
+                        if len(_latent_shape) < 4:
+                            _latent_shape = list(latent_io.payload_latents(latent_entry).shape)
+                        _latent_grid_ok = len(_latent_shape) >= 4 and _latent_canvas_factor > 0
+                        _latent_width = int(_latent_shape[-1] * _latent_canvas_factor) if _latent_grid_ok else 0
+                        _latent_height = int(_latent_shape[-2] * _latent_canvas_factor) if _latent_grid_ok else 0
+                        latent_side_bytes = _all_latent_sidecar(
+                            latent_entry, latent_audio_entry, window_no, latent_windows, latent_audio_windows,
+                            branch_prefix=branch_prefix,
+                            branch_carried_image=_branch_carried_image,
+                            sliding_window=sliding_window,
+                            reuse_frames=reuse_frames,
+                            post_decode_pre_trim=post_decode_pre_trim,
+                            trim_first_frames=trim_first_frames,
+                            source_video_overlap_frames_count=source_video_overlap_frames_count,
+                            discard_last_frames=discard_last_frames,
+                            automatic_trim_last_frames=automatic_trim_last_frames,
+                            window_prefix_is_image=window_prefix_is_image,
+                            fake_start_image=fake_start_image,
+                            sample_is_hdr=sample_is_hdr,
+                            image_start_tensor=image_start_tensor,
+                            written_frame_count=frames_already_processed_count,
+                            model_def=model_def,
+                            model_type=str(model_type or ""),
+                            base_model_type=str(base_model_type or ""),
+                            width=_latent_width,
+                            height=_latent_height,
+                            splices_exact_image=_all_latent_splices,
+                            branch_cut_video_block=_h3_cut_video_block,
+                            branch_cut_audio_block=_h3_cut_audio_block)
+                else:
+                    latent_side_bytes = side_files.pop(latent_io.LATENT_SIDECAR_SUFFIX, None) if isinstance(side_files, dict) else None
+                if latent_side_bytes is not None:
+                    latent_io.write_latent_file_bytes(latent_io.latent_sidecar_path(media_path), latent_side_bytes)
+                    print(f"Latent file saved to Path: {os.path.abspath(latent_io.latent_sidecar_path(media_path))}", flush=True)
+                output_side_files = process_side_files(media_path, side_files, return_files=api_return_side_files)
                 for side_name in output_side_files:  # a saved world file joins the Worlds gallery
-                    side_path = os.path.join(os.path.dirname(video_path[0] if isinstance(video_path, list) else video_path), side_name)
+                    side_path = os.path.join(os.path.dirname(media_path), side_name)
                     if has_world_file_extension(side_name) and os.path.isfile(side_path):
                         record_file_metadata(side_path, configs, False, False, gen, notify_generation=False, record_notification=False)
                 if api_return_video_uint8 or api_return_audio or return_flashvsr_continue_cache or (api_return_side_files and output_side_files):
@@ -9656,6 +12722,15 @@ def validate_task(task, state, skip_validate_settings=False):
                 from postprocessing.film_grain import is_film_grain_enabled
                 if len(temporal_upsampling) == 0 and len(spatial_upsampling) == 0 and not is_film_grain_enabled(inputs.get("film_grain_intensity", 0)):
                     validation_error = "You must choose at least one Post Processing Method"
+        elif mode == "edit_latent":
+            video_source = inputs.get("video_source")
+            validation_error = ""
+            if not media_source_exists(video_source):
+                validation_error = "Selected video or image file is missing"
+            elif not has_video_file_extension(video_source):
+                validation_error = "Latent decoding is only available with Videos"
+            elif latent_io.find_latent_file(video_source) is None:
+                validation_error = "No saved latent companion file was found next to this video. Latent decoding only works on media generated with the 'Save Latents' option enabled."
         elif mode == "edit_remux":
             video_source = inputs.get("video_source")
             postprocess_audio = audio_processor_api.normalize_method(inputs.get("postprocess_audio", "") or "")
@@ -9707,6 +12782,9 @@ def validate_task(task, state, skip_validate_settings=False):
     if override_inputs is None:
         return None, validation_error or "Task failed validation."
     inputs.update(override_inputs)
+    branch_error = validate_latent_branch_task(state, model_type, inputs)
+    if branch_error:
+        return None, branch_error
     return inputs, ""
 
 
@@ -11354,6 +14432,9 @@ def save_inputs(
             model_mode,
             video_source,
             keep_frames_video_source,
+            branch_from_latent,
+            branch_fit_latent,
+            branch_latent_file,
               input_video_strength,
               video_guide_outpainting,
               video_guide_outpainting_ratio,
@@ -11442,6 +14523,7 @@ def save_inputs(
             self_refiner_f_uncertainty,
             self_refiner_certain_percentage,
             output_filename,
+            save_latents_choice,
             config,
             mode,
             state,
@@ -11810,14 +14892,408 @@ def refresh_audio_prompt_type_sources(state, audio_prompt_type, audio_prompt_typ
         gr.update(visible=force_control_video_trim_visible(model_def, image_mode, video_prompt_type, audio_prompt_type)),
     )
 
-def refresh_image_prompt_type_radio(state, image_prompt_type, image_prompt_type_radio, video_prompt_type):
+def refresh_image_prompt_type_radio(state, image_prompt_type, image_prompt_type_radio, video_prompt_type, video_source, branch_from_latent, branch_fit_latent, branch_latent_file):
     image_prompt_type = del_in_sequence(image_prompt_type, "VLTS")
     image_prompt_type = add_to_sequence(image_prompt_type, image_prompt_type_radio)
     any_video_source = len(filter_letters(image_prompt_type, "VL"))>0
     model_def = get_model_def(get_state_model_type(state))
     end_visible = end_frames_option_visible(model_def, image_prompt_type)
     input_strength_visible = input_video_strength_visible(model_def, image_prompt_type, video_prompt_type)
-    return image_prompt_type, gr.update(visible = "S" in image_prompt_type ), gr.update(visible = end_visible and ("E" in image_prompt_type) ), gr.update(visible = "V" in image_prompt_type) , gr.update(visible = input_strength_visible), gr.update(visible = any_video_source), gr.update(visible = end_visible)
+    # The branch mode persists across every Location change: the latent
+    # file works with either Continue location, and the mode / file the
+    # user picked are not a Location setting — so the components' values
+    # are never written here, only their visibility and labels (re-writing the
+    # checkbox's value or clearing the file would silently lose the
+    # picked mode, and the next validation would then run the classic
+    # video-to-sidecar flow on a different file than the one the user
+    # picked). Two conditions hide the components: outside the Continue
+    # domain the mode sleeps, and for models whose family does not write
+    # latent files it is dormant (hidden, value preserved) — the job
+    # pipeline (queue validation, the job-start re-resolution, the job
+    # loop, the implicit Save Latents conversion) is gated on the same
+    # conditions, so a job started there is neither refused by nor
+    # affected by the hidden mode, and the setup is intact when the user
+    # comes back. The video label goes back to the legacy one whenever
+    # the mode does not apply.
+    branch_available = any_video_source and _is_all_latent_family(get_base_model_type(get_state_model_type(state)), model_def)
+    branch_on = branch_available and bool(branch_from_latent)
+    # The label bases switch with the value's origin (the "Detected..."
+    # variant names the value the app itself selected): this handler never
+    # writes values, so it only reads the origin markers the branch
+    # handlers maintain.
+    _vsrc = str(video_source or "").strip()
+    _video_auto = isinstance(state, dict) and len(_vsrc) > 0 and state.get("branch_video_origin") == "auto"
+    video_base = (DETECTED_COMPANION_VIDEO_LABEL if _video_auto else COMPANION_VIDEO_LABEL) if branch_on else VIDEO_SOURCE_LABEL
+    _fsrc = str(branch_latent_file or "").strip()
+    _file_auto = isinstance(state, dict) and len(_fsrc) > 0 and state.get("branch_latent_origin") == "auto"
+    if branch_available:
+        branch_checkbox_update = gr.update(visible = True)
+        branch_fit_update = gr.update(visible = branch_on)
+        branch_file_update = gr.update(visible = branch_on, label = DETECTED_LATENT_FILE_LABEL if (branch_on and _file_auto) else BRANCH_LATENT_FILE_LABEL)
+    else:
+        branch_checkbox_update = gr.update(visible = False)
+        branch_fit_update = gr.update(visible = False)
+        branch_file_update = gr.update(visible = False, label = BRANCH_LATENT_FILE_LABEL)
+    return image_prompt_type, gr.update(visible = "S" in image_prompt_type ), gr.update(visible = end_visible and ("E" in image_prompt_type) ), gr.update(visible = "V" in image_prompt_type, label = video_input_label_with_info(video_base, video_source)) , gr.update(visible = input_strength_visible), gr.update(visible = any_video_source), branch_checkbox_update, branch_fit_update, branch_file_update, gr.update(visible = end_visible)
+
+def _branch_video_label_base(state, video_value):
+    """The video picker's label base in the *From latent* mode: the
+    "Detected companion..." variant when the picker's current value is
+    the one the app itself selected (the origin marker the latent-file
+    handler sets when it auto-selects the companion), the plain
+    "Companion..." base whenever the user selected it (or nothing is
+    selected yet — nothing selected is never "detected")."""
+    _src = str(video_value or "").strip()
+    if len(_src) == 0:
+        return COMPANION_VIDEO_LABEL
+    auto = isinstance(state, dict) and state.get("branch_video_origin") == "auto"
+    return DETECTED_COMPANION_VIDEO_LABEL if auto else COMPANION_VIDEO_LABEL
+
+
+def _branch_latent_label_base(state, latent_value):
+    """The latent file picker's label base: the mirror of
+    :func:`_branch_video_label_base` for the backward direction — the
+    "Detected latent file..." variant when the picker's value is the one
+    the app matched to a selected video, the plain "Select..." base
+    whenever the user picked it (or nothing is picked yet)."""
+    _src = str(latent_value or "").strip()
+    if len(_src) == 0:
+        return BRANCH_LATENT_FILE_LABEL
+    auto = isinstance(state, dict) and state.get("branch_latent_origin") == "auto"
+    return DETECTED_LATENT_FILE_LABEL if auto else BRANCH_LATENT_FILE_LABEL
+
+
+def _branch_success_updates(info, keep_frames_video_source, branch_fit_latent, prompt, seed, no_companion=False, advisory="", state=None, selected_video=""):
+    """The common success tail of the *From latent* handlers (the checkbox
+    and the latent-file picker): snaps the field up to the latent boundary
+    when *Round branch frame* is on (the empty field is the field's own
+    "branch at the end" preset), pre-fills the prompt / seed (only when
+    empty / -1), and prints one merged info box: the resolved file with
+    its recorded total (which bounds the branch-point field) and the
+    branch point, explained in plain terms (the mid-latent cut that
+    starts earlier than the typed frame, the rounded-up cut, or the
+    on-boundary cut). With ``no_companion`` set (no companion video
+    present) the no-companion note is merged into the same box (one box
+    instead of two), and the separate no-companion warning is never
+    printed on its own. The box (and its console mirror) is re-emitted
+    only when the resolved message actually changes: repeated
+    re-validations (the companion picker's reapplications included) are
+    deduplicated with a per-session memo, cleared when the mode turns
+    off. ``selected_video`` (the effective source video in the backward
+    direction — the video is the input and no explicit file was picked)
+    adds a console-only direction note naming the video the latent file
+    was matched from (the merged box already names the file); it is part
+    of the memo, so it prints once per resolved state like the box.
+    Returns the (possibly snapped) field value and the pre-filled
+    prompt / seed."""
+    branch = info["branch"]
+    total = int(branch["total_frames"])
+    kept = int(branch["kept_frames"])
+    asked = int(info["branch_frame"])
+    new_keep = keep_frames_video_source
+    if branch_fit_latent:
+        if kept > total:
+            # The clamped cut is the end of the video; the empty field is
+            # the field's own "branch at the end" preset.
+            new_keep = ""
+        elif str(keep_frames_video_source or "").strip() != str(kept):
+            new_keep = str(kept)
+    new_prompt = info["prefill_prompt"] if len(str(prompt or "").strip()) == 0 and len(info["prefill_prompt"]) > 0 else prompt
+    try:
+        seed_value = int(seed)
+    except (TypeError, ValueError):
+        seed_value = -1
+    new_seed = info["prefill_seed"] if seed_value == -1 and info["prefill_seed"] != 0 else seed
+    if branch.get("mid_latent"):
+        detail = (f"Branch point: frame {kept} of {total}. You asked for frame {asked}, "
+                  f"which falls inside the next latent block, so the branch starts {asked - kept} frames earlier, "
+                  f"at frame {kept}; the first new latent is the block that contains frame {asked}.")
+    elif branch.get("fit") and kept != asked:
+        detail = f"Branch point: frame {kept} of {total}. The frame you typed ({asked}) rounds up to the latent block boundary at frame {kept}."
+    else:
+        detail = f"Branch point: frame {kept} of {total}, exactly on a latent block boundary."
+    if no_companion:
+        detail = (f"No companion video was found next to the latent file, so the branch point "
+                  f"is taken from the {total} frames recorded in the file. {detail}")
+    merged = f"From latent: using saved latent file {info['path']} ({total} frames). {detail}"
+    if advisory:
+        merged = f"{merged} {advisory}"
+    # The tail runs on every event that re-validates the branch (the
+    # companion picker's reapplications included); report the boxes only
+    # when the resolved state actually changed. The no-companion note
+    # stays merged into the box above (one box instead of two) and a
+    # stale raw no-companion warning is never printed on its own (several
+    # candidates may have been listed after the fact).
+    warnings = tuple(f"From latent: {warning}" for warning in info["warnings"]
+                     if not str(warning).startswith("no companion video was found"))
+    _sv = str(selected_video or "").strip()
+    direction_note = f"From latent: source video {_sv}; matched saved latent file {info['path']} ({total} frames)." if len(_sv) > 0 else ""
+    memo_key = (merged, warnings, direction_note)
+    if isinstance(state, dict) and state.get("branch_success_memo") == memo_key:
+        return new_keep, new_prompt, new_seed
+    if isinstance(state, dict):
+        state["branch_success_memo"] = memo_key
+    if len(direction_note) > 0:
+        print(direction_note, flush=True)
+    gr.Info(merged)
+    print(merged, flush=True)
+    for note in warnings:
+        gr.Info(note)
+        print(note, flush=True)
+    return new_keep, new_prompt, new_seed
+
+
+def refresh_branch_from_latent(state, image_prompt_type, image_prompt_type_radio, video_source, branch_from_latent, keep_frames_video_source, branch_fit_latent, prompt, seed, branch_latent_file):
+    """The *From latent* checkbox / video-picker change handler: validates
+    the branch job (latent file present / same model family / branch point
+    in range), pre-fills the prompt and seed from the latent file (only
+    when the boxes are empty / -1) and relabels the branch-point field.
+    The branch point resolves to the latent boundary before the latent
+    containing the entered frame (that latent is the branch's first new
+    latent) by default, or to the boundary after it with the *Round
+    branch frame* checkbox, which also snaps the field up front so the
+    value it shows is the exact cut. With the mode on the two pickers'
+    labels switch with the value's origin (the "Detected..." variant
+    names the picker the app itself filled; see the label constants). In
+    the backward direction (a selected video, no explicit file) the
+    resolved sidecar is mirrored into the file picker and a console note
+    names the pair, so the detection shows up in the UI as it does in the
+    forward direction (a picked file finds its companion video). The soft
+    note (validation pending, not an error) is shown only when neither a
+    source video nor a latent file is selected yet — the branch point
+    resolves from the latent file's recorded frames, so a picked file
+    validates the branch on its own. Raises a visible error when the
+    combination is invalid."""
+    _vsrc = str(video_source or "").strip()
+    _fsrc = str(branch_latent_file or "").strip()
+    if len(filter_letters(str(image_prompt_type or ""), "VL")) == 0 or not branch_from_latent:
+        # Mode off: drop the origin / re-assert markers so re-enabling the
+        # mode re-detects and pushes the pickers' values once more (see
+        # the success path below), and the success-report memo so a later
+        # selection reports again.
+        if isinstance(state, dict):
+            state.pop("branch_video_asserted", None)
+            state.pop("branch_latent_asserted", None)
+            state.pop("branch_video_origin", None)
+            state.pop("branch_latent_origin", None)
+            state.pop("branch_success_memo", None)
+        if len(filter_letters(str(image_prompt_type or ""), "VL")) == 0:
+            return gr.update(value = False, visible = False), gr.update(label = KEEP_FRAMES_VIDEO_SOURCE_LABEL), gr.update(visible = False), prompt, seed, gr.update(visible = False, label = BRANCH_LATENT_FILE_LABEL), gr.update(label = video_input_label_with_info(VIDEO_SOURCE_LABEL, video_source))
+        return gr.update(value = False, visible = True), gr.update(label = KEEP_FRAMES_VIDEO_SOURCE_LABEL), gr.update(visible = False), prompt, seed, gr.update(visible = False, label = BRANCH_LATENT_FILE_LABEL), gr.update(label = video_input_label_with_info(VIDEO_SOURCE_LABEL, video_source))
+    model_type = get_state_model_type(state)
+    model_def = get_model_def(model_type)
+    if not _is_all_latent_family(get_base_model_type(model_type), model_def):
+        # The family does not write latent files: the mode is dormant
+        # (treated as off) — the components hide, the stored value is
+        # preserved (no value write), the classic labels stay, and
+        # nothing is resolved (never a refusal).
+        if isinstance(state, dict):
+            state.pop("branch_video_asserted", None)
+            state.pop("branch_latent_asserted", None)
+            state.pop("branch_video_origin", None)
+            state.pop("branch_latent_origin", None)
+            state.pop("branch_success_memo", None)
+        return gr.update(visible = False), gr.update(label = KEEP_FRAMES_VIDEO_SOURCE_LABEL), gr.update(visible = False), prompt, seed, gr.update(visible = False, label = BRANCH_LATENT_FILE_LABEL), gr.update(label = video_input_label_with_info(VIDEO_SOURCE_LABEL, video_source))
+    # The origin of the incoming video value: a change event carrying the
+    # value the server itself pushed (the retrigger of the latent-file
+    # handler's companion auto-select) keeps the "auto" origin; any other
+    # value is a user selection.
+    _was_asserted = isinstance(state, dict) and len(_vsrc) > 0 and state.get("branch_video_asserted") == _vsrc
+    if isinstance(state, dict):
+        if len(_vsrc) > 0:
+            state["branch_video_origin"] = "auto" if _was_asserted else "user"
+        else:
+            state.pop("branch_video_origin", None)
+    info, error = resolve_latent_branch(image_prompt_type, video_source, state, model_type, keep_frames=keep_frames_video_source, fit=bool(branch_fit_latent), base_model_type=get_base_model_type(model_type), model_def=model_def, latent_file=branch_latent_file)
+    if error:
+        if error == "no source video was found for the branch job" and len(_vsrc) == 0 and len(_fsrc) == 0:
+            note = "From latent: select a source video or a latent file first; the branch point is validated once one is selected"
+            gr.Info(note)
+            print(note, flush=True)
+            return gr.update(value = True, visible = True), gr.update(label = BRANCH_FRAMES_VIDEO_SOURCE_LABEL), gr.update(visible = True), prompt, seed, gr.update(visible = True, label = BRANCH_LATENT_FILE_LABEL), gr.update(label = video_input_label_with_info(COMPANION_VIDEO_LABEL, video_source))
+        raise gr.Error(f"From latent: {error}")
+    entry = info.get("entry")
+    # The backward direction (a selected video, no explicit file): the
+    # direction note (console only) names the video the match was
+    # determined from. In *Continue Last Video* the video is an implicit
+    # queue reference, so the mirror and the note stay off — the
+    # job-start log reports the resolved pair instead.
+    _v_mode = "V" in str(image_prompt_type or "")
+    new_keep, new_prompt, new_seed = _branch_success_updates(info, keep_frames_video_source, branch_fit_latent, prompt, seed, no_companion=not bool(info.get("video_present")), advisory=_branch_prefix_advisory(model_type), state=state, selected_video=info.get("video", "") if (_v_mode and len(_fsrc) == 0) else "")
+    # Re-assert the picker's value alongside the label (once per value per
+    # session): the value update may originate in the latent-file handler,
+    # and when it is lost in client-side event processing this retrigger
+    # (picker change) resends it through the same pipeline. Gradio caches
+    # files by content hash, so re-postprocessing the same file converges
+    # to the identical payload and cannot loop.
+    video_label = video_input_label_with_info(_branch_video_label_base(state, video_source), video_source)
+    video_update = gr.update(label = video_label)
+    if len(_vsrc) > 0 and (not isinstance(state, dict) or not _was_asserted):
+        if isinstance(state, dict):
+            state["branch_video_asserted"] = _vsrc
+        video_update = gr.update(value = video_source, label = video_label)
+    # The latent file picker: with no explicit file the resolved sidecar
+    # is mirrored into it (the backward direction — the video is the
+    # input and the file is what the app detected), labelled "Detected"
+    # so the user sees which side of the pair the app filled. A picked
+    # file keeps its value; its label picks up the origin-aware base and
+    # the file's own recorded info.
+    if _v_mode and len(_fsrc) == 0:
+        if isinstance(state, dict):
+            state["branch_latent_asserted"] = info["path"]
+            state["branch_latent_origin"] = "auto"
+        file_update = gr.update(value = info["path"], label = latent_file_label_with_info(DETECTED_LATENT_FILE_LABEL, entry))
+    else:
+        # The label's info comes from the resolved file, but is only shown
+        # when the picker actually holds a file (in *Continue Last Video*
+        # the picker stays empty, so the label stays plain there).
+        file_update = gr.update(label = latent_file_label_with_info(_branch_latent_label_base(state, branch_latent_file), entry if len(_fsrc) > 0 else None))
+    return gr.update(value = True, visible = True), gr.update(label = BRANCH_FRAMES_VIDEO_SOURCE_LABEL, value = new_keep), gr.update(visible = True), new_prompt, new_seed, file_update, video_update
+
+
+def refresh_branch_frame_fit(state, image_prompt_type, video_source, branch_from_latent, branch_fit_latent, keep_frames_video_source, branch_latent_file):
+    """The *Round branch frame* handler of the branch-point field: with
+    *From latent* and the fit checkbox enabled, an entered frame is snapped
+    up to the latent boundary the cut clamps to, so the value shown in the
+    field is the exact cut (a clamped value past the video end becomes the
+    empty "branch at the end" preset). Out-of-range values surface the same
+    error as the branch validation; the field is left untouched only when
+    neither a selected video nor a picked latent file is present yet (the
+    snap comes from the branch resolution, which works from the file alone)."""
+    if not branch_fit_latent or not branch_from_latent:
+        return keep_frames_video_source
+    if len(filter_letters(str(image_prompt_type or ""), "VL")) == 0:
+        return keep_frames_video_source
+    keep_text = str(keep_frames_video_source or "").strip()
+    if len(keep_text) == 0:
+        return keep_frames_video_source
+    model_type = get_state_model_type(state)
+    if not _is_all_latent_family(get_base_model_type(model_type), get_model_def(model_type)):
+        # Dormant family: the snap is a no-op (never a refusal).
+        return keep_frames_video_source
+    info, error = resolve_latent_branch(image_prompt_type, video_source, state, model_type, keep_frames=keep_text, fit=True, base_model_type=get_base_model_type(model_type), model_def=get_model_def(model_type), latent_file=branch_latent_file)
+    if error:
+        if error == "no source video was found for the branch job" and len(str(video_source or "").strip()) == 0 and len(str(branch_latent_file or "").strip()) == 0:
+            return keep_frames_video_source
+        raise gr.Error(f"From latent: {error}")
+    branch = info["branch"]
+    snapped = int(branch["kept_frames"])
+    if snapped > int(branch["total_frames"]):
+        note = f"From latent: the branch frame {keep_text} rounds up to the last latent of the source latent file, so the cut is the end of the video."
+        gr.Info(note)
+        print(note, flush=True)
+        return ""
+    if snapped != int(keep_text):
+        note = f"From latent: the branch frame {keep_text} rounds up to the latent boundary at frame {snapped} of {branch['total_frames']}."
+        gr.Info(note)
+        print(note, flush=True)
+        return str(snapped)
+    return keep_frames_video_source
+
+
+def refresh_branch_from_latent_file(state, image_prompt_type, branch_latent_file, video_source, branch_from_latent, keep_frames_video_source, branch_fit_latent, prompt, seed):
+    """The latent-file picker's change handler: the file is the primary
+    input of the *From latent* mode, so with the mode on and a file picked
+    this validates the branch from the file alone (the same validation as
+    the checkbox handler — the companion video is optional) and then looks
+    the companion video up in the other direction
+    (:func:`latent_io.find_video_for_latent`): exactly one candidate that
+    is not already selected is auto-selected into the video picker (the
+    retrigger that follows is recognised by the re-assert marker and
+    skipped, so there is no loop) with the path reported in the note;
+    several candidates are listed and the user picks through the normal
+    video control (no auto-select); none is merged into the branch-point
+    detail (the branch proceeds from the file's records). A change event
+    carrying back the file the video handler just mirrored (the retrigger
+    of the backward direction) is recognised the same way and does
+    nothing — no re-report, no re-resolution, no value re-push. On the
+    success path the file's label picks up its origin-aware base and the
+    file's own recorded info; the success tail (prompt / seed pre-fill,
+    field relabel, fit snap, branch-point details) is the shared helper.
+    With the mode off or no file the video and file labels are restored
+    and everything else is left unchanged (no error)."""
+    # The success-report memo is dropped so a (re)selection reports again;
+    # the origin markers survive (the labels depend on them).
+    if isinstance(state, dict):
+        state.pop("branch_success_memo", None)
+    if len(filter_letters(str(image_prompt_type or ""), "VL")) == 0:
+        if isinstance(state, dict):
+            state.pop("branch_video_asserted", None)
+            state.pop("branch_latent_asserted", None)
+            state.pop("branch_video_origin", None)
+            state.pop("branch_latent_origin", None)
+        return video_source, keep_frames_video_source, branch_fit_latent, prompt, seed, gr.update()
+    if not branch_from_latent or len(str(branch_latent_file or "").strip()) == 0:
+        # Mode off, or the file was cleared: drop the origin / re-assert
+        # markers so a later (re)selection re-detects, and the labels go
+        # back to the plain ones.
+        if isinstance(state, dict):
+            state.pop("branch_video_asserted", None)
+            state.pop("branch_latent_asserted", None)
+            state.pop("branch_video_origin", None)
+            state.pop("branch_latent_origin", None)
+        # The label switches with the mode (not with the file): the mode
+        # is on, so the video picker stays labelled as the (optional)
+        # companion video whatever the file picker holds.
+        base = COMPANION_VIDEO_LABEL if branch_from_latent else VIDEO_SOURCE_LABEL
+        return gr.update(label = video_input_label_with_info(base, video_source)), keep_frames_video_source, branch_fit_latent, prompt, seed, gr.update(label = BRANCH_LATENT_FILE_LABEL)
+    model_type = get_state_model_type(state)
+    if not _is_all_latent_family(get_base_model_type(model_type), get_model_def(model_type)):
+        # Dormant family: no resolution; the video keeps its classic
+        # label and the field / fit stay untouched (never a refusal).
+        return gr.update(label = video_input_label_with_info(VIDEO_SOURCE_LABEL, video_source)), keep_frames_video_source, branch_fit_latent, prompt, seed, gr.update()
+    _fsrc = str(branch_latent_file or "").strip()
+    # The origin of the incoming file value: a change event carrying the
+    # value the server itself pushed (the retrigger of the video handler's
+    # backward auto-fill) is not a user selection — the branch was already
+    # reported there, so nothing is re-resolved or re-pushed (the labels
+    # stay).
+    _was_asserted = isinstance(state, dict) and len(_fsrc) > 0 and state.get("branch_latent_asserted") == _fsrc
+    if isinstance(state, dict):
+        state["branch_latent_origin"] = "auto" if _was_asserted else "user"
+    if _was_asserted:
+        # The label switches with the mode (not with the file): the mode
+        # is on, so the video picker stays labelled as the (optional)
+        # companion video whatever the file picker holds.
+        return gr.update(label = video_input_label_with_info(_branch_video_label_base(state, video_source), video_source)), keep_frames_video_source, branch_fit_latent, prompt, seed, gr.update()
+    info, error = resolve_latent_branch(image_prompt_type, video_source, state, model_type, keep_frames=keep_frames_video_source, fit=bool(branch_fit_latent), base_model_type=get_base_model_type(model_type), model_def=get_model_def(model_type), latent_file=branch_latent_file)
+    if error:
+        raise gr.Error(f"From latent: {error}")
+    # The auto-companion: the file's own directory and the app's save /
+    # search directories (the same construction resolve_latent_branch
+    # uses) are probed for the video the file was saved from.
+    found = latent_io.find_video_for_latent(info["path"], _branch_latent_search_dirs())
+    _vsrc = str(video_source or "").strip()
+    if len(found) == 1 and _vsrc != found[0]:
+        # A new companion: select it and mark it auto-detected (the video
+        # handler's retrigger recognises this through the re-assert marker
+        # and skips the re-report).
+        note = f"From latent: companion video selected: {found[0]}"
+        gr.Info(note)
+        print(note, flush=True)
+        if isinstance(state, dict):
+            state["branch_video_asserted"] = found[0]
+            state["branch_video_origin"] = "auto"
+        video_update = gr.update(value = found[0], label = video_input_label_with_info(DETECTED_COMPANION_VIDEO_LABEL, found[0]))
+    else:
+        # The companion is already the selected video (the backward flow
+        # resolved the same pair) — kept without re-selecting or noting —
+        # or several / no candidates (the user picks through the normal
+        # video control); the video's origin is then left to the next
+        # user selection.
+        if len(found) > 1:
+            note = f"From latent: several companion videos match the latent file ({', '.join(os.path.basename(p) for p in found)}); select one with the video control."
+            gr.Info(note)
+            print(note, flush=True)
+        if isinstance(state, dict):
+            state.pop("branch_video_asserted", None)
+            state.pop("branch_video_origin", None)
+        # The label switches with the mode (not with the file): the mode
+        # is on, so the video picker stays labelled as the (optional)
+        # companion video whatever the file picker holds.
+        video_update = gr.update(label = video_input_label_with_info(_branch_video_label_base(state, video_source), video_source))
+    new_keep, new_prompt, new_seed = _branch_success_updates(info, keep_frames_video_source, branch_fit_latent, prompt, seed, no_companion=len(found) == 0, advisory=_branch_prefix_advisory(model_type), state=state)
+    return video_update, gr.update(label = BRANCH_FRAMES_VIDEO_SOURCE_LABEL, value = new_keep), gr.update(visible = True), new_prompt, new_seed, gr.update(label = latent_file_label_with_info(_branch_latent_label_base(state, branch_latent_file), info.get("entry")))
 
 def refresh_image_prompt_type_endcheckbox(state, image_prompt_type, image_prompt_type_radio, end_checkbox, video_prompt_type):
     image_prompt_type = del_in_sequence(image_prompt_type, "E")
@@ -12341,8 +15817,42 @@ def video_input_label_with_info(base_label, video_path):
         info += [f"{frames_count} {'frame' if frames_count == 1 else 'frames'}"]
     return f"{base_label} ({', '.join(info)})"
 
+def latent_file_label_with_info(base_label, entry):
+    """The latent file picker's label info suffix: the same
+    (width x height, fps, frame count) shape as
+    :func:`video_input_label_with_info`, but taken from the latent file's
+    own records (the sidecar stores the video's resolution / fps / frame
+    count), so the suffix works with no companion video present."""
+    entry = entry or {}
+    try:
+        width = int(entry.get("width") or 0)
+        height = int(entry.get("height") or 0)
+        fps = float(entry.get("fps") or 0)
+        frames = int(entry.get("frames") or 0)
+    except (TypeError, ValueError):
+        return base_label
+    if width <= 0 or height <= 0:
+        return base_label
+    info = [f"{width}x{height}"]
+    if fps > 0:
+        info += [f"{fps:g} fps"]
+    if frames > 0:
+        info += [f"{frames} {'frame' if frames == 1 else 'frames'}"]
+    return f"{base_label} ({', '.join(info)})"
+
 def refresh_video_input_label(video_path, base_label):
     return gr.update(label=video_input_label_with_info(base_label, video_path))
+
+def refresh_video_source_label(video_path, branch_from_latent, image_prompt_type):
+    """The source-video picker's label refresh: its base label switches
+    with the *From latent* mode (on: the companion of the latent file —
+    optional, the branch reads the file; off: the continuation source),
+    so the resolution / fps / frame-count suffix is appended to the
+    mode-appropriate base instead of the one fixed at layout construction
+    time (the shared refresh_video_input_label wiring carries a State that
+    would go stale when the mode switches)."""
+    base = COMPANION_VIDEO_LABEL if (bool(branch_from_latent) and len(filter_letters(str(image_prompt_type or ""), "VL")) > 0) else VIDEO_SOURCE_LABEL
+    return gr.update(label=video_input_label_with_info(base, video_path))
 
 def change_force_control_video_trim(state, video_prompt_type, force_control_video_trim):
     video_prompt_type = del_in_sequence( video_prompt_type, "|")
@@ -12671,8 +16181,26 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                             any_end_image = True
                         else:
                             image_prompt_type_endcheckbox = gr.Checkbox( value =False, show_label= False, visible= False , scale= 1)
+                # The *From latent* checkbox is the mode switch of the media
+                # selection: directly below the Location radio, above the
+                # pickers. The latent file is the primary input (it names
+                # the branch source on its own); the video picker below is
+                # its companion (selected automatically when found) when
+                # the mode is on, the continuation source when it is off.
+                # With the checkbox off the layout is the exact legacy one
+                # (both components are hidden).
+                branch_from_latent_value = bool(ui_get("branch_from_latent", False))
+                # The *From latent* mode applies to the latent-writing
+                # families only (LTX2 / Wan / LongCat / MiniMax H3): for
+                # every other model the mode is dormant — hidden (the
+                # stored value is preserved), the classic labels stay,
+                # and a job started with it on runs as a normal job
+                # (never a refusal).
+                branch_family_ok = _is_all_latent_family(str(base_model_type or ""), model_def)
+                branch_from_latent = gr.Checkbox(value= branch_from_latent_value , visible= len(filter_letters(image_prompt_type_value, "VL"))>0 and branch_family_ok , scale = 2, label= "From WanGP latent file", info= BRANCH_LATENT_TOOLTIP )
+                branch_latent_file = gr.File(file_types=[".pt"], type="filepath", value=ui_get("branch_latent_file", None), visible= len(filter_letters(image_prompt_type_value, "VL"))>0 and branch_from_latent_value and branch_family_ok , scale = 2, label= BRANCH_LATENT_FILE_LABEL, elem_id="branch_latent_file_input")
                 image_start_row, image_start, image_start_extra = get_image_gallery(label= "Images as starting points for new Videos in the Generation Queue" + (" (None for Black Frames)" if model_def.get("black_frame", False) else ''), value = ui_defaults.get("image_start", None), visible= "S" in image_prompt_type_value )
-                video_source_label = "Video to Continue"
+                video_source_label = COMPANION_VIDEO_LABEL if (branch_from_latent_value and branch_family_ok) else VIDEO_SOURCE_LABEL
                 video_source_value = ui_defaults.get("video_source", None)
                 video_source = gr.Video(label= video_input_label_with_info(video_source_label, video_source_value), height = gallery_height, visible= "V" in image_prompt_type_value, value= video_source_value, elem_id="video_input")
                 image_end_row, image_end, image_end_extra = get_image_gallery(label=get_image_end_label(multi_prompts_gen_type_value), value = ui_defaults.get("image_end", None), visible=end_option_visible and "E" in image_prompt_type_value)
@@ -12682,7 +16210,8 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                 else:
                     model_mode_value = ui_defaults["model_mode"] = get_default_value(model_mode_choices["choices"], ui_get("model_mode", None), model_mode_choices["default"] )
                     model_mode = gr.Dropdown(choices=model_mode_choices["choices"], value=model_mode_value, label=model_mode_choices["label"],  visible=image_mode_value in model_modes_visibility)                        
-                keep_frames_video_source = gr.Text(value=ui_get("keep_frames_video_source") , visible= len(filter_letters(image_prompt_type_value, "VL"))>0 , scale = 2, label= "Truncate Video beyond this number of resampled Frames (empty=Keep All, negative truncates from End)" ) 
+                keep_frames_video_source = gr.Text(value=ui_get("keep_frames_video_source") , visible= len(filter_letters(image_prompt_type_value, "VL"))>0 , scale = 2, label= BRANCH_FRAMES_VIDEO_SOURCE_LABEL if (branch_from_latent_value and branch_family_ok) else KEEP_FRAMES_VIDEO_SOURCE_LABEL )
+                branch_fit_latent = gr.Checkbox(value= bool(ui_get("branch_fit_latent", False)) , visible= len(filter_letters(image_prompt_type_value, "VL"))>0 and branch_from_latent_value and branch_family_ok , scale = 2, label= BRANCH_FIT_LATENT_LABEL )
 
             any_control_video = any_control_image = False
             if image_mode_value ==2:
@@ -12934,7 +16463,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                 with gr.Column(elem_classes=["wangp-magic-mask-anchor"]):
                     video_mask_label = model_def.get("video_mask_label", "Video Mask Area (for Inpainting, white = Control Area, black = Unchanged)")
                     video_mask_value = ui_defaults.get("video_mask", None)
-                    video_mask = gr.Video(label=video_input_label_with_info(video_mask_label, video_mask_value), visible=(not image_outputs) and magic_mask_visible, height=gallery_height, value=video_mask_value)
+                    video_mask = gr.Video(label=video_input_label_with_info(video_mask_label, video_mask_value), visible=(not image_outputs) and magic_mask_visible, height=gallery_height, value=video_mask_value, elem_id="video_input_mask")
                     if not image_outputs:
                         magic_mask_ui = MagicMaskUI().render(visible=magic_mask_visible)
                         magic_mask_uis.append(magic_mask_ui)
@@ -13712,6 +17241,13 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                     with gr.Column():
                         gr.Markdown('<B>Customize the Output Filename using Settings Values (<I>date, seed, resolution, num_inference_steps, prompt, flow_shift, video_length, guidance_scale</I>). For Instance:<BR>"<I>{date(YYYY-MM-DD_HH-mm-ss)}_{seed}_{prompt(50)}, {num_inference_steps}</I>"</B>')
                         output_filename = gr.Text( label= " Output Filename (Leave Blank for Auto Naming)", value= ui_get("output_filename"))
+                    with gr.Column(visible=_is_all_latent_family(base_model_type, model_def)) as save_latents_col:
+                        gr.Markdown("<B>For this Generation only, choose whether the companion Latent File is written. *Configuration* follows the *Save Latents* option of the *Configuration* tab</B>")
+                        save_latents_choice = gr.Dropdown(
+                            choices=SAVE_LATENT_CHOICES,
+                            value=ui_get("save_latents_choice", 0),
+                            label="Save Latents"
+                        )
 
                 with gr.Tab("Configs"):
                     override_values = generation_overrides.parse_overrides(ui_get("overrides"))
@@ -14036,7 +17572,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
             gallery_tabs.select(fn=set_gallery_tab, inputs=[state, video_info_tab], outputs=[current_gallery_tab, gallery_source, video_info_tabs, video_info_tab]).then(
                 fn=select_media, inputs=[state, current_gallery_tab, output, last_choice, gr.State(-1), gallery_source, PP_spatial_upsampling, PP_spatial_postprocessing_parameters, PP_temporal_postprocessing_parameters, PP_spatial_upsampler_help_target, PP_temporal_upsampling, video_info_tab], outputs=select_media_outputs, show_progress="hidden").then(fn=None, inputs=None, outputs=None, js=PROMPT_TOOLS_ATTACH_JS)
             gr.on(triggers=[video_length.release, force_fps.change, video_guide.change, video_source.change], fn=refresh_video_length_label, inputs=[state, video_length, force_fps, video_guide, video_source] , outputs = video_length, trigger_mode="always_last", show_progress="hidden"  )
-            video_source.change(fn=refresh_video_input_label, inputs=[video_source, gr.State(video_source_label)], outputs=video_source, show_progress="hidden")
+            video_source.change(fn=refresh_video_source_label, inputs=[video_source, branch_from_latent, image_prompt_type], outputs=video_source, show_progress="hidden")
             video_guide.change(fn=refresh_video_input_label, inputs=[video_guide, gr.State(video_guide_label)], outputs=video_guide, show_progress="hidden")
             video_guide2.change(fn=refresh_video_input_label, inputs=[video_guide2, gr.State(video_guide2_label)], outputs=video_guide2, show_progress="hidden")
             video_guide3.change(fn=refresh_video_input_label, inputs=[video_guide3, gr.State(video_guide3_label)], outputs=video_guide3, show_progress="hidden")
@@ -14048,7 +17584,18 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
             audio_prompt_type_sources.change(fn=refresh_audio_prompt_type_sources, inputs=[state, audio_prompt_type, audio_prompt_type_sources, video_prompt_type, image_mode], outputs=[audio_prompt_type, audio_guide, audio_guide2, audio_guide3, speakers_locations_row, remove_background_sound, normalize_audio_volumes, audio_prompt_type_custom_option, audio_options_row, audio_guide_row, force_control_video_trim])
             prompt_enhancer_mode_dropdown.input(fn=build_prompt_enhancer_value, inputs=[prompt_enhancer_mode_dropdown, prompt_enhancer_think], outputs=[prompt_enhancer], show_progress="hidden")
             prompt_enhancer_think.input(fn=build_prompt_enhancer_value, inputs=[prompt_enhancer_mode_dropdown, prompt_enhancer_think], outputs=[prompt_enhancer], show_progress="hidden")
-            image_prompt_type_radio.change(fn=refresh_image_prompt_type_radio, inputs=[state, image_prompt_type, image_prompt_type_radio, video_prompt_type], outputs=[image_prompt_type, image_start_row, image_end_row, video_source, input_video_strength, keep_frames_video_source, image_prompt_type_endcheckbox], show_progress="hidden").then(fn=None, inputs=None, outputs=None, js="() => window.wangpRefreshInputModes()")
+            image_prompt_type_radio.change(fn=refresh_image_prompt_type_radio, inputs=[state, image_prompt_type, image_prompt_type_radio, video_prompt_type, video_source, branch_from_latent, branch_fit_latent, branch_latent_file], outputs=[image_prompt_type, image_start_row, image_end_row, video_source, input_video_strength, keep_frames_video_source, branch_from_latent, branch_fit_latent, branch_latent_file, image_prompt_type_endcheckbox], show_progress="hidden").then(fn=None, inputs=None, outputs=None, js="() => window.wangpRefreshInputModes()")
+            branch_from_latent.change(fn=refresh_branch_from_latent, inputs=[state, image_prompt_type, image_prompt_type_radio, video_source, branch_from_latent, keep_frames_video_source, branch_fit_latent, prompt, seed, branch_latent_file], outputs=[branch_from_latent, keep_frames_video_source, branch_fit_latent, prompt, seed, branch_latent_file, video_source], show_progress="hidden")
+            # The branch is validated as soon as the source video is picked,
+            # long before the job (and its model load) runs: the latent file
+            # is resolved from the uploaded name and its path reported here.
+            video_source.change(fn=refresh_branch_from_latent, inputs=[state, image_prompt_type, image_prompt_type_radio, video_source, branch_from_latent, keep_frames_video_source, branch_fit_latent, prompt, seed, branch_latent_file], outputs=[branch_from_latent, keep_frames_video_source, branch_fit_latent, prompt, seed, branch_latent_file, video_source], show_progress="hidden")
+            keep_frames_video_source.input(fn=refresh_branch_frame_fit, inputs=[state, image_prompt_type, video_source, branch_from_latent, branch_fit_latent, keep_frames_video_source, branch_latent_file], outputs=[keep_frames_video_source], show_progress="hidden")
+            video_source.change(fn=refresh_branch_frame_fit, inputs=[state, image_prompt_type, video_source, branch_from_latent, branch_fit_latent, keep_frames_video_source, branch_latent_file], outputs=[keep_frames_video_source], show_progress="hidden")
+            # The latent file is the primary input: picking it (or dropping
+            # it on the zone) validates the branch from the file alone and
+            # auto-selects the companion video when exactly one is found.
+            branch_latent_file.change(fn=refresh_branch_from_latent_file, inputs=[state, image_prompt_type, branch_latent_file, video_source, branch_from_latent, keep_frames_video_source, branch_fit_latent, prompt, seed], outputs=[video_source, keep_frames_video_source, branch_fit_latent, prompt, seed, branch_latent_file], show_progress="hidden")
             image_prompt_type_endcheckbox.change(fn=refresh_image_prompt_type_endcheckbox, inputs=[state, image_prompt_type, image_prompt_type_radio, image_prompt_type_endcheckbox, video_prompt_type], outputs=[image_prompt_type, image_end_row, input_video_strength] ) 
             video_prompt_type_image_refs.input(fn=refresh_video_prompt_type_image_refs, inputs = [state, video_prompt_type, video_prompt_type_image_refs,image_mode, image_prompt_type], outputs = [video_prompt_type, image_refs_row, remove_background_images_ref,  image_refs_relative_size, frames_positions,video_guide_outpainting_col, input_video_strength], show_progress="hidden")
             enhancer_label_inputs = [image_mode, video_prompt_type, image_prompt_type, image_start, image_end, image_refs, image_guide, image_mask_guide, video_source]

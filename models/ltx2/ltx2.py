@@ -13,6 +13,7 @@ import torchaudio
 from accelerate import init_empty_weights
 from safetensors.torch import load_file
 from shared.utils import files_locator as fl
+from shared.utils import latent_io
 from shared.utils.phase_progress import generation_progress
 from shared.cuda_memory import mmgp_vram_allocator
 from shared.utils.hdr import VIDEO_PROMPT_HDR_OUTPUT_FLAG, hdr_linear_to_vae_range, sdr_to_vae_range
@@ -84,6 +85,13 @@ LTX2_OUTPAINT_GAMMA = 2.0
 LTX2_DISABLE_STAGE2_WITH_CONTROL_VIDEO = True
 LTX2_ENABLE_EMBEDDING_LORAS = False
 LTX2_VAE_TEMPORAL_TILING_FPS = 24.0
+# The HDR transform the LTX-2 video VAE decodes to (scene-linear Rec.709
+# through it): the model spec may state its own one ("hdr_transform", e.g.
+# "acescct" for the SDR-to-HDR IC-LoRA flow). An all-latent sidecar records
+# the transform its job wrote (the entry's "hdr_transform"), and the Latent
+# Decode / From latent jobs read it back; this constant is the fallback for
+# a sidecar that carries only the HDR flag.
+LTX2_HDR_TRANSFORM = "logc3"
 LTX2_UPSCALE_SIGMAS = tuple(DISTILLED_SIGMA_VALUES)
 LTX2_UPSCALE_MAX_FRAMES = 481
 LTX2_EMBEDDING_LORA_PREFIXES = (
@@ -738,6 +746,136 @@ def _build_tiling_config(tile_size: int | tuple | list | None, fps: float | None
     return TilingConfig(spatial_config=spatial_config, temporal_config=temporal_config)
 
 
+def load_ltx2_decode_models(
+    video_vae_file,
+    audio_vae_file="",
+    vocoder_file="",
+    VAE_dtype: torch.dtype = torch.float32,
+    device: str = "cpu",
+    config_fallback_path: str = "",
+):
+    """Load only the VAE/vocoder components needed to decode saved LTX-2 latents.
+
+    Mirrors ``LTX2._init_models`` component loading (same constructors,
+    postprocess and tiling settings) without loading the transformer,
+    spatial upsampler or text encoders, so the Media Flow Latent Decode job
+    can decode a latent companion file without loading the whole model.
+    ``config_fallback_path`` is used when the checkpoint itself carries no
+    config metadata (all-in-one models).
+    """
+    from mmgp import offload as mmgp_offload
+
+    video_vae_path = fl.locate_file(str(video_vae_file), error_if_none=False)
+    if not video_vae_path or not os.path.isfile(video_vae_path):
+        raise FileNotFoundError(f"Unable to locate the LTX2 video VAE checkpoint '{video_vae_file}'.")
+    video_config = _load_config_from_checkpoint(video_vae_path, fallback_config_path=config_fallback_path)
+    if not video_config:
+        raise ValueError(f"Missing config metadata in the LTX2 video VAE checkpoint '{video_vae_path}'.")
+    # NAD variant: the video VAE is a CausalDiffusionVAE with a different
+    # (non-tilable) decoder; every other version is the classic LTX-VAE.
+    diffusion_vae = video_config.get("vae", {}).get("_class_name") == "CausalDiffusionVAE"
+    video_config_vae = video_config.setdefault("vae", {})
+    # use 'reflect' padding to make sure the model works well with tiling
+    video_config_vae["spatial_padding_mode"] = "reflect"
+    video_config_vae["encoder_spatial_padding_mode"] = "reflect"
+    video_config_vae["decoder_spatial_padding_mode"] = "reflect"
+    with init_empty_weights():
+        video_encoder = VideoEncoderConfigurator.from_config(_diffusion_vae_encoder_config(video_config) if diffusion_vae else video_config)
+        video_decoder = DiffusionVideoDecoder.from_config(video_config) if diffusion_vae else VideoDecoderConfigurator.from_config(video_config)
+        video_vae = _VAEContainer(video_encoder, video_decoder)
+    vae_postprocess = _make_diffusion_vae_postprocess("vae.") if diffusion_vae else _make_vae_postprocess("vae.")
+    mmgp_offload.load_model_data(
+        video_vae,
+        video_vae_path,
+        postprocess_sd=vae_postprocess,
+        default_dtype=VAE_dtype,
+        writable_tensors=False,
+        ignore_missing_keys=False,
+        ignore_unused_weights=True,
+    )
+
+    components = types.SimpleNamespace(video_decoder=video_vae.decoder)
+
+    if audio_vae_file:
+        audio_vae_path = fl.locate_file(str(audio_vae_file), error_if_none=False)
+        if not audio_vae_path or not os.path.isfile(audio_vae_path):
+            raise FileNotFoundError(f"Unable to locate the LTX2 audio VAE checkpoint '{audio_vae_file}'.")
+        audio_config = _load_config_from_checkpoint(audio_vae_path, fallback_config_path=config_fallback_path)
+        if not audio_config:
+            raise ValueError(f"Missing config metadata in the LTX2 audio VAE checkpoint '{audio_vae_file}'.")
+        with init_empty_weights():
+            audio_encoder = AudioEncoderConfigurator.from_config(audio_config)
+            audio_decoder = AudioDecoderConfigurator.from_config(audio_config)
+            audio_vae = _VAEContainer(audio_encoder, audio_decoder)
+        mmgp_offload.load_model_data(
+            audio_vae,
+            audio_vae_path,
+            postprocess_sd=_make_vae_postprocess("audio_vae."),
+            default_dtype=VAE_dtype,
+            writable_tensors=False,
+            ignore_missing_keys=False,
+        )
+        components.audio_decoder = audio_vae.decoder
+        if vocoder_file:
+            vocoder_path = fl.locate_file(str(vocoder_file), error_if_none=False)
+            if not vocoder_path or not os.path.isfile(vocoder_path):
+                raise FileNotFoundError(f"Unable to locate the LTX2 vocoder checkpoint '{vocoder_file}'.")
+            vocoder_config = _load_config_from_checkpoint(vocoder_path, fallback_config_path=config_fallback_path)
+            if not vocoder_config:
+                raise ValueError(f"Missing config metadata in the LTX2 vocoder checkpoint '{vocoder_path}'.")
+            with init_empty_weights():
+                vocoder = VocoderConfigurator.from_config(vocoder_config)
+            mmgp_offload.load_model_data(
+                vocoder,
+                vocoder_path,
+                postprocess_sd=_make_sd_postprocess(VOCODER_COMFY_KEYS_FILTER),
+                default_dtype=VAE_dtype,
+                writable_tensors=False,
+                ignore_missing_keys=False,
+            )
+            components.vocoder = vocoder
+    for module in (components.video_decoder, getattr(components, "audio_decoder", None), getattr(components, "vocoder", None)):
+        if module is not None:
+            module.eval().requires_grad_(False).to(device)
+            # The loader converts the loaded *parameters* to VAE_dtype but
+            # leaves the registered *buffers* at the checkpoint's dtype (the
+            # 2.5 checkpoints are bf16; the vocoder's FIR filter
+            # coefficients live in buffers) - the vocoder's conv then mixes
+            # fp16 activations with bf16 filters and crashes ("expected
+            # scalar type Half but found BFloat16"). Align the buffers.
+            seen = set()
+            for buffer in module.buffers():
+                if id(buffer) in seen or buffer.dtype == VAE_dtype:
+                    continue
+                seen.add(id(buffer))
+                buffer.data = buffer.data.to(VAE_dtype)
+    return components
+
+
+def build_decode_tiling_config(video_decoder, vae_config, device_mem_capacity, mixed_precision, fps, output_height=None, output_width=None):
+    """Build the decode tiling config the same way the app does at generation time.
+
+    Mirrors the main generation flow: use the decoder's own
+    ``get_VAE_tile_size`` when it has one (the classic LTX-2 VAE decoder),
+    otherwise fall back to the temporal-only config, exactly like the
+    generation path does for decoders without the helper.
+    """
+    import inspect
+
+    tile_size = None
+    get_tile_size = getattr(video_decoder, "get_VAE_tile_size", None)
+    if get_tile_size is not None:
+        try:
+            sig = inspect.signature(get_tile_size)
+        except (TypeError, ValueError):
+            sig = None
+        if sig is not None and "output_height" in sig.parameters:
+            tile_size = get_tile_size(vae_config, device_mem_capacity, mixed_precision, output_height=output_height, output_width=output_width)
+        else:
+            tile_size = get_tile_size(vae_config, device_mem_capacity, mixed_precision)
+    return _build_tiling_config(tile_size, fps)
+
+
 def _infer_ic_lora_downscale_factor(loras_selected) -> int | None:
     factors = []
     for lora_path in loras_selected or []:
@@ -881,6 +1019,7 @@ class LTX2:
         self.dtype = dtype
         self.VAE_dtype = VAE_dtype
         self.base_model_type = base_model_type
+        self.model_type = model_type
         self.model_def = model_def
         self._interrupt = False
         self._hdr_scene_context = None
@@ -1086,6 +1225,9 @@ class LTX2:
         self.audio_decoder = audio_decoder
         self.vocoder = vocoder
         self.spatial_upsampler = spatial_upsampler
+        self.video_vae_path = video_vae_path
+        self.audio_vae_path = audio_vae_path
+        self.vocoder_path = vocoder_path
         self.model = transformer
         self.model2 = None
 
@@ -1411,6 +1553,12 @@ class LTX2:
         input_waveform=None,
         input_waveform_sample_rate=None,
         audio_conditioning_end=None,
+        prefix_latents=None,
+        prefix_audio_latents=None,
+        prefix_kept_windows=None,
+        prefix_kept_frames=0,
+        prefix_is_i2v=False,
+        prefix_i2v_image_frames=None,
         audio_scale: float | None = None,
         outpainting_dims: list[int] | None = None,
         frame_num: int = 121,
@@ -1429,6 +1577,9 @@ class LTX2:
         gen_state=None,
         input_video_is_hdr: bool = False,
         lora_dir: str | None = None,
+        save_latents: bool = False,
+        app_version: str = "",
+        latent_model_type: str = "",
         **kwargs,
     ):
         if self._interrupt:
@@ -1527,7 +1678,7 @@ class LTX2:
                 latent_stride = int(getattr(scale_factors, "time", scale_factors[0]))
         if image_mode > 0 and "V" in video_prompt_type and any(letter in video_prompt_type for letter in "PODE") and ((int(frame_num) - 1) // latent_stride + 1) <= 1:
             frame_num = latent_stride + 1
-            print(f"[WAN2GP][LTX2] Expanding image pose/depth/edge control from one latent to two latents ({frame_num} frames) to allow denoised image generation.")
+            print(f"[WanGP][LTX2] Expanding image pose/depth/edge control from one latent to two latents ({frame_num} frames) to allow denoised image generation.")
 
         input_video_strength = max(0.0, min(1.0, input_video_strength))
         if requested_outpaint_gamma_roundtrip:
@@ -1664,6 +1815,36 @@ class LTX2:
 
         latent_conditioning_stage2 = None
 
+        # Latent Branch (Phase 2): on the head window of a plain
+        # continuation job the frozen prefix is the sidecar's kept latents
+        # verbatim, injected as a latent-index conditioning at the window's
+        # first latent (exactly like the start-image path, where the denoise
+        # mask keeps the injected tokens clean at every step of both
+        # stages). The guide pixels are not re-encoded. Any mismatch with
+        # this window's latent grid falls back to the pixel-prefix path.
+        prefix_video_latent = None
+        if (window_no == 1 and image_start is None
+                and input_video is not None and int(prefix_frames_count or 0) > 0
+                and input_frames is None and input_frames2 is None
+                and input_ref_images is None and video_conditioning is None
+                and frozen_control_video is None and not msr and not editanything
+                and joyai_context is None and prefix_latents is not None):
+            _pv = prefix_latents
+            if _pv.dim() == 5 and _pv.shape[0] == 1:
+                _pv = _pv[0]
+            _pv_rh = int(height)
+            _pv_rw = int(width)
+            _pv_rh = int(math.ceil(_pv_rh / 64) * 64)
+            _pv_rw = int(math.ceil(_pv_rw / 64) * 64)
+            _pv_z = int(getattr(self.video_encoder, "latent_channels", 0) or 0)
+            _pv_t = (int(frame_num) - 1) // int(latent_stride) + 1
+            if (_pv.dim() == 4 and int(_pv.shape[0]) == _pv_z and 0 < int(_pv.shape[1]) <= _pv_t
+                    and int(_pv.shape[2]) == _pv_rh // 32 and int(_pv.shape[3]) == _pv_rw // 32):
+                prefix_video_latent = _pv
+                print(f"[WanGP][LTX2] The first {int(_pv.shape[1])} latents of the head window are the kept latents of the source latent file (latent branch); the guide pixels are not re-encoded.")
+            else:
+                print(f"[WanGP][LTX2] The video prefix of the source latent file {tuple(int(u) for u in _pv.shape)} does not match the latent grid of this window ([1, {_pv_z}, <= {_pv_t}, {_pv_rh // 32}, {_pv_rw // 32}]); the head window uses a fresh encode of the guide pixels.")
+
         images = []
         guiding_images = []
         guiding_images_stage2 = []
@@ -1697,7 +1878,10 @@ class LTX2:
                     extra_list.append(entry)
 
         if image_start is None:
-            _append_prefix_entries(images, images_stage2)
+            # The pixel prefix is the Phase 0 stand-in for the frozen
+            # prefix; a valid sidecar prefix (Phase 2) replaces it.
+            if prefix_video_latent is None:
+                _append_prefix_entries(images, images_stage2)
         else:
             entry = (image_start, _to_latent_index(0, latent_stride), input_video_strength, "lanczos")
             images.append(entry)
@@ -1721,7 +1905,38 @@ class LTX2:
         audio_conditionings = None
         audio_conditionings_stage2 = None
         audio_identity_guidance_scale = 0.0
-        if input_waveform is not None:
+        # Latent Branch (Phase 2): the head window's audio prefix is the
+        # sidecar's kept audio latents (sliced by time ratio), so the source
+        # waveform is not re-encoded for it; the remaining audio frames are
+        # denoised on from the frozen prefix like a continuation.
+        prefix_audio_latent = None
+        if prefix_audio_latents is not None:
+            _pa = prefix_audio_latents
+            if _pa.dim() == 4 and _pa.shape[0] == 1:
+                # The pipelines' audio target always derives from the
+                # default layout (16000 Hz / 160 hop / 4x = 25 Hz, 8
+                # channels, 16 mel bins), so check against exactly the
+                # target AudioConditionByLatentPrefix.apply_to would see.
+                _pa_target = AudioLatentShape.from_video_pixel_shape(
+                    VideoPixelShape(
+                        batch=1,
+                        frames=int(frame_num),
+                        width=1,
+                        height=1,
+                        fps=float(fps),
+                    ),
+                )
+                if (int(_pa.shape[1]) == int(_pa_target.channels) and int(_pa.shape[3]) == int(_pa_target.mel_bins)
+                        and 0 < int(_pa.shape[2]) <= int(_pa_target.frames)):
+                    prefix_audio_latent = _pa.to(device=self.device, dtype=self.dtype)
+                    print(f"[WanGP][LTX2] The first {int(_pa.shape[2])} audio latents of the head window are the kept latents of the source latent file (latent branch); the source waveform is not re-encoded.")
+                else:
+                    print(f"[WanGP][LTX2] The audio prefix of the source latent file {tuple(int(u) for u in _pa.shape)} does not match the audio target of this window ({int(_pa_target.frames)} latent frames, {int(_pa_target.channels)} channels, {int(_pa_target.mel_bins)} mel); the head window re-encodes the source waveform.")
+            else:
+                print(f"[WanGP][LTX2] The audio prefix of the source latent file {tuple(int(u) for u in _pa.shape)} is not a batched [1, c, t, mel] latent; the head window re-encodes the source waveform.")
+        if prefix_audio_latent is not None:
+            audio_conditionings = [AudioConditionByLatentPrefix(prefix_audio_latent)]
+        elif input_waveform is not None:
             if audio_scale is None:
                 audio_scale = 1.0
             audio_strength = max(0.0, min(1.0, float(audio_scale)))
@@ -1765,7 +1980,7 @@ class LTX2:
                 waveform_sample_rate = int(waveform_sample_rate or 0)
                 input_samples = int(waveform.shape[-1])
                 if "1" not in audio_prompt_type and audio_processor.waveform_too_short_for_mel(waveform, waveform_sample_rate):
-                    print(f"[WAN2GP][LTX2] Audio conditioning is too short for mel encoding ({input_samples} samples at {waveform_sample_rate} Hz); disabling it so audio frames are denoised.")
+                    print(f"[WanGP][LTX2] Audio conditioning is too short for mel encoding ({input_samples} samples at {waveform_sample_rate} Hz); disabling it so audio frames are denoised.")
                     skip_audio_conditioning = True
                 if not skip_audio_conditioning:
                     audio_processor = audio_processor.to(waveform.device)
@@ -1865,6 +2080,8 @@ class LTX2:
             prompt_relay_frame_offset = max(0, int(prefix_frames_count or 0))
         ltx2_22B_class = self.model_def.get("ltx2_22B_class", False)
 
+        latent_capture = {} if save_latents else None
+
         def run_ltx2_pipeline(**pipeline_kwargs):
             pipeline_kwargs["custom_sigmas"] = custom_sigmas
             pipeline_context = self.pipeline.joyai_echo_context(joyai_context) if joyai_context is not None else nullcontext()
@@ -1897,6 +2114,7 @@ class LTX2:
                 alt_scale=float(alt_scale),
                 sample_solver=sample_solver,
                 images=images,
+                prefix_video_latent=prefix_video_latent,
                 guiding_images=guiding_images or None,
                 guiding_images_stage2=guiding_images_stage2 or None,
                 images_stage2=images_stage2 if stage2_override else None,
@@ -1931,6 +2149,7 @@ class LTX2:
                 hdr_transform=hdr_transform,
                 skip_audio=hdr_enabled or alpha_gen,
                 tiled_stage_2="~" in video_prompt_type and not skip_stage_2,
+                latent_capture=latent_capture,
             )
         else:
             distilled_kwargs = {}
@@ -1953,6 +2172,7 @@ class LTX2:
                 prompt_relay_frame_offset=prompt_relay_frame_offset,
                 prompt_relay_epsilon=prompt_relay_epsilon,
                 images=images,
+                prefix_video_latent=prefix_video_latent,
                 guiding_images=guiding_images or None,
                 guiding_images_stage2=guiding_images_stage2 or None,
                 images_stage2=images_stage2 if stage2_override else None,
@@ -1992,6 +2212,7 @@ class LTX2:
                 ltx2_22B_class=ltx2_22B_class,
                 use_ancestral_sampler=distill and ltx25,
                 layout_to_render=layout_to_render,
+                latent_capture=latent_capture,
                 **distilled_kwargs,
             )
 
@@ -2058,6 +2279,85 @@ class LTX2:
             result["hdr"] = True
             result["hdr_format"] = "linear_srgb"
             result["hdr_transform"] = hdr_transform
+        if save_latents and latent_capture is not None and latent_capture.get("video") is not None:
+            # Build the latent companion payload (the file itself is written by
+            # the caller: the all-latent sidecar, the job's windows stacked
+            # on one time dimension, the sidecar the sole content source of
+            # the video).
+            try:
+                window_start_frame_no = int(kwargs.get("window_start_frame_no") or 0)
+                model_filename = str(kwargs.get("model_filename") or "")
+                lora_names = [os.path.basename(str(lora)) for lora in (loras_selected or []) if str(lora).strip()]
+                # Unbatch to the canonical [c, t, h, w] layout the sidecar uses
+                # for every family (the captured state latent is [1, c, t, h, w])
+                # so the caller's window frame math and the decode job share one
+                # code path with Wan/LongCat.
+                video_latent = latent_capture["video"]
+                if video_latent.dim() == 5 and video_latent.shape[0] == 1:
+                    video_latent = video_latent[0]
+                payload = latent_io.build_latent_payload(
+                    video_latent,
+                    app_version=app_version or "",
+                    model_type=latent_model_type or self.model_type or "",
+                    base_model_type=str(self.base_model_type or ""),
+                    model_filename=model_filename,
+                    loras=lora_names,
+                    vae_file=os.path.basename(str(self.video_vae_path)) if getattr(self, "video_vae_path", None) else "",
+                    vae_sha256=latent_io.sha256_file(self.video_vae_path) if getattr(self, "video_vae_path", None) and os.path.isfile(str(self.video_vae_path)) else "",
+                    vae_z_dim=int(video_latent.shape[0]) if video_latent.dim() == 4 else 0,
+                    vae_dtype=str(self.VAE_dtype).replace("torch.", ""),
+                    frames=int(frame_num),
+                    fps=float(fps),
+                    seed=int(seed),
+                    prompt=str(input_prompt)[:1000],
+                    denoising_strength=float(denoising_strength or 1.0),
+                    steps=int(sampling_steps),
+                    # Causal LTX-2 VAE: the first latent covers one pixel frame,
+                    # every later latent covers 8 (recorded so any VAE layout
+                    # can derive its pixel frame count at decode time).
+                    latent_stride=int(latent_stride),
+                    frame_offset=1,
+                    is_hdr=hdr_enabled,
+                    hdr_transform=self.model_def["ltx2_hdr_transform"] if hdr_enabled else "",
+                )
+                latent_file_obj = payload
+                audio_latent = latent_capture.get("audio")
+                if audio_latent is not None and audio_latent.numel() > 0:
+                    sample_rate = int(output_audio_sampling_rate)
+                    audio_payload = latent_io.build_audio_latent_payload(
+                        # The 4D [1, c, t, mel] latent is flattened to [c, t*mel]
+                        # (mel bins innermost) so it fits the [c, t] audio
+                        # layout; the original shape is recorded in mel_bins.
+                        audio_latent[0].reshape(int(audio_latent.shape[1]), -1),
+                        [{
+                            "window_no": int(window_no or 1),
+                            "start_sample": int(window_start_frame_no / fps * sample_rate) if (fps and sample_rate) else 0,
+                            "samples": int(audio_np.shape[0]) if audio_np is not None and audio_np.ndim == 2 else 0,
+                        }],
+                        app_version=app_version or "",
+                        model_type=latent_model_type or self.model_type or "",
+                        base_model_type=str(self.base_model_type or ""),
+                        model_filename=model_filename,
+                        loras=lora_names,
+                        audio_vae_file=os.path.basename(str(self.audio_vae_path)) if getattr(self, "audio_vae_path", None) else "",
+                        audio_vae_sha256=latent_io.sha256_file(self.audio_vae_path) if getattr(self, "audio_vae_path", None) and os.path.isfile(str(self.audio_vae_path)) else "",
+                        audio_vae_dtype=str(self.VAE_dtype).replace("torch.", ""),
+                        sample_rate=sample_rate,
+                        channels=int(audio_np.shape[1]) if audio_np is not None and audio_np.ndim == 2 else 2,
+                        samples=int(audio_np.shape[0]) if audio_np is not None and audio_np.ndim == 2 else 0,
+                        seed=int(seed),
+                        prompt=str(input_prompt)[:1000],
+                        denoising_strength=float(denoising_strength or 1.0),
+                        steps=int(sampling_steps),
+                        total_windows=1,
+                        vocoder_file=os.path.basename(str(self.vocoder_path)) if getattr(self, "vocoder_path", None) else "",
+                        mel_bins=int(audio_latent.shape[3]) if audio_latent.dim() == 4 else 0,
+                    )
+                    latent_file_obj = {**latent_file_obj, **audio_payload}
+                result["latent_file_obj"] = latent_file_obj
+                print(f"[WanGP][LTX2] Latent companion payload built (video {tuple(video_latent.shape)}" + (f", audio {tuple(audio_latent.shape)}" if audio_latent is not None else "") + ").")
+            except Exception as exc:
+                print(f"Warning: the latent companion file was not saved: {exc}")
         if latent_slice is not None:
             result["latent_slice"] = latent_slice
         if memory_latents is not None:
@@ -2065,4 +2365,45 @@ class LTX2:
         if joyai_memory_bank is not None:
             from .joyai_echo import record_joyai_echo_memory
             result = record_joyai_echo_memory(self, result, joyai_memory_bank, joyai_store_mem_selectors, prefix_frames_count, frame_num, fps, window_no)
+        if prefix_kept_windows is not None and int(prefix_kept_frames or 0) > 0:
+            # The branch job's kept region is a fresh decode of the source
+            # sidecar's kept windows (the same reconstruction the Latent
+            # Decode job performs: the per-window recorded trims, the
+            # family's grid; an all-latent i2v sidecar splices its embedded
+            # start image into frame 0 — content, not a pointer), handed
+            # back as decoded_prefix so the job uses it as the output
+            # video's prefix instead of a re-extraction of the source video
+            # (source independence). Best effort: any failure keeps the
+            # source-pixel prefix the job extracted before the model call.
+            from .ltx_core.model.video_vae import decode_video_to_tensor
+            def _decode_kept_window(spec):
+                # The kept latents keep the dtype they were saved in
+                # (often fp16), while the decoder weights may be bf16;
+                # cast to the decoder's own device and dtype, like the
+                # Latent Decode job does, or the decode fails on the
+                # mismatch and the output silently keeps the
+                # source-pixel prefix.
+                _first_param = next(self.video_decoder.parameters(), None)
+                _dec_device = _first_param.device if _first_param is not None else self.device
+                _dec_dtype = _first_param.dtype if _first_param is not None else torch.float16
+                _lat = spec["latents"].to(device=_dec_device, dtype=_dec_dtype)
+                if _lat.dim() == 4:
+                    _lat = _lat.unsqueeze(0)
+                _video = decode_video_to_tensor(
+                    _lat, self.video_decoder, tiling_config,
+                    interrupt_check=interrupt_check,
+                    hdr_transform=self.model_def["ltx2_hdr_transform"] if hdr_enabled else None,
+                    output_dtype=torch.float16 if hdr_enabled else None)
+                if _video is None:
+                    return None
+                return _video.permute(3, 0, 1, 2).contiguous().to("cpu")
+            try:
+                decoded_prefix = latent_io.decode_kept_windows(
+                    _decode_kept_window, prefix_kept_windows, int(prefix_kept_frames),
+                    is_i2v=bool(prefix_is_i2v),
+                    i2v_image_frames=prefix_i2v_image_frames if prefix_is_i2v else None)
+                if decoded_prefix is not None:
+                    result["decoded_prefix"] = decoded_prefix
+            except Exception as exc:
+                print(f"[WanGP][LTX2] The kept region of the branch could not be decoded ({exc}); the output keeps the source-pixel prefix.")
         return result
