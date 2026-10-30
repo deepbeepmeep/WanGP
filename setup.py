@@ -312,13 +312,18 @@ def run_cmd(cmd, env_vars=None):
 
     subprocess.run(cmd, shell=True, check=True, env=custom_env)
 
-def run_pip_component(pip, cmd, env_path=None):
+def run_pip_component(pip, cmd, env_path=None, component=None):
     if not cmd: return
     env_vars = None
-    if not IS_WIN and env_path:
+    if not IS_WIN:
+        build_bin = (os.path.join(os.path.abspath(env_path), "bin") if env_path else os.path.dirname(os.path.abspath(sys.executable)))
         # Build-time generators may invoke bare python instead of sys.executable.
-        env_vars = {"PATH": os.path.join(os.path.abspath(env_path), "bin") + os.pathsep + os.environ.get("PATH", "")}
-    run_cmd(cmd.format(pip=pip) if "{pip}" in cmd else f"{pip} {cmd}", env_vars=env_vars)
+        env_vars = {"PATH": build_bin + os.pathsep + os.environ.get("PATH", "")}
+    try:
+        run_cmd(cmd.format(pip=pip) if "{pip}" in cmd else f"{pip} {cmd}", env_vars=env_vars)
+    except subprocess.CalledProcessError as e:
+        name = component or "pip component"
+        raise RuntimeError(f"Failed to install {name} (pip exited with code {e.returncode}).") from e
 
 def install_plugin_requirements(pip_cmd):
     plugins_dir = "plugins"
@@ -384,11 +389,42 @@ def show_status():
     print(f" * = Active Environment")
     print("="*90 + "\n")
 
-def install_logic(env_name, env_type, env_path, py_k, torch_k, triton_k, sage_k, sparge_k, flash_k, kernel_list, config):
+def get_env_python(env_type, env_path):
+    if env_type == "none":
+        return sys.executable
+    if env_type == "conda":
+        return os.path.join(os.path.abspath(env_path), "python.exe" if IS_WIN else "bin/python")
+    return ENV_TEMPLATES[env_type]["run"].format(dir=env_path).strip('"')
+
+def verify_sparge_install(env_type, env_path, expected_flag=None):
+    py_exec = get_env_python(env_type, env_path)
+    check = """
+import sys
+import spas_sage_attn.core as core
+
+expected = sys.argv[1] if len(sys.argv) > 1 else None
+if expected:
+    if not getattr(core, expected, False):
+        print(f"missing SpargeAttn kernel flag: {expected}")
+        sys.exit(1)
+elif not (core.SM80_ENABLED or core.SM89_ENABLED or core.SM90_ENABLED):
+    print("SpargeAttn has no enabled kernel")
+    sys.exit(1)
+"""
+    cmd = [py_exec, "-c", check]
+    if expected_flag:
+        cmd.append(expected_flag)
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"SpargeAttention verification failed in the {env_type} environment (exit code {e.returncode}).") from e
+
+def install_logic(env_name, env_type, env_path, py_k, torch_k, triton_k, sage_k, sparge_k, flash_k, kernel_list, config, gpu_key=None):
     template = ENV_TEMPLATES[env_type]
     target_py_ver = config['components']['python'][py_k]['ver']
 
     print(f"\n[1/3] Preparing Environment: {env_name} ({env_type})...")
+    create_cmd = ""
 
     if env_type != "none":
         if env_type == "venv":
@@ -435,7 +471,18 @@ def install_logic(env_name, env_type, env_path, py_k, torch_k, triton_k, sage_k,
 
     if sparge_k:
         cmd = resolve_cmd(config['components']['sparge'][sparge_k]['cmd'])
-        if cmd: run_pip_component(pip, cmd, env_path=env_path if env_type != "none" else None)
+        if cmd:
+            try:
+                run_pip_component(pip, cmd, env_path=env_path if env_type != "none" else None, component="SpargeAttention")
+                expected_flag = {"RTX_30": "SM80_ENABLED", "RTX_40": "SM89_ENABLED", "RTX_50": "SM89_ENABLED"}.get(gpu_key)
+                if not IS_WIN:
+                    verify_sparge_install(env_type, env_path, expected_flag)
+            except Exception as e:
+                print(f"\n[!] SpargeAttention install failed: {e}")
+                if not IS_WIN and sparge_k == "v010_cu13":
+                    print("[*] For CUDA 13, the SpargeAttn source build needs NVCC_PREPEND_FLAGS='-DNDEBUG'.")
+                    print("[*] The build also needs its Python on PATH so the kernel generators use the installed interpreter.")
+                raise SystemExit(1)
 
     if flash_k:
         cmd = resolve_cmd(config['components']['flash'][flash_k]['cmd'])
@@ -515,11 +562,11 @@ def do_install_interactive(env_type, config, detected_key):
         flash_k = menu("Flash Attention", config['components']['flash'], base['flash'])
         kernels = base['kernels']
 
-        install_logic(name, env_type, path, py_k, torch_k, triton_k, sage_k, sparge_k, flash_k, kernels, config)
+        install_logic(name, env_type, path, py_k, torch_k, triton_k, sage_k, sparge_k, flash_k, kernels, config, gpu_key=detected_key)
 
     else:
         p = config['gpu_profiles'][detected_key]
-        install_logic(name, env_type, path, p['python'], p['torch'], p['triton'], p['sage'], p.get('sparge'), p.get('flash'), p['kernels'], config)
+        install_logic(name, env_type, path, p['python'], p['torch'], p['triton'], p['sage'], p.get('sparge'), p.get('flash'), p['kernels'], config, gpu_key=detected_key)
 
     manager.add_env(name, env_type, path)
 
@@ -896,7 +943,8 @@ def do_upgrade(config):
     env_data = manager.list_envs()[env_name]
 
     gpu_name, vendor = get_gpu_info()
-    rec = config['gpu_profiles'][get_profile_key(gpu_name, vendor)]
+    gpu_key = get_profile_key(gpu_name, vendor)
+    rec = config['gpu_profiles'][gpu_key]
 
     py_k = menu("Python Version", config['components']['python'], rec['python'])
     torch_k = menu("Torch Version", config['components']['torch'], rec['torch'])
@@ -905,7 +953,7 @@ def do_upgrade(config):
     sparge_k = menu("Sparge Attention", config['components']['sparge'], rec.get('sparge'))
     flash_k = menu("Flash Attention", config['components']['flash'], rec['flash'])
 
-    install_logic(env_name, env_data['type'], env_data['path'], py_k, torch_k, triton_k, sage_k, sparge_k, flash_k, rec['kernels'], config)
+    install_logic(env_name, env_data['type'], env_data['path'], py_k, torch_k, triton_k, sage_k, sparge_k, flash_k, rec['kernels'], config, gpu_key=gpu_key)
 
 def get_system_specs():
     ram_gb = 0

@@ -214,11 +214,27 @@ pip install https://github.com/woct0rdho/SpargeAttn/releases/download/v0.1.0-win
 ```
 
 #### Linux Install Sparge Attention
-Activate your WanGP Python environment before running these commands; SpargeAttn's build also invokes `python` from `PATH` to generate its kernels.
+Activate your WanGP Python environment before running these commands; SpargeAttn's build compiles against that environment's PyTorch. The installer prepends the environment's `bin` directory to `PATH`, so the build's kernel generators run with the same Python that builds the package.
+
+CUDA 13 builds can fail with `error: identifier "__assert_fail" is undefined` in `cuda_fp8.hpp`, `cuda_fp6.hpp`, or `cuda_fp4.hpp`. The 1 click installer sets `NVCC_PREPEND_FLAGS='-DNDEBUG'` for the Linux CUDA 13 Sparge entry. This turns off C assertions during the build, so the CUDA header assertion does not stop it. `-DNDEBUG` is intentional: it disables assertion checks for this build and does not change the sparse attention kernels.
+
+Manual equivalent:
 ```
 python -m pip install ninja wheel packaging
-python -m pip install --no-build-isolation git+https://github.com/woct0rdho/SpargeAttn.git
+NVCC_PREPEND_FLAGS='-DNDEBUG' python -m pip install --no-build-isolation git+https://github.com/woct0rdho/SpargeAttn.git
 ```
+
+If you only need the kernels for one GPU family, limit the build:
+```
+TORCH_CUDA_ARCH_LIST="12.0" NVCC_PREPEND_FLAGS='-DNDEBUG' \
+  python -m pip install --no-build-isolation git+https://github.com/woct0rdho/SpargeAttn.git   # RTX 50xx only
+TORCH_CUDA_ARCH_LIST="8.9" NVCC_PREPEND_FLAGS='-DNDEBUG' \
+  python -m pip install --no-build-isolation git+https://github.com/woct0rdho/SpargeAttn.git    # RTX 40xx only
+TORCH_CUDA_ARCH_LIST="8.6" NVCC_PREPEND_FLAGS='-DNDEBUG' \
+  python -m pip install --no-build-isolation git+https://github.com/woct0rdho/SpargeAttn.git    # RTX 30xx only
+```
+
+The 1 click installer selects Sparge Attention for the Linux CUDA 13 RTX 30XX-50XX profiles. Windows uses the prebuilt wheels above; macOS/MPS and AMD/ROCm do not install Sparge.
 
 
 ## Flash Attention
