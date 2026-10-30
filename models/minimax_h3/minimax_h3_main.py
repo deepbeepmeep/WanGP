@@ -94,7 +94,24 @@ def _strip_wrappers(state_dict, quantization_map=None, tied_weights_map=None, pd
 
 
 def _strip_text_encoder_wrapper(state_dict, quantization_map=None, tied_weights_map=None):
-    root = "language_model" if "model.embed_tokens.weight" in state_dict else ""
+    # Strip Comfy quantization metadata markers
+    keys_to_remove = [k for k in list(state_dict.keys()) if k.endswith(".comfy_quant")]
+    for k in keys_to_remove:
+        del state_dict[k]
+
+    # Dequantize INT8 embedding to BF16 so MMGP sees consistent dtypes
+    embed_weight_key = "model.embed_tokens.weight"
+    embed_scale_key = "model.embed_tokens.weight_scale"
+    if embed_weight_key in state_dict and embed_scale_key in state_dict:
+        w = state_dict[embed_weight_key]
+        s = state_dict[embed_scale_key]
+        if w.dtype == torch.int8:
+            dequant = w.to(torch.float32) * s.to(torch.float32)
+            state_dict[embed_weight_key] = dequant.to(torch.bfloat16)
+            del state_dict[embed_scale_key]
+            print("[H3 FIX] Dequantized INT8 embedding to BF16")
+
+    root = "language_model" if embed_weight_key in state_dict else ""
     return tuple(offload.map_state_dict([state_dict, quantization_map, tied_weights_map], rules={"model": root}))
 
 
@@ -243,6 +260,41 @@ def _load_text_encoder(filename, dtype):
                             preprocess_sd=_strip_text_encoder_wrapper, ignore_unused_weights=True)
     runtime.lookup_on_cpu(text_encoder.language_model.embed_tokens)  # the 1.5 GB token table stays in RAM: mmgp looks up the prompt's rows on the CPU
     text_encoder.set_tokenizer(os.path.dirname(config_path))
+
+    # Fix AWQ pre_quant_scale: load directly from checkpoint since MMGP strips them.
+    # Map checkpoint key prefix "model." → module path "language_model."
+    import safetensors.torch as _st
+    _awq_count = 0
+    try:
+        with _st.safe_open(filename, framework="pt", device="cpu") as _sf:
+            for _key in _sf.keys():
+                if ".pre_quant_scale" in _key and _key.startswith("model."):
+                    # Convert "model.layers.N.mlp.down_proj.pre_quant_scale"
+                    # to "language_model.layers.N.mlp.down_proj"
+                    _mod_path = "language_model" + _key[len("model"):_key.rfind(".pre_quant_scale")]
+                    _parts = _mod_path.split(".")
+                    _mod = text_encoder
+                    for _p in _parts:
+                        if _p.isdigit():
+                            _mod = _mod[int(_p)]
+                        else:
+                            _mod = getattr(_mod, _p)
+                    _scale = _sf.get_tensor(_key).to(dtype=dtype)
+                    # Register as buffer and monkey-patch forward
+                    if hasattr(_mod, "forward"):
+                        _mod.register_buffer("pre_quant_scale", _scale, persistent=False)
+                        _orig_fwd = _mod.forward
+                        def _make_awq_fwd(orig, pqs):
+                            def awq_forward(input):
+                                scaled = input * pqs.to(device=input.device, dtype=input.dtype)
+                                return orig(scaled)
+                            return awq_forward
+                        _mod.forward = _make_awq_fwd(_orig_fwd, _scale)
+                        _awq_count += 1
+    except Exception as _e:
+        print(f"[H3 FIX] Warning: could not load AWQ scales: {_e}")
+    print(f"[H3 FIX] Patched {_awq_count} AWQ linears with pre_quant_scale from checkpoint")
+
     text_encoder.eval().requires_grad_(False)
     return text_encoder
 
