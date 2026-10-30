@@ -6416,8 +6416,14 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
     self.pool_models = [] if not pinPool or not asyncTransfers else list(models) if pinPool is True else pinPool if isinstance(pinPool, list) else [pinPool]
     self.cpu_compute_forced = cpuComputeForce
     if self.anyCompiledModule:
-        torch.compiler.reset()
-        torch._dynamo.config.cache_size_limit = 10000
+        # torch.compiler.reset() used to be called here, which threw away the Inductor cache of every
+        # model compiled in the same process: each new model paid the compilation of its tower again from
+        # scratch. The modules loaded a second time are un-compiled one by one where they get compiled
+        # (see the compilation loop below), which is what needs protecting against nested graphs.
+        # The Dynamo cache must stay wide for the many shapes a generation walks through, but an unbounded
+        # cache lets a new shape recompile every compiled module of the tower, which is what makes the
+        # first steps of a new resolution take minutes.
+        torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
     #dynamic=True
 
       #  torch._logging.set_logs(recompiles=True)
@@ -6696,7 +6702,13 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
                     print(f"Pytorch compilation of model '{model_id}' is not yet supported.")
 
             for submodel in modules_to_be_compiled:
-                submodel.forward= torch.compile(submodel.forward,  backend= "inductor", mode= compile_mode) # , fullgraph= True, mode= "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs",  
+                forward = submodel.forward
+                # A module compiled during a previous profile of the same process still carries its
+                # compiled forward: compiling it once more nests the graphs, so un-compile it first.
+                if getattr(forward, "_torchdynamo_orig_callable", None) is not None:
+                    torch._dynamo.eval_frame.remove_from_cache(forward)
+                    forward = forward._torchdynamo_orig_callable
+                submodel.forward= torch.compile(forward,  backend= "inductor", mode= compile_mode) # , fullgraph= True, mode= "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs",  
                     #dynamic=True,
 
         if towers_names:
@@ -6708,6 +6720,12 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
         self.tune_preloading(model_id, current_budget, towers_names, covers)
         if self.preload_plans and current_budget > 0 and towers_names and self.async_transfers and not compilationInThisOne:
             (auto_models if self.auto_preload_requested else fixed_models).append(model_id)
+        elif compilationInThisOne and towers_names and self.preload_plans and current_budget > 0 and self.verboseLevel >= 1:
+            # A compiled tower is kept out of the preload list above, so its weights are streamed from the
+            # disk during the steps. Without this line the user sees very slow steps and no hint of the cause.
+            tqdm.write(f"The compiled model '{model_id}' cannot preload its weights in the GPU, so the tower "
+                       f"is streamed from the disk during the steps: PyTorch compilation is best left disabled "
+                       f"on the low VRAM memory profiles.")
         self.parameters_ref  = {} 
 
 

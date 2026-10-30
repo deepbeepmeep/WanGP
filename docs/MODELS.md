@@ -93,6 +93,8 @@ LTX 2.5 also offers finishing and visual-effects workflows:
 
 Decoder choices affect both memory and appearance. The optional **NAD** decoder for LTX 2.3/2.5 trades additional time and VRAM for a different quality profile. Use the original decoder as the initial baseline, and choose only decoder/LoRA combinations offered by the selected model. LTX-based upscaling and detail refinement are also available in postprocessing and Media Flow.
 
+Acceleration follows the family: LTX-2 uses **CUDA Graph**, not **PyTorch Compilation**. The attention and the fused kernels of the LTX-2 blocks are deliberately kept out of the compiled graphs, so an offloaded transformer is traced in as many pieces as it has blocks, and every change of latent shape between the two stages is traced again. The first step of a new shape therefore costs about ten times an uncompiled step with a quarter of the tower compiled, and about twenty times with the whole tower, while a warm compiled run is no faster than an uncompiled one. CUDA Graph captures once per shape and needs no re-trace, which is what the many steps of a normal generation pay for. When the setting asks for compilation, the load prints `Pytorch compilation is not supported for this Model` and the model is loaded uncompiled.
+
 ### Wan 2.1 and Wan 2.2
 
 The Wan family covers general generation and many specialist animation, editing and control workflows:
