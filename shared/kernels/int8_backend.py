@@ -47,6 +47,7 @@ _COMPILE_CACHE_VERSION = 4
 # Includes row quantization, a possible INT32 GEMM result, and a temporary output.
 # Never allocate an activation-sized quantization buffer for a whole video.
 _SCRATCH_BYTES = 16 * 1024 * 1024
+_WGP_BLOCK_ROWS = 65535  # rows of one WGPKernels per-block activation quantization call
 
 
 def prepare_compile_cache(enabled):
@@ -793,7 +794,13 @@ class _WgpRowProjection:
     @staticmethod
     def prepare(module, x):
         _, group, precise = _WgpRowProjection.key(module)
-        return _wgp.prepare(x, group, _wgp_path(module, x, group, precise))
+        path = _wgp_path(module, x, group, precise)
+        if path != "block" or x.shape[0] <= _WGP_BLOCK_ROWS:
+            return _wgp.prepare(x, group, path)
+        # wq8_quantize_blocks puts the rows on the CUDA grid's y axis, at most 65535 per call (else CUDA error 1): longer inputs are
+        # quantized by pieces; the GEMM that follows has no row limit
+        parts = [_wgp.prepare(x[start:start + _WGP_BLOCK_ROWS], group, path) for start in range(0, x.shape[0], _WGP_BLOCK_ROWS)]
+        return _wgp.Prepared(path, torch.cat([part.x for part in parts]), None, torch.cat([part.scale for part in parts]), x.dtype)
 
     @staticmethod
     def rows(module, prepared, start, stop):
