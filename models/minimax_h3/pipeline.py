@@ -519,8 +519,12 @@ class MiniMaxH3Pipeline:
         cache_key = self._prompt_cache_key(prompt, presentation)
         return self.text_encoder_cache.encode(encode_fn, prompt, device=self.device, cache_keys=cache_key)[0]
 
-    def _configure_tiling(self, _tile_size):
-        self.vae.enable_tiling(tile_sample_min_height=256, tile_sample_min_width=256)
+    def _configure_tiling(self, tile_size):
+        if tile_size == 0:  # vae_config == 1: tiling explicitly disabled
+            self.vae.use_tiling = False
+            return
+        tile = tile_size or 256
+        self.vae.enable_tiling(tile_sample_min_height=tile, tile_sample_min_width=tile)
 
     def _encode_video(self, video, keep_all_latents=False):
         self._check_abort()
