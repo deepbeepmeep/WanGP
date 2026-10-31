@@ -34,6 +34,21 @@ if os.name == "nt":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 if sys.platform.startswith("linux") and "NUMBA_THREADING_LAYER" not in os.environ:
     os.environ["NUMBA_THREADING_LAYER"] = "workqueue"
+# Console stamps: put the time of day at the start of every line the console prints. Bar redraws
+# are echoed untouched, so a bar is stamped once, where its line starts, and a line carrying no
+# text at all -- a bare print(), a status line closing on a carriage return -- is stamped nowhere.
+# Nothing is written to a file: pipe the output ('wgp.py ... 2>&1 | tee job.log') when you want a
+# stamped log. In a terminal, Ctrl+C writes one newline so the shutdown lines start on a clean
+# line, clear of the ^C the terminal echoes.
+# A Traceback line takes the stamps off for good: a crash dump and the prompt after it read clean.
+# A line that opens with a rule of stars -- the version banner, the mmgp banners -- is a header, not
+# a message: it is echoed unstamped, so its rule keeps the width the app built it with.
+# Installed before torch / mmgp so the model loading output is stamped too.
+# Off by default in every mode: --log-timestamp=on stamps this run, WAN2GP_LOG_TIMESTAMP=1 stamps
+# every run, and a plain run keeps the output it produced before, byte for byte.
+from shared.utils import console_stamps as _console_stamps
+_console_stamps.install_console_stamps(sys.argv)
+
 from shared.asyncio_utils import silence_proactor_connection_reset
 silence_proactor_connection_reset()
 
@@ -2775,6 +2790,7 @@ attention_modes_supported = get_supported_attention_modes()
 override_attention_modes_installed = get_override_attention_modes()
 override_attention_modes_supported = get_supported_override_attention_modes()
 args = parse_wgp_args(CONFIG_FILENAME)
+_console_stamps.configure_console_stamps(args, sys.argv)
 migrate_loras_layout()
 
 gpu_major, gpu_minor = torch.cuda.get_device_capability(args.gpu if len(args.gpu) > 0 else None)
