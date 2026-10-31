@@ -4249,6 +4249,12 @@ def init_pipe(pipe, kwargs, profile, output_type="video", extension=None):
 
     kwargs["extraModelsToQuantize"]=  None
     budgets = kwargs.setdefault("budgets", {})
+    # per-model VRAM budgets (in MB) from the config: they beat the profile defaults below but never a budget a handler set
+    user_budgets = server_config.get("budgets")
+    if isinstance(user_budgets, dict):
+        for name, value in user_budgets.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                budgets.setdefault(name, value)
     mmgp_profile = int(profile)
     if mmgp_profile in (0, 1, 2, 3, 4, 5): # the budgets a handler gives replace the profile's
         # text encoders run once per prompt: streamed, they use less VRAM and overlap their transfers with their layers (a model whose
