@@ -13,6 +13,15 @@ def _arg_provided(argv: Sequence[str], name: str) -> bool:
     return any(one_arg == name or str(one_arg).startswith(f"{name}=") for one_arg in argv)
 
 
+def _arg_on_off(raw: str) -> bool:
+    value = str(raw).strip().lower()
+    if value in ("on", "yes", "true", "1"):
+        return True
+    if value in ("off", "no", "false", "0"):
+        return False
+    raise argparse.ArgumentTypeError(f"expected on, off, yes or no, got {raw!r}")
+
+
 def parse_wgp_args(config_filename: str, argv: Sequence[str] | None = None):
     from shared.deepy.config import normalize_deepy_voice_language
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -40,6 +49,18 @@ def parse_wgp_args(config_filename: str, argv: Sequence[str] | None = None):
     add("--config", type=str, default="", help=f"Path to config folder for {config_filename} and queue.zip")
     add("--profile", type=str, default=-1, help="Profile No")
     add("--verbose", type=str, default=1, help="Verbose level")
+    add("--log-timestamp", dest="log_timestamp", type=_arg_on_off, nargs="?", const=True, default=False, metavar="on|off",
+        help="Stamp every line WanGP prints to the console with the time of day, for instance '2026-10-12 15:06:41 | '. "
+             "Default: off in every mode - a plain run prints exactly what it printed before. 'on' stamps this "
+             "run's console, and the flag on its own means on. Nothing is written "
+             "to a file: pipe it ('wgp.py ... 2>&1 | tee job.log') to keep a stamped log. "
+             "WAN2GP_LOG_TIMESTAMP=1 sets the default to on for every run")
+    add("--log-timestamp-format", dest="log_timestamp_format", type=str, default=None, metavar="FMT",
+        help="Stamp format: full (the default, 'YYYY-MM-DD HH:MM:SS'), clock, date, ms, uptime, clock+uptime, "
+             "any strftime pattern (e.g. the full preset) or a token mix (e.g. \"{time}.{ms} +{uptime}\"). "
+             "The pattern is rendered literally, so brackets are available by writing them: \"[%%H:%%M:%%S]\"")
+    add("--log-timestamp-sep", dest="log_timestamp_sep", type=str, default=None, metavar="SEP",
+        help="Separator between the stamp and the message (default: pipe). 'none' separates with a single space")
     add("--debug-deepy", type=str, default=None, help="Enable Deepy verbose debug logging and write it to the given folder")
     add("--deepy-sessions-dir", type=str, default="", metavar="FOLDER", help="Store persistent Deepy sessions in FOLDER (default: ./deepy_sessions)")
     add("--workspaces-dir", type=str, default="", metavar="FOLDER", help="Workspace manifests and dedicated media folders (overrides Configuration / Outputs; default: ./workspaces)")
