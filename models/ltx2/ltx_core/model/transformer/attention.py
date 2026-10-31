@@ -7,6 +7,7 @@ from ...utils import rms_norm
 from shared import attention_kit
 from shared.attention import pay_attention
 from .rope import LTXRopeType, RopeCache, apply_rotary_emb_inplace, apply_rope_cache_heads_inplace
+from .sol_attention import SOL_ATTN_HEAD_DIM, sol_attention
 from shared.kernels.ops import project_many
 
 memory_efficient_attention = None
@@ -328,15 +329,25 @@ class Attention(torch.nn.Module):
                 out = self.to_out(out)
                 return out
 
+        use_sol = (
+            not cross_attn
+            and mask is None
+            and NAG is None
+            and self.dim_head == SOL_ATTN_HEAD_DIM
+            and sol_attention.use_for_layer(q.shape[1], self.dim_head)
+        )
         qkv_list = [q, k, v]
         q = k = v = None
-        out = pay_attention(
-            qkv_list,
-            attention_mask=mask,
-            force_attention=force_attention,
-            version=attention_version,
-            recycle_q= True,
-        )
+        if use_sol:
+            out = sol_attention(qkv_list)
+        else:
+            out = pay_attention(
+                qkv_list,
+                attention_mask=mask,
+                force_attention=force_attention,
+                version=attention_version,
+                recycle_q=True,
+            )
         if gate_logits is not None:
             gates = 2.0 * torch.sigmoid(gate_logits).to(dtype=out.dtype)
             out.mul_(gates.unsqueeze(-1))
