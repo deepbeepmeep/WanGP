@@ -1286,10 +1286,12 @@ def _mapped_pages(leaves):
         return []
     info, ranges, region = _MemoryInformation(), [], (0, 0, None)
     for pointer, nbytes in sorted(leaves):
+        if nbytes == 0: # empty tensors have no pages; their data_ptr() may be 0
+            continue
         if not region[0] <= pointer < region[1]:
             found = _virtual_query(pointer, ctypes.byref(info), ctypes.sizeof(info)) != 0
             region = (info.BaseAddress, info.BaseAddress + info.RegionSize, info.AllocationBase if info.Type != 0x20000 else None) if found else (0, 0, None) # not MEM_PRIVATE: its view
-        if region[2] is None or nbytes == 0:
+        if region[2] is None:
             continue
         start, end = pointer // PAGE_SIZE * PAGE_SIZE, (pointer + nbytes + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE
         if ranges and ranges[-1][2] == region[2] and start <= ranges[-1][1]: # one call never spans two views
