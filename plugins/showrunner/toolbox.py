@@ -129,15 +129,25 @@ class ShowrunnerToolbox:
         pictures = self._cast_pictures(target.snapshot(), shot)
         if entry is not None and entry["refs"] and pictures and not settings.get("image_refs"):  # the cast's identity in every shot that shows them
             settings["image_refs"] = [ctx.virtualize(str(target.resolve(path))) for path in pictures]
-        spoken = model.spoken_lines(target.snapshot(), shot)
-        # a speaking shot is driven by its spoken line; a reference template that follows a soundtrack (lip sync of the cast when Video With
-        # Speech's template takes no pictures) lip-syncs only a speaker it shows, never a narrator's line over the shot
-        speaking = len(spoken) == 1 and entry is not None and (entry["audio"] or entry["soundtrack"] and spoken[0]["speaker"] in shot.get("cast", []))
-        if speaking and not settings.get("audio_guide") and not shot.get("audio_slice"):
-            settings["audio_guide"] = ctx.virtualize(str(target.resolve(spoken[0]["audio"])))
+        if entry is not None and entry["task"] == "edit_image" and entry.get("sized_by_ref") and settings.get("image_refs") and "video_prompt_type" not in settings:
+            settings["video_prompt_type"] = "I"  # an illustrated page keeps the production's format: its references bring the cast, not their picture's size
+        lines = self._driving_lines(target.snapshot(), shot, entry)
+        if lines and not settings.get("audio_guide") and not shot.get("audio_slice"):  # several lines drive the shot one after the other
+            paths = [target.resolve(line["audio"]) for line in lines]
+            settings["audio_guide"] = ctx.virtualize(str(paths[0] if len(paths) == 1 else media.joined_audio(paths, target.folder / "media" / "slices")))
         if entry is not None and entry["soundtrack"] and not entry["audio"] and settings.get("audio_guide") and not settings.get("audio_prompt_type"):
             settings["audio_prompt_type"] = "AS"  # the driving audio as a kept soundtrack the picture follows, not a voice reference
         return settings
+
+    @staticmethod
+    def _driving_lines(doc: dict[str, Any], shot: dict[str, Any], entry: dict[str, Any] | None, spoken: bool = True) -> list[dict[str, Any]]:
+        """The dialogue lines that drive a shot's picture, in order (spoken=False: whether recorded or not): every line for a template driven
+        by speech, the lines of the people it shows for a reference template that follows a soundtrack, never a narrator's line over them."""
+        lines = model.spoken_lines(doc, shot) if spoken else shot.get("dialogue") or []
+        if entry is None:
+            return []
+        shown = [line for line in lines if line.get("speaker") in shot.get("cast", [])]
+        return shown if entry["soundtrack"] and not entry["audio"] else shown or lines if entry["audio"] else []
 
     def _validate(self, ctx, target, shot_ids: list[str]) -> list[str]:
         """Problems of the listed shots' settings, one line per shot ("s4: ..."), checked as render will send them (drawn and locked shots skipped)."""
@@ -363,6 +373,21 @@ class ShowrunnerToolbox:
             if shot["generation"].get("template") == templates.DRAWN:
                 renders.append({"shot": shot_id, "error": "a drawn shot: draw it with draw_svg and record it with record_take (or record_take card=...)"})
                 continue
+            doc = target.snapshot()
+            catalog = self._catalog(doc)
+            entry = templates.resolve(catalog, shot["generation"].get("template", "gen_video"))
+            recorded = model.spoken_lines(doc, shot)
+            missing = [number for number, line in enumerate(shot.get("dialogue") or []) if line in self._driving_lines(doc, shot, entry, spoken=False) and line not in recorded]
+            if missing and not shot.get("audio_slice") and not (shot["generation"].get("settings") or {}).get("audio_guide"):
+                # a line not spoken yet: the model would invent its words, in a voice of its own; spoken in the speaker's voice first, it drives the shot
+                said = []
+                if self._speak_lines(ctx, target, production, shot_id, missing, False, catalog, templates.effective(doc, catalog), [], said):
+                    renders.append({"paused": True, "not_rendered": shots[index:], "note": "the user paused you: stop here, they will resume the task later"})
+                    break
+                if errors := [f"line {item['line']}: {item['error']}" for item in said if item.get("error")]:
+                    renders.append({"shot": shot_id, "error": "its lines could not be spoken (" + "; ".join(errors) + "): fix the speakers' voices, then render it"})
+                    continue
+                shot = model.find(target.snapshot()["shots"], shot_id, "shot")
             settings = self._generation(ctx, target, shot)
             song = target.resolve(target.snapshot()["brief"].get("song"))
             if shot.get("audio_slice") and song is not None and settings.get("audio_guide") == ctx.virtualize(str(song)):
@@ -664,7 +689,10 @@ class ShowrunnerToolbox:
         doc, path = target.snapshot(), target.resolve(result["path"])
         cut = model.sequence(doc)
         lines = sum(len(shot.get("dialogue") or []) for shot, _ in cut)
-        subtitles = {"source": "your SRT", "files": len(doc["edit"]["subtitles"])} if doc["edit"]["subtitles"] else {"source": "the shots' dialogue", "cues": lines} if lines else None
+        subtitles = {"source": "your SRT", "files": len(doc["edit"]["subtitles"])} if doc["edit"]["subtitles"] else {"source": "the shots' dialogue"} if lines else None
+        if subtitles:  # the delivered file's cues with their times: checking them needs no parsing of the file
+            cues = media.subtitle_cues(path)
+            subtitles.update(count=len(cues), cues=[f"{start:.2f}-{end:.2f} {text}" for start, end, text in cues[:40]], **({"cues_listed": 40} if len(cues) > 40 else {}))
         return {"revision": doc["revision"], "version": len(doc["deliverables"]), "path": ctx.virtualize(str(path)), "method": result["method"], "duration_s": result.get("duration_s"),
                 "shots": len(cut), "left_out": [shot["id"] for shot in doc["shots"] if shot["included"] and not shot["takes"]], "sound": doc["edit"]["audio_mode"],
                 "tracks": len(doc["edit"]["audio_tracks"]), "text_overlays": len(doc["edit"]["overlays"]), "subtitles": subtitles,

@@ -33,7 +33,8 @@ format changes how the showrunner plans and cuts:
 - **Music video**: shots follow the song's sections and bars, with the singer lip-synced to the part of the song each shot covers.
 - **Short film** and **Trailer**: scenes with recurring characters, dialogue and narration; a script you supply keeps its exact words.
 - **Ad**: a short product spot with a clear message and a closing card.
-- **Illustrated story**: narrated pages with the same characters throughout.
+- **Illustrated story**: picture-book pages, each a still picture held while the narrator reads it, with the same characters throughout;
+  the edit moves slowly over each page and dissolves to the next.
 - **Anything**: start from an idea.
 
 The production opens on its **Brief**, which saves itself as you type:
@@ -70,6 +71,8 @@ The **Cast** page holds the people and recurring things of the production (a sin
 
 - **Pictures**: drop photos on the card. The highlighted one is the **reference picture** of every shot the member appears in; click
   another to use it instead. **Ask the showrunner for master images** makes a clean front-facing picture for members without one.
+  When your photos do not match the production's style (a photo in a watercolor story), the showrunner draws the reference picture
+  in that style from them, so the person keeps their face and clothes and every shot keeps the style; your photos stay on the card.
 - **Name, role and description**: what must stay the same in every shot (age, look, clothes).
 - **Looks**: a change of costume (or of age, or a wet or wounded state) is a look of the same person: its own picture, made from the
   person's reference so that the face stays, worn in the sequences the card lists.

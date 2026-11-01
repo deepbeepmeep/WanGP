@@ -523,7 +523,7 @@ def get_css():
     }
     .wangp-model-selector-tool:hover::after {
         opacity: 1;
-        transition-delay: 500ms;
+        transition-delay: 1000ms;
     }
     .wangp-model-selector-tool-search::after { content: "Search models [Alt+S]"; }
     .wangp-model-selector-tool-refresh::after { content: "Refresh model list [Alt+R]"; }

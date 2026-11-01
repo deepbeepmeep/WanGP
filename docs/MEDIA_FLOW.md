@@ -59,6 +59,8 @@ A file that fails is recorded and the batch moves on to the next one; the **Run*
 - **Output:** leave it empty for an automatic name next to the source (it includes the process, ratio, resolution and time range), type a full file name, or type a folder for an automatic name inside it. When that file already exists and **Continue** is off, a new numbered name is used, so nothing is overwritten.
 - **Output Resolution:** the size of the result for processes that generate the picture again. Higher resolutions keep more detail but take longer and need more memory. 1440p and 2160p appear when 4K resolutions are enabled in **Configuration**.
 - **Target Ratio:** for outpainting, the aspect ratio of the result. Upscalers and frame interpolators show their **Upsampling** multiplier here instead, such as x2.
+- For **FlashVSR**, select the model and transformer quantization in **Configuration > Extensions > FlashVSR**, then choose One Pass or Two Pass in Media Flow.
+- For **SeedVR2**, select **3B** or **7B** in **Configuration > Extensions > SeedVR2**. The Upsampling control shows the selected model for both image and video processes. Each run or batch keeps the model it started with.
 - **Process Strength:** how strongly a restoration is applied. Lower values stay closer to the source, higher values push the effect further.
 - **Upscaler options:** some upscalers add their own settings below, such as the number of passes or tile sizes.
 - **Live Preview:** shows the last frame of the latest finished piece, so you can judge the result early and stop if it is not what you want.

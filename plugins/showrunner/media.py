@@ -51,8 +51,10 @@ def probe(path: str | Path) -> dict[str, Any]:
     kind = kind_of(path)
     if kind == "image":
         from PIL import Image
+        from shared.deepy.image_channels import upright_size
         with Image.open(path) as image:
-            return {"kind": "image", "width": image.width, "height": image.height, "duration_s": None, "has_audio": False}
+            width, height = upright_size(image)  # a phone photo as it is shown: its EXIF orientation applied
+            return {"kind": "image", "width": width, "height": height, "duration_s": None, "has_audio": False}
     output = _run([ffprobe(), "-v", "error", "-show_entries", "format=duration:stream=codec_type,codec_name,width,height,avg_frame_rate,r_frame_rate,duration", "-of", "json", str(path)]).stdout
     data = json.loads(output or b"{}")
     streams = data.get("streams", [])
@@ -89,8 +91,9 @@ def poster(path: str | Path, out: str | Path, *, at_s: float | None = None, widt
     out.parent.mkdir(parents=True, exist_ok=True)
     if kind_of(path) == "image":
         from PIL import Image
+        from shared.deepy.image_channels import upright
         with Image.open(path) as image:
-            image = image.convert("RGB")
+            image = upright(image).convert("RGB")
             image.thumbnail((width, width * 4))
             image.save(out, quality=88)
         return out
@@ -116,6 +119,19 @@ def subtitles_vtt(path: str | Path) -> str:
     return _run([ffmpeg(), "-v", "error", "-i", str(path), "-map", "0:s:0", "-f", "webvtt", "-"]).stdout.decode("utf-8", "replace") if tracks else ""
 
 
+def subtitle_cues(path: str | Path) -> list[tuple[float, float, str]]:
+    """The cues of a video's first subtitle track: (start_s, end_s, text)."""
+    seconds = lambda stamp: sum(float(part) * 60 ** index for index, part in enumerate(reversed(stamp.split(":"))))
+    cues = []
+    for block in subtitles_vtt(path).replace("\r", "").split("\n\n"):
+        lines = block.strip().split("\n")
+        timing = next((index for index, line in enumerate(lines) if " --> " in line), None)
+        if timing is not None:
+            start, end = lines[timing].split(" --> ")
+            cues.append((seconds(start.strip()), seconds(end.split()[0]), " ".join(lines[timing + 1:]).strip()))
+    return cues
+
+
 def audio_slice(path: str | Path, start_s: float, end_s: float, out_folder: str | Path) -> Path:
     """The [start_s, end_s] excerpt of an audio file as a WAV in out_folder, cut once and reused (a shot's driving audio)."""
     out = Path(out_folder) / f"{Path(path).stem}-{start_s:.3f}-{end_s:.3f}.wav"
@@ -131,6 +147,19 @@ def padded_audio(path: str | Path, duration_s: float, out_folder: str | Path) ->
     if not out.is_file():
         out.parent.mkdir(parents=True, exist_ok=True)
         _run([ffmpeg(), "-y", "-v", "error", "-i", str(path), "-vn", "-af", f"apad=whole_dur={duration_s:.3f}", "-c:a", "pcm_s16le", str(out)])
+    return out
+
+
+def joined_audio(paths: list[str | Path], out_folder: str | Path, gap_s: float = 0.3) -> Path:
+    """Audio files one after the other with gap_s of silence between them, as a WAV in out_folder (the lines of a shot driving it together)."""
+    key = hashlib.sha1(json.dumps([[str(path), Path(path).stat().st_mtime_ns] for path in paths] + [gap_s]).encode("utf-8")).hexdigest()[:12]
+    out = Path(out_folder) / f"lines-{key}.wav"
+    if not out.is_file():
+        out.parent.mkdir(parents=True, exist_ok=True)
+        inputs = [arg for path in paths for arg in ("-i", str(path))]
+        chains = [f"[{index}:a]aresample=48000,aformat=channel_layouts=mono" + (f",apad=pad_dur={gap_s:.3f}" if index < len(paths) - 1 else "") + f"[l{index}]" for index in range(len(paths))]
+        graph = ";".join(chains) + ";" + "".join(f"[l{index}]" for index in range(len(paths))) + f"concat=n={len(paths)}:v=0:a=1[out]"
+        _run([ffmpeg(), "-y", "-v", "error", *inputs, "-filter_complex", graph, "-map", "[out]", "-c:a", "pcm_s16le", str(out)])
     return out
 
 

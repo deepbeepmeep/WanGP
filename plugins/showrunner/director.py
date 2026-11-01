@@ -17,6 +17,9 @@ TASKS = ("plan", "shoot", "continue", "message", "reshoot", "assemble", "resume"
 KIND_SKILLS = {"music_video": "wangp://skills/music-video", "short_film": "wangp://skills/edited-film", "trailer": "wangp://skills/edited-film",
                "story": "wangp://skills/production", "ad": "wangp://skills/production", "free": "wangp://skills/production"}  # long-story-writing is for long texts, and only listed with long-text tools
 KIND_NAMES = {"music_video": "music video", "short_film": "short film", "ad": "ad", "trailer": "trailer", "story": "illustrated story", "free": "production"}
+KIND_RULES = {"story": "An illustrated story is narrated picture-book pages: each page a still picture (template_advice `pages`, or `pages_with_cast` for the pages "
+                       "showing the cast) held as long as its narration, a narrator (a cast member with role narrator) reading every page, crossfades between "
+                       "pages; the edit moves slowly over each still. A page moves (a video template) only where the brief asks for motion."}
 
 
 def _name(path: str) -> str:
@@ -26,7 +29,7 @@ def _name(path: str) -> str:
 def _brief_text(doc: dict[str, Any]) -> str:
     """The brief in words. Media are named only: the production action gives their paths as Deepy uses them."""
     brief = doc["brief"]
-    lines = [f"Kind: {KIND_NAMES[brief['kind']]}."]
+    lines = [f"Kind: {KIND_NAMES[brief['kind']]}." + (f" {KIND_RULES[brief['kind']]}" if brief["kind"] in KIND_RULES else "")]
     if brief.get("text"):
         lines.append(f"Concept: {brief['text']}")
     if brief.get("script"):
@@ -97,8 +100,9 @@ def build_prompt(doc: dict[str, Any], task: str, message: str = "", shots: list[
     header = (f"[Showrunner] Production \"{doc['title']}\" (production id: {doc['id']}). Method for its kind: {KIND_SKILLS[kind]}. "
               f"Read it with wangp_plugins(plugin=\"showrunner\", action=\"production\", arguments={{\"production\": \"{doc['id']}\"}}).")
     if task == "plan":
-        body = ("Plan the production from its brief: cast (with a master image of each recurring person or object that has no picture yet), style, and every shot "
-                "with its template, complete generation settings and duration. Do not render shots: the user reviews and edits the plan first, then asks you to shoot.")
+        body = ("Plan the production from its brief: cast (with a master image of each recurring person or object that has no picture yet, and one in the "
+                "production's style for a member whose pictures have another look), style, and every shot with its template, complete generation settings and "
+                "duration. Do not render shots: the user reviews and edits the plan first, then asks you to shoot.")
         length = doc["brief"].get("duration_s") or (doc["audio"].get("analysis") or {}).get("duration_s") or 0
         if length > 90:
             body += f" It runs about {length / 60:.1f} minutes: outline its sequences first, then plan each sequence's shots (the skill's long productions section)."
@@ -137,6 +141,7 @@ class Director:
         self._jobs: dict[str, Any] = {}
         self._pausing: dict[str, bool] = {}  # productions whose director stops after its current step
         self._tools: dict[str, set] = {}  # the tool calls each director job is running
+        self._live: dict[str, dict[str, Any]] = {}  # what each production's last job showed (its text and steps), for a page that missed the events
         self._lock = threading.Lock()
 
     def status(self, production_id: str) -> dict[str, Any]:
@@ -151,8 +156,10 @@ class Director:
             self.settle(production_id)
             doc = production.snapshot()
         info = self.host.director_info()
+        live = self._live.get(production_id)
         return {"state": doc["director"].get("state", "idle"), "task": doc["director"].get("task"), "running": job is not None and not job.done(),
-                "available": info["available"], "reason": info["reason"], "info": info, "last": doc["director"].get("last")}
+                "available": info["available"], "reason": info["reason"], "info": info, "last": doc["director"].get("last"),
+                **({"live": {"text": live["text"], "tools": list(live["tools"].values())[-20:]}} if live else {})}
 
     def start(self, production_id: str, task: str, message: str = "", shots: list[str] | None = None) -> dict[str, Any]:
         if task not in TASKS:
@@ -184,6 +191,7 @@ class Director:
             self._jobs[production_id] = job
             self._pausing.pop(production_id, None)
             self._tools[production_id] = set()
+            self._live[production_id] = {"text": "", "tools": {}}
         # a resumed task keeps the paused one's task, note and shots: pausing again resumes the same work
         paused = (doc["director"].get("paused") or {}) if task == "resume" else {}
         work = {"task": paused.get("task") or "continue", "message": paused.get("message", ""), "shots": paused.get("shots") or []} if task == "resume" else \
@@ -254,6 +262,7 @@ class Director:
     def _follow(self, production_id: str, job) -> None:
         production = self.store.get(production_id)
         publish = lambda kind, data=None: self.store.publish({"type": "director", "production": production_id, "event": kind, "data": data})
+        live = self._live.setdefault(production_id, {"text": "", "tools": {}})
         try:
             for event in job.events():
                 if event.kind == "queued":
@@ -262,12 +271,14 @@ class Director:
                     production.apply([{"op": "director", "fields": {"state": "running"}}], by="system", record=False)
                     publish("started")
                 elif event.kind == "text":
-                    publish("text", {"text": event.data["text"][-4000:]})
+                    live["text"] = event.data["text"][-4000:]
+                    publish("text", {"text": live["text"]})
                 elif event.kind == "status":
                     publish("status", event.data)
                 elif event.kind == "tool":
                     running = self._tools.setdefault(production_id, set())
                     (running.add if event.data.get("status") == "running" else running.discard)(event.data.get("id"))
+                    live["tools"][event.data.get("id")] = event.data
                     publish("tool", event.data)
                     if self._pausing.get(production_id) and not running:  # its step is done: pause now
                         job.cancel()

@@ -459,6 +459,7 @@ input[type=range].range::-webkit-slider-thumb { -webkit-appearance: none; width:
 .tool-line.running svg { animation: spin 1s linear infinite; color: var(--blue); }
 .tool-line.done svg { color: var(--green); }
 .tool-line.error svg { color: var(--red); }
+.tool-line .why { display: block; color: var(--muted); font-size: 11px; margin-top: 2px; overflow-wrap: anywhere; }  /* why a step failed */
 .live { border: 1px solid rgba(255, 61, 129, .35); background: var(--grad-soft); border-radius: 13px; padding: 10px 12px; font-size: 13px; white-space: pre-wrap; }
 .live .live-head { display: flex; align-items: center; gap: 8px; font-size: 11.5px; font-weight: 700; color: var(--text-2); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 6px; }
 .typing { display: inline-flex; gap: 3px; }

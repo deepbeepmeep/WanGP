@@ -2,7 +2,7 @@
 import os, sys
 from tqdm import tqdm
 
-WanGP_version = "19.01"
+WanGP_version = "19.02"
 _welcome_message = f" WanGP v{WanGP_version} - Copyright (c) 2024-2026 DeepBeepMeep "
 tqdm.write(f"\033[1m\033[93m{_welcome_message:*^100}\033[0m")
 

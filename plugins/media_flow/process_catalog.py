@@ -142,7 +142,7 @@ def load_process_definitions() -> tuple[dict[str, dict], str | None]:
         if not isinstance(raw_settings, dict):
             return {}, f"Process setting file {settings_path.name} must contain a JSON object."
         process_name = str(settings_path.stem).strip()
-        info = raw_settings.pop("process", None)  # what agents read to choose a process (task, summary, recommended / legacy), not a generation setting
+        info = raw_settings.pop("process", None)  # catalog metadata, kept out of generation settings
         model_type = str(raw_settings.get("model_type") or "").strip()
         system_handler = str(raw_settings.get("system_handler") or "").strip()
         if len(process_name) == 0:

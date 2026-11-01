@@ -107,9 +107,11 @@ class WanGPHost:
                 preset = tool_settings.clone_tool_preset(task, variant)  # the model type of every template: speech models differ in how they take cues
                 video = preset if task in VIDEO_TASKS else {}
                 sources = (self.plugin.get_model_def(video["model_type"]) or {}).get("audio_prompt_type_sources") or {} if video else {}
+                refs = str((preset if task in (*VIDEO_TASKS, "edit_image") else {}).get("video_prompt_type") or "")  # image edits take the cast's pictures too
                 catalog.append({"task": task, "category": tool_settings.TOOL_DISPLAY_NAMES[task], "name": variant, "label": label, "default": variant == default,
-                                "model_type": preset.get("model_type"), "refs": "I" in str(video.get("video_prompt_type") or ""), "audio": "A" in str(video.get("audio_prompt_type") or ""),
-                                "soundtrack": "AS" in (sources.get("selection") or [])})  # its model can follow an audio_guide kept as the soundtrack
+                                "model_type": preset.get("model_type"), "refs": "I" in refs, "audio": "A" in str(video.get("audio_prompt_type") or ""),
+                                "soundtrack": "AS" in (sources.get("selection") or []),  # its model can follow an audio_guide kept as the soundtrack
+                                "sized_by_ref": "K" in refs})  # its output takes the first reference's size, not the production's format
         return catalog
 
     def default_templates(self) -> dict:

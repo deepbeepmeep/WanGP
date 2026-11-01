@@ -82,7 +82,7 @@ export function mountDirector(root) {
     if (!element) return;
     if (!working() && !live.text && !live.summary) { element.innerHTML = ''; return; }
     const tools = live.tools.filter(tool => !/^(Unknown Tool|Retrying)/.test(tool.label || "")).slice(-6).map(  // the agent's own retries are no news to the user
-      tool => `<div class="tool-line ${tool.status}">${icon(tool.status === 'running' ? 'loader' : tool.status === 'done' ? 'check' : 'alert')}<span>${shotNames(tool.label || tool.name)}</span></div>`).join('');
+      tool => `<div class="tool-line ${tool.status}">${icon(tool.status === 'running' ? 'loader' : tool.status === 'done' ? 'check' : 'alert')}<span>${shotNames(tool.label || tool.name)}${tool.error ? `<span class="why">${esc(tool.error.slice(0, 160))}</span>` : ''}</span></div>`).join('');
     const progress = live.progress ? `<div class="col" style="gap:4px"><div class="row" style="font-size:12px"><span class="grow muted">${esc(live.progress.status || live.progress.phase || '')}</span><span class="mono">${Math.round(live.progress.progress || 0)}%</span></div><div class="progress"><i style="width:${live.progress.progress || 0}%"></i></div></div>` : '';
     const summary = !working() && live.summary ? `<div class="msg system changes">${icon('check')} ${shotNames(live.summary)}</div>` : '';
     element.innerHTML = `${summary}<div class="live"><div class="live-head">${working() ? '<span class="typing"><i></i><i></i><i></i></span>' : icon('check')}${working() ? 'Directing' : 'Last reply'}</div>${shotNames((live.text || '').slice(-1800)) || '<span class="muted">Reading the production…</span>'}</div>${tools ? `<div class="col" style="gap:6px">${tools}</div>` : ''}${progress}`;

@@ -226,7 +226,8 @@ class DeepyJob:
         for block in blocks:
             if block.get("type") == "tool" and self._tools.get(block["id"]) != (block["status"], block["status_text"]):
                 self._tools[block["id"]] = (block["status"], block["status_text"])
-                self._emit("tool", {key: block[key] for key in ("id", "name", "label", "status", "status_text")})
+                failure = str((block.get("result") or {}).get("error") or "")[:400] if block["status"] == "error" else ""  # what went wrong, for the plugin's page
+                self._emit("tool", {**{key: block[key] for key in ("id", "name", "label", "status", "status_text")}, **({"error": failure} if failure else {})})
         if status is not None and status != self._status:
             self._emit("status", {"kind": status["kind"], "text": status["text"]})
         self._status = status

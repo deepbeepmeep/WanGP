@@ -33,7 +33,8 @@ merges, this document and its actions replace them:
 ## 2. Plan
 
 - `plan` writes outline, cast, style and shots in one call. Shots the user locked, edited or already shot are kept; the others are
-  replaced.
+  replaced. Write the prompts in the call itself, never in files: for many shots, `plan` the outline, cast, style and first shots, then
+  `add_shots` the others in batches.
 - Each shot: `title`, `section` (its sequence), `intent` (what happens, in one or two sentences the user can read), `camera`, `cast`
   (the cast ids it shows), `dialogue` (the words spoken in it: [{speaker, line, note}], the speaker a cast id or NARRATOR, the line
   exactly as the script has it, the note a delivery hint), `duration_s`, `audio_slice` [start_s, end_s] for song-driven shots, and `generation`:
@@ -59,6 +60,11 @@ merges, this document and its actions replace them:
   not a scene: the face, hair and outfit (or the object) large, sharp and evenly lit on a simple background, in the production's
   look. A small figure in a wide shot gives a weak identity in every shot that uses it. Write the outfit into the member's
   `description`: prompts repeat it.
+- Look at the user's pictures of each member before planning: references carry their look into every shot, and the prompt does not
+  change it (a photo or a 3D render stays one in a watercolor story; a cartoon stays one in a live-action film). When their look is not
+  the production's style, make the member's master from those pictures with the image editing template (`masters_from_pictures` in
+  the advice): the same face, fur or outfit, drawn in the production's style, large on a simple background. Inspect it, then attach
+  it with `cast(cast_id, master=...)`; the user's pictures stay with the member.
 - When the brief asks for a plan to review, stop after planning: the user edits the storyboard, then asks you to shoot.
 
 ## 3. Choose each shot's template
@@ -120,10 +126,10 @@ The production's edit replaces the merge and remux steps of the film and product
 - Never write the spoken or sung words in a video prompt (no `<d>…</d>` dialogue, even when a template's example prompt shows one):
   the model would voice them itself, in a new voice every shot. Speak every line with `speak` first; the prompt only says who speaks,
   "speaking with natural lip movements synchronized".
-- Speaking shots: give the shot's spoken line as its `audio_guide` with the lip-sync template of the advice, `video_length` at least as long as the
-  line. `render` pads a shorter line with silence to the shot's length and trims the shot 0.35 s after the line: the model fills the
-  padding with invented words. Set another `trim` when a pause after the line is wanted. The edit keeps the line in sync with
-  `edit(audio_mode="clips")`, or "mix" when the song plays too.
+- Speaking shots: use the lip-sync template of the advice, `video_length` at least as long as the shot's lines. `render` drives the shot
+  with its lines (it speaks the ones not spoken yet, one after the other when there are several), pads them with silence to the shot's
+  length and trims the shot 0.35 s after them: the model fills the padding with invented words. Set another `trim` when a pause after
+  the lines is wanted. The edit keeps the lines in sync with `edit(audio_mode="clips")`, or "mix" when the song plays too.
 - Narration and voice-over: `speak` the shots' NARRATOR lines, then lay them over the edit with `edit(tracks=[{shot, line}, ...])`: each
   spoken line starts where its shot starts (`start_s` places it elsewhere), with no media ids to copy. Score: one `gen_song` instrumental as long as the cut (up to
   10 minutes), about -12 dB under speech.
@@ -143,8 +149,9 @@ The production's edit replaces the merge and remux steps of the film and product
   period), minimal (light spaced capitals: documentary, fashion, tech), typewriter (monospace with a cursor: thrillers, investigations,
   dates and places), storybook (serif with a swash and flourished corners: tales, children's stories). Choose the one that suits the
   production instead of leaving every production on classic; a piece may name another `design` for a reason.
-- Illustrated pages: shots whose template is `gen_image` (or `edit_image` from the cast's master, to keep a character), lasting as long
-  as their narration, joined by crossfades.
+- Illustrated pages (an illustrated story's shots): stills on the `pages` template, or `pages_with_cast` for a page showing the cast
+  (`render` gives it their masters as references and keeps the production's format), each lasting as long as its narration, joined by
+  crossfades; the edit moves slowly over each still. Every page has its NARRATOR line, laid over the edit with `edit(tracks)`.
 - Subtitles: every spoken or sung word goes in its shot's `dialogue`: lines of the cast, narration and voice-over (speaker NARRATOR)
   and sung lyrics (speaker: the singer). `assemble` subtitles them, timed on the cut, in the script's words: a line starts with its
   shot, so a narration track starts at its shot's start (`timeline` in the summary). An SRT of your own
@@ -185,7 +192,7 @@ A film of several minutes is a chain of sequences, each a scene or a chapter of 
   {type: cut|crossfade|fade_black|fade_white, duration_s}); its sound and text are set with `edit`.
 - A finished production has sound under its whole length. Unless the brief asks otherwise, a film, ad, trailer or story gets a score
   (an instrumental `gen_song` as long as the cut, about -12 dB under speech), a title and an end card, and spoken words get subtitles.
-- `assemble` renders it and reports what went in (length, sound, subtitle cues, text, tracks). It levels the sound and measures the
+- `assemble` renders it and reports what went in (length, sound, subtitle cues with their times, text, tracks). It levels the sound and measures the
   delivered file (true peak under -1 dBTP): never re-master, re-mux or re-encode its export with other tools. A file made outside
   the production is not a version the user sees on Deliver; change the edit (`edit`, trims) and assemble again instead. Check the picture and the sound of the
   result; transcribe single takes or lines, not the scored mix (music confuses the transcriber), and do not parse the file's boxes.

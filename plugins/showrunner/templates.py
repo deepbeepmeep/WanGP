@@ -145,6 +145,10 @@ def advice(doc: dict[str, Any], catalog: list[dict[str, Any]]) -> dict[str, Any]
         result["lip_synced_without_cast"] = lip
         result["lip_sync"] = ("cast_shots_lip_synced is a reference template: give a singing shot its song slice as audio_guide (render gives a "
                               "speaking shot its line), and render makes the template follow it as a kept soundtrack.")
+    if "image_edits" in picks:  # a master in the production's look made from the member's own pictures (or from a master, for a look)
+        result["masters_from_pictures"] = picks["image_edits"]
+    if doc["brief"].get("kind") == "story":  # picture-book pages are stills: the cast's go through the image editing template
+        result.update({key: picks[role] for key, role in (("pages", "images"), ("pages_with_cast", "image_edits")) if role in picks})
     if user:
         result["user_choices"] = user
         result["user_rule"] = "user_choices are the user's picks for these kinds of shots and media: use them, never another template for the same kind."
@@ -169,13 +173,13 @@ def lint(doc: dict[str, Any], catalog: list[dict[str, Any]], shot_ids: list[str]
         lines, settings = shot.get("dialogue") or [], shot["generation"].get("settings") or {}
         # driven by audio: a lip-sync template, or a reference template that follows a soundtrack when a speaker the shot shows talks
         driven = entry["audio"] or entry["soundtrack"] and any(line.get("speaker") in (shot.get("cast") or []) for line in lines)
-        if shown and not entry["refs"]:
-            suggestion = lip_synced_with_cast(picks, catalog) if entry["audio"] else picks.get("cast_shots")
+        if shown and not entry["refs"]:  # a still keeps the cast through the image editing template, a moving shot through a video one
+            suggestion = lip_synced_with_cast(picks, catalog) if entry["audio"] else picks.get("image_edits") if entry["task"] == "gen_image" else picks.get("cast_shots")
             warnings.append(f"{shot['id']} shows {', '.join(sorted(shown))} but its template {entry_name(entry)} takes no reference images"
                             + (f": use {suggestion} with their pictures as references." if suggestion else "."))
-        elif driven and not settings.get("audio_guide") and not shot.get("audio_slice") and len([line for line in lines if line.get("audio")]) != 1:
-            warnings.append(f"{shot['id']} is driven by audio but has none yet: " + ("give its audio_slice and the song as audio_guide." if doc["brief"].get("song") and not lines
-                            else "speak its line with `speak` (render then uses it)." if len(lines) <= 1 else "it has several lines: give the joined lines as its audio_guide."))
+        elif driven and not settings.get("audio_guide") and not shot.get("audio_slice") and not lines:  # render speaks and joins a shot's lines itself
+            warnings.append(f"{shot['id']} is driven by audio but has none: " + ("give its audio_slice and the song as audio_guide." if doc["brief"].get("song")
+                            else "write its dialogue (render speaks it) or give an audio_guide."))
         elif (role := role_of(entry)) in user and user[role] != entry_name(entry) and shot.get("updated_by") != "user" \
                 and (shown or not resolve(catalog, user[role])["refs"]):  # a pick that needs references does not fit a shot without the cast
             warnings.append(f"{shot['id']} uses {entry_name(entry)} but the user picked {user[role]} for this kind of shot: use it.")

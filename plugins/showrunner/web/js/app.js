@@ -228,6 +228,9 @@ async function catchUp() {
   try {
     const status = await api.director(state.pid);
     changed = status.running !== state.live.running;
+    if (status.live && (status.live.text !== state.live.text || JSON.stringify(status.live.tools) !== JSON.stringify(state.live.tools))) {  // steps that ended unseen
+      state.live.text = status.live.text; state.live.tools = status.live.tools; changed = true;
+    }
     if (state.live.running && !status.running) { state.live.running = false; state.live.progress = null; reportChanges('caught_up'); }
     else state.live.running = status.running;
   } catch { /* the page works without it */ }
@@ -393,7 +396,12 @@ async function route() {
     catalogStop?.(); catalogStop = null;
     if (active) eventsFor(pid);
     renderShell();
-    try { const status = await api.director(pid); state.live.running = status.running; state.directorInfo = status.info || { available: status.available, reason: status.reason }; } catch { /* the page works without it */ }
+    try {
+      const status = await api.director(pid);
+      state.live.running = status.running;
+      if (status.running && status.live) Object.assign(state.live, { text: status.live.text, tools: status.live.tools });  // the work under way, not only what comes next
+      state.directorInfo = status.info || { available: status.available, reason: status.reason };
+    } catch { /* the page works without it */ }
   }
   const doc = state.doc;
   const fallback = doc.shots.length ? 'storyboard' : 'brief';

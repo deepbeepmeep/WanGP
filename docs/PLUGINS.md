@@ -14,7 +14,7 @@ Media Flow and Showrunner appear in the normal **Enabled Apps & Plugins** list, 
 
 Both apps have a **Full Screen** control. `/media-flow/` and `/showrunner/` on your WanGP address open the corresponding app directly in full screen. The address keeps that folder URL, which you can bookmark or share. **WanGP** returns to the same tab, preserving its form or editor. Expanding and returning reuse the existing page.
 
-**Models Manager** is always installed. Open **Configuration → General → Manage Models & Disk Space**, beside **Show "All" Model Filter**, or press **Alt+M** from anywhere in WanGP, to inspect model files, shared dependencies and recoverable disk space. Use **Back to Configuration** (or **Alt+M** again) when finished.
+**Models Manager** is always installed. Open **Configuration → General → Manage Models & Disk Space**, beside **Show "All" Model Filter**, or press **Alt+M** from anywhere in WanGP, to inspect model files, shared dependencies and recoverable disk space. When finished, its **Back to ...** link (or **Alt+M** again) returns to the screen you came from.
 
 Apps and plugins use the same Plugin system described below. Developer APIs, Plugin identifiers and installation folders keep their existing names.
 
@@ -414,7 +414,7 @@ with self.deepy.run("Make it 6 s", session_dir="D:/my_plugin/sessions/trailer-12
 | `started` | `{"session_dir", "workspace_id"}`: Deepy now shows the job. |
 | `status` | `{"kind", "text"}`: Deepy's status line (starting, thinking, paused...). |
 | `text` | `{"text", "delta"}`: Deepy's reply so far, and what was added. |
-| `tool` | `{"id", "name", "label", "status", "status_text"}` when a Deepy action starts or changes state (`running`, `done`, `error`, `interrupted`). |
+| `tool` | `{"id", "name", "label", "status", "status_text"}` when a Deepy action starts or changes state (`running`, `done`, `error`, `interrupted`); a failed action adds `"error"`, its reason. |
 | `progress` | A `ProgressUpdate` (`phase`, `status`, `progress` in percent, `current_step`, `total_steps`, `unit`) for generations run by the job. |
 | `output` | `{"id", "path", "kind", "name", "label"}` for each media file Deepy writes. |
 | `done`, `cancelled`, `error` | The `DeepyResult`; always the last event. |
