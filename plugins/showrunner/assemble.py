@@ -96,7 +96,13 @@ def _run_graph(command: list[str], **kwargs):
         graph = command.index("-filter_complex")
         script = Path(folder) / "graph.txt"
         script.write_text(command[graph + 1], encoding="utf-8")
-        return media._run([*command[:graph], "-filter_complex_script", str(script), *command[graph + 2:]], **kwargs)
+        try:
+            return media._run([*command[:graph], "-/filter_complex", str(script), *command[graph + 2:]], **kwargs)
+        except RuntimeError as error:
+            if "Unrecognized option '/filter_complex'" not in str(error):
+                raise
+            # Older FFmpeg builds need the legacy flag; keep the graph in the same file.
+            return media._run([*command[:graph], "-filter_complex_script", str(script), *command[graph + 2:]], **kwargs)
 
 
 def _true_peak(path: Path) -> float | None:
