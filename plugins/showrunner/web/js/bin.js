@@ -1,7 +1,7 @@
 // Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 // Media bin: uploads and the director's untracked media, ready to be dragged onto shots (as takes) or cast members.
 import { state, actions } from './app.js';
-import { icon, esc, art, pickFiles, menu } from './ui.js';
+import { icon, esc, art, pickFiles, menu, AUDIO_ACCEPT } from './ui.js';
 import { BIN_TYPE } from './storyboard.js';
 
 // Generated files are named "<date>_seed<n>_<start of the prompt>": the bin shows the prompt's words.
@@ -24,7 +24,7 @@ export function mountBin(root) {
       render();
     };
     const drop = root.querySelector('#bin-drop');
-    drop.onclick = async () => { const files = await pickFiles('image/*,video/*,audio/*'); if (files.length) actions.upload(files, 'bin'); };
+    drop.onclick = async () => { const files = await pickFiles('image/*,video/*,' + AUDIO_ACCEPT); if (files.length) actions.upload(files, 'bin'); };
     root.querySelectorAll('[data-bin]').forEach(element => {
       element.ondragstart = event => { event.dataTransfer.setData(BIN_TYPE, element.dataset.bin); event.dataTransfer.effectAllowed = 'copy'; };
       element.oncontextmenu = event => {

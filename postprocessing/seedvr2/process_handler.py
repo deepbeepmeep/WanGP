@@ -29,16 +29,16 @@ class SeedVR2ProcessHandler:
         return max(0, min(self.overlap_frames, int(chunk_frames) - 1))
 
     def get_chunk_frames(self, selected_frame_count: int) -> int:
-        from postprocessing import spatial_upsamplers as upsampler_api
         window_size = SeedVR2Bridge.resolve_model_window_size(upsampler_api.config_for_method(SeedVR2Bridge.UPSAMPLING_VALUE_PREFIX)["window_size"])
         return int(selected_frame_count) if window_size == SeedVR2Bridge.WINDOW_SIZE_UNLIMITED else window_size
 
     def normalize_target_control(self, value: str | None) -> str:
+        """The scale of a SeedVR2 value on the model chosen in Configuration > Extensions."""
         scale = _scale_for_value(value)
-        return SeedVR2Bridge.upsampling_value(scale) if scale in SeedVR2Bridge.UPSAMPLING_RATIOS else self.default_target_control
+        return SeedVR2Bridge.upsampling_value(scale if scale in SeedVR2Bridge.UPSAMPLING_RATIOS else 2.0, _configured_method())
 
     def target_control_choices_for_process(self, process_settings: dict) -> list[tuple[str, str]]:
-        return self.target_control_choices
+        return [(label, SeedVR2Bridge.upsampling_value(_scale_for_value(value), _configured_method())) for label, value in self.target_control_choices]
 
     def target_control_default_for_process(self, process_settings: dict) -> str:
         return self.normalize_target_control(process_settings.get("target_ratio"))
@@ -109,7 +109,12 @@ class SeedVR2ProcessHandler:
 
 
 def _scale_for_value(value: str | None) -> float | None:
-    return upsampler_api.parse_multiplier_suffix(value, SeedVR2Bridge.UPSAMPLING_VALUE_PREFIX, 2.0)
+    split = upsampler_api.split_upsampling_value(value)
+    return split[1] if split is not None and split[0] in SeedVR2Bridge.METHOD_MODELS else None
+
+
+def _configured_method() -> str:
+    return upsampler_api.require_upsampler_by_method(SeedVR2Bridge.UPSAMPLING_VALUE_PREFIX).method()
 
 
 HANDLER = SeedVR2ProcessHandler()

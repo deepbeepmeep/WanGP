@@ -1,7 +1,7 @@
 // Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 // Cast: the people and recurring things of the production, with their reference pictures, master image and voice.
 import { state, actions } from './app.js';
-import { icon, esc, art, h, fieldSaver, pickFiles, confirmDialog, promptDialog, toast } from './ui.js';
+import { icon, esc, art, h, fieldSaver, pickFiles, confirmDialog, promptDialog, toast, AUDIO_ACCEPT } from './ui.js';
 import { BIN_TYPE } from './storyboard.js';
 
 export function mountCast(container) {
@@ -64,7 +64,7 @@ export function mountCast(container) {
         actions.ops([{ op: 'update_cast', cast: id, fields: { images, master: member.master === button.dataset.dropImage ? images[0] || null : member.master } }]);
       });
       card.querySelector('[data-drop-voice]')?.addEventListener('click', () => actions.ops([{ op: 'update_cast', cast: id, fields: { voice: null } }]));
-      card.querySelector('[data-add-voice]').onclick = async () => { const files = await pickFiles('audio/*', false); if (files.length) actions.upload(files, 'cast', id); };
+      card.querySelector('[data-add-voice]').onclick = async () => { const files = await pickFiles(AUDIO_ACCEPT, false); if (files.length) actions.upload(files, 'cast', id); };
       card.querySelector('[data-remove]').onclick = async () => {
         if (await confirmDialog({ title: `Remove ${member.name || 'this cast member'}?`, text: 'Shots stop referencing them; their pictures stay in the production folder.', ok: 'Remove', danger: true })) actions.ops([{ op: 'remove_cast', cast: id }]);
       };

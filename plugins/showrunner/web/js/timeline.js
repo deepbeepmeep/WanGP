@@ -3,7 +3,7 @@
 // set transitions, and see sections, bars and the waveform the cuts should follow.
 import { state, actions } from './app.js';
 import { api } from './api.js';
-import { icon, esc, art, h, formatTime, formatDuration, sectionColor, drawWave, toast, menu, confirmDialog, pickFiles } from './ui.js';
+import { icon, esc, art, h, formatTime, formatDuration, sectionColor, drawWave, toast, menu, confirmDialog, pickFiles, AUDIO_ACCEPT } from './ui.js';
 import { Sequencer, segments } from './sequencer.js';
 import { shotMenu } from './storyboard.js';
 
@@ -102,7 +102,7 @@ export function mountTimeline(container, doc) {
     container.querySelectorAll('[data-mode]').forEach(button => button.onclick = () => actions.ops([{ op: 'edit', fields: { audio_mode: button.dataset.mode } }]));
     $('#assemble').onclick = assemble;
     $('#add-text').onclick = () => editText(null);
-    $('#add-track').onclick = async () => { const files = await pickFiles('audio/*', false); if (files.length) actions.upload(files, 'track'); };
+    $('#add-track').onclick = async () => { const files = await pickFiles(AUDIO_ACCEPT, false); if (files.length) actions.upload(files, 'track'); };
     renderTime(sequencer?.time || 0);
   }
 

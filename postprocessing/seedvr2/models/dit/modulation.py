@@ -99,5 +99,11 @@ class AdaSingle(nn.Module):
             
         raise NotImplementedError
 
+    def gate(self, emb: torch.FloatTensor, layer: str) -> torch.FloatTensor:
+        """The multiplier of the "out" mode of a layer (b, dim), for a gated residual computed elsewhere."""
+        gate = rearrange(emb, "b (d l g) -> b d l g", l=len(self.layers), g=3)[..., self.layers.index(layer), 2]
+        gate_b = getattr(self, f"{layer}_gate", None)
+        return gate if gate_b is None else gate + gate_b
+
     def extra_repr(self) -> str:
         return f"dim={self.dim}, emb_dim={self.emb_dim}, layers={self.layers}"

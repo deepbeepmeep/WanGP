@@ -67,7 +67,7 @@ A mesh under `out/` is published when the run ends: render it in the next run wi
 
 ```python
 # Front and three-quarter views of the vase
-views = wangp.toolbox("render_3d_views", media_id="mesh_3", views=["front", "three_quarter"], width=768, height=768, gallery=False)
+views = wangp.toolbox("render_3d_views", media_id="3d:MESH", views=["front", "three_quarter"], width=768, height=768, gallery=False)
 views
 ```
 

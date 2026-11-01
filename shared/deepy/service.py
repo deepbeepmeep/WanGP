@@ -360,7 +360,7 @@ class DeepyService(WorkspaceSupport, PluginJobSupport, GenerationRuntime):
                 path = self.workspaces.adopt(self.workspace_id, [str(path)])[0]
             result = self.gallery.add_path(str(path))
             record = media_registry.mark_media_access(result["record"], "read")
-            entry = {"media_id": record["settings"]["gallery_media_ids"][0], "title": record["label"], "media_type": record["media_type"]}
+            entry = {"media_id": record["settings"]["gallery_media_ids"][0], "title": record["label"], "media_type": record["media_type"], "path": record["path"]}
             with self._session.turn_lock:
                 pending = self._session.pending_chat_media
                 existing = next((item for item in pending if item['media_id'] == entry['media_id']), None)
@@ -375,7 +375,8 @@ class DeepyService(WorkspaceSupport, PluginJobSupport, GenerationRuntime):
             self.save_session()
             return self.gallery.media_id(result["record"]["path"])
 
-    def remove_last_chat_upload(self, chat_session_id):
+    def remove_chat_upload(self, chat_session_id, media_id=None):
+        """Detach the given pending chat upload, or the last one."""
         with self._mutation_lock:
             self.require_restored()
             if chat_session_id != self._session.chat_session_id:
@@ -383,7 +384,7 @@ class DeepyService(WorkspaceSupport, PluginJobSupport, GenerationRuntime):
             with self._session.turn_lock:
                 pending = self._session.pending_chat_media
                 for index in range(len(pending) - 1, -1, -1):
-                    if pending[index].get('chat_upload'):
+                    if pending[index].get('chat_upload') and media_id in (None, pending[index]['media_id']):
                         pending.pop(index)
                         break
             event = chat.build_pending_upload_event(self._session)

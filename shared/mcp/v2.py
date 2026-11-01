@@ -880,7 +880,7 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
 
     @mcp.tool()
     def wangp_toolbox(action: str | None = None, arguments: dict[str, Any] | None = None, wait: bool = True) -> dict[str, Any]:
-        """Inspect or compare media, transcribe, extract, trim, assemble and transform media, or retrieve their generation settings."""
+        """Inspect or compare media, transcribe, extract, trim, assemble, resize or crop media, or retrieve their generation settings."""
         actions = {item["name"]: {"description": item["description"], "parameters": {**item["parameters"], "additionalProperties": False}} for item in core._toolbox_discovery(get_toolbox(), policy.read_enabled) if item["name"] not in {"search_doc", "load_doc_section", "get_media_details"}}
         if not extended:
             actions.pop("inspect_audio", None)
@@ -1300,7 +1300,7 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
                 elif action not in ("run", "restart", "files"):  # the app actions
                     response.update(python_sandbox.describe()["web_apps"])
                 return response
-            return python_sandbox.run_action(action, dict(arguments))
+            return public_media_result(python_sandbox.run_action(action, dict(arguments)), get_toolbox().session.media_registry, virtualize=virtualize)  # published media by their Gallery ids, as the other tools take them
 
     if web_search is not None:
         web_actions = web_search.actions

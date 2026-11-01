@@ -39,6 +39,9 @@ def main():
     (worker / "installation").mkdir(parents=True, exist_ok=True)
     for source in (manager.parent / "installation").glob("*.py"):
         shutil.copyfile(source, worker / "installation" / source.name)
+    startup_probe = Path("shared/gradio/gradio_startup_patch.py")
+    (worker / startup_probe).parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(manager.parent / startup_probe, worker / startup_probe)
     shutil.copytree(manager.parent / "installation/catalog_seed", worker / "installation/catalog_seed", dirs_exist_ok=True)
     (worker / "entry.py").write_text("import sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(__file__).resolve().parent))\nfrom installation.manager_worker import main\nraise SystemExit(main())\n", encoding="utf-8")
     inventory = {path.relative_to(resources).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(resources.rglob("*")) if path.is_file() and "__pycache__" not in path.parts}

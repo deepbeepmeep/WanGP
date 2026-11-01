@@ -61,29 +61,32 @@ class RotaryEmbeddingBase(nn.Module):
         return self.rope.get_axial_freqs(*dims)
 
 
-class RotaryEmbedding3d(RotaryEmbeddingBase):
+class NaRotaryEmbedding3d(nn.Module):
+    """The 7B's RoPE: video tokens only, pixel frequencies over each window's own coordinates (linspace(-1, 1) on every axis, as in
+    rotary-embedding-torch 0.5.3), interleaved pairs, the first 3 * 2 * (dim // 3 // 2) channels rotated. The frequencies are built
+    in FP32 here rather than read from the checkpoint."""
+
     def __init__(self, dim: int):
-        super().__init__(dim, rope_dim=3)
+        super().__init__()
+        self.freqs = torch.linspace(1.0, 128.0, dim // 3 // 2, dtype=torch.float32, device="cpu") * pi
         self.mm = False
 
-    def forward(
-        self,
-        q: torch.FloatTensor,  # b h l d
-        k: torch.FloatTensor,  # b h l d
-        size: Tuple[int, int, int],
-    ) -> Tuple[
-        torch.FloatTensor,
-        torch.FloatTensor,
-    ]:
-        T, H, W = size
-        freqs = self.get_axial_freqs(T, H, W)
-        q = rearrange(q, "b h (T H W) d -> b h T H W d", T=T, H=H, W=W)
-        k = rearrange(k, "b h (T H W) d -> b h T H W d", T=T, H=H, W=W)
-        q = apply_rotary_emb(freqs, q.float()).to(q.dtype)
-        k = apply_rotary_emb(freqs, k.float()).to(k.dtype)
-        q = rearrange(q, "b h T H W d -> b h (T H W) d")
-        k = rearrange(k, "b h T H W d -> b h (T H W) d")
-        return q, k
+    def window_tables(self, shapes: list, txt_len: int, cache: Cache, device: torch.device, pairs: int):
+        """One table per window shape (f, h, w) over the window's tokens followed by the text's (see _pair_table); the text is not rotated."""
+        def make_tables():
+            freqs, axes, tables = self.freqs.to(device), {}, {}
+            for f, h, w in set(shapes):
+                for size in (f, h, w):
+                    if size not in axes:
+                        axes[size] = torch.outer(torch.linspace(-1, 1, size, device=device, dtype=torch.float32), freqs)
+                angles = torch.zeros(f * h * w + txt_len, 3, freqs.numel(), device=device, dtype=torch.float32)
+                window = angles[:f * h * w].view(f, h, w, 3, -1)
+                window[..., 0, :] = axes[f][:, None, None]
+                window[..., 1, :] = axes[h][None, :, None]
+                window[..., 2, :] = axes[w][None, None]
+                tables[(f, h, w)] = _pair_table(angles.view(f * h * w + txt_len, -1), pairs)
+            return tables
+        return cache("rope_tables_3d", make_tables)
 
 
 class MMRotaryEmbeddingBase(RotaryEmbeddingBase):
@@ -136,6 +139,17 @@ class NaMMRotaryEmbedding3d(MMRotaryEmbeddingBase):
             return vid_freqs.cos(), vid_freqs.sin(), txt_freqs.cos(), txt_freqs.sin()
         return cache("mmrope_cos_sin_3d", make_cos_sin)
 
+    def window_tables(self, shapes: list, txt_len: int, cache: Cache, device: torch.device, pairs: int):
+        """One table per window shape (f, h, w) over the window's tokens, whose temporal positions follow the text's, then the text's
+        (see _pair_table); the same frequencies as get_freqs."""
+        def make_tables():
+            txt_freqs, tables = self.get_axial_freqs(txt_len).repeat(1, 3), {}
+            for f, h, w in set(shapes):
+                freqs = self.get_axial_freqs(txt_len + f, h, w)[txt_len:].reshape(f * h * w, -1)
+                tables[(f, h, w)] = _pair_table(torch.cat([freqs, txt_freqs])[:, 0::2].to(device), pairs)
+            return tables
+        return cache("mmrope_tables_3d", make_tables)
+
     def get_freqs(
         self,
         vid_shape: torch.LongTensor,
@@ -183,6 +197,16 @@ class NaMMRotaryEmbedding3d(MMRotaryEmbeddingBase):
         return torch.cat(vid_freq_list, dim=0), torch.cat(txt_freq_list, dim=0)
 
 
+def _pair_table(angles: torch.Tensor, pairs: int) -> torch.Tensor:
+    """(tokens, 1, pairs, 2) FP32 cos / sin of interleaved channel pairs for ops.interleaved_norm_rope_: angles (tokens, rotated pairs),
+    cos and sin taken in the angles' dtype as the former per-token tables were; the pairs past the rotated ones unrotated (cos 1, sin 0)."""
+    table = torch.zeros(angles.shape[0], 1, pairs, 2, device=angles.device, dtype=torch.float32)
+    table[:, 0, angles.shape[1]:, 0] = 1
+    table[:, 0, :angles.shape[1], 0] = angles.cos()
+    table[:, 0, :angles.shape[1], 1] = angles.sin()
+    return table
+
+
 def _apply_rotary_inplace(x_list: list[torch.Tensor], cosine: torch.Tensor, sine: torch.Tensor) -> torch.Tensor:
     x = x_list.pop()
     rotated = x[..., :cosine.shape[-1]].unflatten(-1, (-1, 2))
@@ -200,4 +224,6 @@ def get_na_rope(rope_type: Optional[str], dim: int):
         return None
     if rope_type == "mmrope3d":
         return NaMMRotaryEmbedding3d(dim=dim)
+    if rope_type == "rope3d":
+        return NaRotaryEmbedding3d(dim=dim)
     raise NotImplementedError(f"{rope_type} is not supported.")

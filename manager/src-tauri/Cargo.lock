@@ -4312,7 +4312,7 @@ dependencies = [
 
 [[package]]
 name = "wangp-manager"
-version = "0.1.10"
+version = "0.1.12"
 dependencies = [
  "serde",
  "serde_json",

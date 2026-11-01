@@ -338,7 +338,7 @@ def _build_wangp_module() -> types.ModuleType:
     module.out = "out"
 
     def path(ref: str) -> str:
-        """Local path of a Gallery media id (image_3, visual:..., audio:...) or an authorized @alias/file, readable from Python afterwards.
+        """Local path of a Gallery media id (visual:..., audio:..., 3d:...) or an authorized @alias/file, readable from Python afterwards.
         Files only: the sandbox folder itself is the working directory, so its content is addressed with relative paths ('out/x.png')."""
         ref = str(ref)
         if not ref.startswith("@") and not os.path.isabs(ref) and os.path.isfile(ref):  # the sandbox's own file ('out/x.png'): already readable here
@@ -722,6 +722,20 @@ def facts() -> dict:
     return {"python": sys.version.split()[0], "libraries": versions, "pid": os.getpid()}
 
 
+def _upright_open(open_image):
+    """PIL.Image.open showing images as the Gallery does: a photo's EXIF orientation is applied to its pixels (Pillow's own lookup,
+    which decodes a PNG at once to find metadata after its image data)."""
+    import PIL.ImageOps
+
+    def upright_open(fp, *args, **kwargs):
+        image = open_image(fp, *args, **kwargs)
+        if image.getexif().get(0x0112, 1) != 1:
+            PIL.ImageOps.exif_transpose(image, in_place=True)
+        return image
+
+    return upright_open
+
+
 def main() -> None:
     global ROOT, ROOT_KEY, CONFIG, READ_PREFIXES
     ROOT = os.path.realpath(sys.argv[1])
@@ -732,8 +746,9 @@ def main() -> None:
     for folder in ("out", "tmp"):
         os.makedirs(os.path.join(ROOT, folder), exist_ok=True)
     import numpy  # noqa: F401  pre-imported so that their own imports happen before the guards and the first run stays fast
-    import PIL.Image  # noqa: F401
+    import PIL.Image
     import warnings
+    PIL.Image.open = _upright_open(PIL.Image.open)
     for category in (DeprecationWarning, PendingDeprecationWarning, FutureWarning):  # library deprecations are noise in the assistant's context
         warnings.simplefilter("ignore", category)
 

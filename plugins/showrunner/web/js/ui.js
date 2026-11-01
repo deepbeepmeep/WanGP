@@ -250,11 +250,15 @@ export function pickFiles(accept, multiple = true) {
   });
 }
 
+const AUDIO_EXTENSIONS = ['wav', 'mp3', 'flac', 'ogg', 'm4a', 'aac', 'opus'];
+// File pickers name audio by extension: iOS Safari filters audio/* as video and greys out audio files.
+export const AUDIO_ACCEPT = AUDIO_EXTENSIONS.map(extension => '.' + extension).join(',');
+
 export function kindOfFile(name) {
   const extension = String(name).toLowerCase().split('.').pop();
   if (['png', 'jpg', 'jpeg', 'webp', 'bmp'].includes(extension)) return 'image';
   if (['mp4', 'mov', 'mkv', 'webm', 'avi', 'm4v'].includes(extension)) return 'video';
-  if (['wav', 'mp3', 'flac', 'ogg', 'm4a', 'aac', 'opus'].includes(extension)) return 'audio';
+  if (AUDIO_EXTENSIONS.includes(extension)) return 'audio';
   return null;
 }
 

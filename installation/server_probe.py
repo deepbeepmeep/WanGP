@@ -1,12 +1,11 @@
 """Bounded loopback readiness checks tied to the launched Windows process tree."""
 
 import ctypes
+from http.client import HTTPConnection, HTTPException
 import os
 import socket
 import struct
 import time
-from urllib.error import HTTPError, URLError
-from urllib.request import ProxyHandler, build_opener
 
 from .state import InstallError
 
@@ -70,21 +69,27 @@ def owned_listener(root_pid, port):
 
 def wait_for_server(root_pid, port, finished, emit, timeout=180):
     url = f"http://127.0.0.1:{port}"
-    opener = build_opener(ProxyHandler({}))
+    # Gradio renders its homepage for its own startup check. Ask for the
+    # lightweight app ID so Manager does not trigger competing page renders.
+    path = "/gradio_api/app_id"
     deadline = time.monotonic() + timeout
     while not finished.wait(0.4) and time.monotonic() < deadline:
         try:
             if (pid := owned_listener(root_pid, port)) is None:
                 continue
+            conn = HTTPConnection("127.0.0.1", port, timeout=2)
             try:
-                with opener.open(url, timeout=1) as response:
-                    status = response.status
-            except HTTPError as exc:
-                status = exc.code
-            if status < 500:
+                conn.request("GET", path)
+                status = conn.getresponse().status
+            finally:
+                conn.close()
+            if status in (404, 405) and path != "/":
+                path = "/"  # Non-Gradio sample servers and older installations.
+                continue
+            if 200 <= status < 400 or status == 401:
                 emit({"type": "server_ready", "url": url, "pid": pid, "validation": "owned_listener_http", "http_status": status})
                 return
-        except (OSError, URLError):
+        except (OSError, HTTPException):
             continue
     if not finished.is_set():
         emit({"type": "notice", "title": "Still Starting", "message": "The process is running, but its own web server has not become ready. Check the logs or stop and retry."})

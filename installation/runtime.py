@@ -50,6 +50,14 @@ class EnvironmentService:
             raise InstallError("wrong_environment", "The selected interpreter is not a Conda environment")
         return inventory
 
+    def snapshot(self, environment):
+        return {"inventory": self.inventory(environment)}
+
+    def update_clone(self, source, destination, resolution_directory, resolution):
+        # Build a relocatable environment at its final path; never copy venv scripts
+        # whose shebangs/launchers can still point to the user's previous interpreter.
+        return self.build(destination, resolution_directory, resolution)
+
     def build(self, environment, resolution_directory, resolution):
         environment = plain_path(environment)
         environment.mkdir(parents=True, exist_ok=False)
@@ -67,6 +75,7 @@ class EnvironmentService:
             # Keep source builds short on Windows and package links on the target drive.
             package_env["UV_CACHE_DIR"] = str(self.cache_directory)
         self.runner.run(command, env=package_env)
+        ensure_pip(python, self.runtime, self.runner)
         return self.validate(environment, resolution)
 
     def validate(self, environment, resolution, expected_inventory=None):
@@ -94,3 +103,14 @@ class EnvironmentService:
             result = self.runner.run([python, "-I", "-c", COMPUTE_SCRIPT, backend], env=env, timeout=90, capture=True)
             health["compute"] = json.loads(result.stdout)
         return {"inventory": inventory, "inventory_sha256": digest(inventory), "health": health}
+
+
+def ensure_pip(python, runtime, runner):
+    """Keep third-party plugins using python -m pip compatible with uv installs."""
+    probe = runner.run([python, "-I", "-B", "-c", "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('pip') else 1)"], env=runtime.environment(python), check=False, emit_output=False)
+    if probe.returncode:
+        runner.events({"type": "progress", "title": "Preparing Plugin Installer", "message": "Adding pip compatibility for plugins; WanGP dependencies continue to use uv."})
+        wheel = runner.run([python, "-I", "-B", "-c", "import ensurepip,pathlib; print(next((pathlib.Path(ensurepip.__file__).parent / '_bundled').glob('pip-*.whl')))"], env=runtime.environment(python), capture=True, emit_output=False)
+        # Install only the bundled pip wheel. ensurepip also seeds setuptools on
+        # Python 3.11, whose old test fixtures can exceed Windows path limits.
+        runner.run(runtime.command("pip", "install", "--python", python, "--no-index", "--no-deps", wheel.stdout.strip()), env=runtime.environment(python))

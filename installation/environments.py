@@ -98,6 +98,27 @@ def inspect_registry(root, timeout=15):
     return {"active": registry["active"], "envs": records}
 
 
+def installation_environments(root):
+    """Prefer the saved selection and local launcher/Pinokio environments."""
+    root = Path(root).resolve()
+    registry = inspect_registry(root)
+    candidates = {}
+    for name, entry in registry["envs"].items():
+        if entry.get("interpreter"):
+            candidates[entry["interpreter"]] = {**entry, "name": name, "saved": name == registry["active"]}
+    for name in ("env_uv", "venv", ".venv", "env", "environment"):
+        directory = root / name
+        kind = "conda" if (directory / "conda-meta").is_dir() else "venv"
+        python = interpreter_path(directory, kind)
+        if Path(python).is_file() and python not in candidates:
+            candidates[python] = {**inspect_interpreter(python), "name": name, "saved": False}
+    usable = [item for item in candidates.values() if item["status"] == "inspected" and item["packages"]["torch"]]
+    preferred = next((item for item in usable if item["saved"]), None)
+    if preferred is None and len(usable) == 1:
+        preferred = usable[0]
+    return {"environments": list(candidates.values()), "python": preferred["interpreter"] if preferred else None}
+
+
 def managed_record(root):
     root = Path(root).resolve()
     for parent in (root, root.parent):

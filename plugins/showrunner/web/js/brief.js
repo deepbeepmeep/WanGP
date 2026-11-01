@@ -2,7 +2,7 @@
 // Brief: what to make, from which material, in which format and style. Every change saves itself.
 import { state, actions } from './app.js';
 import { api } from './api.js';
-import { icon, esc, fieldSaver, drawWave, formatTime, formatDuration, sectionColor, pickFiles, toast, confirmDialog, promptDialog } from './ui.js';
+import { icon, esc, fieldSaver, drawWave, formatTime, formatDuration, sectionColor, pickFiles, toast, confirmDialog, promptDialog, AUDIO_ACCEPT } from './ui.js';
 import { kindTiles, KINDS } from './home.js';
 import { modelRows, openDefaultModels } from './models.js';
 
@@ -35,7 +35,7 @@ export function mountBrief(container, doc) {
         </div></section>
 
       <section class="panel"><div class="panel-head"><span class="num">3</span><h3>${brief.kind === 'music_video' ? 'The song' : 'Soundtrack'}</h3><span class="hint">${brief.kind === 'music_video' ? 'Drives timing, cuts and lip sync' : 'Optional: music the edit follows'}</span></div>
-        <div id="song">${brief.song ? songCard(doc, analysis) : dropzone('song', 'audio/*,video/*', 'Drop the song here', `or click to choose a file · WAV, MP3, FLAC, M4A, or a video to take its audio${brief.kind === 'music_video' ? '. No song yet? Leave this empty: the showrunner composes one from your idea and lyrics.' : ''}`)}</div></section>
+        <div id="song">${brief.song ? songCard(doc, analysis) : dropzone('song', AUDIO_ACCEPT + ',video/*', 'Drop the song here', `or click to choose a file · WAV, MP3, FLAC, M4A, or a video to take its audio${brief.kind === 'music_video' ? '. No song yet? Leave this empty: the showrunner composes one from your idea and lyrics.' : ''}`)}</div></section>
 
       <section class="panel"><div class="panel-head"><span class="num">4</span><h3>References</h3><span class="hint">Looks, places, moods, motion: images or videos</span></div>
         <div class="refs">${brief.references.map((path, index) => reference(path, index)).join('')}
@@ -173,7 +173,7 @@ export function mountBrief(container, doc) {
   function modelsOpen() { try { return localStorage.getItem('sr.models') === '1'; } catch { return false; } }
 
   function dropTarget(zone, role) {
-    const accept = role === 'song' ? 'audio/*,video/*' : 'image/*,video/*';
+    const accept = role === 'song' ? AUDIO_ACCEPT + ',video/*' : 'image/*,video/*';
     zone.onclick = async () => {
       if (role === 'cast') {  // as on the Cast page: a person is named first; dropping photos adds people too
         const name = await promptDialog({ title: 'Who or what is it?', text: 'Describe them on the Cast page, or drop a photo here.', placeholder: 'Mia, the lead singer', ok: 'Add' });

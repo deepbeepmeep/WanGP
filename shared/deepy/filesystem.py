@@ -18,7 +18,7 @@ from typing import Any
 import ffmpeg
 from PIL import Image
 
-from shared.deepy.image_channels import image_color_details
+from shared.deepy.image_channels import image_color_details, upright_size
 from shared.deepy.media_registry import detect_media_type
 from shared.utils.video_decode import resolve_media_binary
 
@@ -402,7 +402,7 @@ def _probe_media(path: Path, media_type: str) -> dict[str, Any]:
 
 def _query_image(path: Path) -> dict[str, Any]:
     with Image.open(path) as image:
-        width, height = image.size
+        width, height = upright_size(image)
         color_details = image_color_details(image)
         frame_count = int(getattr(image, "n_frames", 1) or 1)
         duration = sum(float(image.seek(index) or image.info.get("duration", 0) or 0) for index in range(frame_count)) / 1000 if frame_count > 1 else None

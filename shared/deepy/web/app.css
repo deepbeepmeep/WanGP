@@ -22,7 +22,7 @@ body[data-deepy-app] #assistant_chat_dock { position: static !important; display
 body[data-deepy-app] #assistant_chat_panel { position: static !important; display: flex !important; flex-direction: column !important; width: min(100%, 1100px) !important; max-width: none !important; height: 100% !important; max-height: none !important; min-height: 0 !important; margin: 0 auto !important; padding: 14px !important; transform: none !important; opacity: 1 !important; visibility: visible !important; border: 0 !important; box-shadow: none !important; pointer-events: auto !important; }
 body[data-deepy-app] #assistant_chat_shell_block { position: relative !important; flex: 1 !important; min-height: 0 !important; height: auto !important; overflow: hidden; }
 body[data-deepy-app] #assistant_chat_html, body[data-deepy-app] .chat { height: 100% !important; min-height: 0 !important; max-height: none !important; }
-body[data-deepy-app] #assistant_chat_controls { position: absolute !important; bottom: 20px; left: 8px; right: 8px; width: auto !important; z-index: 5; display: grid; grid-template-columns: 36px minmax(0, 1fr) auto 36px; grid-template-areas: "status status status status" "reset request count upload" "notice notice notice notice"; align-items: center; gap: 0 4px; padding: 8px !important; border: 1px solid #c5d5df !important; border-radius: 22px; background: #fffffff5 !important; box-shadow: 0 5px 22px #173e5420 !important; }
+body[data-deepy-app] #assistant_chat_controls { position: absolute !important; bottom: 20px; left: 8px; right: 8px; width: auto !important; z-index: 5; display: grid; grid-template-columns: 36px minmax(0, 1fr) auto 36px; grid-template-areas: "status status status status" "pending pending pending pending" "reset request . upload" "notice notice notice notice"; align-items: center; gap: 0 4px; padding: 8px !important; border: 1px solid #c5d5df !important; border-radius: 22px; background: #fffffff5 !important; box-shadow: 0 5px 22px #173e5420 !important; }
 body[data-deepy-app] #assistant_chat_stats_block { position: absolute !important; bottom: 0; left: 10px; right: 10px; width: auto !important; }
 body[data-deepy-app] #assistant_chat_request { grid-area: request; width: 100% !important; min-width: 0 !important; }
 body[data-deepy-app] #assistant_chat_controls > button { display: none !important; width: 36px !important; min-width: 36px !important; height: 36px; min-height: 36px; margin: 0; padding: 0; box-shadow: none; }
@@ -33,13 +33,12 @@ body[data-deepy-app] #assistant_chat_clear_draft { grid-area: clear; align-items
 body[data-deepy-app] #assistant_chat_clear_draft:disabled { opacity: .35; cursor: default; }
 body[data-deepy-app] #assistant_chat_controls #assistant_chat_upload_button { grid-area: upload; display: inline-flex !important; }
 body[data-deepy-app] #assistant_chat_upload_status { grid-area: status; min-width: 0; margin: 0 4px 6px; max-height: 4.2em; overflow: auto; }
-body[data-deepy-app] #assistant_chat_upload_count { grid-area: count; display: inline-flex; align-items: center; gap: 3px; color: #376279; font-size: 12px; white-space: nowrap; }
-body[data-deepy-app] #assistant_chat_upload_count svg { flex: 0 0 18px; }
+body[data-deepy-app] #assistant_chat_pending_uploads { grid-area: pending; padding: 6px 4px 8px; }
 body[data-deepy-app] #assistant_chat_controls #assistant_chat_reset_button { grid-area: reset; display: inline-flex !important; }
-body[data-deepy-app] #assistant_chat_controls:is(:focus-within, :has(.is-recording, .is-transcribing)) { grid-template-areas: "status status status status" "request request request upload" "clear voice count ask" "notice notice notice notice"; }
+body[data-deepy-app] #assistant_chat_controls:is(:focus-within, :has(.is-recording, .is-transcribing)) { grid-template-areas: "status status status status" "pending pending pending pending" "request request request upload" "clear voice . ask" "notice notice notice notice"; }
 body[data-deepy-app] #assistant_chat_controls:is(:focus-within, :has(.is-recording, .is-transcribing)) > button:not([hidden]) { display: inline-flex !important; }
 body[data-deepy-app] #assistant_chat_controls:is(:focus-within, :has(.is-recording, .is-transcribing)) #assistant_chat_reset_button { display: none !important; }
-body[data-deepy-app] #assistant_chat_controls:is(:focus-within, :has(.is-recording, .is-transcribing)) :is(#assistant_chat_upload_count, #assistant_chat_ask_button, #assistant_chat_microphone, #assistant_chat_clear_draft) { margin-top: 4px; }
+body[data-deepy-app] #assistant_chat_controls:is(:focus-within, :has(.is-recording, .is-transcribing)) :is(#assistant_chat_ask_button, #assistant_chat_microphone, #assistant_chat_clear_draft) { margin-top: 4px; }
 body[data-deepy-app] #assistant_chat_controls:focus-within { border-color: #339ec6 !important; }
 body[data-deepy-app] #assistant_chat_request textarea:focus-visible { outline: none; }
 body[data-deepy-app] #assistant_chat_panel { position: relative !important; inset: auto; width: 100% !important; border-radius: 0 !important; background: transparent !important; }

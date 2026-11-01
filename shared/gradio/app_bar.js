@@ -102,6 +102,15 @@
             requestAnimationFrame(sync);
         },
         refresh() { requestAnimationFrame(() => { sync(); window.WanGPAddonNavigation?.refresh(); }); },
+        order(plugins) {
+            // Links of these Plugins take their places in this order; the other links stay where they are.
+            const rank = link => plugins.indexOf(link.dataset.appPlugin);
+            host()?.querySelectorAll('.app-bar-apps, .app-bar-menu').forEach(list => {
+                const links = [...list.children], moved = links.filter(link => rank(link) >= 0).sort((a, b) => rank(a) - rank(b));
+                list.replaceChildren(...links.map(link => rank(link) >= 0 ? moved.shift() : link));
+            });
+            layout();
+        },
         visited(value) {
             const visited = JSON.parse(value);
             host()?.querySelectorAll('[data-app-plugin]').forEach(button => {
@@ -161,6 +170,10 @@
     document.addEventListener('keydown', event => {
         const backdrop = host()?.querySelector('.app-welcome-backdrop');
         if (event.key === 'Escape') { closeMenu(); closeIntro(); }
+        if (event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && !event.repeat && event.key.length === 1) {
+            const link = host()?.querySelector(`.app-bar-utilities [aria-keyshortcuts="Alt+${CSS.escape(event.key.toUpperCase())}"]:not([hidden])`);
+            if (link) { event.preventDefault(); window.WanGPAppBar.navigate(link.dataset.appRoute); }
+        }
         if (event.key === 'Tab' && backdrop && !backdrop.hidden) {
             const buttons = Array.from(backdrop.querySelectorAll('button')).filter(button => button.offsetParent !== null && !button.disabled);
             const first = buttons[0], last = buttons[buttons.length - 1];

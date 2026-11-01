@@ -18,6 +18,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from shared.kernels import ops
+
 
 def get_mlp(mlp_type: Optional[str] = "normal"):
     if mlp_type == "normal":
@@ -34,14 +36,16 @@ class MLP(nn.Module):
     ):
         super().__init__()
         self.proj_in = nn.Linear(dim, dim * expand_ratio)
-        self.act = nn.GELU("tanh")
         self.proj_out = nn.Linear(dim * expand_ratio, dim)
 
     def forward(self, x: torch.FloatTensor) -> torch.FloatTensor:
-        x = self.proj_in(x)
-        x = self.act(x)
-        x = self.proj_out(x)
-        return x
+        x_list = [x]
+        x = None
+        return ops.mlp(x_list, self.proj_in, self.proj_out, "gelu")
+
+    def forward_residual(self, x_list: list[torch.Tensor], residual: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """residual += gate * mlp(x), x handed off in x_list."""
+        return ops.mlp(x_list, self.proj_in, self.proj_out, "gelu", residual=residual, gate=gate)
 
 
 class SwiGLUMLP(nn.Module):
@@ -59,6 +63,10 @@ class SwiGLUMLP(nn.Module):
         self.proj_in = nn.Linear(dim, hidden_dim, bias=False)
         self.dim = dim
         self.hidden_dim = hidden_dim
+
+    def forward_residual(self, x_list: list[torch.Tensor], residual: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """residual += gate * mlp(x), x handed off in x_list."""
+        return ops.mlp(x_list, self.proj_in_gate, self.proj_out, "swiglu", up=self.proj_in, residual=residual, gate=gate)
 
     def _forward(self, x: torch.FloatTensor) -> torch.FloatTensor:
         gate = F.silu(self.proj_in_gate(x))

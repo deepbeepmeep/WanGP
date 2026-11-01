@@ -102,7 +102,7 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 - **WanGP Manager (Experimental, Windows)**: [download the official app](https://github.com/deepbeepmeep/WanGP/releases/latest/download/WanGPManager.exe) for guided setup that selects the recommended GPU profile and installs Python and dependencies for you.\
   Keep several installations, update their dependencies and recommended kernels, try an older WanGP build or restore both source and environment from a saved version.\
-  Launch WanGP in its own window or your browser; add existing Conda installations and update them through a separate environment copy, keeping the original available for rollback.
+  Launch WanGP in its own window or your browser; add existing Conda, uv or venv installations, update their dependencies and keep a rollback checkpoint.
 
 - **Refreshed UI**:
   - **App bar**: apps sit side by side with an icon and a name, and the icons on the right open **Configuration**, **Apps & PlugIn Manager** and **Infos** (guides and About together).
@@ -507,7 +507,11 @@ It is recommended to use in Pinokio the Community Scripts *wan2gp* or *wan2gp-am
 
 **Download:** [WanGPManager.exe](https://github.com/deepbeepmeep/WanGP/releases/latest/download/WanGPManager.exe). This permanent link downloads the latest Manager release.
 
-Run `WanGPManager.exe`, open Manager and follow the **Install** tab. The official [WanGP repository](https://github.com/deepbeepmeep/WanGP) is selected by default. Model downloads, generation and Deepy remain in WanGP's web interface. To reuse existing checkpoints, add all of your checkpoint folders in WanGP's configuration.
+Run `WanGPManager.exe`, open Manager and follow **Install / Add**. Already have WanGP? Choose **Use existing installation** at the top, browse to its folder and let Manager detect its saved, `env_uv` or venv environment. You can also select a Conda environment. Registration leaves your packages unchanged. Choose **Update WanGP → Prepare latest update**, then confirm **Update WanGP** after reviewing the result. No new WanGP installation is required. Existing-installation updates require a Git checkout and a Conda or virtual environment.
+
+To update **Manager itself**, download the same installer, close Manager and run it. **Update in place** is selected for upgrades; it preserves your installation list and preferences. You do not need to uninstall first. **Preferences → Check for Manager updates** checks for a newer installer.
+
+The official [WanGP repository](https://github.com/deepbeepmeep/WanGP) is selected by default. Model downloads, generation and Deepy remain in WanGP's web interface. To reuse existing checkpoints, add all of your checkpoint folders in WanGP's configuration.
 
 ### Manual installation: (for RTX20xx - RTX50xx)
 
@@ -571,7 +575,7 @@ scripts\gputrim.cmd
 Trimming briefly applies memory pressure to encourage Windows to move idle GPU allocations to system RAM, then releases its allocations and displays updated usage. It can briefly stall GPU applications, and savings are not guaranteed. By default, it refuses if a process other than the Windows desktop compositor uses more than 1 GB; close GPU-heavy applications before retrying.
 
 #### Update the application (stay in the current python / pytorch version):
-For a Manager-managed installation, use the **Maintenance** tab in WanGP Manager. For another guided installer, use its update action or the included update script.
+In WanGP Manager, use **Update WanGP → Prepare latest update**, review the result and confirm **Update WanGP**. For another guided installer, use its update action or the included update script.
 
 For a manual installation, get in the directory where WanGP is installed and:
 ```bash

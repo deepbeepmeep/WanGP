@@ -271,9 +271,9 @@ def create_app(service, *, token=None, auth=None, voice_language=None, https_por
         with service._mutation_lock:
             return {"id": media_id, "gallery": service.gallery_snapshot()}
 
-    @app.post('/deepy_api/media/unattach-last')
-    def unattach_last(payload: dict):
-        return {'event': service.remove_last_chat_upload(payload.get('chat_session_id'))}
+    @app.post('/deepy_api/media/unattach')
+    def unattach(payload: dict):
+        return {'event': service.remove_chat_upload(payload.get('chat_session_id'), payload.get('media_id'))}
 
     @app.get("/deepy_api/media/locate")
     def locate_media(url: str):

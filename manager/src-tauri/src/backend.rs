@@ -16,7 +16,7 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum Action { Hardware, CondaEnvironments, Catalog, Sources, Register, Inspect, Preview, Apply, Recover, Versions, Launch, Demo }
+enum Action { Hardware, CondaEnvironments, DetectInstallation, ManagerUpdate, Catalog, Sources, Register, Inspect, Preview, Apply, Recover, Versions, Launch, Demo }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -401,6 +401,22 @@ async fn open_server(window: WebviewWindow, app: tauri::AppHandle, state: tauri:
     }
 }
 
+#[tauri::command]
+async fn open_manager_download(window: WebviewWindow) -> Result<(), String> {
+    authorize(&window)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let url = "https://github.com/deepbeepmeep/WanGP/releases/latest/download/WanGPManager.exe";
+        let wide: Vec<u16> = std::ffi::OsStr::new(url).encode_wide().chain(Some(0)).collect();
+        let result = unsafe { windows_sys::Win32::UI::Shell::ShellExecuteW(std::ptr::null_mut(), std::ptr::null(), wide.as_ptr(), std::ptr::null(), std::ptr::null(), 1) };
+        if result as isize <= 32 { return Err("Could not open the Manager download".into()); }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    Err("Manager installers are currently available for Windows".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,6 +503,12 @@ async fn export_diagnostics(window: WebviewWindow, app: tauri::AppHandle, state:
 #[tauri::command]
 fn set_console_fullscreen(window: WebviewWindow, enabled: bool) -> Result<(), String> {
     authorize(&window)?;
+    // Windows can restore the window without notifying Tao. Sync its minimized
+    // state before leaving fullscreen so it reapplies the normal title bar.
+    #[cfg(windows)]
+    if !enabled {
+        window.unminimize().map_err(|e| e.to_string())?;
+    }
     window.set_fullscreen(enabled).map_err(|e| e.to_string())
 }
 #[tauri::command]
@@ -548,6 +570,6 @@ pub fn run() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_state, start_job, cancel_job, pick_path, select_installation, set_port, set_launch_options, open_server, set_console_fullscreen, console_text, export_diagnostics, stop_and_exit])
+        .invoke_handler(tauri::generate_handler![get_state, start_job, cancel_job, pick_path, select_installation, set_port, set_launch_options, open_server, open_manager_download, set_console_fullscreen, console_text, export_diagnostics, stop_and_exit])
         .run(tauri::generate_context!()).expect("Unable to start WanGP Manager");
 }

@@ -275,12 +275,16 @@ class TransactionEngine:
                     _cache_resolution(Path(plan["resolution_directory"]), resolved_dir)
                 resolution = load_resolution(resolved_dir, check_inputs=False)
                 environment = inside(root, plan["environment"])
-                if previous and plan["operation"] == "update":
+                checkpoint_record = previous
+                if previous and plan["operation"] not in ("rollback", "repair"):
                     old_resolution = load_resolution(resolution_location(root, previous["active"]["resolution"]), check_inputs=False)
-                    service.validate(inside(root, previous["active"]["environment"]), old_resolution, previous["active"]["validation"]["inventory"])
+                    # Plugins may add packages after installation. Save the actual,
+                    # healthy environment for rollback rather than its old inventory.
+                    current_validation = service.validate(inside(root, previous["active"]["environment"]), old_resolution)
+                    checkpoint_record = {**previous, "active": {**previous["active"], "validation": current_validation}}
                 self._phase(operation, journal, "validating_environment" if plan["reuse_environment"] else "building_environment")
                 if plan["reuse_environment"]:
-                    expected_inventory = plan["target_active"]["validation"]["inventory"] if plan["target_active"] else previous["active"]["validation"]["inventory"]
+                    expected_inventory = plan["target_active"]["validation"]["inventory"] if plan["target_active"] else checkpoint_record["active"]["validation"]["inventory"]
                     validation = service.validate(environment, resolution, expected_inventory)
                 else:
                     validation = service.build(environment, resolved_dir, resolution)
@@ -301,7 +305,7 @@ class TransactionEngine:
                     if item["before"]:
                         atomic_copy(inside(root, "app/" + item["path"]), inside(operation / "backup", item["path"]), item["before"])
                 if previous:
-                    atomic_json(inside(root, f".manager/checkpoints/{plan['operation_id']}.json"), previous)
+                    atomic_json(inside(root, f".manager/checkpoints/{plan['operation_id']}.json"), checkpoint_record)
                 history = [*previous["history"], plan["operation_id"]] if previous else []
                 next_record = {
                     "schema_version": 1, "ownership": "managed", "root": str(root),

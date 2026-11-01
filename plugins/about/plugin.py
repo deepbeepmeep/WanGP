@@ -25,6 +25,8 @@ class AboutPlugin(WAN2GPPlugin):
 4. **WanGP Manager (Experimental, Windows x64)** — the official app for guided installation, launching, updates and rollback. **Download:** [WanGPManager.exe](https://github.com/deepbeepmeep/WanGP/releases/latest/download/WanGPManager.exe). This permanent link downloads the latest Manager release.
 
 See the [installation instructions](https://github.com/deepbeepmeep/WanGP#-quick-start) for these four methods and manual setup.
+
+Already have WanGP? In Manager, choose **Install / Add → Use existing installation**, then **Update WanGP → Prepare latest update**. Conda and uv/venv Git installations support dependency updates and rollback. To update Manager itself, run the latest installer and keep **Update in place** selected; no uninstall is needed.
 """)
         gr.Markdown("Many thanks to:")
         gr.Markdown("- <B>Bria AI</B> for Fibo 2.0 Dev\\* image generation and editing, and Fibo 2.0 Edit Turbo\\* four-step editing (https://huggingface.co/briaai/Fibo-2.0-dev, https://huggingface.co/briaai/Fibo-2.0-edit-turbo)")

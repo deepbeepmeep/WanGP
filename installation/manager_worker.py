@@ -12,14 +12,15 @@ import uuid
 from .catalog import load_config
 from .conda import discover_conda_environments
 from . import conda_transactions
-from .environments import inspect_interpreter, inspect_registry, interpreter_path, managed_record
+from .environments import inspect_interpreter, installation_environments, interpreter_path, managed_record
 from .execute import Cancelled, ProcessRunner
 from .hardware import detect_hardware, select_device
-from .launch import launch_managed, manager_arguments, combined_arguments, launch_context
+from .launch import application_command, launch_managed, manager_arguments, combined_arguments, launch_context
 from .manager_demo import create_demo
 from .plan import build_plan
 from .releases import create_release, load_release, source_path
 from .resolution import resolve_dependencies
+from .runtime import ensure_pip
 from .server_probe import require_free_port, wait_for_server
 from .sources import OFFICIAL_REPOSITORY, VERSION_FILE, cached_download_release, list_versions, remote_catalog, version_metadata
 from .state import InstallError, InstallationLock, atomic_json, inside, plain_path, read_json
@@ -29,11 +30,20 @@ from .version import local_version
 
 
 PROTOCOL = 1
-ACTIONS = {"hardware", "conda_environments", "catalog", "sources", "register", "inspect", "preview", "apply", "recover", "versions", "launch", "demo"}
+ACTIONS = {"hardware", "conda_environments", "detect_installation", "catalog", "sources", "register", "inspect", "preview", "apply", "recover", "versions", "launch", "demo", "manager_update"}
+
+
+def application_root(root):
+    root = plain_path(root)
+    if root.name == "app" and (root.parent / ".manager/installation.json").is_file():
+        return root.parent
+    if not (root / "wgp.py").is_file() and not (root / ".manager/installation.json").is_file() and (root / "app/wgp.py").is_file():
+        return root / "app"
+    return root
 
 
 def installation_info(root, python=None, data=None):
-    root = plain_path(root)
+    root = application_root(root)
     conda = conda_transactions.read_record(root)
     pending_conda = conda_transactions.active_operation(root)
     if conda or pending_conda:
@@ -41,8 +51,9 @@ def installation_info(root, python=None, data=None):
             journal = read_json(inside(root, f".manager/conda-operations/{pending_conda}/journal.json"))
             conda = journal["plan"]["previous"]
         active = conda["active"]
-        python = interpreter_path(active["environment"], "conda")
-        return {"root": str(root), "name": root.name, "ownership": "conda", "maintenance": "conda", "python": python, "release": active["release_id"], "environment": active["environment"], "inspection": inspect_interpreter(python), "pending_operation": pending_conda}
+        kind = conda["ownership"]
+        python = interpreter_path(active["environment"], kind)
+        return {"root": str(root), "name": root.name, "ownership": kind, "maintenance": kind, "python": python, "release": active["release_id"], "environment": active["environment"], "inspection": inspect_interpreter(python), "pending_operation": pending_conda}
     if (root / ".manager/installation.json").exists() or (root / ".manager/active_operation.json").exists():
         current = read_installation(root)
         pending = active_operation(root)
@@ -56,16 +67,18 @@ def installation_info(root, python=None, data=None):
     if managed_record(root):
         raise InstallError("select_parent", "Select the parent installation folder containing .manager and app")
     if python is None:
-        registry = inspect_registry(root)
-        selected = registry["envs"].get(registry["active"])
-        if not selected or selected["status"] != "inspected":
-            raise InstallError("python_required", "Select this installation's Python executable. Its packages will not be changed")
-        python = selected["interpreter"]
+        python = installation_environments(root)["python"]
+        if not python:
+            raise InstallError("python_required", "Choose the Python environment used by this WanGP installation. Use Detect environment to find env_uv, venv or the saved selection")
     inspection = inspect_interpreter(plain_path(python))
     if inspection["status"] != "inspected":
         raise InstallError("python_unavailable", inspection["error"])
+    demo = (root / "setup_config.json").is_file() and set(load_config(root / "setup_config.json")["gpu_profiles"]) == {"Demo"}
+    if not inspection["packages"]["torch"] and not demo:
+        raise InstallError("torch_missing", "This Python has no PyTorch. Choose the WanGP environment (usually env_uv or env), not the base Miniconda Python. Use Detect environment to find it")
     version = local_version(root)
-    return {"root": str(root), "name": root.name, "ownership": "external", "maintenance": "conda" if inspection["conda_environment"] else None, "python": inspection["interpreter"], "release": version or "Existing checkout", "inspection": inspection, "pending_operation": None}
+    kind = "conda" if inspection["conda_environment"] else "venv" if inspection["prefix"] != inspection["base_prefix"] else None
+    return {"root": str(root), "name": root.name, "ownership": "external", "maintenance": kind if (root / ".git").exists() else None, "python": inspection["interpreter"], "release": version or "Existing checkout", "inspection": inspection, "pending_operation": None}
 
 
 def source_catalog(source):
@@ -116,6 +129,23 @@ def run_action(action, args, data, runtime, cancelled, emit, request_id):
         return detect_hardware()
     if action == "conda_environments":
         return discover_conda_environments(check_cancelled=runner.check_cancelled)
+    if action == "detect_installation":
+        root = application_root(args["root"])
+        if managed_record(root) or conda_transactions.read_record(root):
+            info = installation_info(root)
+            return {"root": str(root), "python": info["python"], "environments": [{"name": "Saved Manager environment", "interpreter": info["python"], **inspect_interpreter(info["python"])}]}
+        if not (root / "wgp.py").is_file():
+            raise InstallError("missing_application", "Choose your existing WanGP folder containing wgp.py")
+        return {"root": str(root), **installation_environments(root)}
+    if action == "manager_update":
+        from urllib.request import Request, urlopen
+        request = Request("https://api.github.com/repos/deepbeepmeep/WanGP/releases/latest", headers={"Accept": "application/vnd.github+json", "User-Agent": "WanGP-Manager"})
+        with urlopen(request, timeout=20) as response:
+            release = json.load(response)
+        tag = release["tag_name"]
+        if not tag.startswith("manager-v"):
+            raise InstallError("manager_release_unavailable", "The latest release is not a Manager release. Visit the download page")
+        return {"version": tag.removeprefix("manager-v"), "url": "https://github.com/deepbeepmeep/WanGP/releases/latest/download/WanGPManager.exe"}
     if action == "catalog":
         if args.get("repository"):
             config, version = remote_catalog(args["repository"], args["commit"], runner)
@@ -131,7 +161,7 @@ def run_action(action, args, data, runtime, cancelled, emit, request_id):
                 info["operation"] = operation_status(info["root"])
         return info
     if action == "versions":
-        if conda_transactions.read_record(args["root"]) or args.get("maintenance") == "conda":
+        if conda_transactions.read_record(args["root"]) or args.get("maintenance") in ("conda", "venv"):
             return conda_transactions.version_history(args["root"])
         return version_history(args["root"])
     if action == "demo":
@@ -145,7 +175,7 @@ def run_action(action, args, data, runtime, cancelled, emit, request_id):
         preview = data / "previews" / request_id
         preview.mkdir(parents=True, exist_ok=False)
         existing = installation_info(args["root"], args.get("python"), data) if operation != "install" else None
-        is_conda = existing and existing.get("maintenance") == "conda"
+        is_conda = existing and existing.get("maintenance") in ("conda", "venv")
         if is_conda:
             with InstallationLock(args["root"]):
                 if existing["pending_operation"]:
@@ -170,13 +200,41 @@ def run_action(action, args, data, runtime, cancelled, emit, request_id):
             targets = [device["architecture"]] if device and device.get("architecture", "").startswith("gfx") else []
             catalog = build_plan(config, release / "source", plain_path(args["root"]) / "environments" / request_id, args["profile"], recommended_extras=bool(args.get("extras", False)), plugins=args.get("plugins", []), device=device, amd_targets=targets)
             emit({"type": "progress", "title": "Resolving Dependencies", "message": "Checking compatible versions and package hashes. uv may download package metadata or wheels; this can take several minutes."})
-            resolve_dependencies(catalog, preview / "resolution", runtime, runner=runner)
+            plugins = []
+            if existing:
+                app_root = Path(existing["root"]) / "app" if existing["ownership"] == "managed" else Path(existing["root"])
+                for requirements in sorted(app_root.glob("plugins/*/requirements.txt")):
+                    # Built-in plugins must use the target release's requirements.
+                    target = release / "source" / requirements.relative_to(app_root)
+                    plugins.append(target if target.is_file() else requirements)
+            resolved = resolve_dependencies(catalog, preview / "resolution", runtime, runner=runner, extra_requirements=plugins)
             runner.check_cancelled()
             emit({"type": "progress", "title": "Preparing Installation Plan", "message": "Comparing files and recording the changes for your review"})
             if is_conda:
                 repository = args.get("repository") or args.get("source")
                 commit = args.get("commit") or conda_transactions.git(plain_path(repository), runner, "rev-parse", "HEAD")
-                plan = conda_engine.prepare(args["root"], python=existing["python"], release=release, resolution=preview / "resolution", repository=repository, commit=commit, operation=operation)
+                # Source-only updates keep the working packages. Changed recipes
+                # build/validate a candidate before switching either source or Python.
+                same_inputs = True
+                for filename in resolved["input_files"]:
+                    path = Path(filename)
+                    if not path.is_relative_to(release / "source"):
+                        continue
+                    previous = Path(existing["root"]) / path.relative_to(release / "source")
+                    if not previous.is_file() or previous.read_text(encoding="utf-8-sig").strip() != path.read_text(encoding="utf-8-sig").strip():
+                        same_inputs = False
+                        break
+                previous_record = conda_transactions.read_record(existing["root"])
+                previous_resolution = previous_record and previous_record["active"].get("resolution")
+                # An imported environment has no validated dependency recipe yet.
+                # Its first update builds a candidate, including plugin requirements.
+                same_recipe = False
+                if previous_resolution:
+                    from .resolution import load_resolution
+                    saved = load_resolution(previous_resolution, check_inputs=False)
+                    same_recipe = saved["dependency_fingerprint"] == resolved["dependency_fingerprint"]
+                reuse = args.get("environment", "auto") != "new" and same_inputs and same_recipe
+                plan = conda_engine.prepare(args["root"], python=existing["python"], release=release, resolution=preview / "resolution", repository=repository, commit=commit, operation=operation, reuse_environment=reuse)
             else:
                 plan = prepare_transaction(args["root"], release, preview / "resolution", operation=operation, environment_policy=args.get("environment", "auto"), emit=emit, check_cancelled=runner.check_cancelled)
         atomic_json(preview / "transaction.json", plan)
@@ -219,12 +277,18 @@ def run_action(action, args, data, runtime, cancelled, emit, request_id):
                 return launch_managed(info["root"], runtime, arguments, emit, cancelled.is_set, started, args.get("launch_options"), args.get("auth_password"))
             # The lease is in Manager data, never inside an externally owned checkout.
             import hashlib
-            lease = Path(info["root"]) if info.get("maintenance") == "conda" else data / "external-leases" / hashlib.sha256(os.path.normcase(info["root"]).encode()).hexdigest()
+            lease = Path(info["root"]) if info.get("maintenance") in ("conda", "venv") else data / "external-leases" / hashlib.sha256(os.path.normcase(info["root"]).encode()).hexdigest()
             with InstallationLock(lease):
                 root = Path(info["root"])
                 with launch_context(runtime, info["python"], args.get("launch_options"), args.get("auth_password"), emit) as (env, output_events):
                     runner.events = output_events
-                    result = runner.run([info["python"], "-u", str(root / "wgp.py"), *combined_arguments(root, arguments)], cwd=root, env=env, timeout=None, check=False, on_start=started)
+                    if info.get("maintenance") == "venv":
+                        ensure_pip(info["python"], runtime, runner)
+                    while True:
+                        command = application_command(info["python"], root / "wgp.py", combined_arguments(root, arguments))
+                        result = runner.run(command, cwd=root, env=env, timeout=None, check=False, on_start=started)
+                        if result.returncode != 42:
+                            break
                     return {"status": "stopped" if result.returncode == 0 else "crashed", "returncode": result.returncode}
         except Cancelled:
             return {"status": "stopped"}

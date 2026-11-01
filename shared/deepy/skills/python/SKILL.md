@@ -10,14 +10,14 @@ description: "Use before the first wangp_python run of a session: how the sandbo
 ## Working loop
 
 1. One step per run: a `# title` comment first (it becomes the description of published media), under about 80 lines. Variables persist between runs; a timeout or `restart` loses variables, never files.
-2. Read inputs: Gallery media and authorized files with `wangp.path(ref)` (`Image.open(wangp.path("image_2"))`, `open("@documents/notes.txt")`); folders with `wangp.listdir("@test/photos", recursive=True)` (dicts with path, file, name, type, kind, bytes, date).
+2. Read inputs: Gallery media and authorized files with `wangp.path(ref)` (`Image.open(wangp.path("visual:IMAGE"))`, `open("@documents/notes.txt")`); folders with `wangp.listdir("@test/photos", recursive=True)` (dicts with path, file, name, type, kind, bytes, date).
 3. Write only with relative paths inside the sandbox (`tmp/`, `scratch/`, `out/`). Finished deliverables go under `out/`: images, audio and meshes there are published to the Gallery after the run and come back in `outputs` with a `media_id` (at most 8 per run). Frames and scratch never go under `out/`.
 4. Look at what you made before building on it: `inspect_media` with a question (or `wangp.inspect(media, question)` from a script), several times along a clip.
 5. Print only what the next decision needs (counts, sizes, the matches): long output is cut.
 
 ## WanGP's tools from a script
 
-- `wangp.generate(settings)`: generates with a template or model and waits; returns the job result with the new media ids. `wangp.call("deepy_templates")` / `wangp.call("models", action="lookup", arguments={"query": ...})` find templates and model types.
+- `wangp.generate(settings)`: generates with a template or model and waits; returns the job result with the new media ids. `wangp.call("templates", task="gen_video")` / `wangp.call("models", action="lookup", arguments={"query": ...})` find templates and model types.
 - `wangp.inspect(media, question)`: asks the visual model about an image, a video frame (`media_inputs=[{"media_id": ref, "time_s": t}]`) or a 3D asset.
 - `wangp.toolbox(action, **arguments)`: media utilities (resize_crop, extract_video, merge_videos, remux_media, render_3d_views, create_mask, transcribe_media...).
 - `wangp.io(action, {...})`: list, info, read_text, mkdir, copy, move, zip in authorized folders (writing there goes through it: no delete).

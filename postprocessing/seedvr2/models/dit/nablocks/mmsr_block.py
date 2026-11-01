@@ -25,7 +25,10 @@ from ..modulation import ada_layer_type
 from ..normalization import norm_layer_type
 from ..mm import MMArg, MMModule
 from ..mlp import get_mlp
-    
+
+MLP_INPUT_CHUNK_BYTES = 64 << 20  # the normalized rows of the video residual handed to the MLP at a time (its own chunking follows)
+
+
 
 class NaMMSRTransformerBlock(nn.Module):
     def __init__(
@@ -96,42 +99,39 @@ class NaMMSRTransformerBlock(nn.Module):
         torch.LongTensor,
         torch.LongTensor,
     ]:
+        # The video residual is updated in place: the attention by batches of windows and the MLP by chunks of rows normalize, modulate,
+        # process, gate and add back their own rows, so no full-size branch tensor exists beside the residual. The text is processed whole.
         vid, txt = vid_list.pop(), txt_list.pop()
-        hid_len = MMArg(
-            cache("vid_len", lambda: vid_shape.prod(-1)),
-            cache("txt_len", lambda: txt_shape.prod(-1)),
-        )
-        ada_kwargs = {
-            "emb": emb,
-            "hid_len": hid_len,
-            "cache": cache,
-            "branch_tag": MMArg("vid", "txt"),
-        }
+        vid_ada, txt_ada = self.ada.module("vid"), self.ada.module("txt")
+        # the cached modulation rows also serve the 3B's output modulation (as upstream: it reads this block layout's "attn" entry)
+        vid_kwargs = {"emb": emb, "hid_len": cache("vid_len", lambda: vid_shape.prod(-1)), "cache": cache, "branch_tag": "vid"}
+        txt_kwargs = {"emb": emb, "hid_len": cache("txt_len", lambda: txt_shape.prod(-1)), "cache": cache, "branch_tag": "txt"}
+        attn_norm, mlp_norm, mlp = self.attn_norm.module("vid"), self.mlp_norm.module("vid"), self.mlp.module("vid")
 
-        vid_attn, txt_attn = self.attn_norm(vid, txt)
+        def vid_attn_in(x_list):
+            x = attn_norm(x_list.pop())
+            return vid_ada(x, layer="attn", mode="in", **vid_kwargs)
 
-        vid_attn, txt_attn = self.ada(vid_attn, txt_attn, layer="attn", mode="in", **ada_kwargs)
-        vid_attn_list, txt_attn_list = [vid_attn], [txt_attn]
-        vid_attn = txt_attn = None
-        vid_attn, txt_attn = self.attn(vid_attn_list, txt_attn_list, vid_shape, txt_shape, cache)
-        vid_attn, txt_attn = self.ada(vid_attn, txt_attn, layer="attn", mode="out", **ada_kwargs)
-        vid_attn.add_(vid)
+        txt_attn = self.attn_norm.module("txt")(txt)
+        if txt_ada is not None:
+            txt_attn = txt_ada(txt_attn, layer="attn", mode="in", **txt_kwargs)
+        txt_attn_list = [txt_attn]
+        txt_attn = None
+        txt_attn = self.attn(vid, txt_attn_list, vid_shape, txt_shape, cache, vid_attn_in, lambda x: vid_ada(x, layer="attn", mode="out", **vid_kwargs))
+        if txt_ada is not None:
+            txt_attn = txt_ada(txt_attn, layer="attn", mode="out", **txt_kwargs)
         txt_attn.add_(txt)
-        vid = txt = None
+        txt = None
 
-        vid_mlp, txt_mlp = self.mlp_norm(vid_attn, txt_attn)
-        # ADD BY NUMZ
-        if vid_mlp.dtype != vid_attn.dtype:
-            vid_mlp = vid_mlp.to(vid_attn.dtype)
-        if txt_mlp.dtype != txt_attn.dtype:
-            txt_mlp = txt_mlp.to(txt_attn.dtype)
-        # END BY NUMZ
-        vid_mlp, txt_mlp = self.ada(vid_mlp, txt_mlp, layer="mlp", mode="in", **ada_kwargs)
-        vid_mlp_list, txt_mlp_list = [vid_mlp], [txt_mlp]
-        vid_mlp = txt_mlp = None
-        vid_mlp, txt_mlp = self.mlp.forward_disposable(vid_mlp_list, txt_mlp_list)
-        vid_mlp, txt_mlp = self.ada(vid_mlp, txt_mlp, layer="mlp", mode="out", **ada_kwargs)
-        vid_mlp.add_(vid_attn)
+        gate, rows = vid_ada.gate(emb, "mlp").reshape(-1), max(1, MLP_INPUT_CHUNK_BYTES // (vid.shape[-1] * vid.element_size()))
+        for start in range(0, vid.shape[0], rows):
+            residual = vid[start:start + rows]
+            x_list = [vid_ada(mlp_norm(residual), layer="mlp", mode="in", **vid_kwargs)]
+            mlp.forward_residual(x_list, residual, gate)
+        if txt_ada is None:  # the 3B's last block has no text MLP: its text output is not used
+            return vid, txt_attn, vid_shape, txt_shape
+
+        txt_mlp = txt_ada(self.mlp_norm.module("txt")(txt_attn), layer="mlp", mode="in", **txt_kwargs)
+        txt_mlp = txt_ada(self.mlp.module("txt")(txt_mlp), layer="mlp", mode="out", **txt_kwargs)
         txt_mlp.add_(txt_attn)
-
-        return vid_mlp, txt_mlp, vid_shape, txt_shape
+        return vid, txt_mlp, vid_shape, txt_shape

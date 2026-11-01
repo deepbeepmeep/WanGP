@@ -2,7 +2,7 @@
 import os, sys
 from tqdm import tqdm
 
-WanGP_version = "19.0"
+WanGP_version = "19.01"
 _welcome_message = f" WanGP v{WanGP_version} - Copyright (c) 2024-2026 DeepBeepMeep "
 tqdm.write(f"\033[1m\033[93m{_welcome_message:*^100}\033[0m")
 
@@ -92,6 +92,7 @@ from shared.utils.audio_metadata import read_audio_metadata, extract_creation_da
 from shared.utils.media_recording import record_file_metadata as shared_record_file_metadata
 from shared.utils.settings_bundle import is_wangp_settings_filename
 from shared.utils.video_decode import decode_video_frames_ffmpeg, probe_video_stream_metadata
+from shared.utils.video_metadata import extract_source_images  # also a plugin global (Queue Editor)
 from shared.utils.virtual_media import get_virtual_image, get_virtual_media_entry, get_virtual_media_vsource, media_source_exists, parse_virtual_media_path, replace_virtual_media_source, strip_virtual_media_suffix
 from shared.utils.frame_scheduler import SLASH_BLOCK_RE, build_default_window_plan, build_extension_window, build_frame_scheduler, fit_video_length, floor_frame_count, has_slash_commands, normalize_frame_count, set_video_length_rounding, prepare_loras_mult_windows
 from shared.match_archi import match_nvidia_architecture

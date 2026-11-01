@@ -41,8 +41,8 @@ Generate the narration (or song) and the pictures first, then one run makes the 
 ```python
 # Slideshow timed to the narration
 from PIL import Image
-narration, pictures = "audio_7", ["image_3", "image_4", "image_5", "image_6"]
-seconds = wangp.toolbox("get_media_details", media_id=narration)["duration_seconds"]
+narration, pictures = "audio:NARRATION", ["visual:PICTURE_1", "visual:PICTURE_2", "visual:PICTURE_3", "visual:PICTURE_4"]
+seconds = wangp.io("info", {"path": narration})["duration_seconds"]
 fps, W, H = 24, 1280, 720
 frames = []
 for ref in pictures:

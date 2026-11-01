@@ -203,7 +203,8 @@ class PluginManagerUIPlugin(WAN2GPPlugin):
                     const enabledUserPlugins = collectEnabledUserPlugins();
                     if (silent && enabledUserPlugins === null) return;
                     
-                    const payload = makePayload({ restart: restart, silent: !!silent, enabled_plugins: enabledUserPlugins });
+                    if (!restart) window.WanGPAppBar?.order(enabledUserPlugins);
+                    const payload = makePayload({ restart: restart, enabled_plugins: enabledUserPlugins });
                     updateGradioInput('save_action_input', payload);
 
                     if (restart) {
@@ -524,7 +525,7 @@ class PluginManagerUIPlugin(WAN2GPPlugin):
                 """
             user_html = f'<div id="user-plugin-list">{user_items_html}</div>'
 
-        restart_warning_html = "<div class='plugin-restart-warning'>Restart required: app and plugin changes were saved. Restart WanGP for tab visibility and ordering to update.</div>" if self.restart_required else ""
+        restart_warning_html = "<div class='plugin-restart-warning'>Restart required: app and plugin changes were saved. Restart WanGP for them to take effect.</div>" if self.restart_required else ""
         return f"{css}<div class='plugin-list'>{instruction_html}{user_html}{restart_warning_html}</div>"
 
     def _default_available_tab(self):
@@ -584,11 +585,8 @@ class PluginManagerUIPlugin(WAN2GPPlugin):
             component=self.operation_progress,
         )
 
-        self.save_action_input.change(
-            fn=self._handle_save_action,
-            inputs=[self.save_action_input],
-            outputs=self.on_tab_outputs,
-        ).then(fn=None, js=catalog_changed_js)
+        # Saving an order changes nothing on this page: the dragged list and the app bar already show it.
+        self.save_action_input.change(fn=self._handle_save_action, inputs=[self.save_action_input], show_progress="hidden").then(fn=None, js=catalog_changed_js)
         
         WangpProgress.bind(self.plugin_action_input.change, self._handle_plugin_action_from_json,
             inputs=[self.plugin_action_input],
@@ -682,13 +680,6 @@ class PluginManagerUIPlugin(WAN2GPPlugin):
             return result_message
         return result_message
 
-    def _save_plugin_settings(self, enabled_plugins: list, silent: bool = False):
-        update_config(self.server_config, self.server_config_filename, {"enabled_plugins": enabled_plugins})
-        self.restart_required = True
-        if not silent:
-            gr.Info("App and plugin configuration saved. Please restart WanGP for changes to take effect.")
-        return self._build_plugins_html(), *self._build_available_plugins_html_outputs()
-
     def _save_and_restart(self, enabled_plugins: list):
         update_config(self.server_config, self.server_config_filename, {"enabled_plugins": enabled_plugins})
         gr.Info("Settings saved. Restarting application...")
@@ -702,20 +693,13 @@ class PluginManagerUIPlugin(WAN2GPPlugin):
 
     def _handle_save_action(self, payload_str: str):
         if not payload_str:
-            return gr.update(value=self._build_plugins_html()), *[gr.update() for _ in range(self._available_outputs_count())]
-        try:
-            payload = json.loads(payload_str)
-            enabled_plugins = payload.get("enabled_plugins", self.server_config.get("enabled_plugins", []))
-            if not isinstance(enabled_plugins, list):
-                enabled_plugins = self.server_config.get("enabled_plugins", [])
-            if payload.get("restart", False):
-                self._save_and_restart(enabled_plugins)
-                return self._build_plugins_html(), *self._build_available_plugins_html_outputs()
-            else:
-                return self._save_plugin_settings(enabled_plugins, silent=payload.get("silent", False))
-        except (json.JSONDecodeError, TypeError):
-            gr.Warning("Could not process save action due to invalid data.")
-            return gr.update(value=self._build_plugins_html()), *[gr.update() for _ in range(self._available_outputs_count())]
+            return
+        payload = json.loads(payload_str)
+        enabled_plugins = self.server_config.get("enabled_plugins", []) if payload["enabled_plugins"] is None else payload["enabled_plugins"]
+        if payload["restart"]:
+            self._save_and_restart(enabled_plugins)
+        else:  # a new order needs no restart: the app bar follows it
+            update_config(self.server_config, self.server_config_filename, {"enabled_plugins": enabled_plugins})
 
     def _install_plugin_and_refresh(self, url, progress=WangpProgress()):
         progress(0, desc="Starting installation...")

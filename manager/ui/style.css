@@ -54,3 +54,9 @@ dialog{border:1px solid var(--line);border-radius:17px;padding:29px;width:460px;
 @media(max-width:1000px){.content{padding-bottom:190px}.operation-dock{left:206px;right:16px;bottom:14px;padding:14px 16px}.install-step{padding:22px}.install-step .form-title{margin:-22px -22px 22px;padding:18px 22px}.install-step .form-footer{flex-direction:column;gap:14px}}
 
 .operation-dock.ready .row>div{min-width:0}.operation-dock.ready button{flex-shrink:0}
+.existing-entry { display:flex; align-items:center; justify-content:space-between; gap:24px; border:2px solid #8c73e6; margin-bottom:24px; }
+.existing-entry button { flex-shrink:0; }
+.update-entry { border:2px solid #8c73e6; }
+.version-options > summary { padding:8px 0; font-size:17px; font-weight:650; cursor:pointer; }
+.version-options[open] > summary { margin-bottom:20px; }
+.detected-environment { margin-top:18px; }

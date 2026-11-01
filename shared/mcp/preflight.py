@@ -39,6 +39,7 @@ def effective_settings(session, supplied):
 def input_metadata(session, settings):
     from .server import _MCP_MEDIA_SETTING_KEYS, _mcp_media_type
     from PIL import Image
+    from shared.deepy.image_channels import upright_size
     from shared.utils.video_decode import resolve_media_binary
 
     result = []
@@ -52,7 +53,7 @@ def input_metadata(session, settings):
             record = {"role": role, "path": str(path), "media_type": _mcp_media_type(str(path)), "size_bytes": path.stat().st_size}
             if record["media_type"] == "image":
                 with Image.open(path) as image:
-                    record.update(width=image.width, height=image.height)
+                    record.update(zip(("width", "height"), upright_size(image)))
             elif record["media_type"] in {"audio", "video"}:
                 if probe:
                     process = subprocess.run([str(probe), "-v", "error", "-show_entries", "stream=codec_type,width,height,sample_rate,channels,avg_frame_rate:format=duration", "-of", "json", str(path)], capture_output=True, text=True, timeout=15)

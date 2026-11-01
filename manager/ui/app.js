@@ -5,7 +5,7 @@ const state = {
   page:"overview", preferences:{installations:[],selected:null,port:7860}, jobs:new Map(), pending:new Map(),
   hardware:null, catalog:null, inspection:null, versions:[], preview:null, demo:null, message:null, runtime_error:null,
   form:{source:"",root:"",release_id:"",profile:"",device:"",extras:true,environment:"auto",operation:"install"},
-  registration:{root:"",python:""}, selectedLog:null, consoleExpanded:false, progressExpanded:false, launchDraft:null, preferencesDraft:null, authenticationDraft:{password:""}, savingPreferences:false,
+  registration:{root:"",python:""}, detected:{environments:[],loading:false,error:null}, managerUpdate:null, selectedLog:null, consoleExpanded:false, progressExpanded:false, launchDraft:null, preferencesDraft:null, authenticationDraft:{password:""}, savingPreferences:false,
   conda:{environments:[],warnings:[],loading:false,loaded:false,error:null},
   renderedView:null, scrollPositions:new Map(), flowKey:"install", flows:new Map()
 };
@@ -17,14 +17,14 @@ function selectFlow(page){
   if(!["install","maintenance"].includes(page))return;
   state.flowKey=page==="install"?"install":"maintenance:"+(selected()?.root||"");
   if(!state.flows.has(state.flowKey)){
-    const flow={form:{...initialForm,root:selected()?.root||"",operation:"switch-version"},remote:{...initialRemote,choices:[]},catalog:null,preview:null};
+    const flow={form:{...initialForm,root:selected()?.root||"",operation:"update"},remote:{...initialRemote,choices:[]},catalog:null,preview:null};
     if(selected()?.test_workspace){Object.assign(flow.remote,{manual:true,kind:"local"});flow.form.source=selected().demo_releases?.[0]?.path||"";flow.form.profile="Demo";}
     state.flows.set(state.flowKey,flow);
   }
 }
 const currentFlow=()=>state.flows.get(state.flowKey);
 const viewKey=()=>state.page+(state.page==="install"&&state.registerView?":registration":"");
-const applyLabel=plan=>plan.operation==="install"?(state.catalog?.profiles.Demo?"Install test installation":"Install WanGP"):plan.operation==="rollback"?"Restore this version":"Apply changes";
+const applyLabel=plan=>plan.operation==="install"?(state.catalog?.profiles.Demo?"Install test installation":"Install WanGP"):plan.operation==="rollback"?"Restore this version":plan.operation==="update"?"Update WanGP":"Apply changes";
 const icons = {
   home:'<path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z"/><path d="M9 21v-8h6v8"/>',
   install:'<path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5"/>',
@@ -36,6 +36,7 @@ const icons = {
   play:'<path d="m8 4 13 8-13 8z"/>',
   copy:'<rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V3H3v13h5"/>',
   save:'<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h12l4 4v12a2 2 0 0 1-2 2Z"/><path d="M7 3v6h10V3M7 21v-8h10v8"/>',
+  minimize:'<path d="M5 12h14"/>',
   expand:'<path d="M8 3H3v5M16 3h5v5M3 16v5h5M21 16v5h-5"/>',
   collapse:'<path d="M3 8h5V3M21 8h-5V3M8 21v-5H3M16 21v-5h5"/>'
 };
@@ -46,7 +47,7 @@ const svg = name => '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" 
 const pretty = value => esc(JSON.stringify(value,null,2));
 const selected = () => state.preferences.installations.find(x=>x.root===state.preferences.selected);
 const usesConda = item => item?.maintenance==="conda"||item?.ownership==="conda"||Boolean(item?.inspection?.conda_environment);
-const canMaintain = item => item?.ownership==="managed"||usesConda(item);
+const canMaintain = item => item?.ownership==="managed"||["conda","venv"].includes(item?.maintenance)||["conda","venv"].includes(item?.ownership);
 const server = () => [...state.jobs.values()].find(x=>x.action==="launch"&&!x.done&&x.args?.root===selected()?.root);
 const busyJob = () => [...state.jobs.values()].find(x=>!x.done&&["preview","apply","recover","demo","register","sources","catalog"].includes(x.action));
 const launchLog = () => [...state.jobs.values()].reverse().find(x=>x.action==="launch"&&x.args?.root===selected()?.root);
@@ -99,9 +100,9 @@ function render(){
   const nextView=viewKey(),sameView=state.renderedView===nextView;
   const scrollTop=state.scrollPositions.get(nextView)||0;
   state.renderedView=nextView;
-  const nav=state.preferences.installations.length?[["overview","home","Overview"],["install","install","Install"],["maintenance","maintain","Maintenance"],["diagnostics","diagnostic","Diagnostics"],["activity","activity","Activity"],["preferences","settings","Preferences"]]:[["install","install","Install"]];
+  const nav=state.preferences.installations.length?[["overview","home","Overview"],["install","install","Install / Add"],["maintenance","maintain","Update WanGP"],["diagnostics","diagnostic","Diagnostics"],["activity","activity","Activity"],["preferences","settings","Preferences"]]:[["install","install","Install / Add"]];
   document.querySelector("#app").innerHTML=html(
-    '<div class="shell" {shellState}><aside class="sidebar"><div class="brand"><img class="brand-icon" src="manager.png" alt=""><div><div class="brand-name">WanGP</div><div class="brand-sub">Manager</div></div></div><div class="nav-label">YOUR INSTALLATIONS</div><nav class="nav">{nav}</nav><div class="sidebar-bottom"><div><span class="dot {warn}"></span>{runtime}</div><div class="badge-label">VERSION {version} · LOCAL PREVIEW</div></div></aside><main class="main"><header class="topbar"><div class="breadcrumb">WanGP Manager / <strong>{page}</strong></div>{picker}</header><div class="content">{error}{message}{progress}{content}</div></main></div>{expandedConsole}<dialog id="close-dialog"><h2>Work is still running</h2><p>Keep Manager open, or stop its servers and cancel active operations before exiting. Interrupted installation work can be recovered when you return.</p><div class="actions">{keep}{exit}</div></dialog>',{
+    '<div class="shell" {shellState}><aside class="sidebar"><div class="brand"><img class="brand-icon" src="manager.png" alt=""><div><div class="brand-name">WanGP</div><div class="brand-sub">Manager</div></div></div><div class="nav-label">YOUR INSTALLATIONS</div><nav class="nav">{nav}</nav><div class="sidebar-bottom"><div><span class="dot {warn}"></span>{runtime}</div><div class="badge-label">VERSION {version} · EXPERIMENTAL</div></div></aside><main class="main"><header class="topbar"><div class="breadcrumb">WanGP Manager / <strong>{page}</strong></div>{picker}</header><div class="content">{error}{message}{progress}{content}</div></main></div>{expandedConsole}<dialog id="close-dialog"><h2>Work is still running</h2><p>Keep Manager open, or stop its servers and cancel active operations before exiting. Interrupted installation work can be recovered when you return.</p><div class="actions">{keep}{exit}</div></dialog>',{
       shellState:state.consoleExpanded?'inert aria-hidden="true"':"",
       expandedConsole:state.consoleExpanded?consoleMarkup(launchLog(),"server-log","Start WanGP to see its console output here."):"",
       nav:nav.map(([page,icon,label])=>button("navigate",svg(icon)+label,state.page===page?"active":"",false,'data-page="'+page+'"')).join(""),
@@ -127,7 +128,7 @@ function overview(){
   return heading("YOUR INSTALLATIONS",item.test_workspace?"Your test installation.":"Ready when you are.","Launch WanGP here, or open it in your browser.")+html(
     '<section class="card hero"><div class="hero-header"><div><div class="row"><span class="pill {statusClass}">{status}</span><span class="pill purple">{ownership}</span></div><div class="spacer"></div><h2>{name}</h2><p class="path">{root}</p></div><div class="hero-art">{box}</div></div><div class="actions">{actions}</div>{launching}{url}{console}</section><div class="cards">{cards}</div>{test}<section class="card"><div class="row"><div><h3>{heading}</h3><p class="hint">{description}</p></div>{manage}</div></section>',{
       statusClass:live?.server_url?"green":item.pending_operation?"amber":"",status,ownership:item.test_workspace?"Test installation":item.ownership==="managed"?"Managed installation":"Existing installation",name:esc(item.test_workspace?"Test installation":item.name),root:esc(item.root),box:svg("box"),
-      actions:button("start",live&&!live.server_url?'<span class="spinner"></span> '+(live.stopping?"Stopping…":"Starting…"):"Start WanGP","primary",live||item.pending_operation||busyJob()||state.runtime_error)+button("open-app","Open in App","",!live?.server_url)+button("open-browser","Open in Browser","",!live?.server_url)+(live?'<span class="separator"></span>'+button("stop",live.stopping?"Stopping…":"Stop","danger",live.stopping):"")+(item.pending_operation?button("recover","Recover installation","primary"):""),
+      actions:button("start",live&&!live.server_url?'<span class="spinner"></span> '+(live.stopping?"Stopping…":"Starting…"):"Start WanGP","primary",live||item.pending_operation||busyJob()||state.runtime_error)+button("navigate","Update WanGP","",live||busyJob()||!canMaintain(item),'data-page="maintenance"')+button("open-app","Open in App","",!live?.server_url)+button("open-browser","Open in Browser","",!live?.server_url)+(live?'<span class="separator"></span>'+button("stop",live.stopping?"Stopping…":"Stop","danger",live.stopping):"")+(item.pending_operation?button("recover","Recover installation","primary"):""),
       launching:live&&!live.server_url?'<div class="launch-progress" role="status"><p class="hint">'+(live.stopping?"Waiting for WanGP to stop…":"Starting WanGP. The opening buttons become available when the server is ready.")+'</p><div class="progress"></div></div>':"",
       console:state.consoleExpanded?"":consoleMarkup(launchLog(),"server-log","Start WanGP to see its console output here."),
       url:live?.server_url?'<p class="footer-note">'+esc(live.server_url)+' · Same server in both views</p>':"",
@@ -138,16 +139,20 @@ function overview(){
       ].map(([label,value,detail])=>html('<div class="card"><div class="metric-label">{label}</div><div class="metric-value">{value}</div><div class="metric-detail">{detail}</div></div>',{label,value:esc(value),detail:esc(detail)})).join(""),
       test:item.test_workspace?notice("This test installation runs a small sample web page. It does not contain WanGP models or generation features."):"",
       heading:canMaintain(item)?"Keep a version that works for you.":"Your existing installation stays yours.",
-      description:usesConda(item)?"Update WanGP and its dependencies in a Conda clone, or restore a saved source and environment pair.":item.ownership==="managed"?"Try another release or restore a saved version from Maintenance.":"Manager can inspect and launch it. Source and package maintenance remain with your existing tools.",
-      manage:button("navigate",canMaintain(item)?"Manage versions":"Inspect installation","",false,'data-page="'+(canMaintain(item)?"maintenance":"diagnostics")+'"')
+      description:canMaintain(item)&&item.ownership!=="managed"?"Update WanGP and its dependencies, or restore a saved source and environment pair.":item.ownership==="managed"?"Update this installation, try another release or restore a saved version.":"Register a Git checkout with a Conda or virtual environment to enable updates and rollback.",
+      manage:button("navigate",canMaintain(item)?"Update WanGP":"Inspect installation","primary",false,'data-page="'+(canMaintain(item)?"maintenance":"diagnostics")+'"')
     });
 }
 function install(){
   if(state.registerView)return heading("ADD EXISTING","Bring your installation.","Register its folder and Python environment without changing packages.")+
-    '<section class="card">'+field("registration","root","WanGP folder","Folder containing wgp.py, or a managed installation root","folder")+condaEnvironmentField()+field("registration","python","Python executable","Choose a Conda environment above, or browse to Python","python")+
-    '<div class="form-footer"><p class="hint">Registration preserves your source, packages and application configuration.</p>'+button("register","Add installation","primary",!state.registration.root||busyJob())+'</div></section>'+button("new-view","← Set up a new installation","text-link");
-  return heading("SET UP","Install WanGP.","Choose a version and a folder. Manager selects the right installation for your GPU.")+installForm(false)+review()+
+    '<section class="card">'+field("registration","root","WanGP folder","Folder containing wgp.py, or a managed installation root","folder")+button("detect-installation",state.detected.loading?"Finding environment…":"Detect environment","small",!state.registration.root||state.detected.loading)+localEnvironmentField()+'<details><summary>Choose another Conda environment or Python</summary>'+condaEnvironmentField()+field("registration","python","Python executable","Select the Python used by this installation","python")+'</details>'+
+    '<div class="form-footer"><p class="hint">Your models, plugins and settings stay in place. Once added, choose Start WanGP or Update WanGP on the Overview page.</p>'+button("register","Add installation","primary",!state.registration.root||busyJob()||state.detected.loading)+'</div></section>'+button("new-view","← Set up a new installation","text-link");
+  return heading("SET UP","Install or add WanGP.","Use an existing installation, or let Manager create a new one.")+'<section class="card existing-entry"><div><h2>Already have WanGP?</h2><p class="hint">Use your current installation, including Conda, uv, venv and Desktop setups. Keep your models and settings.</p></div>'+button("register-view","Use existing installation","primary",busyJob())+'</section>'+installForm(false)+review()+
     '<section class="installation-alternatives"><h2>Other ways to get started</h2><div><h3>Already have WanGP?</h3><p class="hint">Add its folder and Python environment to Manager.</p>'+button("register-view","Add existing installation","small")+'</div><details><summary>Try a lightweight test installation</summary><p class="hint">Creates a small sample web page to practice installation, launching and rollback. It does not install WanGP or download models or GPU packages.</p>'+button("demo","Prepare test installation","small",busyJob()||state.runtime_error)+'</details></section>';
+}
+function localEnvironmentField(){
+  const detected=state.detected,current=state.registration.python;
+  return '<div class="field detected-environment">'+(detected.error?notice(esc(detected.error),"error"):'')+(detected.environments.length?'<label for="local-environment">Environment found in this installation</label><select id="local-environment">'+option('','Choose an environment',current)+detected.environments.map(x=>option(x.interpreter,x.name+' · Python '+x.python+' · PyTorch '+(x.packages?.torch||'not installed')+(x.saved?' · Saved selection':''),current)).join('')+'</select><p class="hint">'+esc(current||'More than one environment may be available; choose the one you normally use.')+'</p>':state.registration.root&&!detected.loading?'<p class="hint">Choose Detect environment, or select another environment below.</p>':'')+'</div>';
 }
 function profileName(key,label){return /^(RTX|GTX)_\d{2}$/.test(key)?key.replace("_"," ")+"XX":label;}
 function condaEnvironmentField(){
@@ -175,17 +180,17 @@ function installForm(maintaining){
     '<p class="profile-stack">'+esc(profile?'Python '+profile.python+' · '+profile.torch:'Select a version to find the right packages for your GPU.')+'</p>'+
     (state.catalog&&!form.profile?notice(devices.length?'This version has no supported profile for the selected GPU. Choose another detected GPU or version.':'No supported GPU was detected. Check the GPU driver, then refresh hardware.','error'):'')+
     button('refresh-hardware','Refresh hardware','small',busyJob())+
-    '</section><section class="install-step" aria-labelledby="destination-step"><div class="form-title"><span class="step">3</span><div><h3 id="destination-step">'+(maintaining?'Choose how to switch':'Choose where to install')+'</h3><p class="hint">'+(maintaining?'Keep the current environment when compatible, or create a separate one.':'Python and packages will be installed automatically in this folder.')+'</p></div></div>'+
+    '</section><section class="install-step" aria-labelledby="destination-step"><div class="form-title"><span class="step">3</span><div><h3 id="destination-step">'+(maintaining?'Update options':'Choose where to install')+'</h3><p class="hint">'+(maintaining?'Keep the current environment when compatible, or create a separate one.':'Python and packages will be installed automatically in this folder.')+'</p></div></div>'+
     (!maintaining?field('form','root','Installation folder','Choose a new or empty folder','folder'):
-      '<div class="grid2">'+selectField('operation','Action',[["switch-version","Switch version / downgrade"],["update","Update"],...(!usesConda(selected())?[["repair","Repair missing files and rebuild"]]:[])],form.operation)+(usesConda(selected())?'<div class="field"><label>Environment</label><p>Update a separate Conda clone. Keep the previous environment for rollback.</p></div>':selectField('environment','Environment',[["auto","Automatic"],["current","Reuse current (if compatible)"],["new","Create a new environment"]],form.environment))+'</div>')+
+      '<div class="grid2">'+selectField('operation','Action',[["switch-version","Switch version / downgrade"],["update","Update"],...(selected()?.ownership==="managed"?[["repair","Repair missing files and rebuild"]]:[])],form.operation)+(usesConda(selected())?'<div class="field"><label>Environment</label><p>Update a separate Conda clone. Keep the previous environment for rollback.</p></div>':selectField('environment','Environment',[["auto","Automatic"],["current","Reuse current (if compatible)"],["new","Create a new environment"]],form.environment))+'</div>')+
     '<label class="check recommended-components"><input type="checkbox" data-group="form" data-key="extras" '+(form.extras?'checked':'')+'>Include recommended optional components</label>'+
-    '<div class="form-footer"><p class="hint">'+(state.preview?'Preparation is complete. The summary is below; use '+applyLabel(state.preview.plan)+' in the bottom bar to continue.':(online?'Downloads WanGP source':'Reads the selected source')+' and resolves compatible packages. Some package metadata or wheels may also download. Installation starts only when you confirm the prepared result.')+'</p>'+(!state.preview?button('preview',online?'Download and prepare':'Prepare installation','primary',!ready||(!maintaining&&!form.root)||busyJob()||server()||state.runtime_error):'')+'</div></section></div></fieldset>';
+    '<div class="form-footer"><p class="hint">'+(state.preview?'Preparation is complete. The summary is below; use '+applyLabel(state.preview.plan)+' in the bottom bar to continue.':(online?'Downloads WanGP source':'Reads the selected source')+' and resolves compatible packages. Some package metadata or wheels may also download. Installation starts only when you confirm the prepared result.')+'</p>'+(!state.preview?button('preview',maintaining?'Prepare changes':online?'Download and prepare':'Prepare installation','primary',!ready||(!maintaining&&!form.root)||busyJob()||server()||state.runtime_error):'')+'</div></section></div></fieldset>';
 }
 
 function review(){
   const data=state.preview;if(!data)return "";const p=data.plan;
   return html('<section class="card review" id="installation-review"><div class="row"><h2>Prepared changes</h2><span class="pill purple">{operation}</span></div><p class="path">{root}</p><div class="review-summary"><div><span>Target version</span><strong>{version}</strong></div><div><span>Environment</span><strong>{environment}</strong></div><div><span>Source files</span><strong>{count}</strong></div></div><p class="hint">{checkpoint} Your application settings and media are preserved.</p><details><summary>Show affected files</summary><pre>{changes}</pre></details><div class="actions">{discard}</div></section>',{
-    operation:esc(p.operation),root:esc(p.installation_root),version:esc(p.target_release_id),environment:p.reuse_environment?(p.operation==="rollback"?"Restore saved environment":"Reuse validated environment"):p.backend==="conda"?"Update a separate Conda clone":"Build a new environment",count:p.changes.length+" change"+(p.changes.length===1?"":"s"),
+    operation:esc(p.operation),root:esc(p.installation_root),version:esc(p.target_release_id),environment:p.reuse_environment?(p.operation==="rollback"?"Restore saved environment":"Reuse validated environment"):p.environment_kind==="conda"?"Update a separate Conda clone":"Build a new environment",count:p.changes.length+" change"+(p.changes.length===1?"":"s"),
     checkpoint:p.previous_release_id?"Current version "+esc(p.previous_release_id)+" will remain available as a rollback checkpoint.":"A new managed installation will be created.",
     changes:p.changes.slice(0,100).map(x=>(x.before?x.after?"Change":"Remove":"Add")+"  "+esc(x.path)).join("\n")+(p.changes.length>100?"\n… and "+(p.changes.length-100)+" more":""),
     discard:button("discard-preview","Discard prepared changes","quiet",busyJob())
@@ -195,15 +200,16 @@ function maintenance(){
   const item=selected();
   if(!item)return heading("MAINTENANCE","Keep a way back.","Manage releases and restore a known-good version.")+'<div class="card empty">'+svg("maintain")+'<h2>Add an installation first</h2><p>Managed installations have version switching, repair and rollback.</p>'+button("navigate","Set up WanGP →","text-link",false,'data-page="install"')+'</div>';
   if(!canMaintain(item))return heading("MAINTENANCE","Existing installation.","This checkout remains under your control.")+notice("Manager can launch and inspect this installation. Use its existing tools to update source or packages, or create a separate managed installation to test version switching.")+button("navigate","Create a managed installation","primary",false,'data-page="install"');
-  return heading("MAINTENANCE","Find your working version.","Preview updates, test an older release, or restore a checkpoint.")+
+  return heading("UPDATES","Update your WanGP installation.","Keep this installation and its models. Prepare an update, review it, then apply it.")+
+    '<section class="card update-entry"><h2>Update WanGP to the latest version</h2><p>Currently installed: <strong>'+esc(item.release||'Existing checkout')+'</strong></p><p class="hint">Manager checks the latest version and its dependencies, then keeps a rollback checkpoint. Your models, plugins, settings and outputs stay in place.</p>'+button("prepare-latest","Prepare latest update","primary",server()||busyJob()||item.pending_operation||state.runtime_error)+'</section>'+review()+
     (usesConda(item)?notice("Conda updates keep your WanGP folder and prepare dependencies in a separate environment. Manager switches to that clone after validation; rollback restores both source and environment. Launch through Manager or the installation's scripts to use the selected environment. Stop WanGP and save or stash tracked source edits first. Git and Conda must be installed; allow disk space for another environment."):"")+
     (server()?notice("Stop this installation before changing its version or environment."):"")+
     (item.pending_operation?notice("An interrupted operation needs recovery before this installation can launch. "+button("recover","Recover now"),"error"):"")+
-    '<section class="card"><div class="row"><h2>Saved versions</h2>'+button("versions","Refresh history","small",server()||busyJob())+'</div>'+
+    '<details class="card version-options"><summary>Choose another version or change dependencies</summary>'+installForm(true)+'</details><section class="card"><div class="row"><h2>Saved versions and rollback</h2>'+button("versions","Refresh history","small",server()||busyJob())+'</div>'+
     (state.versions.length?'<ul class="list">'+state.versions.map(x=>html('<li><div class="version-main"><span class="version-node {current}"></span><div><strong>{release}</strong><p>{description}</p></div></div>{restore}</li>',{
       current:x.current?"current":"",release:esc(x.release_id),description:x.current?"Active source and environment":"Retained rollback checkpoint",
       restore:x.current?'<span class="pill green">Current</span>':button("rollback","Preview restore","small",server()||busyJob(),'data-checkpoint="'+x.checkpoint+'"')
-    })).join("")+'</ul>':'<p class="hint">Refresh history to see available checkpoints.</p>')+'</section><div class="spacer"></div>'+review()+'<div class="spacer"></div>'+installForm(true);
+    })).join("")+'</ul>':'<p class="hint">Your first update will save the current version here for rollback.</p>')+'</section>';
 }
 function diagnostics(){
   const hardware=state.hardware,info=state.inspection,packages=info?.inspection?.packages||{};
@@ -224,7 +230,13 @@ function environmentDetails(info){
 function jobLog(job){return job.events.map(e=>e.text||([e.title,e.message].filter(Boolean).join(" — ")||(e.type==="finished"?"Operation "+(e.result?.status||"completed")+(e.result?.error?": "+e.result.error.message:""):e.type==="server_ready"?"Server ready: "+e.url:""))+"\n").join("").replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g,"").slice(-180000);}
 function consoleMarkup(job,id,placeholder){
   const attributes='data-id="'+(job?.id||"")+'"';
-  return '<section class="console'+(state.consoleExpanded?' console-fullscreen':'')+'" aria-label="Console"><div class="row"><h3>Console</h3><div class="console-actions">'+iconButton("copy-console","copy","Copy console",!job,attributes)+iconButton("save-console","save","Save console",!job,attributes)+iconButton("toggle-console",state.consoleExpanded?"collapse":"expand",state.consoleExpanded?"Exit full-screen console (Esc)":"Full-screen console",false,'id="console-size"')+'</div></div><pre id="'+id+'" class="log" tabindex="0" aria-label="WanGP console">'+esc(job?jobLog(job):placeholder)+'</pre><p class="hint">Recent console output · Copy and Save include the text shown here.'+(state.consoleExpanded?' · Press Esc to return.':'')+'</p>'+(state.consoleExpanded&&state.message?'<p class="console-feedback" role="status">'+esc(state.message.text)+'</p>':"")+'</section>';
+  const actions=[
+    iconButton("copy-console","copy","Copy console",!job,attributes),
+    iconButton("save-console","save","Save console",!job,attributes),
+    state.consoleExpanded ? iconButton("minimize-manager","minimize","Minimize Manager") : "",
+    iconButton("toggle-console",state.consoleExpanded?"collapse":"expand",state.consoleExpanded?"Exit full-screen console (Esc)":"Full-screen console",false,'id="console-size"')
+  ].join("");
+  return '<section class="console'+(state.consoleExpanded?' console-fullscreen':'')+'" aria-label="Console"><div class="row"><h3>Console</h3><div class="console-actions">'+actions+'</div></div><pre id="'+id+'" class="log" tabindex="0" aria-label="WanGP console">'+esc(job?jobLog(job):placeholder)+'</pre><p class="hint">Recent console output · Copy and Save include the text shown here.'+(state.consoleExpanded?' · Press Esc to return.':'')+'</p>'+(state.consoleExpanded&&state.message?'<p class="console-feedback" role="status">'+esc(state.message.text)+'</p>':"")+'</section>';
 }
 async function setConsoleExpanded(enabled){
   const log=document.getElementById("server-log");
@@ -268,7 +280,12 @@ function preferences(){
     launchOption('telemetry','Deepy telemetry','Enable detailed decode, MTP, CUDA-memory and GPU diagnostics. Also enables verbose level 2 and saves console output locally; nothing is uploaded.')+
     (draft.telemetry?field('launchDraft','telemetry_file','Telemetry output file','Choose a .log or .txt file','log')+'<p class="hint">Output is appended to this file while WanGP runs. Detailed decode telemetry appears when Deepy is used.</p>':'')+'</section>'+
     '<div class="preference-save"><div class="actions">'+button('save-launch-options',state.savingPreferences?'Saving…':'Save preferences','primary',!preferencesDirty()||state.savingPreferences)+button('discard-preferences','Discard changes','quiet',!preferencesDirty()||state.savingPreferences)+'</div><p id="preferences-status" class="hint" role="status">'+(state.savingPreferences?'Saving…':preferencesDirty()?'Unsaved changes — saved settings still apply until you save.':'All preferences saved.')+'</p><p class="hint">Existing scripts/args.txt settings still apply unless an enabled Manager option overrides them.</p></div></fieldset>'+
-    '<aside class="manager-information" aria-label="Manager information"><h2>Manager information</h2><p class="hint">Information only. These locations are managed automatically and are not editable preferences.</p><dl><dt>App version</dt><dd>WanGP Manager '+esc(state.version)+'</dd><dt>Installation list and preferences</dt><dd><code>'+esc(state.data_directory.replace(/[\\/]+$/,'')+'/preferences.json')+'</code></dd><dt>Per-installation records</dt><dd>The .manager folder inside each managed installation stores its active version, environment and rollback history.</dd></dl><p class="hint">Add existing installations and create test installations from the Install page. Generation workspaces remain inside WanGP.</p></aside>';
+    '<section class="card"><h2>Update WanGP Manager</h2><p>Installed Manager: <strong>'+esc(state.version)+'</strong></p>'+(state.managerUpdate?'<p role="status">'+(newerVersion(state.managerUpdate.version,state.version)?'Manager '+esc(state.managerUpdate.version)+' is available.':'You have the latest Manager version.')+'</p>':'')+'<p class="hint">Download the latest installer, close Manager, then run it. It updates Manager in place and keeps your installation list and preferences. You do not need to uninstall first. WanGP itself is updated from Update WanGP in the sidebar.</p><div class="actions">'+button('manager-update','Check for Manager updates','',busyJob())+button('manager-download','Download latest Manager')+'</div></section>'+ '<aside class="manager-information" aria-label="Manager information"><h2>Manager information</h2><p class="hint">Information only. These locations are managed automatically and are not editable preferences.</p><dl><dt>App version</dt><dd>WanGP Manager '+esc(state.version)+'</dd><dt>Installation list and preferences</dt><dd><code>'+esc(state.data_directory.replace(/[\\/]+$/,'')+'/preferences.json')+'</code></dd><dt>Per-installation records</dt><dd>The .manager folder inside each managed installation stores its active version, environment and rollback history.</dd></dl><p class="hint">Add existing installations and create test installations from the Install / Add page. Generation workspaces remain inside WanGP.</p></aside>';
+}
+function newerVersion(candidate,current){
+  const a=candidate.split('.').map(Number),b=current.split('.').map(Number);
+  for(let i=0;i<Math.max(a.length,b.length);i++){if((a[i]||0)!==(b[i]||0))return (a[i]||0)>(b[i]||0);}
+  return false;
 }
 
 function notify(text,type="success"){state.message={text,type};render();}
@@ -293,6 +310,24 @@ async function loadCondaEnvironments(){
     Object.assign(state.conda,{environments:result.environments,warnings:result.warnings,loaded:true});
   }catch(error){state.conda.error=error.message||String(error);}
   finally{state.conda.loading=false;render();}
+}
+async function detectInstallation(){
+  const root=state.registration.root;if(!root)return;
+  const request={environments:[],loading:true,error:null};
+  state.registration.python="";state.detected=request;render();
+  try{
+    const result=await run("detect_installation",{root});
+    if(root!==state.registration.root||state.detected!==request)return;
+    state.registration.root=result.root;state.registration.python=result.python||"";
+    state.detected.environments=result.environments;
+  }catch(error){if(root===state.registration.root&&state.detected===request)request.error=error.message||String(error);}
+  finally{if(state.detected===request){request.loading=false;render();}}
+}
+async function prepareUpdate(){
+  state.message=null;state.preview=null;
+  const flow=currentFlow();
+  const args={...state.form,...sourceArgs(),root:state.page==="maintenance"?selected().root:state.form.root,python:state.page==="maintenance"?selected().python:null,operation:state.page==="maintenance"?state.form.operation:"install",environment:state.page==="maintenance"?state.form.environment:"auto"};
+  flow.preview=await run("preview",args);render();
 }
 function inferProfile(){
   const profiles=state.catalog?.profiles||{},devices=state.hardware?.devices||[];
@@ -326,14 +361,14 @@ async function refreshInspection(){
 }
 async function history(){
   if(!canMaintain(selected())||server())return;
-  const root=selected().root,result=await run("versions",{root,maintenance:usesConda(selected())?"conda":null});
+  const root=selected().root,result=await run("versions",{root,maintenance:selected().maintenance||null});
   if(selected()?.root===root){state.versions=result.versions;render();}
 }
 async function navigate(page){
   state.page=page;state.registerView=false;state.message=null;selectFlow(page);
   if(state.catalog&&["install","maintenance"].includes(page))inferProfile();
   render();
-  if(page==="maintenance")await history();
+  if(page==="maintenance"){await refreshInspection();await history();}
   if(state.page!==page)return;
   if((page==="install"||page==="maintenance")&&!busyJob()){
     if(usingRemote()&&!state.catalog)await loadSources();
@@ -346,6 +381,7 @@ document.addEventListener("input",event=>{
   const {group,key}=event.target.dataset;
   if(group&&key){
     state[group][key]=event.target.type==="checkbox"?event.target.checked:event.target.value;
+    if(group==="registration"&&key==="root"){state.registration.python="";state.detected={environments:[],loading:false,error:null};}
     if(group==="form"||group==="remote")state.preview=null;
     if((group==="form"&&key==="source")||group==="remote"&&["kind","commit","repository"].includes(key))state.catalog=null;
     if(group==="remote"&&key==="repository"){state.remote.choices=[];state.remote.commit="";state.remote.loaded_repository=null;}
@@ -356,7 +392,8 @@ document.addEventListener("change",async event=>{
   try{
     if(event.target.id==="installation-picker"){await invoke("select_installation",{root:event.target.value});state.preferences.selected=event.target.value;state.inspection=null;state.versions=[];await navigate(state.page);}
     else if(event.target.id==="log-picker"){state.selectedLog=event.target.value;render();}
-    else if(event.target.id==="conda-environment"){state.registration.python=event.target.value;render();}
+    else if(["conda-environment","local-environment"].includes(event.target.id)){state.registration.python=event.target.value;render();}
+    else if(event.target.dataset.group==="registration"&&event.target.dataset.key==="root")await detectInstallation();
     else if(event.target.dataset.group==="remote"){
       if(event.target.dataset.key==="manual"&&!state.remote.manual){Object.assign(state.remote,{kind:"github",repository:OFFICIAL_REPOSITORY,commit:"",choices:[],loaded_repository:null});state.catalog=null;}
       render();
@@ -376,10 +413,13 @@ document.addEventListener("click",async event=>{
     else if(action==="dismiss"){state.message=null;render();}
     else if(action==="register-view"){state.page="install";selectFlow("install");state.registerView=true;render();if(!state.conda.loaded)await loadCondaEnvironments();}
     else if(action==="refresh-conda")await loadCondaEnvironments();
+    else if(action==="detect-installation")await detectInstallation();
+    else if(action==="manager-update"){state.managerUpdate=await run("manager_update");render();}
+    else if(action==="manager-download")await invoke("open_manager_download");
     else if(action==="new-view"){state.registerView=false;render();}
     else if(action==="browse"){
       const value=await invoke("pick_path",{kind:el.dataset.kind});
-      if(value){state[el.dataset.group][el.dataset.key]=value;if(el.dataset.group==="form"||el.dataset.group==="registration")state.preview=null;render();if(el.dataset.group==="form"&&el.dataset.key==="source")await readCatalog();}
+      if(value){state[el.dataset.group][el.dataset.key]=value;if(el.dataset.group==="form"||el.dataset.group==="registration")state.preview=null;render();if(el.dataset.group==="form"&&el.dataset.key==="source")await readCatalog();if(el.dataset.group==="registration"&&el.dataset.key==="root")await detectInstallation();}
     }
     else if(action==="catalog")await readCatalog();
     else if(action==="sources")await loadSources(true);
@@ -390,11 +430,11 @@ document.addEventListener("click",async event=>{
       state.page="install";state.registerView=false;state.preview=null;await readCatalog();notify("Test source ready. Choose Prepare installation, then Install test installation to try the sample workflow.");
     }
     else if(action==="demo-version"){state.form.source=el.dataset.source;state.preview=null;await readCatalog();}
-    else if(action==="preview"){
-      state.message=null;state.preview=null;
-      const flow=currentFlow();
-      const args={...state.form,...sourceArgs(),root:state.page==="maintenance"?selected().root:state.form.root,python:state.page==="maintenance"?selected().python:null,operation:state.page==="maintenance"?state.form.operation:"install",environment:state.page==="maintenance"?state.form.environment:"auto"};
-      flow.preview=await run("preview",args);render();
+    else if(action==="preview")await prepareUpdate();
+    else if(action==="prepare-latest"){
+      Object.assign(state.remote,{manual:false,kind:"github",repository:OFFICIAL_REPOSITORY,commit:""});
+      state.form.operation="update";state.form.environment="auto";state.preview=null;
+      await loadSources(true);await prepareUpdate();
     }
     else if(action==="apply"){
       const flow=currentFlow(),page=state.page;
@@ -414,6 +454,7 @@ document.addEventListener("click",async event=>{
     else if(action==="stop"){state.message=null;await invoke("cancel_job",{id:server().id});}
     else if(action==="open-app"||action==="open-browser")await invoke("open_server",{id:server().id,presentation:action==="open-app"?"app":"browser"});
     else if(action==="toggle-console")await setConsoleExpanded(!state.consoleExpanded);
+    else if(action==="minimize-manager")await window.__TAURI__.window.getCurrentWindow().minimize();
     else if(action==="copy-console"||action==="save-console"){
       const text=jobLog(state.jobs.get(el.dataset.id)),save=action==="save-console";
       const path=await invoke("console_text",{text,save});

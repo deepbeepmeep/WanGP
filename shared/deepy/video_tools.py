@@ -15,6 +15,7 @@ from tempfile import TemporaryDirectory
 import ffmpeg
 from PIL import Image, ImageDraw, ImageFont
 
+from shared.deepy.image_channels import upright, upright_size
 from shared.ffmpeg_setup import download_ffmpeg
 from shared.utils.audio_video import get_mp4_audio_codec_settings, get_video_audio_extra_args
 from shared.utils.video_codecs import get_video_container_extension, get_video_encode_args, validate_video_output_settings
@@ -354,7 +355,7 @@ def side_by_side_media(source_paths: list[str], output_path: str, layout: str | 
             sizes.append((int(stream["width"]), int(stream["height"])))
         else:
             with Image.open(path) as image:
-                sizes.append(image.size)
+                sizes.append(upright_size(image))
     tile_width, tile_height = sizes[0]
     has_legends = any(legends)
     legend_height = max(32, min(96, tile_height // 8)) if has_legends else 0
@@ -365,7 +366,7 @@ def side_by_side_media(source_paths: list[str], output_path: str, layout: str | 
         canvas = Image.new("RGB", (columns * tile_width, rows * cell_height), "black")
         for index, (path, legend) in enumerate(zip(source_paths, legends)):
             with Image.open(path) as source:
-                image = source.convert("RGB")
+                image = upright(source).convert("RGB")
                 image.thumbnail((tile_width, tile_height), Image.Resampling.LANCZOS)
                 x = index % columns * tile_width
                 y = index // columns * cell_height
@@ -941,7 +942,7 @@ def resize_crop_image(source_path: str, output_path: str, *, width: int | None =
     if not os.path.isfile(source_path):
         raise FileNotFoundError(f"Image not found: {source_path}")
     with Image.open(source_path) as image:
-        source_width, source_height = image.size
+        source_width, source_height = upright(image).size
         left, top, cropped_width, cropped_height = _resolve_resize_crop_geometry(
             source_width,
             source_height,

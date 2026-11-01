@@ -574,6 +574,7 @@ class DeepyPrimeTools:
                 f"Default seed: {int(settings['seed'])}.",
             ])
             lines.append("Override compatible template/model defaults with the resolution, video_length, duration_seconds and seed above when the user does not specify them.")
+        lines.append("A supplied speech or song that must be heard whole sets video_length instead: its duration in seconds, such as \"10.2s\", which WanGP fits to the model's frame steps.")
         lines.append("The generate tool fills omitted dimensions, duration, and seed from Deepy's standing defaults before model factory defaults; pass the template values explicitly to preserve them.")
         return "\n".join(lines)
 

@@ -44,6 +44,18 @@ running those restored settings uses that version without changing the
 configuration preference. Existing `flashvsr` and `flashvsr2pass` settings mean
 FlashVSR v1.1; `flashvsrplus` and `flashvsrplus2pass` mean FlashVSR+ Turbo.
 
+## SeedVR2 Models
+
+SeedVR2 3B and SeedVR2 7B have separate selections, and
+**Configuration > Extensions > SeedVR2 > SeedVR2 Model** controls which one is
+normally shown (3B by default). The two trade appearance for fidelity: in the
+authors' comparisons 3B looks better on AI-generated and real-world video,
+while 7B stays closer to the source on degraded footage. 7B downloads as an
+INT8 file a little larger than 3B and runs slightly slower. **Extract Settings**
+restores the saved model even when the configuration hides it. Existing
+`seedvr2` settings mean SeedVR2 3B; `seedvr2_7b` means SeedVR2 7B. Media Flow's
+SeedVR2 processes use the configured model.
+
 ## Handler contract
 
 ```python
@@ -269,7 +281,8 @@ Upsampler settings are stored under `wgp_config["spatial_upsamplers"][config_key
 Handlers can read old top-level keys during migration with `legacy_config()`, but
 those keys are deleted after the nested section is written.
 
-SeedVR2 stores `window_size` under `spatial_upsamplers.seedvr2`. `0` selects the
+SeedVR2 stores `model` (`3b` or `7b`) and `window_size` under
+`spatial_upsamplers.seedvr2`. For `window_size`, `0` selects the
 GPU-based automatic limit, `-1` disables windowing, and positive values are
 finite frame limits. SeedVR2 aligns finite limits down to its required `4n+1`
 input shape and crossfades three overlapping output frames.

@@ -91,6 +91,10 @@ class MMModule(nn.Module):
         vid = vid_module(vid_list.pop(), *get_args("vid", args), **get_kwargs("vid", kwargs))
         return vid, txt
 
+    def module(self, branch: str):
+        """The vid or txt module (the shared one when the weights are shared); None for the text of a video-only module."""
+        return None if branch == "txt" and self.vid_only else self.all if self.shared_weights else getattr(self, branch)
+
     def forward_vid_disposable(self, vid_list: List[torch.FloatTensor], *args, **kwargs) -> torch.FloatTensor:
         module = self.vid if not self.shared_weights else self.all
         return module(vid_list.pop(), *get_args("vid", args), **get_kwargs("vid", kwargs))

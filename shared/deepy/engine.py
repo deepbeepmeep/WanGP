@@ -4594,7 +4594,7 @@ class DeepyZeroTools:
         shutil.copy2(source, output_path)
         if is_image:
             with Image.open(output_path) as image:
-                width, height = image.size
+                width, height = deepy_image_channels.upright_size(image)
             settings = self._build_direct_image_settings(description, width, height, prompt="Made with Python.")
         else:
             settings = self._build_deepy_settings("Made with Python.", description)
@@ -4620,13 +4620,13 @@ class DeepyZeroTools:
         stem = re.sub(r"[^A-Za-z0-9_-]+", "_", str(name or "clip")).strip("_") or "clip"
         output_path = self._resolve_direct_output_path(f"{stem}{deepy_video_tools.get_video_container_extension(video_container)}", False, False)
         with Image.open(frame_paths[0]) as first:
-            size = first.size
+            size = deepy_image_channels.upright_size(first)
         for frame_path in frame_paths[1:]:
             with Image.open(frame_path) as frame:
-                if frame.size != size:
-                    raise ValueError(f"publish_video frames must share one size: {Path(frame_path).name} is {frame.width}x{frame.height}, the first frame {size[0]}x{size[1]}.")
+                if (frame_size := deepy_image_channels.upright_size(frame)) != size:
+                    raise ValueError(f"publish_video frames must share one size: {Path(frame_path).name} is {frame_size[0]}x{frame_size[1]}, the first frame {size[0]}x{size[1]}.")
         fps = max(1.0, min(float(fps), 120.0))
-        deepy_video_tools.encode_frames((Image.open(frame_path).convert("RGB") for frame_path in frame_paths), output_path, fps, video_codec=video_codec, video_container=video_container)
+        deepy_video_tools.encode_frames((deepy_image_channels.upright(Image.open(frame_path)).convert("RGB") for frame_path in frame_paths), output_path, fps, video_codec=video_codec, video_container=video_container)
         settings = self._build_deepy_settings("Made with Python.", f"{description} ({len(frame_paths)} frames at {fps:g} fps)")
         self._update_video_metadata_fields(output_path, settings)
         return self._record_direct_media(output_path, settings, is_image=False, audio_only=False, label="Python clip")
@@ -5919,7 +5919,7 @@ class DeepyZeroTools:
         try:
             if media_type == "image":
                 with Image.open(media_path) as image_handle:
-                    width, height = image_handle.size
+                    width, height = deepy_image_channels.upright_size(image_handle)
                     color_details = deepy_image_channels.image_color_details(image_handle)
                 result = {
                     "status": "done",
@@ -6263,7 +6263,10 @@ class DeepyZeroTools:
                 if record.get("media_type") != "image" or record.get("source_media_type") in ("3d", "world") or not os.path.isfile(record.get("path", "")):
                     continue
                 with Image.open(record["path"]) as image_handle:
-                    image_details.append({"media_id": record.get("media_id", ""), **deepy_image_channels.image_color_details(image_handle)})
+                    details = {"media_id": record.get("media_id", ""), "resolution": "{}x{}".format(*deepy_image_channels.upright_size(image_handle)), **deepy_image_channels.image_color_details(image_handle)}
+                    if deepy_image_channels.exif_orientation(image_handle) != 1:
+                        details["exif_orientation_applied"] = True  # the file stores the photo turned: the inspector and every tool read it upright
+                    image_details.append(details)
             if image_details:
                 result = dict(result)
                 result["source_image_details"] = image_details

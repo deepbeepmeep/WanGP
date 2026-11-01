@@ -159,9 +159,11 @@ You can override supported values in a request, including width, height, frame c
 
 ### Import and attach media
 
-In Gradio, either use the chat **+** button or open **Media Info / Late Post Processing / Import Media > Import Media to Galleries**. In the Web app, use the chat **+** for media needed by the next request, or import files from a gallery.
+In Gradio, either use the chat **+** button or open **Media Info / Late Post Processing / Import Media > Import Media to Galleries**. In the Web app, use the chat **+** for media needed by the next request, or import files from a gallery. The chat **+** accepts images, videos and audio.
 
-The attachment counter shows how many files are waiting for the next request. Sending the request consumes those attachments. Removing an attachment from the composer does not delete its workspace file.
+Files waiting for the next request appear as thumbnails above the message box: click one to view it, or its **×** to remove it. Sending the request consumes those attachments, and your message keeps them above its text, so you can see what each request used without searching the gallery. Removing an attachment from the composer does not delete its workspace file.
+
+Importing a file that is already in the gallery moves it to the end of the gallery, beside your latest creations, instead of jumping back to its old place.
 
 ### Select media and refer to it naturally
 

@@ -6,7 +6,7 @@ For configuration forms shared across browser windows, use the [shared form sync
 
 ## Discover Apps Included with WanGP
 
-The app bar is the main way to move between **Media Generator**, **Mask Generator** and your installed apps. Each app has an icon and a name. **More Apps** lists only the apps that do not fit when the window is narrow. Selecting an app keeps the other labels and icons in place. The icon buttons on the right open **Configuration**, **Apps & PlugIn Manager** and **Infos**. Infos brings the guides together with **About** as its final page.
+The app bar is the main way to move between **Media Generator**, **Mask Generator** and your installed apps. Each app has an icon and a name. **More Apps** lists only the apps that do not fit when the window is narrow. Selecting an app keeps the other labels and icons in place. The icon buttons on the right open **Configuration** (**Alt+C**), **Apps & PlugIn Manager** (**Alt+P**) and **Infos** (**Alt+I**). Infos brings the guides together with **About** as its final page.
 
 **Media Flow** and **Showrunner** come enabled with WanGP. Media Flow restores, upscales and processes long videos or folders; Showrunner plans and assembles complete productions with Deepy Prime. Each app keeps its yellow **New!** badge until its own tab has been opened, even if it was already enabled. Viewing or dismissing an introduction from the app bar does not clear the badge; visits are remembered across restarts. Select one to see an illustrated introduction, then choose **Keep It** to open it or **Remove It** to hide it from your app bar. Removal hides the app immediately and stops it loading at the next startup. Your choice is saved across restarts. The introduction also appears when you first open the app through its folder URL. After a visit, it remains available from the app's **info icon** beside its ID in **Apps & PlugIn Manager**.
 
@@ -14,7 +14,7 @@ Media Flow and Showrunner appear in the normal **Enabled Apps & Plugins** list, 
 
 Both apps have a **Full Screen** control. `/media-flow/` and `/showrunner/` on your WanGP address open the corresponding app directly in full screen. The address keeps that folder URL, which you can bookmark or share. **WanGP** returns to the same tab, preserving its form or editor. Expanding and returning reuse the existing page.
 
-**Models Manager** is always installed. Open **Configuration → General → Manage Models & Disk Space**, beside **Show "All" Model Filter**, to inspect model files, shared dependencies and recoverable disk space. Use **Back to Configuration** when finished.
+**Models Manager** is always installed. Open **Configuration → General → Manage Models & Disk Space**, beside **Show "All" Model Filter**, or press **Alt+M** from anywhere in WanGP, to inspect model files, shared dependencies and recoverable disk space. Use **Back to Configuration** (or **Alt+M** again) when finished.
 
 Apps and plugins use the same Plugin system described below. Developer APIs, Plugin identifiers and installation folders keep their existing names.
 

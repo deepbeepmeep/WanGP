@@ -75,23 +75,28 @@ class AppBar:
         return gr.skip()
 
     def render(self):
-        enabled = set(self.config.get("enabled_plugins", []))
+        order = {pid: index for index, pid in enumerate(self.config.get("enabled_plugins", []))}
+        enabled = set(order)
         visited = set(self.config.get(VISITED_KEY, []))
         apps, utilities = [], []
-        for entry in self.entries:
+        # Enabled Plugins take the places of their tabs in their saved order, which may have changed since the tabs were created.
+        reordered = iter(sorted((entry for entry in self.entries if entry["plugin"] in order), key=lambda entry: order[entry["plugin"]]))
+        for entry in [next(reordered) if entry["plugin"] in order else entry for entry in self.entries]:
             pid, target, label = entry["plugin"], entry["id"], entry["label"]
             if pid in ("models_manager", "about") or (pid in FEATURED_APPS and pid not in enabled):
                 continue
             utility = pid in ("configuration", "plugin_manager", "guides")
             label = {"plugin_manager": "Apps & PlugIn Manager", "guides": "Infos"}.get(pid, label)
             tooltip = {"configuration": "Configuration — application settings", "plugin_manager": "Apps & PlugIn Manager", "guides": "Infos — guides and About"}.get(pid, label)
+            shortcut = {"configuration": "C", "plugin_manager": "P", "guides": "I"}.get(pid)
+            hint = f' data-tooltip="{escape(tooltip, quote=True)} [Alt+{shortcut}]" aria-keyshortcuts="Alt+{shortcut}"' if shortcut else f' title="{escape(tooltip, quote=True)}"'
             svg = entry["icon"] or icon("apps" if pid == "plugin_manager" else pid)
             new = pid in FEATURED_APPS and pid not in visited
             intro_pending = new
             badge = f'<span class="app-bar-new{ "" if new else " is-seen"}" aria-hidden="{str(not new).lower()}">New!</span>' if pid in FEATURED_APPS else ''
             navigation = entry['navigation']
             navigation_data = f' data-app-url="{escape(navigation.path, quote=True)}" data-app-fullscreen="{str(navigation.fullscreen).lower()}" data-app-panel="{escape(entry["panel"], quote=True)}"' if navigation else ''
-            button = f'<button type="button" class="app-bar-link{" app-bar-utility" if utility else ""}" data-app-route="{escape(target, quote=True)}" data-app-plugin="{escape(pid, quote=True)}" data-app-intro-pending="{str(intro_pending).lower()}"{navigation_data} aria-label="{escape(label, quote=True)}" title="{escape(tooltip, quote=True)}">{svg}<span class="app-bar-label" data-label="{escape(label, quote=True)}"><span>{escape(label)}</span></span>{badge}</button>'
+            button = f'<button type="button" class="app-bar-link{" app-bar-utility" if utility else ""}" data-app-route="{escape(target, quote=True)}" data-app-plugin="{escape(pid, quote=True)}" data-app-intro-pending="{str(intro_pending).lower()}"{navigation_data} aria-label="{escape(label, quote=True)}"{hint}>{svg}<span class="app-bar-label" data-label="{escape(label, quote=True)}"><span>{escape(label)}</span></span>{badge}</button>'
             (utilities if utility else apps).append(button)
         manager = self.app.plugin_manager.plugins["plugin_manager"]
         intros = manager.information_cards_html()

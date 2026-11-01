@@ -105,12 +105,15 @@ class NaPatchOut(PatchOut):
         torch.FloatTensor,
         torch.LongTensor,
     ]:
+        return self.unpatchify([self.proj(vid_list.pop())], vid_shape, cache)
+
+    def unpatchify(self, vid_list: list[torch.FloatTensor], vid_shape: torch.LongTensor, cache: Cache) -> Tuple[torch.FloatTensor, torch.LongTensor]:
+        """The projected tokens (forward without the projection) back to frames."""
         cache = cache.namespace("patch")
         vid = vid_list.pop()
         vid_shape_before_patchify = cache.get("vid_shape_before_patchify")
 
         t, h, w = self.patch_size
-        vid = self.proj(vid)
         if not (t == h == w == 1):
             vid = na.unflatten(vid, vid_shape)
             for i in range(len(vid)):

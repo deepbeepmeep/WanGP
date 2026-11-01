@@ -27,6 +27,8 @@ from .nablocks import get_nablock
 from .normalization import get_norm_layer
 from .patch import get_na_patch_layers
 
+OUTPUT_CHUNK_BYTES = 64 << 20  # rows of the final hidden states normalized at a time
+
 # Fake func, no checkpointing is required for inference
 def gradient_checkpointing(module: Union[Callable, nn.Module], *args, enabled: bool, **kwargs):
     return module(*args, **kwargs)
@@ -75,6 +77,7 @@ class NaDiT(nn.Module):
         txt_in_norm_scale_factor: int = 0.01,
         txt_proj_type: Optional[str] = "linear",
         vid_out_norm: Optional[str] = None,
+        vid_only_last_layer: bool = True,
         attention_mode: str = 'sdpa',
         **kwargs,
     ):
@@ -156,7 +159,7 @@ class NaDiT(nn.Module):
                     mca_type=mca_type[i],
                     rope_type=rope_type,
                     rope_dim=rope_dim,
-                    is_last_layer=(i == num_layers - 1),
+                    is_last_layer=vid_only_last_layer and i == num_layers - 1,  # the 3B has no text MLP / modulation in its last block
                     attention_mode=attention_mode,
                     **kwargs,
                 )
@@ -239,23 +242,17 @@ class NaDiT(nn.Module):
             if callable(abort_callback) and abort_callback():
                 raise InterruptedError("SeedVR2 upscaling aborted")
 
-        # Video output norm.
-        if self.vid_out_norm:
-            vid_list = [vid]
-            vid = None
-            vid = self.vid_out_norm(vid_list.pop())
-            vid = self.vid_out_ada(
-                vid,
-                emb=emb,
-                layer="out",
-                mode="in",
-                hid_len=cache("vid_len", lambda: vid_shape.prod(-1)),
-                cache=cache,
-                branch_tag="vid",
-            )
-
-        # Video output.
-        vid_list = [vid]
+        # Video output norm and projection, by chunks of rows when there is a norm: no normalized copy of the whole video.
+        if self.vid_out_norm is None:
+            out = self.vid_out.proj(vid)
+        else:
+            out = vid.new_empty(vid.shape[0], self.vid_out.proj.out_features)
+            rows = max(1, OUTPUT_CHUNK_BYTES // (vid.shape[-1] * vid.element_size()))
+            # the cache returns the blocks' "attn" modulation rows for this key, as upstream's inference does
+            ada_kwargs = {"emb": emb, "hid_len": cache("vid_len", lambda: vid_shape.prod(-1)), "cache": cache, "branch_tag": "vid"}
+            for start in range(0, vid.shape[0], rows):
+                x = self.vid_out_ada(self.vid_out_norm(vid[start:start + rows]), layer="out", mode="in", **ada_kwargs)
+                out[start:start + rows] = self.vid_out.proj(x)
         vid = None
-        vid, vid_shape = self.vid_out(vid_list, vid_shape, cache)
+        vid, vid_shape = self.vid_out.unpatchify([out], vid_shape, cache)
         return NaDiTOutput(vid_sample=vid)

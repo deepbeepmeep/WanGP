@@ -305,7 +305,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                                 label='Show "All" Model Filter',
                                 interactive=not self.args.lock_config,
                             )
-                            gr.HTML(f'<button type="button" class="wangp-model-manager-link" data-app-route="plugin_model_manager">{app_icon("models_manager")} Manage Models &amp; Disk Space</button>')
+                            gr.HTML(f'<button type="button" class="wangp-model-manager-link" data-app-route="plugin_model_manager" title="Open the Models Manager [Alt+M]">{app_icon("models_manager")} Manage Models &amp; Disk Space <kbd>Alt+M</kbd></button>')
                     self.model_hierarchy_type_choice = gr.Dropdown(
                         choices=[
                             ("Two Levels: Model Family > Models & Finetunes", 0),

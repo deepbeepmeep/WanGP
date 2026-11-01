@@ -1,5 +1,6 @@
 """Launch managed WanGP under the installation lease used by maintenance."""
 
+import hashlib
 import os
 import shlex
 from contextlib import contextmanager
@@ -8,8 +9,22 @@ from pathlib import Path
 from .environments import interpreter_path
 from .execute import ProcessRunner
 from .resolution import load_resolution
+from .runtime import ensure_pip
 from .state import InstallError, InstallationLock, inside
 from .transactions import ready_record, resolution_location
+
+
+def application_command(python, entry, arguments):
+    probe = Path("shared/gradio/gradio_startup_patch.py")
+    installed = entry.parent / probe
+    # Only backport to the unchanged probe shipped in 18.888 through 19.0.
+    # Updated releases and forks with a different probe use their own code.
+    compatibility = []
+    if installed.is_file() and installed.stat().st_size < 4096:
+        digest = hashlib.sha256(installed.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+        if digest == "cc4ee6f75134213cc886e5b82af8650233f2e9ad3a3d1c925fc5721e87d91753":
+            compatibility.append(str(Path(__file__).resolve().parents[1] / probe))
+    return [python, "-u", *compatibility, str(entry), *arguments]
 
 
 def saved_arguments(app):
@@ -60,6 +75,16 @@ def manager_arguments(options):
 def launch_context(runtime, python, options=None, auth_password=None, events=None):
     options = normalized_options(options)
     env = runtime.environment(python)
+    # Gradio checks its own HTTP endpoint through httpx, which honors host proxies.
+    # Keep external downloads proxied, but always reach the local server directly.
+    bypass = next((value for key, value in env.items() if key.lower() == "no_proxy"), "")
+    bypass = ",".join(dict.fromkeys([*filter(None, bypass.split(",")), "localhost", "127.0.0.1", "::1"]))
+    for key in list(env):
+        if key.lower() == "no_proxy":
+            del env[key]
+    env.update(NO_PROXY=bypass, no_proxy=bypass)
+    # Use the same IPv4 loopback address as Manager's readiness probe and browser.
+    env["SERVER_NAME"] = "127.0.0.1"
     if options["authentication"]:
         if options["password_mode"] == "custom":
             if not isinstance(auth_password, str) or not auth_password.strip() or len(auth_password.encode("utf-8")) > 1024 or "\0" in auth_password:
@@ -129,7 +154,9 @@ def launch_managed(root, runtime, arguments=(), events=None, cancelled=None, on_
                 elif device["vendor"] == "AMD" and "index" in device:
                     env["HIP_VISIBLE_DEVICES"] = str(device["index"])
             runner = ProcessRunner(inside(root, ".manager/server.log"), events=output_events, cancelled=cancelled)
+            ensure_pip(python, runtime, runner)
+            command = application_command(python, entry, arguments)
             while True:
-                result = runner.run([python, "-u", str(entry), *arguments], cwd=app, env=env, timeout=None, check=False, on_start=on_start)
+                result = runner.run(command, cwd=app, env=env, timeout=None, check=False, on_start=on_start)
                 if result.returncode != 42:
                     return {"status": "stopped" if result.returncode == 0 else "crashed", "returncode": result.returncode}
