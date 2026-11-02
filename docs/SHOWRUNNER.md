@@ -80,6 +80,10 @@ The **Cast** page holds the people and recurring things of the production (a sin
   sample, made once from the description (or your recording), and every line they say is spoken from it. Remove the sample to have the
   showrunner make a new voice from the description; every line is then spoken again.
 - **Lock** keeps the member exactly as it is: the showrunner never changes a locked member.
+- **LoRA** (only with **LoRAs on cast cards** on, in **Settings** at the top of every page): a LoRA you trained for this person or thing,
+  its strength and its trigger word. A LoRA only works with the family of models it was trained on, so the card lists those of the
+  models this production uses and says how many of the member's shots can use it; the other shots are made without it. Shots already
+  made do not change: **New take** or **Re-shoot** uses it. Turned off in Settings, no shot uses a LoRA from its card.
 
 Every shot that shows a cast member is generated from that member's reference picture, so faces, hair and clothes stay the same over
 dozens of shots. Dropping a photo anywhere on the Cast page adds a new member.
@@ -114,12 +118,17 @@ is shot (hover to play it), its status and the showrunner's opinion of the take.
 - **Lock** a shot (or a cast member) to keep it exactly as it is: the showrunner never changes it.
 - **Exclude** a shot to keep it out of the edit without deleting it.
 - **Drop media** from your computer onto a shot to use it as a take, or onto the cast to add reference pictures and voices. Media you drop
-  elsewhere, and media the showrunner made outside the shots, wait in the **Media bin** at the bottom: drag them where you need them.
+  elsewhere, and media the showrunner made outside the shots, wait in the **Media bin** at the bottom: click one to play or view it (in a picture, scroll or use + and − to zoom, hold and drag to
+  move inside it), drag it where you need it. The **×** on an item takes it out of the bin: its file stays in the production's folder, and undo
+  brings it back.
 - **Undo and redo** (Ctrl+Z, Ctrl+Shift+Z) cover every change, yours and the showrunner's, including a new take; a message says what was
   undone.
 
 When the plan suits you, press **Shoot N shots**: the showrunner shoots the shots without a take and the ones marked for a redo, never
 the others. Once every shot has a take, the same button becomes **Assemble**.
+
+The line under **Storyboard** gives the picture size of the shots: the real size of their takes, and for a shot not shot yet what its model makes of the
+brief's resolution (a model works on a grid of pixels, so 1280×720 can come out at 1280×704). Change it in the brief. Point at it for the details.
 
 Next to the button, the Board says roughly how long generating those shots takes ("about 12 min"). The estimate comes from the time the
 same models really took for earlier takes at the production's picture size: this production's takes first, then your other
@@ -151,16 +160,24 @@ over the song. Shots that are not shot yet appear as cards in their place, so th
 
 - The lanes show the parts, the shots and the song's waveform with its beats and bars. The Parts lane names the parts as the Board
   does (each shot's section); before the plan, it shows the parts heard in the song. The Sound lane also shows the tracks laid
-  over the edit (narration, score, your own audio): drag one to move it, click it to hear it alone and set its start and level beside
-  the monitor (**Delete** removes it from the edit, **Escape** closes it). Texts and tracks follow the shots they start on when shots are
-  added, removed, moved or retimed.
+  over the edit (narration, score, your own audio): drag one to move it, drag its edges to play less or more of its file, click it to
+  hear it alone and set its start, the part of the file it plays, its fades and its level beside the monitor (**Delete** removes it from
+  the edit, **Escape** closes it). Tracks play in the preview as they will in the export, whichever soundtrack is chosen. Texts and tracks
+  follow the shots they start on when shots are added, removed, moved or retimed.
 - The soundtrack of the preview and of the export is chosen above the lanes: **Song**, **Shot sound** (dialogue, effects) or **Mix**.
-  **+ Audio**, next to **+ Text**, adds your own audio track (it starts at 0 s: drag it into place). The **Edit** card beside the
+  In a mix, the song plays at half its level. **+ Audio**, next to **+ Text**, adds your own audio track (it starts at 0 s: drag it into place). The **Edit** card beside the
   monitor sets where the song starts; in a narrow window it is hidden, and the card beside the monitor only appears while a track is
   selected.
 - Click a shot to see it in the monitor; double-click it to open it in the shot panel. Drag a shot to move it; drag its edges to trim it
   (or to change the planned duration of a shot not shot yet). With **Snap**, edges stick to the beats and bars and to the other shots'
   edges. **Fit** shows the whole edit, however long.
+- **Speed**, in the shot panel, plays a take faster or slower (0.25× to 4×) and changes its length in the edit; what follows it moves
+  with it. Its sound follows at the same pitch. Slow motion repeats frames, so strong slow motion can look jerky. A shot made on its part
+  of the song leaves the song at another speed: its lips and its cuts no longer match, and the panel says so.
+- **Detach Sound**, in the shot panel or by right-clicking a shot, makes the shot's sound a track of its own on the Sound lane: shorten it,
+  extend it over the next shot or start it before its own (up to what the take holds), move it or fade it, apart from the picture.
+  **Reattach** removes that track, and the shot plays its take's sound again. A new take keeps the old sound on the track until you
+  reattach it; the panel says when the track comes from another take.
 - Click the marker above the cut between two shots to choose the transition (cut, dissolve, fade through black or white) and its length.
   When the song drives the edit, every shot stays on its part of the song: a dissolve plays over the extra end of the outgoing take,
   so it lasts at most as long as that take runs past its shot (and becomes a cut when it does not).
@@ -209,11 +226,21 @@ spoken line.
 
 ## Talking to the Showrunner
 
+When the showrunner finishes a task and something is up to you, the **Showrunner** button at the top of every page says what ("Review the
+plan", "Review 5 takes", "Watch the video") with a dot on its avatar, and its panel opens on the same note until you have done it. "Stopped"
+means that its task ended early: the panel says why, and **Continue** picks it up. The note only shows while the page is open: if you were
+elsewhere, it is there when you come back. To hear about it sooner, turn on **Tell me when a task ends** in **Settings**: when the
+showrunner finishes a task or stops on an error, WanGP plays its notification sound on the computer it runs on and sends what comes next to
+your notification destinations (**Config > Notification**), if you have set any.
+
 The **Showrunner** panel shows what the showrunner is doing and its log of decisions, next to your own notes. Write in plain language ("faster
 cuts in the chorus", "make shot 3 at night"): while it works, your message reaches it at its next step; otherwise it starts working on it.
 When shots are selected, your message is about them. **Stop** interrupts it; it continues where it stopped when you ask again.
 When a task ends, the panel says what the showrunner changed (shots added, rewritten or removed, takes shot and judged, text, sound,
 new versions) and the shots it touched glow for a moment on the board. Shots appear as "shot 4" in its messages, in the order of the cut.
+During a long wait, the panel tells a slow step from a stuck one: what Deepy is doing now, its thoughts as it writes them (when its model thinks
+aloud; click **Thinking** to fold them), how many tokens it is reading before it can answer, and its speed in tokens per second with how full its
+context is.
 
 **Pause** stops the showrunner after its current step (the shot or voice it is generating is finished and kept) and frees the GPU for
 other work: WanGP's models and Deepy's leave the video memory. **Pause now** also stops what it is generating; that shot is generated

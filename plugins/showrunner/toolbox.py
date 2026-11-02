@@ -23,7 +23,7 @@ GUIDE = """Read wangp://skills/showrunner/directing before directing a productio
 - The production document is the plan: read `production` first and after long steps, and record every change with these actions.
 - Locked shots and cast members are the user's, and the user's verdicts override yours.
 - Choose templates as `template_advice` says (the cast's pictures as references, never as image_start) and fix the `warnings` returned.
-- A shot's settings hold only what the shot changes (prompt, media, length): its template brings the model, LoRAs and steps. `plan` validates them.
+- A shot's settings hold only what the shot changes (prompt, media): its template brings the model, LoRAs and steps, the brief the resolution, its duration_s the length. `plan` validates them and returns what they will render at.
 - Paths are given as you can use them in settings."""
 
 
@@ -126,6 +126,7 @@ class ShowrunnerToolbox:
         settings = {"template": shot["generation"].get("template", "gen_video"), "resolution": model.resolution(target.snapshot()["brief"]),
                     **self._resolve_settings(ctx, target, shot["generation"].get("settings", {}))}  # the brief's format unless the shot sets its own
         entry = templates.resolve(self._catalog(target.snapshot()), settings["template"])
+        settings.update(templates.planned_length(target.snapshot(), shot, entry))
         pictures = self._cast_pictures(target.snapshot(), shot)
         if entry is not None and entry["refs"] and pictures and not settings.get("image_refs"):  # the cast's identity in every shot that shows them
             settings["image_refs"] = [ctx.virtualize(str(target.resolve(path))) for path in pictures]
@@ -149,19 +150,46 @@ class ShowrunnerToolbox:
         shown = [line for line in lines if line.get("speaker") in shot.get("cast", [])]
         return shown if entry["soundtrack"] and not entry["audio"] else shown or lines if entry["audio"] else []
 
-    def _validate(self, ctx, target, shot_ids: list[str]) -> list[str]:
-        """Problems of the listed shots' settings, one line per shot ("s4: ..."), checked as render will send them (drawn and locked shots skipped)."""
-        problems = []
+    def _generation_with_loras(self, ctx, target, shot: dict[str, Any]) -> tuple[dict[str, Any], list[Any] | None]:
+        """A shot's settings with the LoRAs of its cast (Settings > LoRAs on cast cards), and the LoRAs before them."""
+        settings, doc = self._generation(ctx, target, shot), target.snapshot()
+        return self.showrunner.with_cast_loras(doc, shot, templates.resolve(self._catalog(doc), settings["template"]), settings)
+
+    def _validate(self, ctx, target, shot_ids: list[str]) -> tuple[list[str], dict[str, dict[str, float | None]]]:
+        """The listed shots' settings checked as render will send them (drawn and locked shots skipped): their problems, one line per shot ("s4: ..."),
+        and what they will render at as the validator measures it, {size: {shot: seconds}}."""
+        problems, batch = [], []
         for shot in [item for item in target.snapshot()["shots"] if item["id"] in shot_ids and not item["locked"] and item["generation"].get("template") != templates.DRAWN]:
             try:
-                validation = ctx.call("wangp_validate", {"settings": [self._generation(ctx, target, shot)]})
+                batch.append((shot["id"], self._generation_with_loras(ctx, target, shot)[0]))
             except Exception as error:
                 problems.append(f"{shot['id']}: {error}")
-                continue
-            problems += [f"{shot['id']}: {item.get('message')}" for item in validation.get("diagnostics", []) if item.get("severity") == "error"]
-            if validation.get("status") == "error":
-                problems.append(f"{shot['id']}: {validation.get('error')}")
-        return problems
+        found, renders = self._check_settings(ctx, batch) if batch else ([], {})
+        return problems + found, renders
+
+    def _check_settings(self, ctx, batch: list[tuple[str, dict[str, Any]]]) -> tuple[list[str], dict[str, dict[str, float | None]]]:
+        """One validation of all the shots (one step in the window); an error it cannot tie to a task stopped the check of them all: each shot is checked alone then, to name it."""
+        renders: dict[str, dict[str, float | None]] = {}
+        try:
+            validation = ctx.call("wangp_validate", {"settings": [settings for _, settings in batch]})
+            errors = [item for item in validation.get("diagnostics", []) if item.get("severity") == "error"]
+            errors += [{"message": validation.get("error")}] if validation.get("status") == "error" else []
+            for task in validation.get("tasks", []):
+                size = (task.get("resolution_assessment") or {}).get("aligned")
+                seconds = (task.get("window_plan") or {}).get("total_seconds") or (task.get("requested_video") or {}).get("duration_seconds")
+                if size:
+                    renders.setdefault(size, {})[batch[task["index"]][0]] = round(seconds, 2) if seconds else None
+        except Exception as error:
+            errors = [{"message": str(error)}]
+        if len(batch) > 1 and any("task" not in item for item in errors):
+            problems = []
+            for one in batch:
+                found, measured = self._check_settings(ctx, [one])
+                problems += found
+                for size, shots in measured.items():
+                    renders.setdefault(size, {}).update(shots)
+            return problems, renders
+        return [f"{batch[item.get('task', 0)][0]}: {item['message']}" for item in errors], renders
 
     def _apply(self, production, ops, revision=None):
         try:
@@ -186,6 +214,7 @@ class ShowrunnerToolbox:
             result["timeline"] = model.timeline(doc)
             result["references"] = doc["brief"]["references"]
             result["song"] = doc["brief"]["song"]
+            result["format"] = f"{model.resolution(doc['brief'])}: the brief's, what shots render at (fitted to their model's grid) unless one sets its own resolution"
             result["cast"] = [{**member, "images": full["images"], "voice": full["voice"], **({"voice_description": full["voice_description"]} if full["voice_description"] else {})}
                               for member, full in zip(result["cast"], doc["cast"])]
             catalog = self._catalog(doc)
@@ -263,7 +292,7 @@ class ShowrunnerToolbox:
         cast: [{name, role, description, master, images, voice, voice_description}] adds members or updates the one of that name. outline: [{name, summary, duration_s}]
         the sequences in order (a shot's section names its sequence); long productions plan it first, then the shots of each sequence with add_shots.
         Every shot is validated as render will send it (the cast's pictures as references): fix the warnings with update_shot, which validates again;
-        plan() without shots validates the whole document."""
+        plan() without shots validates the whole document. renders in the result: what the shots will come out at, measured, {size: {shot: seconds}}."""
         target = self._production(ctx, production)
         ops = [{"op": "outline", "outline": outline}] if outline is not None else []
         if style:
@@ -287,30 +316,35 @@ class ShowrunnerToolbox:
             response["warnings"] = warnings
         if validate:  # the new shots, or the whole document when the call only re-checks it
             checked = added if shots is not None else [shot["id"] for shot in target.snapshot()["shots"]]
-            problems = self._validate(ctx, target, checked)
+            problems, renders = self._validate(ctx, target, checked)
             response["validated"] = len(checked)
             if problems:  # problems become warnings next to the shot they concern, where they get fixed
                 response["warnings"] = response.get("warnings", []) + problems
+            if renders:
+                response["renders"] = renders
         target.apply([{"op": "stage", "stage": "review" if target.doc["stage"] in ("brief", "planning") else target.doc["stage"]}], by="system", record=False)
         return response
 
     def update_shot(self, ctx, production: str, shot: str, fields: dict[str, Any], revision: int | None = None) -> dict[str, Any]:
         """fields: any of title, section, intent, camera, cast, dialogue, duration_s, audio_slice, generation (settings are merged; null removes one), status, included, chosen_take,
-        trim [start_s, end_s], transition {type: cut|crossfade|fade_black|fade_white, duration_s}, notes. revision: the one you read, which guards
+        trim [start_s, end_s], speed (0.25 to 4, how fast the take plays in the edit; trim stays in seconds of the take), sound (false: the take plays silent),
+        transition {type: cut|crossfade|fade_black|fade_white, duration_s}, notes. revision: the one you read, which guards
         against the user's edits since your read (your own writes never conflict). Changed settings or cast are validated again."""
         target = self._production(ctx, production)
         if isinstance(fields.get("generation"), dict) and isinstance(fields["generation"].get("settings"), dict):
             fields = {**fields, "generation": {**fields["generation"], "settings": self._portable(ctx, target, fields["generation"]["settings"])}}
         result = self._apply(target, [{"op": "update_shot", "shot": shot, "fields": fields, "revision": revision}], revision)
-        warnings = self._warnings(target, [shot]) + (self._validate(ctx, target, [shot]) if {"generation", "cast"} & set(fields) else [])
-        return {"revision": target.doc["revision"], **result[0], **({"warnings": warnings} if warnings else {})}
+        problems, renders = self._validate(ctx, target, [shot]) if {"generation", "cast"} & set(fields) else ([], {})
+        warnings = self._warnings(target, [shot]) + problems
+        return {"revision": target.doc["revision"], **result[0], **({"warnings": warnings} if warnings else {}), **({"renders": renders} if renders else {})}
 
     def add_shots(self, ctx, production: str, shots: list[dict[str, Any]], position: int | None = None) -> dict[str, Any]:
         """Insert shots (same fields as plan) at a zero-based position, or at the end."""
         target = self._production(ctx, production)
         result = self._apply(target, [{"op": "add_shots", "shots": self._portable_shots(ctx, target, shots), "position": position}])
-        warnings = self._warnings(target, result[0]["shots"]) + self._validate(ctx, target, result[0]["shots"])
-        return {"revision": target.doc["revision"], **result[0], **({"warnings": warnings} if warnings else {})}
+        problems, renders = self._validate(ctx, target, result[0]["shots"])
+        warnings = self._warnings(target, result[0]["shots"]) + problems
+        return {"revision": target.doc["revision"], **result[0], **({"warnings": warnings} if warnings else {}), **({"renders": renders} if renders else {})}
 
     def remove_shot(self, ctx, production: str, shot: str, revision: int | None = None) -> dict[str, Any]:
         target = self._production(ctx, production)
@@ -323,7 +357,7 @@ class ShowrunnerToolbox:
         return {"revision": target.doc["revision"], "order": [item["id"] for item in target.doc["shots"]]}
 
     def cast(self, ctx, production: str, name: str | None = None, cast_id: str | None = None, role: str | None = None, description: str | None = None,
-             images: list[str] | None = None, master: str | None = None, voice: str | None = None, voice_description: str | None = None, lora: str | None = None,
+             images: list[str] | None = None, master: str | None = None, voice: str | None = None, voice_description: str | None = None,
              remove: bool = False, looks: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         """Add a cast member or update one (cast_id, or the member of that name); remove=true removes the member cast_id (and takes it out of every
         shot). images, master and voice are media ids or paths (voice="" removes the voice sample: `speak` makes a new one from the description).
@@ -335,7 +369,7 @@ class ShowrunnerToolbox:
             self._apply(target, [{"op": "remove_cast", "cast": cast_id}])
             return {"revision": target.doc["revision"], "removed": cast_id}
         fields = {key: value for key, value in {"name": name, "role": role, "description": description, "images": images, "master": master, "voice": voice,
-                                                 "voice_description": voice_description, "lora": lora}.items() if value is not None}
+                                                 "voice_description": voice_description}.items() if value is not None}
         if looks is not None:
             fields["looks"] = [{"name": str(look.get("name") or ""), "master": target.adopt(ctx.resolve(look["master"])) if look.get("master") else None,
                                 "sections": [str(section) for section in look.get("sections") or []], "shots": [str(shot) for shot in look.get("shots") or []],
@@ -388,7 +422,7 @@ class ShowrunnerToolbox:
                     renders.append({"shot": shot_id, "error": "its lines could not be spoken (" + "; ".join(errors) + "): fix the speakers' voices, then render it"})
                     continue
                 shot = model.find(target.snapshot()["shots"], shot_id, "shot")
-            settings = self._generation(ctx, target, shot)
+            settings, base_loras = self._generation_with_loras(ctx, target, shot)
             song = target.resolve(target.snapshot()["brief"].get("song"))
             if shot.get("audio_slice") and song is not None and settings.get("audio_guide") == ctx.virtualize(str(song)):
                 start_s, end_s = shot["audio_slice"]  # the song drives the shot: its own slice, not the song from the start
@@ -402,6 +436,8 @@ class ShowrunnerToolbox:
                         target.apply([{"op": "update_shot", "shot": shot_id, "fields": {"trim": [0.0, round(spoken + 0.35, 2)]}}], by="system", record=False)
                 elif spoken > float(shot["duration_s"]):  # the edit ends a take at its planned length: the shot must hold its whole line
                     target.apply([{"op": "update_shot", "shot": shot_id, "fields": {"duration_s": round(spoken + 0.1, 2)}}], by="system", record=False)
+                    shot = model.find(target.snapshot()["shots"], shot_id, "shot")
+                    settings.update(templates.planned_length(target.snapshot(), shot, entry))
             if not str(settings.get("prompt") or "").strip():
                 renders.append({"shot": shot_id, "error": "the shot's settings have no prompt"})
                 continue
@@ -428,13 +464,13 @@ class ShowrunnerToolbox:
             try:
                 path = ctx.resolve(entry["path"])  # tool results name files as the caller does
                 used = entry.get("settings") if isinstance(entry.get("settings"), dict) else settings
-                take = self.showrunner.add_take(production, shot_id, path, by="deepy", settings=self._real_paths(ctx, used), media_id=entry.get("media_id"), gpu_s=generated)
+                take = self.showrunner.add_take(production, shot_id, path, by="deepy", settings=self._real_paths(ctx, used), media_id=entry.get("media_id"), gpu_s=generated, base_loras=base_loras)
             except Exception as error:  # the media exists: report it with the shot and render the next shots
                 target.apply([{"op": "update_shot", "shot": shot_id, "fields": {"status": "failed"}}], by="deepy", record=False)
                 renders.append({"shot": shot_id, "media_id": entry.get("media_id"), "error": f"the take could not be recorded ({error}): record it with record_take"})
                 continue
             target.apply([{"op": "budget", "gpu_seconds": time.time() - started}], by="system", record=False)
-            renders.append({"shot": shot_id, "take": take["take"], "media_id": entry.get("media_id"), "path": ctx.virtualize(path), "duration_s": take.get("duration_s"),
+            renders.append({"shot": shot_id, "take": take["take"], "media_id": entry.get("media_id"), "path": ctx.virtualize(path), "duration_s": take.get("duration_s"), "size": f"{take.get('width')}x{take.get('height')}",
                             **{key: response[key] for key in ("cut_times_seconds", "canvas") if isinstance(response, dict) and key in response}})
         ctx.progress(done=len(renders), total=len(shots), text="Rendered", force=True)
         return {"revision": target.doc["revision"], "renders": renders}
@@ -623,8 +659,8 @@ class ShowrunnerToolbox:
              tracks: list[dict[str, Any]] | None = None, subtitles: list[dict[str, Any]] | None = None, overlays: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         """Set the edit's sound, subtitles and text. audio_mode: song (the production's song alone), clips (each take's own sound: dialogue, effects) or
         mix (both). song: a song you made (media id or path) becomes the production's song, analysed for bars and sections. tracks:
-        [{media, start_s, gain_db}] narration, voice-over or score laid over the edit, replacing the current tracks (a score under speech sits
-        around -12 dB); [{shot, line, gain_db}] lays a line spoken with `speak` from its shot's start (start_s to place it elsewhere). subtitles: [{media, language}] SRT files, kept as removable tracks. overlays: text or pictures over the cut, replacing
+        [{media, start_s, gain_db, in_s, out_s, fade_in_s, fade_out_s}] narration, voice-over or score laid over the edit, replacing the current tracks (a score under speech sits
+        around -12 dB; in_s and out_s: the part of the file it plays; keep what `production` lists for tracks you leave as they are); [{shot, line, gain_db}] lays a line spoken with `speak` from its shot's start (start_s to place it elsewhere). subtitles: [{media, language}] SRT files, kept as removable tracks. overlays: text or pictures over the cut, replacing
         yours (the user's stay): [{text, subtitle, style: title|lower_third|caption|chapter|end_card, design, start_s, duration_s, fade_s}] drawn for
         you in the production's text design (style.text_design, or design), or [{media, start_s, duration_s, fade_s}] a transparent picture you drew
         at the production's format (draw_svg)."""
@@ -659,8 +695,9 @@ class ShowrunnerToolbox:
     def _track(ctx, target, track: dict[str, Any]) -> dict[str, Any]:
         """A sound track of the edit: a media file, or a shot's spoken line ({shot, line}), which starts with its shot unless start_s is given."""
         gain = float(track.get("gain_db") or 0.0)
+        cut = {key: float(track[key]) for key in ("in_s", "out_s", "fade_in_s", "fade_out_s") if track.get(key) is not None}
         if track.get("media"):
-            return {"path": target.adopt(ctx.resolve(track["media"])), "start_s": float(track.get("start_s") or 0.0), "gain_db": gain}
+            return {"path": target.adopt(ctx.resolve(track["media"])), "start_s": float(track.get("start_s") or 0.0), "gain_db": gain, **cut}
         doc = target.snapshot()
         shot = model.find(doc["shots"], track.get("shot"), "shot")
         index = int(track.get("line") or 0)
@@ -671,7 +708,7 @@ class ShowrunnerToolbox:
         start = track.get("start_s")
         if start is None:
             start = next((item["start_s"] for item in model.timeline(doc) if item["shot"] == shot["id"]), 0.0)
-        return {"path": line["audio"], "start_s": float(start), "gain_db": gain}
+        return {"path": line["audio"], "start_s": float(start), "gain_db": gain, **cut}
 
     def assemble(self, ctx, production: str) -> dict[str, Any]:
         """Render the edit: included shots in order with their chosen takes, trims and transitions, and the soundtrack chosen in the edit.

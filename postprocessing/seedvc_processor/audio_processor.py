@@ -82,6 +82,10 @@ class SeedVCProcessor:
         self._sync_bridge_config()
         return self.bridge.enabled()
 
+    def format_choice_label(self, label, method) -> str:
+        version = self.bridge._VERSIONS.get(read_config_section(self.server_config, self)["mode"])
+        return label.replace("SeedVC", f"SeedVC {version}") if version else label
+
     def validate_method(self, method, voice_sample=None, voice_sample2=None, **_kwargs) -> str:
         if not self.enabled():
             return "SeedVC is disabled in Configuration > Extensions"

@@ -2,7 +2,7 @@
 // Brief: what to make, from which material, in which format and style. Every change saves itself.
 import { state, actions } from './app.js';
 import { api } from './api.js';
-import { icon, esc, fieldSaver, drawWave, formatTime, formatDuration, sectionColor, pickFiles, toast, confirmDialog, promptDialog, AUDIO_ACCEPT } from './ui.js';
+import { icon, esc, fieldSaver, drawWave, formatTime, formatDuration, sectionColor, pickFiles, toast, confirmDialog, promptDialog, availability, AUDIO_ACCEPT } from './ui.js';
 import { kindTiles, KINDS } from './home.js';
 import { modelRows, openDefaultModels } from './models.js';
 
@@ -80,7 +80,7 @@ export function mountBrief(container, doc) {
           ${state.directorInfo.available === false && state.directorInfo.reason ? `<div class="muted" style="font-size:12px;color:var(--amber)">${esc(state.directorInfo.reason)}</div>` : ''}</div>
         ${doc.shots.length ? `<button class="btn" id="to-board">${icon('grid')} Storyboard (${doc.shots.length})</button>` : ''}
         ${!(brief.text || '').trim() && !(brief.script || '').trim() && !brief.song ? '<span class="muted" style="font-size:12.5px">Write your idea first</span>' : ''}
-        <button class="btn primary lg" id="plan" ${actions.busy(doc) || state.live.running || !(brief.text || '').trim() && !(brief.script || '').trim() && !brief.song ? 'disabled' : ''}>${icon('wand')} ${actions.busy(doc) || state.live.running ? 'The showrunner is working…' : doc.shots.length ? 'Plan again' : 'Plan with the showrunner'}</button>
+        <button class="btn primary lg" id="plan" ${availability(actions.directorBlocked() || actions.planBlocked(doc))}>${icon('wand')} ${actions.busy(doc) || state.live.running ? 'The showrunner is working…' : doc.shots.length ? 'Plan again' : 'Plan with the showrunner'}</button>
       </div>`;
     bind();
     renderModels();
@@ -96,7 +96,9 @@ export function mountBrief(container, doc) {
     const ready = () => {  // the Plan button follows the idea as it is typed
       const filled = root.querySelector('#text').value.trim() || root.querySelector('#script')?.value.trim() || state.doc.brief.song;
       const button = root.querySelector('#plan');
-      button.disabled = !filled || actions.busy(state.doc) || state.live.running;
+      const blocked = actions.directorBlocked() || (filled ? '' : actions.planBlocked({ brief: {} }));
+      button.disabled = !!blocked;
+      button.title = blocked;
       button.previousElementSibling?.classList.contains('muted') && (button.previousElementSibling.style.display = filled ? 'none' : '');
     };
     root.querySelector('#text').oninput = event => { queue({ text: event.target.value }); ready(); };

@@ -16,7 +16,7 @@ Users describe what they want; the method is yours. Apply it without being asked
 
 ## 2. Make
 
-- Use the configured templates and their fast or accelerated variants; keep video at the template's resolution (720p or below) unless the user asks otherwise.
+- Use the configured templates and their fast or accelerated variants; keep video at the template's resolution (720p or below) unless the user or the task states otherwise (a production brief's format, for instance).
 - Make shared assets once (master images of recurring people and objects, voices, music) and reuse them; submit independent generations together in one batch.
 - One voice per speaker, narrator included: make it once (a `gen_speech_from_description` of a neutral sentence of about ten seconds,
   or the user's recording) and speak every line with `gen_speech_from_sample` from that sample. A voice described again for each line

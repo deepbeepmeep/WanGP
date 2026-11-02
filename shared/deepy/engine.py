@@ -76,6 +76,7 @@ from shared.prompt_enhancer.qwen35_assistant_runtime import (
     assistant_action_budget_tokens,
     extract_incomplete_tool_arguments,
     extract_incomplete_tool_name,
+    extract_incomplete_tool_parameters,
     extract_tool_calls,
     render_assistant_messages,
     render_assistant_text_suffix,
@@ -600,6 +601,7 @@ class AssistantSessionState:
     generation_speed_window: ActiveComputeSpeedWindow = field(default_factory=ActiveComputeSpeedWindow)
     runtime_max_model_len: int = 0
     chat_stats_signature: str = ""
+    chat_stats: dict[str, Any] | None = None
     chat_status: dict[str, Any] | None = None
     remote_usage_stats: dict[str, Any] | None = None
     file_access_policy: Any | None = None
@@ -724,6 +726,7 @@ def clear_assistant_session(session: AssistantSessionState) -> None:
     session.generation_speed_window.clear()
     session.runtime_max_model_len = 0
     session.chat_stats_signature = ""
+    session.chat_stats = None
     session.chat_status = None
     session.remote_usage_stats = None
     session.seen_video_gallery_paths = []
@@ -4856,6 +4859,7 @@ class DeepyZeroTools:
         return result
 
     @assistant_tool(
+        display_name="Inspect Audio",
         description="Inspect the selected audio stream's playable range on CPU: peak/RMS, clipping indicators, EBU R128 loudness and below-threshold silence intervals. Coverage excludes decoder tail padding when track duration is known; silence does not mean zero or missing audio. Optional playable preview (at most 30 seconds). Does not transcribe or judge musical quality.",
         parameters={
             "media_id": {"type": "string", "description": "Audio or video media ID or authorized file.", "required": True},
@@ -6829,12 +6833,13 @@ class AssistantEngine:
             live_generation_seconds=live_generation_seconds,
         )
 
-    def _emit_stats(self, *, force: bool = False) -> None:
-        stats = self._chat_stats_payload()
+    def _emit_stats(self, *, force: bool = False, prefilling_tokens: int = 0) -> None:
+        stats = {**self._chat_stats_payload(), **({"prefilling_tokens": prefilling_tokens} if prefilling_tokens else {})}
         signature = _json_dumps(stats)
         if not force and signature == str(self.session.chat_stats_signature or ""):
             return
         self.session.chat_stats_signature = signature
+        self.session.chat_stats = stats
         self._emit_chat_event(assistant_chat.build_stats_event(stats))
 
     def _record_prefill_metrics(self, token_count: int, elapsed_seconds: float) -> None:
@@ -6872,6 +6877,8 @@ class AssistantEngine:
 
     def _run_prefill_call(self, token_count: int, callback: Callable[[], Any], *, record_if: bool | Callable[[Any], bool] = True) -> Any:
         tokens = max(0, int(token_count or 0))
+        if tokens > 0:
+            self._emit_stats(force=True, prefilling_tokens=tokens)  # before the timer starts: the speeds stay those of the finished prefills
         started_at = time.perf_counter()
         self._prefill_started_at = started_at if tokens > 0 else None
         self._live_prefill_tokens = tokens
@@ -9236,7 +9243,7 @@ class AssistantEngine:
         self.session.messages.append({"role": "assistant", "content": content})
         self._record_live_context("Rejected tool request retained in live context; only error feedback will be appended.")
         self._append_tool_message(payload)
-        tool_label = self.tool_box.get_tool_transcript_label(tool_name, {}) if tool_name else "Tool request"
+        tool_label = self.tool_box.get_tool_transcript_label(tool_name, extract_incomplete_tool_parameters(raw_text)) if tool_name else "Tool request"
         message_id, tool_id = self._start_tool_call_card(tool_name, {}, tool_label)
         self._emit_chat_event(assistant_chat.complete_tool_call(self.session, message_id, tool_id, {**payload, "rejected_request": rejected_request}))
         checkpoint_assistant_turn(self.session)

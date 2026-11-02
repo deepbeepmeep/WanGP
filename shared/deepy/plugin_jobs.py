@@ -32,6 +32,7 @@ from shared.utils.workspaces import load_gallery
 WORKSPACE_MODES = ("isolated", "temporary", "current")
 MEDIA_MODES = ("copy", "link")
 TERMINAL_EVENTS = ("done", "cancelled", "error")
+LIVE_INTERVAL = 1 / 3  # seconds between the updates of a thought being written or of the speed
 _MEDIA_ID_RE = re.compile(r"^(?:" + "|".join(re.escape(source.media_ids) for source in GALLERY_SOURCES) + r"):[0-9a-f]{12}$")
 _service = None
 _open_scratch: set[Path] = set()
@@ -100,12 +101,13 @@ class DeepyJob:
         self._result = None
         self._phase = "waiting"
         self._text, self._tools, self._status, self._outputs = "", {}, None, {}
+        self._thoughts, self._thought_due, self._stats, self._stats_due = {}, 0.0, None, 0.0
         self._known, self._steers = set(), 0
         self._thread = threading.Thread(target=self._run, name=f"Deepy job ({owner})", daemon=True)
         self._thread.start()
 
     def events(self, timeout: float | None = None) -> Iterator[SessionEvent]:
-        """Events until the job ends: queued, started, status, text, tool, progress, output, then done, cancelled or error."""
+        """Events until the job ends: queued, started, status, text, thought, stats, tool, progress, output, then done, cancelled or error."""
         while True:
             event = self._events.get(timeout=timeout)
             yield event
@@ -207,7 +209,7 @@ class DeepyJob:
             with service._condition:
                 del service._request_states[self._submission_id]
 
-    def _scan(self, session, known):
+    def _scan(self, session, known, final=False):
         with session.turn_lock:
             transcript = session.chat_transcript
             start = next((index for index in range(len(transcript) - 1, -1, -1) if transcript[index].get("client_submission_id") == self._submission_id), None)
@@ -217,13 +219,19 @@ class DeepyJob:
                 for record in transcript[start + 1:]:
                     if record.get("role") != "user":
                         blocks.extend(dict(block) for block in record.get("blocks", []) if isinstance(block, dict))
-            status = session.chat_status
+            status, stats = session.chat_status, session.chat_stats or session.remote_usage_stats
             written = [(record["path_key"], record["path"], record["media_type"], record.get("label", "")) for record in session.media_registry if "write" in record.get("access", []) and record.get("path_key") not in known and record.get("path")]
         text = "\n\n".join(block["text"] for block in blocks if block.get("type") == "markdown" and block.get("text"))
         if text != self._text:
             self._emit("text", {"text": text, "delta": text[len(self._text):] if text.startswith(self._text) else text})
             self._text = text
+        now = float("inf") if final else time.monotonic()  # the last pass holds nothing back
         for block in blocks:
+            if block.get("type") == "reasoning":
+                thought, streaming, before = block["text"], bool(block.get("streaming")), self._thoughts.get(block["id"], ("", True))
+                if (thought, streaming) != before and (not streaming or now >= self._thought_due):  # a finished thought is never held back
+                    self._thoughts[block["id"]], self._thought_due = (thought, streaming), now + LIVE_INTERVAL
+                    self._emit("thought", {"id": block["id"], "text": thought, "delta": thought[len(before[0]):] if thought.startswith(before[0]) else thought, "streaming": streaming})
             if block.get("type") == "tool" and self._tools.get(block["id"]) != (block["status"], block["status_text"]):
                 self._tools[block["id"]] = (block["status"], block["status_text"])
                 failure = str((block.get("result") or {}).get("error") or "")[:400] if block["status"] == "error" else ""  # what went wrong, for the plugin's page
@@ -231,6 +239,9 @@ class DeepyJob:
         if status is not None and status != self._status:
             self._emit("status", {"kind": status["kind"], "text": status["text"]})
         self._status = status
+        if stats and stats != self._stats and now >= self._stats_due:
+            self._stats, self._stats_due = stats, now + LIVE_INTERVAL
+            self._emit("stats", {key: value for key, value in stats.items() if key != "visible"})
         for path_key, path, kind, label in written:
             if path_key not in self._outputs:
                 self._outputs[path_key] = {"id": gallery_media_ids(path, source_for_kind(kind).media_ids)[0], "path": path, "kind": kind, "name": Path(path).name, "label": label}
@@ -335,7 +346,7 @@ class PluginJobSupport:
                 while not self._plugin_idle():
                     self._condition.wait(timeout=1)
             if job._phase == "started":  # a late steering message can start one more turn: its reply and media belong to the job
-                job._scan(self._session, job._known)
+                job._scan(self._session, job._known, final=True)
             self._plugin_restore(job, parked)
 
     def _plugin_acquire(self, job):

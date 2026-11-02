@@ -131,6 +131,8 @@ def install(mode="vmm", large_mb=256, chunk_mb=32, spill=False):
     lib.vmm_pool_live.restype = ctypes.c_int64
     lib.vmm_in_pool.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_ulonglong, ctypes.c_ulonglong)
     lib.vmm_in_pool.restype = ctypes.c_int
+    lib.vmm_storage_shared.argtypes = (ctypes.c_void_p, ctypes.c_int)
+    lib.vmm_storage_shared.restype = ctypes.c_int
     _install_oom_error(lib)
     _lib, active = lib, mode
     _redirect_torch_memory_functions()
@@ -139,6 +141,9 @@ def install(mode="vmm", large_mb=256, chunk_mb=32, spill=False):
         set_vram_limit(virtual_gpu.state["limit"])
     from . import ram
     ram._link_vram_allocator()  # the RAM allocator, when installed first, gives its cache back before a spill is refused
+    if os.environ.get("MMGP_VRAM_CHUNK_LOG"):
+        from . import debug
+        debug.start_chunk_log(os.environ["MMGP_VRAM_CHUNK_LOG"], [int(size) for size in os.environ.get("MMGP_VRAM_WATCH_SIZES", "").split(",") if size])
 
 
 def _install_oom_error(lib):
@@ -286,6 +291,11 @@ def graph_storage_overlaps(first, second):
     """Capture planning only: escaped outputs must not alias physical pages loaned by static inputs."""
     return (active == "vmm" and first.is_cuda and first.device == second.device and
             bool(_lib.vmm_graph_storage_overlaps(first.untyped_storage().data_ptr(), second.untyped_storage().data_ptr(), first.device.index)))
+
+
+def storage_shared(tensor):
+    """Whether a chunk this tensor lent during a call (an output plan, a lifetime view) came back with memory allocated meanwhile still on it."""
+    return active == "vmm" and tensor.is_cuda and bool(_lib.vmm_storage_shared(tensor.untyped_storage().data_ptr(), tensor.device.index))
 
 
 def same_graph_storage(first, second):

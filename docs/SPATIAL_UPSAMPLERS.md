@@ -38,7 +38,9 @@ Decoded-media handlers also declare `postprocessing_category`:
 
 FlashVSR v1.1 and FlashVSR+ Turbo have separate selections, including their
 two-pass variants. **Configuration > Extensions > FlashVSR > Model** controls
-which version is normally shown. **Extract Settings** restores the saved
+which version is normally shown. Saving a version change updates the generation
+and gallery menus immediately. A selected FlashVSR method keeps its scale and
+one-pass or two-pass setting. **Extract Settings** restores the saved
 version and scale even if the current configuration hides that version;
 running those restored settings uses that version without changing the
 configuration preference. Existing `flashvsr` and `flashvsr2pass` settings mean
@@ -48,7 +50,8 @@ FlashVSR v1.1; `flashvsrplus` and `flashvsrplus2pass` mean FlashVSR+ Turbo.
 
 SeedVR2 3B and SeedVR2 7B have separate selections, and
 **Configuration > Extensions > SeedVR2 > SeedVR2 Model** controls which one is
-normally shown (3B by default). The two trade appearance for fidelity: in the
+normally shown (3B by default). Saving a change switches an active SeedVR2
+selection to that model at the same scale. The two trade appearance for fidelity: in the
 authors' comparisons 3B looks better on AI-generated and real-world video,
 while 7B stays closer to the source on degraded footage. 7B downloads as an
 INT8 file a little larger than 3B and runs slightly slower. **Extract Settings**

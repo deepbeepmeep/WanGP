@@ -2,9 +2,10 @@
 // Shot inspector: watch and compare takes, judge them, and edit everything the director will use.
 import { state, actions } from './app.js';
 import { api } from './api.js';
-import { icon, esc, art, fieldSaver, formatDuration, toast, promptDialog, menu, confirmDialog, shotRefs, shotText } from './ui.js';
+import { icon, esc, art, fieldSaver, formatDuration, toast, promptDialog, menu, confirmDialog, shotRefs, shotText, availability } from './ui.js';
 import { shotMenu } from './storyboard.js';
 import { choiceLabel, templateLabel } from './models.js';
+import { segments } from './sequencer.js';
 
 const TRANSITIONS = [['cut', 'Cut'], ['crossfade', 'Dissolve'], ['fade_black', 'Fade black'], ['fade_white', 'Fade white']];
 
@@ -50,9 +51,9 @@ export function mountInspector(root) {
       ${take ? `<div class="verdict-row">
           <button class="btn approve ${shot.status === 'approved' ? 'active' : ''}" id="i-approve">${icon('check')} Approve</button>
           <button class="btn reject ${shot.status === 'rejected' && verdict?.by === 'user' ? 'active' : ''}" id="i-reject" title="Mark the take for a redo, with a note for the showrunner">${icon('x')} Redo…</button>
-          ${take.settings && Object.keys(take.settings).length ? `<button class="btn" id="i-rerun" title="Render a new take now from this shot's settings and prompt, without the showrunner" ${rendering ? 'disabled' : ''}>${icon('refresh')} New take</button>` : ''}</div>
+          ${take.settings && Object.keys(take.settings).length ? `<button class="btn" id="i-rerun" ${availability(rendering ? 'This shot is rendering: wait for its take.' : '', 'Render a new take now from this shot\'s settings and prompt, without the showrunner')}>${icon('refresh')} New take</button>` : ''}</div>
         ${[verdict, verdict?.by === 'user' && take.showrunner_verdict].filter(Boolean).map(item => `<div class="verdict-note ${item.ok ? 'ok' : 'bad'}">${icon(item.ok ? 'check' : 'alert')}<span><b>${item.by === 'user' ? 'You' : 'Showrunner'}:</b> ${shotRefs(item.note || (item.by === 'user' ? (item.ok ? 'Approved.' : 'Marked for a redo.') : item.ok ? 'Good take.' : 'Needs a retry.'), doc.shots, doc.cast)}</span></div>`).join('')}
-        ${checksHtml(take)}` : `<div class="verdict-row"><button class="btn primary" id="i-shoot" ${rendering ? 'disabled' : ''}>${icon('clapper')} ${rendering ? 'Rendering…' : 'Shoot this shot'}</button></div>`}
+        ${checksHtml(take)}` : `<div class="verdict-row"><button class="btn primary" id="i-shoot" ${availability(rendering ? 'This shot is rendering: wait for its take.' : actions.directorBlocked())}>${icon('clapper')} ${rendering ? 'Rendering…' : 'Shoot this shot'}</button></div>`}
       <div class="field"><div class="label">${icon('sparkles')} What happens</div><textarea class="textarea" id="i-intent" rows="3" placeholder="${doc.brief.kind === 'music_video' ? 'The singer turns to the camera as the chorus starts…' : 'She hears the radio crackle and turns to the window…'}">${esc(shot.intent)}</textarea></div>
       <div class="field"><div class="label">${icon('chat')} Dialogue <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">words spoken or sung in this shot</span></div>
         <div class="dialogue" id="i-dialogue">${(shot.dialogue || []).map(item => lineRow(item, doc)).join('')}</div>
@@ -76,8 +77,10 @@ export function mountInspector(root) {
       ${take?.duration_s ? `<div class="field"><div class="label">${icon('scissors')} Trim <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">seconds of the take</span></div>
         <div class="row"><input class="input" id="i-in" type="number" min="0" step="0.05" value="${shot.trim?.[0] ?? 0}" style="width:90px"><span class="muted">to</span><input class="input" id="i-out" type="number" min="0" step="0.05" value="${shot.trim?.[1] ?? ''}" placeholder="${(+take.duration_s).toFixed(2)}" style="width:90px">
         <button class="btn small ghost" id="i-trim-reset">Reset</button><span class="grow"></span><label class="row muted" style="font-size:12.5px;cursor:pointer"><span class="toggle ${shot.included ? 'on' : ''}" id="i-included"></span>In the edit</label></div></div>` : ''}
+      ${take?.kind === 'video' ? speedField(shot, doc) : ''}
+      ${take?.kind === 'video' && take.has_audio ? soundField(shot, take, doc) : ''}
       <div class="field"><div class="label">${icon('note')} Notes for the showrunner</div><textarea class="textarea" id="i-notes" rows="2" placeholder="Anything to keep in mind for this shot…">${esc(shot.notes)}</textarea></div>
-      <div class="row"><button class="btn grow" id="i-ask">${icon('director')} Ask the showrunner</button><button class="btn grow" id="i-reshoot">${icon('refresh')} Re-shoot</button></div>
+      <div class="row"><button class="btn grow" id="i-ask">${icon('director')} Ask the showrunner</button><button class="btn grow" id="i-reshoot" ${availability(actions.directorBlocked())}>${icon('refresh')} Re-shoot</button></div>
       <details class="details"><summary>${icon('chevron')} Generation settings · ${esc(templateLabel(shot.generation?.template))}</summary>
         <div class="col" style="margin-top:10px"><input class="input mono" id="i-template" value="${esc(shot.generation?.template || 'gen_video')}">
         <textarea class="textarea json" id="i-settings" spellcheck="false">${esc(JSON.stringify(settings, null, 2))}</textarea><div class="muted" style="font-size:12px">JSON merged into the shot's settings when you leave the field.</div></div></details>
@@ -152,6 +155,11 @@ export function mountInspector(root) {
     root.querySelector('#i-in')?.addEventListener('input', trim);
     root.querySelector('#i-out')?.addEventListener('input', trim);
     root.querySelector('#i-trim-reset')?.addEventListener('click', () => actions.ops([{ op: 'update_shot', shot: id, fields: { trim: [0, null] } }]));
+    const setSpeed = value => actions.ops([{ op: 'update_shot', shot: id, fields: { speed: Math.min(4, Math.max(0.25, +value || 1)) } }]);
+    root.querySelectorAll('[data-speed]').forEach(button => button.onclick = () => setSpeed(button.dataset.speed));
+    root.querySelector('#i-speed')?.addEventListener('change', event => setSpeed(event.target.value));
+    root.querySelector('#i-detach')?.addEventListener('click', () => actions.detachSound(id));
+    root.querySelector('#i-reattach')?.addEventListener('click', () => actions.reattachSound(id));
     root.querySelector('#i-included')?.parentElement.addEventListener('click', () => actions.ops([{ op: 'update_shot', shot: id, fields: { included: !shot.included } }]));
     root.querySelectorAll('[data-take]').forEach(element => {
       element.onclick = () => actions.ops([{ op: 'update_shot', shot: id, fields: { chosen_take: element.dataset.take } }]);
@@ -238,10 +246,10 @@ export function mountInspector(root) {
     root.innerHTML = `<div class="inspector"><div class="insp-head"><b style="font-size:15px">${shots.length} shots selected</b><span class="muted">· ${formatDuration(total)}</span></div>
       <div class="refs" style="grid-template-columns:repeat(3,1fr)">${shots.slice(0, 9).map(shot => { const take = actions.take(shot); return `<div class="ref" style="aspect-ratio:16/9">${take?.poster ? `<img src="${actions.file(take.poster)}" alt="">` : `<div style="position:absolute;inset:0;${art(shot.id + shot.section, shot.intent)}"></div>`}</div>`; }).join('')}</div>
       <div class="col">
-        <button class="btn approve" data-bulk="approve">${icon('check')} Approve their takes</button>
+        <button class="btn approve" data-bulk="approve" ${availability(shots.some(shot => actions.take(shot)) ? '' : 'None of them has a take yet.')}>${icon('check')} Approve their takes</button>
         <button class="btn" data-bulk="lock">${icon('lock')} Lock / unlock</button>
         <button class="btn" data-bulk="include">${icon('eye')} Include / exclude</button>
-        <button class="btn" data-bulk="reshoot">${icon('refresh')} Ask the showrunner to re-shoot</button>
+        <button class="btn" data-bulk="reshoot" ${availability(actions.directorBlocked())}>${icon('refresh')} Ask the showrunner to re-shoot</button>
         <div class="field"><div class="label">${icon('layers')} Move to section</div><input class="input" id="bulk-section" placeholder="Chorus 2"></div>
         <div class="field"><div class="label">${icon('transition')} Transition</div><div class="seg" id="bulk-tr">${TRANSITIONS.map(([key, label]) => `<button data-tr="${key}">${label}</button>`).join('')}</div></div>
         <button class="btn danger" data-bulk="delete">${icon('trash')} Delete</button></div></div>`;
@@ -292,6 +300,26 @@ export function mountInspector(root) {
 function failure(shot, doc) {
   const entry = [...doc.log].reverse().find(item => new RegExp(`\\b${shot.id}\\b`).test(item.text || '') && /fail/i.test(item.text || ''));
   return `<div class="verdict-note bad">${icon('alert')}<span><b>Failed:</b> ${entry ? shotRefs(entry.text, doc.shots, doc.cast) : 'the render returned nothing; ask the showrunner or try again.'}</span></div>`;
+}
+
+// How fast the take plays in the edit; its sound follows, at the same pitch. A shot on the song leaves its beat and its lips the song's words.
+function speedField(shot, doc) {
+  const speed = +(shot.speed || 1), seg = segments(doc, actions.take).find(item => item.shot.id === shot.id);
+  const onSong = doc.brief.song && doc.edit.audio_mode !== 'clips' && shot.audio_slice;
+  return `<div class="field"><div class="label">${icon('gauge')} Speed ${seg ? `<span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">plays for ${formatDuration(seg.duration)} in the edit</span>` : ''}</div>
+    <div class="row"><div class="seg">${[0.5, 0.75, 1, 1.5, 2].map(value => `<button class="${value === speed ? 'on' : ''}" data-speed="${value}">${value}×</button>`).join('')}</div>
+      <input class="input" id="i-speed" type="number" min="0.25" max="4" step="0.05" value="${speed}" style="width:74px" title="From 0.25× to 4×"></div>
+    ${speed < 0.75 ? '<div class="muted" style="font-size:12px">Slow motion repeats frames: the movement can look jerky.</div>' : ''}
+    ${speed !== 1 && onSong ? `<div class="verdict-note bad">${icon('alert')}<span>This shot was made on its part of the song: at another speed, its lips and its cuts leave the song.</span></div>` : ''}</div>`;
+}
+
+// The take's sound in the edit: its own, or a track of its own on the Timeline's Sound lane.
+function soundField(shot, take, doc) {
+  const tracks = doc.edit.audio_tracks.filter(track => track.shot === shot.id);
+  const other = tracks.length && tracks.every(track => track.take !== take.id);
+  return `<div class="field"><div class="label">${icon('audio')} Sound</div>
+    ${shot.sound !== false ? `<div class="row"><button class="btn small" id="i-detach" title="Makes its sound a track on the Timeline's Sound lane, to shorten, extend, move or fade apart from the picture">${icon('scissors')} Detach Sound</button></div>`
+      : `<div class="row"><span class="muted grow" style="font-size:12.5px">${tracks.length ? `A track on the Sound lane${other ? ', from another take' : ''}` : 'This shot plays silent'}</span><button class="btn small" id="i-reattach" title="${tracks.length ? 'Removes its track from the Sound lane; the shot plays the sound of its take again' : 'The shot plays the sound of its take again'}">${icon('undo')} Reattach</button></div>`}</div>`;
 }
 
 function check(ok, text) { return `<div class="check ${ok ? 'ok' : 'todo'}">${icon(ok ? 'check' : 'clock')}<span>${esc(text)}</span></div>`; }

@@ -2,7 +2,7 @@
 // Storyboard: every shot as a card, grouped by section; drag to reorder, drop media to add takes, review at a glance.
 import { state, actions } from './app.js';
 import { api } from './api.js';
-import { icon, esc, art, formatDuration, sectionColor, menu, confirmDialog, promptDialog, toast, count, shootEstimate } from './ui.js';
+import { icon, esc, art, formatDuration, sectionColor, menu, confirmDialog, promptDialog, toast, count, shootEstimate, availability } from './ui.js';
 import { segments } from './sequencer.js';
 import { templateLabel } from './models.js';
 
@@ -23,6 +23,31 @@ export function shootTime(doc, shots, ready) {
   }
   rates.ready.add(ready);
   return rates.value ? shootEstimate(shots, rates.value) : '';
+}
+
+// The picture size of the shots, beside their number: measured on the takes, else what their model makes of the format, whatever anyone says of it.
+const sizes = { key: '', value: null, ready: new Set() };
+function frameSizes(doc, ready) {
+  const key = JSON.stringify([doc.id, doc.brief.aspect, doc.brief.resolution, doc.brief.templates, doc.shots.map(shot => [shot.id, shot.included, shot.generation?.template, shot.generation?.settings?.resolution, shot.chosen_take, shot.takes.length])]);
+  if (sizes.key !== key) {
+    if (sizes.key && JSON.parse(sizes.key)[0] !== doc.id) sizes.value = null;  // never another production's
+    Object.assign(sizes, { key, ready: new Set() });
+    api.sizes(doc.id).then(result => { if (sizes.key === key) { sizes.value = result.sizes; sizes.ready.forEach(call => call()); } }).catch(() => {});
+  }
+  sizes.ready.add(ready);
+  if (!sizes.value) return '';
+  const groups = new Map(), shown = size => size ? size.replace('x', '×') : 'the size of their reference';
+  for (const { size, shot } of Object.values(sizes.value)) {
+    const group = groups.get(size) || { size, count: 0, planned: false };
+    group.count += 1;
+    group.planned ||= !shot;
+    groups.set(size, group);
+  }
+  if (!groups.size) return '';
+  const list = [...groups.values()].sort((a, b) => b.count - a.count);
+  const lines = list.map(group => `${count(group.count, 'shot')} at ${shown(group.size)}`).join(', ');
+  const title = `Picture size: ${lines}.${list.some(group => group.planned) ? ` Shots not shot yet: the ${doc.brief.resolution} of the brief as their model makes it (a model works on a grid of pixels). Change it in the brief.` : ''}`;
+  return `<span title="${esc(title)}">${list.length === 1 ? esc(shown(list[0].size)) : 'mixed sizes'}</span> · `;
 }
 
 const FILTERS = [['all', 'All'], ['todo', 'To shoot'], ['review', 'To review'], ['approved', 'Approved'], ['excluded', 'Excluded']];
@@ -67,23 +92,22 @@ export function mountStoryboard(container, doc) {
     const doc = state.doc;
     const total = Math.max(0, ...segments(doc, actions.take).map(item => item.start + item.duration));  // where the cut ends: transitions overlap
     const counts = status => doc.shots.filter(shot => shot.status === status).length;
-    const working = actions.busy(doc) || state.live.running;
     const selected = [...state.selection];
     const shooting = toShoot(doc), todo = shooting.length;
     const estimate = todo ? shootTime(doc, shooting, renderTools) : '';
     const review = doc.brief.review_before_edit, approved = shot => actions.take(shot)?.verdict?.by === 'user' && actions.take(shot).verdict.ok;
     const waiting = review && !todo ? doc.shots.filter(shot => shot.included && !approved(shot)).length : 0;  // the showrunner waits for them before the edit
-    tools.innerHTML = `<div class="col" style="gap:0;min-width:0"><h2>Storyboard</h2><span class="stat" style="white-space:nowrap">${doc.shots.length} shots · ${formatDuration(total)} · <span style="color:var(--green)">${counts('approved')} approved</span> · <span style="color:var(--amber)">${counts('rendered')} to review</span></span></div>
+    tools.innerHTML = `<div class="col" style="gap:0;min-width:0"><h2>Storyboard</h2><span class="stat" style="white-space:nowrap">${doc.shots.length} shots · ${formatDuration(total)} · ${doc.shots.length ? frameSizes(doc, renderTools) : ''}<span style="color:var(--green)">${counts('approved')} approved</span> · <span style="color:var(--amber)">${counts('rendered')} to review</span></span></div>
       <span class="sep"></span><div class="filters">${FILTERS.map(([key, label]) => `<button class="chip clickable ${state.filter === key ? 'on' : ''}" data-filter="${key}">${label}</button>`).join('')}</div>
       <div class="row" style="margin-left:auto;flex-wrap:nowrap">
       <input type="range" class="range" id="density" min="180" max="420" step="10" value="${state.cardWidth}" style="width:96px" title="Card size">
       ${selected.length > 1 ? `<span class="chip on">${selected.length} selected</span>` : ''}
-      ${selected.length ? `<button class="btn small" id="reshoot" ${working ? 'disabled' : ''}>${icon('refresh')} Re-shoot ${count(selected.length, 'shot')}</button>` : ''}
+      ${selected.length ? `<button class="btn small" id="reshoot" ${availability(actions.directorBlocked())}>${icon('refresh')} Re-shoot ${count(selected.length, 'shot')}</button>` : ''}
       <button class="btn small" id="add">${icon('plus')} Shot</button>
       ${estimate ? `<span class="stat" style="white-space:nowrap" title="Roughly how long generating the ${count(todo, 'shot')} to shoot takes, measured on earlier takes of the same models (this production's first, then your other productions' at the same picture size). Checks and retakes add to it.">${icon('clock')} ${esc(estimate)}</span>` : ''}
       ${waiting ? `<button class="chip clickable" id="review-wait" title="The showrunner waits for your review before the edit: approve each take, or mark it for a redo. Assemble still makes a cut now.">${icon('clock')}Waiting for your review: ${count(waiting, 'shot')}</button>` : ''}
-      ${doc.shots.length ? `<button class="btn primary small" id="shoot" ${working ? 'disabled' : ''} title="${todo ? `The showrunner shoots the shots without a take and the ones marked for a redo, then ${review ? 'waits for your review before the edit' : 'assembles the edit'}` : 'Every shot has a take: assemble the edit now (texts, sound, subtitles); the showrunner panel can also assemble and check it'}">${icon(todo ? 'clapper' : 'film')} ${todo ? `Shoot ${count(todo, 'shot')}` : 'Assemble'}</button>`
-        : `<button class="btn primary small" id="plan" ${working ? 'disabled' : ''}>${icon('wand')} Plan with the showrunner</button>`}</div>`;
+      ${doc.shots.length ? `<button class="btn primary small" id="shoot" ${availability(actions.directorBlocked() || (todo ? '' : actions.assembleBlocked(doc)), todo ? `The showrunner shoots the shots without a take and the ones marked for a redo, then ${review ? 'waits for your review before the edit' : 'assembles the edit'}` : 'Every shot has a take: assemble the edit now (texts, sound, subtitles); the showrunner panel can also assemble and check it')}>${icon(todo ? 'clapper' : 'film')} ${todo ? `Shoot ${count(todo, 'shot')}` : 'Assemble'}</button>`
+        : `<button class="btn primary small" id="plan" ${availability(actions.directorBlocked() || actions.planBlocked(doc))}>${icon('wand')} Plan with the showrunner</button>`}</div>`;
     tools.querySelectorAll('[data-filter]').forEach(button => button.onclick = () => {
       state.filter = button.dataset.filter;
       const shown = new Set(visibleIds());
@@ -108,7 +132,7 @@ export function mountStoryboard(container, doc) {
 
   function signature(shot, index) {
     const take = actions.take(shot);
-    return JSON.stringify([index, shot.title, shot.intent, shot.dialogue, shot.section, shot.status, shot.locked, shot.included, shot.duration_s, shot.trim, shot.camera, shot.generation?.template, shot.cast, take?.id, take?.poster, take?.verdict, shot.takes.length, state.selection.has(shot.id), state.renders[shot.id], state.flash?.has(shot.id)]);
+    return JSON.stringify([index, shot.title, shot.intent, shot.dialogue, shot.section, shot.status, shot.locked, shot.included, shot.duration_s, shot.trim, shot.speed, shot.camera, shot.generation?.template, shot.cast, take?.id, take?.poster, take?.verdict, shot.takes.length, state.selection.has(shot.id), state.renders[shot.id], state.flash?.has(shot.id)]);
   }
 
   function card(shot, index) {
@@ -153,7 +177,7 @@ export function mountStoryboard(container, doc) {
       board.innerHTML = `<div class="sb-empty"><div class="big-icon">${icon(working ? 'director' : 'wand')}</div>
         <h2>${working ? 'The showrunner is planning…' : 'No shots yet'}</h2>
         <p>${working ? 'Shots appear here as soon as the plan is written. Follow along in the Showrunner panel.' : 'Let the showrunner turn your brief into a shot list, or add shots yourself.'}</p>
-        <div class="row">${working ? '<span class="spinner"></span>' : `<button class="btn primary lg" id="empty-plan">${icon('wand')} Plan with the showrunner</button><button class="btn lg" id="empty-add">${icon('plus')} Add a shot</button>`}</div>
+        <div class="row">${working ? '<span class="spinner"></span>' : `<button class="btn primary lg" id="empty-plan" ${availability(actions.directorBlocked() || actions.planBlocked(doc))}>${icon('wand')} Plan with the showrunner</button><button class="btn lg" id="empty-add">${icon('plus')} Add a shot</button>`}</div>
         <button class="btn ghost small" id="empty-brief">${icon('brief')} Review the brief</button></div>`;
       board.querySelector('#empty-plan')?.addEventListener('click', () => actions.direct('plan'));
       board.querySelector('#empty-add')?.addEventListener('click', () => addShot());
@@ -305,6 +329,8 @@ export function mountStoryboard(container, doc) {
   };
 }
 
+const rendering = shot => shot.status === 'rendering' || state.renders[shot.id] != null;
+
 export function shotMenu(anchor, ids) {
   const shots = ids.map(id => actions.shot(id)).filter(Boolean);
   if (!shots.length) return;
@@ -317,8 +343,9 @@ export function shotMenu(anchor, ids) {
     { label: locked ? 'Unlock' : 'Lock (the showrunner keeps it)', icon: locked ? 'unlock' : 'lock', action: () => actions.ops(shots.map(shot => ({ op: 'update_shot', shot: shot.id, fields: { locked: !locked } }))) },
     { label: included ? 'Exclude from the edit' : 'Include in the edit', icon: included ? 'eyeOff' : 'eye', action: () => actions.ops(shots.map(shot => ({ op: 'update_shot', shot: shot.id, fields: { included: !included } }))) },
     '-',
-    ...(one && take?.settings && Object.keys(take.settings).length ? [{ label: 'Render a new take', icon: 'refresh', action: () => import('./inspector.js').then(module => module.rerun(one.id)) }] : []),
-    { label: `Ask the showrunner to re-shoot${shots.length > 1 ? ` ${shots.length} shots` : ''}`, icon: 'director', action: () => actions.direct('reshoot', '', shots.map(shot => shot.id)) },
+    ...(one && take?.kind === 'video' && take.has_audio ? [one.sound !== false ? { label: 'Detach Sound', icon: 'scissors', action: () => actions.detachSound(one.id) } : { label: 'Reattach Sound', icon: 'undo', action: () => actions.reattachSound(one.id) }] : []),
+    ...(one && take?.settings && Object.keys(take.settings).length ? [{ label: 'Render a new take', icon: 'refresh', unavailable: rendering(one) ? 'This shot is rendering: wait for its take.' : '', action: () => import('./inspector.js').then(module => module.rerun(one.id)) }] : []),
+    { label: `Ask the showrunner to re-shoot${shots.length > 1 ? ` ${shots.length} shots` : ''}`, icon: 'director', unavailable: actions.directorBlocked(), action: () => actions.direct('reshoot', '', shots.map(shot => shot.id)) },
     { label: 'Tell the showrunner about it…', icon: 'chat', action: async () => { const text = await promptDialog({ title: 'Note for the showrunner', placeholder: 'Make it a slow push-in, keep her red coat…', multiline: true, ok: 'Send' }); if (text?.trim()) actions.steer(`${shots.map(shot => shot.id).join(', ')}: ${text.trim()}`); } },
     '-',
     ...(one ? [{ label: 'Duplicate', icon: 'copy', action: () => duplicate(one) }] : []),

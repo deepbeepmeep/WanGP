@@ -49,7 +49,7 @@ const selected = () => state.preferences.installations.find(x=>x.root===state.pr
 const usesConda = item => item?.maintenance==="conda"||item?.ownership==="conda"||Boolean(item?.inspection?.conda_environment);
 const canMaintain = item => item?.ownership==="managed"||["conda","venv"].includes(item?.maintenance)||["conda","venv"].includes(item?.ownership);
 const server = () => [...state.jobs.values()].find(x=>x.action==="launch"&&!x.done&&x.args?.root===selected()?.root);
-const busyJob = () => [...state.jobs.values()].find(x=>!x.done&&["preview","apply","recover","demo","register","sources","catalog"].includes(x.action));
+const busyJob = () => [...state.jobs.values()].find(x=>!x.done&&["preview","apply","recover","remove_version","demo","register","sources","catalog"].includes(x.action));
 const launchLog = () => [...state.jobs.values()].reverse().find(x=>x.action==="launch"&&x.args?.root===selected()?.root);
 const usingRemote = () => !state.remote.manual||state.remote.kind==="github";
 const sourceArgs = () => usingRemote()?{repository:state.remote.repository,commit:state.remote.commit}:{source:state.form.source,release_id:state.form.release_id};
@@ -71,12 +71,12 @@ function progressMarkup(){
     return plan&&["install","maintenance"].includes(state.page)&&!state.registerView?'<section id="progress-area" class="operation-dock ready" aria-label="Installation ready"><div class="row"><div><strong>Ready · '+esc(plan.target_release_id)+'</strong><p class="path">'+esc(plan.installation_root)+'</p><p>'+(plan.reuse_environment?'Reuse the compatible environment.':'Create a new environment.')+' '+plan.changes.length+' source file change'+(plan.changes.length===1?'':'s')+'.</p></div>'+button('apply',applyLabel(plan),'primary',server()||state.runtime_error)+'</div></section>':'<div id="progress-area"></div>';
   }
   const progress=operationProgress(job);
-  return '<section id="progress-area" class="operation-dock" aria-label="Installation progress"><div class="row"><div class="operation-heading" role="status"><span class="spinner"></span><strong id="progress-title">'+esc(progress.title)+'</strong></div><div class="operation-actions">'+button('toggle-progress',state.progressExpanded?'Hide output':'Show output','small')+button('cancel','Cancel','quiet small',false,'data-id="'+job.id+'"')+'</div></div><p id="progress-message">'+esc(progress.message)+'</p><div id="operation-meter" class="operation-meter '+(progress.total?'determinate':'')+'"><progress id="operation-progress" aria-label="Current step progress" '+(progress.total?'max="'+progress.total+'" value="'+progress.completed+'"':'')+'></progress><div class="progress" role="progressbar" aria-label="Current step in progress"></div></div><p id="progress-output" class="operation-output">'+esc(progress.output)+'</p>'+(state.progressExpanded?'<pre id="operation-log" class="log" tabindex="0" aria-label="Installation output">'+esc(jobLog(job))+'</pre>':'')+'</section>';
+  return '<section id="progress-area" class="operation-dock" aria-label="Installation progress"><div class="row"><div class="operation-heading" role="status"><span class="spinner"></span><strong id="progress-title">'+esc(progress.title)+'</strong></div><div class="operation-actions">'+button('toggle-progress',state.progressExpanded?'Hide output':'Show output','small')+(job.action==="remove_version"?"":button('cancel','Cancel','quiet small',false,'data-id="'+job.id+'"'))+'</div></div><p id="progress-message">'+esc(progress.message)+'</p><div id="operation-meter" class="operation-meter '+(progress.total?'determinate':'')+'"><progress id="operation-progress" aria-label="Current step progress" '+(progress.total?'max="'+progress.total+'" value="'+progress.completed+'"':'')+'></progress><div class="progress" role="progressbar" aria-label="Current step in progress"></div></div><p id="progress-output" class="operation-output">'+esc(progress.output)+'</p>'+(state.progressExpanded?'<pre id="operation-log" class="log" tabindex="0" aria-label="Installation output">'+esc(jobLog(job))+'</pre>':'')+'</section>';
 }
 function operationProgress(job){
   const last=[...job.events].reverse().find(e=>e.title)||{};
   const line=[...job.events].reverse().find(e=>e.type==="log"&&e.text.trim());
-  return {title:last.title||({preview:"Preparing Installation",apply:"Installing WanGP",recover:"Recovering Installation",demo:"Preparing Test Installation",register:"Reading Installation",sources:"Finding WanGP Versions",catalog:"Reading Installation Configuration"}[job.action]),
+  return {title:last.title||({preview:"Preparing Installation",apply:"Installing WanGP",remove_version:"Removing Saved Version",recover:"Recovering Installation",demo:"Preparing Test Installation",register:"Reading Installation",sources:"Finding WanGP Versions",catalog:"Reading Installation Configuration"}[job.action]),
     message:last.message||({building_environment:"Creating Python and downloading the required packages.",validating_environment:"Checking installed packages and GPU compatibility.",caching_release:"Saving source files for installation and rollback.",backing_up:"Saving the previous version before applying changes.",activating:"Activating the prepared version."}[last.phase])||"Working… Live output appears below as it becomes available.",
     total:Number.isFinite(last.total)&&last.total>0?last.total:null,completed:Math.max(0,last.completed||0),
     output:line?line.text.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g,"").split(/[\r\n]+/).filter(x=>x.trim()).at(-1)?.slice(-220)||"":""};
@@ -182,7 +182,7 @@ function installForm(maintaining){
     button('refresh-hardware','Refresh hardware','small',busyJob())+
     '</section><section class="install-step" aria-labelledby="destination-step"><div class="form-title"><span class="step">3</span><div><h3 id="destination-step">'+(maintaining?'Update options':'Choose where to install')+'</h3><p class="hint">'+(maintaining?'Keep the current environment when compatible, or create a separate one.':'Python and packages will be installed automatically in this folder.')+'</p></div></div>'+
     (!maintaining?field('form','root','Installation folder','Choose a new or empty folder','folder'):
-      '<div class="grid2">'+selectField('operation','Action',[["switch-version","Switch version / downgrade"],["update","Update"],...(selected()?.ownership==="managed"?[["repair","Repair missing files and rebuild"]]:[])],form.operation)+(usesConda(selected())?'<div class="field"><label>Environment</label><p>Update a separate Conda clone. Keep the previous environment for rollback.</p></div>':selectField('environment','Environment',[["auto","Automatic"],["current","Reuse current (if compatible)"],["new","Create a new environment"]],form.environment))+'</div>')+
+      '<div class="grid2">'+selectField('operation','Action',[["switch-version","Switch version / downgrade"],["update","Update"],...(selected()?.ownership==="managed"?[["repair","Repair missing files and rebuild"]]:[])],form.operation)+selectField('environment','Environment',[["auto","Automatic"],["current","Reuse current (if compatible)"],["new","Create a new environment"]],form.environment)+'</div>')+
     '<label class="check recommended-components"><input type="checkbox" data-group="form" data-key="extras" '+(form.extras?'checked':'')+'>Include recommended optional components</label>'+
     '<div class="form-footer"><p class="hint">'+(state.preview?'Preparation is complete. The summary is below; use '+applyLabel(state.preview.plan)+' in the bottom bar to continue.':(online?'Downloads WanGP source':'Reads the selected source')+' and resolves compatible packages. Some package metadata or wheels may also download. Installation starts only when you confirm the prepared result.')+'</p>'+(!state.preview?button('preview',maintaining?'Prepare changes':online?'Download and prepare':'Prepare installation','primary',!ready||(!maintaining&&!form.root)||busyJob()||server()||state.runtime_error):'')+'</div></section></div></fieldset>';
 }
@@ -202,14 +202,28 @@ function maintenance(){
   if(!canMaintain(item))return heading("MAINTENANCE","Existing installation.","This checkout remains under your control.")+notice("Manager can launch and inspect this installation. Use its existing tools to update source or packages, or create a separate managed installation to test version switching.")+button("navigate","Create a managed installation","primary",false,'data-page="install"');
   return heading("UPDATES","Update your WanGP installation.","Keep this installation and its models. Prepare an update, review it, then apply it.")+
     '<section class="card update-entry"><h2>Update WanGP to the latest version</h2><p>Currently installed: <strong>'+esc(item.release||'Existing checkout')+'</strong></p><p class="hint">Manager checks the latest version and its dependencies, then keeps a rollback checkpoint. Your models, plugins, settings and outputs stay in place.</p>'+button("prepare-latest","Prepare latest update","primary",server()||busyJob()||item.pending_operation||state.runtime_error)+'</section>'+review()+
-    (usesConda(item)?notice("Conda updates keep your WanGP folder and prepare dependencies in a separate environment. Manager switches to that clone after validation; rollback restores both source and environment. Launch through Manager or the installation's scripts to use the selected environment. Stop WanGP and save or stash tracked source edits first. Git and Conda must be installed; allow disk space for another environment."):"")+
+    (usesConda(item)?notice("Conda updates reuse your current environment when it satisfies the selected dependencies. When packages need to change, Manager prepares and validates a separate clone. Stop WanGP and save or stash tracked source edits before updating."):"")+
     (server()?notice("Stop this installation before changing its version or environment."):"")+
     (item.pending_operation?notice("An interrupted operation needs recovery before this installation can launch. "+button("recover","Recover now"),"error"):"")+
     '<details class="card version-options"><summary>Choose another version or change dependencies</summary>'+installForm(true)+'</details><section class="card"><div class="row"><h2>Saved versions and rollback</h2>'+button("versions","Refresh history","small",server()||busyJob())+'</div>'+
-    (state.versions.length?'<ul class="list">'+state.versions.map(x=>html('<li><div class="version-main"><span class="version-node {current}"></span><div><strong>{release}</strong><p>{description}</p></div></div>{restore}</li>',{
-      current:x.current?"current":"",release:esc(x.release_id),description:x.current?"Active source and environment":"Retained rollback checkpoint",
-      restore:x.current?'<span class="pill green">Current</span>':button("rollback","Preview restore","small",server()||busyJob(),'data-checkpoint="'+x.checkpoint+'"')
-    })).join("")+'</ul>':'<p class="hint">Your first update will save the current version here for rollback.</p>')+'</section>';
+    (state.versions.length?'<ul class="list">'+state.versions.map(savedVersionRow).join("")+'</ul>':'<p class="hint">Your first update will save the current version here for rollback.</p>')+'</section>';
+}
+
+function savedVersionRow(version){
+  const attr='data-checkpoint="'+esc(version.checkpoint)+'"';
+  const disabled=server()||busyJob()||selected().pending_operation;
+  let description="Active source and environment",actions='<span class="pill green">Current</span>';
+  if(!version.current){
+    if(version.removing||currentFlow().removeCheckpoint===version.checkpoint){
+      description=version.removing?"Removal is incomplete. Close any program using the old environment and retry.":"Remove this rollback version? Manager also deletes its environment if it owns it and no other version or registered installation uses it.";
+      actions=button("remove-version",version.removing?"Finish removal":"Confirm removal","small danger",disabled,attr);
+      if(!version.removing)actions+=button("cancel-removal","Cancel","small",disabled);
+    }else{
+      description="Retained rollback checkpoint";
+      actions=button("rollback","Preview restore","small",disabled,attr)+button("confirm-removal","Remove","small",disabled,attr);
+    }
+  }
+  return html('<li><div class="version-main"><span class="version-node {current}"></span><div><strong>{release}</strong><p>{description}</p></div></div><div class="actions">{actions}</div></li>',{current:version.current?"current":"",release:esc(version.release_id),description,actions});
 }
 function diagnostics(){
   const hardware=state.hardware,info=state.inspection,packages=info?.inspection?.packages||{};
@@ -252,7 +266,7 @@ function activity(){
   return heading("ACTIVITY","Every step, in view.","Follow operations and inspect their results.")+
     '<section class="card"><div class="field"><label for="log-picker">Operation</label><select id="log-picker">'+(jobs.map(x=>option(x.id,x.action+" · "+(x.done?x.result?.status||"Complete":"Running")+" · "+x.id.slice(0,8),active?.id)).join("")||'<option>No operations yet</option>')+
     '</select></div><pre id="live-log" class="log">'+esc(active?jobLog(active):"Operations will appear here as you use Manager.")+'</pre>'+
-    (active&&!active.done?'<div class="actions">'+button("cancel",active.action==="launch"?"Stop server":"Cancel operation","danger",false,'data-id="'+active.id+'"')+'</div>':"")+
+    (active&&!active.done&&active.action!=="remove_version"?'<div class="actions">'+button("cancel",active.action==="launch"?"Stop server":"Cancel operation","danger",false,'data-id="'+active.id+'"')+'</div>':"")+
     (active?.result?'<details><summary>Result details</summary><pre>'+pretty(active.result)+'</pre></details>':"")+'</section><p class="footer-note">The live view keeps recent events. Durable installation journals remain with each managed installation.</p>';
 }
 function savedLaunchOptions(){return {listen:false,verbose:false,authentication:false,password_mode:"generated",debug_deepy:false,telemetry:false,...state.preferences.launch_options,debug_directory:state.preferences.launch_options?.debug_directory||state.data_directory+"/logs/deepy",telemetry_file:state.preferences.launch_options?.telemetry_file||state.data_directory+"/logs/telemetry.log"};}
@@ -445,6 +459,16 @@ document.addEventListener("click",async event=>{
     else if(action==="toggle-progress"){state.progressExpanded=!state.progressExpanded;render();}
     else if(action==="discard-preview"){state.preview=null;render();}
     else if(action==="versions")await history();
+    else if(action==="confirm-removal"){currentFlow().removeCheckpoint=el.dataset.checkpoint;render();}
+    else if(action==="cancel-removal"){currentFlow().removeCheckpoint=null;render();}
+    else if(action==="remove-version"){
+      const root=selected().root,flow=currentFlow();
+      flow.preview=null;flow.removeCheckpoint=null;
+      try{
+        const result=await run("remove_version",{root,checkpoint:el.dataset.checkpoint});
+        if(selected()?.root===root)notify(result.environment_removed?"Saved version and unused environment removed.":"Saved version removed. Its environment was kept.");
+      }finally{if(selected()?.root===root)await history();}
+    }
     else if(action==="rollback"){const flow=currentFlow();flow.preview=await run("preview",{root:selected().root,operation:"rollback",checkpoint:el.dataset.checkpoint});render();}
     else if(action==="recover"){
       const result=await run("recover",{root:selected().root});await refreshInspection();

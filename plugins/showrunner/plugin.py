@@ -121,6 +121,41 @@ class WanGPHost:
     def save_default_templates(self, picks: dict) -> None:
         self.plugin.save_config(templates=picks)
 
+    def frame_size(self, entry: dict, resolution: str) -> str:
+        """The size a template's model makes of a resolution: fitted to its grid, as generation does."""
+        from shared import resolutions
+        return resolutions.align_resolution_value(resolution, (self.plugin.get_model_def(entry["model_type"]) or {}).get("vae_block_size", 16))
+
+    def settings(self) -> dict:
+        """Showrunner's own settings (its Settings screen), for every production."""
+        config = self.plugin.config()
+        return {"notify_turns": bool(config.get("notify_turns")), "cast_loras": bool(config.get("cast_loras"))}
+
+    def save_settings(self, **fields) -> None:
+        self.plugin.save_config(**fields)
+
+    def notify(self, title: str, message: str) -> None:
+        """WanGP's notification sound on this computer, whatever it does for generations, at its volume, and its notification destinations when any is set."""
+        from shared.notifications import send_notification_async
+        from shared.utils.notification_sound import play_notification_async
+        config = self.plugin.server_config
+        play_notification_async(config.get("notification_sound_volume", 50))
+        send_notification_async(config, title, message)
+
+    def lora_folder(self, model_type: str) -> str | None:
+        """The LoRA folder of a model (None: it takes no LoRAs): a LoRA fits the models that share its folder."""
+        return None if (self.plugin.get_model_def(model_type) or {}).get("no_lora") else self._client().web_session().get_lora_dir(model_type)
+
+    def list_loras(self, model_type: str) -> list[str]:
+        return list(self._client().web_session().list_loras(model_type)["loras"])
+
+    def template_loras(self, template: str) -> tuple[list[str], str]:
+        """The LoRAs a Deepy template generates with, and their multipliers."""
+        from shared.mcp.server import _deepy_template_settings
+        task, _, name = template.partition("/")
+        settings = _deepy_template_settings(self._client().web_session(), task, name.strip() or "default")["settings"]
+        return list(settings.get("activated_loras") or []), str(settings.get("loras_multipliers") or "")
+
     def encode_settings(self):
         from shared.utils.audio_video import get_mp4_audio_codec_settings, get_video_audio_extra_args
         from shared.utils.video_codecs import get_video_container_extension, get_video_encode_args

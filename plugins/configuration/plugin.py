@@ -9,6 +9,7 @@ import html
 import json
 import os
 from shared.utils.config_store import config_snapshot, update_config
+from plugins.configuration import processor_menus
 from shared.mcp.config import DEFAULT_PORT, server_port
 from shared.gradio.form_sync import GradioForm
 from shared.gradio.app_icons import icon as app_icon
@@ -265,7 +266,8 @@ class ConfigTabPlugin(WAN2GPPlugin):
         self.request_component("model_base_type_choice")
         self.request_component("model_choice")
         self.request_component("model_filter")
-        self.request_component("refresh_form_trigger")      
+        self.request_component("refresh_form_trigger")
+        processor_menus.request_components(self)
         self.request_component("state")
         self.request_component("resolution")
         self.request_component("assistant_launcher_host")
@@ -1085,6 +1087,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
         # These configuration input callbacks only derive presentation/choices.
         view_events = [event for index, event in gr.context.get_blocks_context().fns.items() if index >= first_event and event.fn and event.outputs and all(kind in ('input', 'change') for _, kind in event.targets)]
         self.synced_form = GradioForm(self.state.value.service.forms, 'configuration', inputs[1:-1], view_events=view_events)
+        processor_menus.bind(self, self.synced_form.baseline.change)
         saved = self.synced_form.bind_save(
             self.apply_btn.click, lambda *values: self._save_changes(*values[:-1], overrides=values[-1]),
             inputs=[*inputs, self.overrides],
@@ -1532,6 +1535,12 @@ class ConfigTabPlugin(WAN2GPPlugin):
         launcher_update = gr.update(value=assistant_chat.render_launcher_html() if deepy_visible else "", visible=deepy_visible)
         panel_update = gr.update(visible=deepy_visible)
 
+        refresh_form = not changes or bool(set(changes).difference(processor_menus.CONFIG_KEYS))
+        if refresh_form and upsampler_api.UPSAMPLER_CONFIG_KEY in changes:
+            replacements = upsampler_api.method_preference_changes(old_server_config, new_server_config)
+            if replacements:
+                settings = self.get_current_model_settings(state)
+                settings["spatial_upsampling"] = upsampler_api.apply_method_preference(settings.get("spatial_upsampling", ""), replacements)
         return Saved((
             msg,
             description_update,
@@ -1539,7 +1548,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             model_family_update,
             model_base_type_update,
             model_choice_update,
-            self.get_unique_id(),
+            self.get_unique_id() if refresh_form else gr.update(),
             launcher_update,
             panel_update,
             chat_event_update,

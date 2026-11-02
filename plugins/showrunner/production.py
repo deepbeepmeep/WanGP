@@ -62,6 +62,8 @@ def normalize(doc: dict[str, Any]) -> dict[str, Any]:
         for key, value in {"name": "", "role": "", "description": "", "images": [], "master": None, "voice": None, "voice_description": "", "voice_text": "", "lora": None,
                            "locked": False, "looks": []}.items():
             member.setdefault(key, copy.deepcopy(value))
+        if not isinstance(member["lora"], dict):  # {file, folder (its model family's LoRA folder), multiplier, trigger}
+            member["lora"] = None
         for look in member["looks"]:  # a costume or an age of the member: its master for the sequences it is worn in
             for key, value in {"name": "", "master": None, "sections": [], "shots": [], "description": ""}.items():
                 look.setdefault(key, copy.deepcopy(value))
@@ -96,7 +98,7 @@ def normalize(doc: dict[str, Any]) -> dict[str, Any]:
 
 def normalize_shot(shot: dict[str, Any]) -> dict[str, Any]:
     for key, value in {"title": "", "section": "", "intent": "", "camera": "", "cast": [], "dialogue": [], "duration_s": 5.0, "audio_slice": None, "generation": {},
-                       "status": "planned", "locked": False, "included": True, "takes": [], "chosen_take": None, "trim": [0.0, None],
+                       "status": "planned", "locked": False, "included": True, "takes": [], "chosen_take": None, "trim": [0.0, None], "speed": 1.0, "sound": True,
                        "transition": {"type": "cut", "duration_s": 0.0}, "notes": "", "updated_by": "", "updated_rev": 0}.items():
         shot.setdefault(key, copy.deepcopy(value))
     generation = shot["generation"]
@@ -176,12 +178,48 @@ def shoot_rates(own: list[dict[str, Any]], others: list[dict[str, Any]], size: s
     return rates
 
 
+def speed_of(shot: dict[str, Any], take: dict[str, Any] | None) -> float:
+    """How fast a shot's take plays in the edit (a still has no speed). Its trim stays in seconds of the take."""
+    return 1.0 if (take or {}).get("kind") == "image" else float(shot.get("speed") or 1.0)
+
+
 def out_point(shot: dict[str, Any], length: float) -> float:
     """Where a take ends in the edit without a trim of the user's: at the shot's planned length when the take came out longer. Models round
     lengths up to their frame steps (10.22 s for a 10.125 s plan), and the cuts the director planned on the bars, and the song slices of
     lip-synced shots, must not drift by that much per shot."""
     planned = shot.get("duration_s")
     return min(float(length), float(planned)) if planned else float(length)
+
+
+def next_step(doc: dict[str, Any]) -> str:
+    """What is up to the user once the showrunner's task is over, in a sentence for a notification (the page says it too: nextStep in app.js)."""
+    included = [shot for shot in doc["shots"] if shot.get("included", True)]
+    many = lambda number, word: f"{number} {word}{'' if number == 1 else 's'}"
+    todo = sum(not shot.get("locked") and (not shot["takes"] or shot["status"] in ("rejected", "failed")) for shot in included)
+    review = sum(shot["status"] == "rendered" for shot in included)
+    if doc["shots"] and not any(shot["takes"] for shot in included):
+        return f"The plan is ready: check its {many(len(doc['shots']), 'shot')} on the Board, then press Shoot."
+    if todo:
+        return f"{many(todo, 'shot')} still {'needs' if todo == 1 else 'need'} a take: press Shoot on the Board."
+    if doc["shots"] and doc["brief"].get("review_before_edit") and review:
+        return f"{many(review, 'take')} {'waits' if review == 1 else 'wait'} for your review on the Board."
+    if doc["shots"] and not doc["deliverables"]:
+        return "Every shot has a take: press Assemble to make the video."
+    if doc["deliverables"] and doc["deliverables"][-1].get("edit_key") == edit_key(doc):
+        return f"Version {len(doc['deliverables'])} is ready: watch it on Deliver."
+    return "The showrunner has finished its task."
+
+
+def take_length(doc: dict[str, Any], shot: dict[str, Any]) -> float:
+    """The seconds of take a shot's place in the edit uses at most: its planned length or the end of its trim, and on the song, what it plays on through
+    a transition into the next shot (the song keeps that shot on its part: the outgoing one runs into it, at most 1 s)."""
+    length = max(float(shot.get("duration_s") or 0.0), float((list(shot.get("trim") or []) + [None, None])[1] or 0.0))
+    if doc["brief"].get("song") and doc["edit"].get("audio_mode") in ("song", "mix"):
+        included = [item for item in doc["shots"] if item.get("included", True)]
+        following = next((after for before, after in zip(included, included[1:]) if before["id"] == shot["id"]), None)
+        if following is not None and (following.get("transition") or {}).get("type", "cut") != "cut":
+            length += min(float(following["transition"].get("duration_s") or 0.5), 1.0) * float(shot.get("speed") or 1.0)
+    return length
 
 
 def timeline(doc: dict[str, Any]) -> list[dict[str, Any]]:
@@ -195,7 +233,7 @@ def timeline(doc: dict[str, Any]) -> list[dict[str, Any]]:
         start_trim, end_trim = (shot.get("trim") or [0.0, None]) + [None] * (2 - len(shot.get("trim") or []))
         length = (take or {}).get("duration_s") or shot.get("duration_s") or 0.0
         end = end_trim if end_trim is not None else out_point(shot, length)
-        duration = round(max(0.0, float(end) - float(start_trim or 0.0)) * fps) / fps
+        duration = round(max(0.0, float(end) - float(start_trim or 0.0)) / speed_of(shot, take) * fps) / fps
         result.append({"shot": shot["id"], "start_s": round(position, 3), "duration_s": round(duration, 3)})
         position += duration
     return result
@@ -242,7 +280,8 @@ def outline(doc: dict[str, Any]) -> list[dict[str, Any]]:
 def edit_key(doc: dict[str, Any]) -> str:
     """What an export depends on (shots in the cut with their takes, trims and transitions, the sound, text and subtitles): a delivered
     version whose key differs from the document's is out of date."""
-    cut = [[shot["id"], take["path"], shot.get("trim"), shot.get("transition")] for shot, take in sequence(doc)]
+    cut = [[shot["id"], take["path"], shot.get("trim"), shot.get("transition"), *([speed_of(shot, take)] if speed_of(shot, take) != 1.0 else []), *([False] if shot.get("sound") is False else [])]
+           for shot, take in sequence(doc)]  # listed only when set: older exports stay up to date
     edit = {key: doc["edit"].get(key) for key in ("audio_mode", "song_start_s", "audio_tracks", "subtitles", "fps")}
     edit["overlays"] = [{key: item.get(key) for key in ("path", "start_s", "end_s", "fade_s")} for item in doc["edit"].get("overlays", [])]
     return hashlib.sha1(json.dumps([cut, edit, doc["brief"].get("song")], sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
@@ -262,7 +301,7 @@ def summary(doc: dict[str, Any], sequence: str | None = None) -> dict[str, Any]:
         "style": doc["style"], "shot_counts": counts, "total_s": round(sum(item["duration_s"] for item in timeline(doc)), 2),
         "shots": [{"id": shot["id"], "title": shot["title"], "section": shot["section"], "duration_s": shot["duration_s"], "status": shot["status"], "locked": shot["locked"],
                    "included": shot["included"], "cast": shot["cast"], "prompt": shot_prompt(shot)[:prompt_chars], "takes": len(shot["takes"]), "chosen_take": shot["chosen_take"],
-                   **({"dialogue": shot["dialogue"]} if shot.get("dialogue") else {}),
+                   **({"dialogue": shot["dialogue"]} if shot.get("dialogue") else {}), **({"speed": shot["speed"]} if shot["speed"] != 1.0 else {}), **({"sound": False} if not shot["sound"] else {}),
                    "verdict": (chosen_take(shot) or {}).get("verdict"), "take_path": (chosen_take(shot) or {}).get("path"), "notes": shot["notes"],
                    **({"changed_by_user": True} if shot.get("updated_by") == "user" else {})}
                   for shot in shots],
@@ -279,8 +318,9 @@ def summary(doc: dict[str, Any], sequence: str | None = None) -> dict[str, Any]:
 
 BRIEF_FIELDS = {"kind", "title", "text", "song", "script", "references", "duration_s", "aspect", "resolution", "style_tags", "style", "pacing", "language", "plan_first", "budget_minutes",
                 "templates", "read_other_productions", "review_before_edit"}
-SHOT_FIELDS = {"title", "section", "intent", "camera", "cast", "dialogue", "duration_s", "audio_slice", "generation", "status", "locked", "included", "chosen_take", "trim",
+SHOT_FIELDS = {"title", "section", "intent", "camera", "cast", "dialogue", "duration_s", "audio_slice", "generation", "status", "locked", "included", "chosen_take", "trim", "speed", "sound",
                "transition", "notes"}
+SPEEDS = (0.25, 4.0)  # what a browser plays with its sound and the export's filters handle
 CAST_FIELDS = {"name", "role", "description", "images", "master", "voice", "voice_description", "voice_text", "lora", "locked", "looks"}
 MEDIA_SETTINGS = {"image_refs", "image_start", "image_end", "image_guide", "image_mask", "video_guide", "video_mask", "video_source", "audio_guide", "audio_guide2",
                   "audio_source", "custom_guide"}  # the generation settings that name media files
@@ -333,6 +373,10 @@ def _set_shot_fields(shot: dict[str, Any], fields: dict[str, Any], by: str, revi
             if transition["type"] not in TRANSITIONS:
                 raise OperationError(f"Transition type must be one of {', '.join(TRANSITIONS)}.")
             shot[key] = transition
+        elif key == "speed":
+            if not SPEEDS[0] <= float(value) <= SPEEDS[1]:
+                raise OperationError(f"A shot's speed goes from {SPEEDS[0]:g} to {SPEEDS[1]:g} times.")
+            shot[key] = round(float(value), 3)
         else:
             shot[key] = copy.deepcopy(value)
         changed.append(key)
@@ -411,6 +455,8 @@ def _add_take(shot: dict[str, Any], take: dict[str, Any], by: str) -> dict[str, 
               "has_audio": take.get("has_audio"), "strip": take.get("strip"), "codec": take.get("codec"), "settings": copy.deepcopy(take.get("settings") or {}),
               "by": by, "created": now(), "checks": copy.deepcopy(take.get("checks") or {}), "verdict": None, "showrunner_verdict": None, "note": take.get("note", ""),
               "gpu_s": take.get("gpu_s")}  # gpu_s: the measured generation time, for shoot estimates
+    if take.get("base_loras"):  # its LoRAs before the cast's (activated, multipliers): a new take adds the cast's as they are then
+        record["base_loras"] = copy.deepcopy(take["base_loras"])
     shot["takes"].append(record)
     shot["chosen_take"] = record["id"]
     if shot["status"] in ("planned", "queued", "rendering", "failed", "rejected"):
@@ -690,6 +736,10 @@ def version_changes(old: dict[str, Any], new: dict[str, Any], limit: int = 40, l
             lines.append(f"{label(shot)}: {take(before.get('chosen_take'))} → {take(shot.get('chosen_take'))}")
         if before.get("trim") != shot.get("trim") or before.get("duration_s") != shot.get("duration_s"):
             retimed.append(label(shot))
+        if before.get("speed", 1.0) != shot.get("speed", 1.0):
+            lines.append(f"{label(shot)}: speed {before.get('speed', 1.0):g}× → {shot.get('speed', 1.0):g}×")
+        if before.get("sound", True) != shot.get("sound", True):
+            lines.append(f"{label(shot)}: {'its own sound back' if shot.get('sound', True) else 'sound detached'}")
         if [line.get("line") for line in before.get("dialogue") or []] != [line.get("line") for line in shot.get("dialogue") or []]:
             lines.append(f"{label(shot)}: words changed")
         if (before.get("transition") or {}).get("type") != (shot.get("transition") or {}).get("type"):
@@ -714,6 +764,8 @@ def version_changes(old: dict[str, Any], new: dict[str, Any], limit: int = 40, l
             lines.append(f"{member['name'] or member['id']}: looks changed")
         if before.get("voice") != member.get("voice"):
             lines.append(f"{member['name'] or member['id']}: new voice")
+        if before.get("lora") != member.get("lora"):
+            lines.append(f"{member['name'] or member['id']}: LoRA changed")
     lines += [f"Removed {member['name'] or member['id']} from the cast" for member in before_cast.values()]
     texts = lambda doc: [(item.get("style"), item.get("text")) for item in doc["edit"].get("overlays", [])]
     lines += [f"Text added: «{text}»" for style, text in texts(new) if (style, text) not in texts(old)]
@@ -722,9 +774,12 @@ def version_changes(old: dict[str, Any], new: dict[str, Any], limit: int = 40, l
     lines += [f"Text «{key[1]}» moved" for key, when in timing(new).items() if key in timing(old) and timing(old)[key] != when]
     if old["edit"].get("audio_mode") != new["edit"].get("audio_mode"):
         lines.append(f"Soundtrack: {old['edit'].get('audio_mode')} → {new['edit'].get('audio_mode')}")
+    cuts = lambda doc: [[track.get(key) for key in ("in_s", "out_s", "fade_in_s", "fade_out_s")] for track in doc["edit"].get("audio_tracks", [])]
     if [track.get("path") for track in old["edit"].get("audio_tracks", [])] != [track.get("path") for track in new["edit"].get("audio_tracks", [])]:
         counts = len(old["edit"].get("audio_tracks", [])), len(new["edit"].get("audio_tracks", []))
         lines.append("Sound track replaced" if counts == (1, 1) else "Sound tracks replaced" if counts[0] == counts[1] else f"Sound tracks: {counts[0]} → {counts[1]}")
+    elif cuts(old) != cuts(new):
+        lines.append("Sound tracks trimmed")
     if old["brief"].get("song") != new["brief"].get("song"):
         lines.append("New song")
     if (old.get("style") or {}).get("text_design") != (new.get("style") or {}).get("text_design"):
@@ -752,7 +807,7 @@ def _op_bring_back(doc, op, by, revision, base_revision):
         same = next((take for take in shot["takes"] if take["path"] == used["path"]), None)
         if same is None:
             same = _add_take(shot, used, used.get("by", by))
-        shot["chosen_take"], shot["trim"] = same["id"], copy.deepcopy(old.get("trim") or [0.0, None])
+        shot["chosen_take"], shot["trim"], shot["speed"] = same["id"], copy.deepcopy(old.get("trim") or [0.0, None]), old.get("speed", 1.0)
         if shot["status"] in ("planned", "failed", "rejected"):
             shot["status"] = "rendered"
         return {"shot": shot["id"], "take": same["id"]}
@@ -768,7 +823,7 @@ def _op_bring_back(doc, op, by, revision, base_revision):
         return {"shot": item}
     if kind == "cast":
         old = find(version["cast"], item, "cast member in that version")
-        fields = {key: copy.deepcopy(old.get(key)) for key in ("name", "role", "description", "images", "master", "voice", "voice_description", "voice_text", "looks")}
+        fields = {key: copy.deepcopy(old.get(key)) for key in ("name", "role", "description", "images", "master", "voice", "voice_description", "voice_text", "looks", "lora")}
         member = next((member for member in doc["cast"] if member["id"] == item), None)
         if member is None:
             doc["cast"].append({"id": item, **fields})

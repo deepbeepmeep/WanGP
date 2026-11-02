@@ -371,10 +371,32 @@ def extract_incomplete_tool_name(raw_text: str) -> str:
     open_markers = [(start, end) for start, end, closing in _tool_call_markers(text) if not closing]
     candidate = text if len(open_markers) == 0 else text[open_markers[-1][1]:]
     json_name = re.search(r"[\"']name[\"']\s*:\s*[\"']([^\"']+)", candidate, flags=re.IGNORECASE)
-    if json_name is not None:
-        return _clean_tag_name(json_name.group(1))
     function_start = _FUNCTION_START_RE.search(candidate)
-    return "" if function_start is None else _clean_tag_name(function_start.group(1))
+    if json_name is None and function_start is None:
+        return ""
+    # Whichever comes first names the tool: a "name" after <function=...> belongs to the call's arguments, and a <function=...> after "name" to its text.
+    first = json_name if function_start is None or json_name is not None and json_name.start() < function_start.start() else function_start
+    return _clean_tag_name(first.group(1))
+
+
+def extract_incomplete_tool_parameters(raw_text: str) -> dict[str, Any]:
+    """The parameters an interrupted <function=...> call has written, enough to name it: the finished ones (JSON decoded) and {} for the one it stopped in."""
+    text = str(raw_text or "")
+    open_markers = [(start, end) for start, end, closing in _tool_call_markers(text) if not closing]
+    candidate = text if len(open_markers) == 0 else text[open_markers[-1][1]:]
+    function_start = _FUNCTION_START_RE.search(candidate)
+    if function_start is None:
+        return {}
+    parameters: dict[str, Any] = {}
+    for name, value, closing in re.findall(r"<parameter(?:=|\s+name=)([^\s>]+)[^>]*>(.*?)(</parameter>|$)", candidate[function_start.end():], flags=re.DOTALL | re.IGNORECASE):
+        value = value.strip()
+        if value[:1] in ("{", "["):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                value = {}
+        parameters[_clean_tag_name(name)] = value if closing else {}
+    return parameters
 
 
 def _decode_completed_object_members(source: str, open_brace_index: int) -> dict[str, Any]:

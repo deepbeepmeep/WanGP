@@ -18,6 +18,7 @@ const ICONS = {
   plus: '<path d="M12 5v14M5 12h14"/>',
   upload: '<path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>',
   download: '<path d="M12 4v12M7 11l5 5 5-5"/><path d="M4 18v1a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-1"/>',
+  settings: '<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/>',
   play: '<path d="M7 4.5v15l13-7.5z" fill="currentColor"/>',
   pause: '<rect x="6" y="4.5" width="4" height="15" rx="1" fill="currentColor"/><rect x="14" y="4.5" width="4" height="15" rx="1" fill="currentColor"/>',
   stop: '<rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/>',
@@ -227,9 +228,14 @@ export function promptDialog({ title, text = '', value = '', placeholder = '', o
 }
 
 let openMenu = null;
+// A button's attributes: greyed out with the reason it cannot be used now as its tooltip, or usable with its own tooltip.
+export function availability(reason, title = '') {
+  return reason ? `disabled title="${esc(reason)}"` : title ? `title="${esc(title)}"` : '';
+}
+
 export function menu(anchor, items) {
   closeMenu();
-  const element = h(`<div class="menu" role="menu">${items.map((item, index) => item === '-' ? '<hr>' : `<button data-i="${index}" class="${item.danger ? 'danger' : ''}">${icon(item.icon || 'chevron')}<span>${esc(item.label)}</span></button>`).join('')}</div>`);
+  const element = h(`<div class="menu" role="menu">${items.map((item, index) => item === '-' ? '<hr>' : `<button data-i="${index}" class="${item.danger ? 'danger' : ''}" ${availability(item.unavailable)}>${icon(item.icon || 'chevron')}<span>${esc(item.label)}</span></button>`).join('')}</div>`);
   document.body.append(element);
   const rect = anchor instanceof Element ? anchor.getBoundingClientRect() : { left: anchor.x, right: anchor.x, top: anchor.y, bottom: anchor.y };
   const width = element.offsetWidth, height = element.offsetHeight;

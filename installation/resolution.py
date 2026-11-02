@@ -180,7 +180,7 @@ def collect_inputs(plan, extra_requirements=()):
     return inputs
 
 
-def resolve_dependencies(plan, destination, runtime, *, extra_requirements=(), runner=None):
+def resolve_dependencies(plan, destination, runtime, *, extra_requirements=(), runner=None, installed=None):
     if plan["platform"] != os_key():
         raise InstallError("platform_mismatch", "Resolve on the target operating system")
     inputs = collect_inputs(plan, extra_requirements)
@@ -191,6 +191,13 @@ def resolve_dependencies(plan, destination, runtime, *, extra_requirements=(), r
     configuration = destination / "uv.toml"
     configuration.write_text(inputs.index_configuration(), encoding="utf-8")
     output = destination / "pylock.toml"
+    if installed:
+        # uv uses versions in a previous output as preferences. It still resolves
+        # all requirements, sources, markers and hashes for the target release.
+        preferences = ['lock-version = "1.0"', 'created-by = "WanGP Manager"']
+        for name, version in sorted(installed.items()):
+            preferences.extend(("[[packages]]", "name = " + json.dumps(name), "version = " + json.dumps(version)))
+        output.write_text("\n".join(preferences) + "\n", encoding="utf-8")
     runner = runner or ProcessRunner(destination / "resolve.log")
     arguments = runtime.command("pip", "compile", str(project), "--python-version", plan["python"], "--format", "pylock.toml", "--generate-hashes", "--no-header", "--index-strategy", "first-index", "--output-file", str(output))
     # An explicit config file excludes user/ancestor config while retaining our named indexes.
@@ -235,3 +242,34 @@ def load_resolution(directory, check_inputs=True):
             if file_hash(plain_path(filename)) != expected:
                 raise InstallError("stale_plan", f"Dependency input changed: {filename}")
     return record
+
+
+def artifact_sources_match(previous_directory, directory, resolution, installed):
+    """uv's installed check compares versions, but cannot see a republished wheel."""
+    previous = load_resolution(previous_directory, check_inputs=False)
+    if previous["files"]["pylock.toml"] == resolution["files"]["pylock.toml"]:
+        return True
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python 3.10 CLI
+        from pip._vendor import tomli as tomllib
+
+    def artifacts(folder):
+        with (plain_path(folder) / "pylock.toml").open("rb") as stream:
+            packages = tomllib.load(stream).get("packages", [])
+        result = {}
+        for package in packages:
+            name = package_name(package["name"])
+            if installed.get(name) != package.get("version"):
+                continue
+            values = result.setdefault(name, set())
+            for kind in ("wheels", "sdist", "archive", "directory", "vcs"):
+                entries = package.get(kind, [])
+                for entry in entries if isinstance(entries, list) else [entries]:
+                    # Ignore informational size/timestamps. Keep the source and
+                    # integrity fields so a wheel replaced in place requires a build.
+                    values.add((kind, digest({k: v for k, v in entry.items() if k not in ("size", "upload-time")})))
+        return result
+
+    old, new = artifacts(previous_directory), artifacts(directory)
+    return all(old[name] <= new[name] for name in old.keys() & new.keys())

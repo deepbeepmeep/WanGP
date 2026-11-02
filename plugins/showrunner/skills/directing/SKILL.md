@@ -39,9 +39,10 @@ merges, this document and its actions replace them:
   (the cast ids it shows), `dialogue` (the words spoken in it: [{speaker, line, note}], the speaker a cast id or NARRATOR, the line
   exactly as the script has it, the note a delivery hint), `duration_s`, `audio_slice` [start_s, end_s] for song-driven shots, and `generation`:
   {"template": "<task>/<template name>", "settings": {...}}, as for wangp_generate.
-- `settings` hold only what this shot changes: `prompt`, its media (`audio_guide`, `image_start`) and its length (`video_length` or
-  `duration_seconds`). The template brings the model, LoRAs, steps and other defaults: do not copy them from the template, and do not
-  look for LoRAs it names. `plan` validates every shot and returns the problems; fix them with `update_shot`.
+- `settings` hold only what this shot changes: `prompt` and its media (`audio_guide`, `image_start`). `render` asks for the length the shot
+  uses from its `duration_s`: set `video_length` only to want more than that. The brief sets the resolution: a shot sets `resolution` only
+  when the user asks for another one for it. The template brings the model, LoRAs, steps and other defaults: do not copy them from the template, and do not
+  look for LoRAs it names. `plan` validates every shot and returns the problems (fix them with `update_shot`) and `renders`, what the shots will come out at, {size: {shot: seconds}}: quote these numbers when you tell the user a size or a length.
 - Every prompt restates the production's look for its scene: time of day, weather, light, palette and lens, and the wardrobe of each
   person it shows. A prompt without them drifts to a neutral daylight look and breaks the sequence.
 - Signs, screens, books and labels in a scene, and the markings of a prop or a costume in a master image, come out with garbled letters:
@@ -188,8 +189,10 @@ A film of several minutes is a chain of sequences, each a scene or a chapter of 
   holds its moment, and take the time from shots without words or lyrics before you cut a shot down to a stub. Then check what
   each card covers again: a full-frame end card or chapter card hides the picture under it, so start the end card after the last
   shot has shown its moment.
-- The edit is the included shots in order with their chosen takes, trims (`trim` [start_s, end_s]) and transitions (`transition`
-  {type: cut|crossfade|fade_black|fade_white, duration_s}); its sound and text are set with `edit`.
+- The edit is the included shots in order with their chosen takes, trims (`trim` [start_s, end_s]), speeds (`speed`, 0.25 to 4: the take's
+  sound follows; it leaves a shot on the song off its beat) and transitions (`transition` {type: cut|crossfade|fade_black|fade_white,
+  duration_s}); its sound and text are set with `edit`. A shot with `sound` false has its sound on a track the user made: keep that track
+  when you rewrite the tracks.
 - A finished production has sound under its whole length. Unless the brief asks otherwise, a film, ad, trailer or story gets a score
   (an instrumental `gen_song` as long as the cut, about -12 dB under speech), a title and an end card, and spoken words get subtitles.
 - `assemble` renders it and reports what went in (length, sound, subtitle cues with their times, text, tracks). It levels the sound and measures the

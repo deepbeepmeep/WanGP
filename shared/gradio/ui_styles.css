@@ -928,7 +928,7 @@ user-select: text;
 
 /* Shared inputs of the post-processing parameters: two per line, whichever of them the selected processors show. */
 /* a post-processing slot: its selector and its processor's parameters, set apart from the other slot */
-div.wangp-postprocessing-slot, .postprocess div.wangp-postprocessing-slot { border: 1px solid var(--border-color-primary) !important; border-radius: var(--radius-lg) !important; margin-bottom: var(--spacing-lg) !important; }
+div.wangp-postprocessing-slot:not(.postprocess *) { border: 1px solid var(--border-color-primary) !important; border-radius: var(--radius-lg) !important; margin-bottom: var(--spacing-lg) !important; }
 .wangp-postprocessing-parameters, .wangp-postprocessing-parameters > .form { flex-wrap: wrap !important; }
 .wangp-postprocessing-parameters > .form { flex: 1 1 100% !important; }
 .wangp-postprocessing-parameters .wangp-postprocessing-parameter { flex: 1 1 calc(50% - var(--layout-gap)) !important; min-width: calc(50% - var(--layout-gap)) !important; }

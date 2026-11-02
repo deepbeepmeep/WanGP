@@ -5,7 +5,10 @@ A start image becomes the first frame of the shot (its framing, aspect and setti
 reference images. The catalog is each Deepy category's template list as Deepy's settings show it; nothing here names a model."""
 from __future__ import annotations
 
+import math
 from typing import Any
+
+from . import production as model
 
 VIDEO_TASKS = ("gen_video", "gen_video_with_speech", "gen_video_with_refs")
 DRAWN = "draw_svg"  # the template of a shot the director draws (a card, a diagram, a map) and records with record_take
@@ -26,6 +29,15 @@ ROLES = (
 )
 ROLE_IDS = tuple(role["id"] for role in ROLES)
 TASKS = {role["id"]: role["task"] for role in ROLES}
+
+
+def planned_length(doc: dict[str, Any], shot: dict[str, Any], entry: dict[str, Any] | None) -> dict[str, str]:
+    """The length a video shot asks of its generation, unless its settings name one: what the edit uses of its take. Without it, the take lasts
+    as long as the template's example and the edit throws the rest away (10 s rendered for a 3.4 s shot)."""
+    length = model.take_length(doc, shot)
+    if entry is None or entry["task"] not in VIDEO_TASKS or length <= 0 or {"video_length", "duration_seconds"} & set(shot["generation"].get("settings") or {}):
+        return {}
+    return {"video_length": f"{math.ceil(length * 1000) / 1000:g}s"}
 
 
 def entry_name(entry: dict[str, Any]) -> str:

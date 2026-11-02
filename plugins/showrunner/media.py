@@ -141,6 +141,15 @@ def audio_slice(path: str | Path, start_s: float, end_s: float, out_folder: str 
     return out
 
 
+def take_sound(path: str | Path, speed: float, out_folder: str | Path, tempo: str = "") -> Path:
+    """The whole sound of a take as a WAV in out_folder, at the speed it plays in the edit (tempo: its filters), made once."""
+    out = Path(out_folder) / f"{Path(path).stem}-sound{'' if speed == 1.0 else f'-{speed:g}x'}.wav"
+    if not out.is_file():
+        out.parent.mkdir(parents=True, exist_ok=True)
+        _run([ffmpeg(), "-y", "-v", "error", "-i", str(path), "-vn", *(["-af", tempo] if tempo else []), "-c:a", "pcm_s16le", str(out)])
+    return out
+
+
 def padded_audio(path: str | Path, duration_s: float, out_folder: str | Path) -> Path:
     """An audio file followed by silence up to duration_s, as a WAV in out_folder (a short line driving a longer lip-synced shot)."""
     out = Path(out_folder) / f"{Path(path).stem}-to-{duration_s:.3f}.wav"

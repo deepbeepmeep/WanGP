@@ -414,6 +414,8 @@ with self.deepy.run("Make it 6 s", session_dir="D:/my_plugin/sessions/trailer-12
 | `started` | `{"session_dir", "workspace_id"}`: Deepy now shows the job. |
 | `status` | `{"kind", "text"}`: Deepy's status line (starting, thinking, paused...). |
 | `text` | `{"text", "delta"}`: Deepy's reply so far, and what was added. |
+| `thought` | `{"id", "text", "delta", "streaming"}` while Deepy thinks, when its model does: one `id` per thought, the thought so far, what was added, and whether it is still being written. Up to three updates per second. |
+| `stats` | The line Deepy's chat shows, as `{"text"}`, with the numbers behind it. With a local model: `avg_prefill_tokens_per_second`, `avg_generated_tokens_per_second`, `consumed_tokens`, `max_tokens`, and `prefilling_tokens` while it reads that many tokens before writing. Up to three updates per second. |
 | `tool` | `{"id", "name", "label", "status", "status_text"}` when a Deepy action starts or changes state (`running`, `done`, `error`, `interrupted`); a failed action adds `"error"`, its reason. |
 | `progress` | A `ProgressUpdate` (`phase`, `status`, `progress` in percent, `current_step`, `total_steps`, `unit`) for generations run by the job. |
 | `output` | `{"id", "path", "kind", "name", "label"}` for each media file Deepy writes. |

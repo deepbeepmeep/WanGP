@@ -1,11 +1,12 @@
 // Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 // Showrunner page: state, routing, the shell (top bar, view rail, side panel), live events and global shortcuts.
 import { api, listen } from './api.js';
-import { icon, esc, h, toast, debounce, aspectValue, kindOfFile, closeMenu, confirmDialog, formatDuration, $ } from './ui.js';
+import { icon, esc, h, toast, debounce, aspectValue, kindOfFile, closeMenu, confirmDialog, formatDuration, count, $ } from './ui.js';
 import { renderHome } from './home.js';
 import { openDefaultModels } from './models.js';
+import { openSettings } from './settings.js';
 import { mountBrief } from './brief.js';
-import { mountStoryboard } from './storyboard.js';
+import { mountStoryboard, toShoot } from './storyboard.js';
 import { mountTimeline } from './timeline.js';
 import { mountCast } from './cast.js';
 import { mountDeliver } from './deliver.js';
@@ -24,7 +25,7 @@ const VIEWS = { brief: ['Brief', 'brief', mountBrief], storyboard: ['Board', 'gr
 const UNDONE = { add_take: 'a new take', update_shot: 'a shot edit', verdict: 'a verdict', add_shots: 'new shots', replace_plan: 'the plan', remove_shot: 'a deletion',
   move_shots: 'a move', reorder: 'a move', remove_take: 'a removed take', brief: 'a brief edit', add_cast: 'a new cast member', update_cast: 'a cast edit',
   remove_cast: 'a cast removal', edit: 'a sound edit', add_overlay: 'a text', update_overlay: 'a text edit', remove_overlay: 'a text deletion', style: 'a style edit',
-  outline: 'the outline', deliverable: 'an export', bin_add: 'a bin import', bin_to_take: 'a take from the bin', stage: 'a stage change' };
+  outline: 'the outline', deliverable: 'an export', bin_add: 'a bin import', bin_remove: 'a bin removal', bin_to_take: 'a take from the bin', stage: 'a stage change' };
 const GUIDE_PAGES = { home: 'Quick Start', brief: 'Starting a Production', storyboard: 'Reviewing and Changing the Plan', timeline: 'The Timeline', cast: 'The Cast', deliver: 'Delivering' };
 const STAGES = [['brief', 'Brief'], ['planning', 'Plan'], ['review', 'Review'], ['shooting', 'Shoot'], ['editing', 'Edit'], ['delivered', 'Deliver']];
 const app = document.getElementById('app');
@@ -100,6 +101,14 @@ export const actions = {
     } catch (error) { toast(error.message, 'error', 7000); }
   },
   busy: doc => !['idle', 'paused'].includes(doc.director.state),  // a paused director waits for the user: nothing runs
+  // Why the buttons that give the showrunner a task are greyed out now ('': they are not).
+  directorBlocked() {
+    if (state.live.running || actions.busy(state.doc)) return 'The showrunner is working: this comes back when it finishes, or after Pause or Stop.';
+    return state.directorInfo.available === false && state.directorInfo.reason || '';
+  },
+  // Why the edit cannot be assembled now ('': it can).
+  assembleBlocked: doc => doc.shots.some(shot => shot.included && shot.takes.length) ? '' : 'Nothing to assemble yet: shoot at least one shot, the edit is made of their takes.',
+  planBlocked: doc => ['text', 'script', 'song'].some(key => String(doc.brief[key] || '').trim()) ? '' : 'Write your idea in the brief first, or drop a song or a script: the showrunner plans from it.',
   async upload(files, role = 'bin', target = null) {
     const list = [...files].filter(file => kindOfFile(file.name));
     if (!list.length) { toast('Drop images, videos or audio files.', 'error'); return []; }
@@ -110,6 +119,20 @@ export const actions = {
     }
     refreshDoc();
     return results;
+  },
+  async detachSound(shotId) {
+    try {
+      await api.detachSound(state.pid, shotId);
+      refreshDoc();
+      toast('Its sound is now a track on the Sound lane of the Timeline.', 'ok');
+    } catch (error) { toast(error.message, 'error', 6000); }
+  },
+  reattachSound(shotId) {
+    return actions.ops([{ op: 'edit', fields: { audio_tracks: state.doc.edit.audio_tracks.filter(track => track.shot !== shotId) } }, { op: 'update_shot', shot: shotId, fields: { sound: true } }]);
+  },
+  pausePlayback() {  // the timeline's preview, and every player on the page
+    mounted?.suspend?.();
+    document.querySelectorAll('video, audio').forEach(media => media.pause());
   },
   file: (path, download = false) => api.file(state.pid, path, download),
   templateRoles(refresh = false) {  // the template picker's roles, once per production unless a pick changed them
@@ -190,6 +213,8 @@ function eventsFor(pid) {
       }
       if (event.event === 'text') live.text = event.data.text;
       if (event.event === 'status') live.status = event.data;
+      if (event.event === 'thought') live.thought = event.data;
+      if (event.event === 'stats') live.stats = event.data;
       if (event.event === 'tool') {
         const index = live.tools.findIndex(tool => tool.id === event.data.id);
         index < 0 ? live.tools.push(event.data) : live.tools.splice(index, 1, event.data);
@@ -228,8 +253,9 @@ async function catchUp() {
   try {
     const status = await api.director(state.pid);
     changed = status.running !== state.live.running;
-    if (status.live && (status.live.text !== state.live.text || JSON.stringify(status.live.tools) !== JSON.stringify(state.live.tools))) {  // steps that ended unseen
-      state.live.text = status.live.text; state.live.tools = status.live.tools; changed = true;
+    if (status.live) {  // steps that ended unseen
+      changed ||= Object.keys(status.live).some(key => JSON.stringify(status.live[key]) !== JSON.stringify(state.live[key]));
+      Object.assign(state.live, status.live);
     }
     if (state.live.running && !status.running) { state.live.running = false; state.live.progress = null; reportChanges('caught_up'); }
     else state.live.running = status.running;
@@ -249,7 +275,7 @@ async function reportChanges(outcome) {
   if (!before) { if (outcome === 'done') toast('The showrunner finished.', 'ok'); return; }
   const number = id => doc.shots.findIndex(shot => shot.id === id) + 1;
   const old = new Map(before.shots.map(shot => [shot.id, shot]));
-  const fields = ['title', 'section', 'intent', 'camera', 'cast', 'dialogue', 'duration_s', 'generation', 'transition', 'trim', 'included'];
+  const fields = ['title', 'section', 'intent', 'camera', 'cast', 'dialogue', 'duration_s', 'generation', 'transition', 'trim', 'speed', 'sound', 'included'];
   const added = doc.shots.filter(shot => !old.has(shot.id));
   const removed = before.shots.filter(shot => !doc.shots.some(item => item.id === shot.id));
   const edited = doc.shots.filter(shot => old.has(shot.id) && fields.some(key => JSON.stringify(shot[key]) !== JSON.stringify(old.get(shot.id)[key])));
@@ -271,7 +297,8 @@ async function reportChanges(outcome) {
   ].filter(Boolean);
   state.live.summary = parts.length ? `The showrunner ${parts.join(', ')}.` : 'The showrunner changed nothing in the production.';
   director?.live?.();
-  if (outcome === 'done') toast(state.live.summary, 'ok', 7000);
+  renderTopbar();
+  if (outcome === 'done' || outcome === 'caught_up') toast([state.live.summary, nextStep(doc)?.text].filter(Boolean).join(' '), 'ok', 9000);
   state.flash = new Set([...added, ...edited, ...takes.map(([shot]) => shot)].map(shot => shot.id));
   mounted?.update?.(doc);
   setTimeout(() => { state.flash = null; mounted?.update?.(state.doc); }, 6000);
@@ -299,14 +326,14 @@ function renderTopbar() {
   }
   const doc = state.doc;
   const stageIndex = STAGES.findIndex(([key]) => key === doc.stage);
-  const working = actions.busy(doc) || state.live.running;
+  const working = actions.busy(doc) || state.live.running, next = nextStep(doc);
   bar.innerHTML = `${brand()}
     <span class="sep"></span>
     <input class="input bare crumb-title" id="title" value="${esc(doc.title)}" aria-label="Production title" spellcheck="false">
     <div class="stages">${STAGES.map(([key, label], index) => `${index ? icon('chevron', 'stage-arrow') : ''}<button class="stage ${index < stageIndex ? 'done' : index === stageIndex ? 'current' : ''}" data-stage="${key}" title="${label}: the production's stage · click to open its view"><span class="dot">${index < stageIndex ? icon('check') : index + 1}</span><span>${label}</span></button>`).join('')}</div>
     <button class="btn ghost icon" id="undo" title="Undo (Ctrl+Z)">${icon('undo')}</button>
     <button class="btn ghost icon" id="redo" title="Redo (Ctrl+Shift+Z)">${icon('redo')}</button>
-    <button class="director-pill ${working ? 'working' : ''}" id="pill" title="Showrunner"><span class="avatar">${icon('director')}</span><span>Showrunner</span><span class="state">${esc(directorLabel(doc))}</span></button>
+    <button class="director-pill ${working ? 'working' : ''} ${next ? 'turn' : ''}" id="pill" title="${esc(next ? `Your turn: ${next.text}` : 'Showrunner')}"><span class="avatar">${icon('director')}</span><span>Showrunner</span><span class="state">${esc(directorLabel(doc))}</span></button>
     ${guideButton()}${themeButton()}`;
   const title = document.getElementById('title');
   title.addEventListener('change', () => title.value.trim() && actions.ops([{ op: 'brief', fields: { title: title.value.trim() } }]));
@@ -317,7 +344,28 @@ function renderTopbar() {
   bar.querySelectorAll('[data-stage]').forEach(button => button.onclick = () => actions.go({ brief: 'brief', planning: 'storyboard', review: 'storyboard', shooting: 'storyboard', editing: 'timeline', delivered: 'deliver' }[button.dataset.stage]));
 }
 
+// What the user does next, once the showrunner's task is over, read from the production: it stays in the top bar and the showrunner's panel
+// until it is done, on every page (the toast at the end of a task passes unseen, and not at all while the page is out of sight).
+export function nextStep(doc) {
+  if (!doc || actions.busy(doc) || state.live.running) return null;
+  const last = doc.director.last?.status, latest = doc.deliverables.at(-1);
+  const takes = doc.shots.filter(shot => shot.included && shot.takes.length).length, todo = toShoot(doc).length;
+  const toReview = doc.shots.filter(shot => shot.included && shot.status === 'rendered').length;
+  if (last === 'error' || last === 'interrupted') return { label: 'Stopped', text: 'The showrunner stopped before the end of its task: its panel says why, and Continue picks it up.' };
+  if (!doc.shots.length) return null;
+  if (!takes) return { label: 'Review the plan', text: `The plan is ready: check its ${count(doc.shots.length, 'shot')} on the Board, then press Shoot.`, view: 'storyboard' };
+  if (todo) return { label: `${count(todo, 'shot')} to shoot`, text: `${count(todo, 'shot')} still ${todo === 1 ? 'needs' : 'need'} a take: press Shoot on the Board.`, view: 'storyboard' };
+  if (doc.brief.review_before_edit && toReview) return { label: `Review ${count(toReview, 'take')}`, text: `${count(toReview, 'take')} ${toReview === 1 ? 'waits' : 'wait'} for your review on the Board: approve each one or mark it for a redo.`, view: 'storyboard' };
+  if (!latest) return { label: 'Assemble the edit', text: 'Every shot has a take: press Assemble to make the video.', view: 'timeline' };
+  let watched = null;
+  try { watched = localStorage.getItem(`sr.watched.${doc.id}`); } catch { /* a convenience */ }
+  if (latest.edit_key === doc.edit_key && watched !== latest.id) return { label: 'Watch the video', text: `Version ${doc.deliverables.length} is ready: watch it on Deliver.`, view: 'deliver' };
+  return null;
+}
+
 function directorLabel(doc) {
+  const next = nextStep(doc);
+  if (next) return next.label;
   if (state.live.running && state.live.queued) return 'Waiting for Deepy';
   if (state.live.running || doc.director.state === 'running') return { plan: 'Planning…', shoot: 'Shooting…', reshoot: 'Re-shooting…', assemble: 'Assembling…' }[doc.director.task] || 'Working…';
   if (doc.director.state === 'queued') return 'Queued';
@@ -336,12 +384,14 @@ function guideButton() {  // with the default models: both are about every produ
 // The guide's code and pages load when it first opens, at the part about the page on screen.
 const openGuide = () => import('./guide.js').then(module => module.openGuide(GUIDE_PAGES[state.pid ? state.view : 'home']));
 function themeButton() {
-  return `<button class="btn ghost icon" id="theme" title="Light / dark">${icon(document.documentElement.dataset.theme === 'light' ? 'moon' : 'sun')}</button>`;
+  return `<button class="btn ghost icon" id="settings" title="Settings">${icon('settings')}</button>
+    <button class="btn ghost icon" id="theme" title="Light / dark">${icon(document.documentElement.dataset.theme === 'light' ? 'moon' : 'sun')}</button>`;
 }
 document.addEventListener('click', event => {
   if (event.target.closest('#brand')) location.hash = '#/';
   if (event.target.closest('#guide')) openGuide();
   if (event.target.closest('#default-models')) openDefaultModels();
+  if (event.target.closest('#settings')) openSettings(() => { if (state.view === 'cast' && state.pid) route(); });
   if (event.target.closest('#theme')) {
     localStorage.setItem('sr.theme', document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
     applyTheme();
@@ -399,7 +449,7 @@ async function route() {
     try {
       const status = await api.director(pid);
       state.live.running = status.running;
-      if (status.running && status.live) Object.assign(state.live, { text: status.live.text, tools: status.live.tools });  // the work under way, not only what comes next
+      if (status.running && status.live) Object.assign(state.live, status.live);  // the work under way, not only what comes next
       state.directorInfo = status.info || { available: status.available, reason: status.reason };
     } catch { /* the page works without it */ }
   }
@@ -456,8 +506,7 @@ function updateActivity() {
   if (!active) {
     stopEvents?.(); stopEvents = null;
     catalogStop?.(); catalogStop = null;
-    mounted?.suspend?.();
-    document.querySelectorAll('video, audio').forEach(media => media.pause());
+    actions.pausePlayback();
   } else if (state.pid && state.doc) { eventsFor(state.pid); catchUp(); }
   else if (homeRefresh && !state.pid) { homeRefresh(); watchCatalog(); }
 }
@@ -489,6 +538,9 @@ function showPlace() {
 window.addEventListener('resize', showPlace);  // the frame resizes when WanGP enters or leaves full screen, which rewrites its address
 
 window.addEventListener('hashchange', route);
+
+// A picture of the page held and moved is no file brought in, though browsers hand it to a drop as one: it would land in the bin or on a card.
+window.addEventListener('dragstart', event => { if (event.target.tagName === 'IMG' && !event.target.closest('[draggable="true"]')) event.preventDefault(); });
 
 // Files dropped anywhere on a production go to its bin, unless a drop target took them.
 let dragDepth = 0;

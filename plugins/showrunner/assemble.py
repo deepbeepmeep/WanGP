@@ -35,8 +35,8 @@ def plan(doc: dict[str, Any], resolve) -> dict[str, Any]:
         length = take.get("duration_s") or shot.get("duration_s") or 5.0
         start = float(start or 0.0)
         end = float(end) if end is not None else model.out_point(shot, length)
-        clips.append({"shot": shot["id"], "take": take["id"], "path": path, "kind": take.get("kind", "video"), "start": start, "end": max(start + 0.04, end),
-                      "transition": shot.get("transition") or {"type": "cut"}, "has_audio": take.get("has_audio"), "codec": take.get("codec"),
+        clips.append({"shot": shot["id"], "take": take["id"], "path": path, "kind": take.get("kind", "video"), "start": start, "end": max(start + 0.04, end), "speed": model.speed_of(shot, take),
+                      "transition": shot.get("transition") or {"type": "cut"}, "has_audio": take.get("has_audio"), "sound": shot.get("sound", True), "codec": take.get("codec"),
                       "width": take.get("width"), "height": take.get("height"), "fps": take.get("fps"), "sung": bool(shot.get("audio_slice")), "dialogue": shot.get("dialogue") or [],
                       "line": (shot.get("generation") or {}).get("settings", {}).get("audio_guide"), "length": float(length),
                       "trimmed": start > 0.0 or end < float(length) - 0.01})
@@ -45,9 +45,9 @@ def plan(doc: dict[str, Any], resolve) -> dict[str, Any]:
         for before, clip in zip(clips, clips[1:]):
             if clip["transition"].get("type", "cut") in XFADE:  # the outgoing shot runs into it: spare frames, then its last frame held (tpad, 1 s)
                 overlap = min(float(clip["transition"].get("duration_s") or 0.5), 1.0)
-                before["end"] += overlap
+                before["end"] += overlap * before["speed"]
                 clip["transition"] = {**clip["transition"], "duration_s": overlap}
-    copyable = bool(clips) and all(clip["kind"] == "video" and not clip["trimmed"] and clip["transition"].get("type", "cut") == "cut" for clip in clips) \
+    copyable = bool(clips) and all(clip["kind"] == "video" and not clip["trimmed"] and clip["speed"] == 1.0 and clip["sound"] and clip["transition"].get("type", "cut") == "cut" for clip in clips) \
         and len({(clip["codec"], clip["width"], clip["height"], clip["fps"]) for clip in clips}) == 1 and edit.get("audio_mode") == "clips" and not edit.get("audio_tracks") and not edit.get("overlays") \
         and not edit.get("subtitles") and not any(clip["dialogue"] for clip in clips)  # subtitles need the encode
     return {"clips": clips, "copy": copyable}
@@ -74,7 +74,7 @@ def render(doc: dict[str, Any], resolve, out: str | Path, *, video_args: list[st
             media._run([media.ffmpeg(), "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(listing), "-c:v", "copy", *sound, "-movflags", "+faststart", str(out)])
         method = "stream copy"
     else:
-        length = sum(clip["end"] - clip["start"] for clip in clips)
+        length = sum((clip["end"] - clip["start"]) / clip["speed"] for clip in clips)
         measure = _encode_command(doc, clips, resolve, out, video_args or DEFAULT_VIDEO_ARGS, audio_args or DEFAULT_AUDIO_ARGS, measure=True)
         gain = _gain(-14.0 if doc["edit"].get("audio_mode") == "song" and not doc["edit"].get("audio_tracks") else -16.0, _loudness(measure, timeout=max(120.0, 5.0 * length))) if measure else 0.0
         command = _encode_command(doc, clips, resolve, out, video_args or DEFAULT_VIDEO_ARGS, audio_args or DEFAULT_AUDIO_ARGS, gain_db=gain)
@@ -96,7 +96,15 @@ def _run_graph(command: list[str], **kwargs):
         graph = command.index("-filter_complex")
         script = Path(folder) / "graph.txt"
         script.write_text(command[graph + 1], encoding="utf-8")
-        return media._run([*command[:graph], "-filter_complex_script", str(script), *command[graph + 2:]], **kwargs)
+        args = [*command[:graph], "-/filter_complex", str(script), *command[graph + 2:]]
+        try:
+            return media._run(args, **kwargs)
+        except RuntimeError as error:
+            # Before FFmpeg 7, only the dedicated graph-file option was available.
+            if "Unrecognized option '/filter_complex'" not in str(error):
+                raise
+        args[graph] = "-filter_complex_script"
+        return media._run(args, **kwargs)
 
 
 def _true_peak(path: Path) -> float | None:
@@ -150,15 +158,51 @@ def _level(gain: float) -> str:
     return f"aresample=192000,volume={gain:.2f}dB,alimiter=limit={10 ** (CEILING_DB / 20):.4f}:attack=2:release=40:level=disabled,aresample=48000"
 
 
+def _in_frames(clips, fps) -> list[dict[str, Any]]:
+    """Every clip lasts whole frames (span: its seconds in the cut), and its picture is cut to exactly that many: the sound, subtitles and text placed
+    at the clips' starts then stay on the picture (fractions of a frame left at each cut added up to 0.1 s of lip-sync drift over a 13-shot film)."""
+    return [{**clip, "frames": (frames := max(1, round((clip["end"] - clip["start"]) / clip["speed"] * fps))), "span": frames / fps, "end": clip["start"] + frames / fps * clip["speed"]} for clip in clips]
+
+
+def _places(clips) -> tuple[list[float], list[float], float]:
+    """Where each clip starts in the cut and how much it overlaps the one before (cuts follow each other, transitions overlap the two clips), and the cut's length."""
+    offsets, overlaps, total = [0.0], [0.0], clips[0]["span"]
+    for clip in clips[1:]:
+        overlap = min(float(clip["transition"].get("duration_s") or 0.5), clip["span"] / 2, total / 2) if clip["transition"].get("type", "cut") in XFADE else 0.0
+        overlap = overlap if overlap > 0.04 else 0.0
+        offsets.append(total - overlap)
+        overlaps.append(overlap)
+        total += clip["span"] - overlap
+    return offsets, overlaps, total
+
+
+def placed_clip(doc: dict[str, Any], resolve, shot_id: str) -> dict[str, Any] | None:
+    """A shot's clip as the export cuts it, with where it starts in the cut (offset); None for a shot outside the edit."""
+    clips = plan(doc, resolve)["clips"]
+    if not clips:
+        return None
+    clips = _in_frames(clips, _canvas(doc, clips)[2])
+    return next(({**clip, "offset": offset} for clip, offset in zip(clips, _places(clips)[0]) if clip["shot"] == shot_id), None)
+
+
+def _atempo(speed: float) -> str:
+    """A speed as audio filters that keep the pitch: atempo goes no lower than half speed at a time."""
+    halves = []
+    while speed < 0.5:
+        halves.append("atempo=0.5")
+        speed /= 0.5
+    return ",".join([*halves, f"atempo={speed:g}"])
+
+
 def _encode_command(doc, clips, resolve, out, video_args, audio_args, gain_db: float = 0.0, measure: bool = False) -> list[str] | None:
     """The single encode of the edit; measure=True: the command that measures its mixed sound alone (None without sound)."""
-    width, height, fps = _canvas(doc, [{"width": clip["width"], "height": clip["height"], "fps": clip["fps"]} for clip in clips])
-    # Every clip lasts whole frames, and its picture is cut to exactly that many: the sound, subtitles and text placed at the clips'
-    # starts then stay on the picture (fractions of a frame left at each cut added up to 0.1 s of lip-sync drift over a 13-shot film).
-    clips = [{**clip, "frames": (frames := max(1, round((clip["end"] - clip["start"]) * fps))), "end": clip["start"] + frames / fps} for clip in clips]
+    width, height, fps = _canvas(doc, clips)
+    clips = _in_frames(clips, fps)
+    offsets, overlaps, total = _places(clips)
     inputs, filters = [], []
     for index, clip in enumerate(clips):
-        duration, frames = clip["end"] - clip["start"], clip["frames"]
+        duration, frames = clip["span"], clip["frames"]
+        timing = "PTS-STARTPTS" if clip["speed"] == 1.0 else f"(PTS-STARTPTS)/{clip['speed']:g}"  # slowed down, the fps filter below repeats frames
         if clip["kind"] == "image":  # a still gets a slow push-in (6 % over the shot), cropped to the canvas
             inputs += ["-loop", "1", "-framerate", f"{fps:g}", "-t", f"{duration + 1 / fps:.4f}", "-i", str(clip["path"])]
             source = (f"[{index}:v]scale={2 * width}:{2 * height}:force_original_aspect_ratio=increase,crop={2 * width}:{2 * height},"
@@ -166,26 +210,17 @@ def _encode_command(doc, clips, resolve, out, video_args, audio_args, gain_db: f
         else:
             inputs += ["-i", str(clip["path"])]
             source = f"[{index}:v]trim=start={clip['start']:.4f},"
-        filters.append(f"{source}setpts=PTS-STARTPTS,scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        filters.append(f"{source}setpts={timing},scale={width}:{height}:force_original_aspect_ratio=decrease,"
                        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={fps:g},tpad=stop_mode=clone:stop_duration=1,"
                        f"trim=end_frame={frames},setpts=PTS-STARTPTS,settb=AVTB,format=yuv420p[v{index}]")
     # Video chain: cuts concatenate, transitions overlap the two clips by their duration.
-    label, total = "v0", clips[0]["end"] - clips[0]["start"]
-    offsets = [0.0]
+    label = "v0"
     for index in range(1, len(clips)):
-        clip = clips[index]
-        duration = clip["end"] - clip["start"]
-        transition = clip["transition"].get("type", "cut")
-        overlap = min(float(clip["transition"].get("duration_s") or 0.5), duration / 2, total / 2) if transition in XFADE else 0.0
         target = f"x{index}"
-        if transition in XFADE and overlap > 0.04:
-            filters.append(f"[{label}][v{index}]xfade=transition={XFADE[transition]}:duration={overlap:.3f}:offset={total - overlap:.3f}[{target}]")
-            offsets.append(total - overlap)
-            total += duration - overlap
+        if overlaps[index]:
+            filters.append(f"[{label}][v{index}]xfade=transition={XFADE[clips[index]['transition']['type']]}:duration={overlaps[index]:.3f}:offset={offsets[index]:.3f}[{target}]")
         else:
             filters.append(f"[{label}][v{index}]concat=n=2:v=1:a=0[{target}]")
-            offsets.append(total)
-            total += duration
         label = target
     first_audio = len(filters)
     audio_label = _audio_chain(doc, clips, resolve, inputs, filters, offsets, total, None if measure else gain_db)
@@ -223,9 +258,9 @@ def dialogue_srt(clips, offsets, resolve) -> str:
         lines = [item for item in clip["dialogue"] if item.get("line", "").strip()]
         if not lines:
             continue
-        shown = clip["end"] - clip["start"]
+        shown = clip["span"]
         recorded = media.probe(resolve(clip["line"]))["duration_s"] if clip.get("line") and resolve(clip["line"]).is_file() else None
-        span = min(shown, recorded + 0.3) if recorded and len(lines) == 1 else shown
+        span = min(shown, recorded / clip["speed"] + 0.3) if recorded and len(lines) == 1 else shown
         total = sum(len(item["line"]) for item in lines)
         start = offset
         for item in lines:
@@ -252,16 +287,32 @@ def _overlays(doc, resolve, inputs, filters, label, width, height, fps, total) -
     return label
 
 
+def _track_cut(track) -> str:
+    """The part of its file a sound track plays (in_s to out_s, seconds of the file)."""
+    start, stop = float(track.get("in_s") or 0.0), track.get("out_s")
+    return f"atrim=start={start:.3f}" + (f":end={float(stop):.3f}" if stop is not None else "") + "," if start or stop is not None else ""
+
+
+def _track_fades(track, path) -> str:
+    fade_in, fade_out = float(track.get("fade_in_s") or 0.0), float(track.get("fade_out_s") or 0.0)
+    fades = f",afade=t=in:st=0:d={fade_in:.3f}" if fade_in else ""
+    if fade_out:
+        length = media.probe(path)["duration_s"] or 0.0
+        length = (min(float(track["out_s"]), length) if track.get("out_s") is not None else length) - float(track.get("in_s") or 0.0)
+        fades += f",afade=t=out:st={max(0.0, length - fade_out):.3f}:d={fade_out:.3f}"
+    return fades
+
+
 def _audio_chain(doc, clips, resolve, inputs, filters, offsets, total, gain_db) -> str | None:
     edit, parts = doc["edit"], []
     mode = edit.get("audio_mode", "clips")
     index = len(clips)
     if mode in ("clips", "mix"):
         for position, clip in enumerate(clips):
-            duration = clip["end"] - clip["start"]
             delay = int(offsets[position] * 1000)
-            if clip["kind"] == "video" and clip["has_audio"] and not (mode == "mix" and clip["sung"] and doc["brief"].get("song")):  # the song already sings it
-                filters.append(f"[{position}:a]atrim=start={clip['start']:.3f}:end={clip['end']:.3f},asetpts=PTS-STARTPTS,aresample=48000,adelay={delay}|{delay}[a{position}]")
+            if clip["kind"] == "video" and clip["has_audio"] and clip["sound"] and not (mode == "mix" and clip["sung"] and doc["brief"].get("song")):  # the song already sings it
+                tempo = "" if clip["speed"] == 1.0 else _atempo(clip["speed"]) + ","
+                filters.append(f"[{position}:a]atrim=start={clip['start']:.3f}:end={clip['end']:.3f},asetpts=PTS-STARTPTS,{tempo}aresample=48000,adelay={delay}|{delay}[a{position}]")
                 parts.append((f"a{position}", 1.0))
     song = doc["brief"].get("song")
     if mode in ("song", "mix") and song and resolve(song).is_file():
@@ -276,7 +327,7 @@ def _audio_chain(doc, clips, resolve, inputs, filters, offsets, total, gain_db) 
             continue
         inputs += ["-i", str(resolve(track["path"]))]
         delay = int(float(track.get("start_s") or 0.0) * 1000)
-        filters.append(f"[{index}:a]asetpts=PTS-STARTPTS,aresample=48000,adelay={delay}|{delay}[t{number}]")
+        filters.append(f"[{index}:a]{_track_cut(track)}asetpts=PTS-STARTPTS,aresample=48000{_track_fades(track, resolve(track['path']))},adelay={delay}|{delay}[t{number}]")
         parts.append((f"t{number}", 10 ** (float(track.get("gain_db") or 0.0) / 20)))
         index += 1
     if not parts:

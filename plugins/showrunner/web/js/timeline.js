@@ -3,7 +3,7 @@
 // set transitions, and see sections, bars and the waveform the cuts should follow.
 import { state, actions } from './app.js';
 import { api } from './api.js';
-import { icon, esc, art, h, formatTime, formatDuration, sectionColor, drawWave, toast, menu, confirmDialog, pickFiles, AUDIO_ACCEPT } from './ui.js';
+import { icon, esc, art, h, formatTime, formatDuration, sectionColor, drawWave, toast, menu, confirmDialog, pickFiles, availability, AUDIO_ACCEPT } from './ui.js';
 import { Sequencer, segments } from './sequencer.js';
 import { shotMenu } from './storyboard.js';
 
@@ -12,7 +12,8 @@ const TRANSITION_LABEL = { cut: 'Cut', crossfade: 'Dissolve', fade_black: 'Fade 
 const LANES = { ruler: [0, 30], sections: [30, 24], video: [56, 84], text: [140, 32], audio: [172, 64] };
 const TEXT_STYLES = [['title', 'Title'], ['lower_third', 'Lower third'], ['caption', 'Caption'], ['chapter', 'Chapter card'], ['end_card', 'End card']];
 const trackLengths = new Map(), trackProbes = new Map();  // a sound track's length, read from the file (its probe kept until then)
-const trackName = path => path.split('/').pop().replace(/^\d{4}-\d\d-\d\d-\d\dh\d\dm\d\ds_seed\d+_/, '').replace(/\.\w+$/, '');
+const trackName = track => track.name || track.path.split('/').pop().replace(/^\d{4}-\d\d-\d\d-\d\dh\d\dm\d\ds_seed\d+_/, '').replace(/\.\w+$/, '');
+const trackLength = track => Math.max(0.05, (track.out_s ?? trackLengths.get(track.path) ?? 3) - (+track.in_s || 0));  // what it plays of its file
 const TEXT_DESIGNS = [['classic', 'Classic'], ['bold', 'Bold'], ['elegant', 'Elegant'], ['minimal', 'Minimal'], ['typewriter', 'Typewriter'], ['storybook', 'Storybook']];
 
 export function mountTimeline(container, doc) {
@@ -61,6 +62,7 @@ export function mountTimeline(container, doc) {
     const doc = state.doc;
     segs = segments(doc, actions.take);
     setupSequencer();
+    sequencer.setTracks(doc.edit.audio_tracks);
     sequencer.setSegments(segs);
     if (!fitted) fit();
     const song = analysis();
@@ -79,8 +81,9 @@ export function mountTimeline(container, doc) {
 
   function renderTransport() {
     const doc = state.doc;
-    $('#transport').innerHTML = `<button class="play-btn" id="play" title="Play / pause (Space)">${icon(sequencer?.playing ? 'pause' : 'play')}</button>
-      <button class="btn ghost small icon" id="back" title="To the start (Home)">${icon('undo')}</button>
+    const empty = segs.length ? '' : 'No shot in the edit yet: plan or add shots on the storyboard.';
+    $('#transport').innerHTML = `<button class="play-btn" id="play" ${availability(empty, 'Play / pause (Space)')}>${icon(sequencer?.playing ? 'pause' : 'play')}</button>
+      <button class="btn ghost small icon" id="back" ${availability(empty, 'To the start (Home)')}>${icon('undo')}</button>
       <span class="time" id="time"></span>
       <span class="sep"></span>
       <div class="seg" id="mode" title="Soundtrack of the preview and of the assembled edit">${[['song', 'Song'], ['clips', 'Shot sound'], ['mix', 'Mix']].map(([key, label]) => `<button class="${doc.edit.audio_mode === key ? 'on' : ''}" data-mode="${key}">${label}</button>`).join('')}</div>
@@ -92,7 +95,7 @@ export function mountTimeline(container, doc) {
       <span class="sep"></span>
       <button class="btn small" id="add-text" title="Lay a title, a lower third, a caption or a card over the edit at the playhead">${icon('plus')} Text</button>
       <button class="btn small" id="add-track" title="Narration, score or effects over the edit: it starts at 0 s, drag it on the Sound lane into place and click it for its level">${icon('plus')} Audio</button>
-      <button class="btn primary small" id="assemble">${icon('film')} Assemble</button>`;
+      <button class="btn primary small" id="assemble" ${availability(actions.assembleBlocked(doc))}>${icon('film')} Assemble</button>`;
     $('#play').onclick = togglePlay;
     $('#back').onclick = () => sequencer.seek(0);
     $('#snap').onclick = () => { snap = !snap; localStorage.setItem('sr.snap', snap ? '1' : '0'); renderTransport(); };
@@ -163,7 +166,7 @@ export function mountTimeline(container, doc) {
       const pin = index ? `<div class="transition-pin ${seg.transition ? 'fx' : ''}" data-pin="${seg.shot.id}" style="left:${left + (seg.transition ? seg.transition.duration * pxPerSecond / 2 : 0)}px" title="${TRANSITION_LABEL[seg.shot.transition?.type || 'cut']} into shot ${index + 1}: click to change">${icon(seg.transition ? 'transition' : 'scissors')}</div>` : '';
       return `${pin}<div class="clip ${take ? '' : 'planned'} ${selected ? 'selected' : ''}" data-clip="${seg.shot.id}" style="left:${left}px;width:${width}px;${strip}">
         ${take ? '' : `<div class="clip-art" style="${art(seg.shot.id + seg.shot.section, seg.shot.intent)}"></div>`}
-        <span class="clip-label" title="${index + 1} · ${esc(seg.shot.title || '')}">${width < 46 ? index + 1 : `${index + 1} · ${esc(seg.shot.title || 'Untitled')}`}</span>
+        <span class="clip-label" title="${index + 1} · ${esc(seg.shot.title || '')}${seg.speed !== 1 ? ` · plays at ${seg.speed}×` : ''}">${width < 46 ? index + 1 : `${index + 1} · ${esc(seg.shot.title || 'Untitled')}${seg.speed !== 1 ? ` · ${seg.speed}×` : ''}`}</span>
         <span class="handle l" data-edge="l"></span><span class="handle r" data-edge="r"></span></div>`;
     }).join('') || `<div class="muted" style="position:absolute;left:110px;top:30px">No shot in the edit yet: plan or add shots on the storyboard.</div>`;
   }
@@ -265,7 +268,8 @@ export function mountTimeline(container, doc) {
     renderTracks();
   }
 
-  // The sound tracks laid over the edit (narration, score): a block each, at its start and as long as its file, dragged to move it.
+  // The sound tracks laid over the edit (narration, score, a shot's detached sound): a block each, as long as what it plays of its file,
+  // dragged to move it and by its edges to play less or more of the file.
   function renderTracks() {
     $('#sound-tracks').innerHTML = state.doc.edit.audio_tracks.map((track, index) => {
       if (!trackLengths.has(track.path)) {
@@ -276,8 +280,8 @@ export function mountTimeline(container, doc) {
         trackProbes.set(track.path, probe);
         probe.src = actions.file(track.path);
       }
-      return `<div class="track-clip ${selectedTrack === index ? 'selected' : ''}" data-track="${index}" style="left:${x(+track.start_s || 0)}px;width:${Math.max(18, trackLengths.get(track.path) * pxPerSecond - 2)}px;top:${4 + (index % 2) * 28}px"
-        title="${esc(trackName(track.path))} · from ${formatTime(+track.start_s || 0)} · ${(+track.gain_db || 0).toFixed(0)} dB · click for its level, drag to move">${icon('audio')}${esc(trackName(track.path))}</div>`;
+      return `<div class="track-clip ${selectedTrack === index ? 'selected' : ''}" data-track="${index}" style="left:${x(+track.start_s || 0)}px;width:${Math.max(18, trackLength(track) * pxPerSecond - 2)}px;top:${4 + (index % 2) * 28}px"
+        title="${esc(trackName(track))} · from ${formatTime(+track.start_s || 0)} · ${(+track.gain_db || 0).toFixed(0)} dB · click for its level and fades, drag to move, drag its edges to shorten or extend it">${icon('audio')}${esc(trackName(track))}<span class="handle l" data-edge="l"></span><span class="handle r" data-edge="r"></span></div>`;
     }).join('');
   }
 
@@ -286,7 +290,7 @@ export function mountTimeline(container, doc) {
     const index = segs.indexOf(seg);
     $('#now').innerHTML = seg ? `<div class="label">${icon('target')} Now playing</div><div class="big">${index + 1}<span class="muted" style="font-size:14px;font-weight:500"> / ${segs.length}</span></div>
       <b>${esc(seg.shot.title || seg.shot.id)}</b><div class="muted" style="font-size:12.5px;margin-top:4px">${esc(seg.shot.intent || '')}</div>
-      <div class="row" style="margin-top:8px;flex-wrap:wrap"><span class="tag ${seg.shot.status}">${esc(seg.shot.status)}</span><span class="chip">${formatDuration(seg.duration)}</span>${take ? '' : '<span class="chip">Animatic</span>'}</div>` : '';
+      <div class="row" style="margin-top:8px;flex-wrap:wrap"><span class="tag ${seg.shot.status}">${esc(seg.shot.status)}</span><span class="chip">${formatDuration(seg.duration)}</span>${seg.speed !== 1 ? `<span class="chip">${seg.speed}×</span>` : ''}${take ? '' : '<span class="chip">Animatic</span>'}</div>` : '';
     $('#mon-info').innerHTML = seg ? `<span class="tag">${index + 1}/${segs.length}</span>${take ? '' : '<span class="tag planned">Not shot yet</span>'}` : '';
   }
 
@@ -297,15 +301,21 @@ export function mountTimeline(container, doc) {
     const track = selectedTrack != null ? doc.edit.audio_tracks[selectedTrack] : null;
     if (track) {
       card.innerHTML = `<div class="row"><div class="label grow" style="margin:0">${icon('audio')} Sound track</div><button class="btn small ghost icon" data-close title="Close (Escape)">${icon('x')}</button></div>
-        <b class="track-title" title="${esc(track.path)}">${esc(trackName(track.path))}</b>
+        <b class="track-title" title="${esc(track.path)}">${esc(trackName(track))}</b>
         <audio controls preload="metadata" src="${actions.file(track.path)}"></audio>
         <div class="col" style="gap:6px;font-size:12.5px">
           <label class="row"><span class="muted grow">Starts at</span><input class="input" data-start type="number" min="0" step="0.1" value="${+track.start_s || 0}" style="width:76px"><span class="muted">s</span></label>
+          <div class="row" title="The part of the file it plays, in seconds"><span class="muted grow">Plays</span><input class="input" data-in type="number" min="0" step="0.1" value="${+track.in_s || 0}" style="width:64px" aria-label="From"><span class="muted">to</span><input class="input" data-out type="number" min="0" step="0.1" value="${track.out_s ?? ''}" placeholder="${(trackLengths.get(track.path) ?? 0).toFixed(1)}" style="width:64px" aria-label="To"></div>
+          <div class="row" title="Seconds of fade at its start and at its end"><span class="muted grow">Fades</span><input class="input" data-fade-in type="number" min="0" step="0.1" value="${+track.fade_in_s || 0}" style="width:64px" aria-label="Fade in"><span class="muted">in</span><input class="input" data-fade-out type="number" min="0" step="0.1" value="${+track.fade_out_s || 0}" style="width:64px" aria-label="Fade out"><span class="muted">out</span></div>
           <label class="row"><span class="muted grow">Level</span><input type="range" class="range" data-gain min="-30" max="6" step="1" value="${+track.gain_db || 0}" style="width:104px"><span class="mono" data-gain-v style="width:42px;text-align:right">${(+track.gain_db || 0).toFixed(0)} dB</span></label></div>
         <button class="btn small danger" data-remove style="margin-top:8px">${icon('trash')} Remove from the edit</button>`;
       const setTrack = fields => actions.ops([{ op: 'edit', fields: { audio_tracks: state.doc.edit.audio_tracks.map((item, index) => index === selectedTrack ? { ...item, ...fields } : item) } }]);
       card.querySelector('[data-close]').onclick = () => selectTrack(null);
       card.querySelector('[data-start]').onchange = event => setTrack({ start_s: Math.max(0, +event.target.value || 0) });
+      card.querySelector('[data-in]').onchange = event => setTrack({ in_s: Math.max(0, Math.min(+event.target.value || 0, (track.out_s ?? Infinity) - 0.05)) });
+      card.querySelector('[data-out]').onchange = event => setTrack({ out_s: event.target.value === '' ? null : Math.max((+track.in_s || 0) + 0.05, +event.target.value) });
+      card.querySelector('[data-fade-in]').onchange = event => setTrack({ fade_in_s: Math.max(0, +event.target.value || 0) });
+      card.querySelector('[data-fade-out]').onchange = event => setTrack({ fade_out_s: Math.max(0, +event.target.value || 0) });
       card.querySelector('[data-gain]').oninput = event => { card.querySelector('[data-gain-v]').textContent = `${(+event.target.value).toFixed(0)} dB`; };
       card.querySelector('[data-gain]').onchange = event => setTrack({ gain_db: +event.target.value });
       card.querySelector('[data-remove]').onclick = () => removeTrack(selectedTrack);
@@ -387,8 +397,8 @@ export function mountTimeline(container, doc) {
     if (pin) return;
     const trackClip = event.target.closest('.track-clip');
     if (trackClip) {
-      const index = +trackClip.dataset.track;
-      drag = { kind: 'track', index, element: trackClip, startX: event.clientX, start: +state.doc.edit.audio_tracks[index].start_s || 0, moved: false };
+      const index = +trackClip.dataset.track, track = state.doc.edit.audio_tracks[index];
+      drag = { kind: 'track', index, edge: handle?.dataset.edge || null, element: trackClip, startX: event.clientX, start: +track.start_s || 0, skip: +track.in_s || 0, length: trackLength(track), file: trackLengths.get(track.path) ?? Infinity, moved: false };
       inner.setPointerCapture(event.pointerId);
       event.preventDefault();
       return;
@@ -428,8 +438,20 @@ export function mountTimeline(container, doc) {
     if (drag.kind === 'track') {
       if (Math.abs(event.clientX - drag.startX) > 3) drag.moved = true;
       if (!drag.moved) return;
-      drag.to = +snapTo(Math.max(0, drag.start + delta)).value.toFixed(2);
-      drag.element.style.left = `${x(drag.to)}px`;
+      const { start, skip, length, file, edge } = drag;
+      if (edge === 'l') {  // the track's start moves with the file under it: what it plays there stays in place
+        const shift = Math.max(-skip, -start, Math.min(snapTo(start + delta).value - start, length - 0.1));
+        drag.to = { start_s: +(start + shift).toFixed(2), in_s: +(skip + shift).toFixed(3) };
+        drag.element.style.left = `${x(start + shift)}px`;
+        drag.element.style.width = `${Math.max(18, (length - shift) * pxPerSecond - 2)}px`;
+      } else if (edge === 'r') {  // no further than its file
+        const played = Math.max(0.1, Math.min(snapTo(start + length + delta).value - start, file - skip));
+        drag.to = { out_s: +(skip + played).toFixed(3) };
+        drag.element.style.width = `${Math.max(18, played * pxPerSecond - 2)}px`;
+      } else {
+        drag.to = { start_s: +snapTo(Math.max(0, start + delta)).value.toFixed(2) };
+        drag.element.style.left = `${x(drag.to.start_s)}px`;
+      }
       return;
     }
     if (drag.kind === 'text') {
@@ -461,7 +483,7 @@ export function mountTimeline(container, doc) {
       end = snapped.value;
       showGuide(snapped.guide);
       let duration = Math.max(0.3, end - original.start);
-      if (take && length) duration = Math.min(duration, length - original.srcIn);
+      if (take && length) duration = Math.min(duration, (length - original.srcIn) / seg.speed);
       drag.duration = duration;
       drag.clip.style.width = `${Math.max(14, duration * pxPerSecond - 2)}px`;
       drag.label = `${duration.toFixed(2)} s`;
@@ -471,7 +493,7 @@ export function mountTimeline(container, doc) {
       start = snapped.value;
       showGuide(snapped.guide);
       let shift = start - original.start;
-      if (take) shift = Math.max(-original.srcIn, Math.min(shift, original.duration - 0.3));
+      if (take) shift = Math.max(-original.srcIn / seg.speed, Math.min(shift, original.duration - 0.3));
       else shift = Math.min(shift, original.duration - 0.3);
       drag.shift = shift;
       drag.clip.style.left = `${x(original.start + shift)}px`;
@@ -487,7 +509,7 @@ export function mountTimeline(container, doc) {
     if (!current) return;
     if (current.kind === 'track') {
       if (!current.moved) { selectTrack(current.index); sequencer.seek(current.start + 0.01); return; }  // a click opens the track beside the monitor
-      const tracks = state.doc.edit.audio_tracks.map((track, index) => index === current.index ? { ...track, start_s: current.to } : track);
+      const tracks = state.doc.edit.audio_tracks.map((track, index) => index === current.index ? { ...track, ...current.to } : track);
       await actions.ops([{ op: 'edit', fields: { audio_tracks: tracks } }]);
       return;
     }
@@ -523,9 +545,9 @@ export function mountTimeline(container, doc) {
       const { seg } = current;
       const take = seg.take;
       if (current.edge === 'r' && current.duration != null) {
-        await actions.ops([take ? { op: 'update_shot', shot: seg.shot.id, fields: { trim: [seg.srcIn, +(seg.srcIn + current.duration).toFixed(3)] } } : { op: 'update_shot', shot: seg.shot.id, fields: { duration_s: +current.duration.toFixed(2) } }]);
+        await actions.ops([take ? { op: 'update_shot', shot: seg.shot.id, fields: { trim: [seg.srcIn, +(seg.srcIn + current.duration * seg.speed).toFixed(3)] } } : { op: 'update_shot', shot: seg.shot.id, fields: { duration_s: +(current.duration * seg.speed).toFixed(2) } }]);
       } else if (current.edge === 'l' && current.shift != null) {
-        await actions.ops([take ? { op: 'update_shot', shot: seg.shot.id, fields: { trim: [+(seg.srcIn + current.shift).toFixed(3), seg.shot.trim?.[1] ?? null] } } : { op: 'update_shot', shot: seg.shot.id, fields: { duration_s: +(seg.duration - current.shift).toFixed(2) } }]);
+        await actions.ops([take ? { op: 'update_shot', shot: seg.shot.id, fields: { trim: [+(seg.srcIn + current.shift * seg.speed).toFixed(3), seg.shot.trim?.[1] ?? null] } } : { op: 'update_shot', shot: seg.shot.id, fields: { duration_s: +((seg.duration - current.shift) * seg.speed).toFixed(2) } }]);
       } else render();
     }
   });

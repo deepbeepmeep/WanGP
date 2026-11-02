@@ -74,7 +74,7 @@ You are the showrunner of a production for the user: you plan, cast, shoot, edit
 - Render shots with `render`: it adds the cast's pictures and the driving audio (song slice or spoken line) that the shot's template needs, which a direct wangp_generate call does not. `assemble` reports the delivered file's streams, loudness and true peak: do not parse the export yourself.
 - Locked shots and cast members are the user's, and the user's edits and verdicts override yours. Read the document again after each long step.
 - Shots showing a cast member take that member's pictures as reference images, never as the start image. Follow template_advice and fix the warnings returned.
-- A shot's generation names its template and gives only what the shot changes (prompt, media, length): the template brings the model, LoRAs and steps, and `plan` validates the shots.
+- A shot's generation names its template and gives only what the shot changes (prompt, media): the template brings the model, LoRAs and steps, the brief the resolution and its duration_s the length. `plan` and `add_shots` validate the shots and return what they will render at (`renders`): quote those numbers when you tell the user a size or a length.
 - Words meant to be read (titles, taglines, names, captions) are edit overlays or drawn cards, never part of a video prompt: video models misspell them.
 - Spoken and sung words get subtitles unless the brief says otherwise: write them in their shots' dialogue.
 - Each speaker keeps one voice for the whole production: give every speaker (the narrator too, as a cast member with role narrator) a voice_description and make their lines with `speak`. A voice described again for each line comes out different every time.
@@ -159,7 +159,7 @@ class Director:
         live = self._live.get(production_id)
         return {"state": doc["director"].get("state", "idle"), "task": doc["director"].get("task"), "running": job is not None and not job.done(),
                 "available": info["available"], "reason": info["reason"], "info": info, "last": doc["director"].get("last"),
-                **({"live": {"text": live["text"], "tools": list(live["tools"].values())[-20:]}} if live else {})}
+                **({"live": {**live, "tools": list(live["tools"].values())[-20:]}} if live else {})}
 
     def start(self, production_id: str, task: str, message: str = "", shots: list[str] | None = None) -> dict[str, Any]:
         if task not in TASKS:
@@ -191,7 +191,7 @@ class Director:
             self._jobs[production_id] = job
             self._pausing.pop(production_id, None)
             self._tools[production_id] = set()
-            self._live[production_id] = {"text": "", "tools": {}}
+            self._live[production_id] = {"text": "", "tools": {}, "status": None, "thought": None, "stats": None}
         # a resumed task keeps the paused one's task, note and shots: pausing again resumes the same work
         paused = (doc["director"].get("paused") or {}) if task == "resume" else {}
         work = {"task": paused.get("task") or "continue", "message": paused.get("message", ""), "shots": paused.get("shots") or []} if task == "resume" else \
@@ -259,10 +259,20 @@ class Director:
         return {"state": "paused", "paused": {"task": director.get("task"), "message": director.get("message", ""), "shots": director.get("shots") or [], "time": time.time()},
                 "last": {"status": "paused", "task": director.get("task"), "time": time.time()}}
 
+    def _tell_user(self, production, error: str | None) -> None:
+        """Settings > Tell me when a task ends: the sound and the user's notification destinations, for when the page is out of sight. A task's end stays
+        a success when its notification fails."""
+        try:
+            if self.host.settings()["notify_turns"]:
+                doc = production.snapshot()
+                self.host.notify(f"Showrunner: {doc['title']}", f"It stopped with an error: {str(error)[:300]}" if error else model.next_step(doc))
+        except Exception as failure:
+            print(f"[Showrunner] The notification failed: {failure}", flush=True)
+
     def _follow(self, production_id: str, job) -> None:
         production = self.store.get(production_id)
         publish = lambda kind, data=None: self.store.publish({"type": "director", "production": production_id, "event": kind, "data": data})
-        live = self._live.setdefault(production_id, {"text": "", "tools": {}})
+        live = self._live[production_id]
         try:
             for event in job.events():
                 if event.kind == "queued":
@@ -274,7 +284,14 @@ class Director:
                     live["text"] = event.data["text"][-4000:]
                     publish("text", {"text": live["text"]})
                 elif event.kind == "status":
+                    live["status"] = event.data
                     publish("status", event.data)
+                elif event.kind == "thought":
+                    live["thought"] = {"text": event.data["text"][-4000:], "streaming": event.data["streaming"]}
+                    publish("thought", live["thought"])
+                elif event.kind == "stats":
+                    live["stats"] = event.data
+                    publish("stats", event.data)
                 elif event.kind == "tool":
                     running = self._tools.setdefault(production_id, set())
                     (running.add if event.data.get("status") == "running" else running.discard)(event.data.get("id"))
@@ -306,6 +323,8 @@ class Director:
                 ops.append({"op": "log", "text": "The showrunner was stopped."})
             production.apply(ops, by="system", record=False)
             publish(result.status, last)
+            if result.status in ("done", "error"):
+                self._tell_user(production, result.error if result.status == "error" else None)
         except Exception as error:  # the job thread reports to the page instead of dying silently
             production.apply([{"op": "director", "fields": {"state": "idle", "last": {"status": "error", "error": str(error), "time": time.time()}}}], by="system", record=False)
             publish("error", {"error": str(error)})

@@ -81,6 +81,9 @@ class SeedVR2Bridge(SimpleScaleSuffixMixin):
     def method_visible(self, method: str) -> bool:
         return self.METHOD_MODELS[method] == self.model()
 
+    def preferred_method(self, method: str) -> str:
+        return self.method()
+
     def model_for_upsampling(self, spatial_upsampling) -> str:
         split = self.split_value(spatial_upsampling)
         if split is None:

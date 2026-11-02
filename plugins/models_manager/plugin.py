@@ -895,12 +895,20 @@ class modelsManagerPlugin(WAN2GPPlugin):
             types = model_dropdowns.expand_model_selection(self.transformer_types, self.displayed_model_types, self.get_parent_model_type, self.get_model_family)
         elif isinstance(self.displayed_model_types, list):
             types = list(self.displayed_model_types)
-        seen = set()
         ordered = []
-        for model_type in types:
-            if model_type and model_type not in seen:
+        for model_type in dict.fromkeys(filter(None, types)):
+            model_def = self.get_model_def(model_type)
+            if model_def is None:
+                self._errors.append(f"Model type '{model_type}' was not found.")
+                continue
+            architecture = model_def.get("architecture")
+            source = model_def.get("path", model_type)
+            if not architecture:
+                self._errors.append(f"Model definition '{source}' does not specify an architecture.")
+            elif self.get_model_def(architecture) is None:
+                self._errors.append(f"Model type '{architecture}' was not found. Check the architecture in '{source}'.")
+            else:
                 ordered.append(model_type)
-                seen.add(model_type)
         return ordered
 
     def _collect_model_variants(self, model_type):
@@ -2407,10 +2415,8 @@ class modelsManagerPlugin(WAN2GPPlugin):
         tree_parts = [
             css,
             "<div id='ckpt_tree_root' data-status='ready' class='ckpt-wrap'>",
+            self._build_errors_html(),
         ]
-        if self._errors:
-            errors_html = "<br>".join(html.escape(err) for err in self._errors[:10])
-            tree_parts.append(f"<div class='ckpt-errors'>{errors_html}</div>")
 
         tree_parts.append("<div class='ckpt-panel'><div class='ckpt-panel-inner'>")
         tree_parts.append(self._build_stats_html())
@@ -2431,6 +2437,12 @@ class modelsManagerPlugin(WAN2GPPlugin):
         if end < 0:
             return ""
         return tree_html[start : end + len("</style>")]
+
+    def _build_errors_html(self):
+        if not self._errors:
+            return ""
+        errors_html = "<br>".join(html.escape(err) for err in self._errors[:10])
+        return f"<div class='ckpt-errors'>{errors_html}</div>"
 
     def _build_filtered_tree_html(self, filter_text):
         query = str(filter_text).strip()
@@ -2474,6 +2486,7 @@ class modelsManagerPlugin(WAN2GPPlugin):
         parts = [
             css,
             "<div id='ckpt_tree_root' data-status='ready' class='ckpt-wrap'>",
+            self._build_errors_html(),
             "<div class='ckpt-panel'><div class='ckpt-panel-inner'>",
             f"<div class='ckpt-loading-message'>{title}</div>",
             f"<div class='ckpt-stat-assumption'>{cfg_line}</div>",

@@ -491,14 +491,24 @@ def create_generation_audio_ui(gr, ui_get, ui_defaults, *, any_control_video: bo
     }
 
 
+def late_audio_edit_menu(selected=None):
+    choices = audio_edit_choices(selected_method=normalize_method(selected))
+    return choices, _choice_value(choices, selected, choices[0][1] if choices else None)
+
+
+def late_remux_menu(selected=None):
+    choices = soundtrack_choices(include_none=False, include_control=False, include_voice=True, voice_label_context=AUDIO_PROCESSOR_LABEL_CONTEXT_LATE_POSTPROCESSING, selected_method=normalize_method(selected))
+    default = CUSTOM_SOUNDTRACK_METHOD if CUSTOM_SOUNDTRACK_METHOD in {method for _, method in choices} else (choices[0][1] if choices else None)
+    return choices, _choice_value(choices, selected, default)
+
+
 def create_late_audio_edit_ui(gr, *, default_visibility_false: dict[str, Any], update_form: bool = False):
-    choices = audio_edit_choices()
-    value = choices[0][1] if choices else ""
+    choices, value = late_audio_edit_menu()
     metadata = method_metadata(value)
-    postprocess_audio = gr.Dropdown(choices=choices, value=value, visible=True, scale=1, label="Audio Action", show_label=False, elem_classes="postprocess")
-    with gr.Row(visible=metadata["needs_voice_sample"]) as replace_voice_sample_row:
+    postprocess_audio = gr.Dropdown(choices=choices, visible=True, scale=1, label="Audio Action", show_label=False, elem_classes="postprocess", **({} if update_form else {"value": value}))
+    with gr.Row(**({} if update_form else {"visible": metadata["needs_voice_sample"]})) as replace_voice_sample_row:
         replace_voice_sample = gr.Audio(label="Voice Sample #1", type="filepath", show_download_button=True)
-    with gr.Row(visible=metadata["needs_voice_sample2"]) as replace_voice_sample2_row:
+    with gr.Row(**({} if update_form else {"visible": metadata["needs_voice_sample2"]})) as replace_voice_sample2_row:
         replace_voice_sample2 = gr.Audio(label="Voice Sample #2", type="filepath", show_download_button=True)
     if not update_form:
         postprocess_audio.change(fn=audio_edit_refresh_updates, inputs=[postprocess_audio], outputs=[replace_voice_sample_row, replace_voice_sample2_row])
@@ -512,8 +522,7 @@ def create_late_audio_edit_ui(gr, *, default_visibility_false: dict[str, Any], u
 
 
 def create_late_remux_ui(gr, *, update_form: bool = False, default_visibility_false: dict[str, Any]):
-    choices = soundtrack_choices(include_none=False, include_control=False, include_voice=True, voice_label_context=AUDIO_PROCESSOR_LABEL_CONTEXT_LATE_POSTPROCESSING)
-    default_value = CUSTOM_SOUNDTRACK_METHOD if CUSTOM_SOUNDTRACK_METHOD in {method for _, method in choices} else (choices[0][1] if choices else "")
+    choices, default_value = late_remux_menu()
     value = "" if update_form else default_value
     metadata = method_metadata(value)
     with gr.Column(visible=True) as postprocess_audio_col:
@@ -557,6 +566,8 @@ def query_method_choices(processor_type: str, *, include_none: bool = True, enab
         for label, method in _method_choices(handler_def):
             if _method_has_type(handler_def, method, processor_type) and handler_method_in_choices(handler, method, selected_method=normalize_method(selected_method), include_hidden=include_hidden):
                 choice_label = _method_label(handler_def, method, label_context)
+                if hasattr(handler, "format_choice_label"):
+                    choice_label = handler.format_choice_label(choice_label, method)
                 choices.append((_method_pos(handler_def, method), str(choice_label or "").casefold(), str(method or ""), choice_label, method))
     return choices[:1] + [(label, method) for _, _, _, label, method in sorted(choices[1:])] if include_none else [(label, method) for _, _, _, label, method in sorted(choices)]
 

@@ -1,5 +1,7 @@
 ############# WanGP Copyright DeepBeepMeep 2025-2026 #############
 import os, sys
+# A pipe or a file defaults to the ANSI code page with strict errors: any other character in a print would raise
+for _stream in (sys.stdout, sys.stderr): _stream.reconfigure(encoding="utf-8", errors="replace")
 from tqdm import tqdm
 
 WanGP_version = "19.02"

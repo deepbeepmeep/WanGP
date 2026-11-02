@@ -20,6 +20,8 @@ from . import production as model, titles
 
 WEB = Path(__file__).with_name("web")
 GUIDE = Path(__file__).resolve().parents[2] / "docs" / "SHOWRUNNER.md"
+GALLERY = Path(__file__).resolve().parents[2] / "shared" / "gradio"
+GALLERY_ZOOM = ("image_zoom.js", "image_zoom.css")  # the zoom of WanGP's image gallery, for the page's own image previews
 ASSET = re.compile(r"(?:js|css)/[\w.-]+\.(?:js|css)|icons/[\w.-]+\.svg|[\w.-]+\.(?:svg|png|webmanifest)")
 
 
@@ -47,6 +49,11 @@ class TemplatePick(BaseModel):
 
 class Archived(BaseModel):
     archived: bool = True
+
+
+class Settings(BaseModel):
+    notify_turns: bool | None = None
+    cast_loras: bool | None = None
 
 
 class Text(BaseModel):
@@ -112,6 +119,8 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
 
     @app.get("/assets/{name:path}")
     def asset(name: str):
+        if name in GALLERY_ZOOM:
+            return FileResponse(GALLERY / name, headers={"Cache-Control": "no-cache"})
         if not ASSET.fullmatch(name) or not (WEB / name).is_file():
             raise HTTPException(404)
         return FileResponse(WEB / name, headers={"Cache-Control": "no-cache"})
@@ -136,6 +145,15 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
     @app.post("/api/templates")
     def choose_default_template(request: TemplatePick):
         return showrunner.choose_default_template(request.role, request.template or None)
+
+    @app.get("/api/settings")
+    def settings():
+        return showrunner.host.settings()
+
+    @app.post("/api/settings")
+    def save_settings(request: Settings):
+        showrunner.host.save_settings(**request.model_dump(exclude_none=True))
+        return showrunner.host.settings()
 
     @app.post("/api/productions")
     def create(request: Created):
@@ -285,6 +303,16 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
         production(production_id)
         return showrunner.choose_template(production_id, request.role, request.template or None)
 
+    @app.get("/api/productions/{production_id}/sizes")
+    async def frame_sizes(production_id: str):
+        production(production_id)
+        return await run_in_threadpool(showrunner.frame_sizes, production_id)
+
+    @app.get("/api/productions/{production_id}/loras")
+    async def cast_loras(production_id: str):
+        production(production_id)
+        return await run_in_threadpool(showrunner.cast_lora_choices, production_id)
+
     @app.post("/api/productions/{production_id}/text")
     async def add_text(production_id: str, request: Text):
         production(production_id)
@@ -301,6 +329,11 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
         production(production_id)
         return await run_in_threadpool(showrunner.add_card, production_id, shot_id, request.text, request.subtitle, request.style,
                                        design=request.design or None, picture=request.picture or None)
+
+    @app.post("/api/productions/{production_id}/shots/{shot_id}/detach-sound")
+    async def detach_sound(production_id: str, shot_id: str):
+        production(production_id)
+        return await run_in_threadpool(showrunner.detach_sound, production_id, shot_id)
 
     @app.post("/api/productions/{production_id}/shots/{shot_id}/rerun")
     def rerun(production_id: str, shot_id: str):

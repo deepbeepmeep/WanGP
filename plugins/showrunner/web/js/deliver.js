@@ -2,11 +2,12 @@
 // Deliver: the assembled versions of the edit, what is left before the final cut, and the files to take away.
 import { state, actions } from './app.js';
 import { api } from './api.js';
-import { icon, esc, ago, formatDuration, toast, pickFiles, h, confirmDialog, count } from './ui.js';
+import { icon, esc, ago, formatDuration, toast, pickFiles, h, confirmDialog, count, availability } from './ui.js';
 
 export function mountDeliver(container) {
   let selected = null, compareWith = null, changes = null;
   const number = id => state.doc.deliverables.findIndex(item => item.id === id) + 1;  // versions are numbered in the order they were made
+  try { if (state.doc.deliverables.length) localStorage.setItem(`sr.watched.${state.pid}`, state.doc.deliverables.at(-1).id); } catch { /* a convenience */ }  // the top bar stops asking to watch it
   const subtitles = new Map();  // each export's subtitles for the player: a WebVTT object URL, '' without any (read once)
   let showSubtitles = false;
   try { showSubtitles = localStorage.getItem('sr.subtitles') === '1'; } catch { /* a convenience */ }
@@ -35,8 +36,8 @@ export function mountDeliver(container) {
           <div class="panel" style="padding:16px"><div class="label">${icon('target')} Before the final cut</div><div class="checklist">
             ${check(shot === included.length && included.length, `${shot}/${included.length} shots shot`)}${check(approved === included.length && included.length, `${approved}/${included.length} approved by you`, review ? `${review} waiting for your review` : '')}
             ${check(doc.brief.song || doc.edit.audio_mode === 'clips', doc.edit.audio_mode === 'song' ? 'Soundtrack: the song' : doc.edit.audio_mode === 'mix' ? 'Soundtrack: song and shot sound' : 'Soundtrack: shot sound')}</div>
-            <div class="row" style="margin-top:12px"><button class="btn ${latest && !stale ? '' : 'primary'} grow" id="assemble" ${shot ? '' : 'disabled title="Shoot at least one shot first"'}>${icon('film')} ${latest ? 'Assemble again' : 'Assemble'}</button>
-              <button class="btn" id="ask" title="The showrunner assembles the edit, watches it and reports">${icon('director')} Showrunner review</button></div></div>
+            <div class="row" style="margin-top:12px"><button class="btn ${latest && !stale ? '' : 'primary'} grow" id="assemble" ${availability(actions.assembleBlocked(doc))}>${icon('film')} ${latest ? 'Assemble again' : 'Assemble'}</button>
+              <button class="btn" id="ask" ${availability(actions.directorBlocked() || actions.assembleBlocked(doc), 'The showrunner assembles the edit, watches it and reports')}>${icon('director')} Showrunner review</button></div></div>
           ${current ? `<div class="panel" style="padding:16px"><div class="label">${icon('info')} Version ${number(current.id)} · ${esc(clock(current.time))}</div><div class="col" style="gap:6px;font-size:13px">
             <div class="row"><span class="muted grow">Length</span><b>${formatDuration(current.duration_s)}</b></div>
             <div class="row"><span class="muted grow">Picture</span><b>${current.width || '?'}×${current.height || '?'}${current.fps ? ` · ${current.fps} fps` : ''}</b></div>

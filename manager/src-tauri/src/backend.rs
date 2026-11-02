@@ -16,7 +16,7 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum Action { Hardware, CondaEnvironments, DetectInstallation, ManagerUpdate, Catalog, Sources, Register, Inspect, Preview, Apply, Recover, Versions, Launch, Demo }
+enum Action { Hardware, CondaEnvironments, DetectInstallation, ManagerUpdate, Catalog, Sources, Register, Inspect, Preview, Apply, Recover, Versions, RemoveVersion, Launch, Demo }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -282,6 +282,16 @@ fn start_job(window: WebviewWindow, app: tauri::AppHandle, state: tauri::State<A
     }
     let mut jobs = state.jobs.lock().unwrap();
     if jobs.values().filter(|job| !job.snapshot.lock().unwrap().done).count() >= 8 { return Err("Wait for another operation to finish".into()); }
+    // Worker cleanup reads the registered roots from preferences. An in-flight
+    // registration or activation publishes its new environment in finish().
+    let changes_registry = |action: &Action| matches!(action, Action::Register | Action::Apply | Action::Recover);
+    if jobs.values().any(|job| {
+        let other = job.snapshot.lock().unwrap();
+        !other.done && ((matches!(action, Action::RemoveVersion) && changes_registry(&other.action))
+            || (changes_registry(&action) && matches!(other.action, Action::RemoveVersion)))
+    }) {
+        return Err("Wait for installation changes and saved version removal to finish before starting another change.".into());
+    }
     if matches!(action, Action::Launch) && jobs.values().any(|job| { let s = job.snapshot.lock().unwrap(); !s.done && matches!(s.action, Action::Launch) && s.args["root"] == args["root"] }) { return Err("This installation is already starting or running".into()); }
     if jobs.len() >= 40 {
         let completed: Vec<String> = jobs.iter().filter(|(_, job)| job.snapshot.lock().unwrap().done).map(|(id, _)| id.clone()).take(20).collect();

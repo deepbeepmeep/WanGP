@@ -226,6 +226,10 @@ class FlashVSRBridge:
     def method_visible(self, method: str) -> bool:
         return self.METHOD_MODELS[method] == self.model()
 
+    def preferred_method(self, method: str) -> str:
+        two_pass = self.is_two_pass_upsampling(method)
+        return next(key for key in self.METHOD_MODELS if self.method_visible(key) and self.is_two_pass_upsampling(key) == two_pass)
+
     @classmethod
     def query_upsampler_def(cls) -> dict[str, Any]:
         return {

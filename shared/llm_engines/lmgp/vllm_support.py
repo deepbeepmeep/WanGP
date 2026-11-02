@@ -396,16 +396,6 @@ class TextEngine:
             except Exception:
                 pass
         self._sampling_params_cls = None
-        try:
-            import torch
-            # DO NOT add `from torch._inductor import cudagraph_trees` here.
-            # Its import registers borrowed Python objects in native TLS on PyTorch
-            # 2.10, causing use-after-free and process crashes when a worker exits.
-            # Call the same cleanup as its clear_cublass_cache() helper directly.
-            # Our CUDA graphs use torch.cuda.CUDAGraph, not Inductor's graph trees.
-            torch._C._cuda_clearCublasWorkspaces()
-        except Exception:
-            pass
 
     def __del__(self):
         self.close()
