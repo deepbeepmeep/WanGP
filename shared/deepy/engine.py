@@ -4896,6 +4896,34 @@ class DeepyZeroTools:
         return result
 
     @assistant_tool(
+        display_name="Check Lip Sync",
+        description="Measure whether the lips of the biggest face in a video follow its voice, comparing mouth opening per frame with the voice's loudness: one shot at a time, at most 60 seconds, a few seconds of work. verdict: follows; may_not_follow, a suspicion to check by eye (it compares timing, not mouth shapes, and is noisy on small faces); not_measurable, no clear face or too little voice. best_lag_s: where the match is best, positive when the mouth comes after the voice.",
+        parameters={
+            "media_id": {"type": "string", "description": "Video media ID or authorized file.", "required": True},
+            "start_s": {"type": "number", "description": "Start of the shot in seconds; default 0.", "required": False},
+            "duration_s": {"type": "number", "description": "Seconds to measure; omitted measures through the end.", "required": False},
+            "voice_id": {"type": "string", "description": "Optional audio of the voice alone (a vocal stem from remove_background, or the recording that drove the shot). Default: the video's own sound, where music under the voice weakens the measure.", "required": False},
+            "voice_start_s": {"type": "number", "description": "Where in voice_id the video's start_s falls; default start_s (0 for a recording of this shot alone).", "required": False},
+        },
+        pause_reason="light",
+    )
+    def check_lip_sync(self, media_id: str, start_s: float = 0.0, duration_s: float | None = None, voice_id: str | None = None, voice_start_s: float | None = None) -> dict[str, Any]:
+        from shared.deepy import lip_sync
+
+        source, error_result = self._resolve_video_media(media_id, "media_id")
+        if error_result is not None:
+            return error_result
+        voice = source
+        if voice_id:
+            voice, error_result = self._resolve_audio_or_video_media(voice_id, "voice_id")
+            if error_result is not None:
+                return error_result
+        self._set_status("Checking Lip Sync", kind="tool")
+        result = lip_sync.check(source["path"], start_s, duration_s, voice["path"], voice_start_s)
+        self._set_status("Lip Sync Checked", kind="tool")
+        return {"status": "done", "source_media_id": source["media_id"], **result}
+
+    @assistant_tool(
         display_name="Extract Audio",
         description="Extract audio from a previously resolved video or audio file using either time-based arguments (start_s, end_s, duration_s) or, for video sources, frame-based arguments (start_frame, end_frame, num_frames).",
         parameters={
@@ -6672,6 +6700,9 @@ class DeepyZeroTools:
 check_zero_catalog({metadata["name"]: metadata for metadata in (getattr(value, "_assistant_tool", None) for value in vars(DeepyZeroTools).values()) if metadata is not None})
 
 
+_CONTEXT_BAR_TOKENS = 12000  # a conversation being rebuilt: Prime's system prompt alone takes about 8,000 tokens, and shows no bar
+
+
 class AssistantEngine:
     def __init__(self, session: AssistantSessionState, runtime_hooks: AssistantRuntimeHooks, tool_box: Any, send_cmd, debug_enabled: bool | None = None, thinking_enabled: bool = True, vram_mode: str = DEEPY_VRAM_MODE_UNLOAD, system_prompt: str = ASSISTANT_SYSTEM_PROMPT, custom_system_prompt_key: str = DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY):
         self.session = session
@@ -6710,6 +6741,7 @@ class AssistantEngine:
         self._compaction_thinking_enabled = False
         self._prefill_started_at: float | None = None
         self._live_prefill_tokens = 0
+        self._context_progress_at = 0.0
         self._segment_generated_tokens = 0
         self._segment_metrics_checkpoint_at: float | None = None
         self._segment_metrics_recorded_tokens = 0
@@ -6875,13 +6907,16 @@ class AssistantEngine:
         self._segment_metrics_checkpoint_at = now
         self._segment_metrics_recorded_tokens = current_tokens
 
-    def _run_prefill_call(self, token_count: int, callback: Callable[[], Any], *, record_if: bool | Callable[[Any], bool] = True) -> Any:
+    def _run_prefill_call(self, token_count: int, callback: Callable[[], Any], *, record_if: bool | Callable[[Any], bool] = True, rebuilds_conversation: bool = False) -> Any:
         tokens = max(0, int(token_count or 0))
         if tokens > 0:
             self._emit_stats(force=True, prefilling_tokens=tokens)  # before the timer starts: the speeds stay those of the finished prefills
         started_at = time.perf_counter()
         self._prefill_started_at = started_at if tokens > 0 else None
         self._live_prefill_tokens = tokens
+        long_call = rebuilds_conversation and tokens >= _CONTEXT_BAR_TOKENS and self.runtime is not None
+        if long_call:
+            self.runtime.context_progress = self._report_context_progress
         completed = False
         result = None
         try:
@@ -6889,6 +6924,9 @@ class AssistantEngine:
             completed = True
             return result
         finally:
+            if long_call:
+                self.runtime.context_progress = None
+                self._close_context_progress()
             elapsed_seconds = max(0.0, time.perf_counter() - started_at)
             self._prefill_started_at = None
             self._live_prefill_tokens = 0
@@ -6896,6 +6934,21 @@ class AssistantEngine:
             if completed and should_record:
                 self._record_prefill_metrics(tokens, elapsed_seconds)
             self._emit_stats(force=True)
+
+    def _report_context_progress(self, done: int, total: int) -> None:
+        """A conversation being rebuilt moves the bar of the status line, three times a second at most."""
+        now = time.perf_counter()
+        if done < total and now - self._context_progress_at < 0.33:
+            return
+        self._context_progress_at = now
+        self._emit_chat_event(assistant_chat.build_status_event("Reloading Conversation", kind="loading", session=self.session, progress={"done": done, "total": total}))
+
+    def _close_context_progress(self) -> None:
+        """The status line goes back to what it said before the bar."""
+        if self._context_progress_at:
+            self._context_progress_at = 0.0
+            status = self._current_status_payload
+            self._set_status(status["text"], status["kind"]) if status else self._hide_status()
 
     def _finish_stream_pass(self, token_count: int | None = None) -> None:
         recorded_tokens = max(max(0, int(token_count or 0)), max(0, int(self._segment_generated_tokens or 0)))
@@ -8120,6 +8173,7 @@ class AssistantEngine:
             len(suffix_tokens),
             lambda: self.runtime.extend_context(target_tokens),
             record_if=lambda result: result in ("prefilled", "chunk_prefilled"),
+            rebuilds_conversation=True,
         )
 
     def _restore_or_replay_session(self, context_label: str = "Session context") -> str:
@@ -8150,6 +8204,7 @@ class AssistantEngine:
             len(fallback_tokens),
             lambda: runtime.restore_or_replay(self.session.runtime_snapshot, fallback_tokens),
             record_if=lambda result: isinstance(result, tuple) and len(result) > 0 and result[0] == "prefilled",
+            rebuilds_conversation=True,  # moves only if it has to prefill: a restore from RAM reports nothing
         )
         pending_replay_reason = str(self.session.pending_replay_reason or "").strip()
         runtime_replay_reason = str(runtime_replay_reason or "").strip()
@@ -9094,7 +9149,7 @@ class AssistantEngine:
             else:
                 self._log(f"Generation context {mode}.")
             return
-        self._run_prefill_call(len(target_tokens), lambda: runtime.prime_context(target_tokens))
+        self._run_prefill_call(len(target_tokens), lambda: runtime.prime_context(target_tokens), rebuilds_conversation=True)
         self.session.rendered_token_ids = list(target_tokens)
         self.session.runtime_snapshot = None
         self.session.pending_replay_reason = ""

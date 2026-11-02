@@ -50,6 +50,19 @@
 #wangp-app-bar [data-app-decision="remove"] { background: var(--background-fill-secondary); color: var(--body-text-color); }
 .wangp-model-manager-link { --mm-accent: var(--studio-accent, var(--color-accent)); display: inline-flex; align-items: center; gap: 8px; width: fit-content; margin: 6px 8px !important; padding: 7px 14px 7px 12px !important; border: 1px solid color-mix(in srgb, var(--mm-accent) 50%, transparent) !important; border-radius: 999px; background: color-mix(in srgb, var(--mm-accent) 10%, transparent) !important; box-shadow: none !important; color: var(--mm-accent) !important; cursor: pointer; font-size: 14px !important; font-weight: 600 !important; }
 .wangp-model-manager-link:hover { background: color-mix(in srgb, var(--mm-accent) 20%, transparent) !important; }
+.ckpt-selection-heading { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 1fr); align-items: center; }
+.ckpt-selection-heading > span { padding-right: 12px; font: var(--block-title-text-weight) var(--block-title-text-size)/var(--line-sm) var(--font); color: var(--block-title-text-color); }
+.gradio-container .ckpt-selection-heading .wangp-model-manager-link { width: 100%; margin: 0 !important; padding: 5px 10px !important; gap: 6px; font-size: var(--block-title-text-size) !important; justify-content: flex-start; text-align: left; }
+.ckpt-selection-heading kbd { white-space: nowrap; }
+@media (max-width: 700px) {
+    .ckpt-selection-heading { grid-template-columns: 1fr; gap: 6px; }
+    .gradio-container .ckpt-selection-heading .wangp-model-manager-link { width: fit-content; }
+}
+.ckpt-heading { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px 16px; }
+.ckpt-heading > div { display: grid; gap: 4px; flex: 1 1 20rem; }
+.gradio-container .ckpt-heading h3, .gradio-container .ckpt-heading p { margin: 0 !important; }
+.ckpt-heading .wangp-model-manager-link { margin: 0 !important; padding: 3px 9px !important; font-size: 12px !important; }
+.ckpt-heading .wangp-model-manager-link svg { width: 15px; height: 15px; flex-basis: 15px; }
 .wangp-model-manager-link svg { width: 22px; height: 22px; flex: 0 0 22px; }
 .wangp-model-manager-link kbd { padding: 1px 6px; border: 1px solid var(--border-color-primary); border-radius: 5px; background: var(--background-fill-secondary); color: var(--body-text-color); font: 600 11px/1.5 var(--font-mono, monospace); }
 .wangp-addon-toolbar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; padding: 4px 0 10px; color: var(--body-text-color); }
@@ -59,6 +72,11 @@
 .wangp-addon-toolbar svg { width: 18px; height: 18px; }
 .wangp-addon-toolbar [data-addon-return] { display: none; }
 .wangp-addon-fullscreen-open { overflow: hidden !important; }
+html:not(.wangp-main-tab) footer { display: none !important; }
+.wangp-addon-own-controls .wangp-addon-toolbar { display: none !important; }
+.wangp-addon-own-controls .wangp-addon-web-view iframe { height: calc(100vh - 170px) !important; }
+.wangp-addon-fullscreen.wangp-addon-own-controls { padding: 0 !important; }
+.wangp-addon-fullscreen.wangp-addon-own-controls .wangp-addon-web-view iframe { position: fixed; inset: 0; width: 100vw !important; height: 100dvh !important; min-height: 0 !important; }
 .wangp-addon-fullscreen { position: fixed !important; inset: 0 !important; z-index: 80 !important; overflow: auto !important; box-sizing: border-box; padding: 12px !important; background: var(--body-background-fill) !important; border: 0 !important; border-radius: 0 !important; }
 .wangp-addon-fullscreen .block.wangp-addon-controls { position: sticky; top: 0; z-index: 2; background: var(--body-background-fill); }
 .wangp-addon-fullscreen [data-addon-fullscreen] { display: none; }

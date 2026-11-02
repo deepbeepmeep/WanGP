@@ -38,6 +38,7 @@ ASSISTANT_ACTION_BUDGET_LARGE_CONTEXT_TOKENS = 64000
 ASSISTANT_ACTION_BUDGET_SMALL_TOKENS = 2048
 ASSISTANT_ACTION_BUDGET_MEDIUM_TOKENS = 6144
 ASSISTANT_ACTION_BUDGET_LARGE_TOKENS = 8192
+ASSISTANT_ACTION_MINIMUM_TOKENS = 1024
 DEEPY_TELEMETRY_ENV = "WAN2GP_DEEPY_TELEMETRY"
 _DEEPY_TELEMETRY_ENABLED = str(os.environ.get(DEEPY_TELEMETRY_ENV, "0")).strip().lower() in {"1", "true", "yes", "y", "on"}
 
@@ -546,6 +547,7 @@ class Qwen35AssistantRuntime:
         if self.tokenizer is None:
             raise RuntimeError("Prompt enhancer tokenizer is missing for assistant runtime.")
         self.debug_enabled = bool(debug_enabled)
+        self.context_progress = None  # called with (done, total) while a conversation is prefilled
         self.telemetry_enabled = self.debug_enabled and _DEEPY_TELEMETRY_ENABLED
         self._runtime_extra_tokens = getattr(model, "_prompt_enhancer_thinking_extra_tokens", 0)
         self._assistant_presence_state = None
@@ -1183,6 +1185,8 @@ class Qwen35AssistantRuntime:
                     f"with {len(chunk)} tokens in {time.perf_counter() - chunk_started_at:.3f}s (context={int(seq.num_tokens)})."
                 )
                 self._log_speculative_alignment(seq, f"after suffix chunk {chunk_index}/{total_chunks}")
+                if self.context_progress is not None:
+                    self.context_progress(chunk_index, total_chunks)
         finally:
             seq.logits_processor = original_processor
             seq.logits_processor_update_state = original_update
@@ -1450,7 +1454,11 @@ class Qwen35AssistantRuntime:
         llm = self._get_live_llm()
         available_tokens = max(0, int(llm.config.max_model_len) - int(seq.num_tokens))
         if available_tokens < generation_limit:
-            raise RuntimeError(f"Assistant {phase} action requires {generation_limit} reserved tokens but only {available_tokens} remain.")
+            # Just after a compaction with nothing older left to summarize, the context can sit a little above what a full action reserves.
+            # The action gets what is left, which it rarely uses all of, and the next one can compact.
+            if available_tokens < ASSISTANT_ACTION_MINIMUM_TOKENS:
+                raise RuntimeError(f"Assistant {phase} action requires {generation_limit} reserved tokens but only {available_tokens} remain.")
+            generation_limit = available_tokens - 16
         temp, normalized_top_p, normalized_top_k = qwen35_text._normalize_vllm_sampling(do_sample=bool(do_sample), temperature=temperature, top_p=top_p, top_k=qwen35_text._resolve_prompt_top_k(self.model, top_k))
         existing_completion_tokens = int(seq.num_completion_tokens) if continuing_response else 0
         if not continuing_response:

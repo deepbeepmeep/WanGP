@@ -7,7 +7,7 @@ you follow, review and change anything on a storyboard and a timeline.
 Showrunner comes enabled with WanGP. Open **Showrunner** in the app bar; on first use, choose **Keep It** in its introduction. If you removed it, restore it from **Available Locally** in **Apps & PlugIn Manager**. **Full Screen** at the top of the tab expands the editor in place; **WanGP** returns to the Showrunner tab with your production and view preserved. Open `/showrunner/` on the WanGP address to go directly to the fullscreen editor. Full screen keeps this folder URL, which you can bookmark or share. In the tab as in full screen, the address also names the production and the page you have open: a reload or a copied link opens them again.
 
 Showrunner needs **Deepy Prime**, with a local model or a remote agent (Configuration > Deepy): running a production takes a planner that
-can follow a long plan. Everything you do yourself (reviewing, editing, re-rendering a take, assembling) works without Deepy.
+can follow a long plan. Everything you do yourself (reviewing, editing, re-rendering a take, assembling) works without Deepy. With a local model, Showrunner tells you when Deepy's settings hold a production back: it recommends at least 64K of context, so that Deepy does not keep condensing the conversation and losing details, and a **KV Cache Quantization** of Q4 or lower to fit that context in less VRAM.
 
 **Guide** at the top of every page opens this guide at the part about the page you are on (or press **?**).
 
@@ -67,7 +67,7 @@ Press **Plan with the showrunner**.
 
 ## The Cast
 
-The **Cast** page holds the people and recurring things of the production (a singer, a villain, the red car), each on a card:
+The **Cast** page holds the people, recurring things and places of the production (a singer, a villain, the red car, the studio), each on a card:
 
 - **Pictures**: drop photos on the card. The highlighted one is the **reference picture** of every shot the member appears in; click
   another to use it instead. **Ask the showrunner for master images** makes a clean front-facing picture for members without one.
@@ -83,10 +83,14 @@ The **Cast** page holds the people and recurring things of the production (a sin
 - **LoRA** (only with **LoRAs on cast cards** on, in **Settings** at the top of every page): a LoRA you trained for this person or thing,
   its strength and its trigger word. A LoRA only works with the family of models it was trained on, so the card lists those of the
   models this production uses and says how many of the member's shots can use it; the other shots are made without it. Shots already
-  made do not change: **New take** or **Re-shoot** uses it. Turned off in Settings, no shot uses a LoRA from its card.
+  made do not change: **Same again** or **Fix…** uses it. Turned off in Settings, no shot uses a LoRA from its card.
 
 Every shot that shows a cast member is generated from that member's reference picture, so faces, hair and clothes stay the same over
 dozens of shots. Dropping a photo anywhere on the Cast page adds a new member.
+
+**Voices** are measured against their card. A voice that sounds like the other sex than the card says is made again, a spoken line that moves far from its speaker's voice is spoken again without its delivery note, and a song whose lead voice does not fit the singer on screen is reported before shooting. The showrunner tells you when it cannot fix one.
+
+**Places** keep a location the same from shot to shot, which words in a prompt cannot do: each shot would invent its own set. Press **Add a place**, and give its card one picture of the set as the viewer should see it, without the cast and without writing, but with the people who belong there, such as an audience in its seats: your own photo, or one from **Ask the showrunner for master images**. Every shot that lists the place gets its picture as a reference, close shots and shots without people included. A side the picture does not show, such as the seats seen from the stage, gets its own place card: only one picture of a card goes to a shot. The showrunner adds a place by itself when it plans a location that recurs, and you can ask for one at any time: "the kitchen looks different in every shot".
 
 ## Long Productions
 
@@ -138,20 +142,21 @@ and retakes add to it. **Shoot** in the showrunner's panel shows the same estima
 ## Takes and Verdicts
 
 The showrunner renders each shot, inspects the result with its own tools (picture, motion, cuts inside a shot, black frames, sound) and
-records its verdict: a good take waits for your review (**To review**), a failed one is marked **Redo** and shot again, at most twice:
+records its verdict: a good take counts as shot, with the showrunner's badge on its card (**To review** when takes wait for your review before the edit), a failed one is marked **Redo** and shot again, at most twice:
 then the best take waits for you with a note on what is still wrong. A card's badge says whose verdict it is (**Showrunner** or
 **You**).
 
-Only you approve a shot. In the shot panel:
+Only you approve a shot, and you need to only when takes wait for your review before the edit. In the shot panel:
 
 - **Approve** marks the take as final; the showrunner leaves approved shots alone. Its own opinion of the take stays in the panel under
   yours, so a note on what it found wrong is not lost when you approve or redo the take.
-- **Redo** marks the take for a new one; write what should change, and the showrunner reads your note when it re-shoots (**Re-shoot**
-  on the shot, or **Shoot** for every shot marked for a redo).
+- **Fix…** is where you say what is wrong or what should change: the showrunner fixes this shot and keeps the rest (see Fixing What Is Wrong).
+- **Redo…**, when takes wait for your review before the edit, marks a take for a new one with your note, so that you can go on reviewing: **Shoot** then takes every shot marked for a redo.
 - Click another take to use it in the edit. Right-click a take to **compare** it with the one in use: a split view with a handle to slide,
   played in sync; **Use B** keeps the other take, **Done** closes the comparison.
-- **New take** renders a new take at once from the shot's settings and your edited prompt, without the showrunner.
-- **Ask the showrunner** sends a note about the shot; **Re-shoot** hands the shot back to the showrunner.
+- **Same again** renders another take at once from the shot's settings and prompt, without the showrunner and without any note: for a take that only needs another try, or after you edited the prompt yourself.
+- **+ Shot** adds a shot after the selected one, in its part (at the end when none is selected); drag its card to move it.
+- After changing someone on the **Cast** page, **Re-shoot N** on their card shoots again the shots showing them, with their new look and voice.
 
 ## The Timeline
 
@@ -182,12 +187,13 @@ over the song. Shots that are not shot yet appear as cards in their place, so th
   When the song drives the edit, every shot stays on its part of the song: a dissolve plays over the extra end of the outgoing take,
   so it lasts at most as long as that take runs past its shot (and becomes a cut when it does not).
 - When the picture ends before the song, the edit panel says by how much.
+- The **Words** lane shows each spoken line where its subtitle sits, with its speaker in the tooltip, so that you can check the lines without playing the sound.
 - The **Text** lane holds titles, lower thirds (a name and a role), captions and full-frame chapter or end cards. **+ Text** adds one at
   the playhead: choose its style and its design (the production's, or another), write its words and its time on screen. Drag it to move
   it, drag its edges to change how long it stays, double-click it (or select it and press Enter) to edit it, Delete to remove it. Texts
   that overlap sit on two rows. It plays over the preview as it will in the export, fading in and out. Yellow texts are yours, purple
-  ones the showrunner's: the showrunner never changes yours. Text is drawn, never asked of a video model, so it is always sharp and
-  spelled right. A full-frame card hides the picture under it: after moving shots, check that a card does not cover a moment you want
+  ones the showrunner's: the showrunner never changes yours. Text is drawn, never asked of a video model, so it is always sharp, and it reads
+  exactly as it was typed (read what the showrunner typed: double-click a text to correct it). A full-frame card hides the picture under it: after moving shots, check that a card does not cover a moment you want
   to see.
 - Choose the soundtrack: the **Song**, the **Shot sound** of each take, or a **Mix** of both.
 
@@ -226,28 +232,41 @@ spoken line.
 
 ## Talking to the Showrunner
 
-When the showrunner finishes a task and something is up to you, the **Showrunner** button at the top of every page says what ("Review the
-plan", "Review 5 takes", "Watch the video") with a dot on its avatar, and its panel opens on the same note until you have done it. "Stopped"
-means that its task ended early: the panel says why, and **Continue** picks it up. The note only shows while the page is open: if you were
+When the showrunner finishes a task and something is up to you, the **Showrunner** button at the top of every page becomes **Your turn** and
+says what ("Review the plan", "Review 5 takes", "Watch the video"); clicking it opens or folds the panel. A bar above the media bin says it in full: its button
+does it and closes the bar (**Shoot**, **Assemble**, **Open Board**), and when there is nothing to press, its × closes it. "Stopped" means that its task ended early: the
+Showrunner tab says why, and **Continue** picks it up. The note only shows while the page is open: if you were
 elsewhere, it is there when you come back. To hear about it sooner, turn on **Tell me when a task ends** in **Settings**: when the
 showrunner finishes a task or stops on an error, WanGP plays its notification sound on the computer it runs on and sends what comes next to
 your notification destinations (**Config > Notification**), if you have set any.
 
-The **Showrunner** panel shows what the showrunner is doing and its log of decisions, next to your own notes. Write in plain language ("faster
-cuts in the chorus", "make shot 3 at night"): while it works, your message reaches it at its next step; otherwise it starts working on it.
-When shots are selected, your message is about them. **Stop** interrupts it; it continues where it stopped when you ask again.
+The panel on the right has two tabs:
+
+- **Shot**: the selected shot and its takes.
+- **Showrunner**: your conversation with it, the newest at the bottom, with each step of its task as it goes and what it is doing now above the input.
+
+To follow its work more closely, turn on **Show the Deepy tab** in **Settings**: a third tab shows Deepy's own window on this production, with its thoughts and every step as they are written. It stays at the latest words unless you scroll up. You read it there, and write in the Showrunner tab.
+
+The panel starts open on a large screen and folded on a small one, and then stays as you left it: its arrow or the D key fold it to a strip of
+icons, which also shows when the showrunner is working or waiting for you. While it is folded, double-click a shot to open it, or click an icon.
+
+In the Showrunner tab, write in plain language ("faster cuts in the chorus", "make shot 3 at night"): while it works, your message reaches it at
+its next step; otherwise it starts working on it. When shots are selected, your message is about them. The row under the input holds what you can
+do at that moment: **Shoot**, **Assemble** and **Re-plan**, or **Pause** and **Stop** while it works. **Stop** interrupts it; it continues where
+it stopped when you ask again.
 When a task ends, the panel says what the showrunner changed (shots added, rewritten or removed, takes shot and judged, text, sound,
 new versions) and the shots it touched glow for a moment on the board. Shots appear as "shot 4" in its messages, in the order of the cut.
-During a long wait, the panel tells a slow step from a stuck one: what Deepy is doing now, its thoughts as it writes them (when its model thinks
-aloud; click **Thinking** to fold them), how many tokens it is reading before it can answer, and its speed in tokens per second with how full its
-context is.
+During a long wait, the line above the input tells a slow step from a stuck one: what Deepy is doing now and how many tokens it is reading before it
+can answer. Rest the pointer on it for Deepy's speed in tokens per second and how full its context is; the Deepy tab shows them under its window.
 
 **Pause** stops the showrunner after its current step (the shot or voice it is generating is finished and kept) and frees the GPU for
 other work: WanGP's models and Deepy's leave the video memory. **Pause now** also stops what it is generating; that shot is generated
 again later. The production shows **Paused**, also after you close the page or restart WanGP. **Resume** continues the same task where
 it stopped, in the same conversation with the showrunner, so it remembers what it was doing; a message you write while it is paused
 resumes it with your note. Meanwhile you can review, edit and assemble as usual: the showrunner reads your changes when it resumes.
-The × next to Resume gives up the paused task.
+**Stop** gives up the paused task.
+
+The showrunner sometimes gets a call wrong and corrects it by itself; nothing is lost, and these calls stay out of the panel. What really failed is always shown. **Show every error** in **Settings** lists every one, for finding out what went wrong.
 
 While the showrunner works, its conversation takes Deepy's place: your own Deepy chat comes back when it finishes or stops. Everything
 else in Showrunner and in WanGP stays available.
@@ -255,9 +274,9 @@ else in Showrunner and in WanGP stays available.
 ## Delivering
 
 **Assemble** renders the edit as one video: the included shots in order with their chosen takes, trims and transitions, the text over
-it and the chosen soundtrack. When every take shares the same format and the edit has only plain cuts, the takes are joined without
-re-encoding; otherwise the edit is encoded once with your output codec settings (Configuration > Outputs). Shots without a take are left
-out: Assemble says which ones before it starts. A take plays for its shot's planned length (generations often come out slightly
+it and the chosen soundtrack. When the takes can simply be joined, they are, with no loss of quality; otherwise the edit is encoded once with your output settings (Configuration > Outputs). Shots without a take are left
+out: Assemble says which ones before it starts. The length you set in the Brief is a target: a shot with a spoken line ends a moment after its line, so the cut can come out shorter than planned. The showrunner tells you, and you can ask it to give those shots more room.
+Other shots last a length their model really makes (with MiniMax H3: 4.46, 5.17, 5.88 s and so on), so that every action plays to its end; a music video cuts on its song instead. For faster cuts, turn on **Let the showrunner pick any shot length** in **Settings**: a shot then plays the start of its video, and the end of its action can be lost. A take plays for its shot's planned length (generations often come out slightly
 longer), so the cuts land where the showrunner planned them and lip-synced shots stay on their part of the song; trim a shot to use
 another part of its take.
 
@@ -276,10 +295,50 @@ home page marks the production **Changed since delivery**.
   ones). Subtitles are never burnt into the picture.
 - the level: the whole soundtrack gets one fixed gain to a delivery loudness, with a limiter on the peaks; quiet moments stay quiet.
 
+To make the video in another format, such as vertical for social networks, use **Make it in another format** on **Deliver**, or choose the ratio in the Brief and press **Make a … version**. The showrunner makes the shots again in the new format, with the same words, cast and music. Choosing a ratio alone changes nothing that is already shot. The versions you have stay as they are.
+
+## Fixing What Is Wrong
+
+You do not have to start over when part of a version is wrong. Point at it, and the showrunner fixes that and keeps the rest.
+
+- **While watching:** in **Deliver**, pause on the problem and press **Something's wrong here**. The shot playing is already picked.
+- **On the Board or the Timeline:** select the shots (Ctrl+click, Shift+click) and press **Fix**, or right-click them.
+- **In the showrunner's chat:** say it in your own words, such as "the first 15 seconds of subtitles do not match the song".
+
+The window lets you add or remove shots (Shift+click for a run of them) and say what should change:
+
+- **Redo a shot differently:** "make it 6 s and show her tasting the sauce". The length, the content and the framing are yours to change.
+- **Insert a shot:** press **+** between two shots, or right-click a shot and choose **Insert a shot after it**, and say what the new shot shows and how long it lasts.
+- **Just say what is wrong:** "her coat changes colour". The showrunner looks for the cause and changes as little as it can: a trim, a subtitle, another take, a new take.
+
+With **Keep everything else as it is** on, the showrunner cannot touch anything but those shots. It then makes a new version and tells you what changed. Locked shots are never changed.
+
+**On a film,** the rest moves along when a shot is inserted or changes length: each shot's sound, the voice-over lines, the cards and the subtitles (also those of an SRT file you added) stay on their pictures. A score keeps playing from where it starts, so its hits may no longer land on the same pictures; you are warned if the film outlasts it.
+
+**On a music video,** the song keeps its timing, so the film does not get longer: a new or longer shot takes its time first from the shots before it where nobody sings, then covers what comes next, like a cutaway while the song carries on, and every later shot stays in sync. A shot that sings for longer needs a new take on a longer part of the song, and a shot made shorter can leave a gap that only a new take of the next one can fill; the showrunner tells you.
+
+**If the fix is worse**, you lose nothing. The next step offers to compare the new version with the previous one, side by side, with the list of what changed, and **Go back to version N** restores the previous one as one change you can undo. On the Board, you can also click a shot's earlier take to use it again.
+
+**When the showrunner reaches a limit**, it says so instead of trying forever: after two new takes it keeps the best one and tells you what you can choose.
+
+**Bigger changes stay open.** Some faults reach further than the shots you see: when a song does not sing a verse as written, only a new song brings the words back, and every singing shot has to be shot again. The showrunner tells you what it would change and what it costs, and your answer lets it go ahead. Turn off **Keep everything else as it is** to let it decide from the start, and ask in the chat for changes to the whole film, such as another actor, a new song or a new style.
+
+The showrunner also checks a song against its lyrics by itself before shooting on it, and composes it again when lines are missing. Subtitles of a music video follow the singing, and a line that is not sung gets no subtitle.
+
+## Deep Review
+
+**Deep Review** in **Deliver** goes further than the checks made while shooting. It takes some minutes, changes nothing, and measures the latest version against its script: what is really said or sung and when, subtitles against the words, voices against their cards, lips against the voice, the sound's level and silences, black or frozen picture. The showrunner then looks at every shot against the pictures of its cast and place.
+
+Each finding gives the moment and the shot. A **Fault** is measured; a **Check** is a suspicion for your eyes, as lips on a small face are hard to measure. Click the time to go there, **Fix…** to open the fix window with that shot and that note, or **Fix these…** for all of them at once: remove what you want to keep before sending. With a Nemotron model chosen in **Configuration > Prompt Enhancer / Deepy > Transcription**, the review also compares who is heard with who the script says, and tells you when two characters sound alike.
+
 ## Versions
 
+When two versions are compared, the bar under the picture moves both to any moment, and clicking a line in the list of changes goes straight to that shot. The comparison of two takes has the same bar.
+
 Changing a delivered production, yourself or through the showrunner, keeps working on the same production: each Assemble adds a
-numbered version, and every version keeps the state it was made from (shots and their takes, cast, text and sound).
+numbered version, and every version keeps the state it was made from (shots and their takes, cast, text and sound). A re-shoot does not
+make one by itself: when the cut has changed, the **Your turn** button says so and Assemble makes the new version. The showrunner makes one
+version per request, and another when a fix needs it, saying why.
 
 - **Compare** on a version shows it beside the one you are watching, in one frame with a handle to slide between them, played together
   (switch the sound between A and B). Below the player, a short list says what changed between them: shots added, removed or reordered,

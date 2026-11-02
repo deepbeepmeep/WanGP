@@ -396,6 +396,15 @@ class TextEngine:
             except Exception:
                 pass
         self._sampling_params_cls = None
+        try:
+            from mmgp import cuda_graphs
+            # DO NOT add `from torch._inductor import cudagraph_trees` here.
+            # Its import registers borrowed Python objects in native TLS on PyTorch
+            # 2.10, causing use-after-free and process crashes when a worker exits.
+            # Our CUDA graphs use torch.cuda.CUDAGraph, not Inductor's graph trees.
+            cuda_graphs.release_blas_workspaces()
+        except Exception:
+            pass
 
     def __del__(self):
         self.close()

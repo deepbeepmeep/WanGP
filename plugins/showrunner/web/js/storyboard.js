@@ -5,6 +5,7 @@ import { api } from './api.js';
 import { icon, esc, art, formatDuration, sectionColor, menu, confirmDialog, promptDialog, toast, count, shootEstimate, availability } from './ui.js';
 import { segments } from './sequencer.js';
 import { templateLabel } from './models.js';
+import { askForFix } from './fix.js';
 
 // A shot's length in the cut, as the timeline and the export play it: its planned length or trim, not the whole take.
 const cutLengths = doc => new Map(segments(doc, actions.take).map(item => [item.shot.id, item.duration]));
@@ -97,12 +98,12 @@ export function mountStoryboard(container, doc) {
     const estimate = todo ? shootTime(doc, shooting, renderTools) : '';
     const review = doc.brief.review_before_edit, approved = shot => actions.take(shot)?.verdict?.by === 'user' && actions.take(shot).verdict.ok;
     const waiting = review && !todo ? doc.shots.filter(shot => shot.included && !approved(shot)).length : 0;  // the showrunner waits for them before the edit
-    tools.innerHTML = `<div class="col" style="gap:0;min-width:0"><h2>Storyboard</h2><span class="stat" style="white-space:nowrap">${doc.shots.length} shots · ${formatDuration(total)} · ${doc.shots.length ? frameSizes(doc, renderTools) : ''}<span style="color:var(--green)">${counts('approved')} approved</span> · <span style="color:var(--amber)">${counts('rendered')} to review</span></span></div>
-      <span class="sep"></span><div class="filters">${FILTERS.map(([key, label]) => `<button class="chip clickable ${state.filter === key ? 'on' : ''}" data-filter="${key}">${label}</button>`).join('')}</div>
+    tools.innerHTML = `<div class="col" style="gap:0;min-width:0"><h2>Storyboard</h2><span class="stat" style="white-space:nowrap">${doc.shots.length} shots · ${formatDuration(total)} · ${doc.shots.length ? frameSizes(doc, renderTools) : ''}${review ? `<span style="color:var(--green)">${counts('approved')} approved</span> · <span style="color:var(--amber)">${counts('rendered')} to review</span>` : ''}</span></div>
+      <span class="sep"></span><div class="filters">${FILTERS.filter(([key]) => review || key !== 'review').map(([key, label]) => `<button class="chip clickable ${state.filter === key ? 'on' : ''}" data-filter="${key}">${label}</button>`).join('')}</div>
       <div class="row" style="margin-left:auto;flex-wrap:nowrap">
       <input type="range" class="range" id="density" min="180" max="420" step="10" value="${state.cardWidth}" style="width:96px" title="Card size">
       ${selected.length > 1 ? `<span class="chip on">${selected.length} selected</span>` : ''}
-      ${selected.length ? `<button class="btn small" id="reshoot" ${availability(actions.directorBlocked())}>${icon('refresh')} Re-shoot ${count(selected.length, 'shot')}</button>` : ''}
+      ${selected.length ? `<button class="btn small" id="reshoot" ${availability(actions.directorBlocked())}>${icon('refresh')} Fix ${count(selected.length, 'shot')}…</button>` : ''}
       <button class="btn small" id="add">${icon('plus')} Shot</button>
       ${estimate ? `<span class="stat" style="white-space:nowrap" title="Roughly how long generating the ${count(todo, 'shot')} to shoot takes, measured on earlier takes of the same models (this production's first, then your other productions' at the same picture size). Checks and retakes add to it.">${icon('clock')} ${esc(estimate)}</span>` : ''}
       ${waiting ? `<button class="chip clickable" id="review-wait" title="The showrunner waits for your review before the edit: approve each take, or mark it for a redo. Assemble still makes a cut now.">${icon('clock')}Waiting for your review: ${count(waiting, 'shot')}</button>` : ''}
@@ -115,19 +116,25 @@ export function mountStoryboard(container, doc) {
       renderTools(); renderBoard(); actions.select(state.focus && shown.has(state.focus) ? state.focus : [...state.selection][0] || null, { additive: false, open: false, keep: true });
     });
     tools.querySelector('#density').oninput = event => { state.cardWidth = +event.target.value; localStorage.setItem('sr.card', state.cardWidth); board.style.setProperty('--card-w', `${state.cardWidth}px`); };
-    tools.querySelector('#add').onclick = () => addShot();
+    tools.querySelector('#add').onclick = () => {
+      const selected = state.doc.shots.map((shot, index) => state.selection.has(shot.id) ? index : -1).filter(index => index >= 0);
+      addShot(selected.length ? selected.at(-1) + 1 : null);
+    };
     tools.querySelector('#plan')?.addEventListener('click', () => actions.direct('plan'));
     tools.querySelector('#shoot')?.addEventListener('click', () => todo ? actions.direct('shoot') : actions.assemble());  // as the timeline's Assemble: at once, by you
-    tools.querySelector('#reshoot')?.addEventListener('click', () => actions.direct('reshoot', '', selected));
+    tools.querySelector('#reshoot')?.addEventListener('click', () => askForFix(selected));
     tools.querySelector('#review-wait')?.addEventListener('click', () => tools.querySelector('[data-filter="review"]').click());
   }
 
   async function addShot(position = null) {
     const doc = state.doc;
-    const last = doc.shots.at(-1);
-    const result = await actions.ops([{ op: 'add_shots', position, shots: [{ title: 'New shot', section: last?.section || '', duration_s: 4, generation: { template: last?.generation?.template || 'gen_video', settings: { prompt: '' } } }] }]);
+    const drawn = shot => shot?.generation?.template === 'draw_svg';
+    if (position === null && drawn(doc.shots.at(-1))) position = doc.shots.length - 1;  // before the closing card
+    const last = doc.shots.at(position === null ? -1 : position - 1);  // it joins the part of the shot it follows
+    const before = doc.shots.slice(0, position ?? doc.shots.length).reverse().find(shot => !drawn(shot)) || doc.shots.find(shot => !drawn(shot));  // a drawn card is no model for a shot
+    const result = await actions.ops([{ op: 'add_shots', position, shots: [{ title: 'New shot', section: last?.section || '', duration_s: 4, generation: { template: before?.generation?.template || 'gen_video', settings: { prompt: '' } } }] }]);
     const id = result?.[0]?.shots?.[0];
-    if (id) actions.select(id);
+    if (id) { actions.select(id); toast('Shot added after the selected one (or at the end): drag its card to move it.', 'ok', 5000); }
   }
 
   function signature(shot, index) {
@@ -148,7 +155,8 @@ export function mountStoryboard(container, doc) {
     element.innerHTML = `<div class="shot-media">
         ${poster ? `<img src="${poster}" alt="" loading="lazy" draggable="false">` : `<div class="ph-art" style="${art(shot.id + shot.section, shot.intent)}"></div><div class="ph"><span>${esc(shot.intent || shot.generation?.settings?.prompt || 'No description yet')}</span></div>`}
         <span class="shot-num">${index + 1}</span>
-        <span class="shot-status">${shot.locked ? `<span class="tag" title="${shot.takes.length ? 'Locked: the showrunner leaves it as it is' : 'Locked before it was shot: it will not be shot nor change'}">${icon('lock')}${shot.takes.length ? '' : ' not shot'}</span>` : ''}<span class="tag ${shot.status}">${rendering ? '<span class="spinner" style="width:10px;height:10px;border-width:1.5px"></span>' : ''}${STATUS_LABEL[shot.status]}</span></span>
+        <span class="shot-status">${shot.locked ? `<span class="tag" title="${shot.takes.length ? 'Locked: the showrunner leaves it as it is' : 'Locked before it was shot: it will not be shot nor change'}">${icon('lock')}${shot.takes.length ? '' : ' not shot'}</span>` : ''}<span class="tag ${shot.status}">${rendering ? '<span class="spinner" style="width:10px;height:10px;border-width:1.5px"></span>' : ''}${shot.status === 'rendered' && !state.doc.brief.review_before_edit ? 'Shot' : STATUS_LABEL[shot.status]}</span></span>
+        ${shot.included ? '' : `<span class="tag shot-excluded" title="Excluded" aria-label="Excluded">${icon('eyeOff')}</span>`}
         <span class="shot-badges">${shot.takes.length > 1 ? `<span class="tag" title="Takes">${icon('layers')}${shot.takes.length}</span>` : ''}${verdict ? `<span class="tag" title="${esc((verdict.by === 'user' ? 'You' : 'Showrunner') + ': ' + (verdict.note || (verdict.ok ? 'good take' : 'needs a redo')))}" style="background:${verdict.ok ? 'rgba(61,220,151,.9)' : 'rgba(255,93,108,.9)'};color:${verdict.ok ? '#002b19' : '#fff'}">${icon(verdict.ok ? 'check' : 'x')}${verdict.by === 'user' ? 'You' : 'Showrunner'}</span>` : ''}</span>
         <span class="shot-duration" title="Its length in the cut${take?.duration_s && Math.abs(take.duration_s - (cutLengths(state.doc).get(shot.id) || 0)) > 0.05 ? ` (the take lasts ${formatDuration(take.duration_s)})` : ''}">${formatDuration(cutLengths(state.doc).get(shot.id) ?? shot.duration_s)}</span>
         ${rendering ? `<span class="shot-progress"><i style="width:${state.renders[shot.id] ?? 30}%"></i></span>` : ''}
@@ -254,6 +262,10 @@ export function mountStoryboard(container, doc) {
     if (!element) { if (event.target === board) actions.select(null, { open: false }); return; }
     actions.select(element.dataset.id, { additive: event.ctrlKey || event.metaKey, range: event.shiftKey });
   });
+  board.addEventListener('dblclick', event => {
+    const element = event.target.closest('.shot');
+    if (element) actions.openShot(element.dataset.id);
+  });
   board.addEventListener('contextmenu', event => {
     const element = event.target.closest('.shot');
     if (!element) return;
@@ -345,7 +357,8 @@ export function shotMenu(anchor, ids) {
     '-',
     ...(one && take?.kind === 'video' && take.has_audio ? [one.sound !== false ? { label: 'Detach Sound', icon: 'scissors', action: () => actions.detachSound(one.id) } : { label: 'Reattach Sound', icon: 'undo', action: () => actions.reattachSound(one.id) }] : []),
     ...(one && take?.settings && Object.keys(take.settings).length ? [{ label: 'Render a new take', icon: 'refresh', unavailable: rendering(one) ? 'This shot is rendering: wait for its take.' : '', action: () => import('./inspector.js').then(module => module.rerun(one.id)) }] : []),
-    { label: `Ask the showrunner to re-shoot${shots.length > 1 ? ` ${shots.length} shots` : ''}`, icon: 'director', unavailable: actions.directorBlocked(), action: () => actions.direct('reshoot', '', shots.map(shot => shot.id)) },
+    ...(one ? [{ label: 'Insert a shot after it…', icon: 'plus', unavailable: actions.directorBlocked(), action: () => askForFix([], null, one.id) }] : []),
+    { label: `Ask the showrunner to fix ${shots.length > 1 ? `${shots.length} shots` : 'it'}…`, icon: 'director', unavailable: actions.directorBlocked(), action: () => askForFix(shots.map(shot => shot.id)) },
     { label: 'Tell the showrunner about it…', icon: 'chat', action: async () => { const text = await promptDialog({ title: 'Note for the showrunner', placeholder: 'Make it a slow push-in, keep her red coat…', multiline: true, ok: 'Send' }); if (text?.trim()) actions.steer(`${shots.map(shot => shot.id).join(', ')}: ${text.trim()}`); } },
     '-',
     ...(one ? [{ label: 'Duplicate', icon: 'copy', action: () => duplicate(one) }] : []),
@@ -358,7 +371,7 @@ async function verdict(shots, ok, note = '') {
 }
 
 async function verdictWithNote(shots) {
-  const note = await promptDialog({ title: 'What should change?', text: 'Your note goes into the shot; the showrunner reads it when it re-shoots (Re-shoot, or Shoot for every shot marked for a redo).', placeholder: 'Her face changes in the last second; keep the camera still…', multiline: true, ok: 'Mark for a redo' });
+  const note = await promptDialog({ title: 'What should change?', text: 'Your note goes into the shot; the showrunner reads it when it shoots the shot again (Fix, or Shoot for every shot marked for a redo).', placeholder: 'Her face changes in the last second; keep the camera still…', multiline: true, ok: 'Mark for a redo' });
   if (note === null) return;
   await verdict(shots, false, note);
 }

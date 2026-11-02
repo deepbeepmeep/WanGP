@@ -2,12 +2,15 @@
 // Cast: the people and recurring things of the production, with their reference pictures, master image and voice.
 import { state, actions } from './app.js';
 import { api } from './api.js';
-import { icon, esc, art, h, fieldSaver, pickFiles, confirmDialog, promptDialog, toast, availability, AUDIO_ACCEPT } from './ui.js';
+import { icon, esc, art, h, fieldSaver, pickFiles, confirmDialog, promptDialog, toast, availability, AUDIO_ACCEPT, personFields } from './ui.js';
 import { BIN_TYPE } from './storyboard.js';
+
+// The shots a cast member appears in that already have a take.
+function shot_ids(member) { return state.doc.shots.filter(shot => shot.cast.includes(member.id) && shot.takes.length).map(shot => shot.id); }
 
 export function mountCast(container) {
   container.innerHTML = `<div class="toolbar"><h2>Cast</h2><span class="stat" id="cast-stat"></span><div class="grow"></div>
-    <button class="btn small" id="cast-ask">${icon('director')} Ask the showrunner for master images</button><button class="btn primary small" id="cast-add">${icon('plus')} Add</button></div><div class="cast-grid" id="cast"></div>`;
+    <button class="btn small" id="cast-ask">${icon('director')} Ask the showrunner for master images</button><button class="btn small" id="cast-add-place" title="A location that stays the same from shot to shot">${icon('plus')} Add a place</button><button class="btn primary small" id="cast-add">${icon('plus')} Add</button></div><div class="cast-grid" id="cast"></div>`;
   const grid = container.querySelector('#cast');
   const save = fieldSaver((id, fields) => actions.ops([{ op: 'update_cast', cast: id, fields }], { quiet: true }).catch(error => toast(error.message, 'error')), 450);
   let loras = null;  // the LoRA choices, once Settings has LoRAs on cast cards on
@@ -30,9 +33,13 @@ export function mountCast(container) {
 
   container.querySelector('#cast-add').onclick = async () => {
     const name = await promptDialog({ title: 'Who or what is it?', placeholder: 'Mia, the lead singer', ok: 'Add' });
-    if (name?.trim()) actions.ops([{ op: 'add_cast', fields: { name: name.trim() } }]);
+    if (name?.trim()) actions.ops([{ op: 'add_cast', fields: personFields(name) }]);
   };
-  container.querySelector('#cast-ask').onclick = () => actions.direct('message', 'Make a master image for every cast member that has none (front-facing, neutral background, consistent with the brief and style), and record each one with the cast action.');
+  container.querySelector('#cast-add-place').onclick = async () => {
+    const name = await promptDialog({ title: 'Which place?', text: 'Shots that list this place get its picture as a reference, so the set stays the same. Drop your own photo on its card, or ask the showrunner for a picture.', placeholder: 'The Kitchen Kings Live studio', ok: 'Add' });
+    if (name?.trim()) actions.ops([{ op: 'add_cast', fields: { name: name.trim(), role: 'place', description: '' } }]);
+  };
+  container.querySelector('#cast-ask').onclick = () => actions.direct('message', 'Make a master image for every cast member that has none (front-facing, neutral background, consistent with the brief and style; for a place, a wide view of it as the viewer should see it, without the cast or words, with the crowd that belongs to it), and record each one with the cast action.');
 
   function render() {
     const doc = state.doc;
@@ -42,8 +49,8 @@ export function mountCast(container) {
     ask.disabled = !!reason;
     ask.title = reason;
     grid.innerHTML = doc.cast.map(member => {
-      const master = member.master || member.images[0];
-      const uses = doc.shots.filter(shot => shot.cast.includes(member.id)).length;
+      const master = member.master || member.images[0], place = ['place', 'location', 'set'].includes((member.role || '').trim().toLowerCase());
+      const uses = doc.shots.filter(shot => shot.cast.includes(member.id) || (shot.dialogue || []).some(line => line.speaker === member.id)).length;  // a narrator is in the shots it speaks in
       return `<article class="cast-card" data-cast="${member.id}">
         <div class="cast-hero">${master ? `<img src="${actions.file(master)}" alt="">` : `<div class="ph" style="${art(member.id, member.name)}"><div>${icon('image')}<div style="color:#fff;margin-top:6px">Drop a photo here</div></div></div>`}
           <button class="btn small icon lock ${member.locked ? 'active' : ''}" data-lock title="${member.locked ? 'Locked' : 'Lock: the showrunner keeps this look'}">${icon(member.locked ? 'lock' : 'unlock')}</button></div>
@@ -52,13 +59,14 @@ export function mountCast(container) {
         <div class="cast-body">
           <input class="input cast-name" data-field="name" value="${esc(member.name)}" placeholder="Name" title="Name: click to edit">
           <input class="input" data-field="role" value="${esc(member.role)}" placeholder="Role (lead singer, villain, the red car…)">
-          <textarea class="textarea" data-field="description" rows="3" placeholder="Look, age, clothes, what must stay the same in every shot…">${esc(member.description)}</textarea>
+          <textarea class="textarea" data-field="description" rows="3" placeholder="${place ? 'What the place looks like, what must stay the same in every shot…' : 'Look, age, clothes, what must stay the same in every shot…'}">${esc(member.description)}</textarea>
           ${member.looks?.length ? `<div class="looks">${member.looks.map(look => `<span class="look" title="${esc(look.description || look.name)}">${look.master ? `<img src="${actions.file(look.master)}" alt="">` : ''}<b>${esc(look.name || 'Look')}</b><span class="muted">${esc([...(look.sections || []), ...(look.shots || []).map(id => `shot ${state.doc.shots.findIndex(shot => shot.id === id) + 1}`)].join(', ') || 'no sequence')}</span></span>`).join('')}</div>` : ''}
-          <textarea class="textarea" data-field="voice_description" rows="2" placeholder="Voice: age, timbre, accent, pace (the showrunner makes the voice sample from it; every line is spoken in it)">${esc(member.voice_description || '')}</textarea>
+          ${place ? '' : `<textarea class="textarea" data-field="voice_description" rows="2" placeholder="Voice: age, timbre, accent, pace (the showrunner makes the voice sample from it; every line is spoken in it)">${esc(member.voice_description || '')}</textarea>
           <div class="voice">${icon('audio')}${member.voice ? `<audio controls src="${actions.file(member.voice)}" style="height:30px;flex:1"></audio>` : `<span class="muted grow">No voice sample · drop audio here</span>`}<button class="btn small" data-add-voice>${member.voice ? 'Replace' : 'Add'}</button>${member.voice ? `<button class="btn small ghost icon" data-drop-voice title="Remove the voice sample (the showrunner makes a new one from the description)">${icon('x')}</button>` : ''}</div>
-          ${loraRow(member)}
+          ${loraRow(member)}`}
           <div class="row"><span class="muted" style="font-size:12.5px">In ${uses} ${uses === 1 ? 'shot' : 'shots'}</span><span class="grow"></span>
-            <button class="btn small" data-new-picture ${availability(blocked, 'The showrunner makes a new reference picture from the description (after a recast, or when the picture no longer matches it)')}>${icon('wand')} New picture</button>
+            <button class="btn small" data-new-picture ${availability(blocked, 'Asks the showrunner for a new reference picture from the description, after a recast or when the picture no longer matches it (a few minutes)')}>${icon('wand')} New picture</button>
+            ${shot_ids(member).length ? `<button class="btn small" data-reshoot-cast ${availability(blocked, `Asks the showrunner to shoot again the ${shot_ids(member).length} shots showing them, with their look and voice as they are now`)}>${icon('play')} Re-shoot ${shot_ids(member).length}</button>` : ''}
             <button class="btn small ghost danger" data-remove>${icon('trash')}</button></div>
         </div></article>`;
     }).join('') + `<div class="add-shot" id="cast-drop" style="min-height:320px"><div class="col" style="align-items:center;text-align:center;padding:20px">${icon('users')}<b>Add a person or a thing</b><span class="muted">Drop photos here: each new photo becomes a cast member</span></div></div>`;
@@ -79,6 +87,7 @@ export function mountCast(container) {
         const field = name => card.querySelector(`[data-lora-field="${name}"]`).value;
         save(id, { lora: { ...member.lora, trigger: field('trigger'), multiplier: +field('multiplier') || 0 } });
       }));
+      card.querySelector('[data-reshoot-cast]')?.addEventListener('click', () => { save.flush(); actions.direct('reshoot', `${member.name || id} changed: shoot again the shots showing them, with their look and voice as they are now.`, shot_ids(member)); });
       card.querySelector('[data-new-picture]').onclick = () => { save.flush(); actions.direct('message', `Make a new reference picture of ${member.name || id} (${id}) from their description as it is now, make it their master, and tell me which shots should be shot again with it.`); };
       card.querySelector('.cast-hero img')?.addEventListener('click', event => {  // the whole picture, uncropped
         const back = h(`<div class="modal-back"><img src="${event.target.src}" alt="" style="max-width:calc(100% - 48px);max-height:calc(100% - 48px);border-radius:12px;box-shadow:var(--shadow-lg);cursor:zoom-out"></div>`);
@@ -96,7 +105,8 @@ export function mountCast(container) {
         actions.ops([{ op: 'update_cast', cast: id, fields: { images, master: member.master === button.dataset.dropImage ? images[0] || null : member.master } }]);
       });
       card.querySelector('[data-drop-voice]')?.addEventListener('click', () => actions.ops([{ op: 'update_cast', cast: id, fields: { voice: null } }]));
-      card.querySelector('[data-add-voice]').onclick = async () => { const files = await pickFiles(AUDIO_ACCEPT, false); if (files.length) actions.upload(files, 'cast', id); };
+      const addVoice = card.querySelector('[data-add-voice]');  // a place has none
+      if (addVoice) addVoice.onclick = async () => { const files = await pickFiles(AUDIO_ACCEPT, false); if (files.length) actions.upload(files, 'cast', id); };
       card.querySelector('[data-remove]').onclick = async () => {
         if (await confirmDialog({ title: `Remove ${member.name || 'this cast member'}?`, text: 'Shots stop referencing them; their pictures stay in the production folder.', ok: 'Remove', danger: true })) actions.ops([{ op: 'remove_cast', cast: id }]);
       };

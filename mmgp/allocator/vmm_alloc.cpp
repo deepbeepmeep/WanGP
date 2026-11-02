@@ -243,6 +243,7 @@ using Event = std::shared_ptr<CUevent_st>;  // recorded when memory was freed, s
 using MempoolId = std::pair<unsigned long long, unsigned long long>;  // c10::cuda::MempoolId_t
 using CaptureFilter = std::function<bool(CUstream)>;                  // true for the streams that allocate to a capture's pool
 thread_local bool warmup_paused = false;
+thread_local bool long_lived = false;
 thread_local char thread_tag;  // its address identifies the calling thread: a warmup routes the allocations of its own thread only
 
 struct Range {
@@ -1794,6 +1795,7 @@ void* planned_graph_allocation(Device& d, const MempoolId& id, size_t size, CUst
 
 EXPORT void* vmm_alloc(size_t size, int device, CUstream stream) {
     if (size == 0) return nullptr;
+    if (long_lived) stream = nullptr;
     size_t threshold = debug_threshold.load(std::memory_order_relaxed);
     int64_t origin = -1;
     if (threshold && size >= threshold && !in_debug_origin) {  // debug mode: asked to Python before taking the lock, as it takes the GIL
@@ -2206,6 +2208,12 @@ EXPORT void vmm_end_warmup(int device, unsigned long long first, unsigned long l
     }
 }
 
+EXPORT int vmm_long_lived(int on) {  // this thread's next allocations stay, among the default stream's memory (long_lived_allocations)
+    int previous = long_lived;
+    long_lived = on != 0;
+    return previous;
+}
+
 EXPORT int vmm_pause_warmup(int paused) {
     int previous = warmup_paused;
     warmup_paused = paused != 0;
@@ -2222,6 +2230,15 @@ EXPORT void vmm_release_pool(int device, MempoolId id) {
         RelaxedCapture relaxed(any_capture());
         release_pool_memory(d, pool);
     }
+}
+
+EXPORT int64_t vmm_graph_pools(int device) {  // graph pools in use: every CUDA graph, warmup and allocation of theirs holds one
+    std::lock_guard<std::mutex> guard(lock);
+    auto found = devices.find(device);
+    if (found == devices.end()) return 0;
+    int64_t count = 0;
+    for (auto& entry : found->second.pools) count += !entry.second.ordinary && (entry.second.use_count > 0 || entry.second.live > 0);
+    return count;
 }
 
 EXPORT int64_t vmm_pool_live(int device, unsigned long long first, unsigned long long second) {  // allocations alive in a graph pool

@@ -133,6 +133,10 @@ def install(mode="vmm", large_mb=256, chunk_mb=32, spill=False):
     lib.vmm_in_pool.restype = ctypes.c_int
     lib.vmm_storage_shared.argtypes = (ctypes.c_void_p, ctypes.c_int)
     lib.vmm_storage_shared.restype = ctypes.c_int
+    lib.vmm_long_lived.argtypes = (ctypes.c_int,)
+    lib.vmm_long_lived.restype = ctypes.c_int
+    lib.vmm_graph_pools.argtypes = (ctypes.c_int,)
+    lib.vmm_graph_pools.restype = ctypes.c_int64
     _install_oom_error(lib)
     _lib, active = lib, mode
     _redirect_torch_memory_functions()
@@ -189,6 +193,11 @@ def graph_warmup(pool):
     finally:
         _warmup.depth -= 1
         _lib.vmm_end_warmup(device, *pool, token)
+
+
+def no_graphs(device=None):
+    """No CUDA graph exists on this device: each one holds its pool. Only this allocator knows, so False under any other."""
+    return active == "vmm" and not _lib.vmm_graph_pools(_device_index(device))
 
 
 def pool_live(pool, device=None):
@@ -315,6 +324,20 @@ def normal_allocations():
         yield
     finally:
         _lib.vmm_pause_warmup(previous)
+
+
+@contextlib.contextmanager
+def long_lived_allocations():
+    """For a small allocation that stays, whichever stream asks for it (a library's workspace): it goes among the default stream's memory, whose
+    chunks other tensors use too, rather than taking a whole chunk in that stream's pool. What it frees must have nothing in flight."""
+    if active != "vmm":
+        yield
+        return
+    previous = _lib.vmm_long_lived(1)
+    try:
+        yield
+    finally:
+        _lib.vmm_long_lived(previous)
 
 
 def stats(device=None):

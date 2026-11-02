@@ -19,6 +19,11 @@ class DLSSGTemporalUpsampler(api.SimpleScaleSuffixMixin):
     def config(self):
         return DLSS5SpatialUpsampler.normalize_config_section(spatial_api.read_config_section_by_key(self.server_config, "dlss5"))
 
+    def query_checkpoint_inventory(self):
+        from preprocessing.processors import query_preprocessor_download_def
+
+        return [{"name": "DLSS 5", "variant": "Frame Generation - RAFT Optical Flow", "download_defs": [query_preprocessor_download_def("flow")]}]
+
     def query_download_defs(self, enabled_only=True):
         from preprocessing.processors import query_preprocessor_download_def
 

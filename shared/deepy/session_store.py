@@ -417,6 +417,30 @@ def _compact_replay_event_classes(event: dict[str, Any]) -> dict[str, Any]:
     return event
 
 
+def read_ui_updates(directory: str | os.PathLike, after: int = 0) -> dict[str, Any]:
+    """What Deepy's window needs to show a saved conversation: the updates its journal gained since `after` (a position in the file, 0 for all of it),
+    each message and block at its latest. A journal that went back (the conversation was rewound) starts again, with `restart`."""
+    path = Path(directory) / UI_JOURNAL_FILENAME
+    if not path.is_file():
+        return {"next": 0, "restart": after > 0, "events": []}
+    restart = after > path.stat().st_size
+    with path.open("rb") as file:
+        file.seek(0 if restart else after)
+        data = file.read()
+    data = data[:data.rfind(b"\n") + 1]  # a line still being written waits for the next call
+    latest: dict[tuple, dict[str, Any]] = {}
+    for line in data.splitlines():
+        event = json.loads(line).get("event") or {}
+        if event.get("type") == "upsert_message":  # it holds its blocks
+            latest = {key: value for key, value in latest.items() if key[0] != event["message"]["id"]}
+            latest[(event["message"]["id"], "")] = event
+        elif event.get("type") == "upsert_block":
+            latest[(event["message_id"], event["block_id"])] = event
+        elif event.get("type") in ("remove_message", "remove_block"):
+            latest[(event["message_id"], event.get("block_id") or "", "removed", len(latest))] = event
+    return {"next": (0 if restart else after) + len(data), "restart": restart, "events": list(latest.values())}
+
+
 def _read_ui_journal(directory: Path, *, max_sequence: int | None = None) -> tuple[list[dict[str, Any]], int, int]:
     path = directory / UI_JOURNAL_FILENAME
     if not path.is_file():

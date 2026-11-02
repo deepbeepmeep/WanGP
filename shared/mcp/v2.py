@@ -60,6 +60,7 @@ MEDIA_DISCOVERY_DESCRIPTIONS = {
     "inspect_video": "Answer question about a video from automatically sampled frames: media_id, question, optional start_s / end_s (default: the whole video).",
     "view_media": "Return images or chosen video frames, optionally cropped, sized or tiled into a contact sheet, for your own visual inspection.",
     "inspect_audio": "Measure audio/video on CPU: peak/RMS, clipping indicators, loudness and silence; optionally return a playable excerpt.",
+    "check_lip_sync": "Measure whether the lips of one shot follow its voice: media_id, optional start_s, duration_s, voice_id (the voice alone).",
     "merge_videos": "Join up to 32 videos end to end (media_ids), with optional transitions between them.",
     "render_3d_views": "Render views of a 3D asset at one shared scale (named views or angles, animation frame, zoom, focus) as Gallery images, or a 360-degree turntable video with turntable_s.",
     "draw_svg": "Draw a Gallery image or animated clip from SVG markup (shapes, text, gradients, filters; Gallery images or authorized files embedded), or exact on-screen text and graphics burned over a video (video_id; never subtitles).",
@@ -884,6 +885,7 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
         actions = {item["name"]: {"description": item["description"], "parameters": {**item["parameters"], "additionalProperties": False}} for item in core._toolbox_discovery(get_toolbox(), policy.read_enabled) if item["name"] not in {"search_doc", "load_doc_section", "get_media_details"}}
         if not extended:
             actions.pop("inspect_audio", None)
+            actions.pop("check_lip_sync", None)
         if (deepy_help or extended) and "replace_audio" in actions:
             actions.pop("replace_audio")
             actions["remux_media"] = action_def(

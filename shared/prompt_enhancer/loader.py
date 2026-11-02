@@ -17,13 +17,10 @@ from .florence2.image_processing_florence2 import Florence2ImageProcessorLite
 from transformers import AutoTokenizer, BartTokenizer, BartTokenizerFast
 
 from .assets import (
-    FLORENCE2_FILES,
+    florence_llama_download_def,
     FLORENCE2_FOLDER,
-    LLAMA32_FILES,
     LLAMA32_FOLDER,
-    LLAMAJOY_FILES,
     LLAMAJOY_FOLDER,
-    PROMPT_ENHANCER_REPO,
 )
 from shared.deepy.config import resolve_deepy_kv_cache_quantization
 from .config import resolve_prompt_enhancer_speculative_decoding, speculative_decoding_runtime
@@ -42,25 +39,8 @@ class PromptEnhancerRuntime:
 
 def ensure_prompt_enhancer_assets(process_files_def, enhancer_enabled: int, qwen_backend: str = "quanto_int8", speculative_decoding: bool = False):
     enhancer_enabled = int(enhancer_enabled)
-    if enhancer_enabled == 1:
-        process_files_def(
-            repoId=PROMPT_ENHANCER_REPO,
-            sourceFolderList=[FLORENCE2_FOLDER, LLAMA32_FOLDER],
-            fileList=[
-                FLORENCE2_FILES,
-                LLAMA32_FILES,
-            ],
-        )
-        return
-    if enhancer_enabled == 2:
-        process_files_def(
-            repoId=PROMPT_ENHANCER_REPO,
-            sourceFolderList=[FLORENCE2_FOLDER, LLAMAJOY_FOLDER],
-            fileList=[
-                FLORENCE2_FILES,
-                LLAMAJOY_FILES,
-            ],
-        )
+    if enhancer_enabled in (1, 2):
+        process_files_def(**florence_llama_download_def(enhancer_enabled))
         return
     if enhancer_enabled in (3, 4, 5, 6):
         from .qwen35_vl import ensure_qwen35_prompt_enhancer_assets, get_qwen35_prompt_enhancer_variant

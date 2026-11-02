@@ -16,6 +16,9 @@ import gradio as gr
 from shared.utils.config_store import config_lock, write_config
 
 from shared.deepy.config import (
+    DEEPY_KEPT_KV_CACHES_DEFAULT,
+    DEEPY_KEPT_KV_CACHES_KEY,
+    normalize_deepy_kept_kv_caches,
     DEEPY_CONTEXT_TOKENS_DEFAULT,
     DEEPY_CONTEXT_TOKENS_KEY,
     DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY,
@@ -136,6 +139,7 @@ class DeepyController:
     def __init__(self, deps: DeepyDeps):
         self._deps = deps
         self._active_assistant_session: Any | None = None
+        self._kept_contexts: dict[str, dict[str, Any]] = {}  # the KV caches (copies in RAM) of the conversations set aside: one per owner, oldest first
         self._queue_state_lock = threading.RLock()
         self._session_mode = normalize_deepy_session_mode(self._server_config().get(DEEPY_MULTI_SESSION_KEY, DEEPY_MULTI_SESSION_DEFAULT))
         self._multi_session_enabled = normalize_deepy_multi_session(self._session_mode)
@@ -1126,6 +1130,7 @@ class DeepyController:
         session = get_or_create_assistant_session(state)
         with session.turn_lock:
             parked = {"chat_session_id": session.chat_session_id, "gallery_workspace_id": session.gallery_workspace_id}
+            self._keep_context(session, session.chat_session_id)
             if session.storage_session_id:
                 session_store.flush_session(session)
                 parked["storage_id"] = session.storage_session_id
@@ -1140,12 +1145,32 @@ class DeepyController:
             self.release_vram(state, True, discard_runtime_snapshot=True, preserve_reset_base=True)
         return parked
 
+    def _keep_context(self, session, owner: str) -> None:
+        """A conversation set aside (a plugin job that ends, the user's chat during a job) leaves its KV cache in RAM: when it comes back it goes on from it, without a prefill."""
+        self._kept_contexts.pop(owner, None)
+        if session.runtime_snapshot is not None and session.rendered_token_ids and session.pending_action_replay is None:
+            self._kept_contexts[owner] = {"runtime_snapshot": session.runtime_snapshot, "rendered_token_ids": list(session.rendered_token_ids), "rendered_messages_len": session.rendered_messages_len,
+                                          "rendered_system_prompt_signature": session.rendered_system_prompt_signature, "rendered_context_window_tokens": session.rendered_context_window_tokens}
+
+    def _take_kept_context(self, session, owner: str | None, live: bool = False) -> None:
+        """The conversation now current, once loaded, takes its KV cache back: it reaches the GPU with its next request, and what no longer matches token for token prefills as usual.
+        The oldest others make way so that at most the configured number stays, the current one's included (live: it is about to have one)."""
+        kept = self._kept_contexts.pop(owner, None)
+        if kept is not None:
+            for name, value in kept.items():
+                setattr(session, name, value)
+            session.pending_replay_reason = ""
+        room = normalize_deepy_kept_kv_caches(self._server_config().get(DEEPY_KEPT_KV_CACHES_KEY, DEEPY_KEPT_KV_CACHES_DEFAULT)) - (live or session.runtime_snapshot is not None)
+        while len(self._kept_contexts) > max(room, 0):
+            self._kept_contexts.pop(next(iter(self._kept_contexts)))
+
     def open_external_session(self, state, directory, title: str | None, new_title: str) -> dict[str, Any]:
         """Make a session folder outside the catalog the conversation; an empty folder starts a new session."""
         session = get_or_create_assistant_session(state)
         storage_id = session_store.open_external_session(directory)
         with session.turn_lock:
             if storage_id is None:
+                self._take_kept_context(session, None, live=True)
                 session.storage_title = title or new_title
                 session_store.ensure_session(session, "", self.get_deepy_type(), session_store.GALLERY_MEDIA_LINK, self._session_environment(session), media_import=True, directory=directory)
                 return {"event": assistant_chat.build_reset_event(session), "resumed": False, "missing_media": []}
@@ -1157,6 +1182,7 @@ class DeepyController:
                 raise
             if title:
                 session.storage_title = title
+            self._take_kept_context(session, storage_id, live=True)
             return {"event": assistant_chat.build_replay_batch(session, loaded["replay_commands"]), "resumed": True, "missing_media": loaded["missing_media"]}
 
     def unpark_conversation(self, state, parked: dict[str, Any]) -> dict[str, Any]:
@@ -1164,12 +1190,14 @@ class DeepyController:
         session = get_or_create_assistant_session(state)
         with session.turn_lock:
             plugin_id = session.storage_session_id
+            self._keep_context(session, plugin_id)
             session_store.start_new_session(session)
             session_store.close_external_session(plugin_id)
             self.release_vram(state, True, discard_runtime_snapshot=True, preserve_reset_base=True)
             storage_id = parked.get("storage_id") or parked.get("parked_id")
             if storage_id is None:
                 session.chat_session_id, session.gallery_workspace_id = parked["chat_session_id"], parked["gallery_workspace_id"]
+                self._take_kept_context(session, parked["chat_session_id"])
                 return {"event": assistant_chat.build_reset_event(session), "prefill": False}
             loaded = session_store.load_session(session, storage_id, self.get_deepy_type())
             if "parked_id" in parked:
@@ -1178,7 +1206,9 @@ class DeepyController:
                 session_store.close_external_session(storage_id)
                 shutil.rmtree(parked["parked_dir"])
             session.chat_session_id, session.gallery_workspace_id = parked["chat_session_id"], parked["gallery_workspace_id"]
-            return {"event": assistant_chat.build_replay_batch(session, loaded["replay_commands"]), "prefill": True}
+            self._take_kept_context(session, parked["chat_session_id"])
+            # Its cards are back; its context comes back when the user writes to it, unless an interrupted action has to go on.
+            return {"event": assistant_chat.build_replay_batch(session, loaded["replay_commands"]), "prefill": session.pending_action_replay is not None}
 
     def prefill_restored_session_context(self, state, *, replay_pending: bool = False):
         session = get_or_create_assistant_session(state)

@@ -53,6 +53,7 @@ export const api = {
   chooseDefaultTemplate: (role, template) => call('POST', 'templates', { role, template }),
   guide: () => call('GET', 'guide'),
   settings: () => call('GET', 'settings'),
+  conversation: (id, after) => call('GET', `productions/${id}/conversation?after=${after}`),
   saveSettings: settings => call('POST', 'settings', settings),
   castLoras: id => call('GET', `productions/${id}/loras`),
   addText: (id, text) => call('POST', `productions/${id}/text`, text),

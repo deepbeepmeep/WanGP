@@ -1,5 +1,7 @@
 // Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 // Shot inspector: watch and compare takes, judge them, and edit everything the director will use.
+import { COMPARE_SEEK, bindCompareSeek } from './ui.js';
+import { askForFix } from './fix.js';
 import { state, actions } from './app.js';
 import { api } from './api.js';
 import { icon, esc, art, fieldSaver, formatDuration, toast, promptDialog, menu, confirmDialog, shotRefs, shotText, availability } from './ui.js';
@@ -12,6 +14,8 @@ const TRANSITIONS = [['cut', 'Cut'], ['crossfade', 'Dissolve'], ['fade_black', '
 export async function rerun(shotId) {
   try { await api.rerun(state.pid, shotId); toast('Rendering a new take…'); } catch (error) { toast(error.message, 'error', 7000); }
 }
+
+function loopOn() { try { return localStorage.getItem('sr.loop') === '1'; } catch { return false; } }  // off unless this viewer turned it on
 
 export function mountInspector(root) {
   let shownId = null, compareId = null, signatureShown = '', promptOpen = false;  // the prompt is the showrunner's: folded unless opened
@@ -50,18 +54,19 @@ export function mountInspector(root) {
       ${shot.status === 'failed' ? failure(shot, doc) : ''}
       ${take ? `<div class="verdict-row">
           <button class="btn approve ${shot.status === 'approved' ? 'active' : ''}" id="i-approve">${icon('check')} Approve</button>
-          <button class="btn reject ${shot.status === 'rejected' && verdict?.by === 'user' ? 'active' : ''}" id="i-reject" title="Mark the take for a redo, with a note for the showrunner">${icon('x')} Redo…</button>
-          ${take.settings && Object.keys(take.settings).length ? `<button class="btn" id="i-rerun" ${availability(rendering ? 'This shot is rendering: wait for its take.' : '', 'Render a new take now from this shot\'s settings and prompt, without the showrunner')}>${icon('refresh')} New take</button>` : ''}</div>
+          <button class="btn primary" id="i-fix" ${availability(actions.directorBlocked(), 'Say what is wrong or what should change: the showrunner fixes this shot and keeps the rest')}>${icon('director')} Fix…</button>
+          ${doc.brief.review_before_edit ? `<button class="btn reject ${shot.status === 'rejected' && verdict?.by === 'user' ? 'active' : ''}" id="i-reject" title="Mark the take for a redo, with a note for the showrunner, and carry on reviewing">${icon('x')} Redo…</button>` : ''}
+          ${take.settings && Object.keys(take.settings).length ? `<button class="btn" id="i-rerun" ${availability(rendering ? 'This shot is rendering: wait for its take.' : '', 'Another take now, from the same prompt and settings: nobody is told what was wrong. To say it, use Fix.')}>${icon('refresh')} Same again</button>` : ''}</div>
         ${[verdict, verdict?.by === 'user' && take.showrunner_verdict].filter(Boolean).map(item => `<div class="verdict-note ${item.ok ? 'ok' : 'bad'}">${icon(item.ok ? 'check' : 'alert')}<span><b>${item.by === 'user' ? 'You' : 'Showrunner'}:</b> ${shotRefs(item.note || (item.by === 'user' ? (item.ok ? 'Approved.' : 'Marked for a redo.') : item.ok ? 'Good take.' : 'Needs a retry.'), doc.shots, doc.cast)}</span></div>`).join('')}
         ${checksHtml(take)}` : `<div class="verdict-row"><button class="btn primary" id="i-shoot" ${availability(rendering ? 'This shot is rendering: wait for its take.' : actions.directorBlocked())}>${icon('clapper')} ${rendering ? 'Rendering…' : 'Shoot this shot'}</button></div>`}
-      <div class="field"><div class="label">${icon('sparkles')} What happens</div><textarea class="textarea" id="i-intent" rows="3" placeholder="${doc.brief.kind === 'music_video' ? 'The singer turns to the camera as the chorus starts…' : 'She hears the radio crackle and turns to the window…'}">${esc(shot.intent)}</textarea></div>
+      <div class="field"><div class="label">${icon('sparkles')} What happens</div><textarea class="textarea" id="i-intent" rows="3" placeholder="${{ music_video: 'The singer turns to the camera as the chorus starts…', ad: 'The product in use, close up, the moment it pays off…', story: 'The fox finds the lantern at the edge of the wood…' }[doc.brief.kind] || 'She hears the radio crackle and turns to the window…'}">${esc(shot.intent)}</textarea></div>
       <div class="field"><div class="label">${icon('chat')} Dialogue <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">words spoken or sung in this shot</span></div>
         <div class="dialogue" id="i-dialogue">${(shot.dialogue || []).map(item => lineRow(item, doc)).join('')}</div>
         <button class="btn small ghost" id="i-add-line" style="align-self:flex-start">${icon('plus')} Line</button></div>
       <details class="details" id="i-prompt-box" ${promptOpen ? 'open' : ''}><summary>${icon('chevron')} Prompt <span class="muted" id="i-count" style="font-weight:500">written by the showrunner from what happens, the camera and the cast · ${(settings.prompt || '').length} chars</span></summary>
         <textarea class="textarea" id="i-prompt" rows="6" style="margin-top:8px" placeholder="The showrunner writes the full generation prompt here.">${esc(settings.prompt || '')}</textarea></details>
       <div class="insp-grid">
-        <div class="field"><div class="label">${icon('clock')} Duration</div><input class="input" id="i-duration" type="number" min="0.5" max="60" step="0.1" value="${shot.duration_s ?? ''}"></div>
+        <div class="field"><div class="label">${icon('clock')} Duration ${take?.duration_s ? `<span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500" title="What the edit plays of this shot's video">plays ${(segments(doc, actions.take).find(item => item.shot.id === shot.id)?.duration ?? 0).toFixed(1)} s of ${take.duration_s.toFixed(1)} s</span>` : ''}</div><input class="input" id="i-duration" type="number" min="0.5" max="60" step="0.1" value="${shot.duration_s ?? ''}"></div>
         <div class="field"><div class="label">${icon('layers')} Section</div><input class="input" id="i-section" list="i-sections" value="${esc(shot.section)}"><datalist id="i-sections">${sections.map(name => `<option value="${esc(name)}">`).join('')}</datalist></div>
         <div class="field" style="grid-column:1/-1"><div class="label">${icon('video')} Camera</div><input class="input" id="i-camera" value="${esc(shot.camera)}" placeholder="Slow dolly-in, low angle…"></div>
         <div class="field" style="grid-column:1/-1"><div class="label">${icon('bolt')} Model</div><select class="select" id="i-model" title="The Deepy template that renders this shot">
@@ -80,7 +85,7 @@ export function mountInspector(root) {
       ${take?.kind === 'video' ? speedField(shot, doc) : ''}
       ${take?.kind === 'video' && take.has_audio ? soundField(shot, take, doc) : ''}
       <div class="field"><div class="label">${icon('note')} Notes for the showrunner</div><textarea class="textarea" id="i-notes" rows="2" placeholder="Anything to keep in mind for this shot…">${esc(shot.notes)}</textarea></div>
-      <div class="row"><button class="btn grow" id="i-ask">${icon('director')} Ask the showrunner</button><button class="btn grow" id="i-reshoot" ${availability(actions.directorBlocked())}>${icon('refresh')} Re-shoot</button></div>
+      ${take ? '' : `<div class="row"><button class="btn grow" id="i-ask">${icon('director')} Ask the showrunner</button><button class="btn grow" id="i-reshoot" ${availability(actions.directorBlocked())}>${icon('refresh')} Fix…</button></div>`}
       <details class="details"><summary>${icon('chevron')} Generation settings · ${esc(templateLabel(shot.generation?.template))}</summary>
         <div class="col" style="margin-top:10px"><input class="input mono" id="i-template" value="${esc(shot.generation?.template || 'gen_video')}">
         <textarea class="textarea json" id="i-settings" spellcheck="false">${esc(JSON.stringify(settings, null, 2))}</textarea><div class="muted" style="font-size:12px">JSON merged into the shot's settings when you leave the field.</div></div></details>
@@ -93,11 +98,14 @@ export function mountInspector(root) {
     if (!take) return `<div class="ph-art" style="position:absolute;inset:0;${art(shot.id + shot.section, shot.intent)}"></div><div class="empty" style="color:rgba(255,255,255,.85)">${esc(shot.intent || 'Not shot yet')}</div>`;
     if (take.kind === 'image') return `<img src="${actions.file(take.path)}" alt="">`;
     if (take.kind === 'audio') return `<div class="empty"><audio controls src="${actions.file(take.path)}" style="width:90%"></audio></div>`;
-    if (!compare) return `<video src="${actions.file(take.path)}" controls loop playsinline preload="metadata" poster="${take.poster ? actions.file(take.poster) : ''}"></video>`;
-    return `<video id="cmp-a" src="${actions.file(take.path)}" loop playsinline muted></video>
-      <div class="compare" id="cmp-clip" style="clip-path:inset(0 0 0 50%)"><video id="cmp-b" src="${actions.file(compare.path)}" loop playsinline muted></video></div>
+    const loop = loopOn() ? 'loop' : '';
+    if (!compare) return `<video src="${actions.file(take.path)}" controls ${loop} playsinline preload="metadata" poster="${take.poster ? actions.file(take.poster) : ''}"></video>
+      <button class="btn small player-loop ${loop ? 'active' : ''}" id="i-loop" role="switch" aria-checked="${!!loop}" title="Play this video again and again">${icon('refresh')}<span>Loop</span></button>`;
+    return `<video id="cmp-a" src="${actions.file(take.path)}" ${loop} playsinline muted></video>
+      <div class="compare" id="cmp-clip" style="clip-path:inset(0 0 0 50%)"><video id="cmp-b" src="${actions.file(compare.path)}" ${loop} playsinline muted></video></div>
       <div class="compare-handle" id="cmp-handle" style="left:50%"></div>
       <span class="tag compare-label" style="left:8px">A · used</span><span class="tag compare-label" style="right:8px;left:auto;background:rgba(56,225,208,.85);color:#002b28">B</span>
+      ${COMPARE_SEEK}
       <div class="row" style="position:absolute;bottom:8px;left:50%;transform:translateX(-50%);z-index:4;flex-wrap:nowrap"><button class="btn small" id="cmp-play">${icon('play')} Play both</button>
         <button class="btn small" id="cmp-use" title="Use take B in the edit">${icon('check')} Use B</button><button class="btn small" id="cmp-done">${icon('x')} Done</button></div>`;
   }
@@ -180,8 +188,9 @@ export function mountInspector(root) {
     });
     root.querySelector('#i-rerun')?.addEventListener('click', () => rerun(id));
     root.querySelector('#i-shoot')?.addEventListener('click', () => actions.direct('reshoot', '', [id]));
-    root.querySelector('#i-reshoot').onclick = () => actions.direct('reshoot', '', [id]);
-    root.querySelector('#i-ask').onclick = async () => {
+    root.querySelector('#i-fix')?.addEventListener('click', () => askForFix([id]));
+    if (root.querySelector('#i-reshoot')) root.querySelector('#i-reshoot').onclick = () => askForFix([id]);
+    if (root.querySelector('#i-ask')) root.querySelector('#i-ask').onclick = async () => {
       const text = await promptDialog({ title: `Note for the showrunner about "${shot.title || id}"`, placeholder: 'Make it a slow push-in and keep her red coat…', multiline: true, ok: 'Send' });
       if (text?.trim()) actions.steer(`${id} (${shot.title}): ${text.trim()}`);
     };
@@ -204,6 +213,13 @@ export function mountInspector(root) {
       catch (error) { toast(`Invalid JSON: ${error.message}`, 'error'); }
     });
     if (root.querySelector('#cmp-handle')) bindCompare();
+    root.querySelector('#i-loop')?.addEventListener('click', event => {
+      const on = !loopOn(), button = event.currentTarget;
+      try { localStorage.setItem('sr.loop', on ? '1' : '0'); } catch { /* a convenience */ }
+      root.querySelector('#i-player video').loop = on;
+      button.classList.toggle('active', on);
+      button.setAttribute('aria-checked', on);
+    });
   }
 
   // The shot's model: Deepy's templates grouped by the kind of shot they make (the brief sets each kind's default).
@@ -215,7 +231,9 @@ export function mountInspector(root) {
     const groups = roles.filter(role => ['cast_shots', 'cast_shots_lip_synced', 'shots_without_cast', 'images'].includes(role.id))
       .map(role => ({ ...role, choices: role.choices.filter(choice => choice.value === current || !seen.has(choice.value) && seen.add(choice.value)).map(choice => ({ ...choice, label: choiceLabel(role, choice) })) }));  // each model once, named as in Default models
     const known = current === 'draw_svg' || groups.some(role => role.choices.some(choice => choice.value === current));
+    const used = [...new Set(state.doc.shots.map(item => item.generation?.template).filter(value => value && value !== 'draw_svg' && value !== current))];  // the first choice to look for
     select.innerHTML = (known ? '' : `<option value="${esc(current)}" selected>${esc(templateLabel(current))}</option>`)
+      + (used.length ? `<optgroup label="Used by the other shots">${used.map(value => `<option value="${esc(value)}">${esc(templateLabel(value))}</option>`).join('')}</optgroup>` : '')
       + groups.map(role => `<optgroup label="${esc(role.label)}">${role.choices.map(choice => `<option value="${esc(choice.value)}" ${choice.value === current ? 'selected' : ''}>${esc(choice.label)}${choice.value === (role.value || role.auto) ? ' (the brief\'s choice)' : ''}</option>`).join('')}</optgroup>`).join('')
       + `<optgroup label="Other"><option value="draw_svg" ${current === 'draw_svg' ? 'selected' : ''}>${templateLabel('draw_svg')}</option></optgroup>`;
   }
@@ -232,6 +250,7 @@ export function mountInspector(root) {
     handle.addEventListener('pointerdown', event => { handle.setPointerCapture(event.pointerId); handle.onpointermove = move; });
     handle.addEventListener('pointerup', () => { handle.onpointermove = null; });
     root.querySelector('#cmp-done').onclick = () => { compareId = null; render(); };
+    bindCompareSeek(root);
     root.querySelector('#cmp-use').onclick = () => { const id = compareId; compareId = null; actions.ops([{ op: 'update_shot', shot: shownId, fields: { chosen_take: id } }]); };
     root.querySelector('#cmp-play').onclick = event => {
       const playing = !a.paused;
@@ -249,8 +268,8 @@ export function mountInspector(root) {
         <button class="btn approve" data-bulk="approve" ${availability(shots.some(shot => actions.take(shot)) ? '' : 'None of them has a take yet.')}>${icon('check')} Approve their takes</button>
         <button class="btn" data-bulk="lock">${icon('lock')} Lock / unlock</button>
         <button class="btn" data-bulk="include">${icon('eye')} Include / exclude</button>
-        <button class="btn" data-bulk="reshoot" ${availability(actions.directorBlocked())}>${icon('refresh')} Ask the showrunner to re-shoot</button>
-        <div class="field"><div class="label">${icon('layers')} Move to section</div><input class="input" id="bulk-section" placeholder="Chorus 2"></div>
+        <button class="btn" data-bulk="reshoot" ${availability(actions.directorBlocked())}>${icon('refresh')} Ask the showrunner to fix them…</button>
+        <div class="field"><div class="label">${icon('layers')} Move to section</div><input class="input" id="bulk-section" placeholder="The part of the video they belong to"></div>
         <div class="field"><div class="label">${icon('transition')} Transition</div><div class="seg" id="bulk-tr">${TRANSITIONS.map(([key, label]) => `<button data-tr="${key}">${label}</button>`).join('')}</div></div>
         <button class="btn danger" data-bulk="delete">${icon('trash')} Delete</button></div></div>`;
     root.querySelectorAll('[data-bulk]').forEach(button => button.onclick = () => {
@@ -258,7 +277,7 @@ export function mountInspector(root) {
       if (kind === 'approve') actions.ops(shots.filter(shot => actions.take(shot)).map(shot => ({ op: 'verdict', shot: shot.id, ok: true, note: '' })));
       if (kind === 'lock') actions.ops(shots.map(shot => ({ op: 'update_shot', shot: shot.id, fields: { locked: !shots.every(item => item.locked) } })));
       if (kind === 'include') actions.ops(shots.map(shot => ({ op: 'update_shot', shot: shot.id, fields: { included: !shots.every(item => item.included) } })));
-      if (kind === 'reshoot') actions.direct('reshoot', '', shots.map(shot => shot.id));
+      if (kind === 'reshoot') askForFix(shots.map(shot => shot.id));
       if (kind === 'delete') shotMenu(button, shots.map(shot => shot.id));
     });
     root.querySelector('#bulk-section').addEventListener('change', event => actions.ops(shots.map(shot => ({ op: 'update_shot', shot: shot.id, fields: { section: event.target.value } }))));
@@ -275,9 +294,9 @@ export function mountInspector(root) {
         <div class="checklist">
           ${check(doc.brief.text || doc.brief.script, 'Brief written')}${check(doc.shots.length, `${doc.shots.length} shots planned`)}
           ${check(doc.shots.length && doc.shots.every(shot => shot.takes.length || !shot.included), `${doc.shots.filter(shot => shot.takes.length).length} shots shot`)}
-          ${check(doc.shots.length && count('approved') === doc.shots.length, `${count('approved')} approved by you`)}${check(doc.deliverables.length, doc.deliverables.length ? 'Edit assembled' : 'Edit not assembled yet')}
+          ${doc.brief.review_before_edit ? check(doc.shots.length && count('approved') === doc.shots.length, `${count('approved')} approved by you`) : ''}${check(doc.deliverables.length, doc.deliverables.length ? 'Edit assembled' : 'Edit not assembled yet')}
         </div></div>
-      <div class="three" style="gap:8px">${stat(count('rendered'), 'to review', 'var(--amber)')}${stat(count('rejected') + count('failed'), 'to redo', 'var(--red)')}${stat(minutes.toFixed(1), 'GPU min', 'var(--cyan)')}</div>
+      <div class="three" style="gap:8px">${stat(count('rendered'), doc.brief.review_before_edit ? 'to review' : 'shot', 'var(--amber)')}${stat(count('rejected') + count('failed'), 'to redo', 'var(--red)')}${stat(minutes.toFixed(1), 'GPU min', 'var(--cyan)')}</div>
       <details class="panel details" style="padding:12px 16px"><summary class="label" style="margin:0;cursor:pointer">${icon('keyboard')} Keyboard shortcuts</summary>
         <div class="col" style="gap:6px;font-size:12.5px;margin-top:10px">${[['←→', 'Select shot'], ['A', 'Approve'], ['X', 'Redo, with a note'], ['L', 'Lock'], ['E', 'Include / exclude'], ['N', 'New shot'], ['Del', 'Delete'], ['Space', 'Play (timeline)'], ['1-5', 'Views'], ['D', 'Showrunner'], ['Ctrl+Z', 'Undo'], ['?', 'Guide']].map(([key, text]) => `<div class="row"><span class="kbd">${key}</span><span class="muted">${text}</span></div>`).join('')}</div></details>
       <p class="muted" style="font-size:12.5px;margin:0">Select a shot to watch its takes, judge them and edit what the showrunner will use. Drop media from your computer or the bin onto a shot to make it a take.</p>

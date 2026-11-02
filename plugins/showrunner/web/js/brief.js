@@ -2,13 +2,20 @@
 // Brief: what to make, from which material, in which format and style. Every change saves itself.
 import { state, actions } from './app.js';
 import { api } from './api.js';
-import { icon, esc, fieldSaver, drawWave, formatTime, formatDuration, sectionColor, pickFiles, toast, confirmDialog, promptDialog, availability, AUDIO_ACCEPT } from './ui.js';
+import { icon, esc, fieldSaver, drawWave, formatTime, formatDuration, sectionColor, pickFiles, toast, confirmDialog, promptDialog, availability, AUDIO_ACCEPT, personFields } from './ui.js';
 import { kindTiles, KINDS } from './home.js';
 import { modelRows, openDefaultModels } from './models.js';
 
 const STYLES = ['Cinematic', 'Anime', 'Documentary', 'Noir', 'Neon', 'Pastel', 'Claymation', 'Watercolor', 'Vintage film', 'VHS', 'Epic', 'Minimal', 'Dreamy', 'Gritty', 'Surreal', 'Cyberpunk'];
 const ASPECT_FRAMES = { '16:9': [44, 25], '9:16': [20, 34], '1:1': [30, 30], '4:3': [38, 28], '2.39:1': [50, 21] };
 const PACING = ['Very calm', 'Calm', 'Balanced', 'Energetic', 'Frenetic'];
+
+// A format chosen after shooting changes nothing by itself: the note says so, with the button that does it.
+function formatNote(doc) {
+  const latest = doc.deliverables.at(-1), [width, height] = doc.brief.aspect.split(':').map(Number);
+  if (!latest?.width || Math.abs(latest.width / latest.height - width / height) < 0.08) return '';
+  return `<div class="stale-note" style="margin-top:8px">${icon('alert')}<span class="grow">Your last version is ${latest.width}×${latest.height}: this choice changes nothing until the shots are made again in ${esc(doc.brief.aspect)}.</span><button class="btn small" id="make-format" ${availability(actions.directorBlocked())}>Make a ${esc(doc.brief.aspect)} version</button></div>`;
+}
 
 export function mountBrief(container, doc) {
   container.innerHTML = '<div class="brief" id="brief"></div>';
@@ -49,7 +56,7 @@ export function mountBrief(container, doc) {
       <section class="panel"><div class="panel-head"><span class="num">6</span><h3>Look and format</h3></div>
         <div class="col" style="gap:18px">
           <div class="field"><div class="label">${icon('ratio')} Aspect ratio</div><div class="aspects">${Object.entries(ASPECT_FRAMES).map(([aspect, [width, height]]) =>
-            `<button class="aspect ${brief.aspect === aspect ? 'on' : ''}" data-aspect="${aspect}"><i style="width:${width}px;height:${height}px"></i>${aspect}<span class="muted" style="font-size:10.5px">${{ '16:9': 'Widescreen', '9:16': 'Vertical', '1:1': 'Square', '4:3': 'Classic', '2.39:1': 'Scope' }[aspect]}</span></button>`).join('')}</div></div>
+            `<button class="aspect ${brief.aspect === aspect ? 'on' : ''}" data-aspect="${aspect}"><i style="width:${width}px;height:${height}px"></i>${aspect}<span class="muted" style="font-size:10.5px">${{ '16:9': 'Widescreen', '9:16': 'Vertical', '1:1': 'Square', '4:3': 'Classic', '2.39:1': 'Scope' }[aspect]}</span></button>`).join('')}</div>${formatNote(state.doc)}</div>
           <div class="three">
             <div class="field"><div class="label">${icon('image')} Resolution</div><div class="seg" id="res">${['480p', '720p', '1080p'].map(value => `<button class="${brief.resolution === value ? 'on' : ''}" data-res="${value}">${value}</button>`).join('')}</div></div>
             <div class="field"><div class="label">${icon('clock')} Duration ${brief.song && analysis ? `<button class="chip clickable ${!brief.duration_s ? 'on' : ''}" id="match-song" style="height:20px;margin-left:4px">${icon('music')}Match the song</button>` : ''}</div>
@@ -75,6 +82,7 @@ export function mountBrief(container, doc) {
         <span class="hint" id="models-hint">Auto: the showrunner picks the best model for each shot</span><span class="fold">${icon(modelsOpen() ? 'chevronDown' : 'chevron')}</span></div>
         <div class="models" id="models" ${modelsOpen() ? '' : 'hidden'}><div class="muted">Loading the models…</div></div></section>
 
+      ${state.doc.deliverables.length ? `<div class="muted" style="font-size:12.5px;margin:4px 2px 0">This brief is where the production started: later changes live in the shots, the cast and the edit, and it is not rewritten. To keep going from where the production is, talk to the showrunner.</div>` : ''}
       <div class="cta-bar">
         <div class="grow"><b>${esc(kind.label)}</b> <span class="muted">· ${esc(brief.aspect)} · ${brief.resolution} · <span id="brief-duration">${formatDuration(brief.duration_s || analysis?.duration_s || 30)}</span> · ${doc.cast.length} cast · ${brief.references.length} ${brief.references.length === 1 ? 'reference' : 'references'}</span>
           ${state.directorInfo.available === false && state.directorInfo.reason ? `<div class="muted" style="font-size:12px;color:var(--amber)">${esc(state.directorInfo.reason)}</div>` : ''}</div>
@@ -105,6 +113,7 @@ export function mountBrief(container, doc) {
     root.querySelector('#script')?.addEventListener('input', event => { queue({ script: event.target.value }); ready(); });
     root.querySelector('#style').oninput = event => queue({ style: event.target.value });
     root.querySelectorAll('[data-aspect]').forEach(button => button.onclick = () => actions.ops([{ op: 'brief', fields: { aspect: button.dataset.aspect } }]).then(render));
+    root.querySelector('#make-format')?.addEventListener('click', () => actions.makeFormat(state.doc.brief.aspect));
     root.querySelectorAll('[data-res]').forEach(button => button.onclick = () => actions.ops([{ op: 'brief', fields: { resolution: button.dataset.res } }]).then(render));
     root.querySelectorAll('[data-style]').forEach(button => button.onclick = () => {
       const tags = new Set(save.pending('brief')?.style_tags ?? state.doc.brief.style_tags);  // the chips clicked a moment ago count too
@@ -179,7 +188,7 @@ export function mountBrief(container, doc) {
     zone.onclick = async () => {
       if (role === 'cast') {  // as on the Cast page: a person is named first; dropping photos adds people too
         const name = await promptDialog({ title: 'Who or what is it?', text: 'Describe them on the Cast page, or drop a photo here.', placeholder: 'Mia, the lead singer', ok: 'Add' });
-        if (name?.trim()) actions.ops([{ op: 'add_cast', fields: { name: name.trim() } }]).then(render);
+        if (name?.trim()) actions.ops([{ op: 'add_cast', fields: personFields(name) }]).then(render);
         return;
       }
       const files = await pickFiles(accept, role !== 'song');

@@ -7,6 +7,7 @@
     let current = 'media_gen', opener;
     function send(id, data) {
         const input = root().querySelector('#' + id + ' textarea, #' + id + ' input');
+        if (!input) return; // A window focus can arrive before Gradio mounts the controls.
         input.value = JSON.stringify({...data, nonce: Date.now() + Math.random()});
         input.dispatchEvent(new Event('input', {bubbles: true}));
         input.dispatchEvent(new Event('change', {bubbles: true}));
@@ -57,10 +58,12 @@
     }
     function sync() {
         const shell = host(), native = nativeTabs();
-        if (!shell?.querySelector('.app-bar') || !native) return;
-        native.querySelector(':scope > .tab-wrapper')?.setAttribute('aria-hidden', 'true');
-        const active = native.querySelector(':scope > .tab-wrapper button[data-tab-id][aria-selected="true"]');
-        if (active) current = active.dataset.tabId;
+        if (!shell?.querySelector('.app-bar')) return;
+        const active = native?.querySelector(':scope > .tab-wrapper button[data-tab-id][aria-selected="true"]');
+        if (!active) { layout(); return; }
+        native.querySelector(':scope > .tab-wrapper').setAttribute('aria-hidden', 'true');
+        current = active.dataset.tabId;
+        document.documentElement.classList.toggle('wangp-main-tab', current === 'media_gen');
         if (JSON.parse(shell.querySelector('.app-bar').dataset.removedApps).includes(current)) {
             activate('media_gen');
             return;
@@ -187,9 +190,13 @@
             buttons[(buttons.indexOf(event.target) + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length].focus();
         }
     });
+    // Measure the mounted links before paint, including when a catalog update replaces them.
+    customElements.define('wangp-app-links', class extends HTMLElement {
+        connectedCallback() { queueMicrotask(sync); }
+    });
     const refresh = () => send('wangp_app_refresh', {});
     window.addEventListener('focus', refresh);
     window.addEventListener('storage', event => { if (event.key === catalogKey) refresh(); });
     window.addEventListener('resize', layout);
-    document.fonts.ready.then(layout);
+    document.fonts.addEventListener('loadingdone', layout);
 })();

@@ -23,8 +23,8 @@ allocating thread holds would deadlock (PyTorch's own memory history has the sam
 
 Chunk log, for memory that two owners share (a different question: not what fills the VRAM, but who wrote over what). MMGP_VRAM_CHUNK_LOG=<file> starts it
 with the process; or start_chunk_log(path). It keeps the history of every chunk (up to 6 M events, about 430 MB of RAM), and writes to the file, with the Python
-stack, when a chunk gets two owners, with the chunk's history and the pools (the first REPORTED_VIOLATIONS times). MMGP_VRAM_WATCH_SIZES=8519680,... adds a line with
-thread, stream and stack for allocations of exactly these sizes (8519680 bytes: a cuBLAS workspace). chunk_report(tensor) writes what the allocator knows of a tensor's
+stack, when a chunk gets two owners, with the chunk's history and the pools (the first REPORTED_VIOLATIONS times). MMGP_VRAM_WATCH_SIZES=4325376,... adds a line with
+thread, stream and stack for allocations of exactly these sizes (4325376 bytes: a cuBLAS workspace). chunk_report(tensor) writes what the allocator knows of a tensor's
 chunk, at the moment damage is seen; pools_report(label) lists the pools and their live blocks. Off, each event costs one relaxed load.
 
 Command line: python -m mmgp.allocator.debug summary report.json | diff before.json after.json"""

@@ -189,19 +189,27 @@ class PrismAudioProcessor:
             "fileList": [[_VIDEOPRISM_TOKENIZER_FILENAME]],
         }]
 
+    @staticmethod
+    def _upstream_download_def():
+        return {"repoId": _UPSTREAM_REPO_ID, "sourceFolderList": [""], "targetFolderList": [PRISMAUDIO_FOLDER],
+                "fileList": [[source for _, source in _PACKAGED_FILES]]}
+
+    def query_checkpoint_inventory(self):
+        return [{"name": "PrismAudio", "variant": "BF16", "download_defs": self.query_download_defs(enabled_only=False)},
+                {"name": "PrismAudio", "variant": "Upstream Conversion Files", "download_defs": [self._upstream_download_def()]}]
+
     def _package_from_upstream(self, process_files: Callable[..., Any], send_cmd=None) -> None:
         from shared.utils.download import send_download_status
 
-        upstream_files = [source for _, source in _PACKAGED_FILES]
         send_download_status(send_cmd, "Downloading upstream PrismAudio checkpoints for local safetensors packaging...")
-        process_files(repoId=_UPSTREAM_REPO_ID, sourceFolderList=[""], targetFolderList=[PRISMAUDIO_FOLDER], fileList=[upstream_files])
+        process_files(**self._upstream_download_def())
         send_download_status(send_cmd, "Packaging PrismAudio checkpoints as bf16 safetensors...")
         for target_name, source_name in _PACKAGED_FILES:
             target_path = self._checkpoint_path(target_name)
             if os.path.isfile(target_path):
                 continue
             _save_bf16_safetensors(self._checkpoint_path(source_name), target_path)
-        for source_name in upstream_files:
+        for _, source_name in _PACKAGED_FILES:
             source_path = self.files_locator.locate_file(os.path.join(PRISMAUDIO_FOLDER, source_name), error_if_none=False)
             if source_path is not None:
                 os.remove(source_path)

@@ -25,6 +25,7 @@ from shared.utils import files_locator as fl
 from shared.utils.cancellation import cancellation_context, check_cancelled
 
 from .assets import (
+    QWEN_CHECKPOINTS, qwen_download_defs,
     QWEN35_4B_TEXT_GGUF_FILENAME,
     QWEN35_4B_TEXT_INT8_FILENAME,
     QWEN35_4B_VISION_FILENAME,
@@ -102,14 +103,7 @@ def get_qwen35_quantization(backend: str, variant: str | None = None) -> str:
 
 
 def _get_qwen35_gguf_filename(spec: dict, backend: str) -> str:
-    key = {
-        enhancer_quantization_GGUF: "text_gguf_filename",
-        enhancer_quantization_GGUF_Q3: "text_gguf_q3_filename",
-        enhancer_quantization_GGUF_Q2: "text_gguf_q2_filename",
-        enhancer_quantization_GGUF_PTQ1: "text_gguf_ptq1_filename",
-        enhancer_quantization_GGUF_Q8: "text_gguf_q8_filename",
-    }[backend]
-    return spec[key]
+    return spec[QWEN_CHECKPOINTS[backend][0]]
 
 
 def _resolve_qwen35_assets_dir(assets_dir: str | None, variant: str | None = None, error_if_none: bool = True) -> str | None:
@@ -167,36 +161,8 @@ def ensure_qwen35_prompt_enhancer_assets(process_files_def, backend: str = enhan
         speculative_decoding = False
     spec = get_qwen35_variant_spec(variant)
     backend = get_qwen35_quantization(backend, variant=variant)
-    repo_subfolder = spec.get("repo_subfolder", "")
-    qwen35_shared_files = list(spec["root_files"])
-    if spec["root_repo"] == spec.get("gguf_repo"):
-        gguf_backend = backend in (enhancer_quantization_GGUF, enhancer_quantization_GGUF_Q3, enhancer_quantization_GGUF_Q2, enhancer_quantization_GGUF_PTQ1, enhancer_quantization_GGUF_Q8)
-        checkpoint_filename = _get_qwen35_gguf_filename(spec, backend) if gguf_backend else spec["text_int8_filename"]
-        qwen35_shared_files.append(spec["vision_filename"])
-        checkpoint_folder = spec.get("gguf_repo_subfolder", repo_subfolder)
-        if checkpoint_folder == repo_subfolder:
-            qwen35_shared_files.append(checkpoint_filename)
-        else:
-            process_files_def(repoId=spec["gguf_repo"], sourceFolderList=[checkpoint_folder], targetFolderList=[spec["assets_dir_name"]], fileList=[[checkpoint_filename]])
-        if speculative_decoding:
-            mtp_filename = spec.get("text_gguf_q3_mtp_filename" if backend == enhancer_quantization_GGUF_Q3 else "text_mtp_filename")
-            if mtp_filename:
-                qwen35_shared_files.append(mtp_filename)
-    download_def = {"repoId": spec["root_repo"], "sourceFolderList": [repo_subfolder], "fileList": [qwen35_shared_files]}
-    if len(repo_subfolder) == 0:
-        download_def["targetFolderList"] = [spec["assets_dir_name"]]
-    process_files_def(**download_def)
-    if spec["root_repo"] != spec.get("gguf_repo"):
-        if backend not in (enhancer_quantization_GGUF, enhancer_quantization_GGUF_Q3, enhancer_quantization_GGUF_Q2, enhancer_quantization_GGUF_PTQ1, enhancer_quantization_GGUF_Q8):
-            raise ValueError(f"{spec['display_name']} supports only the GGUF backend.")
-        gguf_files = [spec["vision_filename"], _get_qwen35_gguf_filename(spec, backend)]
-        if speculative_decoding and backend == enhancer_quantization_GGUF_Q3:
-            gguf_files.append(spec["text_gguf_q3_mtp_filename"])
-        if speculative_decoding and backend == enhancer_quantization_GGUF_PTQ1:
-            gguf_files.append(spec["text_gguf_ptq1_mtp_filename"])
-        process_files_def(repoId=spec["gguf_repo"], sourceFolderList=[spec.get("gguf_repo_subfolder", "")], fileList=[gguf_files])
-    if spec.get("text_repo") and spec.get("text_required_files"):
-        process_files_def(repoId=spec["text_repo"], sourceFolderList=[repo_subfolder], fileList=[list(spec["text_required_files"])])
+    for definition in qwen_download_defs(spec, backend, speculative_decoding):
+        process_files_def(**definition)
     qwen35_modeling_path = get_qwen35_modeling_path()
     if not os.path.isfile(qwen35_modeling_path):
         raise FileNotFoundError(f"Missing repo-local Qwen3.5 modeling file: {qwen35_modeling_path}")

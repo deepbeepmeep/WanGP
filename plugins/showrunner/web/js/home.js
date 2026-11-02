@@ -1,7 +1,7 @@
 // Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 // Home: start a production from its kind, or open one.
 import { api } from './api.js';
-import { icon, esc, art, ago, formatDuration, menu, confirmDialog, promptDialog, toast } from './ui.js';
+import { icon, esc, art, ago, formatDuration, menu, confirmDialog, promptDialog, toast, adviceBar, bindAdvice } from './ui.js';
 
 export const KINDS = {
   music_video: { label: 'Music video', icon: 'music', text: 'Cut to the beat of your song', hue: 'music' },
@@ -27,12 +27,14 @@ export function renderHome(container, state, { open }) {
       <p>Pick a format. You write the brief, Deepy directs: it plans every shot, casts, shoots and edits, and you review and change anything on the storyboard and the timeline.</p></div>
       ${reason ? `<div class="banner" style="margin:0;max-width:420px">${icon('alert')}<span>${esc(reason)}</span></div>` : ''}
     </div>
+    ${adviceBar(state.directorInfo)}
     <div class="kinds">${kindTiles()}</div>
     <div class="section-title">${icon('layers')} Your productions <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">${productions.length || ''}</span></div>
     ${productions.length ? `<div class="productions">${productions.map(card).join('')}</div>` : `<div class="empty-state">${archived.length ? 'Every production is archived: open the list below to bring one back.' : 'No production yet. Choose a format above to start.'}</div>`}
     ${archived.length ? `<details class="archived-productions" ${state.archivedOpen ? 'open' : ''}><summary class="section-title">${icon('chevron', 'chev')} Archived <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">${archived.length}</span></summary>
       <div class="productions">${archived.map(card).join('')}</div></details>` : ''}
   </div>`;
+  bindAdvice(container, state.directorInfo);
   const folded = container.querySelector('.archived-productions');
   if (folded) folded.ontoggle = () => state.archivedOpen = folded.open;  // stays open when the list refreshes
   const archive = async (id, archived) => {
@@ -46,7 +48,7 @@ export function renderHome(container, state, { open }) {
   };
   container.querySelectorAll('[data-kind]').forEach(button => button.onclick = async () => {
     const title = await promptDialog({ title: `New ${KINDS[button.dataset.kind].label.toLowerCase()}`, text: 'Its name (you can change it later, at the top of the page).',
-      value: `New ${KINDS[button.dataset.kind].label.toLowerCase()}`, ok: 'Create' });
+      placeholder: `New ${KINDS[button.dataset.kind].label.toLowerCase()}`, ok: 'Create' });
     if (title === null) return;  // a look at the formats creates nothing
     button.disabled = true;
     try {

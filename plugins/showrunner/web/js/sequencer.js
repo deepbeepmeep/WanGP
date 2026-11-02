@@ -6,6 +6,15 @@ import { esc, art } from './ui.js';
 const TRACK_LOAD_AHEAD_S = 2;  // a sound track starts loading this long before it plays
 const trackKey = track => `${track.path}|${track.start_s}`;
 
+// A shot without a take: its planned length, or less when someone it shows speaks, as it ends after the line (about 0.37 s a word until the line is spoken); as production.py plans it.
+function plannedLength(shot, songDriven) {
+  const planned = shot.duration_s || 4;
+  const lines = songDriven ? [] : (shot.dialogue || []).filter(line => line.line && (shot.cast || []).includes(line.speaker));
+  if (!lines.length) return planned;
+  const spoken = lines.reduce((total, line) => total + (line.duration_s || 0.37 * (line.line.match(/[\w']+/g) || []).length), 0);
+  return Math.min(planned, spoken + 0.3 * (lines.length - 1) + 0.35);
+}
+
 export function segments(doc, take) {
   const result = [];
   const songDriven = !!doc.brief.song && doc.edit.audio_mode !== 'clips';  // the song is the clock: transitions keep every shot on its part
@@ -17,7 +26,7 @@ export function segments(doc, take) {
     const length = chosen?.duration_s || shot.duration_s || 4;
     const start = +(shot.trim?.[0] || 0);
     const end = shot.trim?.[1] != null ? +shot.trim[1] : Math.min(length, shot.duration_s || length);  // a take ends at the planned length (as in the assembled edit)
-    const duration = Math.max(0.1, (chosen ? end - start : shot.duration_s || 4) / speed);
+    const duration = Math.max(0.1, (chosen ? end - start : plannedLength(shot, songDriven)) / speed);
     let transition = result.length && shot.transition?.type && shot.transition.type !== 'cut' ? { type: shot.transition.type, duration: Math.min(+shot.transition.duration_s || 0.5, duration / 2) } : null;
     if (transition && songDriven) {  // as the assembled edit: the outgoing shot runs into it (its spare frames, then its last frame held)
       transition = { ...transition, duration: Math.min(transition.duration, 1) };

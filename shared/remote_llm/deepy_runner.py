@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -27,6 +28,7 @@ from shared.deepy.engine import (
     finish_assistant_turn,
     mark_assistant_paused,
     mark_assistant_turn_message,
+    request_assistant_interrupt,
     rollback_assistant_turn,
     interrupt_assistant_for_steering,
     wait_for_assistant_resume,
@@ -336,7 +338,24 @@ def run_remote_deepy_turn(server_config: dict[str, Any], session, text: str, sys
             if status_text:
                 set_remote_status(f"tool:{active_tool['id']}:{status}:{status_text}", f"{active_tool['label']}: {status_text}", "tool")
 
+    tool_calls = threading.Condition(session.turn_lock)
+    active_calls = 0
+    turn_ended = False
+
     def call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        nonlocal active_calls
+        with tool_calls:
+            if turn_ended:
+                return {"status": "interrupted", "tool": name, "cancelled": True, "error": "The remote turn has ended."}
+            active_calls += 1
+        try:
+            return run_tool(name, arguments)
+        finally:
+            with tool_calls:
+                active_calls -= 1
+                tool_calls.notify_all()
+
+    def run_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         nonlocal reasoning_active
         if not wait_while_paused():
             return {"status": "interrupted", "tool": name, "cancelled": True, "error": "The user interrupted before this action started."}
@@ -376,7 +395,18 @@ def run_remote_deepy_turn(server_config: dict[str, Any], session, text: str, sys
         system_prompt = f"{system_prompt}\n\n{execution_instructions}".strip()
     try:
         set_remote_status("waiting", f"Waiting for {engine_label}...", "loading")
-        answer = backend.run_turn(prompt, system_prompt=system_prompt, tools=toolbox.get_tool_schemas(), images=[], on_event=on_event, call_tool=call_tool, should_stop=lambda: bool(session.interrupt_requested or assistant_steering_interrupt_due(session)))
+        try:
+            answer = backend.run_turn(prompt, system_prompt=system_prompt, tools=toolbox.get_tool_schemas(), images=[], on_event=on_event, call_tool=call_tool, should_stop=lambda: bool(session.interrupt_requested or assistant_steering_interrupt_due(session)))
+        finally:
+            # A remote client can finish while its render callback is still between shots.
+            # Keep the turn and its queue alive until the callback has observed Stop and returned.
+            with tool_calls:
+                turn_ended = True
+                if active_calls and not session.interrupt_requested:
+                    if session.current_turn is not None and not session.steering_pending:
+                        session.current_turn["interruption_notice_override"] = f"{engine_label} ended its turn while a tool was still running."
+                    request_assistant_interrupt(session, "steered" if session.steering_pending else "remote_turn_ended")
+                tool_calls.wait_for(lambda: active_calls == 0)
         if answer and not answer_parts:
             answer_parts.append(answer)
             _answer_block_id, payload = assistant_chat.upsert_assistant_content_block(session, assistant_id, None, answer, streaming=False)
@@ -404,7 +434,8 @@ def run_remote_deepy_turn(server_config: dict[str, Any], session, text: str, sys
         finish_reasoning()
         with session.turn_lock:
             if session.interrupt_requested:
-                backend.interrupt()
+                if (session.current_turn or {}).get("interruption_kind") != "remote_turn_ended":
+                    backend.interrupt()
                 rollback_assistant_turn(session)
             finish_assistant_turn(session)
             clear_assistant_steering(session)

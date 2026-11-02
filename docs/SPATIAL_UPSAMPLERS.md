@@ -102,6 +102,7 @@ class MyUpsampler:
     def upscale(self, sample, value, *, seed, ..., abort_callback, progress_callback): ...
     # progress_callback(phase, current=None, total=None, unit=None): unit (e.g. "tiles") labels the counter, default "steps"
     def download(self, process_files, send_cmd=None, status_text=None, spatial_upsampling=None): ...
+    def query_checkpoint_inventory(self): ...                 # all checkpoint variants, independent of the selected settings; see PLUGINS.md
     def load_upsampler(self, value, **kwargs): ...            # optional pre-dispatch load hook
     def supports_loaded_model(self, value, context, **kwargs): ... # optional core-model borrowing
     def release_private_runtime(self): ...                    # optional before borrowing core model

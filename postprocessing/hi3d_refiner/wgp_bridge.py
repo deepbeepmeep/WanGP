@@ -19,6 +19,9 @@ _BOTH = (PARAMETER_UI_POSTPROCESSING, PARAMETER_UI_LATE_POSTPROCESSING)
 
 
 class Hi3DRefinerBridge(SimpleScaleSuffixMixin):
+    def query_checkpoint_inventory(self):
+        return [{"model_types": [MODEL_TYPE]}]
+
     def __init__(self, server_config: dict[str, Any] | None = None, files_locator=None):
         self.runtime = ModelRuntime(NAME, MODEL_TYPE)
 

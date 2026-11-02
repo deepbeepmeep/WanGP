@@ -312,7 +312,16 @@ class FlashVSRBridge:
             return None
         _, variant = self.settings()
         model = self.model() if spatial_upsampling is None else self.model_for_upsampling(spatial_upsampling)
-        files = [self.transformer_filename(model, self.quantization()), self.lq_proj_filename(model), self.POSI_PROMPT_FILENAME]
+        return self._model_download_def(model, self.quantization(), variant)
+
+    def query_checkpoint_inventory(self):
+        for label, model in self.MODEL_CHOICES:
+            for _, quant in self.QUANTIZATION_CHOICES:
+                for mode in ("tiny", "full"):  # Tiny-Long uses the same files as Tiny.
+                    yield {"name": label.split(" (")[0], "variant": f"{quant.upper()} {mode.title()}", "download_defs": [self._model_download_def(model, quant, mode)]}
+
+    def _model_download_def(self, model, quant, variant):
+        files = [self.transformer_filename(model, quant), self.lq_proj_filename(model), self.POSI_PROMPT_FILENAME]
         if variant != "full":
             files.append(self.TCDECODER_FILENAME)
         return {

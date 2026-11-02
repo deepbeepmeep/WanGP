@@ -96,6 +96,13 @@ class SeedVCProcessor:
             return "You must provide a second voice sample"
         return ""
 
+    def query_checkpoint_inventory(self):
+        from .assets import query_download_def
+        from .bridge import SEEDVC_RESTORE_BACKGROUND_STEM
+        from shared.utils.download import query_audio_background_replacement_download_def
+        shared = [query_audio_background_replacement_download_def()] if SEEDVC_RESTORE_BACKGROUND_STEM else []
+        return [{"name": "SeedVC", "variant": label, "download_defs": query_download_def(mode) + shared} for mode, label in self.bridge._VERSIONS.items()]
+
     def query_download_defs(self, enabled_only: bool = True) -> list[dict[str, Any]]:
         self._sync_bridge_config()
         return self.bridge.query_download_def(enabled_only=enabled_only)

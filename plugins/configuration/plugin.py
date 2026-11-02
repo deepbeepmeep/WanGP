@@ -10,6 +10,7 @@ import json
 import os
 from shared.utils.config_store import config_snapshot, update_config
 from plugins.configuration import processor_menus
+from preprocessing.processors import DEPTH_VARIANT_CHOICES
 from shared.mcp.config import DEFAULT_PORT, server_port
 from shared.gradio.form_sync import GradioForm
 from shared.gradio.app_icons import icon as app_icon
@@ -45,6 +46,8 @@ from shared.deepy.config import (
     DEEPY_COMPACTION_THINKING_KEY,
     DEEPY_REPETITION_PENALTY_DEFAULT,
     DEEPY_REPETITION_PENALTY_KEY,
+    DEEPY_KEPT_KV_CACHES_DEFAULT,
+    DEEPY_KEPT_KV_CACHES_KEY,
     DEEPY_CONTEXT_TOKENS_MIN,
     DEEPY_CONTEXT_TOKENS_DEFAULT,
     DEEPY_CONTEXT_TOKENS_KEY,
@@ -99,6 +102,7 @@ from shared.deepy.config import (
     normalize_deepy_compaction_type,
     normalize_deepy_compaction_thinking,
     normalize_deepy_repetition_penalty,
+    normalize_deepy_kept_kv_caches,
     normalize_deepy_custom_system_prompt,
     normalize_deepy_enabled,
     normalize_deepy_kv_cache_quantization,
@@ -290,33 +294,29 @@ class ConfigTabPlugin(WAN2GPPlugin):
             with gr.Tabs():
                 with gr.Tab("General"):
                     with gr.Group():
+                        model_selection_label = "Selectable Generative Models: whole families, models with all their finetunes, or single finetunes (leave empty for all)"
+                        gr.HTML(
+                            f'<div class="ckpt-selection-heading"><span>{model_selection_label}</span>'
+                            f'<button type="button" class="wangp-model-manager-link" data-app-route="plugin_model_manager" title="Open the Models Manager [Alt+M]">'
+                            f'{app_icon("models_manager")} <span>Manage Models &amp; Disk Space</span> <kbd>Alt+M</kbd></button></div>'
+                        )
                         self.transformer_types_choices = HierarchySelector(
                             hierarchy=self.create_models_selector_hierarchy(self.displayed_model_types),
                             value=self.transformer_types,
                             height=0,
-                            label="Selectable Generative Models: whole families, models with all their finetunes, or single finetunes (leave empty for all)",
+                            label=model_selection_label,
+                            show_label=False,
                             display_mode="breadcrumb",
                             sort_hierarchy=False,
                             search_empty_label="No matching models",
                             elem_classes=["block"],
                             interactive=not self.args.lock_config,
                         )
-                        with gr.Row():
-                            self.show_all_model_filter_choice = gr.Checkbox(
-                                value=self.server_config.get(model_dropdowns.SHOW_ALL_MODEL_FILTER_CONFIG_KEY, False),
-                                label='Show "All" Model Filter',
-                                interactive=not self.args.lock_config,
-                            )
-                            gr.HTML(f'<button type="button" class="wangp-model-manager-link" data-app-route="plugin_model_manager" title="Open the Models Manager [Alt+M]">{app_icon("models_manager")} Manage Models &amp; Disk Space <kbd>Alt+M</kbd></button>')
-                    self.model_hierarchy_type_choice = gr.Dropdown(
-                        choices=[
-                            ("Two Levels: Model Family > Models & Finetunes", 0),
-                            ("Three Levels: Model Family > Models > Finetunes", 1),
-                        ],
-                        value=self.server_config.get("model_hierarchy_type", 1),
-                        label="Models Hierarchy In User Interface",
-                        interactive=not self.args.lock_config
-                    )
+                        self.show_all_model_filter_choice = gr.Checkbox(
+                            value=self.server_config.get(model_dropdowns.SHOW_ALL_MODEL_FILTER_CONFIG_KEY, False),
+                            label='Show "All" Model Filter',
+                            interactive=not self.args.lock_config,
+                        )
                     self.fit_canvas_choice = gr.Dropdown(
                         choices=[
                             ("Dimensions are Pixel Budget (preserves aspect ratio, may exceed dimensions)", 0),
@@ -557,7 +557,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                                 interactive=not self.args.lock_config
                             )
                         with gr.Tab("Depth Anything"):
-                            self.depth_anything_v2_variant_choice = gr.Dropdown(choices=[("Depth Anything 2 Large (more precise, slower)", "vitl"), ("Depth Anything 2 Big (less precise, faster)", "vitb"), ("Depth Anything 3 Metric Large (better temporal stability ?)", "da3_metric_large")], value=self.server_config.get("depth_anything_v2_variant", "vitl"), label="Depth Anything Preprocessor")
+                            self.depth_anything_v2_variant_choice = gr.Dropdown(choices=DEPTH_VARIANT_CHOICES, value=self.server_config.get("depth_anything_v2_variant", "vitl"), label="Depth Anything Preprocessor")
                     gr.Markdown("**Speech Recognition**")
                     with gr.Group():
                         self.whisper_model_choice = gr.Dropdown(choices=WHISPER_MODEL_CHOICES, value=self.server_config.get(WHISPER_MODEL_KEY, "auto"), interactive=not self.args.lock_config,
@@ -676,6 +676,12 @@ class ConfigTabPlugin(WAN2GPPlugin):
                             label="Repetition Penalty",
                             info="Reduces repeated phrases in Prompt Enhancer and Deepy; about 10% slower.",
                             visible=not deepy_remote_default and enhancer_enabled_value in QWEN_PROMPT_ENHANCER_IDS,
+                        )
+                        self.deepy_kept_kv_caches_choice = gr.Dropdown(
+                            choices=[("Disabled", 0), ("1", 1), ("2 (recommended)", 2), ("3", 3), ("4", 4)],
+                            value=normalize_deepy_kept_kv_caches(self.server_config.get(DEEPY_KEPT_KV_CACHES_KEY, DEEPY_KEPT_KV_CACHES_DEFAULT)),
+                            label="KV Caches Kept in RAM",
+                            info="How many conversations (your chat, a Showrunner production) answer without rebuilding their context when you come back to them. 64K tokens take about 1.2 GB of RAM in Q4, 2.1 GB in INT8, 4 GB in BF16.",
                         )
                     self.deepy_type_choice = gr.Dropdown(
                         choices=[("Disabled", DEEPY_TYPE_DISABLED), ("Deepy Zero", DEEPY_TYPE_ZERO), ("Deepy Prime", DEEPY_TYPE_PRIME)],
@@ -1052,7 +1058,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
 
         inputs = [
             self.state,
-            self.transformer_types_choices, self.show_all_model_filter_choice, self.model_hierarchy_type_choice, self.fit_canvas_choice,
+            self.transformer_types_choices, self.show_all_model_filter_choice, self.fit_canvas_choice,
             self.attention_choice, self.generation_preview_choice, self.preload_model_policy_choice, self.clear_file_list_choice, self.multi_prompts_gen_type_choice, self.keep_intermediate_sliding_windows_choice,
             self.display_stats_choice, self.max_frames_multiplier_choice, self.keep_resolution_on_model_switch_choice, self.enable_4k_resolutions_choice, self.checkpoints_paths_choice, self.loras_root_choice, self.save_queue_if_crash_choice,
             self.UI_theme_choice, self.floating_generate_button_choice, self.queue_color_scheme_choice, self.process_queues_when_browser_unfocused_choice, self.prevent_power_throttling_choice, self.compute_cache_choice, self.compute_cache_path_choice,
@@ -1072,7 +1078,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             self.prompt_enhancer_temperature_choice, self.prompt_enhancer_top_p_choice, self.prompt_enhancer_randomize_seed_choice,
             self.matanyone_version_choice, self.whisper_model_choice,
             self.deepy_type_choice, self.deepy_vram_mode_choice, self.deepy_voice_language_choice, self.voice_mode_choice, self.deepy_allow_read_file_system_choice, self.deepy_file_system_paths_choice, self.deepy_read_everywhere_choice,
-            self.deepy_context_tokens_choice, self.deepy_kv_cache_quantization_choice, self.deepy_kv_cache_exact_choice, self.deepy_compaction_type_choice, self.deepy_repetition_penalty_choice, self.deepy_zero_custom_system_prompt_choice, self.deepy_prime_custom_system_prompt_choice, self.deepy_prime_mcp_servers_choice, self.deepy_mcp_auto_discover_paths_choice, self.deepy_python_sandbox_choice, self.python_apps_choice, self.deepy_web_search_choice, self.deepy_advanced_transcription_choice, self.deepy_transcription_terms_choice, self.civitai_api_key_choice, self.civitai_api_key_secure_choice, self.huggingface_token_choice, self.huggingface_token_secure_choice,
+            self.deepy_context_tokens_choice, self.deepy_kv_cache_quantization_choice, self.deepy_kv_cache_exact_choice, self.deepy_compaction_type_choice, self.deepy_repetition_penalty_choice, self.deepy_kept_kv_caches_choice, self.deepy_zero_custom_system_prompt_choice, self.deepy_prime_custom_system_prompt_choice, self.deepy_prime_mcp_servers_choice, self.deepy_mcp_auto_discover_paths_choice, self.deepy_python_sandbox_choice, self.python_apps_choice, self.deepy_web_search_choice, self.deepy_advanced_transcription_choice, self.deepy_transcription_terms_choice, self.civitai_api_key_choice, self.civitai_api_key_secure_choice, self.huggingface_token_choice, self.huggingface_token_secure_choice,
             self.video_container_choice, self.video_output_codec_choice, self.rgba_video_output_choice, self.hdr_video_crf_choice, self.image_output_codec_choice, self.audio_output_codec_choice, self.audio_stand_alone_output_codec_choice,
             self.metadata_choice, self.embed_source_images_choice,
             self.video_save_path_choice, self.image_save_path_choice, self.audio_save_path_choice, self.mesh_save_path_choice,
@@ -1165,7 +1171,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             fixed_args = args
 
         (
-            transformer_types_choices, show_all_model_filter_choice, model_hierarchy_type_choice, fit_canvas_choice,
+            transformer_types_choices, show_all_model_filter_choice, fit_canvas_choice,
             attention_choice, generation_preview_choice, preload_model_policy_choice, clear_file_list_choice, multi_prompts_gen_type_choice, keep_intermediate_sliding_windows_choice,
             display_stats_choice, max_frames_multiplier_choice, keep_resolution_on_model_switch_choice, enable_4k_resolutions_choice, checkpoints_paths_choice, loras_root_choice, save_queue_if_crash_choice,
             UI_theme_choice, floating_generate_button_choice, queue_color_scheme_choice, process_queues_when_browser_unfocused_choice, prevent_power_throttling_choice, compute_cache_choice, compute_cache_path_choice,
@@ -1185,7 +1191,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             prompt_enhancer_temperature_choice, prompt_enhancer_top_p_choice, prompt_enhancer_randomize_seed_choice,
             matanyone_version_choice, whisper_model_choice,
             deepy_type_choice, deepy_vram_mode_choice, deepy_voice_language_choice, voice_mode_choice, deepy_allow_read_file_system_choice, deepy_file_system_paths_choice, deepy_read_everywhere_choice,
-            deepy_context_tokens_choice, deepy_kv_cache_quantization_choice, deepy_kv_cache_exact_choice, deepy_compaction_type_choice, deepy_repetition_penalty_choice, deepy_zero_custom_system_prompt_choice, deepy_prime_custom_system_prompt_choice, deepy_prime_mcp_servers_choice, deepy_mcp_auto_discover_paths_choice, deepy_python_sandbox_choice, python_apps_choice, deepy_web_search_choice, deepy_advanced_transcription_choice, deepy_transcription_terms_choice, civitai_api_key_choice, civitai_api_key_secure_choice, huggingface_token_choice, huggingface_token_secure_choice,
+            deepy_context_tokens_choice, deepy_kv_cache_quantization_choice, deepy_kv_cache_exact_choice, deepy_compaction_type_choice, deepy_repetition_penalty_choice, deepy_kept_kv_caches_choice, deepy_zero_custom_system_prompt_choice, deepy_prime_custom_system_prompt_choice, deepy_prime_mcp_servers_choice, deepy_mcp_auto_discover_paths_choice, deepy_python_sandbox_choice, python_apps_choice, deepy_web_search_choice, deepy_advanced_transcription_choice, deepy_transcription_terms_choice, civitai_api_key_choice, civitai_api_key_secure_choice, huggingface_token_choice, huggingface_token_secure_choice,
             video_container_choice, video_output_codec_choice, rgba_video_output_choice, hdr_video_crf_choice, image_output_codec_choice, audio_output_codec_choice, audio_stand_alone_output_codec_choice,
             metadata_choice, embed_source_images_choice,
             save_path_choice, image_save_path_choice, audio_save_path_choice, mesh_save_path_choice,
@@ -1341,7 +1347,6 @@ class ConfigTabPlugin(WAN2GPPlugin):
             "image_output_codec": image_output_codec_choice,
             "audio_output_codec": audio_output_codec_choice,
             "audio_stand_alone_output_codec": audio_stand_alone_output_codec_choice,
-            "model_hierarchy_type": model_hierarchy_type_choice,
             "checkpoints_paths": checkpoints_paths,
             "loras_root": loras_root_choice,
             "save_queue_if_crash": save_queue_if_crash_choice,
@@ -1366,6 +1371,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                 PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY: enhancer_speculative_decoding_choice,
                 DEEPY_KV_CACHE_QUANTIZATION_KEY: join_deepy_kv_cache_quantization(deepy_kv_cache_quantization_choice, deepy_kv_cache_exact_choice),
                 DEEPY_REPETITION_PENALTY_KEY: normalize_deepy_repetition_penalty(deepy_repetition_penalty_choice),
+                DEEPY_KEPT_KV_CACHES_KEY: normalize_deepy_kept_kv_caches(deepy_kept_kv_caches_choice),
             })
         if deepy_enabled_choice:
             new_server_config[DEEPY_ALLOW_READ_FILE_SYSTEM_KEY] = normalize_deepy_file_system_access(deepy_allow_read_file_system_choice)
@@ -1405,7 +1411,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             if "attention_mode" in old_server_config: new_server_config["attention_mode"] = old_server_config["attention_mode"]
             if "compile" in old_server_config: new_server_config["compile"] = old_server_config["compile"]
 
-        for key in ("depth_anything_v3_process_res", "depth_anything_v3_chunk_size", "depth_anything_v3_chunk_overlap"):
+        for key in ("model_hierarchy_type", "depth_anything_v3_process_res", "depth_anything_v3_chunk_size", "depth_anything_v3_chunk_overlap"):
             new_server_config.pop(key, None)
 
         if not show_all_model_filter_choice and new_server_config.get(model_dropdowns.MODEL_OUTPUT_FILTER_CONFIG_KEY) == model_dropdowns.MODEL_OUTPUT_FILTER_ALL:
@@ -1450,17 +1456,16 @@ class ConfigTabPlugin(WAN2GPPlugin):
             "metadata_type", "clear_file_list", "multi_prompts_gen_type", "keep_intermediate_sliding_windows", "fit_canvas", "depth_anything_v2_variant",
             "notification_sound_enabled", "notification_sound_volume", *notifications.CONFIG_KEYS, "audio_processors", "temporal_upsamplers", "spatial_upsamplers", "matanyone_version",
             "prompt_enhancer_temperature", "prompt_enhancer_top_p", "prompt_enhancer_randomize_seed", "prompt_enhancer_quantization", PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY, "enhancer_mode",
-            DEEPY_ENABLED_KEY, DEEPY_TYPE_KEY, DEEPY_VRAM_MODE_KEY, DEEPY_ALLOW_READ_FILE_SYSTEM_KEY, DEEPY_FILE_SYSTEM_PATHS_KEY, DEEPY_READ_EVERYWHERE_KEY, DEEPY_CONTEXT_TOKENS_KEY, DEEPY_KV_CACHE_QUANTIZATION_KEY, DEEPY_COMPACTION_TYPE_KEY, DEEPY_COMPACTION_THINKING_KEY, DEEPY_REPETITION_PENALTY_KEY, DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY, DEEPY_PRIME_CUSTOM_SYSTEM_PROMPT_KEY, DEEPY_PRIME_MCP_SERVERS_KEY, DEEPY_MCP_AUTO_DISCOVER_PATHS_KEY, PYTHON_APPS_KEY, DEEPY_ADVANCED_TRANSCRIPTION_KEY, DEEPY_TRANSCRIPTION_TERMS_KEY,
+            DEEPY_ENABLED_KEY, DEEPY_TYPE_KEY, DEEPY_VRAM_MODE_KEY, DEEPY_ALLOW_READ_FILE_SYSTEM_KEY, DEEPY_FILE_SYSTEM_PATHS_KEY, DEEPY_READ_EVERYWHERE_KEY, DEEPY_CONTEXT_TOKENS_KEY, DEEPY_KV_CACHE_QUANTIZATION_KEY, DEEPY_COMPACTION_TYPE_KEY, DEEPY_COMPACTION_THINKING_KEY, DEEPY_REPETITION_PENALTY_KEY, DEEPY_KEPT_KV_CACHES_KEY, DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY, DEEPY_PRIME_CUSTOM_SYSTEM_PROMPT_KEY, DEEPY_PRIME_MCP_SERVERS_KEY, DEEPY_MCP_AUTO_DISCOVER_PATHS_KEY, PYTHON_APPS_KEY, DEEPY_ADVANCED_TRANSCRIPTION_KEY, DEEPY_TRANSCRIPTION_TERMS_KEY,
             LLM_CONFIG_KEY,
             "max_frames_multiplier", "display_stats", "keep_resolution_on_model_switch", "enable_4k_resolutions", "max_reserved_loras", "video_output_codec", "hdr_video_crf", "video_container",
             "embed_source_images", "image_output_codec", "audio_output_codec", "audio_stand_alone_output_codec", "checkpoints_paths", "loras_root", "save_queue_if_crash",
-            "model_hierarchy_type", "UI_theme", "floating_generate_button", "queue_color_scheme", gradio_queue_focus_patch.FOCUS_QUEUE_SERVER_CONFIG_KEY, "prevent_power_throttling",
+            "UI_theme", "floating_generate_button", "queue_color_scheme", gradio_queue_focus_patch.FOCUS_QUEUE_SERVER_CONFIG_KEY, "prevent_power_throttling",
             COMPUTE_CACHE_KEY, COMPUTE_CACHE_PATH_KEY,
         ]
 
         needs_reload = not all(change in no_reload_keys for change in changes)
 
-        self.set_global("three_levels_hierarchy", new_server_config["model_hierarchy_type"] == 1)
         self.set_global("attention_mode", new_server_config["attention_mode"])
         self.set_global("default_profile", new_server_config["profile"])
         self.set_global("default_profile_video", new_server_config["video_profile"])

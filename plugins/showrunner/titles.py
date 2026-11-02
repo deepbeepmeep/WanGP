@@ -31,15 +31,21 @@ FACES = {
     "storybook": {"family": SERIF, "weight": 400, "glyph": 0.46, "body": SERIF},
 }
 
+CAPITAL = 1.45  # a capital against a face's average glyph, measured on the serif faces' titles
 
-def _lines(text: str, size: float, width: float, glyph: float = 0.46) -> list[str]:
-    """Words wrapped to the width (an average glyph is `glyph` times the font size), keeping the user's line breaks."""
+
+def _measured(text: str, capital: float) -> float:
+    return sum(capital if char.isupper() else 1.0 for char in text)
+
+
+def _lines(text: str, size: float, width: float, glyph: float = 0.46, capital: float = 1.0) -> list[str]:
+    """Words wrapped to the width (an average glyph is `glyph` times the font size, a capital `capital` times that), keeping the user's line breaks."""
     per_line = max(6, int(width / (size * glyph)))
     lines = []
     for paragraph in str(text).splitlines() or [""]:
         line = ""
         for word in paragraph.split():
-            if line and len(line) + 1 + len(word) > per_line:
+            if line and _measured(line, capital) + 1 + _measured(word, capital) > per_line:
                 lines.append(line)
                 line = word
             else:
@@ -68,10 +74,24 @@ def _display(c, lines: list[str], x: float, y: float, size: float, anchor: str =
                  italic=face.get("italic", False), extra='filter="url(#s)"' if shadow and c.shadowed else "")
 
 
-def _wrap(c, text: str, size: float, width: float) -> list[str]:
+def _units(c) -> tuple[float, float]:
+    """A design's average glyph, in em, and how much wider a capital is where its face mixes both."""
     face = c.face
-    text = text.upper() if face.get("upper") else text
-    return _lines(text, size, width, face["glyph"] + face.get("spacing", 0.0))
+    return face["glyph"] + face.get("spacing", 0.0), 1.0 if face.get("upper") or face["family"] == MONO else CAPITAL
+
+
+def _wrap(c, text: str, size: float, width: float) -> list[str]:
+    return _lines(text.upper() if c.face.get("upper") else text, size, width, *_units(c))
+
+
+def _fit(c, text: str, size: float, width: float) -> tuple[float, list[str]]:
+    """The words wrapped at the design's size, or smaller until they stay inside the width and most of the height."""
+    glyph, capital = _units(c)
+    while True:
+        lines = _wrap(c, text, size, width)
+        if max(_measured(line, capital) for line in lines) * size * glyph <= width and len(lines) * size * 1.18 <= c.height * 0.72:
+            return size, lines
+        size *= 0.92
 
 
 def _defs(c) -> str:
@@ -101,8 +121,7 @@ def _card(c, text: str, subtitle: str) -> str:
     face = c.face
     if c.design in ("bold", "typewriter"):  # left-aligned blocks
         x0 = w * (0.09 if c.design == "bold" else 0.11)
-        size = u * (11.0 if c.design == "bold" else 6.5)
-        lines = _wrap(c, text, size, w * 0.78)
+        size, lines = _fit(c, text, u * (11.0 if c.design == "bold" else 6.5), w * 0.78)
         small = u * 2.2
         sub = _lines(subtitle.upper(), small, w * 0.78, 0.62) if subtitle else []
         block = len(lines) * size * 1.08 + (len(sub) * small * 1.35 + u * 2.4 if sub else 0)
@@ -122,8 +141,7 @@ def _card(c, text: str, subtitle: str) -> str:
         cursor_x = x0 + len(last) * size * 0.6 + u * 0.6
         body += f'<rect x="{cursor_x:.1f}" y="{first + (len(lines) - 1) * size * 1.08 - size * 0.72:.1f}" width="{size * 0.5:.1f}" height="{size * 0.86:.1f}" fill="{accent}"/>'
         return body
-    size = u * {"classic": 9.0, "elegant": 8.5, "minimal": 4.6, "storybook": 8.0}[c.design]
-    lines = _wrap(c, text, size, w * 0.78)
+    size, lines = _fit(c, text, u * {"classic": 9.0, "elegant": 8.5, "minimal": 4.6, "storybook": 8.0}[c.design], w * 0.78)
     small = u * (1.8 if c.design == "minimal" else 2.0)
     sub_face = SANS if c.design in ("classic", "elegant") else face["body"]
     sub = _lines(subtitle.upper() if c.design in ("classic", "elegant") else subtitle, small, w * 0.78, 0.6) if subtitle else []
@@ -168,8 +186,8 @@ def _title(c, text: str, subtitle: str) -> str:
     """A title over the opening shot: the design's face over a soft shade (lower left for bold and typewriter designs)."""
     w, h, u, face = c.width, c.height, c.unit, c.face
     if c.design in ("bold", "typewriter"):
-        x0, size = w * 0.07, u * (8.5 if c.design == "bold" else 5.0)
-        lines = _wrap(c, text, size, w * 0.6)
+        x0 = w * 0.07
+        size, lines = _fit(c, text, u * (8.5 if c.design == "bold" else 5.0), w * 0.6)
         small = u * 2.0
         sub = _lines(subtitle.upper(), small, w * 0.6, 0.62) if subtitle else []
         block = len(lines) * size * 1.08 + (len(sub) * small * 1.35 + u * 2.0 if sub else 0)
@@ -186,8 +204,7 @@ def _title(c, text: str, subtitle: str) -> str:
             body += _text(sub, x0, top + len(lines) * size * 1.08 + u * 2.0 + small * 0.4, small, family=MONO if c.design == "typewriter" else SANS, anchor="start", weight=700,
                           fill=c.accent, spacing=u * 0.35, leading=1.35, extra='filter="url(#s)"')
         return body
-    size = u * (5.0 if c.design == "minimal" else 7.5)
-    lines = _wrap(c, text, size, w * 0.8)
+    size, lines = _fit(c, text, u * (5.0 if c.design == "minimal" else 7.5), w * 0.8)
     small = u * 2.0
     sub = _lines(subtitle.upper(), small, w * 0.8, 0.6) if subtitle else []
     block = len(lines) * size * 1.18 + (len(sub) * u * 2.6 + u * 2.5 if sub else 0)

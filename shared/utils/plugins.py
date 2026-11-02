@@ -463,6 +463,14 @@ class WAN2GPPlugin:
 
     def setup_ui(self) -> None:
         pass
+
+    def query_checkpoint_inventory(self):
+        """Return every checkpoint variant this extension can use, regardless of current settings.
+
+        Yield entries with a model name, an optional variant label and the download_defs
+        used by the downloader. None uses the legacy download definition. [] means no checkpoints.
+        """
+        return None
         
     def add_tab(self, tab_id: str, label: str, component_constructor: callable, position: int = -1, *, icon: str | None = None):
         self.tabs[tab_id] = PluginTab(id=tab_id, label=label, component_constructor=component_constructor, position=position, icon=icon)

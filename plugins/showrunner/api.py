@@ -54,6 +54,9 @@ class Archived(BaseModel):
 class Settings(BaseModel):
     notify_turns: bool | None = None
     cast_loras: bool | None = None
+    show_all_errors: bool | None = None
+    show_deepy_tab: bool | None = None
+    any_shot_length: bool | None = None
 
 
 class Text(BaseModel):
@@ -260,6 +263,11 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
     async def shoot_rates(production_id: str):
         production(production_id)
         return await run_in_threadpool(showrunner.shoot_rates, production_id)
+
+    @app.get("/api/productions/{production_id}/conversation")
+    def conversation(production_id: str, after: int = 0):
+        production(production_id)
+        return showrunner.director.conversation(production_id, after)
 
     @app.get("/api/productions/{production_id}/director")
     def director_status(production_id: str):

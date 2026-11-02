@@ -502,7 +502,7 @@ The context window is how much recent conversation, tool output, and project sta
 
 The KV cache holds the active conversation context in GPU memory. Quantizing it reduces that memory cost without changing the model checkpoint.
 
-- **Auto** uses fast INT8 caching when compatible GGUF kernels are installed and otherwise uses BF16. **Recommended for:** most users.
+- **Auto** chooses for your installation: Q4 when the GGUF and Triton kernels are installed and the GPU is an RTX 30XX or newer, fast INT8 with the GGUF kernels alone, and BF16 otherwise. **Recommended for:** most users.
 - **Disabled (BF16)** uses more VRAM and avoids cache quantization. **Recommended for:** quality-sensitive troubleshooting, or systems where INT8 cache performance is worse.
 - **INT8** uses about half the KV-cache VRAM and makes larger context windows practical. **Recommended for:** long Prime sessions or tight VRAM, provided the installed kernels support it efficiently.
 - **Below INT8** (INT8 keys with Q4 values, Q6, Q6 keys with Q4 values, Q4.1, Q4) shrinks the cache further, by a quarter to almost a half of the INT8 size. The first page of the conversation and the most recent tokens always stay in INT8; only the older middle of the context uses the smaller format. Q6 and INT8 keys with Q4 values are practically indistinguishable from INT8 on long texts; Q4.1 and Q4 cost a little precision on the oldest part of the context. Decoding speed is unchanged; reading a long prompt is 5 to 12 percent slower. **Recommended for:** very long Prime sessions on cards where the cache, not the model, is what no longer fits.
@@ -510,6 +510,14 @@ The KV cache holds the active conversation context in GPU memory. Quantizing it 
 **Exact Sink and Recent Tokens** appears with a cache below INT8 and chooses which tokens keep the INT8 precision: the first page plus the last 1024 tokens (recommended), the first page plus the last 256 tokens, the last 1024 tokens alone, or none for a uniformly quantized cache.
 
 The context-window label displays an estimated cache size. Treat that estimate as VRAM reserved before image or video model requirements.
+
+### KV Caches Kept in RAM
+
+When you go back to a conversation you left (your chat after a Showrunner request, or a production you worked on last), Deepy continues from its saved cache instead of rebuilding its context, so it answers in seconds rather than up to a minute. Each conversation keeps one cache, restored when it next needs Deepy; the oldest makes way once the limit is reached, and that conversation simply rebuilds its context on its next request.
+
+- **2** (default) keeps your chat and your last production ready.
+- **More** keeps more productions ready, at the cost of RAM: 64K tokens of context take about 1.2 GB in Q4, 2.1 GB in INT8 and 4 GB in BF16.
+- **Disabled** frees that RAM, and every conversation you come back to rebuilds its context. **Recommended for:** low RAM.
 
 ### Compaction Type When Context is Full
 

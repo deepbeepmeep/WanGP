@@ -1106,8 +1106,6 @@ class MiniMaxH3Pipeline:
         if self.reference_mode:
             visual_ref_count = sum(ref["kind"] in ("image", "video", "video_audio") for ref in refs)
             audio_ref_count = sum(ref["kind"] in ("audio", "video_audio") for ref in refs)
-            if pika and not visual_ref_count:
-                raise ValueError("Pika H3 Flex Ref2VA requires at least one image or video reference")
             if not pika and not self.audio_only and audio_ref_count > visual_ref_count:
                 raise ValueError(f"MiniMax H3 requires at least as many image and video references as audio references (found {visual_ref_count} visual and {audio_ref_count} audio)")
             standalone_audio_count = sum(ref["kind"] == "audio" for ref in refs)

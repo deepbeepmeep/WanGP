@@ -43,8 +43,9 @@ function showItem(item) {
 }
 
 export function mountBin(root) {
+  let known = null;  // the items seen so far: a new one comes into view
   function render() {
-    const items = state.doc?.bin || [];
+    const items = state.doc?.bin || [], position = root.querySelector('.bin-items')?.scrollLeft || 0;
     const open = state.binOpen && (items.length || state.binOpenedEmpty);  // an empty bin stays folded: the board keeps its room
     root.className = `bin ${open ? '' : 'collapsed'}`;
     root.innerHTML = `<div class="bin-head" id="bin-toggle">${icon('bin')} Media bin <span class="muted" style="font-weight:500">${items.length ? `${items.length} · click to play, drag onto a shot or a cast member` : 'drop files here, then drag them onto a shot or a cast member'}</span><span class="grow"></span>${icon(open ? 'chevronDown' : 'chevron')}</div>
@@ -55,6 +56,10 @@ export function mountBin(root) {
           <button class="bin-remove" data-remove-bin title="Remove from the bin (the file stays in the production's folder; Ctrl+Z brings it back)" aria-label="Remove from the bin">${icon('x')}</button>
           <span class="bin-name">${esc(readable(item.name || item.path.split('/').pop()))}</span></div>`).join('')}
         <div class="bin-drop" id="bin-drop">${icon('upload')}<br>Add media</div></div>`;
+    const list = root.querySelector('.bin-items'), added = known && items.some(item => !known.has(item.id));
+    known = new Set(items.map(item => item.id));
+    list.scrollLeft = position;  // a redraw keeps the place
+    if (added && !document.querySelector('.bin-viewer')) list.scrollTo({ left: list.scrollWidth, behavior: 'smooth' });  // not while the user looks at an item
     root.querySelector('#bin-toggle').onclick = () => {
       state.binOpen = !open; state.binOpenedEmpty = state.binOpen && !items.length;
       try { localStorage.setItem('sr.bin', state.binOpen ? '1' : '0'); } catch { /* a convenience */ }

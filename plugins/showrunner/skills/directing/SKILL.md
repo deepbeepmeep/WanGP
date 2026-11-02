@@ -32,6 +32,7 @@ merges, this document and its actions replace them:
 
 ## 2. Plan
 
+- The brief is the user's: no action writes it, and a rewritten line lives in the shot's `dialogue`. Only the user approves a take: yours passes your check, say so in those words.
 - `plan` writes outline, cast, style and shots in one call. Shots the user locked, edited or already shot are kept; the others are
   replaced. Write the prompts in the call itself, never in files: for many shots, `plan` the outline, cast, style and first shots, then
   `add_shots` the others in batches.
@@ -45,13 +46,17 @@ merges, this document and its actions replace them:
   look for LoRAs it names. `plan` validates every shot and returns the problems (fix them with `update_shot`) and `renders`, what the shots will come out at, {size: {shot: seconds}}: quote these numbers when you tell the user a size or a length.
 - Every prompt restates the production's look for its scene: time of day, weather, light, palette and lens, and the wardrobe of each
   person it shows. A prompt without them drifts to a neutral daylight look and breaks the sequence.
+- A master's prompt says plainly who it shows, first: "a young woman", "an old man". A pronoun in the middle of a sentence does not reach the picture, and short hair or a uniform can turn someone into somebody else. When the brief leaves it open, decide once: the description, the picture and the voice say the same. Look at every master before anything depends on it (`inspect_media`), against its description and `voice_description`: age, sex, hair, clothes. A wrong one is made again now, when it costs one picture and not every shot. The tools measure the voices: `speak` makes a voice again when it reads as the other sex than its card, says so when it cannot, and warns when a line moves away from its speaker's voice. Act on these warnings: say the sex plainly in `voice_description`, and make the delivery note gentler.
+- A location that recurs is a cast member too, with `role` "place": one wide picture of the set as the viewer should see it, without the cast and without words, from the user's photo or `images`, as its `master`. People who belong to the place stay in the picture (the audience in its seats, the staff, the crowd), dressed as themselves and not like the cast: leave them out and the place stays empty, or every shot invents another crowd. List it in the `cast` of every shot that happens there, after the people: its picture goes in as a reference, and that is what keeps the set the same. Words in a prompt give a new set each time, however precise. It holds on close shots too, so shots without people use a reference template as well (`cast_shots`). A side the picture does not show (the seats seen from the stage, a reverse angle) gets a second place card, its picture made from the first with `image_edits`: only one picture of a card goes to a shot. When the place changes (a mess after an explosion), give it a `look` for those shots, as for a costume.
+- A shot with lines and more than one face says in its prompt who speaks, and that the others keep their mouths closed: the model moves whichever mouth it finds, a cat's or a statue's, and your inspection has to look for it.
+- Everyone visible in a shot is in its `cast`, background included, and the prompt says who is there: a person without a picture comes out as a stranger, and a crowd takes on the costumes of the cast unless the prompt dresses it otherwise.
 - Signs, screens, books and labels in a scene, and the markings of a prop or a costume in a master image, come out with garbled letters:
   describe them as wordless (neon tubes, plain boxes, out of focus) unless their words matter, and then the words go in an overlay.
-- Shots play back to back in document order. In a music video, their durations add up to the song and the cuts land on bars or section
-  changes (the summary's `song_analysis` gives sections and bars). Respect the model's minimum and maximum shot lengths.
+- Shots play back to back in document order: `move_shots(shots, before)` changes the order, and only it (`before` null: to the end). In a music video, their durations add up to the song and the cuts land on bars or section
+  changes (the summary's `song_analysis` gives sections and bars). Respect the model's longest shot, and `template_advice` `shot_length` for the lengths it makes.
 - Pacing is part of the direction: the edit plays the song (or the score) straight through, so a shot lasts what its moment needs, not
-  the model's longest window. In a music video most shots last one to three bars (2 to 6 s at 120 BPM), faster in choruses and with
-  the brief's pacing; a sung line holds longer. A film's dialogue sets its own rhythm. Planning every shot at the longest window saves
+  the model's longest window. In a music video most shots last one to three bars (a bar is 2 s at 120 BPM), faster in choruses and with
+  the brief's pacing, as far as `shot_length` allows; a sung line holds longer. A film's dialogue sets its own rhythm. Planning every shot at the longest window saves
   renders but gives a slow, monotonous cut.
 - Every speaker gets a voice in the cast: a `voice_description` (age, timbre, accent, pace: "a woman in her seventies, warm and slow,
   a faint Breton accent") or the user's voice sample. The narrator is a cast member with role narrator and no pictures. `speak` makes
@@ -79,7 +84,7 @@ advice's automatic picks.
   needs other pictures too. Never pass a cast picture as `image_start`: a start image becomes the first frame of the shot, so its
   framing, aspect and setting leak into it (a square portrait gives a square take; an indoor photo opens a beach shot indoors).
 - A lip-synced shot also takes its exact slice of the song as driving audio, with the template of `cast_shots_lip_synced`: set its
-  `audio_slice` and give the song itself as `audio_guide`. `render` cuts the slice, and when that template is a reference template
+  `audio_slice`. On a cut that plays the song, a shot's `dialogue` holds the lyric sung under it, for the subtitles: `render` never speaks it. Give a shot that shows the singer singing its slice. `render` takes the brief's song, cuts the slice, and when that template is a reference template
   (`lip_sync` in the advice) makes it follow the slice as its soundtrack; do not cut it yourself.
 - A change of what someone wears or looks like (a user's note "no raincoat in the last two shots") is a look, in a production of any
   length (see Long productions): rewriting the prompts is not enough, the reference picture brings the old outfit back.
@@ -129,15 +134,21 @@ The production's edit replaces the merge and remux steps of the film and product
   "speaking with natural lip movements synchronized".
 - Speaking shots: use the lip-sync template of the advice, `video_length` at least as long as the shot's lines. `render` drives the shot
   with its lines (it speaks the ones not spoken yet, one after the other when there are several), pads them with silence to the shot's
-  length and trims the shot 0.35 s after them: the model fills the padding with invented words. Set another `trim` when a pause after
-  the lines is wanted. The edit keeps the lines in sync with `edit(audio_mode="clips")`, or "mix" when the song plays too.
+  length and trims the shot 0.35 s after them: the model fills the padding with invented words.
+  A spoken shot therefore lasts about its line: plan the cut's length from the lines, not from the planned durations. A short reply gives a
+  shot too short to read: follow it with a silent reaction shot, or set a longer `trim` after `transcribe_media` shows that part of the take says nothing. The edit keeps the lines in sync with `edit(audio_mode="clips")`, or "mix" when the song plays too.
 - Narration and voice-over: `speak` the shots' NARRATOR lines, then lay them over the edit with `edit(tracks=[{shot, line}, ...])`: each
   spoken line starts where its shot starts (`start_s` places it elsewhere), with no media ids to copy. Score: one `gen_song` instrumental as long as the cut (up to
   10 minutes), about -12 dB under speech.
-- A song you make yourself becomes the production's song with `edit(song=...)`; plan the cuts on its `song_analysis` after that.
+- A cut does not outlast its music: when the song ends or fades out before the last shot (the timeline's warnings say so), repeat its last bar under the end, faded out, or end the cut with the song, before you deliver. An end card over silence is a fault.
+- A song you make yourself becomes the production's song with `edit(song=...)`. Then `check_song(lyrics=...)` with the words you wrote for it, before anything depends on it: it says which lines of the lyrics are really sung, and when, and whether the lead voice fits the singer on screen. Its `not_sung` lines are not a transcript's mistake, they are a failed take: compose again as the skill says, and keep the take that sings the most lines. Subtitles follow its times, and an unsung line gets none. Plan the cuts on the song's `song_analysis` after that.
 - A shot whose picture you draw (a card, a diagram, a map, an animated explainer) has `generation: {"template": "draw_svg"}` and an
   intent saying what it shows: `plan` does not validate it and `render` skips it. Draw it with `draw_svg` (`duration_s` and SVG
   animation elements for motion) at the production's format, then record it with `record_take`.
+- Keep a voice description plain: age, gender, pitch and pace. Accents and moods ("a smile in her voice") are where a generated voice tends to sound artificial; add them only when the user asks. A new voice says the same lines at another length: speak them again before you trim anything.
+- End on an `end_card` (a `caption` is too small for it), after the last words, with a moment held after them. A title read aloud does not also need its words as a subtitle.
+- The words the user dictated for a title or a card are copied letter for letter, and `edit` lists under `check_spelling` the words of your text that look like a mistyped word of the user's: correct them before you assemble. Look at the frame of each title in the export too, and ask of it whether any letter touches or passes the edge of the frame or its border.
+- Report the cut's length against the one the brief asks for, in your own words, whenever they differ.
 - Text is never asked of a video model. Titles, lower thirds, captions and the end card go over the cut with
   `edit(overlays=[{text, subtitle, style, start_s, duration_s}])` (styles: title, lower_third, caption, chapter, end_card), drawn for
   you at the production's format. A designed piece of your own: draw it with `draw_svg` at the production's format on a transparent
@@ -174,7 +185,7 @@ A film of several minutes is a chain of sequences, each a scene or a chapter of 
 - Shoot sequence by sequence: render, inspect and judge one sequence, read the document again (`sequence` gives its shots), then the
   next. Assemble after each finished sequence when the user follows the production, so the edit grows as you shoot (not when the brief
   asks to review the takes before the edit).
-- Mark the structure: a title over the opening shot, a chapter card or a lower third where a new place, time or person appears, and
+- Mark the structure, in a music video too: a title over the opening shot, a chapter card or a lower third where a new place, time or person appears, and
   an end card. Vary the chapter cards with what they open: a card over a still of the chapter's first shot, or a title laid over that
   shot itself, rather than the same plain page each time. Score the whole cut, with speech or narration over it.
 
@@ -195,12 +206,38 @@ A film of several minutes is a chain of sequences, each a scene or a chapter of 
   when you rewrite the tracks.
 - A finished production has sound under its whole length. Unless the brief asks otherwise, a film, ad, trailer or story gets a score
   (an instrumental `gen_song` as long as the cut, about -12 dB under speech), a title and an end card, and spoken words get subtitles.
+- Before `assemble`, read `production(section="timeline")`: its `warnings` are what the export would report, while fixing them costs no version.
+- A shot plays its whole take unless the pace asks otherwise: a prompt's action needs its time, and the brief's length is a target, not worth cutting every shot for. When the total differs, say so.
+- A change of song or of voice changes the cut: plan the affected shots again from the new song or line rather than squeezing the old takes into it. A stub under 2 s belongs only in a fast section: drop or merge a shot before you cut it that short.
+- One request, one version: make all of a request's changes and check them, then `assemble` once. Every `assemble` is a version the user has to sort through, so do not assemble to test, and say why when a fix needs another one. A warning `assemble` gives is work to do, not news to report: fix it and assemble again before you report. A score from before you added shots stops short: `assemble` warns, and you lengthen it in the same request.
+- Say only what you checked. `assemble` lists under `warnings` what is wrong with the delivered file, such as a silent end: fix it (a song that lasts as long as the cut, a score on the tail) or tell the user plainly, and never describe sound you did not measure.
+- After a change of cast, tell the user which shots still show the old person or look, and whether you are re-shooting them. Bring the member's `role` and `description` up to date with `cast` when the look or voice changed.
+- A version in another format keeps everything but the frame: the same shots, words, cast, voices and music, each shot made again with its composition rethought for the new frame. A card drawn for the old format is drawn again from the same SVG, with its colours, typefaces and layout kept and only the canvas changed; compare the new card with the old one, and with a card that has no drawing of its own, `record_take(card=...)` in the production's text design follows by itself.
+- A note that arrives while a shot renders does not stop it: let it finish unless the note is about that shot, and do not shoot it again for nothing.
 - `assemble` renders it and reports what went in (length, sound, subtitle cues with their times, text, tracks). It levels the sound and measures the
   delivered file (true peak under -1 dBTP): never re-master, re-mux or re-encode its export with other tools. A file made outside
-  the production is not a version the user sees on Deliver; change the edit (`edit`, trims) and assemble again instead. Check the picture and the sound of the
+  the production is not a version the user sees on Deliver; change the edit (`edit` for sound and text, `update_shot` fields `trim`, `speed` and `transition` for a shot) and assemble again instead. Check the picture and the sound of the
   result; transcribe single takes or lines, not the scored mix (music confuses the transcriber), and do not parse the file's boxes.
 
-## 8. Keep the user informed
+## 8. Fix what is wrong
+
+A first version is not the end of the work. When you find a fault, or the user points at one (shots, a moment of the video, a sentence), fix that and keep the rest:
+
+- What the user asks for is theirs to decide: a new length, other content, another framing, a shot inserted between two others, a shot left out. Do it as asked. A new shot matches the shots around it: the same cast, look and kind of template. A shot that changes length moves what follows in the cut, and on a song it leaves the beat: say so first.
+- Find where it is: `production(section="timeline")` says which shot plays when, so "the first 15 seconds" names its shots.
+- Find the cause before you shoot. Words that do not match: `check_song` for a song, `transcribe_media` of the take for a spoken line. Lips in doubt: `wangp_toolbox` `check_lip_sync` measures one shot in seconds (`voice_id`: the song's vocal stem, `voice_start_s`: where the shot starts in it); `may_not_follow` is a suspicion for your eyes, not a fault. Lips that do not follow a song while its slice is right: the face is too small or moves too fast, so shoot it closer and steadier. A subtitle, a trim, a card or a level is fixed in the edit, without a new take.
+- Make the smallest change that solves it: a trim, another take of the shot, a subtitle, one new take. Never render a shot the fault does not touch, and keep what is locked.
+- On a cut that plays the song, the song is the clock: a shot inserted or made longer covers what comes next, and later shots keep their place and their lips (`on_the_song` in the result says what moved). So the film does not get longer. A shot that sings longer needs a longer `audio_slice` and a new take. A shot made shorter leaves a gap that a singing shot cannot fill, as it has no picture for the song before its slice: `song_drift` reports it, and that shot is shot again on a slice that starts earlier.
+- On a film, each shot's sound, line tracks, cards and subtitles follow the shots. A score stays where it starts: its hits no longer land on the same pictures, and a longer film can outlast it.
+- When the cause reaches other shots, say so before you act: a new song means every singing shot again. Say how many shots and about how long.
+- Then assemble a new version, check that the fault is gone, and say in a line or two what changed. Earlier versions stay: the user can compare them.
+- Two new takes at most for one fault. If it is still there, stop: keep the best take, say plainly what the model cannot do here, and offer what the user can choose (another take, another framing, another line, leaving the shot out). Do not change other things to make up for it.
+- When the user names shots to fix, the tools keep everything else as it is for that task. If the fault needs more, end your turn saying what you would change and what it costs; their answer starts a task that can do it.
+- A change the user asks for as a whole (another actor, a new song, a new style, another structure) is not a fix: do all of it. Say first what it renders again.
+
+A deep review is asked by the user after a version, and changes nothing. `deep_review` measures words, subtitles, voices, lips, sound and picture and records its findings on the version; you add what you see by comparing frames with the cast and place pictures (`deep_review(add=[...])`), then tell the user what matters most. A **fault** is measured; a **check** is a suspicion the user judges by eye, so do not present it as a fact.
+
+## 9. Keep the user informed
 
 - `log` one short line for each decision the user should know about: a changed approach, a limitation, a trade-off.
 - At the end of a task, say in two or three sentences what changed and what is left for the user to review.

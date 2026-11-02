@@ -9,7 +9,7 @@ import { shotMenu } from './storyboard.js';
 
 const TRANSITION_ORDER = ['cut', 'crossfade', 'fade_black', 'fade_white'];
 const TRANSITION_LABEL = { cut: 'Cut', crossfade: 'Dissolve', fade_black: 'Fade through black', fade_white: 'Fade through white' };
-const LANES = { ruler: [0, 30], sections: [30, 24], video: [56, 84], text: [140, 32], audio: [172, 64] };
+const LANES = { ruler: [0, 30], sections: [30, 24], video: [56, 84], text: [140, 32], words: [172, 24], audio: [172, 64] };
 const TEXT_STYLES = [['title', 'Title'], ['lower_third', 'Lower third'], ['caption', 'Caption'], ['chapter', 'Chapter card'], ['end_card', 'End card']];
 const trackLengths = new Map(), trackProbes = new Map();  // a sound track's length, read from the file (its probe kept until then)
 const trackName = track => track.name || track.path.split('/').pop().replace(/^\d{4}-\d\d-\d\d-\d\dh\d\dm\d\ds_seed\d+_/, '').replace(/\.\w+$/, '');
@@ -23,7 +23,7 @@ export function mountTimeline(container, doc) {
     <div class="transport" id="transport"></div>
     <div class="tracks" id="tracks"><div class="tracks-inner" id="inner">
       <div class="track-labels" id="labels"></div>
-      <div class="ruler" id="ruler"></div><div class="sections-lane" id="sections"></div><div class="video-lane" id="video"></div><div class="text-lane" id="text"></div>
+      <div class="ruler" id="ruler"></div><div class="sections-lane" id="sections"></div><div class="video-lane" id="video"></div><div class="text-lane" id="text"></div><div class="words-lane" id="words"></div>
       <div class="audio-lane" id="audio"><canvas id="wave"></canvas><div class="beats-lane" id="beats"></div><div class="sound-lane" id="sound-tracks"></div></div>
       <div class="playhead" id="playhead"></div><div class="snap-guide hidden" id="guide"></div></div></div>
   </div>`;
@@ -74,6 +74,7 @@ export function mountTimeline(container, doc) {
     renderSections(song);
     renderClips();
     renderText();
+    renderWords();
     renderAudio(song, total);
     renderEditCard();
     positionPlayhead(sequencer.time);
@@ -123,9 +124,10 @@ export function mountTimeline(container, doc) {
   }
 
   function renderLabels() {
-    const lane = (key, iconName, label) => `<div style="top:${LANES[key][0]}px;height:${LANES[key][1]}px">${icon(iconName)}${label}</div>`;
+    const spoken = state.doc.shots.some(shot => shot.dialogue?.length);  // no words, no lane: the sound comes up
+    const lane = (key, iconName, label, shift = 0) => `<div style="top:${LANES[key][0] + shift}px;height:${LANES[key][1]}px">${icon(iconName)}${label}</div>`;
     $('#labels').innerHTML = lane('ruler', 'clock', 'Time') + lane('sections', 'layers', 'Parts') + lane('video', 'video', 'Shots') + lane('text', 'note', 'Text')
-      + lane('audio', 'music', state.doc.brief.song ? 'Song' : 'Sound');
+      + (spoken ? lane('words', 'chat', 'Words') : '') + lane('audio', 'music', state.doc.brief.song ? 'Song' : 'Sound', spoken ? LANES.words[1] : 0);
   }
 
   function renderRuler(total) {
@@ -171,6 +173,22 @@ export function mountTimeline(container, doc) {
     }).join('') || `<div class="muted" style="position:absolute;left:110px;top:30px">No shot in the edit yet: plan or add shots on the storyboard.</div>`;
   }
 
+  // The spoken lines where their subtitles sit: a line starts with its shot and lasts its recorded length, several share their shot by their number of characters.
+  function renderWords() {
+    const name = id => state.doc.cast.find(member => member.id === id)?.name || '';
+    $('#words').innerHTML = segs.flatMap(seg => {
+      const lines = (seg.shot.dialogue || []).filter(item => item.line?.trim()), total = lines.reduce((sum, item) => sum + item.line.length, 0);
+      const span = lines.length === 1 && lines[0].duration_s ? Math.min(seg.duration, lines[0].duration_s / seg.speed + 0.3) : seg.duration;
+      let start = seg.start;
+      return lines.map(item => {
+        const length = span * item.line.length / total, left = x(start), width = Math.max(14, length * pxPerSecond - 2), who = name(item.speaker);
+        start += length;
+        return `<div class="word-clip" style="left:${left}px;width:${width}px" title="${esc(who ? `${who}: ${item.line}` : item.line)} · ${length.toFixed(1)} s">${esc(item.line)}</div>`;
+      });
+    }).join('');
+    $('#words').classList.toggle('hidden', !segs.some(seg => seg.shot.dialogue?.length));
+  }
+
   // Text over the edit: titles, lower thirds, captions and cards, drawn at the production's format and faded in and out.
   function overlays() { return state.doc.edit.overlays || []; }
 
@@ -192,15 +210,16 @@ export function mountTimeline(container, doc) {
   function previewText(time) {
     const box = $('#text-preview');
     if (!box) return;
-    const active = overlays().filter(item => time >= item.start_s - 0.02 && time < item.end_s && item.path);  // a text added at the playhead shows at once
+    const closes = item => item.style === 'end_card' && totalSeconds() - item.end_s < 0.25;  // it stays to the last frame, as assemble.py draws it
+    const active = overlays().filter(item => time >= item.start_s - 0.02 && (time < item.end_s || closes(item)) && item.path);  // a text added at the playhead shows at once
     const key = active.map(item => item.id + item.path).join('|');
     if (box.dataset.key !== key) {
       box.dataset.key = key;
       box.innerHTML = active.map(item => `<img data-ov="${item.id}" src="${actions.file(item.path)}" alt="">`).join('');
     }
     for (const item of active) {
-      const fade = Math.min(item.fade_s || 0, (item.end_s - item.start_s) / 3);
-      const opacity = fade > 0.01 && sequencer?.playing ? Math.min(1, (time - item.start_s) / fade, (item.end_s - time) / fade) : 1;  // fades while playing, full while paused
+      const fade = Math.min(item.fade_s || 0, (item.end_s - item.start_s) / (closes(item) ? 1 : 3));
+      const opacity = fade > 0.01 && sequencer?.playing ? Math.min(1, (time - item.start_s) / fade, closes(item) ? 1 : (item.end_s - time) / fade) : 1;  // fades while playing, full while paused
       const image = box.querySelector(`[data-ov="${item.id}"]`);
       if (image) image.style.opacity = Math.max(0, opacity).toFixed(3);
     }
@@ -424,7 +443,7 @@ export function mountTimeline(container, doc) {
       inner.setPointerCapture(event.pointerId);
       return;
     }
-    if (event.target.closest('.ruler, .sections-lane, .audio-lane, .video-lane')) {
+    if (event.target.closest('.ruler, .sections-lane, .audio-lane, .video-lane, .words-lane')) {
       sequencer.seek(secondsAt(event.clientX));
       drag = { kind: 'scrub' };
       inner.setPointerCapture(event.pointerId);
@@ -529,7 +548,7 @@ export function mountTimeline(container, doc) {
       current.clip.classList.remove('dragging');
       if (!current.moved) {
         const seg = segs.find(item => item.shot.id === current.id);
-        if (doubleClick(`shot:${current.id}`)) { actions.select(current.id); return; }  // double-click: open the shot
+        if (doubleClick(`shot:${current.id}`)) { actions.openShot(current.id); return; }  // double-click: open the shot
         actions.select(current.id, { additive: event.ctrlKey || event.metaKey, range: event.shiftKey, open: false });
         if (seg && !sequencer.playing) sequencer.seek(seg.start + 0.01);  // a click shows the shot in the monitor
         renderClips();

@@ -122,7 +122,20 @@ def delivery(path: Path) -> dict[str, Any]:
         if "audio" in kinds else ""
     loudness, peak = re.findall(r"I:\s+(-?[\d.]+) LUFS", report), re.findall(r"Peak:\s+(-?[\d.]+) dBFS", report)
     return {"sound_streams": kinds.count("audio"), "subtitle_streams": kinds.count("subtitle"), "loudness_lufs": float(loudness[-1]) if loudness else None,
-            "true_peak_dbtp": float(peak[-1]) if peak else None}
+            "true_peak_dbtp": float(peak[-1]) if peak else None, "silent_from_s": _silent_from(path) if "audio" in kinds else None}
+
+
+def _silent_from(path: Path) -> float | None:
+    """Where the silence that ends the file starts, when its last second or more is silent."""
+    report = media._run([media.ffmpeg(), "-hide_banner", "-nostats", "-v", "info", "-i", str(path), "-vn", "-sn", "-af", "silencedetect=n=-50dB:d=1", "-f", "null", "-"]).stderr.decode("utf-8", "replace")
+    starts, ends = re.findall(r"silence_start: (-?[\d.]+)", report), re.findall(r"silence_end: (-?[\d.]+)", report)
+    duration = re.search(r"time=(\d+):(\d+):([\d.]+)", report)
+    if not starts:
+        return None
+    if len(ends) < len(starts):  # still silent when the file ended
+        return float(starts[-1])
+    total = int(duration[1]) * 3600 + int(duration[2]) * 60 + float(duration[3]) if duration else None
+    return float(starts[-1]) if total is not None and float(ends[-1]) >= total - 0.2 else None
 
 
 def _tame_peaks(out: Path, audio_args: list[str]) -> None:
@@ -231,9 +244,17 @@ def _encode_command(doc, clips, resolve, out, video_args, audio_args, gain_db: f
     if audio_label:
         command += ["-map", f"[{audio_label}]", *audio_args]
     subtitles = [item for item in doc["edit"].get("subtitles", []) if item.get("path") and resolve(item["path"]).is_file()]
+    if not (doc["brief"].get("song") and doc["edit"].get("audio_mode") != "clips"):  # on a song, subtitles follow the song, which does not move
+        places = model.cut_places(doc)
+        for index, item in enumerate(subtitles):
+            if item.get("cut") and item["cut"] != places:  # timed on an earlier cut: a copy on this one, the file itself stays as it is
+                moved = out.with_name(f"{out.stem}-{index}.srt")
+                moved.write_text(_srt(recut_cues(_srt_cues(resolve(item["path"]).read_text(encoding="utf-8")), item["cut"], places)), encoding="utf-8")
+                subtitles[index] = {**item, "path": str(moved)}
     if not subtitles and any(clip["dialogue"] for clip in clips):  # the shots' lines, timed on this cut (an SRT of the edit's own replaces them)
         srt = out.with_suffix(".srt")
-        srt.write_text(dialogue_srt(clips, offsets, resolve), encoding="utf-8")
+        sung = model.checked_lyrics(doc) if model.on_the_song(doc) else None
+        srt.write_text(dialogue_srt(clips, offsets, resolve) if sung is None else sung_srt(sung, float(doc["edit"].get("song_start_s") or 0.0), total), encoding="utf-8")
         subtitles = [{"path": str(srt), "language": LANGUAGES.get(str(doc["brief"].get("language") or "en")[:2].lower(), "und")}]
     first_subtitle = inputs.count("-i")
     command[command.index("-filter_complex"):command.index("-filter_complex")] = [arg for item in subtitles for arg in ("-i", str(resolve(item["path"])))]
@@ -247,19 +268,72 @@ def _encode_command(doc, clips, resolve, out, video_args, audio_args, gain_db: f
 LANGUAGES = {"en": "eng", "fr": "fra", "de": "deu", "es": "spa", "it": "ita", "pt": "por", "nl": "nld", "ja": "jpn", "zh": "zho", "ko": "kor", "ru": "rus", "ar": "ara", "hi": "hin"}
 
 
-def dialogue_srt(clips, offsets, resolve) -> str:
-    """Subtitles of the shots' dialogue at their place in this cut: a line starts with its shot and lasts its recorded length (the shot's
-    length without one); several lines share their shot by their number of characters."""
+def _srt_cues(text: str) -> list[tuple[float, float, str]]:
+    seconds = lambda stamp: sum(float(part) * 60 ** index for index, part in enumerate(reversed(stamp.strip().replace(",", ".").split(":"))))
+    cues = []
+    for block in text.replace("\r", "").strip().split("\n\n"):
+        lines = block.strip().split("\n")
+        timing = next((index for index, line in enumerate(lines) if " --> " in line), None)
+        if timing is not None:
+            start, end = lines[timing].split(" --> ")
+            cues.append((seconds(start), seconds(end.split()[0]), "\n".join(lines[timing + 1:]).strip()))
+    return cues
+
+
+def recut_cues(cues, before, now) -> list[tuple[float, float, str]]:
+    """Subtitles timed on an earlier cut, placed on this one: each line stays where it was in the picture of the shot it started on. A line goes with its shot when the shot is gone or no
+    longer plays that part of its take."""
+    shots = {item["shot"]: item for item in now}
+    moved = []
+    for start, end, text in cues:
+        old = next((item for item in before if item["start_s"] <= start < item["start_s"] + item["duration_s"]), None)
+        new = shots.get(old["shot"]) if old else None
+        if new is None:
+            continue
+        place = new["start_s"] + start - old["start_s"] + old.get("in_s", 0.0) - new.get("in_s", 0.0)
+        if place + end - start > new["start_s"] and place < new["start_s"] + new["duration_s"]:
+            moved.append((max(place, new["start_s"]), place + end - start, text))
+    return moved
+
+
+def _srt(cues) -> str:
     def stamp(seconds):
         milliseconds = int(round(seconds * 1000))
         return f"{milliseconds // 3600000:02d}:{milliseconds // 60000 % 60:02d}:{milliseconds // 1000 % 60:02d},{milliseconds % 1000:03d}"
+    return "".join(f"{number}\n{stamp(start)} --> {stamp(end)}\n{text}\n\n" for number, (start, end, text) in enumerate(cues, 1))
+
+
+def sung_srt(lines, song_start: float, total: float) -> str:
+    """Subtitles of a cut that plays the song, from when its lines are really sung (check_song): a line stays until the next one when the pause between them is short; a line the song
+    does not sing gets no subtitle."""
+    sung = [(line["start_s"] - song_start, line["end_s"] - song_start, line["line"]) for line in lines if line["sung"] and 0.0 <= line["start_s"] - song_start < total]
+    cues = []
+    for (start, end, text), following in zip(sung, sung[1:] + [None]):
+        cues.append((start, following[0] - 0.05 if following and following[0] - end < 1.0 else min(end + 0.4, total), text))
+    return _srt(cues)
+
+
+def dialogue_srt(clips, offsets, resolve) -> str:
+    """Subtitles of the shots' dialogue at their place in this cut: a line starts with its shot and lasts its recorded length, and several recorded lines
+    follow each other as they do in the sound that drives the shot; lines not recorded yet share their shot by their number of characters."""
     cues = []
     for clip, offset in zip(clips, offsets):
         lines = [item for item in clip["dialogue"] if item.get("line", "").strip()]
         if not lines:
             continue
         shown = clip["span"]
-        recorded = media.probe(resolve(clip["line"]))["duration_s"] if clip.get("line") and resolve(clip["line"]).is_file() else None
+        if all(item.get("duration_s") for item in lines):
+            start = offset
+            for item in lines:
+                if start >= offset + shown:
+                    break
+                end = start + item["duration_s"] / clip["speed"]
+                cues.append((start, min(end + model.BETWEEN_LINES, offset + shown) - 0.05, item["line"].strip()))
+                start = end + model.BETWEEN_LINES / clip["speed"]
+            continue
+        recorded = lines[0].get("duration_s")  # the line itself: the clip that drives the shot may be padded with silence
+        if not recorded and clip.get("line") and resolve(clip["line"]).is_file():
+            recorded = media.probe(resolve(clip["line"]))["duration_s"]
         span = min(shown, recorded / clip["speed"] + 0.3) if recorded and len(lines) == 1 else shown
         total = sum(len(item["line"]) for item in lines)
         start = offset
@@ -267,20 +341,25 @@ def dialogue_srt(clips, offsets, resolve) -> str:
             end = start + span * len(item["line"]) / total
             cues.append((start, end - 0.05, item["line"].strip()))
             start = end
-    return "".join(f"{number}\n{stamp(start)} --> {stamp(end)}\n{text}\n\n" for number, (start, end, text) in enumerate(cues, 1))
+    return _srt(cues)
+
+
+END_CARD_GAP = 0.25  # seconds before the end of the cut within which an end card closes the film
 
 
 def _overlays(doc, resolve, inputs, filters, label, width, height, fps, total) -> str:
     """Text and pictures laid over the cut, each over its own time range with a fade in and out (after the audio inputs, whose indexes are fixed)."""
     for number, overlay in enumerate(doc["edit"].get("overlays", [])):
         start, end = float(overlay["start_s"]), min(float(overlay["end_s"]), total)
+        closes = overlay.get("style") == "end_card" and total - end < END_CARD_GAP  # the last thing seen: it stays to the last frame, and the shot behind it does not come back
+        end = total if closes else end
         if end - start < 0.05 or not overlay.get("path") or not resolve(overlay["path"]).is_file():
             continue
         duration = end - start
-        fade = min(float(overlay.get("fade_s") or 0.0), duration / 3)
+        fade = min(float(overlay.get("fade_s") or 0.0), duration if closes else duration / 3)
         index = inputs.count("-i")
-        inputs += ["-loop", "1", "-framerate", f"{fps:g}", "-t", f"{duration:.3f}", "-i", str(resolve(overlay["path"]))]
-        fades = f",fade=t=in:st=0:d={fade:.3f}:alpha=1,fade=t=out:st={duration - fade:.3f}:d={fade:.3f}:alpha=1" if fade > 0.01 else ""
+        inputs += ["-loop", "1", "-framerate", f"{fps:g}", "-t", f"{duration + 1 if closes else duration:.3f}", "-i", str(resolve(overlay["path"]))]  # longer than the cut, which cuts it: its last frame is covered too
+        fades = f",fade=t=in:st=0:d={fade:.3f}:alpha=1" + ("" if closes else f",fade=t=out:st={duration - fade:.3f}:d={fade:.3f}:alpha=1") if fade > 0.01 else ""
         filters.append(f"[{index}:v]format=rgba,scale={width}:{height}{fades},setpts=PTS-STARTPTS+{start:.3f}/TB[o{number}]")
         filters.append(f"[{label}][o{number}]overlay=eof_action=pass,format=yuv420p[vo{number}]")
         label = f"vo{number}"
@@ -312,7 +391,9 @@ def _audio_chain(doc, clips, resolve, inputs, filters, offsets, total, gain_db) 
             delay = int(offsets[position] * 1000)
             if clip["kind"] == "video" and clip["has_audio"] and clip["sound"] and not (mode == "mix" and clip["sung"] and doc["brief"].get("song")):  # the song already sings it
                 tempo = "" if clip["speed"] == 1.0 else _atempo(clip["speed"]) + ","
-                filters.append(f"[{position}:a]atrim=start={clip['start']:.3f}:end={clip['end']:.3f},asetpts=PTS-STARTPTS,{tempo}aresample=48000,adelay={delay}|{delay}[a{position}]")
+                played = (clip["end"] - clip["start"]) / clip["speed"]
+                fades = f"afade=t=in:d=0.015,afade=t=out:st={played - 0.03:.3f}:d=0.03," if played > 0.1 else ""  # no click where the sound of one clip stops and the next starts
+                filters.append(f"[{position}:a]atrim=start={clip['start']:.3f}:end={clip['end']:.3f},asetpts=PTS-STARTPTS,{tempo}aresample=48000,{fades}adelay={delay}|{delay}[a{position}]")
                 parts.append((f"a{position}", 1.0))
     song = doc["brief"].get("song")
     if mode in ("song", "mix") and song and resolve(song).is_file():

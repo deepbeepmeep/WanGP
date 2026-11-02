@@ -86,6 +86,12 @@ export function shotRefs(text, shots, cast = [], versions = []) {
     return index < 0 ? match : `<span class="shot-ref" title="${esc(shots[index].title || '')} (${match})">shot ${index + 1}</span>`;
   });
 }
+// "Mia, the lead singer": what the Add dialogs ask for, a name and a role.
+export function personFields(text) {
+  const [name, ...role] = text.trim().split(',');
+  return role.length ? { name: name.trim(), role: role.join(',').trim() } : { name: name.trim() };
+}
+
 export function shotText(text, shots, cast = [], versions = []) {
   return versionRefs(text, versions).replace(/\b([sc])(\d+)\b/g, match => {
     if (match[0] === 'c') return cast.find(member => member.id === match)?.name || match;
@@ -134,6 +140,25 @@ export function formatDuration(seconds) {
   if (!seconds) return '0s';
   if (seconds < 60) return `${+seconds.toFixed(1)}s`;
   return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+}
+
+// The bar of a comparison player: it moves both videos together, to any moment of the longer one.
+export const COMPARE_SEEK = '<div class="compare-bar"><span class="mono" id="cmp-time">0:00</span><input type="range" id="cmp-seek" min="0" max="1000" value="0" aria-label="Move through both videos" title="Move through both videos"></div>';
+export function bindCompareSeek(root) {
+  const a = root.querySelector('#cmp-a'), b = root.querySelector('#cmp-b'), seek = root.querySelector('#cmp-seek'), time = root.querySelector('#cmp-time');
+  const length = () => Math.max(a.duration || 0, b.duration || 0);
+  let moving = false;
+  const show = () => {
+    if (!length()) return;
+    if (!moving) seek.value = Math.round(a.currentTime / length() * 1000);
+    time.textContent = `${formatTime(a.currentTime)} / ${formatTime(length())}`;
+  };
+  const jump = seconds => { a.currentTime = seconds; b.currentTime = seconds; show(); };
+  for (const video of [a, b]) video.addEventListener('loadedmetadata', show);
+  a.addEventListener('timeupdate', show);
+  seek.addEventListener('input', () => { moving = true; jump(seek.value / 1000 * length()); });
+  seek.addEventListener('change', () => { moving = false; });
+  return jump;
 }
 
 export function count(number, word) { return `${number} ${word}${number === 1 ? '' : 's'}`; }  // "1 shot", "3 shots"
@@ -229,6 +254,20 @@ export function promptDialog({ title, text = '', value = '', placeholder = '', o
 
 let openMenu = null;
 // A button's attributes: greyed out with the reason it cannot be used now as its tooltip, or usable with its own tooltip.
+// What a local Deepy's settings cost a production: until closed, as long as it says the same.
+let closedAdvice = null;
+export function adviceBar(info) {
+  try { closedAdvice ??= localStorage.getItem('sr.advice'); } catch { /* a convenience */ }
+  return info?.advice && info.advice !== closedAdvice ? `<div class="next-step advice">${icon('alert')}<span class="grow">${esc(info.advice)}</span><button class="btn ghost icon" id="advice-close" title="Close" aria-label="Close">${icon('x')}</button></div>` : '';
+}
+export function bindAdvice(root, info) {
+  root.querySelector('#advice-close')?.addEventListener('click', () => {
+    closedAdvice = info.advice;
+    try { localStorage.setItem('sr.advice', info.advice); } catch { /* a convenience */ }
+    root.querySelector('.advice')?.remove();
+  });
+}
+
 export function availability(reason, title = '') {
   return reason ? `disabled title="${esc(reason)}"` : title ? `title="${esc(title)}"` : '';
 }

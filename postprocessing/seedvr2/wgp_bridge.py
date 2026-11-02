@@ -145,6 +145,12 @@ class SeedVR2Bridge(SimpleScaleSuffixMixin):
 
     def query_download_def(self, enabled_only: bool = True, spatial_upsampling=None) -> dict[str, Any]:
         model = self.model() if spatial_upsampling is None else self.model_for_upsampling(spatial_upsampling)
+        return self._model_download_def(model)
+
+    def query_checkpoint_inventory(self):
+        return [{"name": "SeedVR2", "variant": model.upper(), "download_defs": [self._model_download_def(model)]} for model in self.TRANSFORMER_FILENAMES]
+
+    def _model_download_def(self, model):
         return {
             "repoId": "DeepBeepMeep/MiniMax-H3",
             "sourceFolderList": ["SeedVR2"],

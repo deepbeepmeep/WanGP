@@ -6,6 +6,7 @@ change it through the same operations (apply_ops), with lock and revision rules 
 from __future__ import annotations
 
 import copy
+import re
 import hashlib
 import json
 import time
@@ -222,21 +223,275 @@ def take_length(doc: dict[str, Any], shot: dict[str, Any]) -> float:
     return length
 
 
+def cut_lines(doc: dict[str, Any]) -> list[str]:
+    """Lines driving a shot's lips that are longer than what the cut plays of the shot: their end is lost."""
+    played = {item["shot"]: item["duration_s"] for item in timeline(doc)}
+    found = []
+    for shot in doc["shots"]:
+        take = chosen_take(shot)
+        spoken = sum(float(line.get("duration_s") or 0.0) for line in spoken_lines(doc, shot))
+        if shot.get("included", True) and take and (take.get("settings") or {}).get("audio_guide") and spoken > played.get(shot["id"], 0.0) + 0.05:
+            found.append(f"Shot {shot['id']} plays {played[shot['id']]:.2f} s and its line lasts {spoken:.2f} s: the end of the line is cut. Set its `trim` to hold the whole line (take it again if the take is too short).")
+        elif shot.get("included", True) and take and spoken and played.get(shot["id"], 9.0) < 2.0:
+            found.append(f"Shot {shot['id']} plays only {played[shot['id']]:.2f} s for its line: too short to register. Follow it with a silent reaction shot, or set a longer `trim` after `transcribe_media` shows that part of the take says nothing.")
+    return found
+
+
+def on_the_song(doc: dict[str, Any]) -> bool:
+    """The cut plays the song straight through: its shots keep their place on it, and their lines are lyrics."""
+    return bool(doc["brief"].get("song")) and doc["edit"].get("audio_mode") == "song"
+
+
+def lyric_lines(doc: dict[str, Any]) -> list[str]:
+    """The brief's lyrics, line by line, without their section markers."""
+    return [line.strip() for line in str(doc["brief"].get("script") or "").splitlines() if line.strip() and not line.strip().startswith("[")]
+
+
+def _lyric_words(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9']+", text.lower().replace("\u2019", "'"))
+
+
+def _same_word(written: str, heard: str) -> bool:
+    return written == heard or (len(written) > 3 and written[:4] == heard[:4])  # groove / grooves, skate / skates
+
+
+def _aligned(written: list[str], heard: list[str]) -> list[tuple[int, int]]:
+    """The words two lists share in order, as many as possible (choruses repeat: pairing the longest passage first can pair a chorus with another one)."""
+    best = [[0] * (len(heard) + 1) for _ in range(len(written) + 1)]
+    for row in range(len(written) - 1, -1, -1):
+        for column in range(len(heard) - 1, -1, -1):
+            best[row][column] = max(best[row + 1][column], best[row][column + 1], best[row + 1][column + 1] + 1 if _same_word(written[row], heard[column]) else 0)
+    pairs, row, column = [], 0, 0
+    while row < len(written) and column < len(heard):
+        if _same_word(written[row], heard[column]) and best[row][column] == best[row + 1][column + 1] + 1:
+            pairs.append((row, column))
+            row, column = row + 1, column + 1
+        elif best[row + 1][column] >= best[row][column + 1]:
+            row += 1
+        else:
+            column += 1
+    return pairs
+
+
+def sung_lines(lines: list[str], words: list[tuple[str, float, float]]) -> list[dict[str, Any]]:
+    """Which lines of the lyrics a song really sings, and when, from the words heard in it [(word, start, end)]. A line is sung when at least half of its words are heard, in
+    order and close together: a transcript misses words here and there, but it does not lose a whole line that is sung (Whisper reads most of a song's clear lines word for word)."""
+    said = [(_lyric_words(word) or [""])[0] for word, _, _ in words]
+    written, first_word = [], []
+    for line in lines:
+        first_word.append(len(written))
+        written += _lyric_words(line)
+    found = [[] for _ in lines]
+    for row, column in _aligned(written, said):
+        found[next(index for index in range(len(lines) - 1, -1, -1) if first_word[index] <= row)].append((row, column))
+    result, floor = [], 0.0
+    for index, line in enumerate(lines):
+        count, pairs = len(_lyric_words(line)), found[index]
+        item = {"line": line, "heard": len(pairs), "words": count, "sung": False, "start_s": None, "end_s": None}
+        if pairs and len(pairs) * 2 >= count and words[pairs[-1][1]][2] - words[pairs[0][1]][1] <= 1.5 * count + 2.0:
+            missed_before, missed_after = pairs[0][0] - first_word[index], first_word[index] + count - 1 - pairs[-1][0]  # about 0.3 s a word
+            start = max(floor, words[pairs[0][1]][1] - 0.3 * missed_before)
+            floor = words[pairs[-1][1]][2] + 0.3 * missed_after
+            item.update(sung=True, start_s=round(start, 2), end_s=round(floor, 2))
+        result.append(item)
+    return result
+
+
+def checked_lyrics(doc: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """The lines check_song measured on the production's current song; None before it ran on this song."""
+    checked = doc["audio"].get("lyrics")
+    return checked["lines"] if checked and doc["brief"].get("song") and checked["song"] == str(doc["brief"]["song"]).replace("\\", "/").rsplit("/", 1)[-1] else None
+
+
+def song_words(doc: dict[str, Any]) -> list[str]:
+    """On a cut that plays a song: lyrics the production does not have, a song whose words were not checked, and lines it does not sing."""
+    if not on_the_song(doc):
+        return []
+    if not lyric_lines(doc):
+        return ["The production has the song but not its lyrics, so nothing says which lines it really sings or times the subtitles on them: pass the words it was made from to check_song(lyrics=...), unless it has none."]
+    lines = checked_lyrics(doc)
+    if lines is None:
+        return ["The song's words are not checked: check_song says which lines it really sings, and times the subtitles on them."]
+    missing = [line["line"] for line in lines if not line["sung"]]
+    warnings = [f"The song does not sing {len(missing)} of its {len(lines)} lines as written, and they get no subtitle: " + " / ".join(f'"{line}"' for line in missing[:8]) + (" ..." if len(missing) > 8 else "") + ". Compose it again before shooting on it, with fewer lines or more length."] if missing else []
+    pitch, kinds = doc["audio"]["lyrics"].get("voice_hz"), singer_kinds(doc)
+    if len(kinds) == 1 and voice_off(next(iter(kinds)), pitch):
+        warnings.append(f"The song's lead voice measures {pitch:.0f} Hz, which reads as a {'man' if next(iter(kinds)) == 'woman' else 'woman'}, and the singer on screen is a {next(iter(kinds))}: compose it again, with the lead voice named first in its style.")
+    return warnings
+
+
+def song_drift(doc: dict[str, Any]) -> list[str]:
+    """On a cut that plays the song: shots away from the part of the song their lips were made from, and takes made from a recording the cut does not play."""
+    if not on_the_song(doc):
+        return []
+    start, cut, warnings = float(doc["edit"].get("song_start_s") or 0.0), {item["shot"]: item for item in timeline(doc)}, []
+    away, spoken, short, longer = [], [], [], []
+    for shot in doc["shots"]:
+        item, take = cut.get(shot["id"]), chosen_take(shot)
+        if item is None or take is None:
+            continue
+        if has_lips(doc, shot) and abs(item["start_s"] + start - shot["audio_slice"][0] - _trim_of(shot)[0]) > 0.1:
+            away.append((shot["id"], shot["audio_slice"][0] + _trim_of(shot)[0] - start - item["start_s"]))
+        if has_lips(doc, shot) and float(shot["duration_s"]) > shot["audio_slice"][1] - shot["audio_slice"][0] + 0.1:
+            longer.append(shot["id"])
+        if (take.get("settings") or {}).get("audio_guide") and not shot.get("audio_slice"):
+            spoken.append(shot["id"])
+        if abs(item["duration_s"] - float(shot["duration_s"])) > 0.1 and not away:  # the shots before the first one away from its part
+            short.append(f"{shot['id']} plays {item['duration_s']:.2f} s of its planned {float(shot['duration_s']):.2f} s")
+    if away:
+        worst = max(away, key=lambda found: abs(found[1]))
+        warnings.append(f"From {away[0][0]} on, shots start up to {abs(worst[1]):.2f} s away from the part of the song their lips follow, as the song plays straight through"
+                        + (f": {'; '.join(short)}. Give it back its planned length" if short else ". Move their cuts back onto their slices") + " (update_shot: duration_s, trim null).")
+    if spoken:
+        warnings.append(f"Shots {', '.join(spoken)} follow a recording the cut does not play: on a song their lines are lyrics. Give each its audio_slice, the part of the song under it, and render it again.")
+    if longer:
+        warnings.append(f"Shots {', '.join(longer)} last longer than the part of the song they were made from, and their lips stop following it: give each a longer audio_slice and render it again.")
+    return warnings
+
+
+def missing_ends(doc: dict[str, Any]) -> list[str]:
+    """A cut with no title or no end card: the viewer never reads its name, and it stops on its last image."""
+    included = [shot for shot in doc["shots"] if shot.get("included", True)]
+    if not included:
+        return []
+    styles = {item.get("style") for item in doc["edit"]["overlays"]}
+    notes = [str((chosen_take(shot) or {}).get("note") or "") for shot in included]
+    title = styles & {"title", "chapter"} or any(note.startswith("Chapter card") for note in notes) or included[0]["generation"].get("template") == "draw_svg"
+    end = "end_card" in styles or any(note.startswith("End card") for note in notes) or included[-1]["generation"].get("template") == "draw_svg"
+    missing = [name for name, there in (("title", title), ("end card", end)) if not there]
+    return [f"The cut has no {' and no '.join(missing)}: add {'them' if len(missing) > 1 else 'it'}, in the production's text design, unless the user asked for none."] if missing else []
+
+
+def singing_without_song(doc: dict[str, Any]) -> list[str]:
+    """Shots whose prompt has someone singing with no sung audio driving their lips: the mouth moves, out of time with the song."""
+    if doc["brief"].get("kind") != "music_video":
+        return []
+    def driven(shot):  # a take by what it was made with, a shot still to shoot by what it asks
+        take = chosen_take(shot)
+        return bool((take.get("settings") or {}).get("audio_guide")) if take else bool(shot.get("audio_slice") or (shot["generation"].get("settings") or {}).get("audio_guide"))
+    found = [shot["id"] for shot in doc["shots"] if shot.get("included", True) and shot.get("cast") and re.search(r"\bsing(s|ing)?\b", shot_prompt(shot), re.IGNORECASE) and not driven(shot)]
+    if not found:
+        return []
+    return [f"Shots {', '.join(found)} show someone singing and are not driven by the song: their lips will not match. Give each its `audio_slice` and the song as `audio_guide` and shoot it again, or rewrite it to show something else with the mouth closed."]
+
+
+def planned_length(shot: dict[str, Any]) -> float:
+    """How long a shot without a take will play: its planned length, or less when someone it shows speaks, as the shot ends after the line (about 0.37 s a word until the line is spoken)."""
+    planned = float(shot.get("duration_s") or 0.0)
+    lines = [line for line in shot.get("dialogue") or [] if line.get("line") and line.get("speaker") in (shot.get("cast") or [])]
+    if not lines or not planned:
+        return planned
+    spoken = sum(float(line.get("duration_s") or 0.37 * len(_lyric_words(line["line"]))) for line in lines)
+    return min(planned, spoken + BETWEEN_LINES * (len(lines) - 1) + AFTER_LINE)
+
+
 def timeline(doc: dict[str, Any]) -> list[dict[str, Any]]:
     """Start time and duration of every included shot (planned durations where no take exists yet), in whole frames of the edit as the
     assembly cuts them, so that sound and text placed at a shot's start stay on its picture."""
     included = [shot for shot in doc["shots"] if shot.get("included", True)]
     fps = float(doc.get("edit", {}).get("fps") or next(((take or {}).get("fps") for shot in included if (take := chosen_take(shot)) and take.get("fps")), None) or 24.0)
+    song_driven = bool(doc["brief"].get("song")) and doc.get("edit", {}).get("audio_mode") != "clips"  # the song is the clock: transitions keep every shot on its part
     position, result = 0.0, []
     for shot in included:
         take = chosen_take(shot)
-        start_trim, end_trim = (shot.get("trim") or [0.0, None]) + [None] * (2 - len(shot.get("trim") or []))
-        length = (take or {}).get("duration_s") or shot.get("duration_s") or 0.0
-        end = end_trim if end_trim is not None else out_point(shot, length)
+        start_trim, end_trim = (list(shot.get("trim") or [0.0, None]) + [None, None])[:2]
+        length = (take or {}).get("duration_s") or (shot.get("duration_s") if song_driven else planned_length(shot)) or 0.0
+        end = end_trim if end_trim is not None else length if take is None else out_point(shot, length)
         duration = round(max(0.0, float(end) - float(start_trim or 0.0)) / speed_of(shot, take) * fps) / fps
+        transition = shot.get("transition") or {}
+        if result and not song_driven and transition.get("type", "cut") != "cut":  # as the export: a transition overlaps the two shots, and what follows starts earlier
+            overlap = min(float(transition.get("duration_s") or 0.5), duration / 2, position / 2)
+            position -= overlap if overlap > 0.04 else 0.0
         result.append({"shot": shot["id"], "start_s": round(position, 3), "duration_s": round(duration, 3)})
         position += duration
     return result
+
+
+def _trim_of(shot: dict[str, Any]) -> tuple[float, float | None]:
+    start, end = (list(shot.get("trim") or [0.0, None]) + [None, None])[:2]
+    return float(start or 0.0), None if end is None else float(end)
+
+
+def _plays_until(shot: dict[str, Any]) -> float:
+    """Where a shot stops in its take (or in its plan, before it has one)."""
+    end = _trim_of(shot)[1]
+    return end if end is not None else out_point(shot, (chosen_take(shot) or {}).get("duration_s") or shot.get("duration_s") or 0.0)
+
+
+def _end_shot_at(shot: dict[str, Any], end: float) -> None:
+    if chosen_take(shot):
+        shot["trim"] = [_trim_of(shot)[0], round(end, 3)]
+    else:
+        shot["duration_s"] = round(end - _trim_of(shot)[0], 3)
+
+
+NOT_SINGING = ("place", "location", "set", "object", "prop", "vehicle")
+
+
+def has_lips(doc: dict[str, Any], shot: dict[str, Any]) -> bool:
+    """Lips follow the song in this shot: its slice alone does not say so, as a plan may give every shot its part of the song. A shot listing only places and things has none."""
+    if not shot.get("audio_slice"):
+        return False
+    cast = set(shot.get("cast") or [])
+    return not cast or any(member["id"] in cast and str(member.get("role") or "").strip().casefold() not in NOT_SINGING for member in doc["cast"])
+
+
+def keep_on_the_song(doc: dict[str, Any], asked: set[str] = frozenset()) -> list[str]:
+    """On a cut that plays the song, the song is the clock and lips follow it: what is inserted or lengthened covers what comes next instead of pushing it off the song, so the cut keeps its
+    length and every later shot its place. Time comes first from the shots without lips before a lip-synced one (they keep their start), then from its head: it plays from further into its
+    take, which is still the song at that moment. A shot covered entirely is left out. A gap that nothing can fill stays, and song_drift reports it: a lip-synced shot has no picture for
+    the song before its slice. Locked shots stay as they are, and so does the length asked of a shot (asked: the shots just added or given a length)."""
+    if not on_the_song(doc):
+        return []
+    start, notes, free = float(doc["edit"].get("song_start_s") or 0.0), [], []  # free: the shots without lips since the last lip-synced one
+    for shot in [item for item in doc["shots"] if item.get("included", True)]:
+        if not has_lips(doc, shot) or shot.get("locked"):
+            free = [] if has_lips(doc, shot) else [*free, *([] if shot["id"] in asked or shot.get("locked") else [shot])]
+            continue
+        head = _trim_of(shot)[0]
+        here = next(item["start_s"] for item in timeline(doc) if item["shot"] == shot["id"])
+        late = here + start - shot["audio_slice"][0] - head
+        for other in reversed(free if late > 0.03 else []):
+            if late > 0.03:  # at least 1.5 s of its action stays
+                give = min(late, _plays_until(other) - _trim_of(other)[0] - 1.5)
+                if give > 0.03:
+                    _end_shot_at(other, _plays_until(other) - give)
+                    notes.append(f"{other['id']} now plays {give:.2f} s less.")
+                    late -= give
+        if late < -0.03 and head:  # the time is back: it starts earlier in its take, as far as it has picture for the song
+            back = min(-late, head)
+            head -= back
+            late += back
+            shot["trim"] = [round(head, 3), _plays_until(shot)]
+        for other in reversed(free if late < -0.03 else []):
+            if late < -0.03:
+                take = chosen_take(other)
+                give = min(-late, take["duration_s"] - _plays_until(other)) if take and take.get("duration_s") else -late
+                if give > 0.03:
+                    _end_shot_at(other, _plays_until(other) + give)
+                    notes.append(f"{other['id']} now plays {give:.2f} s more.")
+                    late += give
+        if late > 0.03:
+            if _plays_until(shot) - head - late < 0.5:
+                shot["included"] = False
+                notes.append(f"{shot['id']} is entirely covered and left out of the edit.")
+            else:
+                shot["trim"] = [round(head + late, 3), round(_plays_until(shot), 3)]
+                notes.append(f"{shot['id']} now starts {head + late:.2f} s into its take, on the song.")
+        free = []
+    return notes
+
+
+def cut_places(doc: dict[str, Any]) -> list[dict[str, Any]]:
+    """Where each shot plays in the cut and from where in its take: what a subtitle file timed on this cut needs to follow a later one."""
+    shots = {shot["id"]: shot for shot in doc["shots"]}
+    return [{**item, "in_s": _trim_of(shots[item["shot"]])[0]} for item in timeline(doc)]
+
+
+def cut_length(doc: dict[str, Any]) -> float:
+    """The cut's length, transitions overlapping."""
+    cut = timeline(doc)
+    return round(cut[-1]["start_s"] + cut[-1]["duration_s"], 2) if cut else 0.0
 
 
 def _follow_cut(doc: dict[str, Any], before: list[dict[str, Any]], old_edit: dict[str, Any]) -> None:
@@ -298,7 +553,7 @@ def summary(doc: dict[str, Any], sequence: str | None = None) -> dict[str, Any]:
     result = {
         "id": doc["id"], "title": doc["title"], "revision": doc["revision"], "stage": doc["stage"], "brief": doc["brief"],
         "cast": [{key: member[key] for key in ("id", "name", "role", "description", "master", "locked")} for member in doc["cast"]],
-        "style": doc["style"], "shot_counts": counts, "total_s": round(sum(item["duration_s"] for item in timeline(doc)), 2),
+        "style": doc["style"], "shot_counts": counts, "total_s": cut_length(doc),
         "shots": [{"id": shot["id"], "title": shot["title"], "section": shot["section"], "duration_s": shot["duration_s"], "status": shot["status"], "locked": shot["locked"],
                    "included": shot["included"], "cast": shot["cast"], "prompt": shot_prompt(shot)[:prompt_chars], "takes": len(shot["takes"]), "chosen_take": shot["chosen_take"],
                    **({"dialogue": shot["dialogue"]} if shot.get("dialogue") else {}), **({"speed": shot["speed"]} if shot["speed"] != 1.0 else {}), **({"sound": False} if not shot["sound"] else {}),
@@ -318,6 +573,8 @@ def summary(doc: dict[str, Any], sequence: str | None = None) -> dict[str, Any]:
 
 BRIEF_FIELDS = {"kind", "title", "text", "song", "script", "references", "duration_s", "aspect", "resolution", "style_tags", "style", "pacing", "language", "plan_first", "budget_minutes",
                 "templates", "read_other_productions", "review_before_edit"}
+DEFAULT_LENGTH_S = 30.0  # what the Brief shows and plans for until the user sets a length
+GENERATION_SHORTHAND = {"prompt", "negative_prompt", "audio_guide", "image_refs", "image_start", "video_length", "seed", "template", "settings"}
 SHOT_FIELDS = {"title", "section", "intent", "camera", "cast", "dialogue", "duration_s", "audio_slice", "generation", "status", "locked", "included", "chosen_take", "trim", "speed", "sound",
                "transition", "notes"}
 SPEEDS = (0.25, 4.0)  # what a browser plays with its sound and the export's filters handle
@@ -346,12 +603,29 @@ def _check_shot_write(shot: dict[str, Any], by: str, fields: set[str], base_revi
         raise OperationError(f"The user changed shot {shot['id']} after revision {base_revision}: read it again before changing it.", current=copy.deepcopy(shot))
 
 
+def _generation_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    """A shot's settings or template written beside its fields go in its generation: there is only one thing they can mean."""
+    loose = {key: fields[key] for key in fields if key in GENERATION_SHORTHAND}
+    if not loose:
+        return fields
+    rest = {key: value for key, value in fields.items() if key not in loose}
+    generation = dict(rest.get("generation") or {})
+    settings = dict(generation.get("settings") or {})
+    if "template" in loose:
+        generation["template"] = loose.pop("template")
+    settings.update(loose.pop("settings", None) or {})
+    settings.update(loose)
+    if settings:
+        generation["settings"] = settings
+    rest["generation"] = generation
+    return rest
+
+
 def _set_shot_fields(shot: dict[str, Any], fields: dict[str, Any], by: str, revision: int) -> list[str]:
+    fields = _generation_fields(fields)
     unknown = set(fields) - SHOT_FIELDS
     if unknown:
-        settings = sorted(unknown & {"prompt", "negative_prompt", "audio_guide", "image_refs", "image_start", "video_length", "seed", "template"})
-        raise OperationError(f"Unknown shot fields: {', '.join(sorted(unknown))}." + (f" {', '.join(settings)} belong in the shot's generation: "
-                             '{"generation": {"settings": {...}}} (the template as generation.template).' if settings else ""))
+        raise OperationError(f"Unknown shot fields: {', '.join(sorted(unknown))}.")
     changed = []
     for key, value in fields.items():
         if key == "generation":
@@ -477,6 +751,12 @@ def apply_ops(doc: dict[str, Any], ops: list[dict[str, Any]], *, by: str = "user
             raise OperationError(f"Unknown operation {name!r}. Known: {', '.join(sorted(_OPS))}.")
         results.append(handler(work, op, by, revision, base_revision) or {})
     if not any(op.get("op") in ("restore_version", "bring_back") for op in ops):  # those put back an exact state
+        if results and any(shot["takes"] for shot in work["shots"]) and any(op.get("op") in ("add_shots", "remove_shot", "add_take") or (op.get("op") == "update_shot" and {"duration_s", "included", "chosen_take"} & set(op.get("fields") or {})) for op in ops):
+            asked = {op["shot"] for op in ops if op.get("op") == "update_shot" and "duration_s" in (op.get("fields") or {})} | {shot for result in results for shot in result.get("shots", [])}
+            notes = keep_on_the_song(work, asked)
+            if notes:
+                results[-1] = {**results[-1], "on_the_song": notes}
+                _op_log(work, {"text": "To keep the song in place: " + " ".join(notes)}, "system", revision, base_revision)
         _follow_cut(work, cut, doc["edit"])
     work["revision"], work["updated"] = revision, now()
     work["edit_key"] = edit_key(work)  # the page compares it with the last export's to say whether that export is current
@@ -506,6 +786,41 @@ def _op_stage(doc, op, by, revision, base_revision):
     doc["stage"] = op["stage"]
 
 
+_WOMAN_WORDS = {"woman", "women", "female", "she", "her", "lady", "mother", "motherly", "grandmother", "grandmotherly", "soprano", "alto", "feminine"}
+_MAN_WORDS = {"man", "men", "male", "he", "his", "him", "gentleman", "father", "fatherly", "grandfather", "grandfatherly", "baritone", "bass", "masculine"}
+_CHILD_WORDS = {"boy", "girl", "child", "kid", "teen", "teenage", "teenager"}  # a child's voice is high either way
+
+
+def voice_kind(text: str) -> str | None:
+    """Who a description says this is: "woman", "man", or None for a child or when it leaves it open."""
+    words = set(re.findall(r"[a-z]+", str(text or "").casefold()))
+    if words & _CHILD_WORDS:
+        return None
+    woman, man = bool(words & _WOMAN_WORDS), bool(words & _MAN_WORDS)
+    return "woman" if woman and not man else "man" if man and not woman else None
+
+
+def voice_off(kind: str | None, pitch: float | None) -> bool:
+    """A voice whose median pitch reads as the other sex. Measured on the productions' voice samples: men 98 to 154 Hz, women 150 to 372 Hz, with an overlap left unjudged."""
+    return bool(pitch) and (kind == "woman" and pitch < 165.0 or kind == "man" and pitch > 200.0)
+
+
+def line_off_voice(sample: float | None, line: float | None) -> bool:
+    """A spoken line far from its speaker's voice sample: acting moves pitch by a quarter at most, beyond that it is another voice (one sample at 154 Hz gave lines at 235 to 333 Hz)."""
+    return bool(sample and line) and not 0.75 <= line / sample <= 1.35
+
+
+def singer_kinds(doc: dict[str, Any]) -> set[str]:
+    """Who sings on screen: the people of the lip-synced shots, or the whole cast before there are any."""
+    singing = {member for shot in doc["shots"] if shot.get("audio_slice") for member in shot.get("cast") or []}
+    return {kind for member in doc["cast"] if not is_place(member) and (not singing or member["id"] in singing) and (kind := voice_kind(member.get("voice_description") or member.get("description")))}
+
+
+def is_place(member: dict[str, Any]) -> bool:
+    """A location kept the same from shot to shot: a cast card whose picture shows the empty set."""
+    return str(member.get("role") or "").strip().casefold() in ("place", "location", "set")
+
+
 def _op_add_cast(doc, op, by, revision, base_revision):
     member = {"id": _next_id("c", doc["cast"])}
     fields = dict(op.get("fields") or {})
@@ -526,7 +841,14 @@ def _op_update_cast(doc, op, by, revision, base_revision):
     unknown = set(fields) - CAST_FIELDS
     if unknown:
         raise OperationError(f"Unknown cast fields: {', '.join(sorted(unknown))}.")
+    before = member["name"]
     member.update(copy.deepcopy(fields))
+    if member["name"] != before and before:  # what is written about them in the plan follows; the prompts stay the showrunner's to rewrite
+        name = re.compile(rf"\b{re.escape(before)}\b")
+        for item in doc.get("outline") or []:
+            item["summary"] = name.sub(member["name"], item.get("summary") or "")
+        for shot in doc["shots"]:
+            shot["title"], shot["intent"] = name.sub(member["name"], shot.get("title") or ""), name.sub(member["name"], shot.get("intent") or "")
 
 
 def _op_remove_cast(doc, op, by, revision, base_revision):
@@ -599,6 +921,7 @@ def _op_add_take(doc, op, by, revision, base_revision):
     if by != "user" and shot["locked"]:
         raise OperationError(f"Shot {shot['id']} is locked by the user: leave it as it is.")
     take = _add_take(shot, dict(op.get("take") or {}), by)
+    doc["bin"] = [item for item in doc["bin"] if item.get("by") != "deepy" or item.get("path") != take.get("path")]  # it was in the bin until it became a take
     if by == "user":
         shot["updated_by"], shot["updated_rev"] = by, revision
     return {"shot": shot["id"], "take": take["id"]}
@@ -639,15 +962,19 @@ def _op_edit(doc, op, by, revision, base_revision):
     if "audio_mode" in fields and fields["audio_mode"] not in AUDIO_MODES:
         raise OperationError(f"audio_mode must be one of {', '.join(AUDIO_MODES)}.")
     doc["edit"].update(copy.deepcopy(fields))
+    if "subtitles" in fields:  # a subtitle file is timed on the cut of this moment: assembling a later cut moves its lines with their shots
+        places = cut_places(doc)
+        for item in doc["edit"]["subtitles"] if places else []:
+            item.setdefault("cut", places)
 
 
 def _op_outline(doc, op, by, revision, base_revision):
     """The production's sequences in order: [{name, summary, duration_s}]; shots belong to the sequence their section names."""
     sequences = []
     for item in op.get("outline") or []:
-        name = " ".join(str(item.get("name") or "").split())
+        name = " ".join(str(item.get("name") or item.get("title") or item.get("section") or "").split())
         if not name:
-            raise OperationError("Every sequence of the outline needs a name.")
+            raise OperationError('Every sequence of the outline needs a name: [{"name": ..., "summary": ..., "duration_s": ...}].')
         sequences.append({"name": name, "summary": str(item.get("summary") or ""), "duration_s": float(item["duration_s"]) if item.get("duration_s") else None})
     doc["outline"] = sequences
 
@@ -698,8 +1025,22 @@ def _op_remove_overlay(doc, op, by, revision, base_revision):
 def _op_log(doc, op, by, revision, base_revision):
     text = " ".join(str(op.get("text") or "").split())
     if text:
-        doc["log"].append({"id": uuid.uuid4().hex[:8], "time": now(), "by": by, "text": text[:2000], **({"shot": op["shot"]} if op.get("shot") else {})})
+        doc["log"].append({"id": uuid.uuid4().hex[:8], "time": now(), "by": by, "text": text[:4000], **({"shot": op["shot"]} if op.get("shot") else {})})
         del doc["log"][:-500]
+
+
+AFTER_LINE = 0.35  # how long a shot plays on after its last word
+BETWEEN_LINES = 0.3  # the silence between two lines driving one shot
+
+
+def _lines_length(shot: dict[str, Any]) -> float:
+    spoken = [float(line["duration_s"]) for line in shot.get("dialogue") or [] if line.get("duration_s")]
+    return sum(spoken) + BETWEEN_LINES * max(0, len(spoken) - 1)
+
+
+def _ends_after_lines(shot: dict[str, Any]) -> bool:
+    start, end = _trim_of(shot)
+    return end is not None and bool(_lines_length(shot)) and abs(end - start - _lines_length(shot) - AFTER_LINE) < 0.03
 
 
 def _op_line_audio(doc, op, by, revision, base_revision):
@@ -708,8 +1049,11 @@ def _op_line_audio(doc, op, by, revision, base_revision):
     lines = [line for line in shot["dialogue"] if line_key(line) == op.get("spoken")]
     if not lines:
         raise OperationError(f"Shot {shot['id']} no longer has this line: its words changed while it was spoken.")
+    ended_after_lines = _ends_after_lines(shot)
     for line in lines:
         line.update(audio=op.get("audio"), voice=op.get("voice"), spoken=op["spoken"], duration_s=op.get("duration_s"))
+    if ended_after_lines and shot.get("updated_by") != "user":  # it ended just after its words, as render left it: it still does; a trim chosen otherwise stays
+        shot["trim"] = [_trim_of(shot)[0], round(_lines_length(shot) + _trim_of(shot)[0] + AFTER_LINE, 2)]
 
 
 # Versions -----------------------------------------------------------------------------------------------------------------------------
@@ -784,7 +1128,7 @@ def version_changes(old: dict[str, Any], new: dict[str, Any], limit: int = 40, l
         lines.append("New song")
     if (old.get("style") or {}).get("text_design") != (new.get("style") or {}).get("text_design"):
         lines.append(f"Text design: {(old.get('style') or {}).get('text_design') or 'classic'} → {(new.get('style') or {}).get('text_design') or 'classic'}")
-    before, after = (given if given is not None else sum(item["duration_s"] for item in timeline(doc)) for given, doc in zip(lengths, (old, new)))
+    before, after = (given if given is not None else cut_length(doc) for given, doc in zip(lengths, (old, new)))
     if abs(before - after) >= 0.05:
         lines.append(f"Length {before:.1f} s → {after:.1f} s")
     return lines[:limit] + ([f"…and {len(lines) - limit} more changes"] if len(lines) > limit else [])
@@ -895,6 +1239,16 @@ def _op_audio(doc, op, by, revision, base_revision):
     doc["audio"]["analysis"] = copy.deepcopy(op.get("analysis"))
 
 
+def _op_review(doc, op, by, revision, base_revision):
+    """What a deep review found on a version: its findings stay with that version."""
+    item = find(doc["deliverables"], op.get("deliverable"), "version")
+    item["review"] = {**copy.deepcopy(op.get("review") or {}), "time": now()}
+
+
+def _op_lyrics(doc, op, by, revision, base_revision):
+    doc["audio"]["lyrics"] = copy.deepcopy(op.get("lyrics"))
+
+
 def _op_bin_add(doc, op, by, revision, base_revision):
     """The production's media bin: uploads and Deepy's media that no take records, ready to be dragged onto shots or cast."""
     item = dict(op.get("item") or {})
@@ -923,5 +1277,5 @@ _OPS = {"brief": _op_brief, "style": _op_style, "stage": _op_stage, "add_cast": 
         "add_shots": _op_add_shots, "replace_plan": _op_replace_plan, "update_shot": _op_update_shot, "remove_shot": _op_remove_shot, "move_shots": _op_move_shots,
         "reorder": _op_reorder, "add_take": _op_add_take, "verdict": _op_verdict, "remove_take": _op_remove_take, "edit": _op_edit, "log": _op_log,
         "director": _op_director, "line_audio": _op_line_audio, "bring_back": _op_bring_back, "restore_version": _op_restore_version, "outline": _op_outline, "add_overlay": _op_add_overlay, "update_overlay": _op_update_overlay,
-        "remove_overlay": _op_remove_overlay, "deliverable": _op_deliverable, "budget": _op_budget, "audio": _op_audio, "bin_add": _op_bin_add, "bin_remove": _op_bin_remove,
+        "remove_overlay": _op_remove_overlay, "deliverable": _op_deliverable, "budget": _op_budget, "audio": _op_audio, "lyrics": _op_lyrics, "review": _op_review, "bin_add": _op_bin_add, "bin_remove": _op_bin_remove,
         "bin_to_take": _op_bin_to_take}

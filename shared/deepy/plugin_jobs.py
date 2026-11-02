@@ -61,6 +61,7 @@ class DeepyResult:
     outputs: tuple[dict[str, Any], ...] = ()    # media Deepy wrote: id, path, kind, name
     session_dir: str | None = None
     error: str | None = None
+    reply: str = ""                             # its last message alone: text holds all it said during the job
 
     @property
     def cancelled(self) -> bool:
@@ -100,14 +101,15 @@ class DeepyJob:
         self._done = threading.Event()
         self._result = None
         self._phase = "waiting"
-        self._text, self._tools, self._status, self._outputs = "", {}, None, {}
+        self._text, self._reply, self._tools, self._status, self._outputs = "", "", {}, None, {}
         self._thoughts, self._thought_due, self._stats, self._stats_due = {}, 0.0, None, 0.0
         self._known, self._steers = set(), 0
+        self.chat_events = False  # a page showing Deepy's window sets it: "chat" events then bring what that window needs
         self._thread = threading.Thread(target=self._run, name=f"Deepy job ({owner})", daemon=True)
         self._thread.start()
 
     def events(self, timeout: float | None = None) -> Iterator[SessionEvent]:
-        """Events until the job ends: queued, started, status, text, thought, stats, tool, progress, output, then done, cancelled or error."""
+        """Events until the job ends: queued, started, status, text, thought, stats, tool, progress, output, chat when `chat_events` is set, then done, cancelled or error."""
         while True:
             event = self._events.get(timeout=timeout)
             yield event
@@ -153,7 +155,7 @@ class DeepyJob:
         self._events.put(SessionEvent(kind, data))
 
     def _finish(self, status, error=None):
-        self._result = DeepyResult(status, self._text, tuple(self._outputs.values()), None if self.session_dir is None else str(self.session_dir), error)
+        self._result = DeepyResult(status, self._text, tuple(self._outputs.values()), None if self.session_dir is None else str(self.session_dir), error, self._reply)
         self._done.set()
         self._emit(status, self._result)
 
@@ -189,6 +191,8 @@ class DeepyJob:
                         instance = event["data"]["instance"]
                     elif event["type"] == "progress" and event["data"] is not None and self._phase == "started":
                         self._emit("progress", _progress_update(event["data"]))
+                    elif event["type"] == "chat" and self.chat_events and event["data"] is not None and self._phase == "started":
+                        self._emit("chat", event["data"])
                 with service._condition:
                     state = service._request_states[self._submission_id]
                     # Deepy answers some requests without running them (unavailable, resetting): nothing will start.
@@ -221,9 +225,11 @@ class DeepyJob:
                         blocks.extend(dict(block) for block in record.get("blocks", []) if isinstance(block, dict))
             status, stats = session.chat_status, session.chat_stats or session.remote_usage_stats
             written = [(record["path_key"], record["path"], record["media_type"], record.get("label", "")) for record in session.media_registry if "write" in record.get("access", []) and record.get("path_key") not in known and record.get("path")]
-        text = "\n\n".join(block["text"] for block in blocks if block.get("type") == "markdown" and block.get("text"))
+        said = [block["text"] for block in blocks if block.get("type") == "markdown" and block.get("text")]
+        text = "\n\n".join(said)
         if text != self._text:
-            self._emit("text", {"text": text, "delta": text[len(self._text):] if text.startswith(self._text) else text})
+            self._reply = said[-1]
+            self._emit("text", {"text": text, "delta": text[len(self._text):] if text.startswith(self._text) else text, "last": self._reply})
             self._text = text
         now = float("inf") if final else time.monotonic()  # the last pass holds nothing back
         for block in blocks:
@@ -237,7 +243,7 @@ class DeepyJob:
                 failure = str((block.get("result") or {}).get("error") or "")[:400] if block["status"] == "error" else ""  # what went wrong, for the plugin's page
                 self._emit("tool", {**{key: block[key] for key in ("id", "name", "label", "status", "status_text")}, **({"error": failure} if failure else {})})
         if status is not None and status != self._status:
-            self._emit("status", {"kind": status["kind"], "text": status["text"]})
+            self._emit("status", {"kind": status["kind"], "text": status["text"], **({"progress": status["progress"]} if "progress" in status else {})})
         self._status = status
         if stats and stats != self._stats and now >= self._stats_due:
             self._stats, self._stats_due = stats, now + LIVE_INTERVAL

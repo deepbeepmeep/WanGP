@@ -6,6 +6,9 @@ import { h, toast } from './ui.js';
 const OPTIONS = [
   ['notify_turns', 'Tell me when a task ends', 'When the showrunner finishes a task or stops on an error, plays WanGP\'s notification sound on the computer running WanGP and sends what comes next to your notification destinations (Config > Notification), if you have set any. For long shoots, when this page is out of sight.'],
   ['cast_loras', 'LoRAs on cast cards', 'Adds a LoRA choice to each cast card, for a person or a thing you trained one for. A LoRA only works with the family of models it was trained on: the card lists those of the models this production uses and says how many of its shots can use it; the other shots are made without it. The models themselves, with their own LoRAs, are chosen in Default models and the brief.'],
+  ['show_all_errors', 'Show every error', 'Lists in the Showrunner tab every call it got wrong and corrected by itself, with the exact message, for finding out what went wrong. Off, the tab shows what really failed.'],
+  ['any_shot_length', 'Let the showrunner pick any shot length', 'Off, a shot without words lasts a length its model really makes (4.46, 5.17, 5.88 s and so on with MiniMax H3), so that every action plays to its end; a speaking shot still ends after its line, because the model would invent words after it, and a music video cuts on its song. On, the showrunner can cut faster: a shot plays the start of its video, and the end of its action can be lost.'],
+  ['show_deepy_tab', 'Show the Deepy tab', 'Adds a tab to the panel with Deepy\'s own window on the production: its thoughts and every step, as they are written. You read it there, and write in the Showrunner tab.'],
 ];
 
 export async function openSettings(changed) {

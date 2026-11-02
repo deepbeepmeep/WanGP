@@ -1,0 +1,17 @@
+/* Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt) */
+/* Deepy's chat window as a component: what the options of its URL change on Deepy's own styles. */
+:root:has(body[data-deepy-window]), body[data-deepy-window] { background: transparent; }
+body[data-deepy-window]:not(.no-contour) .chat { border: 1px solid rgba(31, 94, 132, .22) !important; border-radius: 18px !important; }
+.no-input #assistant_chat_controls, .no-input .chat__empty, .no-stats #assistant_chat_stats_block, .no-avatars .chat__avatar, .no-stop .chat__status-pause, .no-stop .chat__status-stop, .no-actions .chat__message-actions { display: none !important; }
+body[data-deepy-window].wide #assistant_chat_panel { width: 100% !important; padding: 0 !important; }
+.wide .chat__message { padding: 0 !important; }
+.wide .chat__message-card { width: 100%; }
+.wide .chat__transcript { padding-left: 6px !important; padding-right: 6px !important; gap: 10px; }
+/* No input under the conversation: what Deepy places above it comes down to the bottom of the window. */
+body[data-deepy-window].no-input .chat__transcript { padding-bottom: calc(10px + var(--chat-status-reserved-height) + var(--chat-status-gap)); }
+body[data-deepy-window].no-input .chat__status { top: auto; bottom: 6px; }
+body[data-deepy-window].no-input .chat__jump-bottom { bottom: calc(10px + var(--chat-status-reserved-height) + var(--chat-status-gap)); }
+/* Its speeds under the conversation, which makes room above them. */
+body[data-deepy-window].no-input:not(.no-stats) #assistant_chat_stats_block { position: static !important; flex: none; padding: 2px 8px 3px; }
+body[data-deepy-window].no-input .chat__stats { font-size: 10.5px; min-height: 13px; }
+:root:has(body.dark) { color-scheme: dark; }  /* the class turns on Deepy's own dark theme */

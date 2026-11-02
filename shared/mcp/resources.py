@@ -196,7 +196,7 @@ def _select_markdown_sections(markdown: str, section_filter: str) -> tuple[str, 
         if not matches:
             matches = [section for section in sections if any(pattern in str(section[key]).casefold() for key in ("section", "heading"))]
     if not matches:
-        raise ValueError(f"Markdown section not found: {section_filter}")
+        raise ValueError(f"Markdown section not found: {section_filter}. Its sections: " + "; ".join(str(section["section"]) for section in sections))
     return "\n\n".join(str(section["content"]) for section in matches), [str(section["section"]) for section in matches]
 
 
