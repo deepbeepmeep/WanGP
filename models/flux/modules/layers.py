@@ -9,6 +9,7 @@ from einops import rearrange
 from torch import Tensor, nn
 
 from shared import attention_kit
+from shared.attention import pay_attention
 from ..math import apply_rope_, attention, rope
 from shared.kernels import ops
 
@@ -108,6 +109,12 @@ class RMSNorm(torch.nn.Module):
         super().__init__()
         self.scale = nn.Parameter(torch.ones(dim))
 
+    @property
+    def weight(self):
+        return self.scale
+
+    eps = 1e-6
+
     def forward(self, x: Tensor):
         x_list, x = [x], None
         return ops.rms_norm_rounded(x_list, manual=True) * self.scale
@@ -147,6 +154,32 @@ def _fused_norm_rope_quant_(query, key, pe, segments, core, settings):
     pe's rotation matrices (interleaved channel pairs) fused with the staged SageAttention 2 quantization of q and / or k."""
     return ops.split_half_norm_rope_quant_(query, key, pe.transpose(1, 2), [(start, stop, (norm.query_norm.scale, 1e-6)) for start, stop, norm in segments],
                                            [(start, stop, (norm.key_norm.scale, 1e-6)) for start, stop, norm in segments], core, settings, interleaved=True)
+
+
+def _kv_norm_rope_(query, key, pe, segments):
+    # FLUX rotation matrices' first column is the compact (cos, sin) table.
+    rope = pe.transpose(1, 2)[..., 0]
+    for start, stop, norm in segments:
+        ops.interleaved_norm_rope_(None if query is None else query[:, start:stop], None if key is None else key[:, start:stop],
+                                  rope[:, start:stop], norm.query_norm, norm.key_norm)
+
+
+def _reference_attention(x_list, projections, norm, pe, heads, capture):
+    """Klein KV references attend only to references, with their post-RoPE K/V borrowed by the body."""
+    segments = ((0, x_list[0].shape[1], norm),)
+
+    def attend(qkv, group):
+        for index, tensor in enumerate(qkv[1:]):
+            if group.kv.start == 0 and group.kv.stop == heads:
+                capture[index] = tensor
+            else:
+                if capture[index] is None:
+                    capture[index] = tensor.new_empty((*tensor.shape[:2], heads, tensor.shape[-1]))
+                capture[index][:, :, group.kv.start:group.kv.stop].copy_(tensor)
+        return pay_attention(qkv, recycle_q=True)
+
+    return attention_kit.qkv_attention(x_list, *projections, heads, norm.query_norm.scale.numel(),
+                                       lambda q, k, group: _kv_norm_rope_(q, k, pe, segments), attention_fn=attend).flatten(2)
 
 
 def _norm_modulate(x, norm, mod):
@@ -263,7 +296,23 @@ class DoubleStreamBlock(nn.Module):
                 nn.Linear(mlp_hidden_dim, hidden_size, bias=mlp_bias),
             )
 
-    def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, *, NAG: dict | None = None) -> tuple[Tensor, Tensor]:
+    def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, *, NAG: dict | None = None,
+                reference=None, reference_pe=None, reference_vec=None, cache_layer=None):
+        kv_prefix = None
+        if cache_layer is not None:
+            if reference is not None:
+                ref_mod1, ref_mod2 = reference_vec
+                capture = [None, None]
+                attended = _reference_attention([_norm_modulate(reference, self.img_norm1, ref_mod1)],
+                                                (self.img_attn.q, self.img_attn.k, self.img_attn.v), self.img_attn.norm,
+                                                reference_pe, self.num_heads, capture)
+                cache_layer.store(*capture, kit=True)
+                capture.clear()
+                ops.gated_residual_(reference, [self.img_attn.proj(attended)], ref_mod1.gate, fused=True)
+                del attended
+                ops.mlp([_norm_modulate(reference, self.img_norm2, ref_mod2)], self.img_mlp[0], self.img_mlp[2], self.mlp_activation,
+                        residual=reference, segments=ops.gate_segments(ref_mod2.gate, reference.shape[0], reference.shape[1]))
+            kv_prefix = cache_layer.kv_prefix()
         if self.shared_modulation:
             (img_mod1, img_mod2), (txt_mod1, txt_mod2) = vec
         else:
@@ -279,7 +328,8 @@ class DoubleStreamBlock(nn.Module):
             streams = [([txt_modulated], (self.txt_attn.q, self.txt_attn.k, self.txt_attn.v)), ([img_modulated], (self.img_attn.q, self.img_attn.k, self.img_attn.v))]
             del txt_modulated, img_modulated
             segments = ((0, txt_len, self.txt_attn.norm), (txt_len, txt_len + img.shape[1], self.img_attn.norm))
-            attn = attention_kit.joint_qkv_attention(streams, self.num_heads, head_dim, lambda query, key, group: _norm_rope_(query, key, pe, segments),
+            normalize = _kv_norm_rope_ if cache_layer is not None else _norm_rope_
+            attn = attention_kit.joint_qkv_attention(streams, self.num_heads, head_dim, lambda query, key, group: normalize(query, key, pe, segments), kv_prefix=kv_prefix,
                                                      fused_quant=lambda query, key, group, core, settings: _fused_norm_rope_quant_(query, key, pe, segments, core, settings)).flatten(2)
         else:
             img_list, img_modulated = [img_modulated], None
@@ -295,7 +345,7 @@ class DoubleStreamBlock(nn.Module):
         ops.gated_residual_(txt, [self.txt_attn.proj(txt_attn)], txt_mod1.gate, fused=True)
         ops.mlp([_norm_modulate(txt, self.txt_norm2, txt_mod2)], self.txt_mlp[0], self.txt_mlp[2], self.mlp_activation,
                 residual=txt, segments=ops.gate_segments(txt_mod2.gate, txt.shape[0], txt.shape[1]))
-        return img, txt
+        return (img, txt, reference) if cache_layer is not None else (img, txt)
 
     def _attention_nag(self, img_list, txt, txt_mod1, pe, NAG):
         img_modulated = img_list.pop()
@@ -380,7 +430,22 @@ class SingleStreamBlock(nn.Module):
         else:
             self.modulation = None
 
-    def forward(self, x: Tensor, vec: Tensor, pe: Tensor, *, txt_len: int | None = None, NAG: dict | None = None) -> Tensor:
+    def forward(self, x: Tensor, vec: Tensor, pe: Tensor, *, txt_len: int | None = None, NAG: dict | None = None,
+                reference=None, reference_pe=None, reference_vec=None, cache_layer=None):
+        kv_prefix = None
+        if cache_layer is not None:
+            if reference is not None:
+                ref_modulated = _norm_modulate(reference, self.pre_norm, reference_vec)
+                capture = [None, None]
+                attended = _reference_attention([ref_modulated], (self.linear1_attn_q, self.linear1_attn_k, self.linear1_attn_v),
+                                                self.norm, reference_pe, self.num_heads, capture)
+                cache_layer.store(*capture, kit=True)
+                capture.clear()
+                ref_list, ref_modulated = [ref_modulated], None
+                ops.mlp(ref_list, self.linear1_mlp, self.linear2, "swiglu", prefix=attended, residual=reference,
+                        segments=ops.gate_segments(reference_vec.gate, reference.shape[0], reference.shape[1]))
+                del attended
+            kv_prefix = cache_layer.kv_prefix()
         if self.shared_modulation:
             mod = vec
         elif self.modulation is not None:
@@ -392,8 +457,9 @@ class SingleStreamBlock(nn.Module):
 
         if NAG is None:  # x_mod stays: the MLP reads it after the attention
             segments = ((0, x_mod.shape[1], self.norm),)
+            normalize = _kv_norm_rope_ if cache_layer is not None else _norm_rope_
             attn = attention_kit.qkv_attention([x_mod], self.linear1_attn_q, self.linear1_attn_k, self.linear1_attn_v, self.num_heads,
-                                               self.hidden_size // self.num_heads, lambda query, key, group: _norm_rope_(query, key, pe, segments),
+                                               self.hidden_size // self.num_heads, lambda query, key, group: normalize(query, key, pe, segments), kv_prefix=kv_prefix,
                                                fused_quant=lambda query, key, group, core, settings: _fused_norm_rope_quant_(query, key, pe, segments, core, settings)).flatten(2)
         else:
             shape = (*x_mod.shape[:2], self.num_heads, int(x_mod.shape[-1] / self.num_heads) )
@@ -412,7 +478,7 @@ class SingleStreamBlock(nn.Module):
         x_mod_list, x_mod = [x_mod], None
         ops.mlp(x_mod_list, self.linear1_mlp, self.linear2, "swiglu" if self.use_silu else "gelu", prefix=attn, residual=x,
                 segments=ops.gate_segments(mod.gate, x.shape[0], x.shape[1]))
-        return x
+        return (x, reference) if cache_layer is not None else x
 
 
 class LastLayer(nn.Module):

@@ -35,6 +35,7 @@ class YuE2AR(Qwen3ForCausalLM):
         self.features, self.abort_fn = features, abort_fn
         self.config._prompt_enhancer_safe_legacy = not features.triton
         configure_engine_kernels(self, features)
+        self._lm_engine_mmgp = True  # MMGP manages its weights: the engine sizes its KV cache without reading the free VRAM
         self._lm_engine_mmgp_graphs = features.graphs  # the engine's decoding passes are MMGP graphs: the AR model may stream its layers
 
     @torch.inference_mode()

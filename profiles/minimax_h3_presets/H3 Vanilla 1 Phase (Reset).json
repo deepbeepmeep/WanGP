@@ -1,0 +1,14 @@
+{
+    "merge_loras": "merge before",
+    "activated_loras": [],
+    "loras_multipliers": "|",
+    "guidance_phases": 1,
+    "video_prompt_type": "",
+    "custom_sigmas": "",
+    "num_inference_steps": 20,
+    "num_inference_steps2": 3,
+    "switch_threshold": 0.9035,
+    "guidance_scale": 1,
+    "flow_shift": 12,
+    "sample_solver": "euler"
+}

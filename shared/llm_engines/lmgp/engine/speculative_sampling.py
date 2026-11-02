@@ -59,7 +59,10 @@ def sample_verified_block(runner, seq, logits, draft_tokens, draft_distributions
     if not seq.ignore_eos:
         stop_ids.add(self.config.eos)
     penalty = float(seq.repetition_penalty or 1.)
-    key = (n, vocab, logits.dtype, seq.top_k, seq.top_p, seq.min_p, seq.temperature, penalty,
+    if penalty != 1 and self._sync_repetition_token_cache(seq)["span"] != (False, False, False):
+        penalty = 1.  # inside code, quotes or backticks: copied text, not repetition (drafted tokens of the block are approximated as outside)
+    exempt = seq.repetition_exempt_ids if penalty != 1 else None
+    key = (n, vocab, logits.dtype, seq.top_k, seq.top_p, seq.min_p, seq.temperature, penalty, exempt,
            tuple(rules["suppressed"]), tuple(rules["thinking_stops"]), tuple(sorted(stop_ids)))
     graphs = getattr(self, "_speculative_acceptance_graphs", None)
     if graphs is None:
@@ -84,10 +87,10 @@ def sample_verified_block(runner, seq, logits, draft_tokens, draft_distributions
                      suppressed=mask(rules["suppressed"]), thinking_stops=mask(rules["thinking_stops"]),
                      thinking=torch.tensor(rules["thinking"], dtype=torch.int64, device=logits.device),
                      stops=mask(stop_ids), uniforms=torch.ones(n, device=logits.device),
-                     noise=torch.ones(vocab, device=logits.device))
+                     noise=torch.ones(vocab, device=logits.device), exempt=None if exempt is None else mask(exempt))
         def compute():
             scores = apply_rules(state["logits"], state["drafts"], state["history"], state["bias"],
-                                 state["suppressed"], state["thinking_stops"], state["thinking"], penalty)
+                                 state["suppressed"], state["thinking_stops"], state["thinking"], penalty, state["exempt"])
             if seq.top_k == 1:
                 probabilities = scores
                 unsafe = torch.zeros(n + 1, dtype=torch.bool, device=logits.device)

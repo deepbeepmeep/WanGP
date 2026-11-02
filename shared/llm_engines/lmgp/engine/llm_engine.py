@@ -2,6 +2,7 @@
 # MIT License (see docs/third_party_licenses/MIT.txt). Modified for WanGP.
 # Modifications Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import atexit
+from contextlib import contextmanager
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
@@ -223,6 +224,39 @@ class LLMEngine:
             seq = self.scheduler.waiting.popleft()
             if seq.block_table:
                 self.scheduler.block_manager.deallocate(seq)
+
+    def can_aside(self, tokens: int) -> bool:
+        """Whether a side request of this many tokens (prompt and generation) fits beside the live sequences (aside): within the context
+        length, in the free pages of the cache as it is."""
+        # (a runtime about to be prepared again, or an INT8 kernel change, would rebuild the cache under the live sequences)
+        if self.scheduler is None or tokens > self.config.max_model_len or not self.model_runner.runtime_current() or self._int8_backend_revision != int8_backend.revision:
+            return False
+        blocks = self.scheduler.block_manager
+        return len(blocks.blocks) == self.config.num_kvcache_blocks and len(blocks.free_block_ids) >= (tokens + blocks.block_size - 1) // blocks.block_size + 1
+
+    @contextmanager
+    def aside(self):
+        """Runs requests beside the live sequences (an assistant's conversation), which keep their pages: they leave the scheduler meanwhile,
+        their per-sequence state (recurrent states, drafter caches, the sampler) is saved and written back afterwards, and an overlay slot
+        they hold is lent with its rows saved when none is free. Requests made inside may reset the scheduler and the generation state as
+        they do alone. Check can_aside() first."""
+        scheduler, blocks = self.scheduler, self.scheduler.block_manager
+        running, waiting = list(scheduler.running), list(scheduler.waiting)
+        lending = [] if blocks.free_overlay_slots else [seq for seq in (*running, *waiting) if seq.overlay_slot >= 0][:1]
+        lent = [seq.overlay_slot for seq in lending]
+        saved = self.model_runner.call("save_sequence_state", lending)
+        scheduler.running.clear()
+        scheduler.waiting.clear()
+        blocks.free_overlay_slots.extend(lent)  # its rows are in the saved state
+        try:
+            yield
+        finally:
+            self.reset()  # the side requests' pages and overlay slots
+            for slot in lent:
+                blocks.free_overlay_slots.remove(slot)
+            self.model_runner.call("restore_sequence_state", saved)
+            scheduler.running.extend(running)
+            scheduler.waiting.extend(waiting)
 
     def _refresh_int8_backend(self):
         # Once per request, never per token. Captured CUDA graphs bypass Python

@@ -216,7 +216,7 @@ class ProcessFormController:
             values = {value for _label, value in target_control_choices}
             value = str(target_ratio or "").strip()
             if value not in values:
-                value = self.library.target_control_default(process_name, main_state, user_refs)
+                value = self.library.target_control_default(process_name, main_state, user_refs, saved_value=value)
             return gr.update(label=self.library.target_control_label(process_name, main_state, user_refs), value=value, visible=True, choices=target_control_choices)
         visible = self.library.has_process_outpaint(process_name, main_state, user_refs)
         value = self.library.normalize_outpaint_target_ratio(process_settings, target_ratio) if visible else ""
@@ -274,7 +274,7 @@ class ProcessFormController:
             target_values = {value for _label, value in target_control_choices}
             target_ratio = str(raw_state.get("target_ratio") or process_settings.get("target_ratio") or self.library.target_control_default(process_name, main_state, user_refs)).strip()
             if target_ratio not in target_values:
-                target_ratio = self.library.target_control_default(process_name, main_state, user_refs)
+                target_ratio = self.library.target_control_default(process_name, main_state, user_refs, saved_value=target_ratio)
         else:
             target_ratio = self.library.normalize_outpaint_target_ratio(process_settings, raw_state.get("target_ratio"))
         if self.library.hides_sliding_window_overlap(process_name, main_state, user_refs):

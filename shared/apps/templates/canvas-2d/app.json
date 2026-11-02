@@ -1,0 +1,10 @@
+{
+  "name": "Canvas Animation",
+  "kind": "web",
+  "entry": "index.html",
+  "description": "",
+  "version": 1,
+  "controls": {"Click": "add a burst", "Space": "pause the motion"},
+  "canvas": "responsive",
+  "audio": false
+}

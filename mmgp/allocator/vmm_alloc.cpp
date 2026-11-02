@@ -262,6 +262,8 @@ struct Stale {  // a virtual range whose chunks moved to other ranges, unmapped 
     size_t size;
     Event freed;
     CUcontext context;
+    std::vector<CUmemGenericAllocationHandle> chunks;  // mapped there: no other mapping of them is removed meanwhile (see unmapping_chunks)
+    std::shared_ptr<std::atomic<bool>> done;           // a slot of an arena (its address stays reserved): set once unmapped
 };
 struct Small {  // a live allocation of the driver pool
     size_t size;  // as allocated (cached sizes are rounded)
@@ -285,6 +287,7 @@ struct PoolArena {  // virtual capacity costs no VRAM; chunks are mapped only as
     size_t capacity = 0, size = 0;
     std::vector<CUmemGenericAllocationHandle> chunks;
     std::unordered_set<CUmemGenericAllocationHandle> mapped;  // no physical chunk occurs twice within one arena
+    std::unordered_map<size_t, std::shared_ptr<std::atomic<bool>>> unmapping;  // slots of lent chunks (evict_eager_free): free once unmapped
 };
 struct PoolUse {
     CUdeviceptr mapping = 0;  // the virtual chunk address currently using this physical chunk
@@ -310,6 +313,7 @@ struct Capture {  // between PyTorch's begin and end of allocation to a pool, or
     CaptureFilter filter;
     const void* thread;      // thread_tag of the thread that began it
     unsigned long long warmup;  // a warmup's token, 0 for a PyTorch capture
+    CUstream stream = nullptr;  // a warmup's stream: the graphs captured within it replay there
 };
 // Debug mode (mmgp/allocator/debug.py): the allocations of debug_threshold bytes and more are recorded with an origin that a Python
 // callback returns (module, tag, stack), the records are copied at the peak of each phase and when an allocation fails, and the
@@ -403,6 +407,8 @@ std::condition_variable& retired_ready = *new std::condition_variable;
 std::condition_variable& retired_unmapped = *new std::condition_variable;  // notified when no stale range is left to unmap
 std::deque<Stale>& retired = *new std::deque<Stale>;
 size_t unmaps_pending = 0;  // stale ranges queued or being unmapped
+// chunks with a stale mapping queued: removing another mapping of a chunk while the thread removes one corrupts the driver's heap
+std::unordered_map<CUmemGenericAllocationHandle, int>& unmapping_chunks = *new std::unordered_map<CUmemGenericAllocationHandle, int>;
 bool unmapper_started = false;
 
 struct RelaxedCapture {  // allocation calls stay allowed in this thread while a stream captures, as PyTorch does for cudaMalloc
@@ -589,9 +595,12 @@ void unmap_retired() {
         if (range.context != current) cu.CtxSetCurrent(current = range.context);
         if (range.freed) cu.EventSynchronize(range.freed.get());
         cu.MemUnmap(range.va, range.size);
-        cu.MemAddressFree(range.va, range.size);
+        if (range.done) range.done->store(true);
+        else cu.MemAddressFree(range.va, range.size);
         range.freed.reset();
         guard.lock();
+        for (auto handle : range.chunks)
+            if (--unmapping_chunks[handle] == 0) unmapping_chunks.erase(handle);
         if (--unmaps_pending == 0) retired_unmapped.notify_all();
     }
 }
@@ -599,6 +608,7 @@ void unmap_retired() {
 void retire(Stale range) {
     {
         std::lock_guard<std::mutex> guard(retired_lock);
+        for (auto handle : range.chunks) ++unmapping_chunks[handle];
         retired.push_back(std::move(range));
         ++unmaps_pending;
     }
@@ -819,7 +829,7 @@ void take_chunks(Device& d, Range& range, size_t need, CUstream stream, bool wai
                 if (range.chunks.size() < need) range.chunks.push_back(handle);
                 else d.spare.push_back({handle, old.freed, old.stream});
             }
-            retire({old.va, old.size, old.freed, d.context});
+            retire({old.va, old.size, old.freed, d.context, old.chunks});
         } else {
             ++it;
         }
@@ -925,32 +935,61 @@ void* alloc_small(Device& d, size_t size, CUstream stream) {
     return reinterpret_cast<void*>(dptr);
 }
 
-void borrow_eager_chunks(Device& d, const Pool* exclude, size_t need);
+void borrow_eager_chunks(Device& d, const Pool* exclude, size_t need, bool known, CUstream ordered, bool others);
 
-bool take_pool_chunks(Device& d, std::vector<CUmemGenericAllocationHandle>& chunks, size_t need, Pool& pool) {
-    if (chunks.size()+d.spare.size() < need) borrow_eager_chunks(d, &pool, need-chunks.size());
-    // Pool growth consumes completed ordinary cache. Pending work is never waited on here.
-    for (size_t i = 0; i < d.spare.size() && chunks.size() < need;) {
-        if (d.spare[i].freed && cu.EventQuery(d.spare[i].freed.get()) != CUDA_SUCCESS) { ++i; continue; }
-        chunks.push_back(d.spare[i].handle);
-        d.spare[i] = d.spare.back();
-        d.spare.pop_back();
-    }
-    for (auto it = d.cached.begin(); it != d.cached.end() && chunks.size() < need;) {
-        if (it->freed && cu.EventQuery(it->freed.get()) != CUDA_SUCCESS) { ++it; continue; }
-        Range old = std::move(*it);
-        it = d.cached.erase(it);
-        for (auto handle : old.chunks) {
-            if (chunks.size() < need) chunks.push_back(handle);
-            else d.spare.push_back({handle, old.freed, old.stream});
+// Pool growth takes the memory whose last use has completed, or was queued on the stream that uses the pool's memory in order: the allocating
+// stream when it runs eagerly; while it captures, the stream of the warmup it runs in, where its graphs replay. Stream order then runs the
+// earlier work first, without the host waiting for it. When VRAM has no room for new chunks, an eager growth also takes the memory freed on
+// other streams, the GPU waiting for their work. `taken` keeps where each chunk came from, for a growth that fails.
+bool take_pool_chunks(Device& d, std::vector<CUmemGenericAllocationHandle>& chunks, size_t need, Pool& pool, const MempoolId& id,
+                      CUstream stream, std::vector<Spare>& taken) {
+    bool eager = !capturing(stream), known = eager;
+    CUstream ordered = stream;
+    for (auto capture = d.captures.rbegin(); !eager && capture != d.captures.rend(); ++capture) {
+        if (capture->warmup && capture->id == id && capture->thread == &thread_tag) {
+            ordered = capture->stream;
+            known = true;
+            break;
         }
-        retire({old.va, old.size, old.freed, d.context});
     }
+    auto take = [&](bool others) {
+        for (size_t i = 0; i < d.spare.size() && chunks.size() < need;) {
+            const Spare& spare = d.spare[i];
+            bool ready = !spare.freed || (known && spare.stream == ordered) || cu.EventQuery(spare.freed.get()) == CUDA_SUCCESS;
+            if (!ready && !others) { ++i; continue; }
+            if (!ready) stream_wait(stream, spare.freed);
+            chunks.push_back(spare.handle);
+            taken.push_back(spare);
+            d.spare[i] = d.spare.back();
+            d.spare.pop_back();
+        }
+        for (auto it = d.cached.begin(); it != d.cached.end() && chunks.size() < need;) {
+            bool ready = !it->freed || (known && it->stream == ordered) || cu.EventQuery(it->freed.get()) == CUDA_SUCCESS;
+            if (!ready && !others) { ++it; continue; }
+            if (!ready) stream_wait(stream, it->freed);
+            Range old = std::move(*it);
+            it = d.cached.erase(it);
+            for (auto handle : old.chunks) {
+                if (chunks.size() < need) {
+                    chunks.push_back(handle);
+                    taken.push_back({handle, old.freed, old.stream});
+                } else d.spare.push_back({handle, old.freed, old.stream});
+            }
+            retire({old.va, old.size, old.freed, d.context, old.chunks});
+        }
+    };
+    if (chunks.size() + d.spare.size() < need) borrow_eager_chunks(d, &pool, need - chunks.size(), known, ordered, false);
+    take(false);
     while (chunks.size() < need) {
         CUmemGenericAllocationHandle handle;
         if (create_chunk(d, &handle, need - chunks.size()) != CUDA_SUCCESS) break;
         chunks.push_back(handle);
+        taken.push_back({handle, nullptr, nullptr});
         ++d.chunks_total;
+    }
+    if (chunks.size() < need && eager) {  // VRAM has no room for new chunks
+        borrow_eager_chunks(d, &pool, need - chunks.size(), known, ordered, true);
+        take(true);
     }
     // Spill mode, VRAM has no room: a graph pool maps chunks of pinned system RAM at the addresses it needs (alloc_spilled cannot serve
     // it), owned by the pool until it is destroyed and never given to ordinary allocations. Ordinary pools spill with alloc_spilled.
@@ -961,6 +1000,7 @@ bool take_pool_chunks(Device& d, std::vector<CUmemGenericAllocationHandle>& chun
             CUmemGenericAllocationHandle handle;
             if (cu.MemCreate(&handle, chunk_size, &host, 0) != CUDA_SUCCESS) break;
             chunks.push_back(handle);
+            taken.push_back({handle, nullptr, nullptr});
             pool.host_chunks.insert(handle);
             d.spilled_bytes += static_cast<int64_t>(chunk_size);
         }
@@ -973,7 +1013,13 @@ bool map_pool_chunks(Device& d, CUdeviceptr start, const std::vector<CUmemGeneri
     for (; mapped < chunks.size(); ++mapped)
         if (cu.MemMap(start + mapped * chunk_size, chunk_size, 0, chunks[mapped], 0) != CUDA_SUCCESS) break;
     if (mapped == chunks.size() && cu.MemSetAccess(start, mapped * chunk_size, &d.access, 1) == CUDA_SUCCESS) return true;
-    if (mapped) cu.MemUnmap(start, mapped * chunk_size);
+    if (mapped) {
+        {   // a lent chunk may still have a stale mapping that the thread removes (see unmapping_chunks)
+            std::unique_lock<std::mutex> guard(retired_lock);
+            retired_unmapped.wait(guard, [] { return unmaps_pending == 0; });
+        }
+        cu.MemUnmap(start, mapped * chunk_size);
+    }
     return false;
 }
 
@@ -983,7 +1029,7 @@ void pool_takes_chunks(Device& d, size_t count) {
     d.peak_reserved = std::max(d.peak_reserved, reserved_now(d));
 }
 
-bool map_shared_pool_chunks(Device& d, Pool& pool, CUdeviceptr va, size_t need,
+bool map_shared_pool_chunks(Device& d, Pool& pool, const MempoolId& id, CUstream stream, CUdeviceptr va, size_t need,
                             std::vector<CUmemGenericAllocationHandle>& chunks, const PoolArena* arena = nullptr) {
     for (auto it = pool.available_chunks.begin(); it != pool.available_chunks.end() && chunks.size() < need;) {
         if (arena && arena->mapped.count(*it)) { ++it; continue; }
@@ -991,10 +1037,11 @@ bool map_shared_pool_chunks(Device& d, Pool& pool, CUdeviceptr va, size_t need,
         it = pool.available_chunks.erase(it);
     }
     size_t reused = chunks.size(), hosted = pool.host_chunks.size();
-    if (!take_pool_chunks(d, chunks, need, pool) || !map_pool_chunks(d, va, chunks)) {
+    std::vector<Spare> taken;
+    if (!take_pool_chunks(d, chunks, need, pool, id, stream, taken) || !map_pool_chunks(d, va, chunks)) {
         for (size_t i = 0; i < chunks.size(); ++i) {
             if (i < reused) pool.available_chunks.insert(chunks[i]);
-            else if (!pool.host_chunks.erase(chunks[i])) d.spare.push_back({chunks[i], nullptr, nullptr});
+            else if (!pool.host_chunks.erase(chunks[i])) d.spare.push_back(taken[i - reused]);  // still behind the work it waited for
             else {  // system RAM never goes to the spare chunks of ordinary allocations
                 cu.MemRelease(chunks[i]);
                 d.spilled_bytes -= static_cast<int64_t>(chunk_size);
@@ -1013,14 +1060,15 @@ bool map_shared_pool_chunks(Device& d, Pool& pool, CUdeviceptr va, size_t need,
 }
 
 
-bool ensure_eager_arena(Device& d, Pool& pool, PoolArena& arena, CUdeviceptr start, size_t size) {
+bool ensure_eager_arena(Device& d, Pool& pool, const MempoolId& id, CUstream stream, PoolArena& arena, CUdeviceptr start, size_t size) {
     size_t first = (start - arena.va) / chunk_size, last = (start + size - 1 - arena.va) / chunk_size;
     for (size_t i = first; i <= last; ++i) {
         if (arena.chunks[i]) continue;
         std::vector<CUmemGenericAllocationHandle> chunk;
-        if (!map_shared_pool_chunks(d, pool, arena.va + i * chunk_size, 1, chunk, &arena)) return false;
+        if (!map_shared_pool_chunks(d, pool, id, stream, arena.va + i * chunk_size, 1, chunk, &arena)) return false;
         arena.chunks[i] = chunk[0];
         arena.mapped.insert(chunk[0]);
+        arena.unmapping.erase(i);  // a lent chunk's stale mapping there is gone (pool_chunk_available)
     }
     return true;
 }
@@ -1042,7 +1090,11 @@ void use_pool_arena(Pool& pool, PoolArena& arena, CUdeviceptr start, size_t size
 }
 
 bool pool_chunk_available(const Pool& pool, const PoolArena& arena, size_t index) {
-    if (!arena.chunks[index]) return true;
+    if (!arena.chunks[index]) {  // unmapped, unless a lent chunk's stale mapping is still there
+        if (arena.unmapping.empty()) return true;
+        auto slot = arena.unmapping.find(index);
+        return slot == arena.unmapping.end() || slot->second->load();
+    }
     const PoolUse& use = pool.uses.at(arena.chunks[index]);
     return !use.refs || use.mapping == arena.va + index * chunk_size;
 }
@@ -1059,7 +1111,7 @@ CUdeviceptr pool_arena_fit(const Pool& pool, const PoolArena& arena, CUdeviceptr
     return 0;
 }
 
-bool grow_pool(Device& d, Pool& pool, PoolArena& arena, size_t bytes) {
+bool grow_pool(Device& d, Pool& pool, const MempoolId& id, CUstream stream, PoolArena& arena, size_t bytes) {
     if (!arena.va) {
         size_t free_bytes, total;
         if (cu.MemGetInfo(&free_bytes, &total) != CUDA_SUCCESS) return false;
@@ -1069,7 +1121,7 @@ bool grow_pool(Device& d, Pool& pool, PoolArena& arena, size_t bytes) {
     size_t need = (bytes + chunk_size - 1) / chunk_size;
     if (need * chunk_size > arena.capacity - arena.size) return false;
     std::vector<CUmemGenericAllocationHandle> chunks;
-    if (map_shared_pool_chunks(d, pool, arena.va + arena.size, need, chunks, &arena)) {
+    if (map_shared_pool_chunks(d, pool, id, stream, arena.va + arena.size, need, chunks, &arena)) {
         arena.chunks.insert(arena.chunks.end(), chunks.begin(), chunks.end());
         arena.mapped.insert(chunks.begin(), chunks.end());
         arena.size += need * chunk_size;
@@ -1095,7 +1147,7 @@ void* alloc_pool_large(Device& d, const MempoolId& id, size_t size, CUstream str
         Range range;
         range.size = bytes;
         if (cu.MemAddressReserve(&range.va, bytes, chunk_size, 0, 0) != CUDA_SUCCESS ||
-            !map_shared_pool_chunks(d, pool, range.va, need, range.chunks)) {
+            !map_shared_pool_chunks(d, pool, id, stream, range.va, need, range.chunks)) {
             if (range.va) cu.MemAddressFree(range.va, bytes);
             return nullptr;
         }
@@ -1150,7 +1202,7 @@ void* alloc_pool(Device& d, const MempoolId& id, size_t size, CUstream stream) {
         // Protect the reusable tail while growth borrows chunks from other mappings.
         CUdeviceptr start = arena.va + previous - available;
         use_pool_arena(pool, arena, start, available, true);
-        bool grown = grow_pool(d, pool, arena, size - available);
+        bool grown = grow_pool(d, pool, id, stream, arena, size - available);
         use_pool_arena(pool, arena, start, available, false);
         if (!grown) return nullptr;
         dptr = arena.va + previous - available;
@@ -1162,7 +1214,7 @@ void* alloc_pool(Device& d, const MempoolId& id, size_t size, CUstream stream) {
             pool.blocks[block_start] = {arena.size - previous, arena.va, small, true};
         }
     }
-    if (pool.ordinary && !ensure_eager_arena(d, pool, arena, dptr, size)) {
+    if (pool.ordinary && !ensure_eager_arena(d, pool, id, stream, arena, dptr, size)) {
         free_set.insert({pool.blocks.at(block_start).size, block_start});
         return nullptr;
     }
@@ -1511,15 +1563,25 @@ void end_capture(Device& d, std::vector<Capture>::iterator capture) {
     captures_ended(d);
 }
 
-// Called only after the owner stream has completed, or after a device sync.
-// Live allocations (including pending record_stream consumers) remain mapped.
-void evict_eager_free(Device& d, Pool& pool, bool release) {
+// The free chunks of an ordinary pool leave it. Without an event: after its stream has completed its work, or a device synchronization; their
+// mappings are removed at once. With the event of the work its stream still runs, recorded now (lent, see borrow_eager_chunks): the spare
+// chunks are used after that work, and the unmapping thread removes their mappings once it has completed; the arena slots they leave are not
+// mapped again before. Live allocations (including pending record_stream consumers) remain mapped.
+void evict_eager_free(Device& d, Pool& pool, bool release, CUstream owner = nullptr, Event freed = nullptr) {
     if (pool.available_chunks.empty()) return;
+    if (!freed) {  // a chunk whose stale mapping the thread removes keeps its mappings meanwhile (see unmapping_chunks): evicted later
+        std::lock_guard<std::mutex> guard(retired_lock);
+        for (auto handle : pool.available_chunks)
+            if (unmapping_chunks.count(handle)) return;
+    }
     for (auto range = pool.large_ranges.begin(); range != pool.large_ranges.end();) {
         auto block = pool.blocks.find(range->first);
         if (!block->second.free) { ++range; continue; }
-        cu.MemUnmap(range->first, range->second.size);
-        cu.MemAddressFree(range->first, range->second.size);
+        if (freed) retire({range->first, range->second.size, freed, d.context, range->second.chunks});
+        else {
+            cu.MemUnmap(range->first, range->second.size);
+            cu.MemAddressFree(range->first, range->second.size);
+        }
         pool.blocks.erase(block);
         auto candidates = pool.free_ranges.equal_range(range->second.size);
         for (auto cached = candidates.first; cached != candidates.second; ++cached) {
@@ -1531,14 +1593,18 @@ void evict_eager_free(Device& d, Pool& pool, bool release) {
         for (size_t i = 0; i < arena.chunks.size(); ++i) {
             auto handle = arena.chunks[i];
             if (!handle || !pool.available_chunks.count(handle)) continue;
-            cu.MemUnmap(arena.va + i * chunk_size, chunk_size);
+            if (freed) {
+                auto done = std::make_shared<std::atomic<bool>>(false);
+                arena.unmapping[i] = done;
+                retire({arena.va + i * chunk_size, chunk_size, freed, d.context, {handle}, done});
+            } else cu.MemUnmap(arena.va + i * chunk_size, chunk_size);
             arena.mapped.erase(handle);
             arena.chunks[i] = 0;
         }
     }
     for (auto handle : pool.available_chunks) {
         if (release) cu.MemRelease(handle);
-        else d.spare.push_back({handle, nullptr, nullptr});
+        else d.spare.push_back({handle, freed, owner});
         pool.uses.erase(handle);
     }
     if (release) d.chunks_total -= static_cast<int64_t>(pool.available_chunks.size());
@@ -1560,15 +1626,18 @@ void release_eager_cached_memory(Device& d) {
     }
 }
 
-void borrow_eager_chunks(Device& d, const Pool* exclude, size_t need) {
+// The free chunks of the ordinary pools, for a pool's growth: those of a stream with no work left, then, lent while it still runs, those of
+// the stream the growing pool uses in order (when known), and with `others` those of the other streams (see take_pool_chunks).
+void borrow_eager_chunks(Device& d, const Pool* exclude, size_t need, bool known, CUstream ordered, bool others) {
     for (auto& entry : d.pools) {
         Pool& pool = entry.second;
         if (&pool == exclude || !pool.ordinary || pool.available_chunks.empty()) continue;
         CUstream owner = reinterpret_cast<CUstream>(static_cast<uintptr_t>(entry.first.second));
         int status = CU_STREAM_CAPTURE_STATUS_NONE;
-        if (cu.StreamIsCapturing(owner, &status) != CUDA_SUCCESS || status != CU_STREAM_CAPTURE_STATUS_NONE ||
-            cu.StreamQuery(owner) != CUDA_SUCCESS) continue;
-        evict_eager_free(d, pool, false);
+        if (cu.StreamIsCapturing(owner, &status) != CUDA_SUCCESS || status != CU_STREAM_CAPTURE_STATUS_NONE) continue;
+        if (cu.StreamQuery(owner) == CUDA_SUCCESS) evict_eager_free(d, pool, false);
+        else if ((known && owner == ordered) || others) evict_eager_free(d, pool, false, owner, record_event(owner));
+        else continue;
         if (d.spare.size() >= need) return;
     }
 }
@@ -2049,7 +2118,7 @@ EXPORT unsigned long long vmm_begin_warmup(int device, unsigned long long first,
     // the allocations of this thread on this stream: the default stream has the same handle in every thread
     const void* thread = &thread_tag;
     d.captures.push_back({{first, second}, [stream, thread](CUstream current) { return !warmup_paused && current == stream && &thread_tag == thread; },
-                          thread, ++warmups});
+                          thread, ++warmups, stream});
     return warmups;
 }
 

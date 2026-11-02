@@ -150,6 +150,7 @@ class TI2VidTwoStagesPipeline:
         alt_guidance_scale: float = 1.0,
         alt_scale: float = 0.0,
         sample_solver: str = "euler",
+        custom_sigmas=None,
         guiding_images: list[tuple[str, int, float]] | None = None,
         guiding_images_stage2: list[tuple] | None = None,
         images_stage2: list[tuple[str, int, float]] | None = None,
@@ -320,7 +321,9 @@ class TI2VidTwoStagesPipeline:
             device=self.device,
             tiling_config=tiling_config,
         )
-        if use_distilled_8_steps:
+        if custom_sigmas and custom_sigmas[0] is not None:
+            sigmas = torch.tensor([*custom_sigmas[0], 0.0], dtype=torch.float32, device=self.device)
+        elif use_distilled_8_steps:
             sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(dtype=torch.float32, device=self.device)
         elif use_hq_sampler:
             empty_latent = torch.empty(
@@ -511,6 +514,7 @@ class TI2VidTwoStagesPipeline:
             components=self.pipeline_components,
             dtype=dtype,
             device=self.device,
+            noise_scale=sigmas[0],
             mask_context=mask_context,
         )
         if video_state is None or audio_state is None:
@@ -568,6 +572,8 @@ class TI2VidTwoStagesPipeline:
         use_ltx23_stage_2_sigmas = LTX23_USE_DISTILLED_8_STEPS_STAGE_2_SIGMAS and ltx2_22B_class
         stage_2_sigma_values = DISTILLED_8_STEPS_STAGE_2_SIGMA_VALUES if use_distilled_8_steps or use_ltx23_stage_2_sigmas else STAGE_2_DISTILLED_SIGMA_VALUES
         distilled_sigmas = torch.Tensor(stage_2_sigma_values).to(self.device)
+        if custom_sigmas and len(custom_sigmas) > 1 and custom_sigmas[1] is not None:
+            distilled_sigmas = torch.tensor([*custom_sigmas[1], 0.0], dtype=torch.float32, device=self.device)
         if loras_slists is not None:
             stage_2_steps = len(distilled_sigmas) - 1
             update_loras_slists(

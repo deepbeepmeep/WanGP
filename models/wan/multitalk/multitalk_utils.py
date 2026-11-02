@@ -69,7 +69,7 @@ def calculate_x_ref_attn_map_per_head(visual_q, ref_k, ref_target_masks, ref_ima
         attn = q_chunk @ ref_k.transpose(-2, -1)
         x_ref_attn_map_source = attn.softmax(-1) # B, H, x_seqlens, ref_seqlens
         del attn
-        ref_target_masks = ref_target_masks.to(dtype)
+        ref_target_masks = ref_target_masks.to(device=visual_q.device, dtype=dtype)
         x_ref_attn_map_source = x_ref_attn_map_source.to(dtype)
 
         for class_idx, ref_target_mask in enumerate(ref_target_masks):
@@ -101,7 +101,7 @@ def calculate_x_ref_attn_map(visual_q, ref_k, ref_target_masks, ref_images_count
     x_ref_attn_map_source = attn.softmax(-1) # B, H, x_seqlens, ref_seqlens
     del attn
     x_ref_attn_maps = []
-    ref_target_masks = ref_target_masks.to(dtype)
+    ref_target_masks = ref_target_masks.to(device=visual_q.device, dtype=dtype)
     x_ref_attn_map_source = x_ref_attn_map_source.to(dtype)
 
     for class_idx, ref_target_mask in enumerate(ref_target_masks):

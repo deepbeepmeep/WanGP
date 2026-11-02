@@ -1,0 +1,13 @@
+{
+    "spatial_upsampling": "",
+    "spatial_postprocessing_parameters": {},
+    "temporal_upsampling": "trellis2_texture",
+    "temporal_postprocessing_parameters": {
+        "texture_resolution": 1024,
+        "texture_size": 2048,
+        "texture_max_faces": 0,
+        "texture_guidance": 1.0
+    },
+    "settings_version": 2.82,
+    "help": "The former TRELLIS.2 4B model: TRELLIS.2's own textures, the fastest but the least faithful (approximate colours)."
+}

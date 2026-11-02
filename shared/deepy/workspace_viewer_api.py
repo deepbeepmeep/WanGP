@@ -83,19 +83,24 @@ def mount_workspace_viewer(app, service):
     def info(workspace: str, source: GallerySourceId, key: str):
         return viewer.info(workspace, source, key)
 
+    @app.get('/deepy_api/workspace_viewer/player')
+    def player(workspace: str, source: GallerySourceId, key: str):
+        return viewer.player(workspace, source, key)
+
     @app.get('/deepy_api/workspace_viewer/thumbnail')
     async def thumbnail(workspace: str, source: GallerySourceId, key: str):
         from shared.deepy.thumbnails import render_thumbnail
         path = await run_in_threadpool(viewer.thumbnail_path, workspace, source, key)
-        if service.gallery._detect_media_type(path) not in ('image', 'video', '3d'):
-            raise HTTPException(400, 'Not an image, video or 3D asset.')
+        if service.gallery._detect_media_type(path) not in ('image', 'video', '3d', 'world', 'app'):
+            raise HTTPException(400, 'This media has no image preview.')
         try:
             image = await render_thumbnail(path)
         except FileNotFoundError:
             raise HTTPException(404, 'Media file not found.')
         if not image:
             raise HTTPException(404, 'Preview unavailable.')
-        return Response(image, media_type='image/jpeg', headers={'Cache-Control': 'private, max-age=3600'})
+        # The RAM cache also validates companions replaced without changing the asset.
+        return Response(image, media_type='image/jpeg', headers={'Cache-Control': 'private, no-store'})
 
     @app.post('/deepy_api/workspace_viewer/import')
     async def upload(workspace: str, file: UploadFile = File(...)):

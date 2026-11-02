@@ -14,10 +14,12 @@
   <link rel="stylesheet" href="assets/app.css">
   <link rel="stylesheet" href="assets/image_zoom.css">
   <link rel="stylesheet" href="assets/workspaces.css">
+  <link rel="stylesheet" href="assets/app_player.css">
   <script defer src="assets/transport.js"></script>
   <script defer src="assets/form_sync.js"></script>
   <script defer src="assets/workspaces.js"></script>
   <script defer src="assets/media_view.js"></script>
+  <script defer src="assets/app_player.js"></script>
   <script defer src="assets/image_zoom.js"></script>
   <script defer src="assets/mesh_viewer.js"></script>
   <script defer src="assets/app.js"></script>
@@ -55,7 +57,7 @@
     </section>
     <section id="audio-view" class="view gallery-view" aria-label="Audio" hidden>
       <div class="gallery-browser">
-      <div class="gallery-header"><div><h1>Audio</h1><p>Voices, music and sound references.</p></div><label class="upload-button">＋ Import<input id="audio-upload" type="file" accept="audio/*" multiple hidden></label></div>
+      <div class="gallery-header"><div><h1>Audio</h1><p>Voices, music and sound references.</p></div><label class="upload-button">＋ Import<input id="audio-upload" type="file" accept=".wav,.mp3,.aac,.flac,.m4a,.ogg,.opus,.wma" multiple hidden></label></div>
       <div id="audio-gallery" class="media-grid audio-grid"></div>
       </div>
       <div class="gallery-divider" role="separator" tabindex="0" aria-label="Resize audio gallery and information panes" aria-orientation="horizontal" aria-valuemin="20" aria-valuemax="80" aria-valuenow="50"><button class="gallery-details-toggle" type="button" aria-label="Hide media information" title="Hide media information" aria-expanded="true" aria-controls="audio-details"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button></div>

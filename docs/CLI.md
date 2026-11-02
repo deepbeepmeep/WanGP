@@ -211,7 +211,7 @@ Each materialized session keeps its canonical decoder context in `context.json` 
 With profiles 0, 2, 4 and 5, models are transferred to the GPU block by block at every denoising step. Image models such as Flux have short steps, so with profile 4 these transfers, rather than the GPU computation, can set the speed. In *Configuration / RAM/VRAM Management*, a *VRAM Preload* choice next to the default memory profile of each kind of output (video, image and audio) decides how much of each model stays in VRAM, so that less is transferred at each step:
 - *Default*: the memory profile's own choice (*Dynamic* for profile 0, none for profiles 2, 4 and 5).
 - *Dynamic*: as much of each model as the generation leaves free, adapted as it goes (below).
-- *Manual*: the amount set with the *VRAM Preload (MB)* slider shown below it, spread across the blocks of each model. Models that work side by side and stay in VRAM together (a world model and its video decoder, the two stages of some audio models) share that amount instead of getting it each, the main model first: for example 12000 MB with a world model of 8.4 GB and a decoder of 7 GB keeps the world model whole and 3.6 GB of the decoder, 12 GB in all. Some models keep more in VRAM on their own (for instance the language models of audio models, which stay whole): the preload never gives a model less than that. If the generation needs more VRAM than the preload leaves free, just enough of the preloaded parts leave the VRAM (also when the preload holds the whole model) until the model is loaded again, instead of the generation spilling into RAM and slowing down several times.
+- *Manual*: the amount set with the *VRAM Preload (MB)* slider shown below it, spread across the blocks of each model. Models that work side by side and stay in VRAM together (a world model and its video decoder, the two stages of some audio models) share that amount instead of getting it each, the main model first: for example 12000 MB with a world model of 8.4 GB and a decoder of 7 GB keeps the world model whole and 3.6 GB of the decoder, 12 GB in all. Some models keep more in VRAM on their own (for instance the language models of audio models, which stay whole): the preload never gives a model less than that. Models made of many experts (Nemotron 3.5 Transcribe, Fish Audio) give what the preload leaves beyond such a model to their experts, which then run on the GPU instead of the processor. If the generation needs more VRAM than the preload leaves free, just enough of the preloaded parts leave the VRAM (also when the preload holds the whole model) until the model is loaded again, instead of the generation spilling into RAM and slowing down several times.
 
 The choice is hidden for profiles 1, 3 and 3+, which always keep as much of each model in VRAM as fits. A memory profile chosen in the settings of a generation uses the VRAM Preload of its kind of output, and `--preload` sets a manual value for all three.
 
@@ -234,6 +234,18 @@ For Flux dev at 1024x1024, a manual 6000 MB shortened the profile 4 steps by abo
 Pinned ("reserved") RAM makes the transfers to the GPU fast, but nothing else can use it. *Configuration / RAM/VRAM Management / Reserved RAM for Pinning* sets the share of RAM that WanGP may pin, in percent (0 = automatic: 40% on Windows, 60% on Linux). `--perc-reserved-mem-max` takes precedence over this setting, which takes precedence over the `perc_reserved_mem_max` environment variable.
 
 When the models do not all fit in it, WanGP reserves first the parts used at every step; with [Smart Memory Pinning](#smart-memory-pinning), the rest still reaches the GPU almost as fast, so a smaller share mostly costs speed on short steps.
+
+### Trying a Smaller GPU
+```bash
+--max-vram 8   # WanGP behaves as on a GPU with 8 GB of VRAM
+```
+`--max-vram GB` makes WanGP behave as it would on a GPU with that much VRAM: memory profiles, preloads, VAE tiling and Deepy's choices follow that card, and WanGP uses at most GB - 1.2 GB of VRAM (a real card leaves about that much to the driver and the desktop). Use it to check that settings or a workflow fit a smaller GPU before sharing them. The VRAM other programs use on your GPU does not count, unless they leave less than the emulated card would: then WanGP has only what is really free. The speed stays that of your GPU.
+
+### RAM Budget
+```bash
+--max-ram 24   # WanGP plans its RAM within 24 GB
+```
+`--max-ram GB` gives WanGP a RAM budget, to leave room for the other programs you use beside it: the RAM it reserves for fast transfers, the RAM it keeps free and the moment it gives back the RAM of models that are not running all follow that budget, counting the RAM WanGP already uses. The RAM other programs use does not count, unless they leave WanGP less than its budget. The RAM WanGP may reserve stays a share of your PC's real RAM (see `--perc-reserved-mem-max`), a safeguard that keeps your system responsive, and never exceeds the budget. It guides WanGP's memory planning but is not a hard limit: a generation that needs more RAM than the budget still gets it from your PC.
 
 ### VRAM Allocator
 ```bash

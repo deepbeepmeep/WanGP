@@ -4,6 +4,8 @@ Only inference is retained. See LICENSE and NOTICE.
 import triton
 import triton.language as tl
 
+_LEGACY_BLOCK_POINTERS = tl.constexpr(tuple(map(int, triton.__version__.split(".")[:2])) < (3, 9))
+
 @triton.jit(do_not_specialize=['stride_qz', 'stride_qh', 'stride_qm', 'stride_qk', 'stride_kz', 'stride_kh', 'stride_kn', 'stride_kk', 'stride_vz', 'stride_vh', 'stride_vn', 'stride_vk', 'stride_oz', 'stride_oh', 'stride_om', 'stride_on', 'stride_bz', 'stride_bh', 'stride_bm', 'stride_bs', 'stride_lz', 'stride_lh', 'stride_lm', 'H', 'N_CTX'])
 def _attn_fwd_bsa_varlen_align(
     Q, K, V, sm_scale, M, Out, 
@@ -22,6 +24,7 @@ def _attn_fwd_bsa_varlen_align(
     BLOCK_N_LG: tl.constexpr, 
     SPARSITY: tl.constexpr,
     HAS_KV_MASK: tl.constexpr,
+    UNIT_INNER_STRIDE: tl.constexpr = False,
     ):
     
     start_m = tl.program_id(0)
@@ -36,43 +39,50 @@ def _attn_fwd_bsa_varlen_align(
     b_offset = off_z.to(tl.int64) * stride_bz + off_h.to(tl.int64) * stride_bh
     l_offset = off_z.to(tl.int64) * stride_lz + off_h.to(tl.int64) * stride_lh
 
-    # block pointers
-    Q_block_ptr = tl.make_block_ptr(
-        base=Q + q_offset,
-        shape=(N_CTX, HEAD_DIM),
-        strides=(stride_qm, stride_qk),
-        offsets=(start_m * BLOCK_M, 0),
-        block_shape=(BLOCK_M, HEAD_DIM),
-        order=(1, 0),
-    )
-    V_block_ptr = tl.make_block_ptr(
-        base=V + v_offset,
-        shape=(N_CTX, HEAD_DIM),
-        strides=(stride_vn, stride_vk),
-        offsets=(0, 0),
-        block_shape=(BLOCK_N_LG, HEAD_DIM),
-        order=(1, 0),
-    )
-    KT_block_ptr = tl.make_block_ptr(
-        base=K + k_offset,
-        shape=(HEAD_DIM, N_CTX),
-        strides=(stride_kk, stride_kn),
-        offsets=(0, 0),
-        block_shape=(HEAD_DIM, BLOCK_N_LG),
-        order=(0, 1),
-    )
-    O_block_ptr = tl.make_block_ptr(
-        base=Out + o_offset,
-        shape=(N_CTX, HEAD_DIM),
-        strides=(stride_om, stride_on),
-        offsets=(start_m * BLOCK_M, 0),
-        block_shape=(BLOCK_M, HEAD_DIM),
-        order=(1, 0),
-    )
+    if _LEGACY_BLOCK_POINTERS:
+        Q_block_ptr = tl.make_block_ptr(
+            base=Q + q_offset,
+            shape=(N_CTX, HEAD_DIM),
+            strides=(stride_qm, stride_qk),
+            offsets=(start_m * BLOCK_M, 0),
+            block_shape=(BLOCK_M, HEAD_DIM),
+            order=(1, 0),
+        )
+        V_block_ptr = tl.make_block_ptr(
+            base=V + v_offset,
+            shape=(N_CTX, HEAD_DIM),
+            strides=(stride_vn, stride_vk),
+            offsets=(0, 0),
+            block_shape=(BLOCK_N_LG, HEAD_DIM),
+            order=(1, 0),
+        )
+        KT_block_ptr = tl.make_block_ptr(
+            base=K + k_offset,
+            shape=(HEAD_DIM, N_CTX),
+            strides=(stride_kk, stride_kn),
+            offsets=(0, 0),
+            block_shape=(HEAD_DIM, BLOCK_N_LG),
+            order=(0, 1),
+        )
+        O_block_ptr = tl.make_block_ptr(
+            base=Out + o_offset,
+            shape=(N_CTX, HEAD_DIM),
+            strides=(stride_om, stride_on),
+            offsets=(start_m * BLOCK_M, 0),
+            block_shape=(BLOCK_M, HEAD_DIM),
+            order=(1, 0),
+        )
     block_indices += b_offset + start_m * stride_bm
     block_indices_lens += l_offset + start_m * stride_lm
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    if not _LEGACY_BLOCK_POINTERS:
+        # BSA pads complete 64-token blocks, so these accesses need no tail mask.
+        # Preserve block pointers' signed 64-bit addressing for strided tensors.
+        rows = offs_m.to(tl.int64)
+        dims = tl.arange(0, HEAD_DIM).to(tl.int64)
+        Q_ptrs = Q + q_offset + rows[:, None] * stride_qm + dims[None, :] * (1 if UNIT_INNER_STRIDE else stride_qk)
+        O_ptrs = Out + o_offset + rows[:, None] * stride_om + dims[None, :] * (1 if UNIT_INNER_STRIDE else stride_on)
 
     # initialize pointer to m and l
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
@@ -82,17 +92,28 @@ def _attn_fwd_bsa_varlen_align(
     qk_scale = sm_scale
     qk_scale *= 1.44269504  # 1/ln2
     # load q: it will stay in SRAM throughout
-    q = tl.load(Q_block_ptr)
+    if _LEGACY_BLOCK_POINTERS:
+        q = tl.load(Q_block_ptr)
+    else:
+        q = tl.load(Q_ptrs)
     S = tl.load(block_indices_lens)
     for i in range(S):
         block_id = tl.load(block_indices + i * stride_bs).to(tl.int32)
         lo = block_id * BLOCK_N_LG
         lo = tl.multiple_of(lo, BLOCK_N_LG)
-        KT_block_ptr_i = tl.advance(KT_block_ptr, (0, lo))
-        V_block_ptr_i = tl.advance(V_block_ptr, (lo, 0))
+        if _LEGACY_BLOCK_POINTERS:
+            KT_block_ptr_i = tl.advance(KT_block_ptr, (0, lo))
+            V_block_ptr_i = tl.advance(V_block_ptr, (lo, 0))
+        else:
+            columns = (lo + tl.arange(0, BLOCK_N_LG)).to(tl.int64)
+            KT_ptrs = K + k_offset + dims[:, None] * (1 if UNIT_INNER_STRIDE else stride_kk) + columns[None, :] * stride_kn
+            V_ptrs = V + v_offset + columns[:, None] * stride_vn + dims[None, :] * (1 if UNIT_INNER_STRIDE else stride_vk)
 
         # -- compute qk ----
-        kT = tl.load(KT_block_ptr_i)
+        if _LEGACY_BLOCK_POINTERS:
+            kT = tl.load(KT_block_ptr_i)
+        else:
+            kT = tl.load(KT_ptrs)
         qkT = tl.dot(q, kT)
 
         if HAS_KV_MASK:
@@ -119,7 +140,10 @@ def _attn_fwd_bsa_varlen_align(
         # -- update output accumulator --
         acc = acc * alpha[:, None]
         # update acc
-        v = tl.load(V_block_ptr_i)
+        if _LEGACY_BLOCK_POINTERS:
+            v = tl.load(V_block_ptr_i)
+        else:
+            v = tl.load(V_ptrs)
         acc = tl.dot(p.to(v.dtype), v, acc)
         # update m_i and l_i
         l_i = l_i * alpha + l_ij
@@ -131,7 +155,10 @@ def _attn_fwd_bsa_varlen_align(
     acc = acc / l_i[:, None]
     m_ptrs = M + off_hz * N_CTX + offs_m
     tl.store(m_ptrs, m_i)
-    tl.store(O_block_ptr, acc.to(Out.type.element_ty))
+    if _LEGACY_BLOCK_POINTERS:
+        tl.store(O_block_ptr, acc.to(Out.type.element_ty))
+    else:
+        tl.store(O_ptrs, acc.to(Out.type.element_ty))
 
 from shared.kernels.triton_compilation_log import install_triton_compilation_logger
 install_triton_compilation_logger()

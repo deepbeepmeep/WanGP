@@ -15,7 +15,7 @@ CUSTOM_SETTINGS = {
          "choices": [("Low", 0), ("Medium", 5), ("High (Recommended)", 9), ("Ultra", 30)]},
         {"id": "edges", "label": "Depth Discontinuities", "name": "Depth Discontinuities", "type": "dropdown", "default": "remove",
          "choices": [("Removed (no stretched surfaces between objects)", "remove"), ("Kept", "keep")]},
-        MAX_POINTS,
+        dict(MAX_POINTS, model_mode=["points"]),  # a mesh keeps every point
     ],
     "mapanything": [
         MAX_POINTS,

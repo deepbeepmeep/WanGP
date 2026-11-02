@@ -67,11 +67,11 @@ def weld(vertices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     width = vertices.element_size() * 8
     keys = (vertices + 0.0).view(getattr(torch, f"int{width}"))  # + 0.0: -0.0 becomes 0.0
     keys = keys ^ ((keys >> (width - 1)) & ((1 << (width - 1)) - 1))  # negative floats: reversed magnitude bits
-    order = torch.arange(len(vertices))
+    order = torch.arange(len(vertices), device=vertices.device)
     for axis in reversed(range(vertices.shape[1])):
         order = order[torch.sort(keys[order, axis], stable=True).indices]
     keys = keys[order]
-    first = torch.ones(len(order), dtype=torch.bool)
+    first = torch.ones(len(order), dtype=torch.bool, device=vertices.device)
     first[1:] = (keys[1:] != keys[:-1]).any(1)
     inverse = torch.empty_like(order)
     inverse[order] = torch.cumsum(first, 0) - 1

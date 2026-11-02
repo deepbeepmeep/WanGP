@@ -18,6 +18,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from mmgp import transfer
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.attention import AttentionMixin
@@ -1034,7 +1035,7 @@ class AutoencoderKLMiniMaxH3(ModelMixin, ConfigMixin, AttentionMixin, Autoencode
                     part = self._prepare_decoded_chunk(chunk[:, :, start : min(start + 4, copy_frames)], uint8_rounding)
                     if decoded is None:
                         decoded = torch.empty(*part.shape[:2], output_frames, *part.shape[3:], dtype=part.dtype, device="cpu")
-                    decoded[:, :, write_position : write_position + part.shape[2]].copy_(part, non_blocking=False)
+                    transfer.copy_(decoded[:, :, write_position : write_position + part.shape[2]], part)
                     write_position += part.shape[2]
                     del part
 

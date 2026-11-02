@@ -3,13 +3,15 @@
 # Precision follows upstream: the blocks run in FP16 (the checkpoint dtype) with FP32 layer norms; the latent projection, the final norm
 # and the output layer compute in FP32 (upstream keeps them FP32 and loads the FP16 checkpoint into them). The sparse decoders work by
 # chunks of voxels: each block writes a new tensor row chunk by row chunk, and the channel-to-space upsampling keeps only the flagged
-# children of each convolution chunk instead of materializing the 8x wider convolution output.
+# children of each convolution chunk instead of materializing the 8x wider convolution output; its second convolution adds the skip
+# rows as it writes its output.
 # Modifications Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from shared.utils.phase_progress import check_abort
+from shared.kernels import vae_ops
 from .sparse import SparseConv3d, SparseTensor, conv_row_ranges, conv_rows, layer_norm_rows_, row_chunks, subdivide
 
 
@@ -69,10 +71,8 @@ class C2SBlock(nn.Module):
         skip = x.feats.reshape(len(x) * 8, channels // 8).index_select(0, slot)
         del x, slot
         y = SparseTensor(layer_norm_rows_(up, eps=1e-6, activation=F.silu), child_coords)
-        out = torch.empty_like(up)
         repeat = out_channels // (channels // 8)
-        for start, stop in conv_row_ranges(y, out_channels):
-            out[start:stop] = conv_rows(y, self.conv2.weight, self.conv2.bias, start, stop).add_(skip[start:stop].repeat_interleave(repeat, dim=1))
+        out = vae_ops.sparse_conv(y.feats, y, self.conv2.weight, self.conv2.bias, residual=lambda start, stop: skip[start:stop].repeat_interleave(repeat, dim=1))
         return y.replace(out), subdivision
 
 

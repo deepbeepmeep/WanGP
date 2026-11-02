@@ -74,8 +74,8 @@ def speculative_decoding_runtime(value):
 
 def block_drafters_supported() -> bool:
     """DSpark and DFlash2 run on Triton and FlashAttention 2 (the LLM engine uses each one wherever it is supported)."""
-    from shared.llm_engines.lmgp.vllm_support import resolve_lm_features
-    features = resolve_lm_features()
+    from shared.llm_engines.lmgp.vllm_support import resolve_prompt_enhancer_lm_features
+    features = resolve_prompt_enhancer_lm_features()
     return features.triton and features.flash
 
 

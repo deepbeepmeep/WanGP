@@ -3,10 +3,10 @@
 # Modifications Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import gc
 import time
-import itertools
 import math
 import torch
 
+from mmgp import transfer
 from ..config import Config
 from .sequence import Sequence
 from ..layers import kv_formats as kvf
@@ -48,16 +48,36 @@ def _kv_page_tensors(runner) -> list[tuple[str, torch.Tensor, int]]:
     return tensors
 
 
-def _copy_pages(tensor: torch.Tensor, saved: torch.Tensor, axis: int) -> None:
-    """saved's pages into the first pages of tensor, one contiguous destination at a time."""
-    count = saved.shape[axis]
-    for index in itertools.product(*(range(n) for n in tensor.shape[:axis])):
-        tensor[index].narrow(0, 0, count).copy_(saved[index])
+_OUTSIDE_SPANS = (False, False, False)  # (code fence, inline backticks, double quotes)
+
+
+def _advance_spans(span: tuple[bool, bool, bool], text: str) -> tuple[bool, bool, bool]:
+    """The span state after a token's text: ``` toggles a code fence, a single backtick inline code, a double quote a quoted string (outside
+    code); a newline closes inline code and quotes, which never span lines."""
+    fence, inline, quote = span
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if character == "`":
+            run = len(text) - index - len(text[index:].lstrip("`"))
+            if run >= 3:
+                fence, inline = not fence, False
+            elif not fence and run % 2:
+                inline = not inline
+            index += run
+            continue
+        if character == '"' and not fence and not inline:
+            quote = not quote
+        elif character == "\n":
+            inline = quote = False
+        index += 1
+    return fence, inline, quote
 
 
 class ModelRunner:
 
     _MAX_SPECULATIVE_DRAFT_TOKENS = 8
+    mmgp = False  # set from the model in __init__: MMGP manages the weights (dynamic preload, streamed blocks), with or without its graphs
     mmgp_graphs = False  # set from the model in __init__ (MMGP owns the weights and the target model's decoding graphs)
 
     def __init__(self, config: Config, model_object=None, graph_pool_handle=None):
@@ -135,6 +155,7 @@ class ModelRunner:
         # MMGP owns the weights (dynamic preload, streamed blocks): the target model's decoding graphs are MMGP graph stages, the engine's
         # own graphs read only the base block (always in VRAM while the model is loaded) or the engine state.
         self.mmgp_graphs = bool(getattr(model_object, "_lm_engine_mmgp_graphs", False))
+        self.mmgp = self.mmgp_graphs or bool(getattr(model_object, "_lm_engine_mmgp", False))
         if self.mmgp_graphs:  # only MMGP moves its weights: the weights key of a whole-model graph is checked in constant time
             model_object._mm_graph_placement_key = True
         self._max_speculative_draft_tokens = min(self._MAX_SPECULATIVE_DRAFT_TOKENS, max(1, int(getattr(self.model, "_prompt_enhancer_speculative_tokens", 2))))
@@ -267,6 +288,47 @@ class ModelRunner:
         self._mtp_sample_params = None
         self.speculative_stats = self._new_speculative_stats()
         reset_context()
+
+    _REQUEST_STATE = ("_logits_bias_cache", "_repetition_token_cache", "_speculative_drafts", "_speculative_pending", "_mtp_sample_params", "speculative_stats", "_sampling_generator")
+
+    def runtime_current(self) -> bool:
+        """The runtime is prepared and ensure_runtime_ready() would keep it (its KV cache and the sequences in it stay valid)."""
+        return self._runtime_ready and (self.enforce_eager or self._get_graph_capture_signature() == self._runtime_signature)
+
+    @torch.inference_mode()
+    def save_sequence_state(self, lending=()) -> list:
+        """The per-sequence state of the live sequences, which a side request (LLMEngine.aside) resets or overwrites: what
+        reset_generation_state resets (the snapshot_sequence_state of each module with a reset_sequence_state, the conv/recurrent states
+        the others drop), the overlay rows of the sequences lending their slot, and the runner's per-request caches and sampler. Pages,
+        weights and per-step scratch (speculative snapshots, metadata tables) are not saved."""
+        modules, attributes = [], []
+        for module in self.model.modules():
+            if callable(getattr(module, "reset_sequence_state", None)):
+                modules.append((module, module.snapshot_sequence_state()))
+            else:
+                attributes.extend((module, name, getattr(module, name)) for name in ("conv_state", "recurrent_state") if hasattr(module, name))
+        overlays = [(seq, self.snapshot_overlay(seq)) for seq in lending]
+        generator = self._sampling_generator
+        requests = {name: getattr(self, name) for name in self._REQUEST_STATE}
+        requests = {name: (value.copy() if isinstance(value, dict) else value) for name, value in requests.items()}
+        return [modules, attributes, overlays, None if generator is None else generator.get_state(), requests]
+
+    @torch.inference_mode()
+    def restore_sequence_state(self, saved: list) -> None:
+        """Writes back what save_sequence_state saved, into the same tensors (the addresses that graphs read), then registers the graph
+        state again."""
+        modules, attributes, overlays, generator_state, requests = saved
+        for module, snapshot in modules:
+            module.restore_sequence_state(snapshot)
+        for module, name, value in attributes:
+            setattr(module, name, value)
+        for seq, overlay in overlays:
+            self.restore_overlay(seq, overlay)
+        for name, value in requests.items():
+            setattr(self, name, value)
+        if generator_state is not None:
+            self._sampling_generator.set_state(generator_state)
+        self._register_graph_state()
 
     def _new_speculative_stats(self) -> dict:
         return {
@@ -840,15 +902,15 @@ class ModelRunner:
             return None
         rows = self.kv_layout.overlay_rows(self.block_size)
         base = seq.overlay_slot * rows
-        return {"data": self.kv_overlay[:, :, base:base + rows].to("cpu", copy=True), "scales": self.kv_overlay_scales[:, :, base:base + rows].to("cpu", copy=True), "ring_high": int(seq.ring_high)}
+        return {"data": transfer.move(self.kv_overlay[:, :, base:base + rows], "cpu"), "scales": transfer.move(self.kv_overlay_scales[:, :, base:base + rows], "cpu"), "ring_high": int(seq.ring_high)}
 
     def restore_overlay(self, seq: Sequence, saved: dict | None) -> None:
         if saved is None or getattr(self, "kv_overlay", None) is None or seq.overlay_slot < 0:
             return
         rows = self.kv_layout.overlay_rows(self.block_size)
         base = seq.overlay_slot * rows
-        self.kv_overlay[:, :, base:base + rows].copy_(saved["data"])
-        self.kv_overlay_scales[:, :, base:base + rows].copy_(saved["scales"])
+        transfer.copy_(self.kv_overlay[:, :, base:base + rows], saved["data"])
+        transfer.copy_(self.kv_overlay_scales[:, :, base:base + rows], saved["scales"])
         seq.ring_high = int(saved["ring_high"])
 
     def _fill_overlays_from_body(self, seq: Sequence, count: int) -> None:
@@ -940,7 +1002,7 @@ class ModelRunner:
         config.num_kvcache_blocks = max(1, int(required_total_blocks))
         required_kv_bytes = config.num_kvcache_blocks * block_bytes
         # MMGP mode: the blocks kept in VRAM by the dynamic preload leave room for the cache when the allocator needs it
-        if is_cuda_runtime and not self.mmgp_graphs:
+        if is_cuda_runtime and not self.mmgp:
             free, total = torch.cuda.mem_get_info()
             current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
             target_total_usage = total * config.gpu_memory_utilization
@@ -1004,9 +1066,9 @@ class ModelRunner:
         if not self.enforce_eager:
             # Capture writes dummy KV slots. Restore live pages only AFTER capture.
             self.capture_cudagraph()
-        # Each destination is contiguous, avoiding a full-cache GPU staging copy.
+        # saved's pages into the first pages of each tensor, without a full-cache GPU staging copy
         for (_name, tensor, axis), saved in zip(_kv_page_tensors(self), staged):
-            _copy_pages(tensor, saved, axis)
+            transfer.copy_(tensor.narrow(axis, 0, saved.shape[axis]), saved)
         del staged
         self._runtime_signature = self._get_graph_capture_signature()
         print(f"[LM Engine] KV cache grew: {old_tokens} -> {tokens}/{config.kv_cache_max_tokens} generation tokens per branch; {config.num_kvcache_blocks} pages.")
@@ -1206,43 +1268,57 @@ class ModelRunner:
         boundary = int(seq.repetition_penalty_start)
         completion_count = int(seq.num_tokens) - boundary
         cache = self._repetition_token_cache.get(seq.seq_id)
-        if cache is None or cache["boundary"] != boundary or cache["synced_tokens"] > completion_count:
+        rules = (id(seq.repetition_exempt_ids), id(seq.repetition_span_marks))
+        if cache is None or cache["boundary"] != boundary or cache["synced_tokens"] > completion_count or cache["rules"] != rules:
             if cache is None and len(self._repetition_token_cache) >= max(1, int(self.config.max_num_seqs)) * 2:
                 self._repetition_token_cache.pop(next(iter(self._repetition_token_cache)))
             if cache is None:
                 cache = {"device_states": {}}
                 self._repetition_token_cache[seq.seq_id] = cache
-            cache.update(boundary=boundary, synced_tokens=0, seen=set(), token_ids=[])
+            cache.update(boundary=boundary, synced_tokens=0, seen=set(), token_ids=[], span=_OUTSIDE_SPANS, rules=rules)
             for state in cache["device_states"].values():
                 state["count"] = 0
                 state["cursor"] = 0
         new_tokens = seq.token_ids[boundary + cache["synced_tokens"]:boundary + completion_count]
         full_vocab_size = int(self.config.hf_config.vocab_size)
+        exempt, marks, span = seq.repetition_exempt_ids or (), seq.repetition_span_marks, cache["span"]
         for token_id in new_tokens:
             token_id = int(token_id)
-            if 0 <= token_id < full_vocab_size and token_id not in cache["seen"]:
+            inside = span != _OUTSIDE_SPANS
+            if marks is not None and token_id in marks:
+                span = _advance_spans(span, marks[token_id])
+            if not inside and 0 <= token_id < full_vocab_size and token_id not in exempt and token_id not in cache["seen"]:
                 cache["seen"].add(token_id)
                 cache["token_ids"].append(token_id)
+        cache["span"] = span
         cache["synced_tokens"] = completion_count
         return cache
 
     @staticmethod
-    def _repetition_virtual_tokens(cache: dict, virtual_tokens, vocab_size: int) -> list[int]:
+    def _repetition_virtual_tokens(seq: Sequence, cache: dict, virtual_tokens, vocab_size: int) -> tuple[bool, list[int]]:
+        """Whether the position after the drafted tokens lies inside a code, quote or backtick span (no penalty there), and the drafted tokens that
+        count as repeated so far."""
+        exempt, marks, span = seq.repetition_exempt_ids or (), seq.repetition_span_marks, cache["span"]
         extra_ids = []
         extra_seen = set()
         for token_id in virtual_tokens:
             token_id = int(token_id)
-            if 0 <= token_id < vocab_size and token_id not in cache["seen"] and token_id not in extra_seen:
+            inside = span != _OUTSIDE_SPANS
+            if marks is not None and token_id in marks:
+                span = _advance_spans(span, marks[token_id])
+            if not inside and 0 <= token_id < vocab_size and token_id not in exempt and token_id not in cache["seen"] and token_id not in extra_seen:
                 extra_seen.add(token_id)
                 extra_ids.append(token_id)
-        return extra_ids
+        return span != _OUTSIDE_SPANS, extra_ids
 
     def _apply_repetition_penalty(self, seq: Sequence, logits: torch.Tensor, penalty: float, virtual_tokens=()) -> None:
         if penalty == 1.0:
             return
         vocab_size = int(logits.shape[-1])
         cache = self._sync_repetition_token_cache(seq)
-        virtual_ids = self._repetition_virtual_tokens(cache, virtual_tokens, vocab_size)
+        suspended, virtual_ids = self._repetition_virtual_tokens(seq, cache, virtual_tokens, vocab_size)
+        if suspended:
+            return
         device_key = (logits.device.type, logits.device.index, vocab_size)
         state = cache["device_states"].get(device_key)
         if state is None:

@@ -197,6 +197,14 @@ To share a *.Lset* file you will need (for the moment) to get it directly in the
 
 ## Supported Formats
 
+### MiniMax H3 Pruned and Full Checkpoints
+
+WanGP selects registered H3 LoRA conversion maps from the checkpoint's conditioning data. Checkpoints that include a conversion package carry the information needed for conversion even when that package is absent from the local installation. Singularity V2 supports this packaging for both full and pruned INT8 checkpoints.
+
+A LoRA trained on a custom pruned checkpoint must identify its source conditioning table. Keep its source-table tag when sharing or converting the adapter. The selected target model cannot identify the adapter's training basis, and matching tensor dimensions alone is insufficient. WanGP reports unknown or ambiguous mappings instead of choosing the closest table. LoRAs that do not modify the affected conditioning projections do not need this conversion.
+
+Conversion preserves adapter rank and strength controls. It makes the supported tensor layouts compatible; generation quality still depends on the LoRA and target fine-tune.
+
 WanGP supports multiple most lora formats:
 - **Safetensors** (.safetensors)
 - **Replicate** format

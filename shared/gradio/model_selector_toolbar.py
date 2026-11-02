@@ -447,6 +447,9 @@ def get_css():
         padding: 0 4px;
         background: var(--body-background-fill);
     }
+    .wangp-model-selector-tool-row:has(.wangp-model-selector-tool:hover) {
+        z-index: 61;
+    }
     .wangp-model-selector-tool {
         position: relative;
         display: flex !important;
@@ -520,12 +523,12 @@ def get_css():
     }
     .wangp-model-selector-tool:hover::after {
         opacity: 1;
-        transition-delay: 500ms;
+        transition-delay: 1000ms;
     }
     .wangp-model-selector-tool-search::after { content: "Search models [Alt+S]"; }
     .wangp-model-selector-tool-refresh::after { content: "Refresh model list [Alt+R]"; }
     .wangp-model-selector-tool-finetune::after { content: attr(data-wangp-tooltip); }
-    .wangp-model-selector-tool-unload::after { content: "Unload models and extensions [Alt+U]"; }
+    .wangp-model-selector-tool-unload::after { content: "Unload models and extensions [Alt+U]"; left: auto; right: 0; transform: none; }
     .wangp-model-selector-search-row {
         --wangp-model-selector-gap: calc(16px * var(--wangp-ui-scale, 0.9));
         --wangp-model-selector-search-margin: 8px;

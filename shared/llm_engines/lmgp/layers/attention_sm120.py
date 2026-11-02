@@ -11,6 +11,14 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.nvidia.ampere import async_copy, mma_v2
 
+# Triton 3.9 renamed the builtin; resolve it once, outside the launch path.
+_async_load = getattr(async_copy, "async_load", None)
+if _async_load is None:
+    _async_load = async_copy.async_copy_global_to_shared
+_barrier = getattr(gl, "barrier", None)
+if _barrier is None:
+    _barrier = gl.thread_barrier
+
 
 @gluon.jit
 def _stage_cache(k_ptr, v_ptr, k_smem, v_smem, slot, head, H_KV: gl.constexpr, D: gl.constexpr, N: gl.constexpr):
@@ -18,8 +26,8 @@ def _stage_cache(k_ptr, v_ptr, k_smem, v_smem, slot, head, H_KV: gl.constexpr, D
     rows = gl.arange(0, N, layout=gl.SliceLayout(1, layout))
     dims = gl.arange(0, D, layout=gl.SliceLayout(0, layout))
     offsets = ((slot + rows[:, None]) * H_KV + head) * D + dims[None, :]
-    async_copy.async_copy_global_to_shared(k_smem, k_ptr + offsets)
-    async_copy.async_copy_global_to_shared(v_smem, v_ptr + offsets)
+    _async_load(k_smem, k_ptr + offsets)
+    _async_load(v_smem, v_ptr + offsets)
     async_copy.commit_group()
 
 
@@ -69,7 +77,7 @@ def q8_prefill_async_kernel(
         k_smem = k_buffers.index(stage)
         v_smem = v_buffers.index(stage)
         async_copy.wait_group(0)
-        gl.thread_barrier()
+        _barrier()
         page = gl.load(tables_ptr + sequence * bt_stride + start // PAGE)
         token = start % PAGE
         next_start = start + N
@@ -109,7 +117,7 @@ def q8_prefill_async_kernel(
         accumulator = mma_v2(p_low, v_low, accumulator)
         maximum = next_maximum
         # All readers finish before a pipeline slot can be overwritten.
-        gl.thread_barrier()
+        _barrier()
     dims = gl.arange(0, D, layout=gl.SliceLayout(0, MMA))
     gl.store(out_ptr + (q_start + rows[:, None]) * out_stride_t + head * out_stride_h + dims[None, :], accumulator / denominator[:, None], mask=rows[:, None] < q_len)
 
@@ -158,7 +166,7 @@ def q8_grouped_async_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tables_ptr, len
         stage = iteration % STAGES
         k_smem, v_smem = k_buffers.index(stage), v_buffers.index(stage)
         async_copy.wait_group(0)
-        gl.thread_barrier()
+        _barrier()
         page = gl.load(tables_ptr + sequence * TABLE_WIDTH + start // PAGE)
         token = start % PAGE
         next_start = start + N
@@ -191,7 +199,7 @@ def q8_grouped_async_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tables_ptr, len
         accumulator = mma_v2(p_high, v_low, accumulator)
         accumulator = mma_v2(p_low, v_low, accumulator)
         maximum = next_maximum
-        gl.thread_barrier()
+        _barrier()
         if more:
             _stage_cache(k_ptr, v_ptr, k_buffers.index(0), v_buffers.index(0), next_slot, kv_head, H_KV, D, N)
     dims = gl.arange(0, D, layout=gl.SliceLayout(0, MMA))

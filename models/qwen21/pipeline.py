@@ -290,9 +290,11 @@ class Qwen21Pipeline(QwenImage21Pipeline):
                 branch["img_mask"] = torch.cat([slots, slots.new_ones(slots.shape[0], latents.shape[1] // 4)], dim=1)
                 branch["img_shapes"] = [shapes] * batch_size
                 branch["target_rope_offset"] = target_rope_offset
-                # INT8_RAM: the layers in RAM, streamed to the GPU with the blocks (NAG reads its cache outside the blocks: kept in VRAM)
+                # INT8_RAM: the layers in RAM, streamed to the GPU with the blocks (NAG reads its cache outside the blocks: kept in VRAM);
+                # Enabled / INT8: in VRAM as far as it fits beside the weights, the other layers in RAM and streamed
                 cache = QwenImage21KVCache(self.transformer.transformer_blocks, quantize=kv_cache_mode in ("INT8", "INT8_RAM"), native=nag_parameters is None,
-                                           ram=kv_cache_mode == "INT8_RAM" and nag_parameters is None) if use_kv_cache else None
+                                           ram=kv_cache_mode == "INT8_RAM" and nag_parameters is None,
+                                           dynamic=kv_cache_mode in ("Enabled", "INT8")) if use_kv_cache else None
                 branch["kv_cache"] = cache
                 if cache is not None:
                     caches.append(cache)

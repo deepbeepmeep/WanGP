@@ -1,0 +1,23 @@
+{
+    "settings_version": 2.82,
+    "model_type": "trellis2_shape",
+    "type": "TRELLIS.2 Shape 4B",
+    "prompt": "",
+    "image_mode": 1,
+    "video_prompt_type": "I",
+    "batch_size": 1,
+    "remove_background_images_ref": 1,
+    "multi_prompts_gen_type": "FG",
+    "num_inference_steps": 12,
+    "guidance_scale": 7.5,
+    "model_mode": 2,
+    "custom_settings": {
+        "max_faces": 100000,
+        "max_tokens": 49152
+    },
+    "temporal_upsampling": "supratex",
+    "temporal_postprocessing_parameters": {
+        "texture_size": 2048,
+        "texture_max_faces": 0
+    }
+}

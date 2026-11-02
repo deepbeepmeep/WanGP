@@ -9,7 +9,7 @@ Every spatial upsampler (built-in or extension) class is listed in
 {
     "name": "FlashVSR",                      # display name
     "upsampler_types": ("postprocessing",),  # "postprocessing" and/or "vae"
-    "media": ("video", "image"),             # media kinds the upsampler can process
+    "media": ("video", "image"),             # media kinds the upsampler can process ("video", "image", "audio", "3d")
     "profile": "video",                      # memory profile kind: video, image, or audio
     "config_key": "flashvsr",                # optional subkey under wgp_config["spatial_upsamplers"]
     "pos": 20,                               # default dropdown order for this handler's methods
@@ -23,7 +23,7 @@ Every spatial upsampler (built-in or extension) class is listed in
     "description": "Restore detail while spatially upscaling media.", # processor-owned help/discovery description
     "method_descriptions": {"flashvsr": "..."}, # optional descriptions per method
     "method_parameters": {"flashvsr": [{      # optional runtime/UI/assistant descriptors
-        "name": "spatial_upsampler_strength", # shared prefix required for UI controls
+        "name": "flashvsr_strength",          # id in spatial_postprocessing_parameters
         "setting": "strength",                # upscale() keyword; defaults to name
         "type": "number",
         "component": "slider",
@@ -40,11 +40,13 @@ Every spatial upsampler (built-in or extension) class is listed in
 Decoded-media handlers declare category ``upsampler`` or ``refiner``. Methods
 without declared multipliers serialize as their bare method key and do not show
 a Scale dropdown. Handler descriptions power both the selector's dynamic help
-and postprocessing discovery. UI parameters may use textbox, number, slider,
-dropdown, checkbox, or images components; images are rendered by the shared
-``AdvancedMediaGallery`` and support ``multiple=True``. Assistant discovery
-keeps only call-relevant parameter fields and omits UI/runtime presentation
-metadata.
+and postprocessing discovery. Parameter values travel in the
+``spatial_postprocessing_parameters`` setting under their ids, the UI shows them
+below the slot's selector (``postprocessing.parameter_ui``: sliders, dropdowns,
+a text input), and an images parameter reads the reference images input shared
+with the temporal slot (``postprocessing_reference_images``). Assistant
+discovery keeps only call-relevant parameter fields and omits UI/runtime
+presentation metadata.
 
 Handlers must also implement:
 - ``is_upsampling(value)``: does this handler own this ``spatial_upsampling`` value?
@@ -97,6 +99,7 @@ from typing import Any
 from shared.attention import attention_shared_state
 from shared.utils import offload_registry
 from . import memory as processor_memory
+from . import parameter_ui
 from .model_context import compatible_loaded_model
 from .processor_status import PROCESSOR_STATUS_DISABLED, PROCESSOR_STATUS_ENABLED, PROCESSOR_STATUS_UNKNOWN, handler_reason_disabled, handler_status, handler_method_in_choices
 
@@ -108,13 +111,13 @@ UPSAMPLER_TYPE_VAE = "vae"
 POSTPROCESSING_CATEGORY_UPSAMPLER = "upsampler"
 POSTPROCESSING_CATEGORY_REFINER = "refiner"
 POSTPROCESSING_CATEGORIES = (POSTPROCESSING_CATEGORY_UPSAMPLER, POSTPROCESSING_CATEGORY_REFINER)
-PARAMETER_PREFIX = "spatial_upsampler_"
 PARAMETER_UI_POSTPROCESSING = "postprocessing"
 PARAMETER_UI_LATE_POSTPROCESSING = "late_postprocessing"
 PARAMETER_UI_MEDIA_FLOW = "media_flow"
 UPSAMPLER_PROFILE_VIDEO = "video"
 UPSAMPLER_PROFILE_IMAGE = "image"
 UPSAMPLER_PROFILE_AUDIO = "audio"
+UPSAMPLER_PROFILE_3D = "3d"  # meshes: the spatial slot holds 3D refiners
 UPSAMPLER_CONFIG_KEY = "spatial_upsamplers"
 PERSISTENCE_CONFIG_KEY = "persistence"
 PERSIST_UNLOAD = 1
@@ -131,6 +134,7 @@ spatial_upsampler_handlers = [
     "postprocessing.h3_face_refiner.wgp_bridge.H3FaceRefinerBridge",
     "postprocessing.chain_of_zoom.wgp_bridge.ChainOfZoomBridge",
     "postprocessing.ltx2_upsampler.wgp_bridge.LTXVideoUpsamplerBridge",
+    "postprocessing.hi3d_refiner.wgp_bridge.Hi3DRefinerBridge",
     "postprocessing.spatial_upsamplers.WanVaeUpsampler",
     "models.minimax_h3.vae_upsampler.MiniMaxH3VaeUpsampler",
 ]
@@ -365,21 +369,8 @@ def method_uses_setting(method, setting: str) -> bool:
 
 
 def runtime_parameter_kwargs(spatial_upsampling, parameter_values) -> dict[str, Any]:
-    if not isinstance(parameter_values, dict):
-        return {}
     split = split_upsampling_value(spatial_upsampling)
-    if split is None:
-        return {}
-    output = {}
-    for parameter in method_parameters(split[0]):
-        name = str(parameter["name"])
-        if name not in parameter_values:
-            continue
-        value = parameter_values[name]
-        if value is None or value == "" or value == []:
-            continue
-        output[str(parameter.get("setting", name))] = value
-    return output
+    return {} if split is None else parameter_ui.runtime_kwargs(method_parameters(split[0]), parameter_values)
 
 
 def _handler_method_label(handler, label: str, method: str) -> str:
@@ -481,7 +472,9 @@ def _unit_compatible_progress(progress_callback):
     return lambda phase, current=None, total=None, unit=None: progress_callback(phase, current, total)
 
 
-def upscale_postprocessing(handler, sample, spatial_upsampling, *, main_offloadobj=None, loaded_model_context=None, **kwargs):
+def upscale_postprocessing(handler, sample, spatial_upsampling, *, main_offloadobj=None, loaded_model_context=None, parameter_values=None, **kwargs):
+    """parameter_values: the slot's runtime values (parameter_ui.runtime_values), passed to the processor as its declared parameters (under
+    their setting names)."""
     if kwargs.get("progress_callback") is not None:
         kwargs["progress_callback"] = _unit_compatible_progress(kwargs["progress_callback"])
     _activate_upsampler(handler)
@@ -490,7 +483,6 @@ def upscale_postprocessing(handler, sample, spatial_upsampling, *, main_offloado
     if kwargs.get("init_pipe") is None:
         kwargs["init_pipe"] = partial(processor_memory.init_pipe, server_config=_upsampler_server_config)
     name = _handler_def(handler)["name"]
-    parameter_values = {name: kwargs.pop(name) for name in tuple(kwargs) if str(name).startswith(PARAMETER_PREFIX)}
     kwargs.update(runtime_parameter_kwargs(spatial_upsampling, parameter_values))
     borrowed_context = compatible_loaded_model(handler, spatial_upsampling, loaded_model_context, **kwargs)
     with attention_shared_state():
@@ -513,12 +505,20 @@ def upscale_postprocessing(handler, sample, spatial_upsampling, *, main_offloado
                 _release_upsampler_handler(handler)
 
 
-def validate_postprocessing_spatial_upsampling(spatial_upsampling, image_mode: int) -> str:
+def handler_media(handler) -> tuple[str, ...]:
+    return tuple(_handler_def(handler).get("media", (UPSAMPLER_PROFILE_VIDEO, UPSAMPLER_PROFILE_IMAGE)))
+
+
+def validate_postprocessing_spatial_upsampling(spatial_upsampling, image_mode: int, *, media_kind: str | None = None) -> str:
+    """media_kind: the processed media when it is neither a video nor an image (``3d``); image_mode tells those apart otherwise."""
     if is_vae_upsampling(spatial_upsampling):
         return "VAE Spatial Upsampling is only available during generation"
     edit_upsampler = find_postprocessing_upsampler(spatial_upsampling)
     if len(spatial_upsampling) > 0 and edit_upsampler is None:
         return f"No spatial upsampler registered for '{spatial_upsampling}'"
+    kind = media_kind or (UPSAMPLER_PROFILE_IMAGE if image_mode else UPSAMPLER_PROFILE_VIDEO)
+    if edit_upsampler is not None and kind not in handler_media(edit_upsampler):
+        return f"{_handler_def(edit_upsampler)['name']} does not process {'3D assets' if kind == UPSAMPLER_PROFILE_3D else kind + 's'}"
     if edit_upsampler is not None:
         error = edit_upsampler.validate_upsampling(spatial_upsampling, image_mode)
         if error:
@@ -733,15 +733,20 @@ def _method_choice_sort_key(choice: tuple[str, str]) -> tuple[float, str, str]:
     return position, str(label or "").casefold(), str(method or "")
 
 
-def query_postprocessing_method_choices(image_outputs: bool = False, late_postprocessing: bool = False, *, selected_method: str = "") -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+def media_kind_of(image_outputs: bool = False, media_kind: str | None = None) -> str:
+    return media_kind or (UPSAMPLER_PROFILE_IMAGE if image_outputs else UPSAMPLER_PROFILE_VIDEO)
+
+
+def query_postprocessing_method_choices(image_outputs: bool = False, late_postprocessing: bool = False, *, selected_method: str = "", media_kind: str | None = None) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     video_post_choices, image_post_choices = [], []
+    kind = media_kind_of(image_outputs, media_kind)
     for handler in upsampler_handlers(UPSAMPLER_TYPE_POSTPROCESSING):
         handler_def = _handler_def(handler)
         method_keys = [key for _, key in handler_def.get("methods", [])]
         if "lanczos" not in method_keys and not (late_postprocessing or handler_enabled(handler)):
             continue
         media = handler_def.get("media", (UPSAMPLER_PROFILE_VIDEO, UPSAMPLER_PROFILE_IMAGE))
-        if (UPSAMPLER_PROFILE_IMAGE if image_outputs else UPSAMPLER_PROFILE_VIDEO) not in media:
+        if kind not in media:
             continue
         choices = [(_method_pos(handler_def, method), str(label or "").casefold(), str(method or ""), _handler_method_label(handler, label, method), method) for label, method in handler_def.get("methods", []) if handler_method_in_choices(handler, method, selected_method=selected_method)]
         if UPSAMPLER_PROFILE_VIDEO in media:
@@ -751,9 +756,9 @@ def query_postprocessing_method_choices(image_outputs: bool = False, late_postpr
     return [(label, method) for _, _, _, label, method in sorted(video_post_choices)], [(label, method) for _, _, _, label, method in sorted(image_post_choices)]
 
 
-def dropdown_state(spatial_upsampling, *, image_outputs: bool = False, late_postprocessing: bool = False, vae_choices: list[tuple[str, str]] | None = None, excluded_methods: set[str] | None = None, exclude_method_fn=None) -> dict[str, Any]:
+def dropdown_state(spatial_upsampling, *, image_outputs: bool = False, late_postprocessing: bool = False, vae_choices: list[tuple[str, str]] | None = None, excluded_methods: set[str] | None = None, exclude_method_fn=None, media_kind: str | None = None) -> dict[str, Any]:
     method, scale = split_upsampling_value(spatial_upsampling) or ("", 2.0)
-    video_post_choices, image_post_choices = query_postprocessing_method_choices(image_outputs=image_outputs, late_postprocessing=late_postprocessing, selected_method=method)
+    video_post_choices, image_post_choices = query_postprocessing_method_choices(image_outputs=image_outputs, late_postprocessing=late_postprocessing, selected_method=method, media_kind=media_kind)
     excluded_methods = excluded_methods or set()
     video_post_choices = [choice for choice in video_post_choices if choice[1] not in excluded_methods and not (exclude_method_fn and exclude_method_fn(choice[1]))]
     image_post_choices = [choice for choice in image_post_choices if choice[1] not in excluded_methods and not (exclude_method_fn and exclude_method_fn(choice[1]))]
@@ -764,56 +769,15 @@ def dropdown_state(spatial_upsampling, *, image_outputs: bool = False, late_post
     return {"method": method, "scale": scale, "value": value, "method_choices": method_choices, "ratio_choices": ratio_choices}
 
 
-def late_postprocessing_ui_state(spatial_upsampling, *, image_outputs: bool, parameter_values=None) -> dict[str, Any]:
-    state = dropdown_state(spatial_upsampling, image_outputs=image_outputs, late_postprocessing=True)
-    state["parameters"] = parameter_ui_state(state["method"], PARAMETER_UI_LATE_POSTPROCESSING, parameter_values)
-    return state
-
-
-def ui_parameter_definitions(ui_context: str) -> list[dict[str, Any]]:
-    definitions = {}
-    for handler in upsampler_handlers():
-        for _label, method in _method_choices(_handler_def(handler)):
-            for parameter in method_parameters(method, ui_context=ui_context):
-                name = str(parameter["name"])
-                if not name.startswith(PARAMETER_PREFIX):
-                    raise ValueError(f"Spatial postprocessor UI parameter '{name}' must start with '{PARAMETER_PREFIX}'")
-                if name in definitions:
-                    previous = definitions[name]
-                    for key in ("type", "component", "multiple"):
-                        if key in previous and key in parameter and previous[key] != parameter[key]:
-                            raise ValueError(f"Spatial postprocessor UI parameter '{name}' has incompatible '{key}' declarations")
-                    continue
-                definitions[name] = parameter
-    return list(definitions.values())
-
-
-def parameter_component_type(parameter: dict[str, Any]) -> str:
-    component_type = str(parameter.get("component", "") or "").strip().lower()
-    return component_type or {"boolean": "checkbox", "integer": "number", "number": "number", "array": "images"}.get(str(parameter.get("type", "string")), "textbox")
-
-
-def parameter_default(parameter: dict[str, Any]):
-    value = parameter.get("default", [] if parameter_component_type(parameter) == "images" else None)
-    return list(value) if isinstance(value, list) else value
-
-
-def parameter_ui_state(method, ui_context: str, parameter_values=None) -> dict[str, Any]:
-    definitions = ui_parameter_definitions(ui_context)
-    selected = {str(parameter["name"]): parameter for parameter in method_parameters(method, ui_context=ui_context)}
-    definitions = [selected.get(parameter["name"], parameter) for parameter in definitions]
-    active = set(selected)
-    current = parameter_values if isinstance(parameter_values, dict) else {}
-    values = {}
-    for parameter in definitions:
-        name = str(parameter["name"])
-        value = current.get(name) if name in active else None
-        values[name] = parameter_default(parameter) if value is None else value
-    return {"definitions": definitions, "active": active, "values": values}
+def late_postprocessing_ui_state(spatial_upsampling, *, image_outputs: bool, media_kind: str | None = None) -> dict[str, Any]:
+    """The state of the late panel's slot for the selected media, with its choices' context (the slot's context state)."""
+    context = {"image_outputs": image_outputs, "late_postprocessing": True, "media_kind": media_kind}
+    return {**dropdown_state(spatial_upsampling, **context), "context": context}
 
 
 def spatial_help_markdown(method_choices, *, media_profile: str, field_help=None) -> str:
-    intro = getattr(field_help, "SPATIAL_UPSAMPLER_HELP_INTRO", "Spatial upsamplers increase resolution. Visual refiners improve targeted decoded content without necessarily changing its dimensions.")
+    intro = ("3D refiners add fine geometric detail to a mesh from its reference image, keeping its position and scale." if media_profile == UPSAMPLER_PROFILE_3D else
+             getattr(field_help, "SPATIAL_UPSAMPLER_HELP_INTRO", "Spatial upsamplers increase resolution. Visual refiners improve targeted decoded content without necessarily changing its dimensions."))
     sections = [intro]
     handler_choices = {}
     for label, method in method_choices:
@@ -823,7 +787,7 @@ def spatial_help_markdown(method_choices, *, media_profile: str, field_help=None
     for handler, choices in handler_choices.items():
         handler_def = _handler_def(handler)
         name = str(handler_def.get("name", choices[0][0]))
-        category = "Visual Refiner" if str(handler_def.get("postprocessing_category", POSTPROCESSING_CATEGORY_UPSAMPLER)).lower() == POSTPROCESSING_CATEGORY_REFINER else "Spatial Upsampler"
+        category = slot_label(media_profile) if media_profile == UPSAMPLER_PROFILE_3D else "Visual Refiner" if str(handler_def.get("postprocessing_category", POSTPROCESSING_CATEGORY_UPSAMPLER)).lower() == POSTPROCESSING_CATEGORY_REFINER else "Spatial Upsampler"
         description = str(handler_def.get("description", "") or "").strip()
         media_descriptions = handler_def.get("media_descriptions", {})
         media_description = str(media_descriptions.get(media_profile, "") or "").strip() if isinstance(media_descriptions, dict) else ""
@@ -842,7 +806,7 @@ def spatial_help_markdown(method_choices, *, media_profile: str, field_help=None
 
 
 def spatial_help_popup(method_choices, *, media_profile: str, field_help=None) -> tuple[str, str]:
-    return "Spatial Upsampler / Visual Refiner", spatial_help_markdown(method_choices, media_profile=media_profile, field_help=field_help)
+    return slot_label(media_profile), spatial_help_markdown(method_choices, media_profile=media_profile, field_help=field_help)
 
 
 def spatial_help_id(method_choices, *, media_profile: str) -> str:
@@ -850,12 +814,20 @@ def spatial_help_id(method_choices, *, media_profile: str) -> str:
     return f"spatial_upsampling_{hashlib.sha1(signature.encode('utf-8')).hexdigest()[:12]}"
 
 
-def create_generation_spatial_ui(gr, spatial_upsampling, *, image_outputs: bool = False, late_postprocessing: bool = False, vae_choices: list[tuple[str, str]] | None = None, excluded_methods: set[str] | None = None, exclude_method_fn=None, elem_classes=None, update_form: bool = False, field_help=None, help_target_id: str | None = None, parameter_values=None) -> dict[str, Any]:
+def slot_label(media_kind: str) -> str:
+    return "3D Refiner" if media_kind == UPSAMPLER_PROFILE_3D else "Spatial Upsampler / Visual Refiner"
+
+
+def create_generation_spatial_ui(gr, spatial_upsampling, *, image_outputs: bool = False, late_postprocessing: bool = False, vae_choices: list[tuple[str, str]] | None = None, excluded_methods: set[str] | None = None, exclude_method_fn=None, elem_classes=None, update_form: bool = False, field_help=None, help_target_id: str | None = None, media_kind: str | None = None) -> dict[str, Any]:
+    """The spatial slot's selectors; its processors' parameters are in the shared inputs of parameter_ui. The context of its choices
+    (returned in extra_components and media_outputs) follows the model shown (form refresh) or the selected media (late panel): the
+    slot's events are bound once, for the first model."""
     method, scale = split_upsampling_value(spatial_upsampling) or ("", 2.0)
-    state = dropdown_state(build_upsampling_value(method, scale) or "", image_outputs=image_outputs, late_postprocessing=late_postprocessing, vae_choices=vae_choices, excluded_methods=excluded_methods, exclude_method_fn=exclude_method_fn)
-    media_profile = UPSAMPLER_PROFILE_IMAGE if image_outputs else UPSAMPLER_PROFILE_VIDEO
+    context = {"image_outputs": image_outputs, "late_postprocessing": late_postprocessing, "vae_choices": vae_choices, "excluded_methods": excluded_methods, "exclude_method_fn": exclude_method_fn, "media_kind": media_kind}
+    state = dropdown_state(build_upsampling_value(method, scale) or "", **context)
+    media_profile = media_kind_of(image_outputs, media_kind)
     with gr.Row():
-        method_component = gr.Dropdown(choices=state["method_choices"], value=state["method"], visible=True, scale=3, label="Spatial Upsampler / Visual Refiner", elem_id=help_target_id, elem_classes=elem_classes)
+        method_component = gr.Dropdown(choices=state["method_choices"], value=state["method"], visible=True, scale=3, label=slot_label(media_profile), elem_id=help_target_id, elem_classes=elem_classes)
         if field_help is not None:
             help_title, help_markdown = spatial_help_popup(state["method_choices"], media_profile=media_profile, field_help=field_help)
             help_id = spatial_help_id(state["method_choices"], media_profile=media_profile)
@@ -865,83 +837,24 @@ def create_generation_spatial_ui(gr, spatial_upsampling, *, image_outputs: bool 
     if field_help is None:
         help_component = gr.Markdown(value=spatial_help_markdown(state["method_choices"], media_profile=media_profile), visible=True, elem_classes=elem_classes)
 
-    ui_context = PARAMETER_UI_LATE_POSTPROCESSING if late_postprocessing else PARAMETER_UI_POSTPROCESSING
-    parameter_values = dict(parameter_values or {})
-    parameter_state = parameter_ui_state(state["method"], ui_context, parameter_values)
-    parameter_defs = parameter_state["definitions"]
-    parameter_components, parameter_rows, parameter_extras = {}, {}, []
-    for parameter in parameter_defs:
-        name = str(parameter["name"])
-        component_type = parameter_component_type(parameter)
-        visible = name in parameter_state["active"]
-        initial = parameter_state["values"][name]
-        label = str(parameter.get("label", name.removeprefix(PARAMETER_PREFIX).replace("_", " ").title()))
-        if not late_postprocessing:
-            label = parameter.get("label_long", label)
-        info = str(parameter.get("description", "") or "") or None
-        if component_type == "images":
-            from shared.gradio.gallery import AdvancedMediaGallery
+    context_component = context if update_form else gr.State(context)
 
-            with gr.Row(visible=visible) as row:
-                gallery = AdvancedMediaGallery(media_mode="image", height=int(parameter.get("height", 240)), columns=int(parameter.get("columns", 4)), label=label, initial=initial, single_image_mode=not bool(parameter.get("multiple", True)))
-                gallery.mount(update_form=update_form)
-            component = gallery.gallery
-            parameter_extras += [row] + gallery.get_toggable_elements()
-        else:
-            with gr.Row(visible=visible) as row:
-                if component_type == "slider":
-                    component = gr.Slider(parameter.get("minimum", 0), parameter.get("maximum", 1), value=initial, step=parameter.get("step", 1), label=label, info=info, elem_classes=elem_classes)
-                elif component_type == "dropdown":
-                    component = gr.Dropdown(choices=parameter.get("choices", parameter.get("enum", ())), value=initial, label=label, info=info, elem_classes=elem_classes)
-                elif component_type == "checkbox":
-                    component = gr.Checkbox(value=bool(initial), label=label, info=info, elem_classes=elem_classes)
-                elif component_type == "number":
-                    component = gr.Number(value=initial, label=label, info=info, elem_classes=elem_classes)
-                else:
-                    component = gr.Textbox(value=initial or "", label=label, info=info, lines=int(parameter.get("lines", 1)), elem_classes=elem_classes)
-            parameter_extras += [row, component]
-        parameter_components[name] = component
-        parameter_rows[name] = row
-
-    initial_parameters = parameter_state["values"]
-    parameters_component = initial_parameters if update_form else gr.State(initial_parameters)
-
-    def refresh_method(method, value, current_parameters):
+    def refresh_method(method, value, context):
         _, _, value = normalize_upsampling_value_for_method(method, value)
-        method_state = dropdown_state(value, image_outputs=image_outputs, late_postprocessing=late_postprocessing, vae_choices=vae_choices, excluded_methods=excluded_methods, exclude_method_fn=exclude_method_fn)
+        method_state = dropdown_state(value, **context)
         method, ratio_choices, scale, value = (method_state[key] for key in ("method", "ratio_choices", "scale", "value"))
-        current_parameters = dict(current_parameters)
-        for name in ("spatial_upsampler_param", "spatial_upsampler_param2"):
-            current_parameters.pop(name, None)
-        method_parameter_state = parameter_ui_state(method, ui_context, current_parameters)
-        selected_defs = {parameter["name"]: parameter for parameter in method_parameter_state["definitions"]}
-
-        def update_parameter(name):
-            parameter = selected_defs[name]
-            changes = {"value": method_parameter_state["values"][name]}
-            if parameter_component_type(parameter) == "slider":
-                changes.update(label=parameter.get("label") if late_postprocessing else parameter.get("label_long", parameter.get("label")), info=parameter.get("description"), minimum=parameter.get("minimum", 0), maximum=parameter.get("maximum", 1), step=parameter.get("step", 1))
-            return gr.update(**changes)
-        return (gr.update(choices=method_state["method_choices"], value=method_state["method"]),
-                gr.update(choices=ratio_choices, value=scale if ratio_choices else None, visible=bool(method and ratio_choices)), value,
-                *(gr.update(visible=name in method_parameter_state["active"]) for name in parameter_components),
-                *(update_parameter(name) for name in parameter_components), method_parameter_state["values"])
+        return (gr.update(choices=method_state["method_choices"], value=method), gr.update(choices=ratio_choices, value=scale if ratio_choices else None, visible=bool(method and ratio_choices)),
+                value)
 
     def refresh_ratio(method, scale):
         _, scale, value = normalize_upsampling_state(method, scale)
         return gr.update(value=scale, visible=bool(method and method_multipliers(method))), value
 
-    def collect_parameters(*values):
-        return dict(zip(parameter_components, values))
-
     if not update_form:
-        gr.on(triggers=[method_component.input], fn=refresh_method, inputs=[method_component, value_component, parameters_component], outputs=[method_component, ratio_component, value_component, *parameter_rows.values(), *parameter_components.values(), parameters_component], show_progress="hidden")
+        gr.on(triggers=[method_component.input], fn=refresh_method, inputs=[method_component, value_component, context_component], outputs=[method_component, ratio_component, value_component], show_progress="hidden")
         gr.on(triggers=[ratio_component.input], fn=refresh_ratio, inputs=[method_component, ratio_component], outputs=[ratio_component, value_component], show_progress="hidden")
-        if parameter_components:
-            gr.on(triggers=[component.change for component in parameter_components.values()], fn=collect_parameters, inputs=list(parameter_components.values()), outputs=parameters_component, show_progress="hidden")
-    return {"value": value_component, "method": method_component, "ratio": ratio_component, "parameters": parameters_component, "help": help_component, "help_target_id": help_target_id or method_component.elem_id,
-            "parameter_components": parameter_components, "parameter_rows": parameter_rows, "extra_components": [help_component, *parameter_extras, parameters_component],
-            "media_outputs": [help_component, *parameter_rows.values(), *parameter_components.values(), parameters_component]}
+    return {"value": value_component, "method": method_component, "method_value": state["method"], "ratio": ratio_component, "help": help_component, "help_target_id": help_target_id or method_component.elem_id,
+            "extra_components": [help_component, context_component], "media_outputs": [help_component, context_component]}
 
 
 def query_postprocessing_upsampling_choices(include_name: bool = True, enabled_only: bool = False, image_outputs: bool | None = None, *, include_hidden: bool = False) -> list[tuple[str, str]]:

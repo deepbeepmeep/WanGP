@@ -2,7 +2,7 @@
     "model": {
         "name": "Hunyuan3D 2.1 Shape 3B",
         "architecture": "hunyuan3d_21_shape",
-        "description": "Tencent Hunyuan3D 2.1 shape model: one picture of an object to a 3D mesh (GLB, geometry only).",
+        "description": "Tencent Hunyuan3D 2.1 Shape: one picture of an object to a 3D mesh (GLB). Its presets add PBR textures (Hunyuan3D 2.1 Paint or SUPRA-Tex) and fine geometric detail (Hi3D) in the same generation.",
         "URLs": [
             "https://huggingface.co/DeepBeepMeep/3D/resolve/main/hunyuan3d_21_dit_fp16.safetensors",
             "https://huggingface.co/DeepBeepMeep/3D/resolve/main/hunyuan3d_21_dit_int8_convrot.safetensors"

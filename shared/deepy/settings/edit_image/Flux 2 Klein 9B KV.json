@@ -1,0 +1,15 @@
+{
+    "settings_version": 2.73,
+    "model_type": "flux2_klein_9b_kv",
+    "type": "Flux 2 Klein 9B KV",
+    "prompt_enhancer": "",
+    "prompt": "",
+    "multi_prompts_gen_type": "FG",
+    "image_mode": 1,
+    "resolution": "1024x1024",
+    "num_inference_steps": 4,
+    "guidance_scale": 1,
+    "batch_size": 1,
+    "video_prompt_type": "KI",
+    "remove_background_images_ref": 0
+}

@@ -1,0 +1,10 @@
+{
+  "name": "Three.js Scene",
+  "kind": "web",
+  "entry": "index.html",
+  "description": "",
+  "version": 1,
+  "controls": {"Drag": "orbit", "Wheel": "zoom", "Right drag": "pan"},
+  "canvas": "responsive",
+  "audio": false
+}

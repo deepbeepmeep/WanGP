@@ -60,13 +60,15 @@ def target_probabilities(logits, top_k, top_p, min_p, temperature):
     return probabilities, unsafe
 
 
-def apply_rules(logits, drafts, history, bias, suppressed, thinking_stops, thinking, penalty):
+def apply_rules(logits, drafts, history, bias, suppressed, thinking_stops, thinking, penalty, exempt=None):
     rows, vocab = logits.shape
     scores = logits.clone()
     if penalty != 1:
         seen = history.unsqueeze(0).expand(rows, -1).clone()
         for i in range(drafts.numel()):
             seen[i + 1:].scatter_(1, drafts[i:i + 1].expand(rows - i - 1, 1), True)
+        if exempt is not None:
+            seen &= ~exempt  # drafted tokens the sequence never penalizes (Sequence.repetition_exempt_ids)
         scores = torch.where(seen, torch.where(scores < 0, scores * penalty, scores / penalty), scores)
     scores.add_(bias)
     scores.masked_fill_(suppressed.unsqueeze(0), -torch.inf)

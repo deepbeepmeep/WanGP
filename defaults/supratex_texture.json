@@ -1,0 +1,25 @@
+{
+    "model": {
+        "name": "SUPRA-Tex Texturer 2.1B",
+        "architecture": "supratex_texture",
+        "description": "SUPRA-Tex paints an existing mesh with PBR textures (base colour, metallic, roughness) from one picture of the same object: the visible side keeps the picture's colours and print, the rest is completed in 3D. It reuses Qwen Image 2.1 7B to read the materials of the picture and takes under a minute on a fast GPU. The material stage is non-commercial (Qwen Research License).",
+        "URLs": [
+            "https://huggingface.co/DeepBeepMeep/3D/resolve/main/supratex_completion_bf16.safetensors",
+            "https://huggingface.co/DeepBeepMeep/3D/resolve/main/supratex_completion_int8_convrot.safetensors"
+        ],
+        "URLs2": [
+            "https://huggingface.co/DeepBeepMeep/Qwen_image_2/resolve/main/qwen_image_21_7B_bf16.safetensors",
+            "https://huggingface.co/DeepBeepMeep/Qwen_image_2/resolve/main/qwen_image_21_7B_int8_convrot.safetensors"
+        ]
+    },
+    "prompt": "Textured pitcher plant",
+    "image_mode": 1,
+    "video_prompt_type": "I",
+    "num_inference_steps": 25,
+    "batch_size": 1,
+    "seed": 42,
+    "custom_settings": {
+        "max_faces": 0,
+        "texture_size": 2048
+    }
+}

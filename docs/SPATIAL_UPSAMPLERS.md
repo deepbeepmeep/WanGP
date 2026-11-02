@@ -44,6 +44,18 @@ running those restored settings uses that version without changing the
 configuration preference. Existing `flashvsr` and `flashvsr2pass` settings mean
 FlashVSR v1.1; `flashvsrplus` and `flashvsrplus2pass` mean FlashVSR+ Turbo.
 
+## SeedVR2 Models
+
+SeedVR2 3B and SeedVR2 7B have separate selections, and
+**Configuration > Extensions > SeedVR2 > SeedVR2 Model** controls which one is
+normally shown (3B by default). The two trade appearance for fidelity: in the
+authors' comparisons 3B looks better on AI-generated and real-world video,
+while 7B stays closer to the source on degraded footage. 7B downloads as an
+INT8 file a little larger than 3B and runs slightly slower. **Extract Settings**
+restores the saved model even when the configuration hides it. Existing
+`seedvr2` settings mean SeedVR2 3B; `seedvr2_7b` means SeedVR2 7B. Media Flow's
+SeedVR2 processes use the configured model.
+
 ## Handler contract
 
 ```python
@@ -66,7 +78,7 @@ class MyUpsampler:
             "media_descriptions": {"video": "Uses overlapping windows."}, # optional media-specific help
             "method_descriptions": {"myup": "..."},       # optional per-method descriptions
             "method_parameters": {"myup": [{
-                "name": "spatial_upsampler_prompt",       # common prefix for UI parameters
+                "name": "prompt",                         # id in spatial_postprocessing_parameters
                 "setting": "prompt",                      # upscale() keyword
                 "type": "string",
                 "component": "textbox",
@@ -184,11 +196,20 @@ item.
 
 Each `method_parameters` entry is a list of dictionaries with at least `name`,
 `type`, `description`, and `required`. It may also define `default`, `enum`,
-`minimum`, `maximum`, and a runtime keyword override named `setting`. UI-exposed
-parameter names must use the shared `spatial_upsampler_` prefix. Method
-parameters travel in the generic `spatial_upsampler_parameters` task dictionary;
-they are not per-model settings and do not belong in `models/_settings.json`.
-Their defaults are owned by the descriptors. `ui` selects one or more UI
+`minimum`, `maximum`, and a runtime keyword override named `setting`. `name` is
+the parameter's id: its value travels under that id in the slot's dictionary,
+`spatial_postprocessing_parameters` (`temporal_postprocessing_parameters` for the
+temporal slot), like a model's `custom_settings`, and the UI shows it below the
+slot's selector (at most 2 sliders, 2 dropdowns and 1 text input per slot; a number
+is a slider). The two slots never share a value, whatever their ids. Selecting
+another processor resets the slot's values to its defaults, except the normalized
+ids, which keep one meaning for every processor declaring them: `prompt`, a text
+description of the content to process. Give an option its own id when its meaning
+differs from a normalized one (the LTX Detail Refiner's style prompt is
+`refine_prompt`, not H3's source description `prompt`). An `images` parameter
+(`type: "array"`, `media_type: "image"`) reads the reference images input shared by
+both slots, `postprocessing_reference_images`: the object image of the 3D refiner
+and the texturers is given once. Defaults are owned by the descriptors. `ui` selects one or more UI
 contexts: `postprocessing` means the normal generation-time Post Processing
 section, `late_postprocessing` means the Post Processing tab for an existing
 gallery item, and `media_flow` exposes scalar controls for the currently selected
@@ -196,26 +217,28 @@ Media Flow spatial process. A parameter can still be inferred and passed by
 WanGP when it is absent from a UI context; H3, for example, receives generation
 prompt/reference data without showing redundant controls during generation.
 
-The two persisted generic slider slots are `spatial_upsampler_param` and
-`spatial_upsampler_param2`. A refiner declares zero, one or both in its
-`method_parameters`, with its own labels, limits, steps and defaults. Unset slot
-values resolve to that method's defaults. Method selection updates the slider
-metadata and resets these slots to the newly selected method's defaults.
+The UI shows the parameters of the two selected processors (the spatial one's,
+then the temporal one's) in a fixed set of shared inputs, two per line: sliders,
+dropdowns, numbers, a textbox and one images field, their counts set by the
+constants of `postprocessing/parameter_ui.py`. Selecting a processor relabels
+these inputs and fills them from the dictionary or from the defaults. A processor
+that would need more inputs of one kind than the shared set holds is refused when
+it is selected, so raise the matching constant together with it.
 
 Use `label` for the short gallery label and optional `label_long` for a generation
 label with brief guidance. Declare `description` and optional `method_descriptions`
 on the processor so the UI can explain which choice suits the user's input.
 
-Supported generic UI components are `textbox`, `number`, `slider`, `dropdown`,
-`checkbox`, and `images`. Image parameters are rendered by
-`AdvancedMediaGallery`; set `multiple` to `True` for an ordered list or `False`
-for one image. Deepy receives only the call-relevant fields (`name`, `type`,
+Supported UI components are `textbox`, `number`, `slider`, `dropdown`, and
+`images`. The images field is rendered by `AdvancedMediaGallery` and accepts an
+ordered list (`multiple: True`). Deepy receives only the call-relevant fields (`name`, `type`,
 `description`, `required`, `default`, `enum`, `minimum`, `maximum`, and
 `media_type`), so UI/runtime fields such as `component`, `ui`, `label`, `step`,
 and `setting` do not consume assistant context. Parameters with `media_type:
-"image"` are resolved from media ids to paths. Each runtime value remains a flat
-entry in `spatial_upsampler_parameters`; dispatch filters it for the selected
-method and maps it to the `upscale()` keyword named by `setting`.
+"image"` are resolved from media ids to paths. Dispatch reads the selected method's
+parameters from `spatial_postprocessing_parameters` (an images parameter from the
+shared reference images) and maps each to the `upscale()`
+keyword named by `setting`.
 
 Registration is owned by `postprocessing/spatial_upsamplers.py`. Add the handler class path
 to `spatial_upsampler_handlers`:
@@ -230,13 +253,13 @@ spatial_upsampler_handlers = [
 it should not import or keep one explicit variable per spatial upsampler.
 
 For a minimal external handler, see the
-[Spatial Pixel Duplicate reference plugin](https://github.com/deepbeepmeep/wan2gp-pixel-upsampler).
+[Spatial Pixel Duplicate reference Plugin](https://github.com/deepbeepmeep/wan2gp-pixel-upsampler).
 It exposes `pixel*1` through `pixel*4` and supplies the description displayed by
 the Spatial Upsampling information button.
 
-Enabled plugins can expose upsamplers without editing core code by adding
+Enabled Plugins can expose upsamplers without editing core code by adding
 `spatial_upsampler_handlers` to `plugin_info.json`. Entries that start with `.`
-are relative to the plugin package root; entries without a leading `.` are
+are relative to the Plugin package root; entries without a leading `.` are
 absolute import paths:
 
 ```json
@@ -250,7 +273,7 @@ absolute import paths:
 }
 ```
 
-Only enabled/loaded plugins are considered. The plugin manager reuses its cached
+Only enabled/loaded Plugins are considered. The Plugin manager reuses its cached
 `plugin_info.json` metadata when registering those handlers, so the file is not
 parsed a second time for upsampler discovery.
 
@@ -258,7 +281,8 @@ Upsampler settings are stored under `wgp_config["spatial_upsamplers"][config_key
 Handlers can read old top-level keys during migration with `legacy_config()`, but
 those keys are deleted after the nested section is written.
 
-SeedVR2 stores `window_size` under `spatial_upsamplers.seedvr2`. `0` selects the
+SeedVR2 stores `model` (`3b` or `7b`) and `window_size` under
+`spatial_upsamplers.seedvr2`. For `window_size`, `0` selects the
 GPU-based automatic limit, `-1` disables windowing, and positive values are
 finite frame limits. SeedVR2 aligns finite limits down to its required `4n+1`
 input shape and crossfades three overlapping output frames.
@@ -276,7 +300,7 @@ stride-aligned windows (81 frames with a 17-frame overlap by default);
 overlapping windows address the same deterministic global noise and time
 coordinates. Both versions are shown in Post Processing and Late Postprocessing,
 and Media Flow keeps explicit processes for both versions. The Configuration
-plugin exposes only the shared LTX window size and overlap controls under
+Plugin exposes only the shared LTX window size and overlap controls under
 `spatial_upsamplers.ltx2`. Both values follow
 the VAE's `8n+1` frame cadence; window size ranges from 9 to 481 frames, with 81
 as the default. The values are read at the start of every native or Media Flow
@@ -357,9 +381,9 @@ offload_registry.unregister_offloadobj("MyUpsampler", offloadobj)  # in release_
 ```
 
 This lets WanGP track every extension offload object and release all extension
-resources centrally: the toolbar "Unload Models" tool (and the Configuration plugin
+resources centrally: the toolbar "Unload Models" tool (and the Configuration Plugin
 release button) calls `offload_registry.release_all()`.
 
 ---
 
-> Applies to: Developing spatial upsampler/refiner plugins: handlers, registration and shared configuration. Installed processing options are available through WanGP's post-processing controls and API.
+> Applies to: Developing spatial upsampler/refiner Plugins: handlers, registration and shared configuration. Installed processing options are available through WanGP's post-processing controls and API.

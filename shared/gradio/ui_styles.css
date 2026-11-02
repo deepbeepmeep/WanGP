@@ -64,7 +64,8 @@ gradio-app {
 }
 .wangp-settings-actions,
 .wangp-media-actions {
-    z-index: 20;
+    /* above Gradio's block titles (--layer-4), below popups and menus */
+    z-index: 45;
     flex: 0 0 auto !important;
     padding: 8px;
     box-sizing: border-box;
@@ -915,7 +916,7 @@ user-select: text;
 .wangp-settings-file-actions.is-compact > .wangp-settings-export::after { content: "Export"; font-size: var(--button-small-text-size); }
 .wangp-lora-download-row { flex-wrap: nowrap !important; align-items: center; gap: 8px !important; }
 .wangp-lora-download-row > .form { flex: 1 1 0 !important; min-width: 0 !important; }
-.wangp-lora-download-row .compact_text { padding: 0 !important; }
+.wangp-lora-download-row .compact_text { padding: 1px !important; }
 .wangp-lora-download-row textarea { padding: var(--button-small-padding) !important; font-size: var(--button-small-text-size) !important; line-height: var(--line-md); }
 .wangp-lora-download-row > button { flex: 0 0 auto !important; font-size: 0 !important; }
 /* Keep this action's literal caption instead of Gradio's translated label. */
@@ -924,3 +925,10 @@ user-select: text;
 .wangp-prompt-enhancer-row, .wangp-prompt-enhancer-row > .form { flex-wrap: nowrap !important; }
 .wangp-prompt-enhancer-row > .form { flex: 1 1 0 !important; min-width: 0 !important; }
 .wangp-prompt-enhancer-row > .btn_centered, .wangp-prompt-enhancer-row > .form > :is(.cbx_centered, .cbx_bottom) { flex: 0 0 auto !important; min-width: 0 !important; }
+
+/* Shared inputs of the post-processing parameters: two per line, whichever of them the selected processors show. */
+/* a post-processing slot: its selector and its processor's parameters, set apart from the other slot */
+div.wangp-postprocessing-slot, .postprocess div.wangp-postprocessing-slot { border: 1px solid var(--border-color-primary) !important; border-radius: var(--radius-lg) !important; margin-bottom: var(--spacing-lg) !important; }
+.wangp-postprocessing-parameters, .wangp-postprocessing-parameters > .form { flex-wrap: wrap !important; }
+.wangp-postprocessing-parameters > .form { flex: 1 1 100% !important; }
+.wangp-postprocessing-parameters .wangp-postprocessing-parameter { flex: 1 1 calc(50% - var(--layout-gap)) !important; min-width: calc(50% - var(--layout-gap)) !important; }

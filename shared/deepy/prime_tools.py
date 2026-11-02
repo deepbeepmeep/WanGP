@@ -512,7 +512,7 @@ class DeepyPrimeTools:
                         reported = time.monotonic()
                         text = str(live.get("status") or live.get("phase") or "Running")[:120]
                         self._update_tool_progress("running", text, {"status": "running", "job_id": job_id, "progress": {"done": round(float(live["progress"]), 1), "total": 100, "text": text}})
-                    if snapshot.get("webui_submission_ready") and not queue_triggered:
+                    if snapshot.get("webui_submission_ready") and not queue_triggered and not (cancel_requested or job.cancel_requested or self._is_interrupted()):  # a stopped job never reaches the queue
                         self.send_cmd("load_queue_trigger", {"job_id": job_id, "token": snapshot.get("webui_load_queue_token", "")})
                         queue_triggered = True
                         self._update_tool_progress("running", "Running", {"status": "running", "job_id": job_id})
@@ -574,6 +574,7 @@ class DeepyPrimeTools:
                 f"Default seed: {int(settings['seed'])}.",
             ])
             lines.append("Override compatible template/model defaults with the resolution, video_length, duration_seconds and seed above when the user does not specify them.")
+        lines.append("A supplied speech or song that must be heard whole sets video_length instead: its duration in seconds, such as \"10.2s\", which WanGP fits to the model's frame steps.")
         lines.append("The generate tool fills omitted dimensions, duration, and seed from Deepy's standing defaults before model factory defaults; pass the template values explicitly to preserve them.")
         return "\n".join(lines)
 
@@ -834,9 +835,24 @@ class DeepyPrimeTools:
         properties = parameters.get("properties", {})
         toolbox = "action" in properties and "arguments" in properties
         inner = arguments.get("arguments")
-        if toolbox and arguments.get("action") is None and isinstance(inner, dict) and isinstance(inner.get("action"), str) and set(inner) <= {"action", "arguments"}:
-            arguments.update(action=inner["action"], arguments=inner.get("arguments", {}))  # the whole call nested in arguments: unwrap it
+        if toolbox and isinstance(inner, dict) and inner.get("action") == arguments.get("action") is not None and set(inner) == {"action", "arguments"} and isinstance(inner["arguments"], dict):
+            arguments["arguments"] = inner = inner["arguments"]  # the whole call repeated inside arguments under the same action
+        if toolbox and arguments.get("action") is None and isinstance(inner, dict):
+            if set(arguments) == {"arguments"} and set(inner) & set(properties) - {"action", "arguments"} and set(inner) <= set(properties):
+                arguments.pop("arguments")  # the whole call nested in arguments with its other top-level parameters (wangp_plugins' plugin)
+                arguments.update(inner)
+                inner = arguments.get("arguments")
+            if isinstance(inner, dict) and set(inner) == {"arguments"} and isinstance(inner["arguments"], dict):
+                arguments["arguments"] = inner = inner["arguments"]  # arguments nested twice
+            if isinstance(inner, dict) and isinstance(inner.get("action"), str) and set(inner) <= {"action", "arguments"}:
+                arguments.update(action=inner["action"], arguments=inner.get("arguments", {}))  # the whole call nested in arguments: unwrap it
+            elif isinstance(inner, dict) and isinstance(inner.get("action"), str):
+                arguments["action"] = inner.pop("action")  # the action written among its own arguments
         unknown = set(arguments) - set(properties)
+        if set(properties) == {"action", "arguments"} and isinstance(arguments.get("arguments"), dict) and unknown and not unknown & set(arguments["arguments"]):
+            for name in unknown:  # action parameters written beside action and arguments, checked there by the action's schema (a flat call stays refused)
+                arguments["arguments"][name] = arguments.pop(name)
+            unknown = set()
         if not PRIME_ASYNC_ENABLED and tool_name in {"wangp_generate", "wangp_postprocess"}:
             unknown -= {"wait", "timeout_s", "event_limit"}
         unknown = sorted(unknown)
@@ -873,7 +889,13 @@ class DeepyPrimeTools:
                 hint = ' For rg, use {"action":"rg","arguments":{"command":"-n pattern -- @documents/file.txt"}}.' if tool_name == "wangp_io" and arguments.get("action") == "rg" else ""
                 return 'arguments must be an object: {"action":"<action>","arguments":{...}}.' + hint
             if not arguments.get("action") and nested:
-                return 'action belongs at the top level, beside arguments: {"action":"<action>","arguments":{...}}. Nothing was executed.'
+                if tool_name == "wangp_plugins":  # name the plugin's call as it should be written, with the caller's own plugin
+                    plugin = json.dumps(arguments.get("plugin") or "<plugin>")
+                    return (f'No action was named. Write the call flat, the action beside plugin and arguments: {{"plugin": {plugin}, "action": "<action>", "arguments": {{...}}}}; '
+                            f'{{"plugin": {plugin}}} alone lists its actions. Nothing was executed.')
+                likely = next((hint for key, hint in (("old_string", "edit"), ("text", "write_text (mode 'overwrite' replaces a file) or append_text"), ("command", "rg")) if key in nested), "")
+                return ('No action was named: write it at the top level, beside arguments: {"action":"<action>","arguments":{...}}' + (f"; with these arguments: {likely}" if likely and tool_name == "wangp_io" else "")
+                        + ". Nothing was executed.")
         for parameter_name in parameters.get("required", []) or []:
             if parameter_name not in arguments or arguments[parameter_name] is None:
                 return f"{parameter_name} is required."
@@ -916,6 +938,7 @@ class DeepyPrimeTools:
                 self._plugin_progress = None  # a new action starts its card's progress afresh
             result = self._call(tool_name, arguments)
             self._hint_script_loop(tool_name, arguments, result)
+            self._hint_repeated_failure(tool_name, arguments, result)
             return result
         arguments = dict(arguments)
         if tool_name == "wangp_web_search" and tool_name not in self._tool_defs_by_name:  # say why, or the model searches the docs for another way online
@@ -997,7 +1020,10 @@ class DeepyPrimeTools:
         return self.file_access_policy.virtualize_result(result)
 
     def _hint_script_loop(self, tool_name: str, arguments: dict[str, Any], result: dict[str, Any]) -> None:
-        """The model's fourth call in a row of one toolbox or file action says once that a Python script loops over the remaining items in one call."""
+        """The model's fourth successful call in a row of one toolbox or file action says once that a Python script loops over the remaining items in
+        one call. Failed calls do not count: retries of one call are not items of a batch."""
+        if isinstance(result, dict) and result.get("status") == "error":
+            return
         action = arguments.get("action") if isinstance(arguments.get("arguments"), dict) else None
         key = (tool_name, action)
         count = self._action_streak[1] + 1 if getattr(self, "_action_streak", (None, 0))[0] == key else 1
@@ -1005,6 +1031,17 @@ class DeepyPrimeTools:
         if count == 4 and action and tool_name in {"wangp_toolbox", "wangp_io"} and "wangp_python" in self._tool_defs_by_name and isinstance(result, dict):
             helper = "wangp.io" if tool_name == "wangp_io" else "wangp.toolbox"
             result["hint"] = (str(result.get("hint") or "") + f" Fourth {action} call in a row: for the remaining items, one wangp_python script can loop over them ({helper}({action!r}, ...) per item, wangp.progress) and return only the summary, instead of one call each.").strip()
+
+    def _hint_repeated_failure(self, tool_name: str, arguments: dict[str, Any], result: dict[str, Any]) -> None:
+        """A failed call identical to the previous failed one: smaller models copy their last call instead of changing it, so the result says so
+        and names what the call holds (a missing argument is then visible)."""
+        failed = isinstance(result, dict) and result.get("status") == "error"
+        signature = (tool_name, json.dumps(arguments, sort_keys=True, default=str)) if failed else None
+        repeated = failed and signature == getattr(self, "_last_failed_call", None)
+        self._last_failed_call = signature
+        if repeated:
+            sent = arguments["arguments"] if isinstance(arguments.get("arguments"), dict) else arguments
+            result["hint"] = (str(result.get("hint") or "") + f" This call is identical to your previous one, which failed the same way: change the call itself before retrying. It holds only {', '.join(sorted(sent)) or 'nothing'}.").strip()
 
     def _get_selected_media_record_from_source(self, source: str, requested_media_type: str = "all"):
         return None, None

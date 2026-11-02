@@ -1,4 +1,6 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
+from models import goals_3d
+
 from .prompts import (DA3_DEEPY_INFOS, DA3_INFOS, DEEPY_PROMPT_INFOS, MAPANYTHING_DEEPY_INFOS, MAPANYTHING_INFOS, MOGE2_DEEPY_INFOS, MOGE2_INFOS,
                       PROMPT_INFOS)
 from .settings import CUSTOM_SETTINGS, MOGE2_MODES
@@ -30,7 +32,7 @@ class family_handler:
 
     @staticmethod
     def query_family_infos():
-        return {"recon3d": (3030, "3D Reconstruction")}
+        return goals_3d.family_infos(goals_3d.RECONSTRUCTION)
 
     @staticmethod
     def get_lora_dir(base_model_type):
@@ -42,7 +44,9 @@ class family_handler:
         extra_model_def = {
             "image_outputs": True,
             "mesh_outputs": True,
+            "mesh_postprocessing": False,  # reconstructed scenes, point clouds and splats
             "device_explicit": True,
+            "no_model_swap": True,  # one managed model: kept loaded between samples and queued tasks of the same model
             "no_background_removal": True,
             "fit_into_canvas_image_refs": 0,
             "prompt_description": "Asset Name / Description (optional, used for file names)",

@@ -1,3 +1,4 @@
+import functools
 import glob
 import os
 import sys
@@ -6,7 +7,7 @@ import inspect
 import re
 import datetime
 from typing import Dict, Any, Optional, List, Union, Set
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import gradio as gr
 import traceback
 import subprocess
@@ -16,6 +17,8 @@ import stat
 import json
 from shared.utils.config_store import config_lock, write_config
 import requests
+from tqdm import tqdm
+from shared.utils.bundled_apps import migrate_featured_apps
 from shared.utils.wgp_config_migration import INSTALLED_REMOTE_PLUGINS_KEY, migrate_bundled_plugin_ids
 media_gen_label = "Media Generator"
 
@@ -33,6 +36,15 @@ PLUGIN_MODEL_PROFILES_KEY = "profiles"
 PENDING_DELETIONS_KEY = "pending_plugin_deletions"
 _DEEPY_TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _DEEPY_PRIME_RESERVED_TOOL_NAMES = {"mcp_resource"}
+
+_tabs_init = gr.Tabs.__init__
+
+@functools.wraps(_tabs_init)
+def _select_media_generator_by_former_id(self, *, selected=None, **kwargs):
+    # Plugins written before the Media Generator tab id became "media_gen" still select "video_gen".
+    _tabs_init(self, selected="media_gen" if selected == "video_gen" else selected, **kwargs)
+
+gr.Tabs.__init__ = _select_media_generator_by_former_id
 
 
 @dataclass
@@ -107,16 +119,42 @@ class PluginWebApp:
     path: str
     factory: callable  # factory() -> ASGI application, called once when the server starts
     plugin_id: str = ""
+    name: str = ""
+
+
+@dataclass(frozen=True)
+class PluginNavigation:
+    plugin_id: str
+    tab_id: str
+    path: str = ""
+    fullscreen: bool = False
+    config: dict | None = field(default=None, repr=False, compare=False)
+    name: str = ""
+
+    @property
+    def enabled(self):
+        return self.config is None or "enabled_plugins" not in self.config or self.plugin_id in SYSTEM_PLUGINS or self.plugin_id in self.config["enabled_plugins"]
+
+
+def plugin_navigation(plugin_id, plugin, config=None):
+    if not (plugin.app_url or plugin.fullscreen):
+        return None
+    tab_id = plugin.app_tab or next(iter(plugin.tabs), "")
+    if tab_id not in plugin.tabs:
+        raise ValueError(f"Plugin '{plugin_id}' must declare a tab matching app_tab to support navigation.")
+    path = plugin.app_url or f"/plugins/{plugin_id}"
+    return PluginNavigation(plugin_id, f"plugin_{tab_id}", path, plugin.fullscreen, config, plugin.name)
 
 
 _ACTIVE_DEEPY_PRIME_TOOLS: Dict[str, PluginDeepyTool] = {}
 _ACTIVE_DEEPY_ZERO_TOOLS: Dict[str, PluginDeepyTool] = {}
 _ACTIVE_DEEPY_TOOLBOXES: Dict[str, PluginDeepyToolbox] = {}
 _ACTIVE_WEB_APPS: Dict[str, PluginWebApp] = {}
+_ACTIVE_APP_NAVIGATION: Dict[str, PluginNavigation] = {}
 _ACTIVE_DEEPY_SKILLS: Dict[str, PluginDeepySkill] = {}
 _BUILTIN_SKILLS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "deepy", "skills")
 _WEB_APP_PATH_RE = re.compile(r"^/[a-z][a-z0-9_-]*$")
-_RESERVED_WEB_APP_PATHS = {"/deepy", "/deepy_api", "/gradio_api", "/file", "/assets", "/config", "/queue", "/upload", "/static", "/theme", "/login", "/logout", "/mcp"}
+_RESERVED_WEB_APP_PATHS = {"/apps", "/plugins", "/auth", "/deepy", "/deepy_api", "/gradio_api", "/file", "/assets", "/config", "/queue", "/upload", "/static", "/theme", "/login", "/logout", "/mcp"}
 
 
 def get_deepy_prime_plugin_tools() -> tuple[PluginDeepyTool, ...]:
@@ -136,12 +174,17 @@ def _reset_deepy_plugin_tools() -> None:
     _ACTIVE_DEEPY_ZERO_TOOLS.clear()
     _ACTIVE_DEEPY_TOOLBOXES.clear()
     _ACTIVE_WEB_APPS.clear()
+    _ACTIVE_APP_NAVIGATION.clear()
     _ACTIVE_DEEPY_SKILLS.clear()
 
 
 def get_plugin_web_apps() -> tuple[PluginWebApp, ...]:
     """Web applications of the enabled plugins, mounted by the WanGP server at their path."""
     return tuple(_ACTIVE_WEB_APPS.values())
+
+
+def get_plugin_navigation() -> tuple[PluginNavigation, ...]:
+    return tuple(_ACTIVE_APP_NAVIGATION.values())
 
 
 def get_deepy_plugin_skills() -> tuple[PluginDeepySkill, ...]:
@@ -357,9 +400,10 @@ def auto_install_and_enable_default_plugins(manager: 'PluginManager', wgp_global
 
 SYSTEM_PLUGINS = [
     "video_mask_creator",
-    "guides",
+    "models_manager",
     "configuration",
     "plugin_manager",
+    "guides",
     "about",
 ]
 BUNDLED_PLUGINS = {
@@ -383,6 +427,7 @@ class PluginTab:
     label: str
     component_constructor: callable
     position: int = -1
+    icon: str | None = None
 
 @dataclass
 class PluginModelExtension:
@@ -412,12 +457,15 @@ class WAN2GPPlugin:
         self._deepy_zero_tools: List[PluginDeepyTool] = []
         self._deepy_toolbox: PluginDeepyToolbox | None = None
         self._web_apps: List[PluginWebApp] = []
+        self.app_url = ""
+        self.app_tab = ""
+        self.fullscreen = False
 
     def setup_ui(self) -> None:
         pass
         
-    def add_tab(self, tab_id: str, label: str, component_constructor: callable, position: int = -1):
-        self.tabs[tab_id] = PluginTab(id=tab_id, label=label, component_constructor=component_constructor, position=position)
+    def add_tab(self, tab_id: str, label: str, component_constructor: callable, position: int = -1, *, icon: str | None = None):
+        self.tabs[tab_id] = PluginTab(id=tab_id, label=label, component_constructor=component_constructor, position=position, icon=icon)
 
     def post_ui_setup(self, components: Dict[str, gr.components.Component]) -> Dict[gr.components.Component, Union[gr.update, Any]]:
         return {}
@@ -813,6 +861,22 @@ class PluginManager:
     def _invalidate_plugin_metadata_cache(self, plugin_path: str) -> None:
         self._plugin_metadata_cache.pop(os.path.join(plugin_path, PLUGIN_METADATA_FILENAME), None)
 
+    def _normalize_discovery_metadata(self, metadata):
+        if "app_url" in metadata:
+            path = str(metadata["app_url"] or "").strip().rstrip("/")
+            if path and (not _WEB_APP_PATH_RE.fullmatch(path) or path in _RESERVED_WEB_APP_PATHS):
+                raise ValueError(f"Invalid Plugin app_url '{path}': use one lowercase path segment, not a WanGP route.")
+            metadata["app_url"] = path
+        if "app_tab" in metadata:
+            metadata["app_tab"] = str(metadata["app_tab"] or "").strip()
+        if "fullscreen" in metadata:
+            metadata["fullscreen"] = self._coerce_bool(metadata["fullscreen"], default=False)
+        if "important" in metadata:
+            metadata["important"] = self._coerce_bool(metadata["important"], default=False)
+        if "info_card" in metadata:
+            card = metadata["info_card"]
+            metadata["info_card"] = {key: card[key].strip() for key in ("tagline", "description", "details", "image", "image_alt") if isinstance(card, dict) and isinstance(card.get(key), str) and card[key].strip()}
+
     def _normalize_plugin_metadata(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         metadata = dict(payload)
         for key in ("name", "version", "description", "author", "date", "wan2gp_version", "url"):
@@ -828,6 +892,7 @@ class PluginManager:
             metadata["wan2gp_version"] = str(legacy_version).strip()
         metadata.pop("wangp_version", None)
         metadata["url"] = normalize_plugin_url(metadata.get("url", ""))
+        self._normalize_discovery_metadata(metadata)
         metadata["type"] = normalize_plugin_types(metadata.get("type"))
         metadata["uninstallable"] = self._coerce_bool(metadata.get("uninstallable"), default=True)
         metadata[PLUGIN_SPATIAL_UPSAMPLER_HANDLERS_KEY] = self._coerce_string_list(metadata.get(PLUGIN_SPATIAL_UPSAMPLER_HANDLERS_KEY))
@@ -849,7 +914,7 @@ class PluginManager:
             if is_system:
                 plugin.uninstallable = False
             return
-        for key in ("name", "version", "description", "author", "date", "wan2gp_version"):
+        for key in ("name", "version", "description", "author", "date", "wan2gp_version", "app_url", "app_tab", "fullscreen"):
             if key in metadata:
                 setattr(plugin, key, metadata.get(key))
         if "type" in metadata:
@@ -1025,6 +1090,7 @@ class PluginManager:
         if not _has_value(entry.get("wan2gp_version")) and _has_value(legacy_version):
             entry["wan2gp_version"] = str(legacy_version).strip()
         entry.pop("wangp_version", None)
+        self._normalize_discovery_metadata(entry)
         entry["type"] = normalize_plugin_types(entry.get("type"))
         return entry
 
@@ -1138,12 +1204,14 @@ class PluginManager:
         entry = {}
         for key in ("name", "author", "version", "description", "type", "date", "wan2gp_version", "url"):
             entry[key] = metadata.get(key, "")
+        entry.update({key: metadata[key] for key in ("important", "info_card", "app_url", "app_tab", "fullscreen") if key in metadata})
         return self._normalize_catalog_entry(entry)
 
     def _extract_catalog_metadata(self, entry: Dict[str, Any]) -> Dict[str, Any]:
         payload = {}
         for key in ("name", "author", "version", "description", "type", "url", "date", "wan2gp_version"):
             payload[key] = entry.get(key, "")
+        payload.update({key: entry[key] for key in ("important", "info_card", "app_url", "app_tab", "fullscreen") if key in entry})
         return self._normalize_catalog_entry(payload)
 
     def _find_catalog_entry(self, plugin_id: str, url: str = "", use_remote: bool = False) -> Optional[Dict[str, Any]]:
@@ -1363,6 +1431,7 @@ class PluginManager:
                 info['date'] = metadata.get('date', info['date'])
                 info['wan2gp_version'] = metadata.get('wan2gp_version', info['wan2gp_version'])
                 info['uninstallable'] = bool(metadata.get('uninstallable', info['uninstallable']))
+                info.update({key: metadata[key] for key in ('important', 'info_card', 'app_url', 'app_tab', 'fullscreen') if key in metadata})
             else:
                 try:
                     module = importlib.import_module(f"{dir_name}.plugin")
@@ -1628,8 +1697,12 @@ class PluginManager:
             skills.append(skill)
         _ACTIVE_DEEPY_SKILLS.update({skill.uri: skill for skill in skills})
 
-    @staticmethod
-    def _activate_plugin_deepy_tools(plugin_id: str, plugin: WAN2GPPlugin) -> None:
+    def _activate_plugin_deepy_tools(self, plugin_id: str, plugin: WAN2GPPlugin) -> None:
+        navigation = plugin_navigation(plugin_id, plugin, self.server_config)
+        for path in [*(web_app.path for web_app in plugin._web_apps), *([navigation.path] if navigation and navigation.path else [])]:
+            owner = next((entry.plugin_id for entry in (*_ACTIVE_APP_NAVIGATION.values(), *_ACTIVE_WEB_APPS.values()) if entry.path == path and entry.plugin_id != plugin_id), None)
+            if owner:
+                raise ValueError(f"Plugin URL '{path}' is already registered by '{owner}'.")
         prime_tools = [replace(definition, plugin_id=plugin_id) for definition in plugin._deepy_prime_tools]
         zero_tools = [replace(definition, plugin_id=plugin_id) for definition in plugin._deepy_zero_tools]
         registrations = [(definition, _ACTIVE_DEEPY_PRIME_TOOLS, "Deepy Prime") for definition in prime_tools]
@@ -1644,7 +1717,9 @@ class PluginManager:
             existing = _ACTIVE_WEB_APPS.get(web_app.path)
             if existing is not None:
                 raise ValueError(f"Plugin web app path '{web_app.path}' is already registered by plugin '{existing.plugin_id}'.")
-            _ACTIVE_WEB_APPS[web_app.path] = replace(web_app, plugin_id=plugin_id)
+            _ACTIVE_WEB_APPS[web_app.path] = replace(web_app, plugin_id=plugin_id, name=plugin.name)
+        if navigation:
+            _ACTIVE_APP_NAVIGATION[plugin_id] = navigation
         toolbox = plugin._deepy_toolbox
         if toolbox is None:
             return
@@ -1686,6 +1761,8 @@ class PluginManager:
                     self._register_plugin_spatial_upsamplers(plugin_dir_name, metadata, files_locator=files_locator)
                     self._register_plugin_temporal_upsamplers(plugin_dir_name, metadata, files_locator=files_locator)
                     self._register_plugin_audio_processors(plugin_dir_name, metadata, files_locator=files_locator)
+                    addon_type = " / ".join(kind.title() for kind in normalize_plugin_types(metadata.get("type")))
+                    tqdm.write(f"Loaded {addon_type}: {metadata.get('name') or plugin_dir_name} (from {plugin_dir_name})")
                     continue
 
                 module = importlib.import_module(f"{plugin_dir_name}.plugin")
@@ -1710,7 +1787,8 @@ class PluginManager:
                         self._register_plugin_temporal_upsamplers(plugin_dir_name, metadata, files_locator=files_locator)
                         self._register_plugin_audio_processors(plugin_dir_name, metadata, files_locator=files_locator)
                         if plugin_dir_name not in SYSTEM_PLUGINS:
-                            print(f"Loaded plugin: {plugin.name} (from {plugin_dir_name})")
+                            addon_type = " / ".join(kind.title() for kind in normalize_plugin_types(plugin.type))
+                            tqdm.write(f"Loaded {addon_type}: {plugin.name} (from {plugin_dir_name})")
                         break
             except Exception as e:
                 print(f"Error loading plugin from directory {plugin_dir_name}: {e}")
@@ -1868,6 +1946,7 @@ class WAN2GPApplication:
         self.plugin_manager.set_server_config(server_config, server_config_filename)
         if not safe_mode:
             migrate_bundled_plugin_ids(server_config, server_config_filename)
+            migrate_featured_apps(server_config, server_config_filename)
         if not safe_mode and not server_config.get("motion_designer_bundled_migrated", 0):
             server_config["enabled_plugins"] = server_config.get("enabled_plugins", []) + ([] if "motion_designer" in server_config.get("enabled_plugins", []) else ["motion_designer"]); server_config["motion_designer_bundled_migrated"] = 1
             self.plugin_manager._save_server_config()
@@ -1879,8 +1958,11 @@ class WAN2GPApplication:
         self.plugin_manager.inject_globals(wgp_globals)
 
     def setup_ui_tabs(self, main_tabs_component: gr.Tabs, state_component: gr.State, set_save_form_event):
+        from shared.gradio.app_bar import AppBar
+        self.app_bar = AppBar(self, main_tabs_component, state_component)
         self._create_plugin_tabs(main_tabs_component, state_component)
         self._setup_tab_events(main_tabs_component, state_component, set_save_form_event)
+        self.app_bar.bind()
     
     def _create_plugin_tabs(self, main_tabs, state):
         if not hasattr(self, 'plugin_manager'):
@@ -1891,6 +1973,8 @@ class WAN2GPApplication:
         system_order = {pid: idx for idx, pid in enumerate(SYSTEM_PLUGINS)}
 
         for plugin_id, plugin in loaded_plugins.items():
+            if plugin_id == "about":
+                continue  # The credits are the final page inside Infos.
             for tab_id, tab in plugin.tabs.items():
                 self.tab_to_plugin_map[tab.label] = plugin
                 tab_info = {
@@ -1923,8 +2007,13 @@ class WAN2GPApplication:
 
         for tab_info in all_tabs_to_render:
             with gr.Tab(tab_info['label'], id=f"plugin_{tab_info['id']}") as new_tab:
+                new_tab.elem_id = f"wangp-addon-tab-{new_tab._id}"
                 self.all_rendered_tabs.append(new_tab)
                 plugin = self.tab_to_plugin_map[new_tab.label]
+                navigation = plugin_navigation(tab_info['plugin_id'], plugin)
+                if navigation and navigation.tab_id == new_tab.id:
+                    from shared.utils.plugin_navigation import toolbar_html
+                    gr.HTML(toolbar_html(navigation, tab_info['label']), elem_classes="wangp-addon-controls", padding=False)
                 plugin.goto_media_tab = goto_media_tab
                 constructor = tab_info['component_constructor']
                 if self._component_constructor_accepts_api(constructor):
@@ -1954,64 +2043,34 @@ class WAN2GPApplication:
 
 
     def _setup_tab_events(self, main_tabs_component: gr.Tabs, state_component: gr.State, set_save_form_event):
-        if main_tabs_component and state_component:
-            main_tabs_component.select(
-                fn=self._handle_tab_selection,
-                inputs=[state_component],
-                outputs=None,
-                show_progress="hidden",
-            )
-
-
-            for tab in self.all_rendered_tabs:
-                # def test_tab(state_component, evt: gr.SelectData):
-                #     last_save_form = state_component.get("last_save_form", media_gen_label)
-                #     if last_save_form != media_gen_label :
-                #         state_component["ignore_save_form"] = True
-                #     else:
-                #         state_component["last_save_form"] = evt.value
-
-
+        # Native Tab.select fires for both user clicks and programmatic navigation.
+        for tab in main_tabs_component.children:
+            if not isinstance(tab, gr.Tab):
+                continue
+            event = tab.select(fn=self._handle_tab_selection, inputs=[state_component], outputs=None, show_progress="hidden")
+            if tab in self.all_rendered_tabs:
                 plugin = self.tab_to_plugin_map[tab.label]
-                # event = tab.select(fn=test_tab, inputs=[state_component])
-                # event = set_save_form_event(event.then)
-                event = set_save_form_event(tab.select)
-                event.then(
-                        fn=self._handle_one_tab_selection,
-                        inputs=[state_component, gr.State(tab.label)],
-                        outputs=plugin.on_tab_outputs if hasattr(plugin, "on_tab_outputs") else None,
-                        show_progress="hidden",
-                        trigger_mode="multiple",
-                    )
+                event = set_save_form_event(event.then)
+                event.then(fn=self._handle_one_tab_selection, inputs=[state_component, gr.State(tab.label)],
+                           outputs=plugin.on_tab_outputs if hasattr(plugin, "on_tab_outputs") else None,
+                           show_progress="hidden", trigger_mode="multiple")
 
-            
     def _handle_tab_selection(self, state: dict, evt: gr.SelectData):
-        if not hasattr(self, 'previous_tab_id'):
-            self.previous_tab_id = media_gen_label
-        
+        previous_tab_id = state.get("_active_plugin_tab", media_gen_label)
         new_tab_id = media_gen_label if evt is None else evt.value
         
-        if self.previous_tab_id == new_tab_id:
+        if previous_tab_id == new_tab_id:
             return
 
-        if self.previous_tab_id and self.previous_tab_id in self.tab_to_plugin_map:
-            plugin_to_deselect = self.tab_to_plugin_map[self.previous_tab_id]
+        if previous_tab_id and previous_tab_id in self.tab_to_plugin_map:
+            plugin_to_deselect = self.tab_to_plugin_map[previous_tab_id]
             try:
                 plugin_to_deselect.on_tab_deselect(state)
             except Exception as e:
                 print(f"[PluginManager] Error in on_tab_deselect for plugin {plugin_to_deselect.name}: {e}")
                 traceback.print_exc()
 
-        # if new_tab_id and new_tab_id in self.tab_to_plugin_map:
-            # plugin_to_select = self.tab_to_plugin_map[new_tab_id]
-            # if not hasattr(plugin_to_select, "on_tab_outputs"):
-            #     try:
-            #         plugin_to_select.on_tab_select(state)
-            #     except Exception as e:
-            #         print(f"[PluginManager] Error in on_tab_select for plugin {plugin_to_select.name}: {e}")
-            #         traceback.print_exc()
-
-        self.previous_tab_id = new_tab_id
+        state["_active_plugin_tab"] = new_tab_id
 
     def _handle_one_tab_selection(self, state: dict, new_tab_id): #, evt: gr.SelectData
         plugin_to_select = self.tab_to_plugin_map.get(new_tab_id, None)

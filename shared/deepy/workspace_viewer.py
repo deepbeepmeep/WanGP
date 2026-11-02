@@ -110,7 +110,7 @@ class WorkspaceViewer:
                 except OSError:
                     download = None
                 item = {'key': entry['key'], 'index': entry['index'], 'name': Path(path).name, 'kind': kind, 'visible': entry['index'] >= offset, 'url': download['url'] if download else None, 'size': download['size_bytes'] if download else None}
-                if download and kind in ('image', 'video', '3d'):
+                if download and kind in ('image', 'video', '3d', 'world', 'app'):
                     item['thumbnail'] = 'deepy_api/workspace_viewer/thumbnail?' + urlencode({'workspace': workspace, 'source': source, 'key': entry['key'], 'v': stamp})
                 items.append(item)
             record = self.service.workspaces.get(workspace)
@@ -158,6 +158,21 @@ class WorkspaceViewer:
     def thumbnail_path(self, workspace, source, key):
         with self.service._mutation_lock:
             return self._entry(workspace, source, key)['path']
+
+    def player(self, workspace, source, key):
+        from shared.gradio.strip_gallery import AppGallery, MeshGallery, WorldGallery, gradio_file_url
+
+        path = self.thumbnail_path(workspace, source, key)
+        kind = self.service.gallery._detect_media_type(path)
+        if kind == '3d':
+            html = MeshGallery.viewer_html(path, gradio_file_url(path))
+        elif kind == 'world':
+            html = WorldGallery.viewer_html(path)
+        elif kind == 'app':
+            html = AppGallery.viewer_html(path)
+        else:
+            raise ValueError('This media uses the browser media player.')
+        return {'html': html}
 
     def action(self, action, payload):
         service = self.service

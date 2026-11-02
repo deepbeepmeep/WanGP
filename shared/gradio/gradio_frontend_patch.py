@@ -150,39 +150,6 @@ function wangpSameProp(previous, next) {
 // runs no update cycle for it: Textbox reads layout before every update and
 // Slider rewrites its range input, both forcing a layout of the whole form.
 // Object values keep Gradio's handling: components react to their identity.
-// Gradio hands every event-stream message to its own setTimeout(0). Chrome
-// throttles those timers in a hidden tab (one per second, less after five
-// minutes), so a generation running while the page is away leaves a backlog
-// of intermediate outputs that replays, one flush each, when the tab returns.
-// Queue the messages instead and drain them in one task. An intermediate
-// process_generating output superseded by a later one in the same batch still
-// feeds the client's accumulated diff, but no longer reaches the components:
-// the page goes straight to the newest state. A foreground page has no
-// backlog, so every message is still applied as before.
-const wangpStreamQueues = new Map();
-let wangpStreamDrain = null;
-function wangpStreamEnqueue(id, handler, message) {
-    let queue = wangpStreamQueues.get(id);
-    if (!queue) wangpStreamQueues.set(id, queue = {handler, messages: []});
-    queue.handler = handler;
-    queue.messages.push(message);
-    if (wangpStreamDrain === null) wangpStreamDrain = setTimeout(wangpStreamFlush, 0);
-}
-function wangpStreamFlush() {
-    wangpStreamDrain = null;
-    const queues = [...wangpStreamQueues.values()];
-    wangpStreamQueues.clear();
-    for (const {handler, messages} of queues) {
-        for (let i = 0; i < messages.length; i++) {
-            const message = messages[i];
-            if (message.msg === "process_generating" && !message.output?.render_config) {
-                const next = messages.slice(i + 1).find(later => later.msg === "process_generating" || later.msg === "process_completed");
-                if (next?.msg === "process_generating") message.wangp_superseded = true;
-            }
-            handler(message);
-        }
-    }
-}
 function wangpSkipUpdate(node, update, next) {
     const prop = update.prop;
     // A label/visibility-only update clears the mark; a node whose mark is already
@@ -564,9 +531,11 @@ _PATCHES = {
         ('function Qo(e,o,t,r){', _UPDATE_SCHEDULER + 'function Qo(e,o,t,r){'),
         ('uv(q)', 'wangpScheduleUpdate(q)'),
         ('function lf(e,o={}){', 'function lf(e,o={}){' + _NATIVE_EVENT_STREAM),
-        ('let h=e[_];typeof window<"u"&&typeof document<"u"?setTimeout(h,0,u):h(u)', 'let h=e[_];typeof window<"u"&&typeof document<"u"?wangpStreamEnqueue(_,h,u):h(u)'),
-        ('(ae==="generating"||ae==="streaming")&&(i({type:"status",time:new Date,...oe,stage:oe?.stage,queue:!0,endpoint:w,fn_index:b}),Y&&g.connection!=="stream"&&["sse_v2","sse_v2.1","sse_v3"].includes(j)&&af(B,I,Y));Y&&(i({type:"data",time:new Date,data:Ee(Y.data,g,m.components,"output",G.with_null_state),endpoint:w,fn_index:b}),',
-         '(ae==="generating"||ae==="streaming")&&(Xe.wangp_superseded||i({type:"status",time:new Date,...oe,stage:oe?.stage,queue:!0,endpoint:w,fn_index:b}),Y&&g.connection!=="stream"&&["sse_v2","sse_v2.1","sse_v3"].includes(j)&&af(B,I,Y));Y&&!Xe.wangp_superseded&&(i({type:"data",time:new Date,data:Ee(Y.data,g,m.components,"output",G.with_null_state),endpoint:w,fn_index:b}),'),
+        # Deliver every partial output in its own task: gr.skip() must not erase
+        # an earlier queue/abort trigger, and consumers must read object updates
+        # before the next diff mutates them. Posted tasks avoid hidden-tab timer
+        # throttling while preserving Gradio's microtask boundaries.
+        ('let h=e[_];typeof window<"u"&&typeof document<"u"?setTimeout(h,0,u):h(u)', 'let h=e[_];typeof window<"u"&&typeof document<"u"?wangpScheduleUpdate(()=>h(u)):h(u)'),
         # Inspect only the actual gallery-view output, never unrelated text.
         # Its whole response must be discarded before an old index can paint.
         ('for(let g=0;g<ge.length;g++)for(let P=0;', 'for(let g=0;g<ge.length;g++){const view=ge[g].find(v=>v&&v.prop==="value"&&s[v.id]?.props.elem_id==="wangp-gallery-view");if(view&&window.WanGPGallerySelection?.acceptView(view.value)===false)continue;for(let P=0;'),

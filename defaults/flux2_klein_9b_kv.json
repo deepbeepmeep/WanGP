@@ -1,0 +1,17 @@
+{
+    "model": {
+        "name": "Flux 2 Klein 9B KV",
+        "architecture": "flux2_klein_9b_kv",
+        "accelerated": "native",
+        "description": "Generate images from text or edit with one or more reference images in four steps. This 9B variant reuses reference information for faster editing, especially with several images; text-only generation does not benefit from the reference cache.",
+        "URLs": [
+            "https://huggingface.co/DeepBeepMeep/Flux2/resolve/main/flux-2-klein-9b-kv_bf16.safetensors",
+            "https://huggingface.co/DeepBeepMeep/Flux2/resolve/main/flux-2-klein-9b-kv_int8_convrot.safetensors"
+        ]
+    },
+    "prompt": "A glass greenhouse filled with lush tropical plants, misty air, and dappled morning light, architectural photography.",
+    "resolution": "1024x1024",
+    "num_inference_steps": 4,
+    "guidance_scale": 1,
+    "prompt_enhancer": ""
+}

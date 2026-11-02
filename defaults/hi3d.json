@@ -1,0 +1,25 @@
+{
+    "model": {
+        "name": "Hi3D v1.0 Mesh Refiner 2x1.8B",
+        "architecture": "hi3d",
+        "description": "Hi3D v1.0 turns a coarse 3D mesh and a picture of the same object into a detailed, closed mesh (GLB, geometry only), at 512, 1024 or 1536 surface detail. Use it after Hunyuan3D 2.1 Shape, TripoSG or TRELLIS.2; it keeps their overall shape and adds fine relief, and 1024 takes a few minutes on a fast GPU.",
+        "URLs": [
+            "https://huggingface.co/DeepBeepMeep/3D/resolve/main/hi3d_transformer_512_bf16.safetensors",
+            "https://huggingface.co/DeepBeepMeep/3D/resolve/main/hi3d_transformer_512_int8_convrot.safetensors"
+        ],
+        "URLs2": [
+            "https://huggingface.co/DeepBeepMeep/3D/resolve/main/hi3d_transformer_1024_bf16.safetensors",
+            "https://huggingface.co/DeepBeepMeep/3D/resolve/main/hi3d_transformer_1024_int8_convrot.safetensors"
+        ]
+    },
+    "prompt": "Refined armchair",
+    "image_mode": 1,
+    "video_prompt_type": "I",
+    "num_inference_steps": 25,
+    "batch_size": 1,
+    "seed": 0,
+    "custom_settings": {
+        "level": 1024,
+        "max_faces": 0
+    }
+}

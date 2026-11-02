@@ -8,7 +8,9 @@ gallery source id (`<id>_gallery_html`, `<id>_gallery_state_paths`, ...), so eac
 import html
 import json
 import os
+import re
 import uuid
+import zipfile
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
@@ -16,7 +18,7 @@ from urllib.parse import quote
 
 import gradio as gr
 
-from shared.utils.gallery_sources import AUDIO, MESH, WORLD
+from shared.utils.gallery_sources import APP, AUDIO, MESH, WORLD
 
 SHOW_THUMBNAIL_DATES = False  # True: the 3D and World thumbnails also show their date and time (Audio thumbnails always do: no image)
 
@@ -72,6 +74,13 @@ class StripGallery:
     def _player_value(self, path):
         return path
 
+    def _create_details(self, path):
+        """Components under the player that follow the selection (none by default)."""
+        return []
+
+    def _details_value(self, path):
+        return []
+
     def _thumbnail_body(self, info):
         raise NotImplementedError
 
@@ -85,7 +94,7 @@ class StripGallery:
     @staticmethod
     def get_javascript():
         """JavaScript for Blocks(js=...): the strip plumbing of every strip gallery, then each gallery's own script."""
-        ids = json.dumps(list(STRIP_GALLERY_CLASSES))
+        ids = json.dumps(list(STRIP_GALLERY_CLASSES))  # the Apps tab too: App Development can be turned on without reloading the page
         return StripGallery._javascript.replace("__STRIP_GALLERY_IDS__", ids) + "".join(gallery._own_javascript for gallery in STRIP_GALLERY_CLASSES.values())
 
     _own_javascript = ""
@@ -298,6 +307,7 @@ for (const id of __STRIP_GALLERY_IDS__) SG.whenElement('#' + id + '_gallery_html
             default_path = infos[selected_index]["path"] if infos and 0 <= selected_index < len(infos) else (infos[0]["path"] if infos else None)
             with gr.Column(elem_classes=["strip-player-wrapper", f"{self.source.id}-player-wrapper"]):
                 self.player = self._create_player(default_path)
+            self.details = self._create_details(default_path)
 
             # The thumbnails strip; its id is the stable anchor of the MutationObserver
             self.gallery_html = gr.HTML(value=self._create_gallery_html(infos, selected_index), elem_id=self.element_id("html"), elem_classes="strip-gallery-root")
@@ -308,9 +318,9 @@ for (const id of __STRIP_GALLERY_IDS__) SG.whenElement('#' + id + '_gallery_html
             # Hidden textbox and button capturing thumbnail clicks
             self.click_data = gr.Textbox(value="", visible=False, elem_id=self.element_id("click_data"))
             self.click_trigger = gr.Button(visible=False, elem_id=self.element_id("click_trigger"))
-            self.click_trigger.click(fn=self._select, inputs=[self.click_data, self.state_paths, self.state_selected], outputs=[self.player, self.gallery_html, self.state_paths, self.state_selected, self.click_data], show_progress="hidden")
+            self.click_trigger.click(fn=self._select, inputs=[self.click_data, self.state_paths, self.state_selected], outputs=[self.player, *self.details, self.gallery_html, self.state_paths, self.state_selected, self.click_data], show_progress="hidden")
             # Programmatic updates
-            self.refresh_trigger.change(fn=self._refresh_gallery, inputs=[self.refresh_trigger, self.state_paths, self.state_selected], outputs=[self.player, self.gallery_html, self.state_selected], show_progress="hidden")
+            self.refresh_trigger.change(fn=self._refresh_gallery, inputs=[self.refresh_trigger, self.state_paths, self.state_selected], outputs=[self.player, *self.details, self.gallery_html, self.state_selected], show_progress="hidden")
 
     def _select(self, click_value, paths_json, current_selected):
         """Handle a thumbnail selection (manual)."""
@@ -320,20 +330,24 @@ for (const id of __STRIP_GALLERY_IDS__) SG.whenElement('#' + id + '_gallery_html
             paths = json.loads(paths_json) if paths_json else []
             infos = self._process_paths(paths)
             if not infos:
-                return self._player_value(None), self._create_gallery_html([], 0), paths_json, -1, ""
+                return *self._player_updates(None), self._create_gallery_html([], 0), paths_json, -1, ""
             new_index = int(click_value)
             if 0 <= new_index < len(infos):
                 selected_path = infos[new_index]["path"]
                 if not os.path.exists(selected_path):
                     selected_path = None
-                return self._player_value(selected_path), self._create_gallery_html(infos, new_index), paths_json, new_index, ""
+                return *self._player_updates(selected_path), self._create_gallery_html(infos, new_index), paths_json, new_index, ""
         except Exception:
             pass
         return self._render_from_state(paths_json, current_selected)
 
     def _refresh_gallery(self, refresh_id, paths_json, selected_idx):
-        rendered = self._render_from_state(paths_json, selected_idx)
-        return rendered[0], rendered[1], rendered[3]
+        *players, gallery_html, _paths_json, selected_idx, _click_data = self._render_from_state(paths_json, selected_idx)
+        return *players, gallery_html, selected_idx
+
+    def _player_updates(self, path):
+        """The player's value and the details under it."""
+        return self._player_value(path), *self._details_value(path)
 
     @classmethod
     def _get_cached_creation_datetime(cls, path):
@@ -410,6 +424,61 @@ for (const id of __STRIP_GALLERY_IDS__) SG.whenElement('#' + id + '_gallery_html
             .strip-player-wrapper {{ margin-bottom: 0 !important; padding-bottom: 0 !important; }}
             .audio-player-wrapper {{ min-height: 200px; max-height: 200px; overflow: hidden; }}
             .audio-player-wrapper .audio {{ height: 100% !important; margin-bottom: 0 !important; }}
+            .strip-transcript {{
+                display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border: 1px solid var(--studio-border); border-radius: 8px;
+                background: var(--studio-surface); color: var(--body-text-color);
+            }}
+            .strip-transcript .strip-transcript-bar {{ display: flex; align-items: center; gap: 6px; }}
+            .strip-transcript .strip-transcript-title {{ margin-right: auto; font-weight: 600; }}
+            .strip-transcript .strip-transcript-bar .strip-transcript-button {{  /* outranks Gradio's .prose a */
+                padding: 2px 10px; border-radius: 6px; border: 1px solid var(--studio-border); background: var(--studio-input); color: var(--body-text-color);
+                font-size: 13px; line-height: 20px; text-decoration: none; cursor: pointer;
+            }}
+            .strip-transcript .strip-transcript-bar .strip-transcript-button:hover {{ border-color: var(--studio-accent); }}
+            .strip-transcript .strip-transcript-lines {{ max-height: 220px; overflow-y: auto; font-size: 14px; line-height: 1.45; }}
+            .strip-transcript .strip-transcript-line {{ display: flex; gap: 10px; padding: 2px 4px; border-radius: 4px; }}
+            .strip-transcript .strip-transcript-line[data-start] {{ cursor: pointer; }}
+            .strip-transcript .strip-transcript-line[data-start]:hover {{ background: var(--studio-soft); }}
+            .strip-transcript .strip-transcript-time {{ flex-shrink: 0; min-width: 42px; color: var(--studio-accent); font-variant-numeric: tabular-nums; }}
+            .strip-transcript .strip-transcript-line.selected {{ background: var(--studio-soft); }}
+            .strip-transcript b[style] {{ color: var(--speaker); }}
+            /* the text or the timeline: the page's view, kept across selections (:root data-transcript-view) */
+            .strip-transcript .strip-transcript-timeline {{ display: none; flex-direction: column; gap: 4px; }}
+            :root[data-transcript-view="timeline"] .strip-transcript.has-timeline .strip-transcript-lines {{ display: none; }}
+            :root[data-transcript-view="timeline"] .strip-transcript.has-timeline .strip-transcript-timeline {{ display: flex; }}
+            .strip-transcript .strip-transcript-bar .strip-transcript-icon {{
+                display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 26px; padding: 0; border-radius: 6px;
+                border: 1px solid var(--studio-border); background: var(--studio-input); color: var(--body-text-color); cursor: pointer;
+            }}
+            .strip-transcript .strip-transcript-bar .strip-transcript-icon:hover {{ border-color: var(--studio-accent); }}
+            .strip-transcript .strip-transcript-switch {{ display: inline-flex; }}
+            .strip-transcript .strip-transcript-bar .strip-transcript-switch .strip-transcript-icon:first-child {{ border-radius: 6px 0 0 6px; }}
+            .strip-transcript .strip-transcript-bar .strip-transcript-switch .strip-transcript-icon:last-child {{ border-radius: 0 6px 6px 0; border-left: 0; }}
+            :root:not([data-transcript-view="timeline"]) .strip-transcript .strip-transcript-bar .strip-transcript-switch [data-view="text"],
+            :root[data-transcript-view="timeline"] .strip-transcript .strip-transcript-bar .strip-transcript-switch [data-view="timeline"] {{
+                background: var(--studio-accent); border-color: var(--studio-accent); color: var(--button-primary-text-color, #fff);
+            }}
+            .strip-transcript .strip-transcript-copy .icon-done, .strip-transcript .strip-transcript-copy .icon-failed,
+            .strip-transcript .strip-transcript-copy.copied .icon-copy, .strip-transcript .strip-transcript-copy.failed .icon-copy {{ display: none; }}
+            .strip-transcript .strip-transcript-copy.copied .icon-done, .strip-transcript .strip-transcript-copy.failed .icon-failed {{ display: inline; }}
+            .strip-transcript .strip-transcript-lane, .strip-transcript .strip-transcript-axis {{ display: flex; align-items: center; gap: 8px; }}
+            .strip-transcript .strip-transcript-speaker {{
+                flex: 0 0 84px; font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--speaker, var(--body-text-color));
+            }}
+            .strip-transcript .strip-transcript-track {{ position: relative; flex: 1; height: 20px; border-radius: 4px; background: var(--studio-input); }}
+            .strip-transcript .strip-transcript-segment {{
+                position: absolute; top: 3px; bottom: 3px; min-width: 3px; border-radius: 3px; background: var(--speaker, var(--studio-accent)); opacity: 0.7; cursor: pointer;
+            }}
+            .strip-transcript .strip-transcript-segment:hover, .strip-transcript .strip-transcript-segment.selected {{ opacity: 1; outline: 2px solid var(--body-text-color); z-index: 1; }}
+            .strip-transcript .strip-transcript-axis > div {{
+                flex: 1; display: flex; justify-content: space-between; font-size: 11px; color: var(--body-text-color-subdued); font-variant-numeric: tabular-nums;
+            }}
+            .strip-transcript .strip-transcript-selection {{
+                min-height: 44px; max-height: 120px; overflow-y: auto; margin-top: 4px; padding: 4px 6px; border-radius: 6px; background: var(--studio-input);
+                font-size: 14px; line-height: 1.45; color: var(--body-text-color-subdued);
+            }}
+            .strip-transcript .strip-transcript-selection:empty::before {{ content: attr(data-empty); }}
+            .strip-transcript .strip-transcript-selection .strip-transcript-line {{ color: var(--body-text-color); }}
             .strip-gallery-container .selected-filename {{
                 padding: 4px 12px; background: var(--bg-selected-filename); border-radius: 4px; font-size: 14px; font-weight: 500;
                 margin: 0 0 8px 0; text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-primary);
@@ -437,6 +506,9 @@ for (const id of __STRIP_GALLERY_IDS__) SG.whenElement('#' + id + '_gallery_html
             .mesh-thumbnail {{ padding: 6px; }}
             .mesh-thumbnail .thumbnail-time {{ font-size: 11px; line-height: 1.2; text-align: center; white-space: nowrap; }}
             .mesh-thumbnail .thumbnail-detail {{ margin-top: 0; font-size: 10.5px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }}
+            .app-thumbnail {{ padding: 6px; }}
+            .app-thumbnail .thumbnail-detail {{ margin-top: 0; max-width: 100%; font-size: 10.5px; line-height: 1.25; text-align: center; white-space: normal; overflow-wrap: anywhere;
+                display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }}  /* the app's name on up to two lines */
             @keyframes wangp-mesh-ready {{ from {{ opacity: .99; }} to {{ opacity: 1; }} }}
             .mesh-viewer {{ display: block; position: relative; border-radius: 8px; background: var(--studio-input); }}
             wangp-mesh-viewer {{ animation: wangp-mesh-ready 1ms; }}
@@ -471,7 +543,7 @@ for (const id of __STRIP_GALLERY_IDS__) SG.whenElement('#' + id + '_gallery_html
             .mesh-snapshot-popup button:hover, .mesh-snapshot-popup button[data-snapshot="add"] {{ border-color: var(--studio-accent); }}
             .mesh-snapshot-popup button:disabled {{ cursor: progress; opacity: 0.5; }}
             .mesh-viewer-fallback {{ height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 12px; box-sizing: border-box; }}
-            .world-viewer {{ position: relative; border-radius: 8px; background: #000; overflow: hidden; }}
+            .world-viewer {{ display: block; position: relative; border-radius: 8px; background: #000; overflow: hidden; }}
             .world-viewer-empty {{ background: var(--studio-input); }}
             .world-viewer .world-video {{ position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; }}
             .world-viewer .world-video.world-buffer {{ visibility: hidden; }}  /* the next clip, loading */
@@ -575,7 +647,7 @@ for (const id of __STRIP_GALLERY_IDS__) SG.whenElement('#' + id + '_gallery_html
         selected_path = infos[local_index]['path'] if 0 <= local_index < len(infos) else None
         if selected_path and not os.path.exists(selected_path):
             selected_path = None
-        return self._player_value(selected_path), self._create_gallery_html(infos, local_index, offset), paths_json, selected_idx, ''
+        return *self._player_updates(selected_path), self._create_gallery_html(infos, local_index, offset), paths_json, selected_idx, ''
 
 
 class AudioGallery(StripGallery):
@@ -595,28 +667,168 @@ class AudioGallery(StripGallery):
     def _extra_file_info(self, path):
         return {"duration": self._get_audio_duration(path)}
 
+    _own_javascript = r"""
+// ===== AudioGallery: the transcript under the player =====
+if (!SG.transcriptInit) {
+  // The view (text or timeline) is the page's: it stays when another recording is selected, and is remembered by the browser
+  try { const view = localStorage.getItem('wangp-transcript-view'); if (view) document.documentElement.dataset.transcriptView = view; } catch (_) {}
+  document.addEventListener('click', function (e) {
+    const panel = e.target.closest && e.target.closest('.strip-transcript');
+    if (!panel) return;
+    const copy = e.target.closest('.strip-transcript-copy');
+    if (copy) {  // the clipboard icon turns into a check mark (or a cross when the browser refuses)
+      const done = (state) => { copy.classList.add(state); setTimeout(() => copy.classList.remove(state), 1200); };
+      if (!navigator.clipboard) { done('failed'); return; }
+      navigator.clipboard.writeText(panel.querySelector('.strip-transcript-source').value).then(() => done('copied'), () => done('failed'));
+      return;
+    }
+    const view = e.target.closest('.strip-transcript-switch [data-view]');
+    if (view) {
+      document.documentElement.dataset.transcriptView = view.dataset.view;
+      try { localStorage.setItem('wangp-transcript-view', view.dataset.view); } catch (_) {}
+      return;
+    }
+    // A timed line or a timeline segment: shown below the timeline, and the player moves to its start; a click beside them unselects
+    const item = e.target.closest('.strip-transcript-line[data-start], .strip-transcript-segment');
+    if (!item && e.target.closest('a, button')) return;
+    const selection = panel.querySelector('.strip-transcript-selection');
+    panel.querySelectorAll('.selected').forEach((el) => el.classList.remove('selected'));
+    if (!item) {
+      if (selection) selection.replaceChildren();
+      return;
+    }
+    const row = panel.querySelector('.strip-transcript-lines .strip-transcript-line[data-index="' + item.dataset.index + '"]');
+    if (selection) selection.innerHTML = row.outerHTML;
+    for (const el of [row, panel.querySelector('.strip-transcript-segment[data-index="' + item.dataset.index + '"]')]) if (el) el.classList.add('selected');
+    SG.seekAudio(panel, Number(item.dataset.start) / Number(panel.dataset.duration));
+  });
+  SG.transcriptInit = true;
+}
+// The waveform player keeps its audio element out of the page: it seeks where its waveform is clicked
+SG.seekAudio = function (panel, fraction) {
+  const gallery = panel.closest('.column');  // the gallery's column: its player is beside the transcript (each tab has its galleries)
+  const host = [...gallery.querySelectorAll('.audio-player-wrapper #waveform > div')].find((el) => el.shadowRoot);
+  const wave = host && host.shadowRoot.querySelector('[part="wrapper"]');
+  if (!wave) return;
+  const r = wave.getBoundingClientRect();
+  wave.dispatchEvent(new MouseEvent('click', { clientX: r.left + r.width * Math.min(Math.max(fraction, 0), 1), clientY: r.top + r.height / 2, bubbles: true }));
+};
+"""
+
+    def _create_details(self, path):
+        transcript = self._transcript_html(path)
+        return [gr.HTML(value=transcript, visible=bool(transcript), elem_id=self.element_id("transcript"), elem_classes="strip-transcript-root")]
+
+    def _details_value(self, path):
+        transcript = self._transcript_html(path)
+        return [gr.update(value=transcript, visible=bool(transcript))]
+
+    _timed_line = re.compile(r"\[(\d+):(\d\d):(\d\d(?:\.\d+)?) - (\d+):(\d\d):(\d\d(?:\.\d+)?)\]\s*(.*)")  # a "[start - end] text" line of a transcript
+    _speaker_hues = (210, 25, 140, 280, 350, 50, 180, 320)
+
+    _text_icon = '<path d="M4 6h16M4 12h16M4 18h10"/>'
+    _timeline_icon = '<rect x="3" y="4" width="9" height="4" rx="1"/><rect x="12" y="10" width="9" height="4" rx="1"/><rect x="6" y="16" width="10" height="4" rx="1"/>'
+    _copy_icon = '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>'
+    _done_icon = '<path d="M20 6 9 17l-5-5"/>'
+    _failed_icon = '<path d="M18 6 6 18M6 6l12 12"/>'
+
+    @staticmethod
+    def _icon(drawing, classes=""):
+        return (f'<svg class="{classes}" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"'
+                f' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{drawing}</svg>')
+
+    @staticmethod
+    def _clock(seconds):
+        minutes, seconds = divmod(int(seconds), 60)
+        return f"{minutes // 60}:{minutes % 60:02}:{seconds:02}" if minutes >= 60 else f"{minutes}:{seconds:02}"
+
+    @staticmethod
+    def _speaker_names(path):
+        """The names that the recording's generation gave its speakers (custom setting speaker_names), in the order of Speaker 1, 2..."""
+        from shared.utils.audio_metadata import read_audio_metadata
+        from shared.utils.speech_dialogue import parse_speaker_names
+        try:
+            metadata = read_audio_metadata(path) or {}
+        except Exception:  # an imported file without readable WanGP metadata
+            return []
+        return parse_speaker_names((metadata.get("custom_settings") or {}).get("speaker_names") or "")
+
+    @classmethod
+    def _transcript_html(cls, path):
+        """The text a model saved beside the audio (its .txt side file), shown under the player as text or as a timeline with one lane per
+        speaker; a timed line or segment plays the recording from its start. "" without one."""
+        from shared.utils.side_files import saved_side_files
+        files = saved_side_files(path) if path is not None else {}
+        if ".txt" not in files:
+            return ""
+        text = files[".txt"].read_text(encoding="utf-8").strip()
+        duration = cls._audio_seconds(path)
+        names = cls._speaker_names(path)
+        labels = sorted({name for name in names if name}, key=len, reverse=True)  # the longest first: a name may begin with another one
+        speaker_line = re.compile("(" + "".join(re.escape(name) + "|" for name in labels) + r"Speaker \d+):\s*(.*)")
+        rows, lanes = [], {}
+        for index, line in enumerate(filter(None, (line.strip() for line in text.splitlines()))):
+            timed = cls._timed_line.fullmatch(line)
+            body = timed.group(7) if timed else line
+            speaker = speaker_line.fullmatch(body)
+            number = (names.index(speaker.group(1)) + 1 if speaker.group(1) in names else int(speaker.group(1)[len("Speaker "):])) if speaker else 0
+            color = f' style="--speaker: hsl({cls._speaker_hues[(number - 1) % len(cls._speaker_hues)]} 65% 50%)"' if speaker else ""
+            body = f"<b{color}>{html.escape(speaker.group(1))}:</b> {html.escape(speaker.group(2))}" if speaker else html.escape(body)
+            if timed is None:
+                rows.append(f'<div class="strip-transcript-line"><span>{body}</span></div>')
+                continue
+            start, end = (int(timed.group(i)) * 3600 + int(timed.group(i + 1)) * 60 + float(timed.group(i + 2)) for i in (1, 4))
+            rows.append(f'<div class="strip-transcript-line" data-index="{index}" data-start="{start:.2f}" title="Play from {cls._clock(start)}">'
+                        f'<span class="strip-transcript-time">{cls._clock(start)}</span><span>{body}</span></div>')
+            lane = lanes.setdefault(number, {"label": speaker.group(1) if speaker else "Speech", "color": color, "segments": []})
+            left, right = (100 * min(max(seconds, 0), duration) / duration for seconds in (start, end)) if duration > 0 else (0, 0)
+            lane["segments"].append(f'<div class="strip-transcript-segment" data-index="{index}" data-start="{start:.2f}" style="left: {left:.3f}%; width: {right - left:.3f}%"'
+                                    f' title="{cls._clock(start)} - {cls._clock(end)}"></div>')
+        timeline = ""
+        if lanes and duration > 0:  # one lane per speaker ("Speech" when the speakers are not labelled)
+            lanes_html = "".join(f'<div class="strip-transcript-lane"{lane["color"]}><span class="strip-transcript-speaker" title="{html.escape(lane["label"])}">{html.escape(lane["label"])}</span>'
+                                 f'<div class="strip-transcript-track">{"".join(lane["segments"])}</div></div>' for number, lane in sorted(lanes.items()))
+            ticks = "".join(f"<span>{cls._clock(duration * step / 4)}</span>" for step in range(5))
+            timeline = (f'<div class="strip-transcript-timeline">{lanes_html}<div class="strip-transcript-axis"><span class="strip-transcript-speaker"></span><div>{ticks}</div></div>'
+                        f'<div class="strip-transcript-selection" data-empty="Select a turn to read what was said."></div></div>')
+        view_switch = ('<span class="strip-transcript-switch" role="group" aria-label="View">'
+                       f'<button type="button" class="strip-transcript-icon" data-view="text" title="Text" aria-label="Text">{cls._icon(cls._text_icon)}</button>'
+                       f'<button type="button" class="strip-transcript-icon" data-view="timeline" title="Timeline of the Speakers" aria-label="Timeline">{cls._icon(cls._timeline_icon)}</button>'
+                       '</span>') if timeline else ""
+        copy_button = (f'<button type="button" class="strip-transcript-icon strip-transcript-copy" title="Copy to Clipboard" aria-label="Copy to Clipboard">'
+                       f'{cls._icon(cls._copy_icon, "icon-copy")}{cls._icon(cls._done_icon, "icon-done")}{cls._icon(cls._failed_icon, "icon-failed")}</button>')
+        downloads = "".join(f'<a class="strip-transcript-button" href="{html.escape(gradio_file_url(files[suffix]))}" download="{html.escape(files[suffix].name)}" title="Download">{suffix}</a>'
+                            for suffix in (".txt", ".srt") if suffix in files)
+        return (f'<div class="strip-transcript{" has-timeline" if timeline else ""}" data-duration="{duration:.3f}"><div class="strip-transcript-bar"><span class="strip-transcript-title">Transcript</span>'
+                f'{view_switch}{copy_button}{downloads}</div>'
+                f'<div class="strip-transcript-lines">{"".join(rows)}</div>{timeline}<textarea class="strip-transcript-source" hidden>{html.escape(text)}</textarea></div>')
+
     def _thumbnail_body(self, info):
         duration = "0:00" if info["deleted"] else info["duration"]
         return f'<div class="thumbnail-date">{info["date"]}</div><div class="thumbnail-time">{info["time"]}</div><div class="thumbnail-detail">{duration}</div>'
 
+    @staticmethod
+    def _audio_seconds(audio_path):
+        import contextlib
+        import wave
+        try:
+            with contextlib.closing(wave.open(audio_path, "r")) as f:
+                return f.getnframes() / float(f.getframerate())
+        except Exception:
+            pass
+        try:
+            from mutagen import File
+            audio = File(audio_path)
+            if audio and getattr(audio, "info", None):
+                return audio.info.length
+        except Exception:
+            pass
+        return os.path.getsize(audio_path) / 32000  # rough estimate from the file size
+
     def _get_audio_duration(self, audio_path):
         """Audio duration formatted as M:SS."""
         try:
-            import contextlib
-            import wave
-            try:
-                with contextlib.closing(wave.open(audio_path, "r")) as f:
-                    return self._format_duration(f.getnframes() / float(f.getframerate()))
-            except Exception:
-                pass
-            try:
-                from mutagen import File
-                audio = File(audio_path)
-                if audio and getattr(audio, "info", None):
-                    return self._format_duration(audio.info.length)
-            except Exception:
-                pass
-            return self._format_duration(os.path.getsize(audio_path) / 32000)  # rough estimate from the file size
+            return self._format_duration(self._audio_seconds(audio_path))
         except Exception:
             return "0:00"
 
@@ -703,7 +915,11 @@ window.__meshGalleryNS = window.__meshGalleryNS || {};
   const SPARK = VENDOR + 'spark/';
   MG.visible = element => {
     const box = element.getBoundingClientRect();
-    return !document.hidden && box.width > 0 && box.height > 0 && box.bottom > 0 && box.right > 0
+    const modal = document.querySelector('dialog[open]:focus-within') || [...document.querySelectorAll('dialog[open]')].at(-1);
+    const full = document.fullscreenElement;
+    return element.isConnected && !document.hidden && document.hasFocus() && (!modal || modal.contains(element))
+      && (!full || full.contains(element) || element.contains(full))
+      && box.width > 0 && box.height > 0 && box.bottom > 0 && box.right > 0
       && box.top < window.innerHeight && box.left < window.innerWidth && getComputedStyle(element).visibility !== 'hidden';
   };
   MG.webgl = function () {
@@ -716,8 +932,10 @@ window.__meshGalleryNS = window.__meshGalleryNS || {};
   };
   MG.load = function () {
     if (customElements.get('model-viewer')) return Promise.resolve();
-    const retry = MG.moduleAttempt ? '?retry=' + MG.moduleAttempt : '';
-    return MG.loading ||= import(VENDOR + 'model-viewer.min.js' + retry).catch(error => {
+    // The render lifecycle API and its bundle must update together, including
+    // browsers which have the former viewer cached from an earlier session.
+    const retry = MG.moduleAttempt ? '&retry=' + MG.moduleAttempt : '';
+    return MG.loading ||= import(VENDOR + 'model-viewer.min.js?v=wangp-demand-1' + retry).catch(error => {
       MG.loading = null; MG.moduleAttempt = (MG.moduleAttempt || 0) + 1; throw error;
     });
   };
@@ -726,8 +944,14 @@ window.__meshGalleryNS = window.__meshGalleryNS || {};
     async load() {
       const token = this.token = {};
       this.ready = this.inView = false;
-      const [THREE, {SparkRenderer, SplatMesh}, {OrbitControls}] = await Promise.all([import(SPARK + 'three.module.js'), import(SPARK + 'spark.module.min.js'), import(SPARK + 'OrbitControls.js')]);
+      const download = this.download = new AbortController();
+      const bytes = fetch(this.getAttribute('src'), {signal: download.signal}).then(response => {
+        if (!response.ok) throw new Error('Unable to Load the Splat Asset');
+        return response.arrayBuffer();
+      });
+      const [THREE, {SparkRenderer, SplatMesh}, {OrbitControls}, fileBytes] = await Promise.all([import(SPARK + 'three.module.js'), import(SPARK + 'spark.module.min.js?v=wangp-dispose-1'), import(SPARK + 'OrbitControls.js'), bytes]);
       if (this.token !== token) return;
+      this.download = null;
       const renderer = new THREE.WebGLRenderer({antialias: false, alpha: true});
       renderer.domElement.addEventListener('webglcontextlost', () => {
         if (this.token === token) this.dispatchEvent(new Event('error'));
@@ -745,7 +969,7 @@ window.__meshGalleryNS = window.__meshGalleryNS || {};
           renderer.render(scene, camera);
         });
       };
-      const splat = new SplatMesh({url: this.getAttribute('src')});
+      const splat = new SplatMesh({fileBytes: new Uint8Array(fileBytes), fileName: 'asset.ply'});
       const spark = new SparkRenderer({renderer, onDirty: requestRender});
       scene.add(spark, splat);
       this.state = {renderer, scene, camera, controls, splat, spark, requestRender};
@@ -760,7 +984,7 @@ window.__meshGalleryNS = window.__meshGalleryNS || {};
       };
       this.state.resize = resize;
       await splat.initialized;
-      if (this.token !== token) return;
+      if (this.token !== token) {splat.dispose(); return;}
       // Same 3/4 framing as the preview: the whole asset in view, seen from the front right and slightly above.
       const box = splat.getBoundingBox(true), center = box.getCenter(new THREE.Vector3()), radius = Math.max(box.getSize(new THREE.Vector3()).length() / 2, 1e-3);
       camera.position.copy(center).addScaledVector(new THREE.Vector3(0.55, 0.35, 0.75).normalize(), radius / Math.sin(THREE.MathUtils.degToRad(20)));
@@ -781,6 +1005,7 @@ window.__meshGalleryNS = window.__meshGalleryNS || {};
     }
     disconnectedCallback() {
       this.token = null;
+      this.download?.abort(); this.download = null;
       cancelAnimationFrame(this.renderFrame);
       this.renderFrame = 0;
       const state = this.state;
@@ -821,8 +1046,11 @@ window.__meshGalleryNS = window.__meshGalleryNS || {};
       this.mount = null;
       this.events?.abort();
       this.viewer?.pause?.();
+      this.viewer?.setRenderActive?.(false);
     }
     async start() {
+      if (!MG.visible(this)) {this.deferred = true; return;}
+      this.deferred = false;
       this.events?.abort();
       this.events = new AbortController();
       const viewer = this.viewer = this.querySelector('model-viewer, wangp-splat-viewer');
@@ -864,22 +1092,34 @@ window.__meshGalleryNS = window.__meshGalleryNS || {};
         if (!MG.webgl()) {fail('Interactive 3D Is Unavailable in This Browser. You Can Still Download the Asset.'); return;}
         if (viewer.localName === 'model-viewer') {
           await MG.load();
+          if (!this.isConnected || this.viewer !== viewer) return;
+          this.refresh();
           if (viewer.loaded) loaded();
         } else {
           await viewer.load();
           loaded();
         }
       } catch (error) {
+        if (!this.isConnected || this.viewer !== viewer) return;
         console.error('3D viewer', error);
         fail('Unable to Start the 3D Viewer. You Can Still Download the Asset.');
       }
     }
     refresh() {
+      const visible = MG.visible(this);
+      if (this.deferred && visible) {this.start(); return;}
       const viewer = this.viewer;
       if (!viewer) return;
-      if (viewer.localName === 'wangp-splat-viewer') viewer.refresh();
+      if (viewer.localName === 'wangp-splat-viewer') {
+        if (!visible) {
+          this.events?.abort();
+          viewer.replaceWith(viewer.cloneNode(false));
+          this.viewer = null; this.deferred = true;
+        } else viewer.refresh();
+      }
       else if (typeof viewer.pause === 'function') {
-        if (this.playing && MG.visible(this)) { if (viewer.paused) viewer.play(); }
+        viewer.setRenderActive(visible);
+        if (this.playing && visible) { if (viewer.paused) viewer.play(); }
         else if (!viewer.paused) viewer.pause();
       }
     }
@@ -897,6 +1137,9 @@ window.__meshGalleryNS = window.__meshGalleryNS || {};
   document.addEventListener('scroll', MG.refresh, {capture: true, passive: true});
   document.addEventListener('fullscreenchange', MG.refresh);
   document.addEventListener('visibilitychange', () => document.querySelectorAll('wangp-mesh-viewer').forEach(viewer => viewer.refresh()));
+  document.addEventListener('wangp-viewer-scope', () => document.querySelectorAll('wangp-mesh-viewer').forEach(viewer => viewer.refresh()));
+  window.addEventListener('blur', () => queueMicrotask(() => document.querySelectorAll('wangp-mesh-viewer').forEach(viewer => viewer.refresh())));
+  window.addEventListener('focus', MG.refresh);
   document.addEventListener('animationstart', event => {if (event.animationName === 'wangp-mesh-ready') MG.refresh();});
   document.addEventListener('click', MG.refresh);
   document.addEventListener('click', event => {
@@ -1010,9 +1253,10 @@ class WorldGallery(StripGallery):
     def _icon(cls, name):
         return f'<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{cls._icons[name]}</svg>'
 
-    def _view_button(self, action, label, title, icon):
+    @classmethod
+    def _view_button(cls, action, label, title, icon):
         """A button with the markup of Gradio's icon buttons (the image gallery's frame actions): the same look in every theme."""
-        drawing = self._icons[icon]
+        drawing = cls._icons[icon]
         return (f'<button type="button" aria-label="{label}" title="{title}" class="svelte-vzs2gq padded" data-world-action="{action}" '
                 f'style="color: var(--block-label-text-color); --bg-color: var(--block-background-fill);"><div class="svelte-vzs2gq small">'
                 f'<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" '
@@ -1054,22 +1298,26 @@ class WorldGallery(StripGallery):
     def _player_value(self, path):
         if path is None or not os.path.isfile(path):
             return f'<div class="world-viewer world-viewer-empty" style="height:{self.viewer_height}px"></div>'
-        video = self.video_path(path)
+        return self.viewer_html(path)
+
+    @classmethod
+    def viewer_html(cls, path):
+        video = cls.video_path(path)
         video_url = html.escape(gradio_file_url(video)) if os.path.isfile(video) else ""
         name = html.escape(Path(path).name)
-        manifest = self.read_manifest(path)
-        poster = f' poster="{self._poster(path)}"'
+        manifest = cls.read_manifest(path)
+        poster = f' poster="{cls._poster(path)}"'
         from shared.gradio.world_explorer import explorer_choices, explorer_menus, world_model_available
         if not world_model_available(manifest):  # its model was removed or disabled: the world's video plays, without the explorer
-            return f"""<div class="world-viewer" data-world="{html.escape(path)}" data-video="{video_url}" style="height:{self.viewer_height}px">
+            return f"""<wangp-world-viewer class="world-viewer" data-world="{html.escape(path)}" data-video="{video_url}" style="height:{cls.viewer_height}px">
 <video class="world-video" src="{video_url}"{poster} autoplay loop muted playsinline></video>
 <div class="world-viewer-actions" role="group" aria-label="World Actions">
 <div class="world-actions-row">
 <span class="world-unavailable">Its model ({html.escape(manifest["model_type"])}) is not available: this world can be watched, not explored</span>
-<a href="{html.escape(gradio_file_url(path))}" download="{name}" title="Download the World File" aria-label="Download {name}">{self._icon("download")}</a>
+<a href="{html.escape(gradio_file_url(path))}" download="{name}" title="Download the World File" aria-label="Download {name}">{cls._icon("download")}</a>
 </div>
 </div>
-</div>"""
+</wangp-world-viewer>"""
         menus = explorer_menus(manifest)  # the world model's own controls and menus
         chosen = explorer_choices(manifest, menus)  # those of the last exploration
         move_frames = {value: frames for value, _, frames in menus["seconds"]}
@@ -1085,23 +1333,23 @@ class WorldGallery(StripGallery):
         memory_items = "".join(f'<div role="option" data-value="{value}" aria-selected="{str(value == chosen["memory"]).lower()}">{moves(value)} ({video_seconds} s) · {needs}</div>'
                                for value, video_seconds, needs in menus["memory"])
         event_box = '<form class="world-event"><input type="text" placeholder="Type something that happens, then Enter" aria-label="World Event"></form>' if "event" in menus["controls"] else ""
-        return f"""<div class="world-viewer" data-world="{html.escape(path)}" data-video="{video_url}" data-controls="{html.escape(json.dumps(self._controls_layout(menus["controls"])))}" style="height:{self.viewer_height}px">
+        return f"""<wangp-world-viewer class="world-viewer" data-world="{html.escape(path)}" data-video="{video_url}" data-controls="{html.escape(json.dumps(cls._controls_layout(menus["controls"])))}" style="height:{cls.viewer_height}px">
 <video class="world-video" src="{video_url}"{poster} autoplay loop muted playsinline></video>
 <div class="world-hud" aria-live="polite"><span class="world-status"></span><span class="world-keys"></span></div>
 {event_box}
 <div class="world-help"></div>
 <div class="world-stats"></div>
-<div class="icon-button-wrapper svelte-9lsba8 world-view-actions no-border" role="group" aria-label="View Actions">{self._view_button("download-view", "Save Image", "Save Current View as PNG - Original Resolution, without the Controls", "save-view")}{self._view_button("snapshot", "Add View to Image Gallery", "Add Current View to Image Gallery, without the Controls", "add-view")}{self._view_button("record", "Record Video", "Record the World's Video and your Moves as a new Video of the Video Gallery", "record")}{self._view_button("replay", "Replay", "Replay the World's Video and your Moves - Space: Pause, Esc: Stop", "replay")}{self._view_button("save-world", "Save World", "Save the World as it is now, with your Moves, as a new World of the Worlds Gallery: Explore it later to resume from here", "save-world")}</div>
+<div class="icon-button-wrapper svelte-9lsba8 world-view-actions no-border" role="group" aria-label="View Actions">{cls._view_button("download-view", "Save Image", "Save Current View as PNG - Original Resolution, without the Controls", "save-view")}{cls._view_button("snapshot", "Add View to Image Gallery", "Add Current View to Image Gallery, without the Controls", "add-view")}{cls._view_button("record", "Record Video", "Record the World's Video and your Moves as a new Video of the Video Gallery", "record")}{cls._view_button("replay", "Replay", "Replay the World's Video and your Moves - Space: Pause, Esc: Stop", "replay")}{cls._view_button("save-world", "Save World", "Save the World as it is now, with your Moves, as a new World of the Worlds Gallery: Explore it later to resume from here", "save-world")}</div>
 <div class="world-viewer-actions" role="group" aria-label="World Actions">
 <div class="world-actions-row">
 <label class="world-seconds" title="Length of each move">Move <select aria-label="Move Length">{seconds}</select></label>
 <label class="world-steps" title="Quality of the moves: fewer denoising steps answer faster"{" hidden" if len(menus["steps"]) < 2 else ""}>Quality <select aria-label="Move Quality">{steps}</select></label>
 <div class="world-memory" title="{html.escape(menus["memory_title"])}"{" hidden" if len(menus["memory"]) < 2 else ""}>Memory <select aria-label="Move Memory" hidden>{memory}</select><button type="button" class="world-memory-button" aria-haspopup="listbox">{moves(chosen["memory"])}</button><div class="world-memory-list" role="listbox" hidden><div class="world-memory-note">Memory needs at this world's {manifest["width"]}x{manifest["height"]}, memory profile {menus["memory_profile"]["profile"]}</div>{memory_items}</div></div>
-<a href="{html.escape(gradio_file_url(path))}" download="{name}" title="Download the World File" aria-label="Download {name}">{self._icon("download")}</a>
+<a href="{html.escape(gradio_file_url(path))}" download="{name}" title="Download the World File" aria-label="Download {name}">{cls._icon("download")}</a>
 </div>
 </div>
-<button type="button" class="world-explore" data-world-action="explore" title="Explore this World Full Screen">{self._icon("explore")}<span>Explore</span></button>
-</div>"""
+<button type="button" class="world-explore" data-world-action="explore" title="Explore this World Full Screen">{cls._icon("explore")}<span>Explore</span></button>
+</wangp-world-viewer>"""
 
     def _extra_file_info(self, path):
         import base64
@@ -1167,16 +1415,10 @@ window.WangpWorld = window.WangpWorld || (function () {
     lines.push(`Move     ${stats.moves} · ${stats.video_seconds} s of video in ${stats.move_seconds} s · ${stats.steps} steps`);
     session.viewer.querySelector('.world-stats').textContent = lines.join('\n');
   }
-  let statsTimer = null;
-  function pollStats() {
-    // VRAM and load change without any event to listen to: while the statistics are shown during an exploration (preparation
-    // included), ask for them every second; stopped when hidden or when the exploration ends
-    clearInterval(statsTimer);
-    statsTimer = null;
+  function refreshStats() {
+    // Refresh on opening the statistics and on exploration responses, without a background timer.
     if (!session || !session.viewer.classList.contains('world-stats-shown')) return;
-    const ask = () => { if (session) send({action: 'stats', path: session.path}); };
-    ask();
-    statsTimer = setInterval(ask, 1000);
+    send({action: 'stats', path: session.path});
     showStats();
   }
   function captureView(viewer) {
@@ -1277,7 +1519,7 @@ window.WangpWorld = window.WangpWorld || (function () {
       event.preventDefault(); event.stopPropagation();
       if (event.type === 'keydown' && !event.repeat) {
         session.viewer.classList.toggle(event.code === 'KeyH' ? 'world-ui-hidden' : 'world-stats-shown');
-        if (event.code === 'KeyG') pollStats();
+        if (event.code === 'KeyG') refreshStats();
       }
       return;
     }
@@ -1315,12 +1557,13 @@ window.WangpWorld = window.WangpWorld || (function () {
     status('Preparing the world… (the model loads the first time)');
     send({action: 'start', path: session.path, seconds: session.seconds, steps: session.steps, memory: session.memory});
   }
-  function leave() {
+  function leave(suspend = false) {
     if (!session) return;
     if (session.replay) stopReplay();
     const current = session;
     session = null;
-    pollStats();
+    clearTimeout(current.errorTimer);
+    refreshStats();
     document.removeEventListener('keydown', onKey, true);
     document.removeEventListener('keyup', onKey, true);
     document.removeEventListener('fullscreenchange', onFullscreen);
@@ -1328,7 +1571,10 @@ window.WangpWorld = window.WangpWorld || (function () {
     const [video, ...buffers] = current.viewer.querySelectorAll('.world-video');
     buffers.forEach((buffer) => buffer.remove());
     video.classList.remove('world-buffer');
-    video.loop = true; video.autoplay = true; video.src = current.viewer.dataset.video; video.play().catch(() => {});
+    video.loop = true; video.autoplay = !suspend;
+    if (!suspend && current.viewer.dataset.video) video.src = current.viewer.dataset.video;
+    if (!suspend && window.__meshGalleryNS.visible(current.viewer)) video.play().catch(() => {});
+    else video.pause();
     if (document.fullscreenElement === current.viewer) document.exitFullscreen().catch(() => {});
     send({action: 'leave', path: current.path});
   }
@@ -1340,6 +1586,7 @@ window.WangpWorld = window.WangpWorld || (function () {
       session.ready = true; session.busy = false;
       session.viewer.classList.add('world-ready');
       status('Ready: hold ' + hold());
+      refreshStats();
       maybeMove();
     } else if (response.action === 'clip') {
       session.busy = false; session.moves += 1;
@@ -1361,7 +1608,7 @@ window.WangpWorld = window.WangpWorld || (function () {
     } else if (response.action === 'error') {
       session.busy = true;
       status('The exploration could not run: ' + response.message);
-      setTimeout(leave, 6000);
+      session.errorTimer = setTimeout(leave, 6000);
     } else if (response.action === 'ended') {
       leave();
     }
@@ -1453,10 +1700,123 @@ window.WangpWorld = window.WangpWorld || (function () {
     const input = form.querySelector('input');
     if (session && input.value.trim()) { session.text = input.value.trim(); input.value = ''; input.blur(); maybeMove(); }
   });
+  class WorldViewer extends HTMLElement {
+    connectedCallback() {queueMicrotask(() => {if (this.isConnected) this.refresh();});}
+    disconnectedCallback() { this.suspend(); }
+    suspend() {
+      if (session?.viewer === this) leave(true);
+      this.querySelectorAll('video').forEach(video => {video.pause(); video.removeAttribute('src'); video.load();});
+      this.suspended = true;
+    }
+    refresh() {
+      if (!window.__meshGalleryNS.visible(this)) {if (!this.suspended) this.suspend();}
+      else if (this.suspended) {
+        this.suspended = false;
+        const video = this.querySelector('.world-video');
+        if (video && this.dataset.video) {video.autoplay = false; video.controls = true; video.src = this.dataset.video;}
+      }
+    }
+  }
+  customElements.define('wangp-world-viewer', WorldViewer);
+  const refreshViewers = () => document.querySelectorAll('wangp-world-viewer').forEach(viewer => viewer.refresh());
+  document.addEventListener('visibilitychange', refreshViewers);
+  document.addEventListener('wangp-viewer-scope', refreshViewers);
+  document.addEventListener('fullscreenchange', refreshViewers);
+  document.addEventListener('scroll', refreshViewers, {capture: true, passive: true});
+  document.addEventListener('click', () => queueMicrotask(refreshViewers));
+  window.addEventListener('resize', refreshViewers);
+  window.addEventListener('blur', () => queueMicrotask(refreshViewers));
+  window.addEventListener('focus', refreshViewers);
+  window.addEventListener('pagehide', () => document.querySelectorAll('wangp-world-viewer').forEach(viewer => viewer.suspend()));
   return {onResponse: onResponse, start: start, leave: leave};
 })();
 // ===== end WorldGallery JS =====
 """
 
 
-STRIP_GALLERY_CLASSES = {gallery.source.id: gallery for gallery in (AudioGallery, MeshGallery, WorldGallery)}
+class AppGallery(StripGallery):
+    """Web apps made with Deepy (.wgpapp): the selected app's thumbnail, name and controls above a strip of thumbnails. Play opens it in the
+    app player (deepy/web/app_player.js), framed isolated from WanGP by shared.apps.server; nothing runs until Play is pressed."""
+
+    source = APP
+    viewer_height = 420
+
+    def _create_player(self, path):
+        return gr.HTML(value=self._player_value(path), elem_id=self.element_id("viewer"))
+
+    def _player_value(self, path):
+        if path is None:
+            return f'<div class="app-viewer app-viewer-empty" style="height:{self.viewer_height}px"></div>'
+        return self.viewer_html(path)
+
+    @classmethod
+    def viewer_html(cls, path):
+        from shared.apps import server as apps_server
+        from shared.utils.app_outputs import preview_path, read_app_metadata
+
+        try:
+            app_id = apps_server.register_package(Path(path))
+            app = read_app_metadata(path)
+        except Exception as error:
+            return f'<div class="app-viewer" style="height:{cls.viewer_height}px"><p class="app-viewer-error">This app cannot be opened: {html.escape(str(error))}</p></div>'
+        preview = preview_path(path)
+        picture = f'<img src="{html.escape(gradio_file_url(preview))}" alt="" loading="lazy">' if os.path.isfile(preview) else '<span class="app-viewer-icon">▶</span>'
+        controls = "".join(f'<span><kbd>{html.escape(str(key))}</kbd> {html.escape(str(action))}</span>' for key, action in (app["app_controls"] or {}).items())
+        name = html.escape(app["app_name"] or Path(path).stem)
+        version = html.escape(str(int(os.path.getmtime(path))))
+        return f"""<div class="app-viewer" style="height:{cls.viewer_height}px">
+<a class="app-viewer-play" href="#" role="button" data-app-id="{app_id}" data-app-name="{name}" data-app-version="{version}" data-download-url="{html.escape(gradio_file_url(path))}" data-download="{html.escape(Path(path).name)}" title="Play {name}">
+{picture}<span class="app-viewer-badge"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>Play</span></a>
+<div class="app-viewer-info"><strong>{name}</strong> <span class="app-viewer-version">version {html.escape(str(app["app_version"]))}</span>{f'<p>{html.escape(app["app_description"])}</p>' if app["app_description"] else ""}{f'<div class="app-viewer-controls">{controls}</div>' if controls else ""}</div>
+</div>"""
+
+    def _extra_file_info(self, path):
+        from shared.utils.app_outputs import preview_path, read_app_metadata
+
+        preview = preview_path(path)
+        try:  # a package dropped in the outputs by hand may be damaged: its file name labels it
+            name = read_app_metadata(path)["app_name"]
+        except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+            name = ""
+        return {"preview": preview if os.path.isfile(preview) else None, "name": name or Path(path).stem}
+
+    def _thumbnail_body(self, info):
+        if info["deleted"]:
+            return f'<div class="thumbnail-date">{info["date"]}</div><div class="thumbnail-time">{info["time"]}</div>'
+        image = f'<img class="thumbnail-image" src="{html.escape(gradio_file_url(info["preview"]))}" alt="" loading="lazy">' if info["preview"] else '<div class="thumbnail-detail">App</div>'
+        return f'{image}<div class="thumbnail-detail">{html.escape(info["name"])}</div>'
+
+    _own_javascript = r"""
+// ===== AppGallery: Play opens the app player =====
+if (!window.__appGalleryInit) {
+  window.__appGalleryInit = true;
+  document.addEventListener('click', event => {
+    const link = event.target.closest('.app-viewer [data-app-id]');
+    if (!link || !window.WanGPAppPlayer) return;
+    event.preventDefault();
+    window.WanGPAppPlayer.open(link);
+  });
+  const style = document.createElement('style');
+  style.textContent = `
+.app-viewer { display: flex; gap: 16px; align-items: stretch; padding: 12px; box-sizing: border-box; border-radius: 8px; background: var(--studio-input); color: var(--body-text-color); }
+.app-viewer-empty { padding: 0; }
+.app-viewer-play { position: relative; flex: 1.6; min-width: 0; display: grid; place-items: center; border-radius: 8px; overflow: hidden; background: #000; text-decoration: none !important; }
+.app-viewer-play img { width: 100%; height: 100%; object-fit: contain; }
+.app-viewer-icon { color: #fff; font-size: 48px; }
+.app-viewer-badge { position: absolute; display: inline-flex; align-items: center; gap: 8px; padding: 10px 20px; border-radius: 999px; background: rgba(0, 0, 0, 0.66); color: #fff !important; font-weight: 600; font-size: 16px; }
+.app-viewer-badge svg { width: 18px; height: 18px; fill: currentColor; }
+.app-viewer-play:hover .app-viewer-badge { background: var(--studio-accent, #3b82f6); }
+.app-viewer-info { flex: 1; min-width: 0; overflow: auto; font-size: 14px; line-height: 1.5; }
+.app-viewer-info strong { font-size: 16px; }
+.app-viewer-version { color: var(--body-text-color-subdued); }
+.app-viewer-controls { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-top: 8px; }
+.app-viewer-controls kbd { padding: 1px 6px; border: 1px solid var(--studio-border); border-bottom-width: 2px; border-radius: 5px; font-size: 12px; }
+.app-viewer-error { margin: auto; }
+@media (max-width: 760px) { .app-viewer { flex-direction: column; } }`;
+  document.head.append(style);
+}
+// ===== end AppGallery JS =====
+"""
+
+
+STRIP_GALLERY_CLASSES = {gallery.source.id: gallery for gallery in (AudioGallery, MeshGallery, WorldGallery, AppGallery)}

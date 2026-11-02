@@ -1,0 +1,20 @@
+{
+  "name": "Showrunner",
+  "author": "DeepBeepMeep",
+  "version": "0.1.0",
+  "description": "Productions directed by Deepy: music videos, short films, ads and stories, defined and reviewed shot by shot on a storyboard and a timeline.",
+  "type": "app",
+  "date": "",
+  "wan2gp_version": "",
+  "uninstallable": false,
+  "info_card": {
+    "tagline": "From an Idea to a Complete Film",
+    "description": "Make music videos, short films and stories with Deepy. Plan your shots, review takes on a storyboard and assemble the final edit.",
+    "details": "Requires Deepy Prime · Local or Remote Agent",
+    "image": "icons/apps/showrunner.webp",
+    "image_alt": "Showrunner with a populated music video storyboard"
+  },
+  "important": true,
+  "app_url": "/showrunner",
+  "fullscreen": true
+}

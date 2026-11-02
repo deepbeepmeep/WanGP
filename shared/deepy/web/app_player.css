@@ -1,0 +1,55 @@
+/* Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt) */
+/* The app player panel (app_player.js) and the Play cards of the chat. The panel stays dark in both themes, like a media player. */
+.wangp-app-player {
+  --player-bg: #0f1318; --player-bar: #171c23; --player-line: #2a323d; --player-text: #e7edf3; --player-muted: #95a3b3; --player-accent: #7cc4ff;
+  position: fixed; z-index: 1600; right: 16px;  /* above the Deepy dock (1500) with its chat and settings; below modals and toasts */
+  top: 72px; width: min(980px, calc(100vw - 32px)); height: min(78vh, 760px);
+  display: flex; flex-direction: column; background: var(--player-bg); color: var(--player-text); border: 1px solid var(--player-line);
+  border-radius: 12px; box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45); overflow: hidden; resize: both; min-width: 320px; min-height: 220px;
+  font: 13px/1.4 system-ui, sans-serif;
+}
+.wangp-app-player[hidden] { display: none; }
+.wangp-app-player.is-placed { left: var(--player-x); top: var(--player-y); right: auto; }  /* moved by its bar (app_player.js) */
+.wangp-app-player.is-dragging { user-select: none; }
+.wangp-app-player.is-dragging .wangp-app-player__stage { pointer-events: none; }
+.wangp-app-player.is-full { inset: 8px; width: auto; height: auto; resize: none; }
+.wangp-app-player.is-minimized { height: auto; min-height: 0; resize: none; width: min(420px, calc(100vw - 32px)); }
+.wangp-app-player.is-minimized > :not(.wangp-app-player__bar) { display: none; }
+.wangp-app-player.is-minimized .wangp-app-player__fps, .wangp-app-player.is-minimized .wangp-app-player__tools > :not([data-action="minimize"], [data-action="close"]) { display: none; }  /* the name, Restore and Close */
+.wangp-app-player__bar { display: flex; align-items: center; gap: 10px; padding: 6px 8px 6px 14px; background: var(--player-bar); border-bottom: 1px solid var(--player-line); cursor: move; user-select: none; touch-action: none; }
+.wangp-app-player.is-full .wangp-app-player__bar { cursor: default; }
+.wangp-app-player__title { flex: 1; min-width: 0; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wangp-app-player__fps { color: var(--player-muted); font-variant-numeric: tabular-nums; }
+.wangp-app-player__tools { display: flex; align-items: center; gap: 2px; }
+.wangp-app-player__button { display: inline-grid; place-items: center; position: relative; width: 30px; height: 30px; padding: 0; border: 0; border-radius: 7px; background: transparent; color: var(--player-text); cursor: pointer; opacity: 0.82; text-decoration: none; }
+.wangp-app-player__button:hover, .wangp-app-player__button:focus-visible { opacity: 1; background: rgba(255, 255, 255, 0.08); outline: none; }
+.wangp-app-player__button[hidden] { display: none; }
+.wangp-app-player__button[data-count]::after { content: attr(data-count); position: absolute; top: 1px; right: 0; min-width: 15px; height: 15px; padding: 0 3px; box-sizing: border-box; border-radius: 8px; background: #e5484d; color: #fff; font-size: 10px; line-height: 15px; text-align: center; }
+.wangp-app-player__select { height: 28px; margin-right: 4px; border: 1px solid var(--player-line); border-radius: 7px; background: var(--player-bg); color: var(--player-text); font: inherit; }
+.wangp-app-player[data-kind="document"] [data-action="pause"], .wangp-app-player[data-kind="document"] [data-action="console"], .wangp-app-player[data-kind="document"] [data-action="send"] { display: none; }
+.wangp-app-player__stage { position: relative; flex: 1; min-height: 0; display: flex; justify-content: center; background: #000; }
+.wangp-app-player__stage:fullscreen { width: 100vw; height: 100vh; }
+.wangp-app-player__viewport { flex: 1; min-width: 0; display: flex; }
+.wangp-app-player__frame { flex: 1; width: 100%; height: 100%; border: 0; background: #000; display: block; }
+.wangp-app-player[data-kind="document"] .wangp-app-player__frame { background: #fbfcfd; }
+.wangp-app-player__notice { position: absolute; inset: auto 16px 16px 16px; padding: 10px 12px; border-radius: 8px; background: rgba(20, 25, 31, 0.92); color: var(--player-text); }
+.wangp-app-player__notice[hidden] { display: none; }
+.wangp-app-player__controls { display: flex; flex-wrap: wrap; gap: 6px 14px; padding: 6px 12px; background: var(--player-bar); border-top: 1px solid var(--player-line); color: var(--player-muted); }
+.wangp-app-player__controls[hidden] { display: none; }
+.wangp-app-player__controls kbd { padding: 1px 6px; border: 1px solid var(--player-line); border-bottom-width: 2px; border-radius: 5px; color: var(--player-text); font: 12px ui-monospace, Consolas, monospace; }
+.wangp-app-player__console { max-height: 34%; overflow: auto; background: #0a0d11; border-top: 1px solid var(--player-line); }
+.wangp-app-player__console[hidden] { display: none; }
+.wangp-app-player__console ol { margin: 0; padding: 6px 10px; list-style: none; font: 12px/1.45 ui-monospace, Consolas, monospace; }
+.wangp-app-player__console li { white-space: pre-wrap; overflow-wrap: anywhere; color: #c9d4df; border-bottom: 1px solid rgba(255, 255, 255, 0.04); padding: 2px 0; }
+.wangp-app-player__console li.is-warn { color: #f5c26b; }
+.wangp-app-player__console li.is-error, .wangp-app-player__console li.is-exception { color: #ff8a8f; }
+.wangp-app-player__console li.is-info { color: var(--player-muted); }
+@media (max-width: 700px) {
+  .wangp-app-player, .wangp-app-player.is-placed { inset: 8px; width: auto; height: auto; resize: none; }
+  .wangp-app-player__select { display: none; }
+}
+
+/* Play cards in the chat */
+.chat__attachment--app { position: relative; cursor: pointer; }
+.chat__attachment-play { position: absolute; left: 8px; top: 8px; width: 26px; height: 26px; display: grid; place-items: center; border-radius: 50%; background: rgba(0, 0, 0, 0.62); color: #fff; pointer-events: none; }
+.chat__attachment-play svg { width: 14px; height: 14px; fill: currentColor; }

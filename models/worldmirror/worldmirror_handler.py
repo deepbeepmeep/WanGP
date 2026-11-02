@@ -1,4 +1,6 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
+from models import goals_3d
+
 from .prompts import WORLDMIRROR_DEEPY_INFOS, WORLDMIRROR_DEEPY_PROMPT_INFOS, WORLDMIRROR_INFOS, WORLDMIRROR_PROMPT_INFOS
 from .settings import CUSTOM_SETTINGS, MODEL_MODES
 
@@ -22,7 +24,7 @@ class family_handler:
 
     @staticmethod
     def query_family_infos():
-        return {"worldmirror": (3040, "WorldMirror")}
+        return {"worldmirror": (3040, "WorldMirror"), **goals_3d.family_infos(goals_3d.RECONSTRUCTION)}
 
     @staticmethod
     def get_lora_dir(base_model_type):
@@ -31,6 +33,7 @@ class family_handler:
     @staticmethod
     def query_model_def(base_model_type, model_def):
         return {
+            "group": goals_3d.RECONSTRUCTION,
             "image_outputs": True,
             "mesh_outputs": True,
             "device_explicit": True,

@@ -1,4 +1,5 @@
-# Sparse voxel tensors and the sparse operators of TRELLIS.2 in plain PyTorch, without compiled extensions.
+# Sparse voxel tensors and the sparse operators of TRELLIS.2, without compiled extensions: the convolutions run through
+# shared.kernels.vae_ops.sparse_conv (the WanGP Triton implicit GEMM, else gathered rows and addmm), the rest in PyTorch.
 # Semantics ported from microsoft/TRELLIS.2 (trellis2/modules/sparse, MIT License, see LICENSE in this folder) and from the FlexGEMM
 # submanifold convolution it uses (github.com/JeffreyXiang/FlexGEMM, MIT License): the neighbor map follows FlexGEMM's kernel order
 # v = (dx + 1) * 9 + (dy + 1) * 3 + (dz + 1) over the coordinates (x, y, z), and weights keep the checkpoint layout (Co, 3, 3, 3, Ci).
@@ -7,6 +8,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from shared.kernels import vae_ops
 
 SCRATCH_BYTES = 256 << 20  # bound of the gathered (im2col) neighbor features of one chunk of rows
 ROW_ELEMENTS = 1 << 24  # bound of the FP32 scratch of the row-wise passes (norms, activations)
@@ -78,20 +81,10 @@ class SparseTensor:
         return self
 
 
-def _gather_neighbors(feats, neighbors):
-    """Neighbor features (rows, 27 * C) of rows whose neighbor indices are neighbors (rows, 27), zero for inactive sites."""
-    rows = neighbors.shape[0]
-    cols = feats.index_select(0, neighbors.clamp(min=0).view(-1)).view(rows, 27, feats.shape[1])
-    cols.masked_fill_((neighbors < 0).unsqueeze(-1), 0)
-    return cols.view(rows, -1)
-
-
 def conv_rows(x, weight, bias, start, stop):
-    """Submanifold 3x3x3 convolution of x for the output rows [start, stop): weight (Co, 3, 3, 3, Ci) as stored by FlexGEMM, computed
-    as one GEMM over the gathered neighbors (FP32 accumulation, rounded once to the activation dtype as FlexGEMM does)."""
-    cols = _gather_neighbors(x.feats, x.neighbors(start, stop))
-    weight = weight.reshape(weight.shape[0], -1)
-    return torch.addmm(bias, cols, weight.t()) if bias is not None else cols @ weight.t()
+    """Submanifold 3x3x3 convolution of x for the output rows [start, stop): weight (Co, 3, 3, 3, Ci) as stored by FlexGEMM, FP32
+    accumulation over all the taps, rounded once to the activation dtype as FlexGEMM does."""
+    return vae_ops.sparse_conv(x.feats, x, weight, bias, rows=(start, stop))
 
 
 def conv_row_ranges(x, in_channels):
@@ -99,11 +92,8 @@ def conv_row_ranges(x, in_channels):
 
 
 def submanifold_conv3d(x, weight, bias):
-    """Whole submanifold convolution of x: a new (N, Co) tensor computed by chunks of rows."""
-    out = x.feats.new_empty((len(x), weight.shape[0]))
-    for start, stop in conv_row_ranges(x, weight.shape[-1]):
-        out[start:stop] = conv_rows(x, weight, bias, start, stop)
-    return out
+    """Whole submanifold convolution of x: a new (N, Co) tensor."""
+    return vae_ops.sparse_conv(x.feats, x, weight, bias)
 
 
 class SparseConv3d(nn.Module):

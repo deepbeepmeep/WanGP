@@ -114,7 +114,7 @@ def normalize_identity_path(path_value: str) -> str:
         return text.casefold()
 
 
-def read_output_identity(output_path: str) -> tuple[str, str, str] | None:
+def read_output_identity(output_path: str) -> tuple[str, str, str, str] | None:
     if not isinstance(output_path, str) or not os.path.isfile(output_path):
         return None
     metadata = read_metadata_from_video(output_path)
@@ -130,16 +130,19 @@ def read_output_identity(output_path: str) -> tuple[str, str, str] | None:
             process_name = str(first_segment.get("process") or "").strip()
     source_video = str(process_metadata.get("source_video") or metadata.get("source_video") or "").strip()
     source_segment = str(process_metadata.get("source_segment") or metadata.get("source_segment") or "").strip()
-    return process_name, source_video, source_segment
+    return process_name, source_video, source_segment, str(process_metadata.get("spatial_upsampling") or metadata.get("spatial_upsampling") or "")
 
 
-def get_output_identity_mismatch_message(output_path: str, *, process_name: str, source_path: str, source_segment: str) -> str | None:
+def get_output_identity_mismatch_message(output_path: str, identity, *, process_name: str, source_path: str, source_segment: str, spatial_upsampling: str = "") -> str | None:
     if not isinstance(output_path, str) or not os.path.isfile(output_path):
         return None
-    identity = read_output_identity(output_path)
     if identity is None:
         return f"Output file already exists at {output_path}, but it does not contain readable WanGP metadata. Processing was stopped."
-    existing_process, existing_source_video, existing_source_segment = identity
+    existing_process, existing_source_video, existing_source_segment, existing_upsampling = identity
+    if existing_upsampling and spatial_upsampling:
+        from postprocessing.spatial_upsamplers import normalize_upsampling_value
+        if normalize_upsampling_value(existing_upsampling) != spatial_upsampling:
+            return f"Cannot continue {output_path}: it used {existing_upsampling} and this run requests {spatial_upsampling}. Choose another output or turn off Continue."
     mismatches: list[str] = []
     if str(existing_process or "").strip() != str(process_name or "").strip():
         mismatches.append("process")

@@ -199,6 +199,45 @@ def _split_glb(data) -> tuple[dict, bytes | None, int]:
     return gltf, binary, 20 + json_length
 
 
+def glb_compress_images(data: bytes, max_size: int | None = None, quality: int = 88) -> bytes:
+    """GLB whose embedded pictures are re-encoded for delivery: JPEG, or PNG when the picture uses its alpha, the longer side reduced to
+    max_size. Geometry, the other buffer views and the rest of the document are kept; pictures PIL cannot read stay as they are."""
+    import io
+
+    from PIL import Image
+
+    gltf, binary, _ = _split_glb(data)
+    images = {image["bufferView"]: index for index, image in enumerate(gltf.get("images", [])) if "bufferView" in image}
+    if binary is None or not images or any(view.get("buffer", 0) != 0 for view in gltf["bufferViews"]):
+        return bytes(data)
+    parts, size = [], 0
+    for index, view in enumerate(gltf["bufferViews"]):
+        start = view.get("byteOffset", 0)
+        chunk = bytes(binary[start:start + view["byteLength"]])
+        if index in images:
+            try:
+                with Image.open(io.BytesIO(chunk)) as picture:
+                    picture.load()
+                    alpha = "A" in picture.getbands() and picture.getchannel("A").getextrema()[0] < 255
+                    if max_size and max(picture.size) > max_size:
+                        picture.thumbnail((max_size, max_size), Image.LANCZOS)
+                    encoded = io.BytesIO()
+                    picture.save(encoded, "PNG", optimize=True) if alpha else picture.convert("RGB").save(encoded, "JPEG", quality=quality)
+                chunk = encoded.getvalue()
+                gltf["images"][images[index]]["mimeType"] = "image/png" if alpha else "image/jpeg"
+            except OSError:
+                pass
+        parts.append(bytes(-size % 4))
+        size += len(parts[-1])
+        view["byteOffset"], view["byteLength"] = size, len(chunk)
+        parts.append(chunk)
+        size += len(chunk)
+    payload = b"".join(parts)
+    payload += bytes(-len(payload) % 4)
+    gltf["buffers"][0]["byteLength"] = len(payload)
+    return _pack_glb(gltf, struct.pack("<II", len(payload), CHUNK_BIN) + payload)
+
+
 def glb_write_extras(data: bytes, extras: dict, *, merge: bool = True) -> bytes:
     """GLB with asset.extras set to extras (merged into the existing asset.extras dict when merge is True). Only the JSON
     chunk is rewritten (re-padded to 4 bytes); the following chunks, including BIN, are kept byte-identical."""
@@ -218,6 +257,38 @@ def _read_document(source) -> dict:
         if head[:4] != b"glTF":
             return json.loads((head + handle.read()).decode("utf-8"))
         return _split_glb(head + handle.read(struct.unpack_from("<I", head, 12)[0]))[0]
+
+
+def glb_add_files(data: bytes, files: dict[str, list[bytes]], key: str) -> bytes:
+    """GLB with files (encoded pictures by role, e.g. {"image_refs": [PNG bytes]}) appended to its BIN chunk, one buffer view each, listed
+    in asset.extras[key] as {role: [buffer view index]}. No texture uses them, so viewers ignore them, and the JSON chunk stays small for
+    the readers of the settings. A GLB that already lists files under key is returned unchanged."""
+    gltf, binary, _ = _split_glb(data)
+    extras = gltf.setdefault("asset", {"version": "2.0"}).setdefault("extras", {})
+    if key in extras or not any(files.values()):
+        return bytes(data)
+    payload, views, listed = bytearray(binary or b""), gltf.setdefault("bufferViews", []), {}
+    for role, contents in files.items():
+        for content in contents:
+            payload += bytes(-len(payload) % 4)
+            views.append({"buffer": 0, "byteOffset": len(payload), "byteLength": len(content)})
+            listed.setdefault(role, []).append(len(views) - 1)
+            payload += content
+    payload += bytes(-len(payload) % 4)
+    gltf.setdefault("buffers", [{}])[0]["byteLength"] = len(payload)
+    extras[key] = listed
+    return _pack_glb(gltf, struct.pack("<II", len(payload), CHUNK_BIN) + bytes(payload))
+
+
+def glb_read_files(source, key: str) -> dict[str, list[bytes]]:
+    """The files glb_add_files stored under asset.extras[key] of a GLB (path or bytes): {role: [bytes]}, {} without any."""
+    data = source if isinstance(source, (bytes, bytearray, memoryview)) else Path(source).read_bytes()
+    gltf, binary, _ = _split_glb(data)
+    listed, views = gltf.get("asset", {}).get("extras", {}).get(key), gltf.get("bufferViews", [])
+    if not isinstance(listed, dict) or binary is None:
+        return {}
+    span = lambda view: bytes(binary[view.get("byteOffset", 0):view.get("byteOffset", 0) + view["byteLength"]])
+    return {role: [span(views[index]) for index in indices] for role, indices in listed.items()}
 
 
 def glb_read_extras(source) -> dict:

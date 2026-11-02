@@ -11,14 +11,14 @@ from typing import Any
 from shared.utils.audio_video import read_image_metadata
 from shared.utils.gallery_media import gallery_media_ids
 from shared.mesh3d.glb import MESH_EXTENSIONS as MESH_FILE_EXTENSIONS
-from shared.utils.gallery_sources import GALLERY_SOURCES, WORLD_EXTENSIONS, source_for_kind
+from shared.utils.gallery_sources import APP_EXTENSIONS, GALLERY_SOURCES, WORLD_EXTENSIONS, source_for_kind
 from shared.utils.media_settings import peek_settings
 
 
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff", ".jfif", ".pjpeg"}
 _VIDEO_EXTENSIONS = {".mkv", ".mov", ".mp4", ".m4v", ".webm", ".avi"}
 _AUDIO_EXTENSIONS = {".wav", ".mp3", ".aac", ".m4a", ".flac", ".ogg", ".opus", ".wma"}
-_MEDIA_TYPES = {"image", "video", "audio", "3d", "world", "any", "all"}
+_MEDIA_TYPES = {"image", "video", "audio", "3d", "world", "app", "any", "all"}
 PROMPT_SUMMARY_MAX_CHARS = 128
 _TYPE_HINTS = {
     "image": ("image", "images", "picture", "photo", "photos", "pic", "pics"),
@@ -26,6 +26,7 @@ _TYPE_HINTS = {
     "audio": ("audio", "sound", "song", "music", "track", "voice"),
     "3d": ("3d", "mesh", "glb", "splat", "splats", "gaussians"),
     "world": ("world", "worlds", "wgpworld"),
+    "app": ("app", "apps", "wgpapp"),
 }
 _ALIAS_PREVIOUS_RE = re.compile(r"\b(previous|prior|before\s+last|second\s+last|penultimate)\b", flags=re.IGNORECASE)
 _ALIAS_LAST_RE = re.compile(r"\b(last|latest|most\s+recent)\b", flags=re.IGNORECASE)
@@ -475,6 +476,8 @@ def _detect_media_type(path: str) -> str:
         return "3d"
     if ext in WORLD_EXTENSIONS:
         return "world"
+    if ext in APP_EXTENSIONS:
+        return "app"
     return "any"
 
 

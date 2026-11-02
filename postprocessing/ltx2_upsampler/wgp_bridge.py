@@ -102,7 +102,7 @@ class LTXVideoUpsamplerBridge(SimpleScaleSuffixMixin):
                 REFINE_METHOD: "Rebuild fine texture, edges and grain in soft, compressed, upscaled or generated video with the LTX 2.5 Refine Details IC-LoRA, keeping framing, exposure and color. The source is resized with Lanczos, then refined in overlapping 1024x576 tiles fused at every step, so x1 (detail only), x1.5 and x2 outputs up to 8K can be processed. Best for 1080p to 4K. Slow: 4K needs 49 tiles per step. Temporal window and gentle mode are configurable in Extensions.",
             },
             "method_parameters": {REFINE_METHOD: [
-                {"name": "spatial_upsampler_prompt", "setting": "refine_prompt", "type": "string", "component": "textbox", "ui": (PARAMETER_UI_POSTPROCESSING, PARAMETER_UI_LATE_POSTPROCESSING), "required": False, "default": DEFAULT_REFINE_PROMPT, "label": "Refiner Style Prompt", "description": "Describe rendering only: sharpness, texture, grain, light. Every tile receives the whole prompt, so naming subjects can paint them into unrelated parts of the frame.", "lines": 2},
+                {"name": "refine_prompt", "setting": "refine_prompt", "type": "string", "component": "textbox", "ui": (PARAMETER_UI_POSTPROCESSING, PARAMETER_UI_LATE_POSTPROCESSING), "required": False, "default": DEFAULT_REFINE_PROMPT, "label": "Refiner Style Prompt", "description": "Describe rendering only: sharpness, texture, grain, light. Every tile receives the whole prompt, so naming subjects can paint them into unrelated parts of the frame.", "lines": 2},
             ]},
         }
 

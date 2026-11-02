@@ -186,8 +186,8 @@ class Residency:
     def prepare(self, grow_only=False):
         """At a model/cycle boundary, after the ordinary preload has priority."""
         self.thread = threading.get_ident()
-        if self.changing:
-            return
+        if self.changing or cuda_graphs.recording() or torch.cuda.is_current_stream_capturing():
+            return  # never inside a graph capture (a decoding pass of a model called as a module): its next eager call places them
         if not self._nonexperts_resident():
             self.unload(reset=False)
             return
@@ -292,8 +292,9 @@ class Residency:
         if auto_preload is not None:
             auto_preload.on_expert_change()
 
-    def on_pressure(self, need):
-        if need <= 0 or self.changing or self.thread != threading.get_ident() or cuda_graphs.recording() or torch.cuda.is_current_stream_capturing():
+    def on_pressure(self, need, parked=False):
+        # parked: its offload object is parked (offload.park), any thread may release its copies
+        if need <= 0 or self.changing or not parked and self.thread != threading.get_ident() or cuda_graphs.recording() or torch.cuda.is_current_stream_capturing():
             return 0
         victims = [(bank, expert) for bank, expert in reversed(self.loaded) if not bank._leases]
         if not victims:

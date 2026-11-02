@@ -730,6 +730,22 @@ def combine_video_with_audio_tracks(target_video, audio_tracks, output_video,
     return True
 
 
+def subtitled_video_extension(source_video):
+    """The container of a copy of source_video with an added text subtitle track: MP4 and MOV keep theirs (mov_text), others become MKV."""
+    extension = os.path.splitext(source_video)[1].lower()
+    return ".mov" if extension == ".mov" else ".mp4" if extension in (".mp4", ".m4v") else ".mkv"
+
+
+def add_subtitle_track(source_video, subtitles, output_video, title=None):
+    """Copy the video and audio streams of source_video (no re-encoding) into output_video with the SRT file subtitles as its subtitle track,
+    shown by default (the source's own subtitle tracks are not kept)."""
+    cmd = [_ffmpeg_binary(), '-y', '-v', 'error', '-i', source_video, '-i', subtitles, '-map', '0:V', '-map', '0:a?', '-map', '1:s', '-c:v', 'copy', '-c:a', 'copy',
+           '-c:s', 'srt' if output_video.lower().endswith('.mkv') else 'mov_text', '-disposition:s:0', 'default', *(['-metadata:s:s:0', f'title={title}'] if title else []), output_video]
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if result.returncode != 0:
+        raise Exception(f"FFmpeg error:\n{result.stderr}")
+
+
 def cleanup_temp_audio_files(audio_tracks, verbose=False):
     """
     Clean up temporary audio files.

@@ -1,0 +1,15 @@
+{
+    "merge_loras": "merge before",
+    "activated_loras": [
+        "https://huggingface.co/DeepBeepMeep/MiniMax-H3/resolve/main/loras/pika_h3_flex_ref2va_6step_v1_bf16.safetensors"
+    ],
+    "loras_multipliers": "1.0",
+    "sample_solver": "pika_renoise",
+    "num_inference_steps": 6,
+    "guidance_phases": 1,
+    "guidance_scale": 1,
+    "flow_shift": 12,
+    "custom_sigmas": "",
+    "skip_steps_cache_type": "",
+    "custom_settings": {"audio_refinement": "none"}
+}

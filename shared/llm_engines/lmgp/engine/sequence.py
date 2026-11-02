@@ -47,6 +47,11 @@ class Sequence:
         self.repetition_penalty = sampling_params.repetition_penalty
         self.predictive_penalty = sampling_params.predictive_penalty
         self.repetition_penalty_start = self.num_prompt_tokens
+        # Optional repetition-penalty rules (set by callers that know the tokenizer): token ids never penalized nor recorded (symbols, digits,
+        # identifier pieces), and the text of the tokens that open or close spans (backticks, double quotes, newlines) inside which the penalty
+        # is suspended and nothing is recorded: code, paths and ids are copied, not repeated by mistake.
+        self.repetition_exempt_ids: Optional[frozenset] = None
+        self.repetition_span_marks: Optional[dict] = None
         # For CFG: mark if this is an unconditional sequence
         self.is_unconditional = is_unconditional
         # For CFG: reference to the corresponding conditional sequence (if this is unconditional)

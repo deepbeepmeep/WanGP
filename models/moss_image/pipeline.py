@@ -98,7 +98,7 @@ class MOSSImagePipeline:
         latents = latents.to(device)
         cache_mode = (custom_settings or {}).get('moss_image_kv_cache', 'Disabled')
         use_cache = self.editing and cache_mode in ('Enabled', 'INT8', 'INT8_RAM')
-        caches = [attention_kit.PrefixCache(self.transformer.layers, quantize=cache_mode in ('INT8', 'INT8_RAM'), ram=cache_mode == 'INT8_RAM',
+        caches = [attention_kit.PrefixCache(self.transformer.layers, quantize=cache_mode in ('INT8', 'INT8_RAM'), ram=cache_mode == 'INT8_RAM', dynamic=cache_mode in ('Enabled', 'INT8'),
                                            name=f'MOSS Image KV cache {branch + 1}')
                   for branch in range(len(texts) if self.hq_edit else 1)] if use_cache else []
         kv_cache = (caches if self.hq_edit else caches[0]) if caches else None

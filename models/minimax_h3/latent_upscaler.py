@@ -31,18 +31,21 @@ def _check_abort(abort_callback):
 class ResidualBlock3D(nn.Module):
     def __init__(self, channels, embedding_channels=64, dropout=0.1):
         super().__init__()
-        self.in_layers = nn.Sequential(_normalization(channels), nn.SiLU(), nn.Conv3d(channels, channels, 3, padding=1))
+        self.in_layers = nn.Sequential(_normalization(channels), nn.SiLU(inplace=True), nn.Conv3d(channels, channels, 3, padding=1))
         self.emb_layers = nn.Sequential(nn.SiLU(), nn.Linear(embedding_channels, 2 * channels))
         self.out_norm = _normalization(channels)
-        self.out_layers = nn.Sequential(nn.SiLU(), nn.Dropout(dropout), _zero_module(nn.Conv3d(channels, channels, 3, padding=1)))
+        self.out_layers = nn.Sequential(nn.SiLU(inplace=True), nn.Dropout(dropout), _zero_module(nn.Conv3d(channels, channels, 3, padding=1)))
         self.skip = nn.Identity()
 
     def forward(self, hidden_states, embedding):
         residual = hidden_states
         hidden_states = self.in_layers(hidden_states)
         scale, shift = self.emb_layers(embedding).to(hidden_states.dtype)[:, :, None, None, None].chunk(2, dim=1)
-        hidden_states = kernels.scale_shift([self.out_norm(hidden_states)], scale, shift)
-        return residual + self.out_layers(hidden_states)
+        hidden_states = self.out_norm(hidden_states)
+        pending, hidden_states = [hidden_states], None
+        hidden_states = kernels.scale_shift(pending, scale, shift)
+        # Inference-only blocks reuse their residual after its final read.
+        return residual.add_(self.out_layers(hidden_states))
 
 
 class TemporalConv3D(nn.Module):
@@ -53,7 +56,10 @@ class TemporalConv3D(nn.Module):
         self.pwconv = _zero_module(nn.Conv3d(channels, channels, 1))
 
     def forward(self, hidden_states):
-        return hidden_states + self.pwconv(self.dwconv(F.silu(self.norm(hidden_states))))
+        residual = hidden_states
+        hidden_states = F.silu(self.norm(hidden_states), inplace=True)
+        hidden_states = self.dwconv(hidden_states)
+        return residual.add_(self.pwconv(hidden_states))
 
 
 class MiniMaxH3LatentUpscaler(nn.Module):
@@ -93,7 +99,8 @@ class MiniMaxH3LatentUpscaler(nn.Module):
             latent = block(latent, embedding) if isinstance(block, ResidualBlock3D) else block(latent)
             advance()
         _check_abort(abort_callback)
-        latent = self.conv_out(F.silu(self.norm_out(latent)))
+        latent = F.silu(self.norm_out(latent), inplace=True)
+        latent = self.conv_out(latent)
         advance()
         return latent
 
@@ -108,11 +115,11 @@ class MiniMaxH3LatentUpscaler(nn.Module):
         total_steps = segment_count * steps_per_segment
         step = 0
 
-        with tqdm(total=total_steps, desc="H3 latent upscaling", unit="layer") as progress:
+        with tqdm(total=total_steps, desc="H3 Latent Upscaling", unit="layer") as progress:
             def advance():
                 nonlocal step
                 if callable(progress_callback):
-                    progress_callback("Latent network", step, total_steps)
+                    progress_callback("Latent Network", step, total_steps)
                 step += 1
                 progress.update()
 

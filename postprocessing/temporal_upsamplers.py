@@ -8,6 +8,13 @@ Handlers expose methods and supported multipliers through
 Definitions may also expose an optional ``description`` plus optional
 ``method_descriptions`` and ``method_parameters`` mappings for reusable
 discovery interfaces. Existing handlers without these fields remain valid.
+
+The slot also holds the texturers of 3D assets: a definition declares the media kinds it processes in ``media``
+(default ``("video",)``; ``("3d",)`` for a texturer) and its ``postprocessing_category`` (``interpolator`` by default,
+``texturer``). A texturer implements ``texture(mesh, temporal_upsampling, **kwargs)`` (called through ``texture_mesh``)
+and returns the textured ``shared.mesh3d.Mesh``. ``method_parameters`` are declared as in the spatial slot: their values
+travel in the ``temporal_postprocessing_parameters`` setting under their ids, the UI shows them below the slot's selector
+(``postprocessing.parameter_ui``), and the processor receives them under their ``setting`` name.
 Discovery tests the existing optional ``enabled()`` method first. When it is
 absent, handlers may expose a ``status`` property containing ``"enabled"`` or
 ``"disabled"``. Discovery reports ``"unknown"`` only when neither contract
@@ -36,20 +43,31 @@ from typing import Any
 from shared.attention import attention_shared_state
 from shared.utils import offload_registry
 from . import memory as processor_memory
+from . import parameter_ui
 from .processor_status import PROCESSOR_STATUS_DISABLED, PROCESSOR_STATUS_ENABLED, PROCESSOR_STATUS_UNKNOWN, handler_reason_disabled, handler_status, handler_method_available, handler_method_in_choices
 from .model_context import compatible_loaded_model
 
 
 TEMPORAL_UPSAMPLER_CONFIG_KEY = "temporal_upsamplers"
 MULTIPLIER_SEPARATOR = "*"
+PARAMETER_UI_POSTPROCESSING = "postprocessing"
+PARAMETER_UI_LATE_POSTPROCESSING = "late_postprocessing"
+MEDIA_VIDEO = "video"
+MEDIA_3D = "3d"
+CATEGORY_INTERPOLATOR = "interpolator"
+CATEGORY_TEXTURER = "texturer"
 
 temporal_upsampler_handlers = [
     "postprocessing.rife.temporal_upsampler.RifeTemporalUpsampler",
     "postprocessing.dlss5.temporal_upsampler.DLSSGTemporalUpsampler",
+    "postprocessing.hunyuan3d_paint.texturer.Hunyuan3DPaintTexturer",
+    "postprocessing.supratex.texturer.SupraTexTexturer",
+    "postprocessing.trellis2_texture.texturer.Trellis2Texturer",
 ]
 _temporal_upsampler_handlers: list[Any] = []
 _temporal_upsampler_server_config: dict[str, Any] | None = None
 _registered_temporal_upsampler_handler_paths: set[str] = set()
+_kept_texturer: Any = None  # the texturer whose models stay loaded: one at a time, as the spatial slot keeps one processor
 
 
 @dataclass
@@ -154,6 +172,39 @@ def registered_temporal_upsamplers(enabled_only: bool = False) -> list[Any]:
 
 def handler_enabled(handler) -> bool:
     return not hasattr(handler, "enabled") or handler.enabled()
+
+
+def handler_media(handler) -> tuple[str, ...]:
+    return tuple(handler.query_temporal_upsampler_def().get("media", (MEDIA_VIDEO,)))
+
+
+def method_category(method) -> str:
+    handler = find_temporal_upsampler_by_method(method)
+    return CATEGORY_INTERPOLATOR if handler is None else str(handler.query_temporal_upsampler_def().get("postprocessing_category", CATEGORY_INTERPOLATOR))
+
+
+def method_parameters(method, *, ui_context: str | None = None) -> list[dict[str, Any]]:
+    handler = find_temporal_upsampler_by_method(method)
+    parameters = {} if handler is None else handler.query_temporal_upsampler_def().get("method_parameters", {})
+    values = parameters.get(str(method or "").strip(), ()) if isinstance(parameters, dict) else ()
+    output = []
+    for parameter in values if isinstance(values, (list, tuple)) else ():
+        if not isinstance(parameter, dict) or not str(parameter.get("name", "") or "").strip():
+            continue
+        contexts = parameter.get("ui", ())
+        contexts = (contexts,) if isinstance(contexts, str) else tuple(contexts)
+        if ui_context is None or ui_context in contexts:
+            output.append(dict(parameter))
+    return output
+
+
+def runtime_parameter_kwargs(temporal_upsampling, parameter_values) -> dict[str, Any]:
+    split = split_temporal_upsampling_value(temporal_upsampling)
+    return {} if split is None else parameter_ui.runtime_kwargs(method_parameters(split[0]), parameter_values)
+
+
+def slot_label(media_kind: str) -> str:
+    return "Texturer" if media_kind == MEDIA_3D else "Temporal Upsampling"
 
 
 def query_temporal_upsampler_defs(enabled_only: bool = False) -> list[dict[str, Any]]:
@@ -276,7 +327,9 @@ def format_temporal_upsampling_label(value) -> str:
         return text
     method, scale = split
     label = _method_labels(handler.query_temporal_upsampler_def()).get(method)
-    return format_method_scale_label(label, scale) if label else text
+    if not label:
+        return text
+    return format_method_scale_label(label, scale) if method_multipliers(method) else label
 
 
 def normalize_temporal_upsampling_state(method, scale) -> tuple[list[tuple[str, float]], float | None, str]:
@@ -284,7 +337,7 @@ def normalize_temporal_upsampling_state(method, scale) -> tuple[list[tuple[str, 
     if not method:
         return [], None, ""
     multiplier_choices = multiplier_choices_for_method(method)
-    scale = normalize_multiplier_for_method(method, scale)
+    scale = normalize_multiplier_for_method(method, scale) if multiplier_choices else None  # texturers: no multiplier
     return multiplier_choices, scale, build_temporal_upsampling_value(method, scale) or ""
 
 
@@ -293,16 +346,19 @@ def normalize_temporal_upsampling_value_for_method(method, current_value) -> tup
     return normalize_temporal_upsampling_state(method, 2.0 if split is None else split[1])
 
 
-def query_method_choices(enabled_only: bool = False, *, selected_method: str = "", include_hidden: bool = False) -> list[tuple[str, str]]:
+def query_method_choices(enabled_only: bool = False, *, selected_method: str = "", include_hidden: bool = False, media_kind: str = MEDIA_VIDEO) -> list[tuple[str, str]]:
     choices = []
     for handler in registered_temporal_upsamplers(enabled_only):
         handler_def = handler.query_temporal_upsampler_def()
+        if media_kind not in handler_media(handler):
+            continue
         choices += [(_method_pos(handler_def, method), str(label or "").casefold(), str(method or ""), label, method) for label, method in _method_choices(handler_def) if handler_method_in_choices(handler, method, selected_method=selected_method, include_hidden=include_hidden)]
     return [(label, method) for _, _, _, label, method in sorted(choices)]
 
 
-def temporal_help_markdown(method_choices, *, field_help=None) -> str:
-    intro = getattr(field_help, "TEMPORAL_UPSAMPLER_HELP_INTRO", "Temporal upsamplers increase frame rate by generating intermediate frames.")
+def temporal_help_markdown(method_choices, *, field_help=None, media_kind: str = MEDIA_VIDEO) -> str:
+    intro = ("Texturers paint the PBR materials of a 3D asset (base colour, metallic, roughness) from its reference image." if media_kind == MEDIA_3D else
+             getattr(field_help, "TEMPORAL_UPSAMPLER_HELP_INTRO", "Temporal upsamplers increase frame rate by generating intermediate frames."))
     sections = [intro]
     handler_choices = {}
     for label, method in method_choices:
@@ -324,8 +380,8 @@ def temporal_help_markdown(method_choices, *, field_help=None) -> str:
     return "\n\n".join(sections)
 
 
-def temporal_help_popup(method_choices, *, field_help=None) -> tuple[str, str]:
-    return "Temporal Upsampler", temporal_help_markdown(method_choices, field_help=field_help)
+def temporal_help_popup(method_choices, *, field_help=None, media_kind: str = MEDIA_VIDEO) -> tuple[str, str]:
+    return ("Texturer" if media_kind == MEDIA_3D else "Temporal Upsampler"), temporal_help_markdown(method_choices, field_help=field_help, media_kind=media_kind)
 
 
 def temporal_help_id(method_choices) -> str:
@@ -333,42 +389,58 @@ def temporal_help_id(method_choices) -> str:
     return f"temporal_upsampling_{hashlib.sha1(signature.encode('utf-8')).hexdigest()[:12]}"
 
 
-def dropdown_state(temporal_upsampling, *, late_postprocessing: bool = False) -> dict[str, Any]:
+def dropdown_state(temporal_upsampling, *, late_postprocessing: bool = False, media_kind: str = MEDIA_VIDEO) -> dict[str, Any]:
     method, scale = split_temporal_upsampling_value(temporal_upsampling) or ("", 2.0)
-    method_choices = [("None", "")] + query_method_choices(enabled_only=not late_postprocessing, selected_method=method)
+    method_choices = [("None", "")] + query_method_choices(enabled_only=not late_postprocessing, selected_method=method, media_kind=media_kind)
     if method not in {value for _, value in method_choices}:
         method = ""
     multiplier_choices, scale, value = normalize_temporal_upsampling_state(method, scale)
     return {"method": method, "scale": scale, "value": value, "method_choices": method_choices, "multiplier_choices": multiplier_choices}
 
 
-def create_generation_temporal_ui(gr, temporal_upsampling, *, visible: bool = True, late_postprocessing: bool = False, elem_classes=None, update_form: bool = False, field_help=None) -> dict[str, Any]:
-    state = dropdown_state(temporal_upsampling if visible else "", late_postprocessing=late_postprocessing)
+def late_postprocessing_ui_state(temporal_upsampling, *, media_kind: str) -> dict[str, Any]:
+    """The state of the late panel's slot for the selected media, with its choices' context (the slot's context state)."""
+    context = {"late_postprocessing": True, "media_kind": media_kind}
+    return {**dropdown_state(temporal_upsampling, **context), "context": context}
+
+
+def create_generation_temporal_ui(gr, temporal_upsampling, *, visible: bool = True, late_postprocessing: bool = False, elem_classes=None, update_form: bool = False, field_help=None,
+                                  media_kind: str = MEDIA_VIDEO, help_target_id: str | None = None) -> dict[str, Any]:
+    """The temporal slot's selectors; its processors' parameters are in the shared inputs of parameter_ui. Its help (returned in
+    extra_components, refreshed with the form) follows the media kind: Temporal Upsampler, or Texturer for 3D assets. So does the context
+    of its choices, also in media_outputs for the late panel: the slot's events are bound once, for the first model."""
+    context = {"late_postprocessing": late_postprocessing, "media_kind": media_kind}
+    state = dropdown_state(temporal_upsampling if visible else "", **context)
+    help_components = []
     with gr.Row():
-        method = gr.Dropdown(choices=state["method_choices"], value=state["method"], visible=visible, scale=3, label="Temporal Upsampling", elem_classes=elem_classes)
+        method = gr.Dropdown(choices=state["method_choices"], value=state["method"], visible=visible, scale=3, label=slot_label(media_kind), elem_id=help_target_id, elem_classes=elem_classes)
         if field_help is not None:
-            help_title, help_markdown = temporal_help_popup(state["method_choices"], field_help=field_help)
-            field_help.bind(method, temporal_help_id(state["method_choices"]), title=help_title, markdown=help_markdown)
-        multiplier = gr.Dropdown(choices=state["multiplier_choices"], value=state["scale"], visible=visible and state["method"] != "", scale=1, label="Multiplier", elem_classes=elem_classes)
+            help_title, help_markdown = temporal_help_popup(state["method_choices"], field_help=field_help, media_kind=media_kind)
+            help_id = temporal_help_id(state["method_choices"])
+            help_components = [gr.update(value=field_help.render_marker(help_target_id, help_id, title=help_title, markdown=help_markdown)) if update_form else field_help.bind(method, help_id, title=help_title, markdown=help_markdown)]
+        multiplier = gr.Dropdown(choices=state["multiplier_choices"], value=state["scale"], visible=visible and bool(state["multiplier_choices"]), scale=1, label="Multiplier", elem_classes=elem_classes)
     value = gr.Textbox(value=state["value"], visible=False, elem_classes=elem_classes)
 
-    def refresh_method(method, value):
+    context_component = context if update_form else gr.State(context)
+
+    def refresh_method(method, value, context):
         _, _, value = normalize_temporal_upsampling_value_for_method(method, value)
-        state = dropdown_state(value, late_postprocessing=late_postprocessing)
-        return gr.update(choices=state["method_choices"], value=state["method"]), gr.update(choices=state["multiplier_choices"], value=state["scale"], visible=bool(state["method"])), state["value"]
+        state = dropdown_state(value, **context)
+        return gr.update(choices=state["method_choices"], value=state["method"]), gr.update(choices=state["multiplier_choices"], value=state["scale"], visible=bool(state["multiplier_choices"])), state["value"]
 
     def refresh_multiplier(method, scale):
         _, scale, value = normalize_temporal_upsampling_state(method, scale)
-        return gr.update(value=scale, visible=bool(method)), value
+        return gr.update(value=scale, visible=bool(method and method_multipliers(method))), value
 
     if not update_form:
-        outputs = [multiplier, value]
-        gr.on(triggers=[method.input], fn=refresh_method, inputs=[method, value], outputs=[method, *outputs], show_progress="hidden")
-        gr.on(triggers=[multiplier.input], fn=refresh_multiplier, inputs=[method, multiplier], outputs=outputs, show_progress="hidden")
-    return {"value": value, "method": method, "multiplier": multiplier}
+        gr.on(triggers=[method.input], fn=refresh_method, inputs=[method, value, context_component], outputs=[method, multiplier, value], show_progress="hidden")
+        gr.on(triggers=[multiplier.input], fn=refresh_multiplier, inputs=[method, multiplier], outputs=[multiplier, value], show_progress="hidden")
+    return {"value": value, "method": method, "method_value": state["method"], "multiplier": multiplier, "extra_components": [*help_components, context_component],
+            "media_outputs": [*help_components, context_component]}
 
 
-def validate_temporal_upsampling(temporal_upsampling, *, source_is_image: bool = False) -> str:
+def validate_temporal_upsampling(temporal_upsampling, *, source_is_image: bool = False, media_kind: str | None = None) -> str:
+    """media_kind: the processed media when it is not a video (``3d``)."""
     temporal_upsampling = str(temporal_upsampling or "").strip()
     if not temporal_upsampling:
         return ""
@@ -378,6 +450,8 @@ def validate_temporal_upsampling(temporal_upsampling, *, source_is_image: bool =
     method, _ = handler.split_value(temporal_upsampling)
     if not handler_method_available(handler, method):
         return f"Temporal upsampler '{method}' is not available"
+    if (media_kind or MEDIA_VIDEO) not in handler_media(handler):
+        return f"{handler.query_temporal_upsampler_def()['name']} does not process {'3D assets' if media_kind == MEDIA_3D else 'videos'}"
     if hasattr(handler, "validate_upsampling"):
         return handler.validate_upsampling(temporal_upsampling, source_is_image=source_is_image)
     return "Temporal Upsampling can not be used with an Image" if source_is_image else ""
@@ -408,6 +482,45 @@ def temporal_upsample(temporal_upsampling, sample, previous_last_frame, fps, *, 
             elif borrowed_context is None and hasattr(handler, "load_upsampler"):
                 handler.load_upsampler(temporal_upsampling, **kwargs)
             return handler.temporal_upsample(temporal_upsampling, sample, previous_last_frame, fps, loaded_model_context=borrowed_context, **kwargs)
+        finally:
+            if borrowed_context is not None:
+                borrowed_context.offloadobj.unload_all()
+            elif persistent:
+                offload_registry.unload_vram([name])
+            else:
+                offload_registry.release_all([name])
+
+
+def texture_mesh(temporal_upsampling, mesh, *, main_offloadobj=None, loaded_model_context=None, parameter_values=None, **kwargs):
+    """The mesh (shared.mesh3d.Mesh) textured by the texturer of temporal_upsampling, with its declared parameters from
+    parameter_values (the slot's runtime values, parameter_ui.runtime_values) and kwargs (reference_image, seed,
+    abort_callback, progress_callback...)."""
+    global _kept_texturer
+    handler = find_temporal_upsampler(temporal_upsampling)
+    if handler is None:
+        raise ValueError(f"No texturer registered for '{temporal_upsampling}'")
+    kwargs["profile"] = 0
+    if kwargs.get("init_pipe") is None:
+        kwargs["init_pipe"] = partial(processor_memory.init_pipe, server_config=_temporal_upsampler_server_config)
+    kwargs.update(runtime_parameter_kwargs(temporal_upsampling, parameter_values))
+    name = handler.query_temporal_upsampler_def()["name"]
+    persistent = handler.persistent_models() if hasattr(handler, "persistent_models") else False
+    if persistent:
+        if _kept_texturer not in (None, handler):
+            offload_registry.release_all([_kept_texturer.query_temporal_upsampler_def()["name"]])
+        _kept_texturer = handler
+    borrowed_context = compatible_loaded_model(handler, temporal_upsampling, loaded_model_context)
+    if borrowed_context is None and hasattr(handler, "download"):
+        from shared.utils.download import process_files_def
+        handler.download(kwargs.get("process_files") or process_files_def, temporal_upsampling=temporal_upsampling)
+    with attention_shared_state():
+        try:
+            core_offloadobj = loaded_model_context.offloadobj if loaded_model_context is not None else main_offloadobj
+            if core_offloadobj is not None:
+                core_offloadobj.unload_all()
+            if borrowed_context is None and hasattr(handler, "load_upsampler"):
+                handler.load_upsampler(temporal_upsampling, **kwargs)
+            return handler.texture(mesh, temporal_upsampling, loaded_model_context=borrowed_context, **kwargs)
         finally:
             if borrowed_context is not None:
                 borrowed_context.offloadobj.unload_all()

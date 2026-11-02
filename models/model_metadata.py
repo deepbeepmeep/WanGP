@@ -109,6 +109,8 @@ def infer_outputs(model_def):
     outputs = infer_main_outputs(model_def)
     if model_def.get("returns_audio", False) and "audio" not in outputs:
         outputs.append("audio")
+    # other kinds of output a model can also give, such as "text" side files (a transcript) or an optional "video"
+    outputs += [output for output in model_def.get("extra_outputs", []) if output not in outputs]
     return outputs
 
 
@@ -159,7 +161,8 @@ def infer_media_inputs(model_def):
     image_control = image_outputs and not model_def.get("reference_video_enabled", False)
     custom_guide = model_def.get("custom_guide")
     return {
-        **({"custom_file": {"name": custom_guide.get("name", "Custom Guide"), "kinds": custom_guide_kinds(model_def), "file_types": list(custom_guide.get("file_types", [])), "required": bool(custom_guide.get("required", False))}} if custom_guide is not None else {}),
+        **({"custom_file": {"name": custom_guide.get("name", "Custom Guide"), "kinds": custom_guide_kinds(model_def), "file_types": list(custom_guide.get("file_types", [])), "required": bool(custom_guide.get("required", False)),
+                           **{key: custom_guide[key] for key in ("model_mode", "model_mode_not", "video_prompt_type", "video_prompt_type_not", "audio_prompt_type", "audio_prompt_type_not") if key in custom_guide}}} if custom_guide is not None else {}),
         "image": {
             "start": "S" in image_prompt_types_allowed,
             "end": "E" in image_prompt_types_allowed or bool(model_def.get("end_frames_always_enabled", False)),
@@ -183,6 +186,9 @@ def infer_media_inputs(model_def):
             "reference": bool(model_def.get("reference_audio_enabled", False)),
             # A control audio drives the output and is kept as its soundtrack.
             "control": bool(model_def.get("output_audio_is_input_audio", False)) or _choice_values_contain(model_def.get("audio_prompt_type_sources", None), "S"),
+            # the soundtrack of a video (audio_prompt_type "K": the Control Video's first audio track) as the audio input
+            "soundtrack": _choice_values_contain(model_def.get("audio_prompt_type_sources", None), "K")
+                          or guide_custom_choices is not None and "K" in "".join(guide_custom_choices.get("audio_letters", {}).values()),
             "output": bool(model_def.get("audio_only", False) or model_def.get("returns_audio", False)),
         },
     }

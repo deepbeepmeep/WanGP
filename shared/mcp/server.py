@@ -21,6 +21,7 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from postprocessing import parameter_ui
 from shared.mesh3d.glb import MESH_EXTENSIONS
 from shared.utils.gallery_sources import GALLERY_SOURCES, WORLD_EXTENSIONS, source_for_kind
 from shared.utils.gallery_media import disambiguate_gallery_media_ids, gallery_media_ids
@@ -70,6 +71,7 @@ _TOOLBOX_ACTIONS = {
     "extract_video",
     "extract_audio",
     "transcribe_media",
+    "advanced_transcription",
     "mute_video",
     "remove_vocals",
     "replace_audio",
@@ -92,6 +94,7 @@ _TOOLBOX_MEDIA_PARAMETERS = {
     "extract_video": ("media_id",),
     "extract_audio": ("media_id",),
     "transcribe_media": ("media_id",),
+    "advanced_transcription": ("media_id",),
     "mute_video": ("media_id",),
     "remove_vocals": ("media_id",),
     "replace_audio": ("video_id", "audio_id"),
@@ -113,8 +116,9 @@ _MCP_MEDIA_SETTING_KEYS = {
     "image_start", "image_end", "image_refs", "image_guide", "image_mask",
     "video_guide", "video_guide2", "video_guide3", "video_mask", "video_source",
     "audio_guide", "audio_guide2", "audio_guide3", "audio_source",
-    "replace_voice_sample", "replace_voice_sample2", "custom_guide",
+    "replace_voice_sample", "replace_voice_sample2", "custom_guide", parameter_ui.IMAGES_SETTING,
 }
+NESTED_SETTINGS = {"custom_settings", *parameter_ui.SETTINGS.values()}  # the settings holding dictionaries
 _GALLERY_LOCK = threading.RLock()
 
 
@@ -126,6 +130,7 @@ def _read_markdown_section(path: Path, start_heading: str, end_heading: str) -> 
 
 
 def _register_documentation_resources(mcp, file_access_policy=None, long_text_active: bool = False, api_version: str | int = 1) -> None:
+    from shared.deepy.config import python_apps_level
     from shared.deepy.web_search import enabled as web_search_enabled
 
     from .skills import skill_metadata
@@ -155,6 +160,8 @@ def _register_documentation_resources(mcp, file_access_policy=None, long_text_ac
         if skill_name in {"long-story-writing", "long-generation-prompts"} and not long_text_active:
             continue
         if skill_name in ("web-research", "lora-search") and not web_search_enabled():
+            continue
+        if skill_name == "web-apps" and python_apps_level() == "off" or skill_name == "progression-design" and python_apps_level() == "off" and not long_text_active:
             continue
         resource_uri = f"wangp://skills/{skill_name}"
         read_skill = document_reader(path)
@@ -860,7 +867,8 @@ def _validate_generation_media(session, settings, model_type, path):
     for key in sorted(supplied & checks.keys()):
         supported, active, required = checks[key]
         if not supported:
-            reject(key, "input is unsupported in this model/output mode")
+            reference = key in ("image_start", "image_end", "image_guide") and reference_choices and "image_refs" not in supplied
+            reject(key, "input is unsupported in this model/output mode" + ("; this model takes its picture in image_refs" if reference else ""))
         if not active:
             reject(key, f"input would be ignored; requires {required}")
     if "image_refs" in supplied:
@@ -878,6 +886,10 @@ def _validate_generation_media(session, settings, model_type, path):
             from postprocessing.audio_processors import method_metadata
             if image_output or not method_metadata(effective.get(method_key, ""))[capability]:
                 reject(key, f"input requires a {method_key} processor that uses it")
+    if parameter_ui.IMAGES_SETTING in supplied:  # read by the post-processors declaring an images parameter (a 3D refiner's or texturer's Object Image)
+        methods = {slot: parameter_ui.method_of(slot, effective.get("spatial_upsampling" if slot == parameter_ui.SPATIAL else "temporal_upsampling", "")) for slot in parameter_ui.SETTINGS}
+        if parameter_ui.images_parameter(*(parameter_ui.slot_parameters(slot, method) for slot, method in methods.items())) is None:
+            reject(parameter_ui.IMAGES_SETTING, "input requires a spatial or temporal post-processor that uses reference images")
 
 
 def _resolve_generation_media(session, source: dict[str, Any] | list[dict[str, Any]], allow_read_file_system: bool, file_access_policy=None):
@@ -1139,10 +1151,10 @@ def _build_mcp_postprocessing_task(source_path: str, process: dict[str, Any], pa
         task.update({"mode": "edit_audio", "audio_source": source_path, "postprocess_audio": process_id})
     parameter_defs = {str(parameter["name"]): parameter for parameter in process.get("parameters", ())}
     spatial_parameter_names = set()
-    if process_type == postprocessing_catalog.PROCESS_TYPE_SPATIAL_UPSAMPLING:
-        spatial_parameters = {name: value for name, value in parameters.items() if name != "multiplier"}
+    if process_type in (postprocessing_catalog.PROCESS_TYPE_SPATIAL_UPSAMPLING, postprocessing_catalog.PROCESS_TYPE_TEMPORAL_UPSAMPLING):
+        spatial_parameters = {name: value for name, value in parameters.items() if name not in ("multiplier", "seed")}
         spatial_parameter_names.update(spatial_parameters)
-        task.update(spatial_parameters)
+        task.update(postprocessing_catalog.task_parameters(process, spatial_parameters))
     path_task_keys = {"audio_path": "audio_source", "voice_sample_path": "replace_voice_sample", "voice_sample2_path": "replace_voice_sample2"}
     for parameter_name, task_key in path_task_keys.items():
         if parameter_name in parameters:
@@ -2008,6 +2020,10 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
         media_type = _mcp_media_type(source_path)
         if not media_type:
             raise ValueError(f"Unsupported media file extension: {Path(source_path).suffix}")
+        if media_type == "3d":
+            from shared.utils.mesh_postprocessing import is_mesh_file
+            if not is_mesh_file(source_path):
+                raise ValueError("Gaussian splats can not be post-processed: only meshes can be refined or textured.")
         processes = postprocessing_catalog.query_processes(media_type)
         discovered_processes = _mcp_postprocessing_processes(media_type, allow_read_file_system, processes)
         process_id = str(process or "").strip()
@@ -2089,9 +2105,10 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
                 if not isinstance(settings, dict):
                     raise ValueError(f"{path} must be a settings object. Nothing was submitted.")
                 defaults_call = f' See wangp_model(model_type="{settings.get("model_type") or "<model_type>"}", action="defaults", arguments={{}}) for setting names and value formats.'
-                nested = [key for key, value in settings.items() if isinstance(value, dict) and key != "custom_settings" or key == "resolution" and not isinstance(value, str)]
+                # nested values: the model's custom_settings and the post-processing slots' parameter dictionaries
+                nested = [key for key, value in settings.items() if isinstance(value, dict) and key not in NESTED_SETTINGS or key == "resolution" and not isinstance(value, str)]
                 if nested:
-                    expected = f'must be a "WIDTHxHEIGHT" string such as "1280x720", not {json.dumps(settings["resolution"])}' if nested[0] == "resolution" else "must be a single value, not an object; only custom_settings holds nested values"
+                    expected = f'must be a "WIDTHxHEIGHT" string such as "1280x720", not {json.dumps(settings["resolution"])}' if nested[0] == "resolution" else "must be a single value; only custom_settings and *_postprocessing_parameters hold objects"
                     raise ValueError(f"{path}.{nested[0]} {expected}.{defaults_call} Nothing was submitted.")
                 if str(settings.get("mode", "") or "").startswith("edit_"):
                     continue
@@ -2100,6 +2117,8 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
                 if not isinstance(model_type, str) or not model_type.strip():
                     template_hint = "" if api_version == "1" else ', or the settings must name a template ("template": "<task>")'
                     raise ValueError(f"{path}.{model_key} must be a non-empty string for generation{template_hint}. Nothing was submitted.")
+                if session.get_model_metadata(model_type.strip()) is None:  # a retired model type becomes its new type (settings converted in place)
+                    model_type = session._ensure_runtime().module.convert_retired_model_type(settings)
                 if session.get_model_metadata(model_type.strip()) is None:
                     template_call = 'wangp_templates(task="...", template="default")' if api_version == "2.1" else 'wangp_deepy_templates(tool_id="...")'
                     known = [str(item.get("model_type") or "") for item in session.list_model_defs()]
@@ -2238,7 +2257,7 @@ def call_tool_inline(mcp, name: str, arguments: dict[str, Any]) -> dict[str, Any
 def _build_python_sandbox(session, toolbox, file_access_policy, call_tool=None):
     """The session's Python sandbox (toolbox wangp_python) when the configuration enables it: its folder lies in the agent's documents workspace; call_tool(name, arguments) serves scripts' WanGP tool calls."""
     from shared.deepy import media_registry
-    from shared.deepy.config import DEEPY_PYTHON_SANDBOX_DEFAULT, DEEPY_PYTHON_SANDBOX_KEY, get_deepy_config_value, normalize_deepy_python_sandbox
+    from shared.deepy.config import DEEPY_PYTHON_SANDBOX_DEFAULT, DEEPY_PYTHON_SANDBOX_KEY, get_deepy_config_value, normalize_deepy_python_sandbox, python_apps_level
     from shared.deepy.python_sandbox import PythonSandbox
 
     if normalize_deepy_python_sandbox(get_deepy_config_value(DEEPY_PYTHON_SANDBOX_KEY, DEEPY_PYTHON_SANDBOX_DEFAULT)) != "enabled" or file_access_policy.workspace is None:
@@ -2253,9 +2272,13 @@ def _build_python_sandbox(session, toolbox, file_access_policy, call_tool=None):
     def compact(record):
         return None if record is None else _output_record(_compact_gallery_record(record), record["path"])
 
+    apps = None
+    if python_apps_level() != "off":
+        from shared.apps.dev import AppWorkshop
+        apps = AppWorkshop(file_access_policy.workspace / "sandbox", resolve_path=resolve_path, publish_app=lambda package, description: compact(toolbox.publish_sandbox_app(package, description)), virtualize=file_access_policy.virtualize_path)
     return PythonSandbox(file_access_policy.workspace / "sandbox", resolve_path=resolve_path, publish_media=lambda path, description: compact(toolbox.publish_sandbox_media(path, description)),
                          publish_frames=lambda frames, fps, name, description: compact(toolbox.publish_sandbox_frames(frames, fps, name, description)), virtualize=file_access_policy.virtualize_path,
-                         call_tool=call_tool, list_dir=lambda reference: file_access_policy.require_read(reference, directory=True))
+                         call_tool=call_tool, list_dir=lambda reference: file_access_policy.require_read(reference, directory=True), apps=apps)
 
 
 def _http_settings(transport: str, host: str | None, port: int | None, oauth) -> dict[str, Any]:

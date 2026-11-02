@@ -5,6 +5,10 @@
   "description": "Cut objects, design their motion paths, preview the animation, and send the mask directly into WanGP.",
   "date": "",
   "wan2gp_version": "",
-  "uninstallable": false
+  "uninstallable": false,
+  "info_card": {
+    "tagline": "Turn a Still Image into Motion",
+    "description": "Cut objects from an image, arrange their layers and draw motion paths. Preview the animation, then send the animated mask directly to WanGP to guide your video.",
+    "details": "Image Layers · Motion Paths · Animation Preview"
+  }
 }
-

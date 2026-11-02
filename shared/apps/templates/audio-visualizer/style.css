@@ -1,0 +1,4 @@
+html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #07080c; color: #f2f5f8; font-family: system-ui, sans-serif; }
+canvas { display: block; width: 100%; height: 100%; }
+#start { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); padding: 14px 26px; border: 1px solid #4cc9f0; border-radius: 999px; background: rgba(7, 8, 12, 0.7); color: inherit; font: 600 18px system-ui, sans-serif; cursor: pointer; }
+#start[hidden] { display: none; }

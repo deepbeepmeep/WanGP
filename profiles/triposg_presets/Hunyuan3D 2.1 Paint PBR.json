@@ -1,0 +1,13 @@
+{
+    "spatial_upsampling": "",
+    "spatial_postprocessing_parameters": {},
+    "temporal_upsampling": "hunyuan3d_paint",
+    "temporal_postprocessing_parameters": {
+        "texture_views": "8_768",
+        "texture_size": 2048,
+        "texture_max_faces": 40000,
+        "texture_guidance": 3.0
+    },
+    "settings_version": 2.82,
+    "help": "PBR textures painted all around the mesh by Hunyuan3D 2.1 Paint."
+}

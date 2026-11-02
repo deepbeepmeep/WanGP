@@ -54,11 +54,11 @@ def _load_affine_package(architecture, width=8):
     return table, affine
 
 
-def _aligned_affine_map(architecture, target_table):
+def _aligned_affine_map(architecture, target_table, package=None):
     target_table = target_table.detach().to(device="cpu", dtype=torch.float64)
     if target_table.ndim != 2 or target_table.shape[1] not in _PRUNED_WIDTHS:
         raise ValueError(f"Unsupported MiniMax H3 {architecture} AdaLN target table shape {tuple(target_table.shape)}")
-    canonical_table, canonical_affine = _load_affine_package(architecture, target_table.shape[1])
+    canonical_table, canonical_affine = _load_affine_package(architecture, target_table.shape[1]) if package is None else _package_at_width(package, target_table.shape[1])
     if target_table.shape[0] != canonical_table.shape[0]:
         position = torch.linspace(0, canonical_table.shape[0] - 1, target_table.shape[0], dtype=torch.float64, device=target_table.device)
         lower = position.floor().long().clamp(max=canonical_table.shape[0] - 2)
@@ -83,6 +83,14 @@ def _canonical_encoder(architecture, width):
     return torch.linalg.pinv(affine[:width].double(), rtol=1e-14).T.float()
 
 
+def _package_at_width(package, width):
+    if package.width == width:
+        return package.table, package.affine
+    if width == 4 and package.width == 8:
+        return package.table[:, :4], torch.cat((package.affine[:4], package.affine[-1:]))
+    raise ValueError(f"MiniMax H3 affine map {package.name} has width {package.width}, not {width}")
+
+
 def _add_bias_delta(state_dict, key, delta):
     existing = state_dict.get(key)
     if existing is not None:
@@ -92,7 +100,8 @@ def _add_bias_delta(state_dict, key, delta):
     state_dict[key] = delta
 
 
-def convert_adaln_loras(model_type, state_dict, target_table=None, hybrid_ref2va_blocks=None, ref2va_target_table=None):
+def convert_adaln_loras(model_type, state_dict, target_table=None, hybrid_ref2va_blocks=None, ref2va_target_table=None,
+                       source_package=None, target_package=None, checkpoint_checked=False):
     """Convert the AdaLN input width without changing the LoRA adapter rank."""
     architecture = _architecture(model_type)
     target_width = FULL_TIME_DIM if target_table is None else int(target_table.shape[1])
@@ -129,17 +138,29 @@ def convert_adaln_loras(model_type, state_dict, target_table=None, hybrid_ref2va
         raise ValueError(f"MiniMax H3 LoRA mixes AdaLN input widths: {sorted(source_widths)}")
     source_width = source_widths.pop()
     supported_widths = (*_PRUNED_WIDTHS, FULL_TIME_DIM)
-    if source_width == target_width and hybrid_ref2va_blocks is None:
+    from .lora_tables import detect_table
+
+    if target_package is None and target_table is not None and hybrid_ref2va_blocks is None:
+        target_package = detect_table(target_table)
+    canonical_target = target_package is not None and all(torch.equal(actual, expected) for actual, expected in
+                         zip((target_package.table, target_package.affine), _load_affine_package(architecture, target_package.width)))
+    if source_width != FULL_TIME_DIM and source_package is None and (
+            target_package is not None and not canonical_target or checkpoint_checked and target_package is None):
+        raise ValueError("MiniMax H3 cannot identify this pruned LoRA's source table. Attach its source affine package; the target checkpoint does not identify the adapter's training basis.")
+    if checkpoint_checked and target_table is not None and target_package is None and hybrid_ref2va_blocks is None:
+        raise ValueError("MiniMax H3 checkpoint table is not registered and has no embedded affine map")
+    same_basis = source_package is None or target_package is not None and torch.equal(source_package.table, target_package.table) and torch.equal(source_package.affine, target_package.affine)
+    if source_width == target_width and hybrid_ref2va_blocks is None and same_basis:
         return 0, architecture, source_width, target_width
     if source_width not in supported_widths or target_width not in supported_widths:
         raise ValueError(f"Unsupported MiniMax H3 AdaLN LoRA conversion {source_width} -> {target_width}; supported widths are {supported_widths}")
 
-    source_affine = None if source_width == FULL_TIME_DIM else _load_affine_package(architecture, source_width)[1]
-    source_encoder = None if source_width == FULL_TIME_DIM else _canonical_encoder(architecture, source_width)
+    source_affine = None if source_width == FULL_TIME_DIM else (_load_affine_package(architecture, source_width)[1] if source_package is None else _package_at_width(source_package, source_width)[1])
+    source_encoder = None if source_affine is None else (_canonical_encoder(architecture, source_width) if source_package is None else torch.linalg.pinv(source_affine[:source_width].double(), rtol=1e-14).T.float())
     target_tables = {architecture: target_table}
     if hybrid_ref2va_blocks is not None:
         target_tables = {"fl2va": target_table, "ref2va": ref2va_target_table}
-    target_affines = {target_architecture: None if table is None else _aligned_affine_map(target_architecture, table)
+    target_affines = {target_architecture: None if table is None else _aligned_affine_map(target_architecture, table, target_package if hybrid_ref2va_blocks is None else None)
                       for target_architecture, table in target_tables.items()}
 
     converted_count = 0
@@ -148,7 +169,7 @@ def convert_adaln_loras(model_type, state_dict, target_table=None, hybrid_ref2va
         if hybrid_ref2va_blocks is not None:
             block = int(module_name.split(".", 2)[1]) if module_name.startswith("blocks.") else -1
             target_architecture = "ref2va" if hybrid_ref2va_blocks[0] <= block <= hybrid_ref2va_blocks[1] else "fl2va"
-        if source_width == target_width and target_architecture == architecture:
+        if source_width == target_width and target_architecture == architecture and same_basis:
             continue
         down = state_dict[down_key]
         mapped = down.float() if source_encoder is None else down.float() @ source_encoder

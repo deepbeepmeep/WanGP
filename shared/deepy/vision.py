@@ -2,14 +2,15 @@
 from __future__ import annotations
 
 import math
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import torch
 from PIL import Image
 
+from shared.deepy.image_channels import upright
 from shared.llm_engines.lmgp.models.qwen3_5 import Qwen3_5ForCausalLM
-from shared.prompt_enhancer.qwen35_vl import _prepare_multimodal_vllm_prompt
+from shared.prompt_enhancer.qwen35_vl import TEXT_MODEL_ID as _TEXT_MODEL_ID, VISION_MODEL_ID as _VISION_MODEL_ID, _prepare_multimodal_vllm_prompt, vision_beside_text
 from shared.utils.video_decode import decode_video_frame_indices_ffmpeg
 
 
@@ -29,8 +30,6 @@ VISION_VIDEO_MAX_SAMPLES_PER_SECOND = 2
 VISION_VIDEO_SHORT_RANGE_SECONDS, VISION_VIDEO_SHORT_RANGE_SAMPLES_PER_SECOND = 3.0, 8  # joins and cuts need dense frames
 VISION_VIDEO_DECODE_BATCH_SIZE = 8
 VISION_QA_SYSTEM_PROMPT = "Answer the user's question about the labeled visual inputs accurately and concisely. Inputs may be images or ordered frames from one or more videos. If the answer is uncertain, say so."
-_TEXT_MODEL_ID = "prompt_enhancer_llm_model"
-_VISION_MODEL_ID = "prompt_enhancer_image_caption_vision_tower_model"
 
 
 def can_keep_text_resident(runtime, manager) -> bool:
@@ -57,49 +56,40 @@ def can_keep_text_resident(runtime, manager) -> bool:
     return cache_bytes >= vision_bytes
 
 
+def engine_idle(runtime):
+    """While the vision tower encodes, the assistant's engine is not used: MMGP may release its KV cache if VRAM runs short (Deepy saves its
+    context first, restored at its next segment)."""
+    engine = None if runtime is None else getattr(runtime.model, "_prompt_enhancer_vllm_engine", None)
+    return nullcontext() if engine is None else engine.idle()
+
+
 @contextmanager
 def resident_inspection(runtime, caption_model, manager):
-    """Lend the assistant's cache memory to vision without moving its weights."""
+    """The vision tower beside the assistant's language model, whose weights and context stay. With the dynamic preload (MMGP VRAM
+    allocator) the tower takes only the VRAM it needs: the idle model's blocks, then its KV cache (engine_idle), and the answer runs beside the
+    live context when the free pages of the cache hold it (Qwen35AssistantRuntime.generate_embedded_answer). Without it, the cache's memory
+    is lent to the tower: the context goes to RAM and comes back afterwards."""
+    from mmgp import runtime as mmgp_runtime
     from shared.prompt_enhancer.qwen35_assistant_runtime import _ASSISTANT_PREFILL_CHUNK_TOKENS
 
     model = runtime.model
-    snapshot = runtime.snapshot_context()
+    lend = not mmgp_runtime.dynamic_preload(model)
+    snapshot = runtime.snapshot_context() if lend else None
     min_model_len = model._prompt_enhancer_min_model_len_hint
     prefill_chunk_tokens = model.__dict__.get("_prefill_chunk_tokens")
-    cotenants = manager.cotenants_map
-    adapter = caption_model.model.language_model
-    input_embedding = adapter._input_embedding_model
-
-    def unload_vision():
-        if _VISION_MODEL_ID not in manager.active_models_ids:
-            return
-        torch.cuda.synchronize()
-        # MMGP owns the CPU originals, including any streamed vision blocks.
-        prefix = _VISION_MODEL_ID + "/"
-        for name in manager.blocks_of_modules:
-            if name == _VISION_MODEL_ID or name.startswith(prefix):
-                manager.gpu_unload_blocks(_VISION_MODEL_ID, None if name == _VISION_MODEL_ID else name[len(prefix):])
-        index = manager.active_models_ids.index(_VISION_MODEL_ID)
-        manager.active_models_ids.pop(index)
-        manager.active_models.pop(index)
-        torch.cuda.empty_cache()
-
     try:
-        # Teardown synchronizes in-flight graphs and releases their KV/state pointers.
-        # The tower has no decoder cache; allocate the smaller QA cache after encoding.
-        model._prompt_enhancer_vllm_engine.close()
-        model._prompt_enhancer_min_model_len_hint = VISION_MIN_MODEL_LEN
+        if lend:
+            # Teardown synchronizes in-flight graphs and releases their KV/state pointers.
+            # The tower has no decoder cache; allocate the smaller QA cache after encoding.
+            model._prompt_enhancer_vllm_engine.close()
+            model._prompt_enhancer_min_model_len_hint = VISION_MIN_MODEL_LEN
         model._prefill_chunk_tokens = _ASSISTANT_PREFILL_CHUNK_TOKENS
-        manager.cotenants_map = {**cotenants, _TEXT_MODEL_ID: [*cotenants.get(_TEXT_MODEL_ID, []), _VISION_MODEL_ID], _VISION_MODEL_ID: [*cotenants.get(_VISION_MODEL_ID, []), _TEXT_MODEL_ID]}
-        # The enhancer's separate MMGP embedding alias would load a second copy.
-        object.__setattr__(adapter, "_input_embedding_model", model.token_embd)
-        runtime._log("Inspection: keeping Qwen weights resident; lending assistant cache memory to vision (and Qwen blocks if it needs more).")
-        yield unload_vision
+        with vision_beside_text(caption_model, manager) as unload_vision:
+            runtime._log("Inspection: keeping Qwen weights resident; " + ("lending assistant cache memory to vision (and Qwen blocks if it needs more)." if lend else "the vision tower takes Qwen blocks, then its cache, only if VRAM runs short."))
+            yield unload_vision
     finally:
-        unload_vision()
-        object.__setattr__(adapter, "_input_embedding_model", input_embedding)
-        manager.cotenants_map = cotenants
-        model._prompt_enhancer_vllm_engine.close()
+        if lend:
+            model._prompt_enhancer_vllm_engine.close()
         model._prompt_enhancer_min_model_len_hint = min_model_len
         if prefill_chunk_tokens is None:
             del model._prefill_chunk_tokens
@@ -129,7 +119,7 @@ def normalize_inspection_bbox(bbox: Any) -> list[int] | None:
 
 
 def prepare_inspection_image(image: Any, max_edge: int | None = None, max_pixels: int | None = None, bbox: list[int] | None = None) -> Image.Image:
-    prepared = image.convert("RGB")
+    prepared = upright(image).convert("RGB")
     if bbox is not None:
         x_min, y_min, x_max, y_max = bbox
         width, height = prepared.size

@@ -11,7 +11,7 @@ import types
 import math
 from contextlib import contextmanager
 from functools import partial
-from mmgp import offload
+from mmgp import offload, transfer
 import torch
 import torch.nn as nn
 import torch.cuda.amp as amp
@@ -498,6 +498,7 @@ class WanAny2V:
         self_refiner_f_uncertainty = 0.0,
         self_refiner_certain_percentage = 0.999,
         custom_settings=None,
+        custom_sigmas=None,
         save_masks=False,
         vae_upsampler=None,
         set_progress_status=None,
@@ -546,6 +547,27 @@ class WanAny2V:
             timesteps = sample_scheduler.timesteps
         else:
             raise NotImplementedError(f"Unsupported Scheduler {sample_solver}")
+        if custom_sigmas and any(schedule is not None for schedule in custom_sigmas):
+            default_sigmas = (sample_scheduler.sigmas[:-1].tolist() if sample_solver != "euler"
+                              else (timesteps / self.num_train_timesteps).tolist())
+            thresholds = [1.0] + [float(value) / self.num_train_timesteps for value in (switch_threshold, switch2_threshold)[:len(custom_sigmas) - 1]] + [0.0]
+            combined_sigmas = []
+            for phase, schedule in enumerate(custom_sigmas):
+                values = schedule if schedule is not None else [sigma for sigma in default_sigmas if thresholds[phase + 1] < sigma <= thresholds[phase]]
+                if not values:
+                    raise ValueError(f"Custom Sigmas phase {phase + 1} has no steps in the automatic schedule; increase Steps, adjust the phase switches, or provide that phase's sigmas.")
+                combined_sigmas.extend(values)
+            if sample_solver == "euler":
+                sample_scheduler.num_inference_steps = len(combined_sigmas)
+            else:
+                # set_timesteps resets multistep history. These sigmas already include
+                # any desired shift; passing shift=1 avoids applying it a second time.
+                sample_scheduler.set_timesteps(sigmas=np.asarray(combined_sigmas, dtype=np.float32), device=self.device, shift=1.0)
+            # Scale before rounding to FP32, just like the phase-switch controls.
+            # Rounding sigmas first can move a boundary one step into the next phase.
+            timesteps = torch.tensor([sigma * self.num_train_timesteps for sigma in combined_sigmas], dtype=torch.float32, device=self.device)
+            sample_scheduler.timesteps = timesteps
+            sampling_steps = len(combined_sigmas)
         original_timesteps = timesteps
 
         seed_g = torch.Generator(device=self.device)
@@ -876,7 +898,7 @@ class WanAny2V:
 
         # Animate 2
         if animate2:
-            input_frames = guide_to_float(input_frames[:, :frame_num].to(self.device)).to(self.VAE_dtype)  # uint8 guides converted on the GPU
+            input_frames = guide_to_float(transfer.move(input_frames[:, :frame_num], self.device)).to(self.VAE_dtype)  # uint8 guides converted on the GPU
             if not input_ref_images:
                 input_ref_images = [image_start if image_start is not None else convert_image_to_tensor(pre_video_frame)]
             image_ref = input_ref_images[0].to(device=self.device, dtype=self.VAE_dtype)
@@ -1216,7 +1238,7 @@ class WanAny2V:
             from .multitalk.multitalk import get_target_masks
             audio_proj = [audio.to(self.dtype) for audio in audio_proj]
             human_no = len(audio_proj[0])
-            token_ref_target_masks = get_target_masks(human_no, lat_h, lat_w, height, width, face_scale = 0.05, bbox = speakers_bboxes).to(self.dtype) if human_no > 1 else None
+            token_ref_target_masks = get_target_masks(human_no, lat_h, lat_w, height, width, face_scale = 0.05, bbox = speakers_bboxes).to(device=self.device, dtype=self.dtype) if human_no > 1 else None
 
         if fantasy and audio_proj != None:
             kwargs.update({ "audio_proj": audio_proj.to(self.dtype), "audio_context_lens": audio_context_lens, }) 
@@ -1523,6 +1545,8 @@ class WanAny2V:
             gauss_mask = load_gauss_mask(fl.locate_file("gauss_mask"))
             latents = apply_alpha_shift(latents, gauss_mask, 0.03)
         if "G" in video_prompt_type: randn = latents
+        if custom_sigmas and custom_sigmas[0] is not None and "G" not in video_prompt_type:
+            latents.mul_(original_timesteps[0] / self.num_train_timesteps)
         if apg_switch != 0:  
             apg_momentum = -0.75
             apg_norm_threshold = 55

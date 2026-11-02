@@ -1,0 +1,20 @@
+{
+    "model": {
+        "name": "TRELLIS.2 Shape 4B",
+        "architecture": "trellis2_shape",
+        "description": "TRELLIS.2 Shape (Microsoft): one picture of an object to a 3D mesh (GLB) that keeps thin and intricate structures. Its presets add PBR textures (SUPRA-Tex, Hunyuan3D 2.1 Paint or TRELLIS.2 Texture) and fine relief (Hi3D) in the same generation.",
+        "URLs": [
+            "https://huggingface.co/DeepBeepMeep/3D/resolve/main/trellis2_shape_bf16.safetensors",
+            "https://huggingface.co/DeepBeepMeep/3D/resolve/main/trellis2_shape_int8_convrot.safetensors"
+        ]
+    },
+    "prompt": "Bronze lion statue",
+    "num_inference_steps": 12,
+    "guidance_scale": 7.5,
+    "model_mode": 2,
+    "batch_size": 1,
+    "custom_settings": {
+        "max_faces": 100000,
+        "max_tokens": 49152
+    }
+}

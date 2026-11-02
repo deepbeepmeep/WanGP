@@ -1,0 +1,26 @@
+SPARC3D authors and contributors
+================================
+
+Sparc3D: Sparse Representation and Construction for High-Resolution 3D Shapes
+Modeling — https://arxiv.org/abs/2505.14521
+
+Paper authors
+-------------
+
+  Zhihao Li
+  Yufei Wang
+  Heliang Zheng
+  Yihao Luo
+  Bihan Wen
+
+Component credits
+-----------------
+
+Named here because the credit belongs with the code, not only with the paper.
+
+  Zhihao Li     GPU surface voxelization in sparc3d/ops, originally written as
+                the pytorch-voxelization extension and implemented as Triton
+                kernels for this release.
+
+Third-party code redistributed with this package is credited separately in
+NOTICE and THIRD_PARTY_LICENSES.md.

@@ -21,7 +21,10 @@ def task_settings(source):
 
 
 def effective_settings(session, supplied):
+    supplied = copy.deepcopy(supplied)
     model_type = supplied.get("model_type", supplied.get("base_model_type"))
+    if session.get_model_def(model_type) is None:  # a model type merged into others (3D stage models + post-processors)
+        model_type = session._ensure_runtime().module.convert_retired_model_type(supplied)
     model_def = session.get_model_def(model_type)
     normalized = copy.deepcopy(supplied)
     apply_media_flag_defaults(normalized, model_def)
@@ -36,6 +39,7 @@ def effective_settings(session, supplied):
 def input_metadata(session, settings):
     from .server import _MCP_MEDIA_SETTING_KEYS, _mcp_media_type
     from PIL import Image
+    from shared.deepy.image_channels import upright_size
     from shared.utils.video_decode import resolve_media_binary
 
     result = []
@@ -49,7 +53,7 @@ def input_metadata(session, settings):
             record = {"role": role, "path": str(path), "media_type": _mcp_media_type(str(path)), "size_bytes": path.stat().st_size}
             if record["media_type"] == "image":
                 with Image.open(path) as image:
-                    record.update(width=image.width, height=image.height)
+                    record.update(zip(("width", "height"), upright_size(image)))
             elif record["media_type"] in {"audio", "video"}:
                 if probe:
                     process = subprocess.run([str(probe), "-v", "error", "-show_entries", "stream=codec_type,width,height,sample_rate,channels,avg_frame_rate:format=duration", "-of", "json", str(path)], capture_output=True, text=True, timeout=15)
@@ -137,7 +141,7 @@ def validate_declared_settings(session, supplied, resolve_media=None):
         definitions = module.get_model_custom_settings(model_def)
         if model_def.get("custom_guide"):
             definitions = [*definitions, {**model_def["custom_guide"], "id": "custom_guide", "type": "file"}]
-        definitions = [definition for definition in definitions if module.custom_setting_visible(definition, effective.get("video_prompt_type", ""), effective.get("audio_prompt_type", ""))]
+        definitions = [definition for definition in definitions if module.custom_setting_visible(definition, effective.get("video_prompt_type", ""), effective.get("audio_prompt_type", ""), effective.get("model_mode"))]
     error = extra_settings.validate_inputs(effective, {**model_def, "custom_settings": definitions})
     if error:
         raise ValueError(error)
@@ -183,7 +187,7 @@ def preflight(session, prepare_generation, prepare_postprocess, settings=None, m
                 inactive = [key for key in explicit if key in declared and not declared[key].visible]
                 if model_def.get("custom_settings"):
                     module = session._ensure_runtime().module
-                    inactive += [f"custom_settings.{definition['id']}" for definition in module.get_model_custom_settings(model_def) if definition["id"] in (explicit.get("custom_settings") or {}) and not module.custom_setting_visible(definition, effective.get("video_prompt_type", ""), effective.get("audio_prompt_type", ""))]
+                    inactive += [f"custom_settings.{definition['id']}" for definition in module.get_model_custom_settings(model_def) if definition["id"] in (explicit.get("custom_settings") or {}) and not module.custom_setting_visible(definition, effective.get("video_prompt_type", ""), effective.get("audio_prompt_type", ""), effective.get("model_mode"))]
                 schema = session.get_model_schema(model_type)["metadata"]
                 task = {"index": index, "model_type": model_type, "settings": effective,
                         "sources": {key: "explicit" if explicit.get(key) is not None else "standing_default_or_inferred" if key in supplied else "model_default" for key in effective},

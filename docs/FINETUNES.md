@@ -8,7 +8,7 @@ You can create a WanGP finetune definition in two ways:
 - **With the Finetune Creator / Editor** in the model toolbar. This is the recommended path when you want to create a finetune from the currently selected model, edit an existing finetune, import a shared finetune JSON file, or keep the current model settings as the finetune defaults.
 - **Manually**, by writing or editing a JSON definition in the **finetunes/** subfolder. This remains useful for advanced definitions, bulk editing, sharing files outside the UI, or when you want to review the exact JSON structure.
 
-WanGP finetune system can be also used to tweak default models : for instance you can add on top of an existing model some loras that will be always applied transparently.
+WanGP finetune system can be also used to tweak default models : for instance you ca plugin top of an existing model some loras that will be always applied transparently.
 
 Finetune models definitions are light json files that can be easily shared. You can find some of them on the WanGP *discord* server https://discord.gg/g7efUW9jGV
 

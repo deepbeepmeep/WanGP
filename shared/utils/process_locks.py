@@ -156,7 +156,9 @@ def try_acquire_GPU_ressources(state, process_id, process_name):
     return True
 
 
-def acquire_GPU_ressources(state, process_id, process_name, gr = None, custom_pause_msg = None, custom_wait_msg = None):
+def acquire_GPU_ressources(state, process_id, process_name, gr = None, custom_pause_msg = None, custom_wait_msg = None, parks = False):
+    """parks: a generation running suspends at its next step with its models parked (their VRAM is reclaimed only as this process
+    allocates it, see mmgp offload.park) rather than unloaded; for processes whose VRAM goes through PyTorch's allocator."""
     gen = get_gen_info(state)
     original_process_status = None
     release_actions = []
@@ -193,6 +195,7 @@ def acquire_GPU_ressources(state, process_id, process_name, gr = None, custom_pa
                     set_generation_state(gen, process_status="process:" + process_id)
                     break
                 original_process_status = process_status
+                gen["park_request"] = parks
                 set_generation_state(gen, process_status="request:" + process_id)
 
                 gen["pause_msg"] = custom_pause_msg if custom_pause_msg is not None else f"Generation Suspended while using {process_name}" 

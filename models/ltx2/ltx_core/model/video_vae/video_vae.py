@@ -3,6 +3,7 @@ import itertools
 from typing import Any, Callable, Iterator, List, Optional, Tuple
 
 import torch
+from mmgp import transfer
 from shared.utils.phase_progress import vae_encoding_progress, PhaseProgress, check_abort
 from einops import rearrange
 from torch import nn
@@ -794,7 +795,7 @@ def decode_video_to_tensor(
             frames = vae_range_to_hdr_linear(frames, transform=hdr_transform, channel_dim=1).to(dtype=tensor_dtype)
         else:
             frames = frames.add_(1.0).mul_(127.5).clamp_(0.0, 255.0)
-        video_tensor[position : position + frame_count, top:bottom, left:right].copy_(frames[0].permute(1, 2, 3, 0))
+        transfer.copy_(video_tensor[position : position + frame_count, top:bottom, left:right], frames[0].permute(1, 2, 3, 0))
         return frame_count
 
     try:
@@ -840,7 +841,7 @@ def decode_video_to_tensor(
                 decoded_video = vae_range_to_hdr_linear(decoded_video, transform=hdr_transform, channel_dim=1).to(dtype=tensor_dtype)
             else:
                 decoded_video = decoded_video.add_(1.0).mul_(127.5).clamp_(0.0, 255.0)
-            video_tensor[:frame_count].copy_(decoded_video[0].permute(1, 2, 3, 0))
+            transfer.copy_(video_tensor[:frame_count], decoded_video[0].permute(1, 2, 3, 0))  # (to RAM, without a GPU copy of the video)
             write_pos = frame_count
         return video_tensor[:write_pos]
     finally:

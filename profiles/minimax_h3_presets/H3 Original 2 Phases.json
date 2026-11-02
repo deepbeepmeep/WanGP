@@ -1,0 +1,16 @@
+{
+    "merge_loras": "merge before",
+    "activated_loras": [
+        "https://huggingface.co/DeepBeepMeep/MiniMax-H3/resolve/main/loras/minimax_h3_lightx2v_fl2v_turbo_4step_alpha16_v0.1.safetensors"
+    ],
+    "loras_multipliers": "0;1",
+    "guidance_phases": 2,
+    "video_prompt_type": "",
+    "custom_sigmas": "",
+    "num_inference_steps": 20,
+    "num_inference_steps2": 3,
+    "switch_threshold": 0.9035,
+    "guidance_scale": 1,
+    "flow_shift": 12,
+    "sample_solver": "euler"
+}

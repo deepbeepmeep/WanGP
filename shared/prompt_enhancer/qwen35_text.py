@@ -1,6 +1,7 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 from __future__ import annotations
 
+import contextlib
 import gc
 import json
 import os
@@ -21,7 +22,7 @@ from shared.llm_engines.lmgp import SamplingParams
 from shared.llm_engines.lmgp.models.qwen3_5 import Qwen3_5ForCausalLM, clear_qwen35_runtime_caches
 from shared.llm_engines.lmgp.layers.attention import reset_attention_backend_logs
 from shared.llm_engines.lmgp.utils.context import reset_context
-from shared.llm_engines.lmgp.vllm_support import TextEngine, resolve_lm_features
+from shared.llm_engines.lmgp.vllm_support import TextEngine, resolve_prompt_enhancer_lm_features
 from shared.qtypes.gguf import GGUFFirstRowsLinear, GGUFWeightTensor, materialize_module_source_tensors
 try:
     from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
@@ -708,7 +709,7 @@ def _resolve_llm_features(backend: str) -> dict:
     """What the LLM engine uses: the LM decoder optimizations the installation supports, each on its own (resolve_lm_features: CUDA
     graphs, MMGP's, the weights stay under its management; the Triton kernels: fused norms, activations, cache writes, GDN, sampling;
     FlashAttention 2), and the GGUF CUDA kernels."""
-    lm = resolve_lm_features()
+    lm = resolve_prompt_enhancer_lm_features()
     if backend == enhancer_quantization_GGUF:
         from shared.qtypes.gguf import _gguf_cuda_module
         native = _gguf_cuda_module()
@@ -775,7 +776,7 @@ def _get_or_create_vllm_engine(model, usage_mode: str | None = None):
     engine = getattr(model, "_prompt_enhancer_vllm_engine", None)
     active_mode = getattr(model, "_prompt_enhancer_vllm_mode", None)
     if engine is not None and usage_mode is not None and active_mode not in (None, usage_mode):
-        try:
+        try:  # its close saves the live context of an owner away (Deepy parked)
             engine.close()
         except Exception:
             pass
@@ -842,7 +843,11 @@ def _generate_messages_vllm(
     if len(messages) == 0:
         return []
 
-    engine = _get_or_create_vllm_engine(self, usage_mode="text")
+    engine = getattr(self, "_prompt_enhancer_vllm_engine", None)
+    # an assistant's context in the engine (Deepy kept loaded): each prompt runs beside it, in the free pages of its cache (LLMEngine.aside)
+    beside = engine is not None and engine.has_live_context()
+    if not beside:
+        engine = _get_or_create_vllm_engine(self, usage_mode="text")
     outputs = []
     apply_repetition_penalty = normalize_deepy_repetition_penalty(get_deepy_config_value(DEEPY_REPETITION_PENALTY_KEY, DEEPY_REPETITION_PENALTY_DEFAULT))
     thinking_enabled = _prompt_enhancer_thinking_enabled(self, thinking_enabled=thinking_enabled)
@@ -860,9 +865,14 @@ def _generate_messages_vllm(
             prompt_token_ids = []
             prompt_len = 0
         generation_max_tokens = int(max_new_tokens) + runtime_extra_tokens
-        # its own minimum: Deepy, which shares the model, leaves its context window in _prompt_enhancer_min_model_len_hint
-        engine.reserve_runtime(prompt_len=prompt_len, max_tokens=generation_max_tokens, cfg_scale=1.0, min_model_len=QWEN35_PROMPT_MIN_MODEL_LEN)
-        engine._ensure_llm()
+        if beside and not engine._llm.can_aside(prompt_len + generation_max_tokens):
+            engine.save_context()  # no room beside it: its owner saves it to RAM (restored at its next use), the prompts run as alone
+            beside = False
+            engine = _get_or_create_vllm_engine(self, usage_mode="text")
+        if not beside:
+            # its own minimum: Deepy, which shares the model, leaves its context window in _prompt_enhancer_min_model_len_hint
+            engine.reserve_runtime(prompt_len=prompt_len, max_tokens=generation_max_tokens, cfg_scale=1.0, min_model_len=QWEN35_PROMPT_MIN_MODEL_LEN)
+            engine._ensure_llm()
         if engine._llm is None:
             raise RuntimeError("Qwen3.5 prompt enhancer vLLM runtime is not available.")
         temp, normalized_top_p, normalized_top_k = _normalize_vllm_sampling(
@@ -900,16 +910,17 @@ def _generate_messages_vllm(
             }, prompt_number=idx + 1)
 
         try:
-            response = generate_prompt(
-                engine._llm,
-                prompt,
-                sampling_params=sampling_params,
-                stop_token_ids=self._prompt_enhancer_stop_token_ids,
-                close_think_token_id=self._prompt_enhancer_close_think_token_id if thinking_enabled else None,
-                max_thinking_tokens=self._prompt_enhancer_thinking_max_tokens,
-                stop_requested=stop_requested,
-                stream_callback=stream_callback,
-            )
+            with engine._llm.aside() if beside else contextlib.nullcontext():
+                response = generate_prompt(
+                    engine._llm,
+                    prompt,
+                    sampling_params=sampling_params,
+                    stop_token_ids=self._prompt_enhancer_stop_token_ids,
+                    close_think_token_id=self._prompt_enhancer_close_think_token_id if thinking_enabled else None,
+                    max_thinking_tokens=self._prompt_enhancer_thinking_max_tokens,
+                    stop_requested=stop_requested,
+                    stream_callback=stream_callback,
+                )
             raw_text = response["text"]
             log_llm_io("IN", "local-prompt-enhancer", "qwen-generation", response, prompt_number=idx + 1)
             # The template supplies the opening <think>; generated text starts
@@ -927,11 +938,13 @@ def _generate_messages_vllm(
             engine._last_failure_reason = ""
         except BaseException as exc:
             engine._last_failure_reason = str(exc)
-            # Discard failed/cancelled runtime state before another enhancement.
-            try:
-                _unload_prompt_enhancer_text_runtime(self)
-            except Exception as cleanup_error:
-                tqdm.write(f"Prompt Enhancer Cleanup Failed: {cleanup_error}")
+            # Discard failed/cancelled runtime state before another enhancement (beside a live context, aside() already discarded the
+            # prompt's own and gave the context back)
+            if not beside:
+                try:
+                    _unload_prompt_enhancer_text_runtime(self)
+                except Exception as cleanup_error:
+                    tqdm.write(f"Prompt Enhancer Cleanup Failed: {cleanup_error}")
             raise
         finally:
             reset_context()
@@ -1429,8 +1442,9 @@ def load_qwen35_text_prompt_enhancer(
         install_block_draft(model, block_draft_method, bonsai=bool(prism_metadata))
     model._prompt_enhancer_use_vllm = features["cuda"]  # the LM engine with each optimization where supported, else (Apple GPUs) the legacy runner
     model._prompt_enhancer_use_legacy_cuda_runner = not features["cuda"]
-    # MMGP manages the weights: its graphs replay the decoding passes, its dynamic preload keeps in VRAM all the blocks that fit beside the
-    # KV cache and the activations (all of them at first: without its VRAM allocator, the budgets of the profile apply)
+    # MMGP manages the weights: its dynamic preload keeps in VRAM all the blocks that fit beside the KV cache and the activations (all of
+    # them at first: without its VRAM allocator, the budgets of the profile apply), with CUDA graphs its graphs replay the decoding passes
+    model._lm_engine_mmgp = features["cuda"]
     model._lm_engine_mmgp_graphs = features["graphs"]
     if QWEN35_LLM_MAPPED_TOKEN_TABLE:
         _map_qwen35_token_table(model)

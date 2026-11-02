@@ -47,26 +47,35 @@ def _load(module, filename):
 
 
 class model_factory:
+    """hunyuan3d_21_shape: a mesh of the object image; hunyuan3d_21_paint: PBR textures of a supplied mesh (also the Hunyuan3D 2.1 Paint
+    Texturer)."""
+
     def __init__(self, model_filename, model_type, base_model_type, save_quantized=False):
         self.device = torch.device("cuda")
         self._interrupt = False
-        files = model_filename if isinstance(model_filename, (list, tuple)) else [model_filename]
+        filename = model_filename[0] if isinstance(model_filename, (list, tuple)) else model_filename
+        self.transformer = self.vae = self.image_encoder = None
+        self.paint = self.paint_vae = self.paint_image_encoder = self.upscaler = None
+        if base_model_type == "hunyuan3d_21_paint":
+            self._load_paint(filename, model_type, save_quantized)
+            self.transformer = self.paint.unet  # wgp's main model of the paint type
+        else:
+            self._load_shape(filename, model_type, save_quantized)
+        self.cache = TextEncoderCache()
+
+    def _load_shape(self, filename, model_type, save_quantized):
         with open(os.path.join(CONFIGS, "hunyuan3d_21_shape.json"), encoding="utf-8") as reader:
             self.config = json.load(reader)
         with init_empty_weights():
             transformer = HunYuanDiTPlain(**self.config["transformer"])
-        self.transformer = _load(transformer, files[0])
+        self.transformer = _load(transformer, filename)
         if save_quantized:
             from wgp import save_quantized_model
-            save_quantized_model(self.transformer, model_type, files[0], torch.float16, None)
+            save_quantized_model(self.transformer, model_type, filename, torch.float16, None)
         with init_empty_weights():
             vae, image_encoder = ShapeVAEDecoder(**self.config["vae"]), Dinov2Model(**self.config["image_encoder"])
         self.vae = _load(vae, fl.locate_file(os.path.join(PROJECT, SHAPE_VAE_FILE)))
         self.image_encoder = _load(image_encoder, fl.locate_file(os.path.join(PROJECT, DINO_LARGE_FILE)))
-        self.paint = self.paint_vae = self.paint_image_encoder = self.upscaler = None
-        if base_model_type == "hunyuan3d_21":
-            self._load_paint(files[1], model_type, save_quantized)
-        self.cache = TextEncoderCache()
 
     def _load_paint(self, filename, model_type, save_quantized):
         from models.z_image.autoencoder_kl import AutoencoderKL
@@ -79,7 +88,7 @@ class model_factory:
         self.paint = _load(paint, filename)
         if save_quantized:
             from wgp import save_quantized_model
-            save_quantized_model(self.paint, model_type, filename, torch.float16, None, submodel_no=2)
+            save_quantized_model(self.paint, model_type, filename, torch.float16, None)
         with init_empty_weights():
             vae = AutoencoderKL(**self.paint_config["vae"])
             image_encoder, upscaler = Dinov2Model(**self.paint_config["image_encoder"]), RRDBNet()
@@ -197,33 +206,40 @@ class model_factory:
         metallic_roughness = np.stack([np.full_like(metallic, 255), roughness, metallic], axis=-1)
         return mesh.replace(uvs=uvs, base_color=torch.from_numpy(base_color).to(mesh.device), metallic_roughness=torch.from_numpy(metallic_roughness).to(mesh.device))
 
+    @generation_progress
+    @torch.inference_mode()
+    def texture_mesh(self, mesh, image, seed=0, guidance_scale=3.0, max_faces=0, texture_views="8_768", texture_size=2048, callback=None, set_progress_status=None):
+        """The Texturer entry (post-processing): PBR textures of mesh (shared.mesh3d.Mesh) painted from the object image (PIL); max_faces 0
+        keeps the mesh's faces."""
+        views, view_size = (int(value) for value in str(texture_views).split("_"))
+        mesh = Mesh(mesh.vertices.float().to(self.device), mesh.faces.to(self.device))
+        return self._texture_mesh(mesh, self._object_image(image), int(seed), float(guidance_scale), int(max_faces) or mesh.faces.shape[0], views, view_size, int(texture_size), callback)
+
     # ---------------------------------------------------------------- generation
 
     @generation_progress
     @torch.inference_mode()
-    def generate(self, input_prompt, seed, sampling_steps, guide_scale, batch_size=1, model_mode=None, original_input_ref_images=None, input_custom=None,
-                 alt_guide_scale=3.0, custom_settings=None, callback=None, set_progress_status=None, **kwargs):
-        mode = model_mode or "shape"
+    def generate(self, input_prompt, seed, sampling_steps, guide_scale, batch_size=1, original_input_ref_images=None, input_custom=None, custom_settings=None,
+                 callback=None, set_progress_status=None, **kwargs):
+        """Shape model: meshes of the object image. Paint model: PBR textures of the Input Mesh (input_custom), guide_scale being the
+        texture guidance."""
         settings = custom_settings or {}
-        octree_resolution, max_faces = int(settings.get("octree_resolution", 256)), int(settings.get("max_faces", 0 if self.paint is None else 40000))
         set_phase_status("Removing Background")
         rgba = self._object_image(original_input_ref_images[0])
         check_abort()
-        if mode == "texture":
-            set_phase_status("Loading Mesh")
-            source = load_mesh(input_custom, device=self.device)
-            meshes = [Mesh(source.vertices.float(), source.faces)] * batch_size
-        else:
+        if self.paint is None:
+            octree_resolution, max_faces = int(settings.get("octree_resolution", 256)), int(settings.get("max_faces", 0))
             meshes = self._generate_shapes(rgba, seed, sampling_steps, guide_scale, batch_size, octree_resolution, callback)
-        if mode == "shape":
             if max_faces > 0:
                 set_phase_status("Reducing Mesh")
                 meshes = [decimate(merge_vertices(mesh), max_faces) for mesh in meshes]
         else:
+            set_phase_status("Loading Mesh")
+            source = load_mesh(input_custom, device=self.device)
             views, view_size = (int(v) for v in str(settings.get("texture_views", "8_768")).split("_"))
-            texture_size = int(settings.get("texture_size", 2048))
-            meshes = [self._texture_mesh(mesh, rgba, seed + i, alt_guide_scale, max_faces, views, view_size, texture_size, callback)
-                      for i, mesh in enumerate(meshes)]
+            max_faces, texture_size = int(settings.get("max_faces", 40000)), int(settings.get("texture_size", 2048))
+            meshes = [self._texture_mesh(Mesh(source.vertices.float(), source.faces), rgba, seed + i, guide_scale, max_faces, views, view_size, texture_size, callback)
+                      for i in range(batch_size)]
         set_phase_status("Exporting Mesh")
         previews, glbs = [], []
         for mesh in meshes:

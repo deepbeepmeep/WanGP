@@ -571,6 +571,7 @@ class DistilledPipeline:
         prompt_relay_frame_offset: int = 0,
         prompt_relay_epsilon: float = 1e-3,
         negative_prompt: str = DEFAULT_NEGATIVE_PROMPT,
+        custom_sigmas=None,
         guiding_images: list[tuple] | None = None,
         guiding_images_stage2: list[tuple] | None = None,
         images_stage2: list[tuple[str, int, float]] | None = None,
@@ -781,6 +782,8 @@ class DistilledPipeline:
         )
         # DISTILLED_SIGMA_VALUES = [0.421875, 0]
         stage_1_sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(self.device)
+        if custom_sigmas and custom_sigmas[0] is not None:
+            stage_1_sigmas = torch.tensor([*custom_sigmas[0], 0.0], dtype=torch.float32, device=self.device)
         pass_no = stage_1_pass_no
         if loras_slists is not None:
             stage_1_steps = len(stage_1_sigmas) - 1
@@ -912,6 +915,7 @@ class DistilledPipeline:
             components=self.pipeline_components,
             dtype=dtype,
             device=self.device,
+            noise_scale=stage_1_sigmas[0],
             mask_context=mask_context,
             skip_audio=skip_audio,
         )
@@ -977,6 +981,8 @@ class DistilledPipeline:
         stepper = EulerAncestralDiffusionStep() if layout_to_render else EulerDiffusionStep()
         stage_2_sigma_values = DISTILLED_8_STEPS_STAGE_2_SIGMA_VALUES if not layout_to_render and LTX23_USE_DISTILLED_8_STEPS_STAGE_2_SIGMAS and ltx2_22B_class else STAGE_2_DISTILLED_SIGMA_VALUES
         stage_2_sigmas = torch.Tensor(stage_2_sigma_values).to(self.device)
+        if custom_sigmas and len(custom_sigmas) > 1 and custom_sigmas[1] is not None:
+            stage_2_sigmas = torch.tensor([*custom_sigmas[1], 0.0], dtype=torch.float32, device=self.device)
         upscaled_video_latent = upsample_video(
             latent=video_state.latent[:1],
             video_encoder=video_encoder,

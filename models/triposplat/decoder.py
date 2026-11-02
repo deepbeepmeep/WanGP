@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from shared.kernels import ops
 from shared.utils.phase_progress import check_abort
 from .layers import CrossAttention, EmbedderMLP, FeedForward, SelfAttention, layer_norm
 
@@ -61,13 +62,23 @@ class OctreeBlock(nn.Module):
 
     def __init__(self, channels, ctx_channels, num_heads, mlp_ratio):
         super().__init__()
+        self.norm1 = nn.LayerNorm(channels, eps=1e-6, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(channels, eps=1e-6, elementwise_affine=False)
         self.cross_attn = CrossAttention(channels, ctx_channels, num_heads)
         self.mlp = FeedForward(channels, mlp_ratio)
 
     def forward(self, x, mod, context):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (m.unsqueeze(1) for m in mod.chunk(6, dim=1))
-        x.add_(self.cross_attn([layer_norm(x).mul_(1 + scale_msa).add_(shift_msa)], context).mul_(gate_msa))
-        return x.add_(self.mlp(layer_norm(x).mul_(1 + scale_mlp).add_(shift_mlp)).mul_(gate_mlp))
+        """x (batch, cells, channels), updated in place; mod (batch, 6 * channels): one modulation row per batch item."""
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mod.chunk(6, dim=1)
+        batch, cells, channels = x.shape
+        rows = x.view(-1, channels)
+        spans = [(b * cells, (b + 1) * cells, b) for b in range(batch)]
+        y = self.cross_attn.attend([ops.norm_modulate([rows], self.norm1, shift_msa, scale_msa, spans).view(x.shape)], context)
+        ops.gated_linear(self.cross_attn.to_out, [y.view(rows.shape)], rows, gate_msa, spans)
+        del y
+        ops.mlp([ops.norm_modulate([rows], self.norm2, shift_mlp, scale_mlp, spans)], self.mlp.mlp[0], self.mlp.mlp[2], "gelu", residual=rows,
+                segments=ops.gate_segments(gate_mlp.unsqueeze(1), batch, cells))
+        return x
 
 
 class OctreeDecoder(nn.Module):
@@ -107,9 +118,11 @@ class GaussianBlock(nn.Module):
         self.mlp = FeedForward(channels, mlp_ratio)
 
     def forward(self, x, context):
-        x.add_(self.self_attn([layer_norm(x)]))
-        x.add_(self.cross_attn([layer_norm(x, self.norm2.weight, self.norm2.bias, self.norm2.eps)], context))
-        return x.add_(self.mlp(layer_norm(x)))
+        rows = x.view(-1, x.shape[-1])
+        ops.linear_residual_(self.self_attn.output, [self.self_attn.attend([layer_norm(x)]).view(rows.shape)], rows)
+        ops.linear_residual_(self.cross_attn.to_out, [self.cross_attn.attend([layer_norm(x, self.norm2.weight, self.norm2.bias, self.norm2.eps)], context).view(rows.shape)], rows)
+        ops.mlp([layer_norm(rows)], self.mlp.mlp[0], self.mlp.mlp[2], "gelu", residual=rows)
+        return x
 
 
 class GaussianDecoder(nn.Module):

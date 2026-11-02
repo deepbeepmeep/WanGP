@@ -25,6 +25,10 @@ try:
     from . import group_norm_silu as _norm_silu
 except (ImportError, OSError, RuntimeError):
     _norm_silu = None
+try:
+    from . import sparse_conv_triton as _sparse
+except (ImportError, OSError, RuntimeError):
+    _sparse = None
 
 _AUDIO_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
@@ -155,6 +159,120 @@ def group_norm_silu(x, norm, dtype, chunk_bytes=256 << 20):
         c0, c1 = start * step, min(norm.num_groups, start + groups) * step
         out[:, c0:c1] = silu_(F.group_norm(x[:, c0:c1].float(), (c1 - c0) // step, norm.weight[c0:c1].float(), norm.bias[c0:c1].float(), norm.eps), chunk_bytes)
     return out
+
+
+def image_norm_conv_supported(x, norm):
+    """Whether whole-image statistics + bounded normalized strips preserve this autocast path."""
+    valid = (torch.is_autocast_enabled(x.device.type) and _norm_silu is not None and norm.affine
+             and _norm_silu.strips_eligible(x, norm.num_groups, torch.get_autocast_dtype(x.device.type)))
+    return choose("Image Norm + Conv Strips", owned_triton=valid) is not None
+
+
+IMAGE_BAND_BYTES = 32 << 20
+
+
+def image_norm_conv_is_banded(x, band_bytes=IMAGE_BAND_BYTES):
+    """Whether a 16-bit normalized image exceeds the strip budget; smaller images need no interleaved workspace."""
+    return x.numel() * 2 > band_bytes
+
+
+def image_norm_conv_bands(x, norm, conv, band_bytes=IMAGE_BAND_BYTES):
+    """Yield (first,last,conv_band) with global GN + SiLU before a 3x3, stride-1, padding-1 convolution.
+    x is borrowed. Eligibility is checked by the caller. All statistics are read before the first yield; a one-row halo on each
+    side gives every convolution its original inputs. Call the module itself so MMGP still owns its weight loading and hooks.
+    A caller overwriting x must retain its last written row until the following band has consumed that row's halo."""
+    n, c, height, width = x.shape
+    dtype = torch.get_autocast_dtype(x.device.type)
+    row_bytes = n * c * width * 2  # eligible output types are both 16-bit
+    affine = _norm_silu.image_affine(x, norm.num_groups, norm.weight, norm.bias, norm.eps)
+    rows = height if height * row_bytes <= band_bytes else max(1, band_bytes // row_bytes - 2)
+    for start in range(0, height, rows):
+        stop = min(height, start + rows)
+        lo, hi = max(0, start - 1), min(height, stop + 1)
+        band = _norm_silu.image_rows(x, affine, lo, hi, dtype)
+        band = conv(band)[:, :, start-lo:stop-lo]
+        yield start, stop, band
+        del band
+
+
+def image_norm_conv(x_list, norm, conv, *, out=None, add=False):
+    """Consume x_list through image_norm_conv_bands. out is borrowed, disjoint from x, optionally a residual updated in place."""
+    x = take(x_list)
+    for start, stop, band in image_norm_conv_bands(x, norm, conv):
+        if out is None:
+            if start == 0 and stop == x.shape[2]:
+                return band  # the whole result already exists; no destination allocation or copy is needed
+            out = torch.empty((x.shape[0], band.shape[1], x.shape[2], band.shape[3]), dtype=band.dtype,
+                              device=band.device, memory_format=torch.channels_last)
+        target = out[:, :, start:stop]
+        target.add_(band) if add else target.copy_(band)
+        del band
+    return out
+
+
+SPARSE_SCRATCH_BYTES = 256 << 20  # bound of the gathered neighbor rows (PyTorch) or of the neighbor map computed per launch (kernel)
+
+
+def sparse_conv(feats, level, weight, bias, *, rowmap=None, affine=None, residual=None, out=None, rows=None):
+    """Submanifold 3x3x3 convolution of feats (N, Ci) 16-bit over the voxels of level (len(level) rows; level.neighbors(start, stop):
+    their neighbor rows (rows, 27) int32 in FlexGEMM's tap order, -1 for inactive sites; level.cache["neighbors"]: the whole map when
+    kept), weight (Co, 3, 3, 3, Ci), bias (Co,) or None. rowmap (len(level),): the feats row of each voxel (features on a coarser level),
+    None when feats are the level's rows. affine: (scale, shift) FP32 (Ci,) of a group norm applied with SiLU to the neighbor features (in
+    FP32, rounded to the activation dtype; inactive sites stay zero). residual: (len(level), Co) or a callable (start, stop) -> rows,
+    added to the rounded convolution. out: the destination (len(level), Co), else a new tensor. rows: (start, stop), the output rows
+    of these voxels alone (out and a residual tensor then hold stop - start rows; a callable residual still takes voxel indices).
+    feats, weights and residual are borrowed. The WanGP implicit GEMM (shared.kernels.sparse_conv_triton: no gathered copy, FP32
+    accumulation over all taps), else the gathered rows and addmm by chunks of rows."""
+    first, last = (0, len(level)) if rows is None else rows
+    co = weight.shape[0]
+    out = feats.new_empty((last - first, co)) if out is None else out
+    flat = weight.reshape(co, -1)
+    # the kernel walks the input channels by K steps of 32 or 64
+    if choose("Sparse Conv3D", owned_triton=_sparse is not None and cuda_inference(feats, dtypes=_DTYPES) and feats.is_contiguous() and feats.shape[1] % 32 == 0):
+        full = level.cache.get("neighbors")
+        if full is not None and not callable(residual):
+            return _sparse.conv_(feats, full, flat, bias, out, rowmap=rowmap, affine=affine, residual=residual, rows=last - first, neighbor_offset=first)
+        # a chunk's neighbor map is looked up through int64 keys and positions (about 32 bytes per entry) unless the level keeps it whole
+        step = max(1, SPARSE_SCRATCH_BYTES // ((27 * 32 if full is None else 0) + (co * feats.element_size() if callable(residual) else 0)))
+        for start in range(first, last, step):
+            stop = min(start + step, last)
+            neighbors = level.neighbors(start, stop) if full is None else full
+            part = residual(start, stop) if callable(residual) else residual
+            _sparse.conv_(feats, neighbors, flat, bias, out, rowmap=rowmap, affine=affine, residual=part, rows=stop - start,
+                          neighbor_offset=0 if full is None else start, out_offset=start - first, residual_offset=0 if callable(residual) else start - first)
+            del neighbors, part
+        return out
+    channels = feats.shape[1]
+    step = max(1, SPARSE_SCRATCH_BYTES // (27 * channels * (4 + feats.element_size() if affine is not None else feats.element_size())))
+    for start in range(first, last, step):
+        stop = min(start + step, last)
+        neighbors = level.neighbors(start, stop)
+        index = neighbors.clamp(min=0)
+        cols = feats.index_select(0, (index if rowmap is None else rowmap[index]).view(-1)).view(stop - start, 27, channels)
+        if affine is not None:
+            cols = F.silu(cols.float().mul_(affine[0]).add_(affine[1]), inplace=True).to(feats.dtype)
+        cols.masked_fill_((neighbors < 0).unsqueeze(-1), 0)
+        rows_out = torch.addmm(bias, cols.view(stop - start, -1), flat.t()) if bias is not None else cols.view(stop - start, -1) @ flat.t()
+        del cols, index, neighbors
+        if residual is not None:
+            rows_out.add_(residual(start, stop) if callable(residual) else residual[start - first:stop - first])
+        out[start - first:stop - first] = rows_out
+    return out
+
+
+def channel_moments(x):
+    """(2, C) FP64 sums of x and of x^2 per channel of x (N, C), x borrowed: statistics of a group norm over voxels. The WanGP kernel
+    reads x once (FP64 partial sums of exact 16-bit products), PyTorch by chunks of rows (FP32 squares summed in FP64)."""
+    if choose("Channel Moments", owned_triton=_sparse is not None and cuda_inference(x, dtypes=_DTYPES) and x.is_contiguous()):
+        return _sparse.moments(x)
+    sums = torch.zeros((2, x.shape[1]), dtype=torch.float64, device=x.device)
+    rows = max(1, (64 << 20) // (x.shape[1] * 4))
+    for start in range(0, x.shape[0], rows):
+        part = x[start:start + rows].float()
+        sums[0] += part.sum(0, dtype=torch.float64)
+        sums[1] += part.square().sum(0, dtype=torch.float64)  # not in place: part is x itself for FP32 features
+        del part
+    return sums
 
 
 def attention(q, k, v, chunk_bytes=64 << 20):

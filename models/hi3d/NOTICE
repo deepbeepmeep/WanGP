@@ -1,0 +1,49 @@
+SPARC3D
+Copyright 2026 The SPARC3D Authors
+
+This product includes software developed by third parties. The following
+components are redistributed under their own licenses, reproduced in full in
+THIRD_PARTY_LICENSES.md:
+
+  * Microsoft TRELLIS (MIT License)
+    Copyright (c) Microsoft Corporation.
+    https://github.com/microsoft/TRELLIS
+
+  * Pointcept / Point Transformer V3 (MIT License)
+    Copyright (c) 2023 Pointcept
+    https://github.com/Pointcept/Pointcept
+
+  * O-CNN, ocnn-pytorch (MIT License)
+    Copyright (c) 2022 Peng-Shuai Wang <wangps@hotmail.com>
+    https://github.com/octree-nn/ocnn-pytorch
+
+  * NVIDIA FlexiCubes (Apache License 2.0)
+    Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES
+    https://github.com/nv-tlabs/FlexiCubes
+    License also included at sparc3d/ops/flexicubes/LICENSE.txt
+
+GPU surface voxelization in sparc3d/ops descends from the PyTorch extension
+written by Zhihao Li; see AUTHORS.
+
+
+Hi3D v1.0
+---------
+Hi3D v1.0 includes the SPARC3D inference implementation. Original copyright,
+attribution, license texts, and per-file modification notices are retained.
+The Python package and API names are sparc3d / Sparc3DPipeline.
+
+Hunyuan3D is referenced only by an optional coarse-mesh example adapter. Tencent's
+Hunyuan3D implementation and weights are not bundled with or relicensed by this
+distribution. External image encoders and any separately obtained model weights
+retain their own terms. See THIRD_PARTY_LICENSES.md for the source and model
+license index.
+
+
+Hi3D Open License Agreement Version 1.0 notice
+--------------------------------------------
+The following notice applies to the Hi3D Materials identified in Schedule 2 of
+LICENSE, only to the extent OCEANO HK HOLDING LIMITED owns or is authorized to
+license them. It does not replace the original third-party notices above or
+extend the Agreement to Excluded Materials. See THIRD_PARTY_LICENSES.md.
+
+Hi3D is licensed under the Hi3D Open License Agreement Version 1.0. Copyright © 2026 OCEANO HK HOLDING LIMITED. All rights not expressly granted are reserved. The Hi3D trademarks are owned by OCEANO HK HOLDING LIMITED or its applicable affiliate(s).

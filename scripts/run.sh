@@ -1,6 +1,10 @@
 #!/bin/bash
 cd "$(dirname "$0")/.." || exit 1
 
+if [ -f "../.manager/installation.json" ] || [ -f "../.manager/active_operation.json" ]; then
+    exec python3 -m installation launch --installation .. -- "$@"
+fi
+
 if [ ! -f "envs.json" ]; then
     echo "[!] envs.json not found. Please run install.sh first or add your existing environment with manage.sh if you already have one."
     read -p "Press Enter to exit..."

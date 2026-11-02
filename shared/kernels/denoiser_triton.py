@@ -39,29 +39,34 @@ import torch
 from triton.language.extra import libdevice
 from shared.kernels.triton_tuner import LaunchTuner
 
-_TUNER = LaunchTuner("wan2gp_h3_denoiser_kernels", 1, "H3")
+_TUNER = LaunchTuner("wan2gp_h3_denoiser_kernels", 3, "H3")
 _ROPE_CONFIGS = ((8, 1), (16, 2), (16, 4), (32, 4), (64, 8))
 _TUNE_ROWS = 1 << 17  # cap tuning scratch
+_ROPE_RUNTIME = ['ROWS', 'HEADS', 'SEQ', 'XB', 'XS', 'XH', 'RB', 'RS', 'RH', 'WH']
 
 
-@triton.jit(do_not_specialize=['ROWS', 'HEADS', 'SEQ', 'XB', 'XS', 'XH', 'RB', 'RS'], do_not_specialize_on_alignment=['ROWS', 'HEADS', 'SEQ', 'XB', 'XS', 'XH', 'RB', 'RS'])
-def _rms_rope(X, W, ROPE, ROWS, HEADS, SEQ, XB, XS, XH, RB, RS, EPS, RP: tl.constexpr, RC: tl.constexpr, D: tl.constexpr,
-              PAIRS: tl.constexpr, BLOCK: tl.constexpr, INTERLEAVED: tl.constexpr):
-    """Rows (batch, token, head) of Q or K, loaded whole: weighted RMSNorm in FP32 rounded to the activation dtype (the norm output),
-    then the rotation of the first 2 * PAIRS channels in FP32 with one final rounding (cos / sin pairs of ROPE): channel p with
-    p + PAIRS (split halves) or, INTERLEAVED, 2p with 2p + 1 (a complex table viewed as real); the other channels keep the norm
-    output. 128-channel heads sum the squares as Comfy Kitchen does (lane sums of c, c + 32, c + 64, c + 96, then the lanes): its
-    results bit for bit."""
+@triton.jit(do_not_specialize=_ROPE_RUNTIME, do_not_specialize_on_alignment=_ROPE_RUNTIME)
+def _rms_rope(X, W, ROPE, ROWS, HEADS, SEQ, XB, XS, XH, RB, RS, RH, WH, EPS, RP: tl.constexpr, RC: tl.constexpr, D: tl.constexpr,
+              PAIRS: tl.constexpr, BLOCK: tl.constexpr, INTERLEAVED: tl.constexpr, ROPE_FIRST: tl.constexpr, PER_HEAD: tl.constexpr,
+              DP: tl.constexpr):
+    """Rows (batch, token, head) of Q or K, loaded whole (DP: D rounded up to a power of two): weighted RMSNorm in FP32 rounded to the
+    activation dtype (the norm output), then the rotation of the first 2 * PAIRS channels in FP32 with one final rounding (cos / sin
+    pairs of ROPE): channel p with p + PAIRS (split halves) or, INTERLEAVED, 2p with 2p + 1 (a complex table viewed as real); the other
+    channels keep the norm output. ROPE_FIRST: the rotation first, then the norm of the rotated row, in FP32 with one final rounding.
+    The weight is one row (D,), or with PER_HEAD a row per head (heads, D) at stride WH; RH: the head stride of a table with one
+    rotation per head, 0 for one shared by the heads; PAIRS 0: the norm alone. 128-channel heads normalized first sum the
+    squares as Comfy Kitchen does (lane sums of c, c + 32, c + 64, c + 96, then the lanes): its results bit for bit."""
     rows = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     ok = rows < ROWS
     head = rows % HEADS
     token = rows // HEADS
     seq = token % SEQ
     batch = token // SEQ
-    c = tl.arange(0, D)
+    c = tl.arange(0, DP)
+    valid = ok[:, None] & (c < D)[None, :]
     base = batch * XB + seq * XS + head * XH
     ptr = X + base[:, None] + c[None, :]
-    x = tl.load(ptr, ok[:, None], 0).to(tl.float32)
+    x = tl.load(ptr, valid, 0).to(tl.float32)
     rotated = c < 2 * PAIRS
     if INTERLEAVED:
         leading = c % 2 == 0
@@ -71,39 +76,56 @@ def _rms_rope(X, W, ROPE, ROWS, HEADS, SEQ, XB, XS, XH, RB, RS, EPS, RP: tl.cons
         leading = c < PAIRS
         partner = tl.where(leading, c + PAIRS, tl.where(rotated, c - PAIRS, c))
         pair = tl.where(leading, c, c - PAIRS)
-    other = tl.load(X + base[:, None] + partner[None, :], ok[:, None], 0).to(tl.float32)
-    if D == 128:
-        lanes = tl.reshape(tl.permute(tl.reshape(x, (BLOCK, 4, 32)), 0, 2, 1), (BLOCK, 32, 2, 2))  # variadic dims: Triton 3.2 rejects the tuple form
-        even, odd = tl.split(lanes)
-        x0, x2 = tl.split(even)
-        x1, x3 = tl.split(odd)
-        total = tl.sum(tl.fma(x3, x3, tl.fma(x2, x2, tl.fma(x1, x1, x0 * x0))), 1)
+    other = tl.load(X + base[:, None] + partner[None, :], valid, 0).to(tl.float32)
+    if PER_HEAD:
+        weight = tl.load(W + head[:, None] * WH + c[None, :], valid, 0).to(tl.float32)
+        partner_weight = tl.load(W + head[:, None] * WH + partner[None, :], valid, 0).to(tl.float32)
     else:
-        total = tl.sum(x * x, 1)
-    inv = libdevice.rsqrt(total / D + EPS)[:, None]
-    y = (x * inv * tl.load(W + c).to(tl.float32)[None, :]).to(X.dtype.element_ty).to(tl.float32)
-    other = (other * inv * tl.load(W + partner).to(tl.float32)[None, :]).to(X.dtype.element_ty).to(tl.float32)
-    angle = batch[:, None] * RB + seq[:, None] * RS + pair[None, :] * RP
+        weight = tl.load(W + c, c < D, 0).to(tl.float32)[None, :]
+        partner_weight = tl.load(W + partner, c < D, 0).to(tl.float32)[None, :]
+    angle = batch[:, None] * RB + seq[:, None] * RS + head[:, None] * RH + pair[None, :] * RP
     mask = ok[:, None] & rotated[None, :]
     cos = tl.load(ROPE + angle, mask, 1.0).to(tl.float32)
     sin = tl.load(ROPE + angle + RC, mask, 0.0).to(tl.float32)
     first = leading[None, :]
-    out = tl.fma(tl.where(first, cos, sin), tl.where(first, y, other), tl.where(first, -sin, cos) * tl.where(first, other, y))
-    tl.store(ptr, tl.where(rotated[None, :], out, y), ok[:, None])
+    if ROPE_FIRST:
+        r = tl.fma(tl.where(first, cos, sin), tl.where(first, x, other), tl.where(first, -sin, cos) * tl.where(first, other, x))
+        r = tl.where(rotated[None, :], r, x)
+        inv = libdevice.rsqrt(tl.sum(r * r, 1) / D + EPS)[:, None]
+        tl.store(ptr, r * inv * weight, valid)
+    else:
+        if D == 128:
+            lanes = tl.reshape(tl.permute(tl.reshape(x, (BLOCK, 4, 32)), 0, 2, 1), (BLOCK, 32, 2, 2))  # variadic dims: Triton 3.2 rejects the tuple form
+            even, odd = tl.split(lanes)
+            x0, x2 = tl.split(even)
+            x1, x3 = tl.split(odd)
+            total = tl.sum(tl.fma(x3, x3, tl.fma(x2, x2, tl.fma(x1, x1, x0 * x0))), 1)
+        else:
+            total = tl.sum(x * x, 1)
+        inv = libdevice.rsqrt(total / D + EPS)[:, None]
+        y = (x * inv * weight).to(X.dtype.element_ty).to(tl.float32)
+        other = (other * inv * partner_weight).to(X.dtype.element_ty).to(tl.float32)
+        out = tl.fma(tl.where(first, cos, sin), tl.where(first, y, other), tl.where(first, -sin, cos) * tl.where(first, other, y))
+        tl.store(ptr, tl.where(rotated[None, :], out, y), valid)
 
 
-def rms_rope_(x, weight, rope, eps, *, interleaved=False):
+def rms_rope_(x, weight, rope, eps, *, interleaved=False, rope_first=False):
     """In place on Q or K (batch, tokens, heads, head_dim), any strides with contiguous channels (views of a fused projection); weight:
-    the RMSNorm weight; rope: (1 | batch, tokens, 1, pairs, 2) cos / sin of the rotation of the first 2 * pairs channels, split halves
-    or interleaved pairs (2p, 2p + 1: a complex table viewed as real)."""
+    the RMSNorm weight (head_dim,), or one per head (heads, head_dim); rope: (1 | batch, tokens, 1 | heads, pairs, 2) cos / sin of the
+    rotation of the first 2 * pairs channels (one table for all heads, or one per head), split halves or interleaved pairs (2p, 2p + 1: a
+    complex table viewed as real), None for the norm alone; rope_first: the rotation before the norm (both in FP32, rounded once)."""
     batch, seq, heads, dim = x.shape
-    rope_batch = 0 if rope.shape[0] == 1 else rope.stride(0)
+    rope_strides = (0, 0, 0, 0, 0) if rope is None else (0 if rope.shape[0] == 1 else rope.stride(0), rope.stride(1), rope.stride(2) if rope.shape[2] > 1 else 0,
+                                                         rope.stride(3), rope.stride(4))
+    pairs = 0 if rope is None else rope.shape[-2]
+    per_head = weight.dim() == 2
 
     def launch(xx, config):
         block, warps = config
         rows = xx.shape[0] * xx.shape[1] * heads
-        _rms_rope[(triton.cdiv(rows, block),)](xx, weight, rope, rows, heads, xx.shape[1], *xx.stride()[:3], rope_batch, rope.stride(1), eps,
-                                               rope.stride(3), rope.stride(4), dim, rope.shape[-2], block, interleaved, num_warps=warps, enable_fp_fusion=False)
+        _rms_rope[(triton.cdiv(rows, block),)](xx, weight, xx if rope is None else rope, rows, heads, xx.shape[1], *xx.stride()[:3], *rope_strides[:3],
+                                               weight.stride(0) if per_head else 0, eps, *rope_strides[3:], dim, pairs, block,
+                                               interleaved, rope_first, per_head, triton.next_power_of_2(dim), num_warps=warps, enable_fp_fusion=False)
 
     def prepare_scratch():  # a copy of the first rows, in the head layout of x
         tokens = max(1, min(seq, _TUNE_ROWS // heads))
@@ -111,8 +133,10 @@ def rms_rope_(x, weight, rope, eps, *, interleaved=False):
         scratch.copy_(x[:1, :tokens])
         return lambda config: launch(scratch, config)
 
-    config = _TUNER.config("rms_rope", f"{x.dtype}|{heads}x{dim}|p{rope.shape[-2]}|s{x.stride(2)}|I{int(interleaved)}", x.device, _ROPE_CONFIGS, prepare_scratch,
-                           batch * seq * heads >= _TUNE_ROWS)
+    variant = ("|F" if rope_first else "") + ("|H" if per_head else "")
+    # no head count in the identity: every Attention Head Split level (group size) reuses one launch configuration, compiling nothing
+    config = _TUNER.config("rms_rope", f"{x.dtype}|d{dim}|p{pairs}|s{x.stride(2)}|I{int(interleaved)}{variant}", x.device, _ROPE_CONFIGS,
+                           prepare_scratch, batch * seq * heads >= _TUNE_ROWS)
     launch(x, config)
     torch.autograd.graph.increment_version(x)
     return x

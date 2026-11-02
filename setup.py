@@ -6,6 +6,11 @@ import argparse
 import shutil
 import platform
 
+from installation.catalog import kernel_variant, load_config as load_install_config, os_key, resolve_command
+from installation.environments import inspect_interpreter, interpreter_path, managed_record
+from installation.hardware import profile_for_name
+from installation.recommendations import recommend_settings
+
 CONFIG_PATH = "setup_config.json"
 ENVS_FILE = "envs.json"
 IS_WIN = os.name == 'nt'
@@ -16,7 +21,7 @@ ENV_TEMPLATES = {
     "uv": {
         "create": "uv venv --seed --python {ver} \"{dir}\"",
         "run": _PY_PATH,
-        "install": "uv pip install --index-strategy unsafe-best-match --python \"{dir}\""
+        "install": f"uv pip install --index-strategy unsafe-best-match --python {_PY_PATH}"
     },
     "venv": {
         "create": "\"{sys_py}\" -m venv \"{dir}\"",
@@ -34,35 +39,6 @@ ENV_TEMPLATES = {
         "install": "pip install"
     }
 }
-
-VERSION_CHECK_SCRIPT = """
-import sys
-import importlib
-import importlib.metadata
-
-pkgs = ['torch', 'triton', 'sageattention', 'spas_sage_attn', 'flash_attn']
-res = []
-try:
-    res.append(f"python={sys.version.split()[0]}")
-except:
-    res.append("python=Unknown")
-
-for p in pkgs:
-    try:
-        ver = importlib.metadata.version(p)
-        res.append(f"{p}={ver}")
-    except importlib.metadata.PackageNotFoundError:
-        try:
-            # Fallback to __version__
-            m = importlib.import_module(p)
-            ver = getattr(m, '__version__', 'Installed')
-            res.append(f"{p}={ver}")
-        except ImportError:
-            res.append(f"{p}=Missing")
-    except Exception:
-        res.append(f"{p}=Error")
-print("||".join(res))
-"""
 
 class EnvsManager:
     def __init__(self):
@@ -174,10 +150,11 @@ class EnvsManager:
         return active
 
 def load_config():
-    if not os.path.exists(CONFIG_PATH):
-        print(f"Error: {CONFIG_PATH} not found.")
+    try:
+        return load_install_config(CONFIG_PATH)
+    except ValueError as exc:
+        print(f"Error: {exc}")
         sys.exit(1)
-    with open(CONFIG_PATH, 'r') as f: return json.load(f)
 
 def get_gpu_info():
     if sys.platform == "darwin":
@@ -270,28 +247,13 @@ def resolve_torch_cmd(config, torch_k):
     return cmd
 
 def get_profile_key(gpu_name, vendor):
-    g = gpu_name.upper()
-    if vendor == "APPLE":
-        return "MPS"
-    if vendor == "NVIDIA":
-        if "50" in g: return "RTX_50"
-        if "40" in g: return "RTX_40"
-        if "30" in g: return "RTX_30"
-        if "20" in g or "QUADRO" in g: return "RTX_20"
-        return "GTX_10"
-    elif vendor == "AMD":
-        return "AMD"
-    return "RTX_40"
+    return profile_for_name(gpu_name, vendor)
 
 def get_os_key():
-    if sys.platform == "darwin":
-        return "macos"
-    return "win" if IS_WIN else "linux"
+    return os_key()
 
 def resolve_cmd(cmd_entry):
-    if isinstance(cmd_entry, dict):
-        return cmd_entry.get(get_os_key())
-    return cmd_entry
+    return resolve_command(cmd_entry, get_os_key())
 
 def run_cmd(cmd, env_vars=None):
     if not cmd: return
@@ -334,17 +296,18 @@ def get_env_details(name, env_data):
     dir_name = env_data["path"]
     entry = ENV_TEMPLATES[env_type]
 
-    py_exec = entry['run'].format(dir=dir_name).strip('"')
-    full_cmd = [py_exec, "-c", VERSION_CHECK_SCRIPT]
-
-    try:
-        output = subprocess.check_output(full_cmd, encoding='utf-8', stderr=subprocess.DEVNULL)
-        data = {k: v for k, v in [x.split('=') for x in output.strip().split('||')]}
-        data['path'] = dir_name
-        data['type'] = env_type
-        return data
-    except Exception as e:
-        return {'error': str(e), 'type': env_type, 'path': dir_name}
+    py_exec = entry['run'] if env_type == "none" else interpreter_path(dir_name, env_type)
+    if env_type == "none":
+        py_exec = shutil.which(py_exec)
+        if py_exec is None:
+            return {'error': 'System interpreter not found', 'type': env_type, 'path': dir_name}
+    inspection = inspect_interpreter(py_exec)
+    if inspection["status"] != "inspected":
+        return {'error': inspection["error"], 'type': env_type, 'path': dir_name}
+    packages = inspection["packages"]
+    data = {key: packages.get(distribution) or "Missing" for key, distribution in (("torch", "torch"), ("sageattention", "sageattention"), ("spas_sage_attn", "spas-sage-attn"), ("flash_attn", "flash-attn"))}
+    data["triton"] = packages["triton"] or packages["triton-windows"] or "Missing"
+    return {**data, "python": inspection["python"], "path": dir_name, "type": env_type}
 
 def show_status():
     manager = EnvsManager()
@@ -442,17 +405,10 @@ def install_logic(env_name, env_type, env_path, py_k, torch_k, triton_k, sage_k,
         if cmd: run_cmd(f"{pip} {cmd}")
 
     for k in kernel_list:
-        if k in ("wgpkernels", "wgpkernels_cu128", "wgpkernels_rocm10"):
-            k = {"cu130": "wgpkernels", "cu128": "wgpkernels_cu128", "rocm10": "wgpkernels_rocm10"}.get(torch_k)
-            if k is None:
-                continue
-            if k == "wgpkernels_rocm10" and not any(f"device-{arch}" in torch_cmd for arch in ("gfx1200", "gfx1201")):
-                continue
-        if k in ("gguf", "gguf_cu128", "gguf_rocm10"):
-            gguf_builds = {("cu130", "3.11"): "gguf", ("cu128", "3.10"): "gguf_cu128", ("rocm10", "3.12"): "gguf_rocm10"}
-            k = gguf_builds.get((torch_k, py_k))
-            if k is None or k == "gguf_rocm10" and not any(f"device-{arch}" in torch_cmd for arch in ("gfx1200", "gfx1201")):
-                continue
+        amd_targets = [arch for arch in ("gfx1200", "gfx1201") if f"device-{arch}" in torch_cmd]
+        k = kernel_variant(k, torch_k, py_k, amd_targets)
+        if k is None:
+            continue
         if k in config['components']['kernels']:
             cmd = resolve_cmd(config['components']['kernels'][k]['cmd'])
             if cmd: run_cmd(f"{pip} {cmd}")
@@ -886,7 +842,7 @@ def do_manage():
         elif choice == "8":
             break
 
-def do_upgrade(config):
+def do_upgrade(config, profile_key=None):
     manager = EnvsManager()
     print("\n" + "="*90)
     print(f"{'WAN2GP MANUAL COMPONENT UPGRADE':^90}")
@@ -896,7 +852,12 @@ def do_upgrade(config):
     env_data = manager.list_envs()[env_name]
 
     gpu_name, vendor = get_gpu_info()
-    rec = config['gpu_profiles'][get_profile_key(gpu_name, vendor)]
+    profile_key = profile_key or get_profile_key(gpu_name, vendor)
+    if profile_key not in config['gpu_profiles']:
+        raise ValueError("Hardware profile is unknown. Run setup.py upgrade --profile with an explicit catalog profile.")
+    rec = config['gpu_profiles'][profile_key]
+    if get_os_key() not in rec.get("platforms", ("win", "linux", "macos")):
+        raise ValueError(f"Hardware profile {profile_key} is not supported on {get_os_key()}")
 
     py_k = menu("Python Version", config['components']['python'], rec['python'])
     torch_k = menu("Torch Version", config['components']['torch'], rec['torch'])
@@ -995,24 +956,6 @@ def create_wgp_config(profile_key, config_data):
     ram, vram = get_system_specs()
     print(f"    Detected: {int(ram)}GB RAM / {int(vram)}GB VRAM")
 
-    has_high_ram = ram > 60
-    has_mid_ram = ram > 30
-    has_huge_vram = vram > 22
-    has_high_vram = vram > 11
-
-    pid = 5
-
-    if has_high_ram and has_huge_vram:
-        pid = 1
-    elif has_high_ram:
-        pid = 2
-    elif has_mid_ram and has_huge_vram:
-        pid = 3
-    elif has_mid_ram and has_high_vram:
-        pid = 4
-    else:
-        pid = 5
-
     prof_settings = config_data['gpu_profiles'].get(profile_key, {})
 
     attn_mode = prof_settings.get("attention", "")
@@ -1022,23 +965,12 @@ def create_wgp_config(profile_key, config_data):
         elif "20" in profile_key:
             attn_mode = "sage"
 
-    compile_mode = "disabled"
-    # triton_key = prof_settings.get('triton')
-    # if triton_key and triton_key != "none":
-    #     compile_mode = "transformer"
-
-    config_out = {
-        "attention_mode": attn_mode,
-        "compile": compile_mode,
-        "video_profile": pid,
-        "image_profile": pid,
-        "audio_profile": pid,
-    }
+    config_out = recommend_settings({}, ram_gb=ram, vram_gb=vram, attention=attn_mode)["patch"]
 
     try:
         with open(WGP_CONFIG_FILE, 'w') as f:
             json.dump(config_out, f, indent=4)
-        print(f"    Created config with Profile {pid}, Attention: '{attn_mode}', Compile: '{compile_mode}'")
+        print(f"    Created config with Video/Image Profile {config_out['video_profile']}, Audio Profile {config_out['audio_profile']}, Attention: '{attn_mode}', Compile: '{config_out['compile']}'")
     except Exception as e:
         print(f"[!] Error writing config: {e}")
 
@@ -1097,15 +1029,35 @@ def repair_git_repo():
     run_cmd(f"git branch --set-upstream-to=origin/{default_branch} {default_branch}")
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "manager":
+        from installation.cli import main as installation_main
+        sys.exit(installation_main(sys.argv[2:]))
+    if len(sys.argv) > 1 and sys.argv[1] == "plan":
+        from installation.cli import main as installation_main
+        sys.exit(installation_main(sys.argv[1:]))
     inject_system_paths()
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(epilog="Read-only Manager planning: python setup.py plan --help")
     parser.add_argument("mode", choices=["install", "update", "upgrade", "status", "manage", "get_env_info"])
     parser.add_argument("--env", default="venv", help="Type of env for install (venv, uv, conda, none)")
     parser.add_argument("--auto", action="store_true", help="Run 1-click automatic install")
+    parser.add_argument("--profile", help="Explicit hardware profile from setup_config.json")
     args = parser.parse_args()
     cfg = load_config()
+    if args.profile is not None and args.profile not in cfg['gpu_profiles']:
+        parser.error(f"Unknown profile {args.profile!r}; choose from {', '.join(cfg['gpu_profiles'])}")
+    record = managed_record(os.getcwd())
+    if record and args.mode not in ("status", "get_env_info"):
+        parser.error(f"Managed installation detected at {record}. Legacy mutations are disabled; use setup.py manager prepare/apply/recover.")
 
     if args.mode == "get_env_info":
+        if record:
+            from installation.state import InstallationLock
+            from installation.transactions import ready_record
+            try:
+                with InstallationLock(record.parent.parent):
+                    ready_record(record.parent.parent)
+            except (OSError, ValueError, RuntimeError) as exc:
+                parser.error(str(exc))
         manager = EnvsManager()
         active = manager.get_active()
 
@@ -1124,11 +1076,13 @@ if __name__ == "__main__":
         do_manage()
         sys.exit(0)
 
-    gpu_name, vendor = get_gpu_info()
-    profile_key = get_profile_key(gpu_name, vendor)
-    profile = cfg['gpu_profiles'][profile_key]
-
     if args.mode == "install":
+        gpu_name, vendor = get_gpu_info()
+        profile_key = args.profile or get_profile_key(gpu_name, vendor)
+        if profile_key is None:
+            parser.error(f"No automatic profile for {gpu_name!r}; select --profile from {', '.join(cfg['gpu_profiles'])}")
+        if get_os_key() not in cfg['gpu_profiles'][profile_key].get("platforms", ("win", "linux", "macos")):
+            parser.error(f"Hardware profile {profile_key} is not supported on {get_os_key()}")
         print(f"Hardware Detected: {gpu_name} ({vendor})")
         if args.auto:
             do_install_auto(args.env, cfg, profile_key)
@@ -1175,4 +1129,7 @@ if __name__ == "__main__":
             print("\n[*] Code is already up to date. Skipping requirements installation.")
 
     elif args.mode == "upgrade":
-        do_upgrade(cfg)
+        try:
+            do_upgrade(cfg, args.profile)
+        except ValueError as exc:
+            parser.error(str(exc))

@@ -1,0 +1,14 @@
+{
+    "spatial_upsampling": "hi3d",
+    "spatial_postprocessing_parameters": {
+        "hi3d_level": 1024,
+        "hi3d_max_faces": 0
+    },
+    "temporal_upsampling": "supratex",
+    "temporal_postprocessing_parameters": {
+        "texture_size": 2048,
+        "texture_max_faces": 0
+    },
+    "settings_version": 2.82,
+    "help": "Hi3D adds fine relief to solid parts, then SUPRA-Tex paints PBR textures keeping the picture's colours."
+}

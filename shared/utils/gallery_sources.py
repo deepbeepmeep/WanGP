@@ -11,6 +11,7 @@ from dataclasses import dataclass
 MESH_EXTENSIONS = (".glb", ".ply")  # 3D gallery files: GLB meshes and Gaussian splat PLYs; other mesh formats are converted to GLB on import
 MESH_IMPORT_EXTENSIONS = (".glb", ".obj", ".ply", ".stl")
 WORLD_EXTENSIONS = (".wgpworld",)  # Worlds gallery files: worlds of interactive world models, explorable again from their stored state
+APP_EXTENSIONS = (".wgpapp",)  # Apps gallery files: web apps made with Deepy (shared.apps), played again from their package
 
 
 @dataclass(frozen=True)
@@ -42,11 +43,13 @@ class GallerySource:
 
 
 VIDEO = GallerySource("video", "Images / Videos", ("image", "video"), "", "video_images", "Video / Images", "image/*,video/*", "visual")
-AUDIO = GallerySource("audio", "Audio", ("audio",), "audio_", "audio", "Audio", "audio/*", "audio")
+# Audio imports filter by extension: iOS Safari treats audio/* as video and greys out audio files.
+AUDIO = GallerySource("audio", "Audio", ("audio",), "audio_", "audio", "Audio", ".wav,.mp3,.aac,.flac,.m4a,.ogg,.opus,.wma", "audio")
 MESH = GallerySource("mesh", "3D", ("3d",), "mesh_", "mesh", "3D", ".glb,.obj,.ply,.stl", "3d")
 WORLD = GallerySource("world", "Worlds", ("world",), "world_", "world", "Worlds", ".wgpworld", "world")
+APP = GallerySource("app", "Apps", ("app",), "app_", "apps", "Apps", ".wgpapp", "app")
 
-GALLERY_SOURCES = (VIDEO, AUDIO, MESH, WORLD)
+GALLERY_SOURCES = (VIDEO, AUDIO, MESH, WORLD, APP)
 STRIP_SOURCES = GALLERY_SOURCES[1:]  # galleries rendered by shared.gradio.strip_gallery (all but the image/video gallery)
 SOURCES = {source.id: source for source in GALLERY_SOURCES}
 _KIND_SOURCES = {kind: source for source in GALLERY_SOURCES for kind in source.kinds}

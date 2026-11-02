@@ -1,0 +1,22 @@
+{
+    "model": {
+        "name": "Hunyuan3D 2.1 Paint 2B",
+        "architecture": "hunyuan3d_21_paint",
+        "description": "Tencent Hunyuan3D 2.1 Paint: PBR textures (base colour and metallic-roughness) painted on a supplied mesh from a picture of the same object. Also the Hunyuan3D 2.1 Paint Texturer of any 3D model; the textures follow the picture's colours, fine print comes out blurred.",
+        "URLs": [
+            "https://huggingface.co/DeepBeepMeep/3D/resolve/main/hunyuan3d_21_paint_fp16.safetensors",
+            "https://huggingface.co/DeepBeepMeep/3D/resolve/main/hunyuan3d_21_paint_int8_convrot.safetensors"
+        ]
+    },
+    "prompt": "red toy robot",
+    "image_mode": 1,
+    "video_prompt_type": "I",
+    "guidance_scale": 3.0,
+    "batch_size": 1,
+    "seed": 1234,
+    "custom_settings": {
+        "max_faces": 40000,
+        "texture_views": "8_768",
+        "texture_size": 2048
+    }
+}

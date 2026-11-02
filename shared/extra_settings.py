@@ -314,7 +314,7 @@ def _sliding_window_visible(model_def: dict[str, Any]) -> bool:
 
 
 def _sample_solver_row_visible(model_def: dict[str, Any]) -> bool:
-    return model_def.get("sample_solvers", None) is not None or bool(model_def.get("flow_shift", False))
+    return model_def.get("sample_solvers", None) is not None or bool(model_def.get("flow_shift", False)) or bool(model_def.get("custom_sigmas", False))
 
 
 def _control_net_visible(index: int) -> _Resolver:
@@ -534,6 +534,7 @@ _add_setting("guidance2_scale", "Guidance2 (CFG)", "number", min=1.0, max=20.0, 
 _add_setting("guidance3_scale", "Guidance3 (CFG)", "number", min=1.0, max=20.0, step=0.1, visible=_show_if_guidance_phase(3), containers=("guidance_row",))
 _add_setting("switch_threshold", _switch_threshold_label, _model_setting_type("switch_threshold", "integer"), min=_model_setting_bound("switch_threshold", "min", 0), max=_model_setting_bound("switch_threshold", "max", 1000), step=_model_setting_bound("switch_threshold", "step", 1), visible=_show_if_int_at_least("guidance_max_phases", 2), active_when=_active_if_guidance_phase(2), containers=("guidance_phases_row",))
 _add_setting("num_inference_steps2", "Phase 2 Steps", "integer", min=1, max=100, step=1, visible=_show_if(lambda model_def: model_def.get("inference_steps2", False) and model_def.get("guidance_max_phases", 0) >= 2), active_when=_active_if_guidance_phase(2), containers=("guidance_phases_row",))
+_add_setting("custom_sigmas", "Custom Sigmas", "string", visible=_show_if_flag("custom_sigmas"), containers=("sample_solver_row",))
 _add_setting("switch_threshold2", "Phase 2-3", "integer", min=0, max=1000, step=1, visible=_show_if_int_at_least("guidance_max_phases", 3), containers=("guidance_phases_row",))
 _add_setting("alt_guidance_scale", _model_label("alt_guidance", "Alternate Guidance"), "number", min=1.0, max=20.0, step=0.5, visible=_show_if_not_none("alt_guidance"), containers=("embedded_guidance_row",))
 _add_setting("alt_scale", _model_label("alt_scale", "Alt Scale"), "number", min=0.0, max=1.0, step=0.05, visible=_show_if_not_none("alt_scale"), containers=("embedded_guidance_row",))

@@ -160,6 +160,7 @@ class LocalFilePickerTextbox:
         browse_label: str = "\U0001F4C2",
         browse_tooltip: str | None = None,
         lines: int | None = None,
+        placeholder: str | None = None,
         textbox_scale: int = 8,
         button_min_width: int = 34,
         browser_height: int = 320,
@@ -177,6 +178,7 @@ class LocalFilePickerTextbox:
         self.browse_tooltip = browse_tooltip or ("Browse local files" if self.multiselect else "Browse local file")
         self.tooltip_class = f"wangp-local-file-picker-tooltip-{next(_tooltip_counter)}"
         self.lines = lines if lines is not None else (4 if self.multiselect else 1)
+        self.placeholder = placeholder
         self.textbox_scale = textbox_scale
         self.button_min_width = button_min_width
         self.browser_height = browser_height
@@ -201,7 +203,7 @@ class LocalFilePickerTextbox:
     def mount(self) -> gr.Textbox:
         gr.HTML(f"<style>{self.get_css()}{self._tooltip_css()}</style>", elem_classes=["wangp-local-file-picker-style"])
         with gr.Column(elem_classes=["wangp-local-file-picker-field", self.tooltip_class]):
-            self.textbox = gr.Textbox(label=self.label, value=self.value, lines=self.lines, scale=self.textbox_scale)
+            self.textbox = gr.Textbox(label=self.label, value=self.value, lines=self.lines, placeholder=self.placeholder, scale=self.textbox_scale)
             self.browse_button = gr.Button(self.browse_label, min_width=1, elem_classes=["wangp-local-file-picker-browse-btn"])
         self._mount_popup()
         self._wire_events()
@@ -300,8 +302,8 @@ class LocalFilePickerTextbox:
             current_paths.extend(selected)
             return self._format_paths(current_paths, compress_root), gr.update()
         selected_text = self._format_paths(selected, compress_root)
-        if not selected_text:
-            return gr.skip(), gr.update(visible=True)
+        if not selected_text:  # an emptied list (a folder reload answering after the pick) leaves the pop-up as it is
+            return gr.skip(), gr.skip()
         current_text = self._format_paths(self._parse_text(current_text, compress_root), compress_root)
         return selected_text, gr.update(visible=selected_text == current_text and bool(selected_text))
 

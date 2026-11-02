@@ -98,16 +98,16 @@ class Qwen3Embedder(nn.Module):
 
             model_inputs = self.tokenizer(
                 text,
-                return_tensors="pt",
                 padding="max_length",
                 truncation=True,
                 max_length=self.max_length,
             )
-            all_input_ids.append(model_inputs["input_ids"])
-            all_attention_masks.append(model_inputs["attention_mask"])
+            all_input_ids.append(torch.tensor(model_inputs["input_ids"], dtype=torch.long, device="cpu").unsqueeze(0))
+            all_attention_masks.append(torch.tensor(model_inputs["attention_mask"], dtype=torch.long, device="cpu").unsqueeze(0))
 
-        input_ids = torch.cat(all_input_ids, dim=0).to(self.model.device)
-        attention_mask = torch.cat(all_attention_masks, dim=0).to(self.model.device)
+        device = runtime.execution_device(self.model)
+        input_ids = torch.cat(all_input_ids, dim=0).to(device)
+        attention_mask = torch.cat(all_attention_masks, dim=0).to(device)
 
         with text_encoding_progress(self.model.model.layers, prompt_count=len(txt)):
             output = self.model.model(

@@ -3,7 +3,6 @@
         "name": "AnimateAnyMesh Text to Mesh Animation",
         "architecture": "animate_any_mesh",
         "description": "AnimateAnyMesh (HUST / Alibaba DAMO, ICCV 2025) animates a static 3D mesh from a text description of its motion: 16 frames of vertex trajectories, no rig, returned as a morph-animated GLB that keeps the mesh textures.",
-        "group": "animate_any_mesh",
         "URLs": [
             "https://huggingface.co/DeepBeepMeep/3D/resolve/main/animate_any_mesh_fp32.safetensors"
         ]

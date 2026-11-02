@@ -1,7 +1,7 @@
 import getpass
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import requests
@@ -1005,19 +1005,25 @@ def load_flow_model(
     preprocess_sd=preprocess_flux_state_dict,
 ) -> Flux:
     # Loading Flux
-    config = configs[name]
+    config = configs["flux2-klein-9b" if name == "flux2-klein-9b-kv" else name]
+    params = replace(config.params, reference_kv=True) if name == "flux2-klein-9b-kv" else config.params
 
     ckpt_path =  model_filename #config.repo_flow
 
     with torch.device("meta"):
         if config.lora_repo_id is not None and config.lora_filename is not None:
-            model = FluxLoraWrapper(params=config.params).to(torch.bfloat16)
+            model = FluxLoraWrapper(params=params).to(torch.bfloat16)
         else:
-            model = Flux(config.params).to(torch.bfloat16)
+            model = Flux(params).to(torch.bfloat16)
 
     # print(f"Loading checkpoint: {ckpt_path}")
     from mmgp import offload
-    offload.load_model_data(model, model_filename, preprocess_sd=preprocess_sd, writable_tensors=False, default_dtype=torch.bfloat16)
+    split_map = None
+    if params.reference_kv:
+        from .modules.layers import get_linear_split_map
+        split_map = get_linear_split_map(params.hidden_size, params.mlp_ratio, params.single_linear1_mlp_ratio, params.double_linear1_mlp_ratio)
+        offload.split_linear_modules(model, split_map)
+    offload.load_model_data(model, model_filename, preprocess_sd=preprocess_sd, fused_split_map=split_map, writable_tensors=False, default_dtype=torch.bfloat16)
 
     # # load_sft doesn't support torch.device
     # sd = load_sft(ckpt_path, device=str(device))

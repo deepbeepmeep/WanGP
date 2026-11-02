@@ -187,50 +187,60 @@ def dequantize_prefix(prefix, dtype=torch.bfloat16):
                  for data, scales in ((prefix.k, prefix.k_scale), (prefix.v, prefix.v_scale)))
 
 
+DYNAMIC_PREFIX = True  # comparison switch: PrefixCache(dynamic=True) places the cache dynamically; False keeps it on the GPU
+
+
 @dataclasses.dataclass
 class PrefixLayer:  # a dataclass: CUDA graphs take its tensors as block arguments
-    """One layer of a PrefixCache: its cached keys / values, 16-bit (k, v) or quantized (prefix)."""
+    """One layer of a PrefixCache: its cached keys / values, 16-bit (k, v) or quantized (prefix), or with a state ring the list of tensors
+    the ring returned (stored), whose items it rebinds as the layer moves between VRAM and its streaming slot: read at each use."""
     k: torch.Tensor | None = None
     v: torch.Tensor | None = None
     prefix: KVPrefix | None = None
+    stored: list | None = None
+    present: tuple = ()  # with a ring: which of the values (k, v or the fields of a KVPrefix) are stored, the others None
     index: int = 0
     quantize: bool = False
     native: bool = True  # a quantized prefix may keep the layout of the kit's staged attention (never read back in 16 bits then)
 
     def store(self, k, v, kit=False):
         """k / v (batch, tokens, kv_heads, head_dim), normalized and rotated (consumed when quantized); kit: attended through the
-        unmasked attention of joint_qkv_attention (a native prefix then). With a RAM cache the layer goes to RAM, its tensors being
-        those of its GPU slot (holding them for this pass already)."""
-        prefix = cache_prefix([k, v], native=kit and self.native) if self.quantize else None
+        unmasked attention of joint_qkv_attention (a native prefix then). With a state ring the layer goes to the ring (RAM, or VRAM of
+        its own with a dynamic ring), its tensors being those the ring binds (holding them for this pass already)."""
+        values = cache_prefix([k, v], native=kit and self.native) if self.quantize else (k, v)
         ring = self.owner.ring
         if ring is not None:
-            slots = iter(ring.store(self.index, [t for t in (prefix if self.quantize else (k, v)) if t is not None], current=True))
-            if self.quantize:
-                prefix = KVPrefix(*(None if t is None else next(slots) for t in prefix))
-            else:
-                k, v = next(slots), next(slots)
-        if self.quantize:
-            self.prefix = prefix
+            self.present = tuple(t is not None for t in values)
+            self.stored = ring.store(self.index, [t for t in values if t is not None], current=True, adopt=True)  # values made for the cache
+        elif self.quantize:
+            self.prefix = values
         else:
-            self.k, self.v = k, v
+            self.k, self.v = values
+
+    def _values(self):
+        if self.stored is None:
+            return self.prefix if self.quantize else (self.k, self.v)
+        items = iter(self.stored)
+        values = [next(items) if present else None for present in self.present]
+        return KVPrefix(*values) if self.quantize else tuple(values)
 
     def empty(self):
-        return self.k is None and self.prefix is None
+        return self.k is None and self.prefix is None and self.stored is None
 
     def kv_prefix(self):
         """The kv_prefix of joint_qkv_attention."""
         if self.empty():
             raise RuntimeError("KV cache has not been populated yet.")
-        return self.prefix if self.quantize else (self.k, self.v)
+        return self._values()
 
     def get(self):
         """The 16-bit keys / values (attentions outside the kit: masks, NAG)."""
         if self.empty():
             raise RuntimeError("KV cache has not been populated yet.")
-        return dequantize_prefix(self.prefix) if self.quantize else (self.k, self.v)
+        return dequantize_prefix(self._values()) if self.quantize else self._values()
 
     def clear(self):
-        self.k = self.v = self.prefix = None
+        self.k = self.v = self.prefix = self.stored = None
 
 
 class PrefixCache:
@@ -241,10 +251,18 @@ class PrefixCache:
     - ram: kept in RAM and streamed to the GPU block by block with the weights (mmgp.runtime.state_ring, locked RAM as far as the reserved
       RAM allows): the VRAM of two layers. blocks: the model's blocks (a ModuleList called one by one), whose forward then fetches the
       layer's cache; without ram, blocks may be a number of layers.
+    - dynamic (without ram): kept in VRAM as far as the model's VRAM allows, planned with its weights by its dynamic preload, the layers that
+      do not stay there kept in RAM and streamed as with ram (a state ring with resident="dynamic"), where mmgp.runtime.dynamic_state(blocks);
+      otherwise kept on the GPU.
     clear() at the end of the generation (clear(keep_ring=True) to store the layers again, e.g. when step-dependent LoRAs change them)."""
 
-    def __init__(self, blocks, quantize=False, native=True, ram=False, name="KV cache"):
-        self.ring = runtime.state_ring(blocks, name) if ram else None
+    def __init__(self, blocks, quantize=False, native=True, ram=False, name="KV cache", dynamic=False):
+        if ram:
+            self.ring = runtime.state_ring(blocks, name)
+        elif dynamic and DYNAMIC_PREFIX and not isinstance(blocks, int) and runtime.dynamic_state(blocks):
+            self.ring = runtime.state_ring(blocks, name, resident="dynamic")
+        else:
+            self.ring = None
         self.layers = [PrefixLayer(index=index, quantize=quantize, native=native) for index in range(blocks if isinstance(blocks, int) else len(blocks))]
         for layer in self.layers:
             layer.owner = self  # not a field: not a block argument

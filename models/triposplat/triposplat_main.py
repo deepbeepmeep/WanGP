@@ -1,6 +1,6 @@
 # TripoSplat for WanGP: one object image to 3D Gaussian splats, from VAST-AI-Research/TripoSplat triposplat.py (TripoSplatPipeline; MIT
 # License, Copyright (c) 2026 VAST, see LICENSE in this folder). Modified by DeepBeepMeep for WanGP: model loading through MMGP, background
-# removal with WanGP's rembg u2net instead of BiRefNet, WanGP's FLUX.2 VAE encoder and checkpoint, conditioning cache, joint-pass CFG,
+# removal with rembg's BiRefNet General session, WanGP's FLUX.2 VAE encoder and checkpoint, conditioning cache, joint-pass CFG,
 # random draws from the generation's generator, glTF axes and the WanGP splat contract (INRIA PLY bytes and previews).
 # Modifications Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import hashlib
@@ -67,12 +67,13 @@ def _load(module, filename, **kwargs):
 
 
 def _remove_background(image):
-    """RGB image with the rembg u2net matte as its alpha (the colours are kept, as upstream's BiRefNet cutout)."""
+    """RGB image with the BiRefNet General matte as its alpha (the colours are kept, as upstream's BiRefNet cutout)."""
     from rembg import remove
+    from preprocessing.rembg.assets import OBJECT_MODEL
     from shared.utils.utils import new_rembg_session
 
     rgba = image.copy()
-    rgba.putalpha(remove(image, session=new_rembg_session("u2net"), only_mask=True))
+    rgba.putalpha(remove(image, session=new_rembg_session(OBJECT_MODEL), only_mask=True))
     return rgba
 
 

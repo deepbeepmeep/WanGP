@@ -134,6 +134,9 @@ def install(mode="vmm", large_mb=256, chunk_mb=32, spill=False):
     _install_oom_error(lib)
     _lib, active = lib, mode
     _redirect_torch_memory_functions()
+    from .. import virtual_gpu
+    if virtual_gpu.state:  # an emulated smaller card: what it leaves the process
+        set_vram_limit(virtual_gpu.state["limit"])
     from . import ram
     ram._link_vram_allocator()  # the RAM allocator, when installed first, gives its cache back before a spill is refused
 

@@ -91,7 +91,7 @@ def create_app(service, *, token=None, auth=None, voice_language=None, https_por
             return FileResponse(WEB.parents[1] / 'gradio' / name)
         if name == "icon.png":
             return FileResponse(WEB.parents[2] / "favicon.png")
-        if name not in {"chat.js", "compact_actions.js", "chat.css", "voice.js", "app.js", "app.css", "gradio_transport.js", "manifest.webmanifest", "icon.svg", "transport.js", "hybrid_transport.js", "workspaces.js", "workspaces.css", "media_view.js"}:
+        if name not in {"chat.js", "compact_actions.js", "chat.css", "voice.js", "app.js", "app.css", "gradio_transport.js", "manifest.webmanifest", "icon.svg", "transport.js", "hybrid_transport.js", "workspaces.js", "workspaces.css", "media_view.js", "app_player.js", "app_player.css"}:
             raise HTTPException(404)
         return FileResponse(WEB / name, media_type="application/manifest+json" if name == "manifest.webmanifest" else None)
 
@@ -271,9 +271,9 @@ def create_app(service, *, token=None, auth=None, voice_language=None, https_por
         with service._mutation_lock:
             return {"id": media_id, "gallery": service.gallery_snapshot()}
 
-    @app.post('/deepy_api/media/unattach-last')
-    def unattach_last(payload: dict):
-        return {'event': service.remove_last_chat_upload(payload.get('chat_session_id'))}
+    @app.post('/deepy_api/media/unattach')
+    def unattach(payload: dict):
+        return {'event': service.remove_chat_upload(payload.get('chat_session_id'), payload.get('media_id'))}
 
     @app.get("/deepy_api/media/locate")
     def locate_media(url: str):
@@ -321,6 +321,9 @@ def run_server(deps, args):
     service = DeepyService(deps)
     service.configure_workspaces(args.workspaces_dir or service._deps.get_server_config().get('workspaces_dir') or str(WEB.parents[2] / 'workspaces'))
     app = create_app(service, auth=auth, voice_language=args.deepy_voice_language, https_port=https_port)
+    from shared.apps import server as apps_server
+    apps_server.mount(app, auth.public_url)
+    app.add_middleware(apps_server.AppFrameGuard)  # outermost: runs before the authentication
     if https_port is None:
         uvicorn.run(app, host=host, port=port, ssl_certfile=cert, ssl_keyfile=key)
     else:

@@ -1396,6 +1396,7 @@ class LTX2:
         audio_cfg_scale: float | None = None,
         alt_scale: float = 0.0,
         sample_solver: str = "",
+        custom_sigmas=None,
         NAG_scale: float = 1.0,
         NAG_tau: float = 3.5,
         NAG_alpha: float = 0.5,
@@ -1451,7 +1452,7 @@ class LTX2:
             alpha_source = input_frames
             height, width = input_frames.shape[-2:]
             if max(height, width) > 1920 or min(height, width) > 1088:
-                raise ValueError("Alpha Gen supports source videos up to 1920×1088. Resize the source before loading it.")
+                raise ValueError("Alpha Gen supports source videos up to 1920Ã—1088. Resize the source before loading it.")
             frame_num = min(frame_num, input_frames.shape[1])
             input_prompt = ""
             guide_phases = 1
@@ -1865,12 +1866,13 @@ class LTX2:
         ltx2_22B_class = self.model_def.get("ltx2_22B_class", False)
 
         def run_ltx2_pipeline(**pipeline_kwargs):
+            pipeline_kwargs["custom_sigmas"] = custom_sigmas
             pipeline_context = self.pipeline.joyai_echo_context(joyai_context) if joyai_context is not None else nullcontext()
             with pipeline_context:
                 return self.pipeline(**pipeline_kwargs)
 
         if hdr_transform == "acescct":
-            pipeline_output = convert_sdr_to_hdr(self.model, self.video_encoder, self.video_decoder, self.pipeline.pipeline_components, self.device, input_frames, prefix_frames_count if images else 0, images, hdr_scene_context[0], int(frame_num), target_height, target_width, float(fps), int(seed), tiling_config=tiling_config, loras_slists=loras_slists, callback=callback, set_progress_status=set_progress_status, interrupt_check=interrupt_check), None
+            pipeline_output = convert_sdr_to_hdr(self.model, self.video_encoder, self.video_decoder, self.pipeline.pipeline_components, self.device, input_frames, prefix_frames_count if images else 0, images, hdr_scene_context[0], int(frame_num), target_height, target_width, float(fps), int(seed), tiling_config=tiling_config, loras_slists=loras_slists, callback=callback, set_progress_status=set_progress_status, interrupt_check=interrupt_check, custom_sigmas=custom_sigmas), None
         elif isinstance(self.pipeline, TI2VidTwoStagesPipeline):
             pipeline_output = run_ltx2_pipeline(
                 prompt=input_prompt,

@@ -5,6 +5,7 @@ from typing import Callable, Literal
 import numpy as np
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
 from einops import rearrange, repeat
 from PIL import Image
 from torch import Tensor
@@ -555,6 +556,7 @@ def denoise(
     piflow_substeps: int = 128,
     piflow_generator: torch.Generator | None = None,
     piflow_gm_temperature: float | None = None,
+    kv_cache=None,
 ):
 
     kwargs = {
@@ -566,9 +568,6 @@ def denoise(
     }
     if NAG is not None:
         kwargs["NAG"] = NAG
-
-    if callback != None:
-        callback(-1, None, True)
 
     original_timesteps = timesteps
     is_piflow = getattr(model, "piflow", False)
@@ -647,10 +646,9 @@ def denoise(
         piflow_spatial_w = int(base_img_ids[..., 2].max().item() + 1)
 
     updated_num_steps= len(timesteps) -1
-    if callback != None:
+    if loras_slists is not None:
         from shared.utils.loras_mutipliers import update_loras_slists
         update_loras_slists(model, loras_slists, len(original_timesteps))
-        callback(-1, None, True, override_num_inference_steps = updated_num_steps)
     from mmgp import offload
     # this is ignored for schnell
     guidance_vec = torch.full((img.shape[0],), guidance, device=img.device, dtype=img.dtype)
@@ -663,8 +661,15 @@ def denoise(
             nfe = len(timesteps) - 1
             piflow_gm_temperature = min(max(0.1 * (nfe - 1), 0.0), 1.0)
 
-    for i, (t_curr, t_prev) in enumerate(zip(timesteps[:-1], timesteps[1:])):
+    dynamic_loras = loras_slists is not None and any(isinstance(value, list) or value != loras_slists["phase1"][index]
+        for phase in ("phase1", "phase2", "phase3") for index, value in enumerate(loras_slists[phase]))
+    if callback is not None:
+        callback(-1, None, True, override_num_inference_steps=updated_num_steps)
+    for i, (t_curr, t_prev) in enumerate(tqdm(zip(timesteps[:-1], timesteps[1:]), total=updated_num_steps, desc="Denoising", mininterval=1 / 3)):
         offload.set_step_no_for_lora(model, first_step  + i)
+        if kv_cache is not None and dynamic_loras and i > 0:
+            for cache in kv_cache:
+                cache.clear(keep_ring=True)
         if pipeline._interrupt:
             return None
 
@@ -680,8 +685,11 @@ def denoise(
             if img_cond is not None:
                 img_input = torch.cat((img_input, img_cond), dim=-1)
             if img_cond_seq is not None:
-                img_input = torch.cat((img_input, img_cond_seq), dim=1)
-                img_input_ids = torch.cat((img_input_ids, img_cond_seq_ids), dim=1)
+                if kv_cache is None:
+                    img_input = torch.cat((img_input, img_cond_seq), dim=1)
+                    img_input_ids = torch.cat((img_input_ids, img_cond_seq_ids), dim=1)
+                else:
+                    kwargs.update(reference_latents=img_cond_seq, reference_ids=img_cond_seq_ids, kv_cache=kv_cache)
             if not joint_pass or cfg_scale == 1:
                 noise_pred = model(
                     img=img_input,

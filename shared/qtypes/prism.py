@@ -105,7 +105,8 @@ class PrismLinear(QLinearGGUF):
     _prism_decode_enabled = False
 
     def forward(self, input):
-        if self._prism_decode_enabled and input.is_cuda and input.numel() == input.shape[-1] and input.dtype == self._gguf_default_dtype and (self.bias is None or self.bias.dtype == input.dtype):
+        # the fused decode reads weights in VRAM: a block MMGP leaves in RAM (cpuCompute) takes QLinearGGUF's CPU branch
+        if self._prism_decode_enabled and input.is_cuda and self.weight._data.is_cuda and input.numel() == input.shape[-1] and input.dtype == self._gguf_default_dtype and (self.bias is None or self.bias.dtype == input.dtype):
             from shared.kernels.prism_decode import select_decode
             transform = self.prism_transform
             raw = self.weight._data

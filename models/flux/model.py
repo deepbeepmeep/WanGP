@@ -1,3 +1,5 @@
+# Based on Black Forest Labs FLUX/FLUX.2, Apache-2.0 (docs/third_party_licenses/Apache-2.0.txt).
+# Modified for WanGP: shared attention, MMGP execution and reference KV caching.
 from dataclasses import dataclass
 import math
 
@@ -54,6 +56,7 @@ class FluxParams:
     double_mlp_ratio: float | None = None
     double_linear1_mlp_ratio: float | None = None
     flux2: bool = False
+    reference_kv: bool = False
     piflow: bool = False
 
 class Flux(nn.Module):
@@ -95,6 +98,7 @@ class Flux(nn.Module):
         self.out_channels = params.out_channels
         self.chroma = params.chroma
         self.is_flux2 = getattr(params, "flux2", False)
+        self.reference_kv = params.reference_kv
         self.radiance = getattr(params, "radiance", False)
         self.piflow = getattr(params, "piflow", False)
         if params.hidden_size % params.num_heads != 0:
@@ -268,6 +272,9 @@ class Flux(nn.Module):
         return modulated, {"means": means, "logweights": logweights, "logstds": logstds}
 
     def preprocess_loras(self, model_type, sd):
+        if self.reference_kv:
+            from .klein_lora import convert_klein_lora
+            return convert_klein_lora(self, sd)
         new_sd = {}
         if len(sd) == 0: return sd
 
@@ -387,6 +394,9 @@ class Flux(nn.Module):
         siglip_embedding = None,
         siglip_embedding_ids = None,
         NAG: dict | None = None,
+        reference_latents=None,
+        reference_ids=None,
+        kv_cache=None,
     ) -> Tensor:
 
         sz = len(txt_list)
@@ -445,7 +455,20 @@ class Flux(nn.Module):
         if self.is_flux2:
             double_vec_list = [ ( self.double_stream_modulation_img(base_vec_list[i]), self.double_stream_modulation_txt(base_vec_list[i]), ) for i in range(sz) ]
 
-        with cuda_graphs.scope():
+        reference = reference_pe = reference_double_vec = reference_single_vec = None
+        if kv_cache is not None and kv_cache[0].empty():
+            # The released KV checkpoint conditions every reference on t=0. References
+            # never attend to text/output tokens, so both CFG branches share this state.
+            reference = self.img_in(reference_latents)
+            reference_pe = self.pe_embedder(reference_ids)
+            reference_vec = self.time_in(timestep_embedding(torch.zeros_like(timesteps), 256))
+            reference_double_vec = self.double_stream_modulation_img(reference_vec)
+            reference_single_vec = self.single_stream_modulation(reference_vec)[0]
+            del reference_vec
+
+        # Extraction writes the cache and its state ring. As in Qwen 2.1, only
+        # the following read-only cached steps may be captured/replayed.
+        with cuda_graphs.scope(reference is None):
             for i, block in enumerate(self.double_blocks):
                 if self.chroma:
                     vec_list = [( self.get_modulations(mod_vectors, "double_img", idx=i), self.get_modulations(mod_vectors, "double_txt", idx=i))] * sz
@@ -455,9 +478,19 @@ class Flux(nn.Module):
                     callback(-1, None, False, True)
                 if pipeline._interrupt:
                     return [None] * sz
-                for img, txt, pe, vec in zip(img_list, txt_list, pe_list, vec_list):
-                    img[...], txt[...] = block(img=img, txt=txt, vec=vec, pe=pe, NAG=NAG)
+                for branch, (img, txt, pe, vec) in enumerate(zip(img_list, txt_list, pe_list, vec_list)):
+                    if kv_cache is None:
+                        img[...], txt[...] = block(img=img, txt=txt, vec=vec, pe=pe, NAG=NAG)
+                    else:
+                        img[...], txt[...], next_reference = block(img=img, txt=txt, vec=vec, pe=pe,
+                            reference=reference if branch == 0 else None, reference_pe=reference_pe,
+                            reference_vec=reference_double_vec, cache_layer=kv_cache[0][i])
+                        if branch == 0:
+                            reference = next_reference
+                        next_reference = None
                     img = txt = pe = vec= None
+                    if pipeline._interrupt:
+                        return [None] * sz
 
             img_list = [torch.cat((txt, img), 1) for txt, img in zip(txt_list, img_list)]
 
@@ -474,9 +507,20 @@ class Flux(nn.Module):
                     callback(-1, None, False, True)
                 if pipeline._interrupt:
                     return [None] * sz
-                for img, pe, vec in zip(img_list, pe_list, vec_list):
-                    img[...]= block(x=img, vec=vec, pe=pe, txt_len=txt_len, NAG=NAG)
+                for branch, (img, pe, vec) in enumerate(zip(img_list, pe_list, vec_list)):
+                    if kv_cache is None:
+                        img[...] = block(x=img, vec=vec, pe=pe, txt_len=txt_len, NAG=NAG)
+                    else:
+                        img[...], next_reference = block(x=img, vec=vec, pe=pe, txt_len=txt_len,
+                            reference=reference if branch == 0 else None, reference_pe=reference_pe,
+                            reference_vec=reference_single_vec, cache_layer=kv_cache[1][i])
+                        if branch == 0:
+                            reference = next_reference
+                        next_reference = None
                     img = pe = vec = None
+                    if pipeline._interrupt:
+                        return [None] * sz
+        reference = reference_pe = reference_double_vec = reference_single_vec = None
         img_list = [img[:, txt.shape[1] : txt.shape[1] + img_len, ...] for img, txt in zip(img_list, txt_list)]
 
         if self.radiance:

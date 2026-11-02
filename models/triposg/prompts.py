@@ -26,7 +26,8 @@ transformer generating 2048 shape latents, decoded into a fine occupancy volume 
 
 ## Output
 
-A watertight GLB mesh, Y up, without UVs or materials (texture it with Hunyuan3D 2.1 "Texture a Mesh" if needed).
+A watertight GLB mesh, Y up, without UVs or materials. Its presets add PBR textures (SUPRA-Tex or Hunyuan3D 2.1 Paint) and fine
+geometric detail (Hi3D) in the same generation.
 
 ## Limits
 

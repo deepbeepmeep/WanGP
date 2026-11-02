@@ -1,9 +1,13 @@
 {
-  "name": "Sample Plugin",
+  "name": "Sample App",
   "author": "DeepBeepMeep",
   "version": "1.0.0",
-  "description": "Sample Source Code to Design Plugins",
+  "description": "Working source examples for building your own WanGP Plugin.",
   "date": "",
-  "wan2gp_version": ""
+  "wan2gp_version": "",
+  "info_card": {
+    "tagline": "Build Your Own Plugin",
+    "description": "Explore working examples of prompt editing, model selection, media generation and Deepy jobs. Use the source as a starting point for your own app.",
+    "details": "For Developers · Some Examples Start Generation"
+  }
 }
-

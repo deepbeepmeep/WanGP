@@ -1,0 +1,17 @@
+{
+    "merge_loras": "merge before",
+    "activated_loras": [
+        "https://huggingface.co/DeepBeepMeep/MiniMax-H3/resolve/main/loras/open_h3_regenerate_2k_lora.safetensors"
+    ],
+    "loras_multipliers": "0;1",
+    "guidance_phases": 2,
+    "video_prompt_type": "",
+    "custom_sigmas": "; 0.909375, 0.8571428571428571, 0.6666666666666666",
+    "num_inference_steps": 20,
+    "num_inference_steps2": 3,
+    "switch_threshold": 0.909375,
+    "guidance_scale": 1,
+    "flow_shift": 12,
+    "sample_solver": "euler",
+    "skip_steps_cache_type": ""
+}

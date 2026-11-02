@@ -823,6 +823,9 @@ class family_handler:
             elif base_model_type in LTX2_22B_CLASS:
                 extra_model_def["sample_solvers"] = [("Distilled 8 Steps", "distilled_8_steps"), ("Euler", "euler"), ("HQ (res2s)", "res2s")]
         extra_model_def["guidance_max_phases"] = 2
+        extra_model_def["custom_sigmas"] = True
+        extra_model_def["custom_sigmas_switch_scale"] = None  # stages have independent schedules, no noise-switch control
+        extra_model_def["custom_sigmas_schedulers"] = ["", "euler", "res2s"]
         extra_model_def["visible_phases"] = 0 if distilled else 1
         if ltx25:
             extra_model_def["self_refiner"] = False
@@ -843,6 +846,8 @@ class family_handler:
         from models.help_shared import merge_help
         from .infos import compact_help
         extra_model_def = merge_help(extra_model_def, compact_help(msr=msr, joy=joy, editanything=editanything_ref, ltx25=ltx25))
+        extra_model_def["infos"] += "\n\n**Custom Sigmas:** leave empty for the normal schedules. Separate values with commas and phase slots with `;`; a blank slot keeps that phase's defaults. Explicit schedules override its step count. The **i** beside the field explains the syntax. Fixed eight-step schedulers require this field to stay empty."
+        extra_model_def["deepy_infos"] += " `custom_sigmas` defaults to empty; use comma-separated positive descending values below 1 and one semicolon-separated slot per phase, e.g. `;0.9,0.6,0.3`. Blank slots retain defaults; optional final zero is ignored. Explicit sigmas are used directly without another flow shift and determine that phase's step count. Each phase restarts its own schedule. Compatible selectable schedulers: `euler`, `res2s`; fixed `distilled_8_steps` / `distilled_8_steps_ancestral` require empty custom sigmas."
         extra_model_def["phase_2_spatial_tiling"] = not (msr or joy or editanything_ref)
         if extra_model_def["phase_2_spatial_tiling"]:
             tiling_help = "\n\n**Two Phases with Tiling** refines overlapping spatial tiles in phase 2, blending predictions at every step. Phase 1 establishes the whole scene. This reduces each transformer call's spatial extent, takes more calls, and can change fine detail. VAE tiling is independent."

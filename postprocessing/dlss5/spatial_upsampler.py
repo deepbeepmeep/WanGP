@@ -78,7 +78,7 @@ class DLSS5SpatialUpsampler(api.SimpleScaleSuffixMixin):
             "postprocessing_category": api.POSTPROCESSING_CATEGORY_UPSAMPLER,
             "description": "DLSS 5 Neural Rendering. At x1 it refines at native resolution; higher modes refine and upscale. Requires Windows and a compatible NVIDIA RTX GPU. WSL can use the Windows worker through Windows interoperability; this is not native Linux Neural Rendering.",
             "method_parameters": {cls.METHOD: [
-                {"name": "spatial_upsampler_dlss_strength", "setting": "intensity", "type": "number", "component": "slider", "ui": (api.PARAMETER_UI_POSTPROCESSING, api.PARAMETER_UI_LATE_POSTPROCESSING, api.PARAMETER_UI_MEDIA_FLOW), "required": False, "default": 1.0, "minimum": 0.0, "maximum": 2.0, "step": 0.05, "label": "DLSS 5 NR Intensity", "description": "Controls the native Neural Rendering intensity. 1 is the native default; values up to 2 strengthen the effect."},
+                {"name": "dlss_strength", "setting": "intensity", "type": "number", "component": "slider", "ui": (api.PARAMETER_UI_POSTPROCESSING, api.PARAMETER_UI_LATE_POSTPROCESSING, api.PARAMETER_UI_MEDIA_FLOW), "required": False, "default": 1.0, "minimum": 0.0, "maximum": 2.0, "step": 0.05, "label": "DLSS 5 NR Intensity", "description": "Controls the native Neural Rendering intensity. 1 is the native default; values up to 2 strengthen the effect."},
             ]},
         }
 

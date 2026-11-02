@@ -372,8 +372,8 @@ class DeepyController:
     def get_deepy_type(self) -> str:
         return normalize_deepy_type(self._server_config().get(DEEPY_TYPE_KEY, ""))
 
-    def _ensure_vision_loaded(self, override_profile=-1):
-        self._deps.ensure_prompt_enhancer_loaded(override_profile=override_profile)
+    def _ensure_vision_loaded(self, override_profile=-1, **loading_kwargs):
+        self._deps.ensure_prompt_enhancer_loaded(override_profile=override_profile, **loading_kwargs)
         image_caption_model = self._deps.get_image_caption_model()
         image_caption_processor = self._deps.get_image_caption_processor()
         if image_caption_model is None or image_caption_processor is None:
@@ -807,6 +807,12 @@ class DeepyController:
         return system_prompt, custom_system_prompt_key
 
     def _build_local_engine(self, state, session, tools, send_cmd, system_prompt: str, custom_system_prompt_key: str, *, thinking_enabled: bool, override_profile=-1) -> AssistantEngine:
+        from shared.deepy.loading_progress import DeepyLoadingProgress
+
+        loading = DeepyLoadingProgress(
+            lambda text: send_cmd("chat_output", assistant_chat.build_status_event(text, kind="loading", session=session)),
+            lambda: session.interrupt_requested,
+        )
         return AssistantEngine(
             session,
             AssistantRuntimeHooks(
@@ -814,10 +820,10 @@ class DeepyController:
                 release_gpu=lambda keep_resident = False, release_vram_callback = None, force_release_on_acquire = True: self._deps.release_gpu(state, keep_resident=keep_resident, release_vram_callback=release_vram_callback, force_release_on_acquire=force_release_on_acquire),
                 register_gpu_resident=lambda release_vram_callback = None, force_release_on_acquire = True: self._deps.register_gpu_resident(state, release_vram_callback=release_vram_callback, force_release_on_acquire=force_release_on_acquire),
                 clear_gpu_resident=lambda: self._deps.clear_gpu_resident(state),
-                ensure_loaded=lambda: self._deps.ensure_prompt_enhancer_loaded(override_profile=override_profile),
+                ensure_loaded=lambda: self._deps.ensure_prompt_enhancer_loaded(override_profile=override_profile, progress=loading, gen=loading.gen),
                 unload_runtime=self._deps.unload_prompt_enhancer_runtime,
                 unload_weights=self._unload_weights,
-                ensure_vision_loaded=lambda: self._ensure_vision_loaded(override_profile=override_profile),
+                ensure_vision_loaded=lambda: self._ensure_vision_loaded(override_profile=override_profile, progress=loading, gen=loading.gen),
                 get_offload_manager=self._deps.get_enhancer_offloadobj,
             ),
             tools,

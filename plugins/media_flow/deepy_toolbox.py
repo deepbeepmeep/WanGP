@@ -182,8 +182,7 @@ class MediaFlowAgent:
         if video and not library.hides_sliding_window_overlap(value, state, refs):
             model_type = library.process_definition_model_type(library.process_definition(value, state, refs))
             controls["overlap"] = {"default": form.sliding_window_overlap, "minimum": 1, "maximum": frames.get_overlap_slider_max(model_type, self.plugin.get_model_def), "step": frames.get_vae_temporal_latent_size(model_type, self.plugin.get_model_def)}
-        parameter_state = library.spatial_upsampler_parameter_state(value, state, refs)
-        parameters = [{key: item for key, item in parameter.items() if key in ("name", "label", "description", "type", "default", "minimum", "maximum", "step", "choices", "enum")} for parameter in parameter_state["definitions"] if parameter["name"] in parameter_state["active"]]
+        parameters = [{key: item for key, item in parameter.items() if key in ("name", "label", "description", "type", "default", "minimum", "maximum", "step", "choices", "enum")} for parameter in library.spatial_upsampler_parameters(value, state, refs)]
         if parameters:
             controls["parameters"] = parameters
         if video:
@@ -258,7 +257,7 @@ class MediaFlowAgent:
             batch_name: str | None = None, resume: bool = True, media: Literal["video", "image"] | None = None) -> dict[str, Any]:
         """Process existing media with a Media Flow template: one file, or a batch of a list, folders or wildcard patterns. A run that was stopped or
         interrupted continues where it stopped when called again with the same arguments (resume=true). Only the settings of the template's settings list apply.
-        The result lists the outputs in generated_files."""
+        Runs keep only the last Media Generator artifact; the tab's retention setting is restored afterward. The result lists the outputs in generated_files."""
         job = plugin_active_job(self.plugin)
         if job.get("running") or job.get("batch_running"):
             raise ValueError("Media Flow is already running a process (from its tab or another agent): follow it with action status or stop it with action stop. Nothing was started.")
@@ -276,7 +275,7 @@ class MediaFlowAgent:
         if isinstance(prompt, list) and entry["media"] != "video":
             raise ValueError("A timed prompt list applies to videos only: give one prompt string. Nothing was started.")
         known = {parameter["name"] for parameter in controls.get("parameters", [])}
-        upsampler_parameters = {name if name.startswith(spatial_upsampler_api.PARAMETER_PREFIX) else spatial_upsampler_api.PARAMETER_PREFIX + name: value for name, value in (parameters or {}).items()}
+        upsampler_parameters = dict(parameters or {})
         if set(upsampler_parameters) - known:
             raise ValueError(f"Unknown parameters for {entry['name']}: {', '.join(sorted(set(upsampler_parameters) - known))}; offered: {', '.join(sorted(known))}. Nothing was started.")
         form = self._form(library, ctx.state, entry)
@@ -316,10 +315,13 @@ class MediaFlowAgent:
         started = time.monotonic()
         watcher = threading.Thread(target=watch, name="mediaflow-agent-run", daemon=True)
         watcher.start()
+        preserve_artifact_count = job[catalog.PRESERVE_ARTIFACTS_STORAGE_KEY]
+        job[catalog.PRESERVE_ARTIFACTS_STORAGE_KEY] = 1
         try:
             for _update in runner.start_process(**arguments):
                 pass
         finally:
+            job[catalog.PRESERVE_ARTIFACTS_STORAGE_KEY] = preserve_artifact_count
             finished.set()
             watcher.join()
         return self._result(job, entry, single, notice["text"], round(time.monotonic() - started, 1))

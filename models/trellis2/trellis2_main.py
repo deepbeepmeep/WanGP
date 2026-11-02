@@ -1,6 +1,7 @@
-# TRELLIS.2 image-to-3D pipeline, inference port of microsoft/TRELLIS.2 (trellis2/pipelines/trellis2_image_to_3d.py, MIT License, see
-# LICENSE in this folder): sparse structure flow, shape flow (512, 1024 or a 512 -> 1024/1536 cascade), texture flow, then the
-# shape and texture decoders, mesh extraction and a PBR GLB.
+# TRELLIS.2 pipelines, inference port of microsoft/TRELLIS.2 (MIT License, see LICENSE in this folder). Shape (trellis2_shape,
+# trellis2/pipelines/trellis2_image_to_3d.py): sparse structure flow, shape flow (512, 1024 or a 512 -> 1024/1536 cascade), shape decoder,
+# mesh extraction. Texture (trellis2_texture, trellis2/pipelines/trellis2_texturing.py): a supplied mesh encoded as shape latents (the
+# flexible dual grid and shape encoder of WanGP's SUPRA-Tex port), texture flow, texture decoder, PBR baking in a UV atlas.
 # Modifications Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import hashlib
 import json
@@ -21,9 +22,9 @@ from shared.utils.text_encoder_cache import TextEncoderCache
 from . import sampler
 from .dinov3 import DINOv3ViT, image_to_pixels
 from .dit import TrellisFlowDiT, fused_split_map
-from .export import SurfaceJob, bake_textures, export_glb, remesh_surface, render_preview, to_gltf_mesh, vertex_colors
+from .export import bake_textures, export_glb, finish_surface, remesh_surface, render_preview, to_gltf_mesh
 from .fdg_mesh import decode_fdg, flexible_dual_grid_to_mesh
-from .settings import DEFAULT_CUSTOM_SETTINGS
+from .settings import DEFAULT_CUSTOM_SETTINGS, DEFAULT_TEXTURE_SETTINGS
 from .sparse import SparseTensor
 from .vae import SparseStructureDecoder, SparseUnetDecoder
 
@@ -34,9 +35,12 @@ TEXTURE_STAGES = ("tex_lowres", "tex_highres")
 SS_DECODER_FILE = "trellis2/trellis2_ss_decoder_fp16.safetensors"
 SHAPE_DECODER_FILE = "trellis2/trellis2_shape_decoder_fp16.safetensors"
 TEXTURE_DECODER_FILE = "trellis2/trellis2_texture_decoder_fp16.safetensors"
+SHAPE_ENCODER_FILE = "trellis2/trellis2_shape_encoder_fp16.safetensors"  # shared with SUPRA-Tex
 IMAGE_ENCODER_FILE = "dinov3_vitl16/dinov3_vitl16_lvd1689m.safetensors"  # Meta's weights, shared folder, DINOv3 License beside them
 PIPELINES = {0: "512", 1: "1024", 2: "1024_cascade", 3: "1536_cascade"}
 PREVIEW_SIZE = 512
+SHAPE_ARCH, TEXTURE_ARCH = "trellis2_shape", "trellis2_texture"
+UNWRAP_REGION_FACES = 40000
 
 
 def _keep_checkpoint_dtypes(model):
@@ -77,48 +81,58 @@ def preprocess_image(image, remove_background):
 def _rembg(image):
     set_phase_status("Removing Background")
     from rembg import remove
+    from preprocessing.rembg.assets import OBJECT_MODEL
     from shared.utils.utils import new_rembg_session
 
-    return remove(image, session=new_rembg_session("u2net"))
+    return remove(image, session=new_rembg_session(OBJECT_MODEL))
 
 
 class model_factory:
+    """trellis2_shape: untextured meshes of the object image; trellis2_texture: PBR textures of a supplied mesh (also the TRELLIS.2 Texture
+    Texturer)."""
+
     def __init__(self, model_filename, model_type, base_model_type, save_quantized=False):
         self.device = torch.device("cuda")
         with open(CONFIG_PATH, encoding="utf-8") as reader:
             self.config = json.load(reader)
+        self.textured = base_model_type == TEXTURE_ARCH
+        stages = TEXTURE_STAGES if self.textured else SHAPE_STAGES
         dit = self.config["dit"]
-        self.flows = {}
-        for filename, stages, submodel_no in ((model_filename[0], SHAPE_STAGES, 1), (model_filename[1], TEXTURE_STAGES, 2)):
-            with init_empty_weights():
-                container = nn.ModuleDict({name: TrellisFlowDiT(**dit, **self.config["stages"][name]) for name in stages})
-            # BF16 checkpoint (INT8 linears compute in BF16); the fused q/k/v and k/v projections are split at load for the attention kit
-            offload.load_model_data(container, filename, writable_tensors=False, default_dtype=None, fp32_dtype=torch.bfloat16, fused_split_map=fused_split_map(dit["model_channels"]))
-            container.eval().requires_grad_(False)
-            if save_quantized:
-                from wgp import save_quantized_model
-                save_quantized_model(container, model_type, filename, torch.bfloat16, None, submodel_no=submodel_no)
-            for name, flow in container.items():
-                self.flows[name] = _keep_checkpoint_dtypes(flow)
-        self.transformer = self.flows["ss_flow"]
         with init_empty_weights():
-            ss_decoder = SparseStructureDecoder(**self.config["ss_decoder"])
-            shape_decoder = SparseUnetDecoder(**self.config["shape_decoder"])
-            texture_decoder = SparseUnetDecoder(**self.config["texture_decoder"])
+            container = nn.ModuleDict({name: TrellisFlowDiT(**dit, **self.config["stages"][name]) for name in stages})
+        # BF16 checkpoint (INT8 linears compute in BF16); the fused q/k/v and k/v projections are split at load for the attention kit
+        offload.load_model_data(container, model_filename[0], writable_tensors=False, default_dtype=None, fp32_dtype=torch.bfloat16, fused_split_map=fused_split_map(dit["model_channels"]))
+        container.eval().requires_grad_(False)
+        if save_quantized:
+            from wgp import save_quantized_model
+            save_quantized_model(container, model_type, model_filename[0], torch.bfloat16, None)
+        self.flows = {name: _keep_checkpoint_dtypes(flow) for name, flow in container.items()}
+        self.transformer = self.flows[stages[0]]
+        with init_empty_weights():
             image_encoder = DINOv3ViT(**self.config["image_encoder"])
-        ss_decoder.lock_checkpoint_fp32_modules()
-        self.ss_decoder = _load_module(ss_decoder, fl.locate_file(SS_DECODER_FILE))
-        self.shape_decoder = _load_module(shape_decoder, fl.locate_file(SHAPE_DECODER_FILE))
-        self.texture_decoder = _load_module(texture_decoder, fl.locate_file(TEXTURE_DECODER_FILE))
+            if self.textured:
+                from models.supratex.encoder import SparseUnetEncoder
+                shape_encoder, texture_decoder = SparseUnetEncoder(**self.config["shape_encoder"]), SparseUnetDecoder(**self.config["texture_decoder"])
+            else:
+                ss_decoder, shape_decoder = SparseStructureDecoder(**self.config["ss_decoder"]), SparseUnetDecoder(**self.config["shape_decoder"])
+        if self.textured:
+            self.shape_encoder = _load_module(shape_encoder, fl.locate_file(SHAPE_ENCODER_FILE))
+            self.texture_decoder = _load_module(texture_decoder, fl.locate_file(TEXTURE_DECODER_FILE))
+        else:
+            ss_decoder.lock_checkpoint_fp32_modules()
+            self.ss_decoder = _load_module(ss_decoder, fl.locate_file(SS_DECODER_FILE))
+            self.shape_decoder = _load_module(shape_decoder, fl.locate_file(SHAPE_DECODER_FILE))
         self.image_encoder = _load_module(image_encoder, fl.locate_file(IMAGE_ENCODER_FILE))
         self.cache = TextEncoderCache()
         self._prepared = (None, None)  # (source image digest, preprocessed image): background removal of the last reference
         self._interrupt = False
 
     def pipe(self):
+        if self.textured:
+            return {"transformer": self.flows["tex_lowres"], "transformer2": self.flows["tex_highres"], "shape_encoder": self.shape_encoder,
+                    "texture_decoder": self.texture_decoder, "image_encoder": self.image_encoder}
         return {"transformer": self.flows["ss_flow"], "transformer2": self.flows["shape_lowres"], "transformer3": self.flows["shape_highres"],
-                "transformer4": self.flows["tex_lowres"], "transformer5": self.flows["tex_highres"], "ss_decoder": self.ss_decoder,
-                "shape_decoder": self.shape_decoder, "texture_decoder": self.texture_decoder, "image_encoder": self.image_encoder}
+                "ss_decoder": self.ss_decoder, "shape_decoder": self.shape_decoder, "image_encoder": self.image_encoder}
 
     def _prepare_image(self, image):
         digest = hashlib.sha1(image.tobytes() + repr((image.mode, image.size)).encode()).hexdigest()
@@ -202,30 +216,20 @@ class model_factory:
         mean, std = self._normalization("shape_normalization")
         return slat * std + mean
 
-    @generation_progress
     @torch.inference_mode()
-    def generate(self, seed, sampling_steps, guide_scale, alt_guide_scale, batch_size, model_mode, custom_settings, original_input_ref_images,
-                 callback=None, set_progress_status=None, **kwargs):
-        settings = DEFAULT_CUSTOM_SETTINGS | custom_settings
-        pipeline = PIPELINES[int(model_mode)]
-        max_faces, texture_size, max_tokens = int(settings["max_faces"]), int(settings["texture_size"]), int(settings["max_tokens"])
-        texture_mode, keep_alpha = settings["texture_mode"], settings["alpha_mode"] == "blend"
-        image = self._prepare_image(original_input_ref_images[0])
+    def _shapes(self, image, seed, steps, guidance, batch_size, pipeline, max_faces, max_tokens, callback):
+        """Meshes (glTF axes, shared.mesh3d Mesh on the CPU) of the preprocessed object image."""
         conds = self._encode_image(image, (512,) if pipeline == "512" else (512, 1024))
-        previews, meshes = [], []
+        meshes = []
         for sample_no in range(batch_size):
             suffix = f" {sample_no + 1}/{batch_size}" if batch_size > 1 else ""
             generator = torch.Generator(device="cpu").manual_seed(seed + sample_no)
-            coords = self._structure(conds[512], generator, sampling_steps, guide_scale, 64 if pipeline == "1024" else 32, "Denoising Structure" + suffix, callback)
-            if pipeline == "512":
-                shape_flow, texture_flow, cond, resolution = "shape_lowres", "tex_lowres", conds[512], 512
-                shape_slat = self._shape(shape_flow, cond, coords, generator, sampling_steps, guide_scale, "Denoising Shape" + suffix, callback)
-            elif pipeline == "1024":
-                shape_flow, texture_flow, cond, resolution = "shape_highres", "tex_highres", conds[1024], 1024
-                shape_slat = self._shape(shape_flow, cond, coords, generator, sampling_steps, guide_scale, "Denoising Shape" + suffix, callback)
+            coords = self._structure(conds[512], generator, steps, guidance, 64 if pipeline == "1024" else 32, "Denoising Structure" + suffix, callback)
+            if pipeline in ("512", "1024"):
+                flow, cond, resolution = ("shape_lowres", conds[512], 512) if pipeline == "512" else ("shape_highres", conds[1024], 1024)
+                shape_slat = self._shape(flow, cond, coords, generator, steps, guidance, "Denoising Shape" + suffix, callback)
             else:
-                texture_flow, cond = "tex_highres", conds[1024]
-                coarse = self._shape("shape_lowres", conds[512], coords, generator, sampling_steps, guide_scale, "Denoising Coarse Shape" + suffix, callback)
+                coarse = self._shape("shape_lowres", conds[512], coords, generator, steps, guidance, "Denoising Coarse Shape" + suffix, callback)
                 fine_coords = self._decode(self.shape_decoder, SparseTensor(coarse, coords), "Upsampling Shape", coords_only=True)
                 del coarse
                 resolution = 1536 if pipeline == "1536_cascade" else 1024
@@ -235,48 +239,103 @@ class model_factory:
                         break
                     resolution -= 128
                 del fine_coords
-                shape_slat = self._shape("shape_highres", cond, coords, generator, sampling_steps, guide_scale, "Denoising Shape" + suffix, callback)
-            # the surface first: its decimation and UV unwrapping run on the CPU while the texture flow and decoder run on the GPU
-            fields, subdivisions = self._decode(self.shape_decoder, SparseTensor(shape_slat, coords), "Decoding Shape" + suffix)
+                shape_slat = self._shape("shape_highres", conds[1024], coords, generator, steps, guidance, "Denoising Shape" + suffix, callback)
+            fields, _ = self._decode(self.shape_decoder, SparseTensor(shape_slat, coords), "Decoding Shape" + suffix)
+            del shape_slat, coords
             set_phase_status("Extracting Surface")
             mesh = list(flexible_dual_grid_to_mesh(fields, *decode_fdg(fields.feats, self.config["shape_decoder"]["voxel_margin"]), resolution))
             del fields
-            vertices, faces, offset = remesh_surface(mesh, resolution)
-            surface = SurfaceJob(vertices, faces, max_faces, texture_size if texture_mode == "texture" else 0)
+            vertices, faces, _ = remesh_surface(mesh, resolution)
+            set_phase_status("Simplifying Mesh")
+            surface = finish_surface(vertices.cpu(), faces.cpu(), max_faces)
             del vertices, faces
-            try:
-                voxels = None
-                if texture_mode != "none":
-                    flow = self.flows[texture_flow]
-                    mean, std = self._normalization("shape_normalization")
-                    concat = (shape_slat - mean) / std
-                    noise = torch.randn(coords.shape[0], flow.in_channels - concat.shape[1], generator=generator, device="cpu").to(self.device)
-                    params = dict(self.config["samplers"]["texture"], steps=sampling_steps)
-                    texture_slat = self._denoise(flow, noise, cond, coords, params, "Denoising Texture" + suffix, callback, guidance=alt_guide_scale, concat=concat)
-                    del concat, noise
-                    mean, std = self._normalization("texture_normalization")
-                    voxels, _ = self._decode(self.texture_decoder, SparseTensor(texture_slat * std + mean, coords), "Decoding Texture" + suffix, subdivisions)
-                    voxels.feats.mul_(0.5).add_(0.5)
-                    del texture_slat
-                del shape_slat, subdivisions
-                set_phase_status("Simplifying Mesh")
-                surface_mesh = surface.result()
-            finally:
-                surface.close()
-            vertices, faces = surface_mesh.vertices.to(self.device), surface_mesh.faces.to(self.device)
-            if voxels is None:
-                mesh = to_gltf_mesh(vertices, faces)
-            elif texture_mode == "vertex":
-                colors = vertex_colors(vertices, faces, voxels, voxels.feats, resolution, offset)
-                mesh = to_gltf_mesh(vertices, faces, colors=colors if keep_alpha else colors[:, :3])
-            else:
-                vertices, faces, uvs, base_color, metallic_roughness = bake_textures(surface_mesh, voxels, voxels.feats, resolution, texture_size, offset)
-                # the official exporter stores the alpha attribute in the base color but writes an OPAQUE material
-                mesh = to_gltf_mesh(vertices, faces, uvs, base_color if keep_alpha else base_color[..., :3].contiguous(), metallic_roughness)
-            del voxels, vertices, faces, surface_mesh
-            set_phase_status("Exporting Mesh")
-            meshes.append(export_glb(mesh))
-            previews.append(render_preview(mesh, PREVIEW_SIZE))
-            del mesh
+            meshes.append(to_gltf_mesh(surface.vertices, surface.faces))
             check_abort()
-        return {"x": torch.stack(previews, dim=1), "meshes": meshes}
+        return meshes
+
+    @torch.inference_mode()
+    def _texture(self, mesh, image, seed, steps, guidance, resolution, max_faces, texture_size, keep_alpha, callback):
+        """Textured copy (shared.mesh3d Mesh on the CPU, the input frame) of mesh, reduced to max_faces when positive: upstream's texturing
+        pipeline, the mesh normalized into the unit cube (TRELLIS axes), encoded as shape latents at resolution^3 voxels, its texture
+        latents sampled from the object image and decoded, then baked into a UV atlas."""
+        from shared.mesh3d import BackgroundUnwrap, Mesh
+        from shared.mesh3d.cleanup import decimate, merge_vertices
+        from models.supratex import dual_grid, encoder
+
+        cond = self._encode_image(self._prepare_image(image), (resolution,))[resolution]
+        set_phase_status("Preparing Mesh")
+        mesh = merge_vertices(Mesh(mesh.vertices.float().cpu(), mesh.faces.cpu()))
+        if max_faces and mesh.faces.shape[0] > max_faces:
+            mesh = decimate(mesh, max_faces)
+        unwrap = BackgroundUnwrap(mesh, max_faces=UNWRAP_REGION_FACES)  # xatlas in a child process, overlapped with the GPU stages
+        try:
+            low, high = mesh.vertices.amin(0), mesh.vertices.amax(0)
+            center, scale = ((low + high) / 2).to(self.device), 0.99999 / float((high - low).max())
+
+            def to_cube(vertices):  # upstream preprocess_mesh: the bounding box centered in the unit cube, glTF Y up -> TRELLIS Z up
+                vertices = (vertices.to(self.device) - center) * scale
+                return torch.stack([vertices[:, 0], -vertices[:, 2], vertices[:, 1]], dim=1)
+
+            set_phase_status("Encoding Shape")
+            faces = mesh.faces.to(self.device)
+            voxels, offsets, intersected = dual_grid.mesh_to_flexible_dual_grid((to_cube(mesh.vertices) + 0.5) * resolution, faces, resolution)
+            del faces
+            check_abort()
+            shape, levels = self.shape_encoder([encoder.shape_input(voxels, offsets, intersected)])
+            del voxels, offsets, intersected
+            flow = self.flows["tex_lowres" if resolution == 512 else "tex_highres"]
+            mean, std = self._normalization("shape_normalization")
+            concat = (shape.feats - mean) / std
+            generator = torch.Generator(device="cpu").manual_seed(seed)
+            noise = torch.randn(len(shape), flow.in_channels - concat.shape[1], generator=generator, device="cpu").to(self.device)
+            params = dict(self.config["samplers"]["texture"], steps=steps)
+            latents = self._denoise(flow, noise, cond, shape.coords, params, "Denoising Texture", callback, guidance=guidance, concat=concat)
+            del concat, noise
+            mean, std = self._normalization("texture_normalization")
+            subdivisions = encoder.decoder_subdivisions(levels, shape.coords)  # the decoder rebuilds exactly the encoded voxels, as upstream
+            voxels, _ = self._decode(self.texture_decoder, SparseTensor(latents * std + mean, shape.coords), "Decoding Texture", subdivisions)
+            voxels.feats.mul_(0.5).add_(0.5)
+            del latents, shape, levels, subdivisions
+            set_phase_status("Unwrapping UVs")
+            unwrapped = unwrap.result(check_abort=check_abort, progress=True)
+        finally:
+            unwrap.close()
+        cube = Mesh(to_cube(unwrapped.vertices), unwrapped.faces.to(self.device), uvs=unwrapped.uvs.to(self.device))
+        _, faces, uvs, base_color, metallic_roughness = bake_textures(cube, voxels, voxels.feats, resolution, texture_size, 0.0)
+        del voxels, cube
+        # opaque by default, as the official exporter: the decoder's alpha would make the material BLEND
+        return Mesh(unwrapped.vertices.cpu(), faces.cpu(), uvs=uvs.cpu(), base_color=base_color if keep_alpha else base_color[..., :3].contiguous(),
+                    metallic_roughness=metallic_roughness)
+
+    @generation_progress
+    @torch.inference_mode()
+    def texture_mesh(self, mesh, image, seed=0, guidance_scale=1.0, resolution=1024, max_faces=0, texture_size=2048, steps=12, callback=None, set_progress_status=None):
+        """The Texturer entry (post-processing): PBR textures of mesh (shared.mesh3d Mesh) from the object image (PIL); max_faces 0 keeps the
+        mesh's faces."""
+        return self._texture(mesh, image, int(seed), int(steps), float(guidance_scale), int(resolution), int(max_faces), int(texture_size), False, callback)
+
+    @generation_progress
+    @torch.inference_mode()
+    def generate(self, seed, sampling_steps, guide_scale, batch_size, model_mode, custom_settings, original_input_ref_images, input_custom=None,
+                 callback=None, set_progress_status=None, **kwargs):
+        """trellis2_shape: meshes of the object image; trellis2_texture: textures of the Input Mesh (input_custom)."""
+        image = original_input_ref_images[0]
+        if self.textured:
+            from shared.mesh3d import load_mesh
+
+            settings = DEFAULT_TEXTURE_SETTINGS | custom_settings
+            set_phase_status("Loading Mesh")
+            source = load_mesh(input_custom)
+            meshes = [self._texture(source, image, seed + i, sampling_steps, guide_scale, int(model_mode), int(settings["max_faces"]), int(settings["texture_size"]),
+                                    settings["alpha_mode"] == "blend", callback) for i in range(batch_size)]
+        else:
+            settings = DEFAULT_CUSTOM_SETTINGS | custom_settings
+            meshes = self._shapes(self._prepare_image(image), seed, sampling_steps, guide_scale, batch_size, PIPELINES[int(model_mode)], int(settings["max_faces"]),
+                                  int(settings["max_tokens"]), callback)
+        set_phase_status("Exporting Mesh")
+        previews, glbs = [], []
+        for mesh in meshes:
+            glbs.append(export_glb(mesh))
+            previews.append(render_preview(mesh, PREVIEW_SIZE))
+            check_abort()
+        return {"x": torch.stack(previews, dim=1), "meshes": glbs}

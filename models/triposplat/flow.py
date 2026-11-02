@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from shared.kernels import ops
 from shared.utils.phase_progress import check_abort
 from .layers import EmbedderMLP, FeedForward, SelfAttention, layer_norm
 
@@ -71,12 +72,22 @@ class TransformerBlock(nn.Module):
             self.shift_table = nn.Parameter(torch.zeros(1, 6 * channels))
 
     def forward(self, x, mod, phases):
+        """x (1, tokens, channels), updated in place; mod (1, 6 * channels) or None for the context refiners."""
+        rows = x.view(-1, x.shape[-1])
+        fc1, fc2 = self.mlp.mlp[0], self.mlp.mlp[2]
         if not self.modulation:
-            x.add_(self.attn([layer_norm(x, self.norm1.weight, self.norm1.bias, self.norm1.eps)], phases))
-            return x.add_(self.mlp(layer_norm(x, self.norm2.weight, self.norm2.bias, self.norm2.eps)))
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (m.unsqueeze(1) for m in (mod + self.shift_table.type(mod.dtype)).chunk(6, dim=1))
-        x.add_(self.attn([layer_norm(x).mul_(1 + scale_msa).add_(shift_msa)], phases).mul_(gate_msa))
-        return x.add_(self.mlp(layer_norm(x).mul_(1 + scale_mlp).add_(shift_mlp)).mul_(gate_mlp))
+            y = self.attn.attend([layer_norm(x, self.norm1.weight, self.norm1.bias, self.norm1.eps)], phases)
+            ops.linear_residual_(self.attn.output, [y.view(rows.shape)], rows)
+            del y
+            ops.mlp([layer_norm(rows, self.norm2.weight, self.norm2.bias, self.norm2.eps)], fc1, fc2, "gelu", residual=rows)
+            return x
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (mod + self.shift_table.type(mod.dtype)).chunk(6, dim=1)
+        spans = [(0, rows.shape[0], 0)]
+        y = self.attn.attend([ops.norm_modulate([rows], self.norm1, shift_msa, scale_msa, spans).view(x.shape)], phases)
+        ops.gated_linear(self.attn.output, [y.view(rows.shape)], rows, gate_msa, spans)
+        del y
+        ops.mlp([ops.norm_modulate([rows], self.norm2, shift_mlp, scale_mlp, spans)], fc1, fc2, "gelu", residual=rows, gate=gate_mlp[0])
+        return x
 
 
 class CameraMLP(nn.Module):

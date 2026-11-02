@@ -72,6 +72,8 @@ _TOOL_ALIASES = {
     "world": "gen_world",
     "gen_3d": "gen_3d",
     "3d": "gen_3d",
+    "texture_3d": "texture_3d",
+    "texture": "texture_3d",
 }
 
 

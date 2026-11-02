@@ -502,6 +502,9 @@ def _prepared_references(refs):
 
 class MiniMaxH3Model(nn.Module):
     def preprocess_loras(self, model_type, state_dict):
+        from .lora_tables import pop_source_tag
+
+        source_package = pop_source_tag(state_dict)
         attention = self.blocks[0].attn
         split_map = get_linear_split_map(self.attention_inner_size, attention.heads, attention.head_dim)
         modules = dict(self.named_modules())
@@ -574,10 +577,12 @@ class MiniMaxH3Model(nn.Module):
         start = time.perf_counter()
         count, architecture, source_width, target_width = convert_adaln_loras(
             model_type, converted, self.adaln_t_table if self.use_adaln_curves else None,
-            self.hybrid_ref2va_blocks, self.ref2va_adaln_t_table if self.hybrid_ref2va_blocks is not None else None)
+            self.hybrid_ref2va_blocks, self.ref2va_adaln_t_table if self.hybrid_ref2va_blocks is not None else None,
+            source_package=source_package, target_package=self.h3_lora_affine_package, checkpoint_checked=self.h3_lora_map_checked)
         if count:
-            source = f"full AdaLN width {source_width}" if source_width == 2688 else f"{architecture.upper()} pruned AdaLN width {source_width}"
-            target_architecture = "hybrid FL2VA/REF2VA" if self.hybrid_ref2va_blocks is not None else architecture.upper()
+            source_architecture = source_package.name if source_package is not None else architecture.upper()
+            source = f"full AdaLN width {source_width}" if source_width == 2688 else f"{source_architecture} pruned AdaLN width {source_width}"
+            target_architecture = "hybrid FL2VA/REF2VA" if self.hybrid_ref2va_blocks is not None else (self.h3_lora_affine_package.name if self.h3_lora_affine_package is not None else architecture.upper())
             target = f"full AdaLN width {target_width}" if target_width == 2688 else f"{target_architecture} pruned AdaLN width {target_width}"
             tqdm.write(f"MiniMax H3 LoRA: converted {count} AdaLN adapters from {source} to {target} in {time.perf_counter() - start:.2f}s")
         if hasattr(self.blocks[0].attn, "q_proj"):
@@ -624,6 +629,8 @@ class MiniMaxH3Model(nn.Module):
         self.latents_dim = latents_dim
         self.audio_latents_dim = audio_latents_dim
         self.use_adaln_curves = adaln_curve_grid is not None
+        self.h3_lora_affine_package = None
+        self.h3_lora_map_checked = False
         self.hybrid_ref2va_blocks = hybrid_ref2va_blocks
         self.pdd_num_steps = pdd_num_steps
         self.pdd_block_size = pdd_block_size

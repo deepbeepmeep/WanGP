@@ -21,14 +21,15 @@ DINO_STD = (0.229, 0.224, 0.225)
 
 
 def remove_background(image):
-    """Object image with its alpha: an RGBA input with transparency is kept, other images go through rembg u2net with upstream's
-    settings (BackgroundRemover: no alpha matting, transparent white background)."""
+    """Object image with its alpha: an RGBA input with transparency is kept, other images go through rembg with upstream's settings
+    (BackgroundRemover: no alpha matting, transparent white background), with BiRefNet General instead of u2net (no cast shadows)."""
     if image.mode == "RGBA" and image.getextrema()[3][0] < 255:
         return image
     from rembg import remove
+    from preprocessing.rembg.assets import OBJECT_MODEL
     from shared.utils.utils import new_rembg_session
 
-    session = new_rembg_session()
+    session = new_rembg_session(OBJECT_MODEL)
     rgba = remove(image.convert("RGB"), session=session, bgcolor=[255, 255, 255, 0])
     del session
     return rgba

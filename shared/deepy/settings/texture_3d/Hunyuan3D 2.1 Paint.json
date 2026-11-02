@@ -1,0 +1,17 @@
+{
+    "settings_version": 2.82,
+    "prompt": "",
+    "image_mode": 1,
+    "video_prompt_type": "I",
+    "batch_size": 1,
+    "multi_prompts_gen_type": "FG",
+    "model_type": "hunyuan3d_21_paint",
+    "type": "Hunyuan3D 2.1 Paint 2B",
+    "remove_background_images_ref": 1,
+    "guidance_scale": 3.0,
+    "custom_settings": {
+        "max_faces": 40000,
+        "texture_views": "8_768",
+        "texture_size": 2048
+    }
+}

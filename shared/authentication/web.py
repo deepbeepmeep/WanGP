@@ -143,6 +143,8 @@ class WebAuthMiddleware:
             return await self.app(scope, receive, send)
         connection = HTTPConnection(scope)
         path = scope["path"]
+        if path.startswith(("/apps/r/", "/apps/lib/")):  # isolated app frames carry no cookie: their launch token path is the credential (shared.apps.server)
+            return await self.app(scope, receive, send)
         if scope["type"] == "http" and path == "/auth/login" and scope["method"] in {"GET", "POST"}:
             return await (await self.auth.login(Request(scope, receive)))(scope, receive, send)
         unsafe = scope["type"] == "websocket" or scope["method"] not in {"GET", "HEAD", "OPTIONS"}

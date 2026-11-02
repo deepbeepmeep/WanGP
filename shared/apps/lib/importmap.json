@@ -1,0 +1,12 @@
+{
+  "imports": {
+    "three": "/apps/lib/three/three.module.js",
+    "three/addons/": "/apps/lib/three/addons/",
+    "three/examples/jsm/": "/apps/lib/three/addons/",
+    "cannon-es": "/apps/lib/cannon-es/cannon-es.js",
+    "phaser": "/apps/lib/phaser/phaser.mjs",
+    "@tweenjs/tween.js": "/apps/lib/tween/tween.esm.js",
+    "simplex-noise": "/apps/lib/simplex-noise/simplex-noise.js",
+    "tone": "/apps/lib/tone/tone.mjs"
+  }
+}

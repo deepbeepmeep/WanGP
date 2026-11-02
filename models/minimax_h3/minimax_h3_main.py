@@ -7,6 +7,7 @@ from functools import partial
 import torch
 from accelerate import init_empty_weights
 from safetensors import safe_open
+from tqdm import tqdm
 
 from mmgp import offload, quant_router, runtime
 from shared.utils import files_locator as fl
@@ -162,7 +163,8 @@ def _qkv_layout(filenames, qkv_layout):
         if path.lower().endswith(".gguf"):
             return "grouped"
         with safe_open(path, "pt") as reader:
-            if (reader.metadata() or {}).get("quantization_format") or any(key.endswith((".comfy_quant", ".weight_s_rel")) for key in reader.keys()):
+            metadata = reader.metadata() or {}
+            if metadata.get("quantization_format") or metadata.get("_quantization_metadata") or any(key.endswith((".comfy_quant", ".weight_s_rel")) for key in reader.keys()):
                 return "grouped"
     return qkv_layout
 
@@ -174,6 +176,11 @@ def _load_transformer(filename, dtype, qkv_splitting=True, qkv_layout="interleav
     qkv_splitting = qkv_splitting or checkpoint["separate_qkv"]
     hybrid_ref2va_blocks = checkpoint.get("hybrid_ref2va_blocks")
     filenames = list(filename) if isinstance(filename, (list, tuple)) else [filename]
+    from .lora_tables import detect_checkpoint
+
+    lora_affine_package = detect_checkpoint(filenames[0])
+    if lora_affine_package is not None:
+        tqdm.write(f"MiniMax H3: detected AdaLN map '{lora_affine_package.name}'.")
     ref2va_adaln_t_table = None
     if hybrid_ref2va_blocks is not None:
         from .lora_affine import _load_affine_package
@@ -217,6 +224,8 @@ def _load_transformer(filename, dtype, qkv_splitting=True, qkv_layout="interleav
                             fused_split_map=split_map)
     transformer.eval().requires_grad_(False)
     transformer.h3_checkpoint_info = checkpoint
+    transformer.h3_lora_affine_package = lora_affine_package
+    transformer.h3_lora_map_checked = hybrid_ref2va_blocks is None
     transformer.split_linear_modules_map = split_map
     transformer.fasth3_inference = fasth3_inference if vsa else None  # the trained schedule and sparsity contract of a FastH3 student
     return transformer

@@ -19,7 +19,12 @@ The timeline comes first: every shot, sound and subtitle is placed on it, and th
 
 ## 3. Speech and sound
 
-- Drive each speaking shot by its own speech clip (`gen_video_with_speech`) with a `video_length` at least as long as the speech: the video stops shortly after the speech ends.
+- One voice per speaker for the whole film: make each speaker's voice sample once (`gen_speech_from_description` of a neutral sentence,
+  or the user's recording) and speak every line with `gen_speech_from_sample` from it. Describing the voice again for each line gives
+  another voice each time.
+- Drive each speaking shot by its own speech clip (`gen_video_with_speech`) with `video_length` set to the speech's duration in seconds (such as `"6.4s"`).
+- A line shorter than its shot: pad the clip with silence to the shot's length, and cut the shot about 0.35 s after the line ends. The
+  model fills the silence with invented words, so the part after the line is not usable.
 - Describe a speaking shot as the person speaking to camera with natural lip movements synchronized, and nothing that competes with the mouth: no written line of dialogue, no language or audio mention, no smiling, waving or nodding. Written dialogue in the prompt leaves the lips still in about half of the shots.
 - A lip-synced shot carries its speech in its own soundtrack, aligned with the lips: mix with `include_video_audio: true`, add only music and other sounds, and duck the music under it with `ducking: {"tracks": [<music index>], "under": ["video"]}`. Placing the speech files again at computed offsets drifts them away from the lips.
 - Narration over inserts: one clip per insert, placed where the insert starts (`remux_media` mix `offsets_s`).

@@ -13,8 +13,9 @@ from shared.kernels import kernel_policy
 from shared.kernels.triton_tuner import LaunchTuner
 from shared.utils.phase_progress import check_abort
 
-_TUNER = LaunchTuner('wangp_prism_bsa', 1, 'Prism BSA')
+_TUNER = LaunchTuner('wangp_prism_bsa', 3, 'Prism BSA')
 try:
+    import triton
     from .sparse_kernel import _attn_fwd_bsa_varlen_align
 except (ImportError, OSError, RuntimeError):
     _attn_fwd_bsa_varlen_align = None
@@ -86,7 +87,7 @@ def launch(q, k, v, indices, lengths, valid, output, lse, config):
     stages, warps = config
     _attn_fwd_bsa_varlen_align[(tokens // 64, batch * heads)](q, k, v, dim ** -.5, lse, output, indices, lengths, valid,
         *q.stride(), *k.stride(), *v.stride(), *output.stride(), *indices.stride(), *lengths.stride(), heads, tokens, dim,
-        BLOCK_M=64, BLOCK_N_LG=64, SPARSITY=.75, HAS_KV_MASK=True, num_stages=stages, num_warps=warps)
+        BLOCK_M=64, BLOCK_N_LG=64, SPARSITY=.75, HAS_KV_MASK=True, UNIT_INNER_STRIDE=all(x.stride(-1) == 1 for x in (q, k, v, output)), num_stages=stages, num_warps=warps)
 
 
 def attend(q, k, v, indices, lengths, valid):
@@ -96,7 +97,14 @@ def attend(q, k, v, indices, lengths, valid):
     lse = torch.empty(q.shape[:-1], device=q.device, dtype=torch.float32)
     def scratch():
         count = min(q.shape[2], 1024)
-        sq, sk, sv = (x[:1, :1, :count].contiguous().clone() for x in (q, k, v))
+        def sample(x):
+            part = x[:1, :1, :count]
+            if x.stride(-1) == 1:
+                return part.contiguous().clone()
+            # Tune the general-stride specialization when that is the live path.
+            result = part.new_empty((*part.shape[:-1], part.shape[-1] * 2))[..., ::2]
+            return result.copy_(part)
+        sq, sk, sv = (sample(x) for x in (q, k, v))
         mask = valid[:count].clone()
         ids, lens = select_blocks(sq, sk, mask, True)
         out = torch.empty_like(sq)
@@ -105,7 +113,8 @@ def attend(q, k, v, indices, lengths, valid):
         launch(sq, sk, sv, ids, lens, mask, out, stats, (3, 4))
         torch.testing.assert_close(out, expected, atol=.03, rtol=.03)
         return lambda config: launch(sq, sk, sv, ids, lens, mask, out, stats, config)
-    config = _TUNER.config('fixed64', f'dim={q.shape[-1]}|dtype={q.dtype}', q.device, [(3, 4), (2, 4), (3, 8)], scratch, q.shape[2] >= 256)
+    unit_stride = all(x.stride(-1) == 1 for x in (q, k, v, output))
+    config = _TUNER.config('fixed64', f'dim={q.shape[-1]}|dtype={q.dtype}|unit_stride={unit_stride}|triton={triton.__version__}', q.device, [(3, 4), (2, 4), (3, 8)], scratch, q.shape[2] >= 256)
     launch(q, k, v, indices, lengths, valid, output, lse, config)
     return output
 

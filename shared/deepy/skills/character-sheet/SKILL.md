@@ -10,7 +10,7 @@ A character sheet shows one character from several angles at the same scale, lab
 ## 1. Source
 
 - **A 3D asset exists** (3D gallery: GLB mesh or Gaussian splats): use its media ID. The gallery listing gives `kind`, `faces` / `gaussians` and, for an animation, `frame_count`, `fps` and `duration_seconds`.
-- **Only a character image exists**: first make a textured mesh with an image-to-3D model (Hunyuan3D 2.1 or TRELLIS.2 for textured characters; TripoSG and PartCrafter give untextured shapes), keeping the automatic background removal on. Use a full-body image, front or three-quarter, with the whole character visible.
+- **Only a character image exists**: first make a textured mesh with a `gen_3d` template (a shape model with a Texturer; TripoSG and PartCrafter alone give untextured shapes), keeping the automatic background removal on. Use a full-body image, front or three-quarter, with the whole character visible.
 - Look at the asset before rendering: `inspect_media` accepts the 3D media ID directly (three-quarter preview).
 
 ## 2. Orientation

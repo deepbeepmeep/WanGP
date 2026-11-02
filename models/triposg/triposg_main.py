@@ -56,14 +56,15 @@ def _valid_alpha(alpha, min_ratio=0.01):
 
 
 def _segmentation_alpha(rgb):
-    """Upstream's photo path with rembg u2net in place of BriaRMBG-1.4: the soft mask thresholded (Otsu), components under 200 pixels
+    """Upstream's photo path with rembg BiRefNet General in place of BriaRMBG-1.4: the soft mask thresholded (Otsu), components under 200 pixels
     removed, and the box of the largest remaining contour."""
     from rembg import remove
     from skimage.measure import label
     from skimage.morphology import remove_small_objects
+    from preprocessing.rembg.assets import OBJECT_MODEL
     from shared.utils.utils import new_rembg_session
 
-    session = new_rembg_session()
+    session = new_rembg_session(OBJECT_MODEL)
     mask = np.array(remove(Image.fromarray(rgb), session=session, only_mask=True))
     del session
     _, mask = cv2.threshold(mask, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)

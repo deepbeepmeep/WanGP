@@ -393,14 +393,32 @@ def split_half_norm_rope_(q, k, rope, packed, q_norm, k_norm, *, allow_fusion=Tr
     return q, k
 
 
-def interleaved_norm_rope_(q, k, rope, q_norm, k_norm):
-    """In place per-head RMSNorm (modules with .weight and .eps) then the rotation of channel pairs (2p, 2p + 1) of q and / or k
-    (batch, tokens, heads, head_dim; the other None) by rope (1 | batch, tokens, 1, pairs, 2) cos / sin, a complex frequency table
-    viewed as real; rope None normalizes only. The fused Triton kernel on CUDA inference tensors (FP32 statistics, the norm output
-    rounded to the activation dtype, the rotation in FP32 with one rounding), else the norm module and paired_rope_ by chunks of
-    tokens, without complex arithmetic."""
+def interleaved_norm_rope_(q, k, rope, q_norm, k_norm, *, rope_first=False):
+    """In place per-head RMSNorm then the rotation of channel pairs (2p, 2p + 1) of q and / or k (batch, tokens, heads, head_dim; the
+    other None) by rope (1 | batch, tokens, 1, pairs, 2) cos / sin, a complex frequency table viewed as real; rope None normalizes
+    only. Norms: modules with .weight and .eps, or (weight, eps) tuples whose weight is (head_dim,) or one row per head (heads,
+    head_dim), in the activation dtype or FP32; with tuples, rope may hold one table per head (1 | batch, tokens, heads, pairs, 2). The
+    fused Triton kernel on CUDA inference tensors (FP32 statistics, the norm output rounded to the activation dtype, the rotation in
+    FP32 with one rounding), else the norm and paired_rope_ by chunks of tokens, without complex arithmetic. rope_first (tuples): the
+    rotation, then the RMSNorm of the rotated rows, both in FP32 and rounded once (Hi3D's and TripoSplat's order)."""
     for x, norm in ((q, q_norm), (k, k_norm)):
         if x is None:
+            continue
+        if isinstance(norm, tuple):
+            weight, eps = norm
+            if _triton is not None and cuda_inference(x, dtypes=(torch.bfloat16, torch.float16)) and weight.device == x.device:
+                _triton.rms_rope_(x, weight, rope, eps, interleaved=True, rope_first=rope_first)
+                continue
+            rows = max(1, (64 << 20) // (x[0, 0].numel() * 4))
+            for start in range(0, x.shape[1], rows):
+                part = x[:, start:start + rows]
+                y = part.float()
+                if rope_first and rope is not None:
+                    y = paired_rope_(y, rope[:, start:start + rows, ..., 0], rope[:, start:start + rows, ..., 1], interleaved=True)
+                y = y.mul_(y.square().mean(-1, keepdim=True).add_(eps).rsqrt_()).mul_(weight)
+                if not rope_first and rope is not None:  # the norm output rounded, then rotated in FP32
+                    y = paired_rope_(y.to(x.dtype).float(), rope[:, start:start + rows, ..., 0], rope[:, start:start + rows, ..., 1], interleaved=True)
+                part.copy_(y)
             continue
         if rope is not None and _triton is not None and cuda_inference(x) and norm.weight.device == x.device and norm.weight.dtype == x.dtype:
             _triton.rms_rope_(x, norm.weight, rope, norm.eps, interleaved=True)
@@ -454,36 +472,40 @@ def _norm_parameters(norm, tokens, device):
     return norm.weight, torch.finfo(torch.float32).eps if norm.eps is None else norm.eps, None
 
 
-def split_half_norm_rope_quant_(q, k, rope, q_norm, k_norm, core, settings, *, interleaved=False):
+def split_half_norm_rope_quant_(q, k, rope, q_norm, k_norm, core, settings, *, interleaved=False, rope_first=False):
     """The staged SageAttention 2 quantization of q and / or k (batch, tokens, heads, head_dim; the other None) fused with their
     per-head RMSNorm (a module with .weight and .eps, a (weight, eps) tuple, None, or segments [(start, stop, module or tuple)] over
-    the tokens, each with its own weights, in the activation dtype or FP32: a joint attention's streams) and RoPE (rope: (1 | batch, tokens, 1, pairs, 2) cos / sin
+    the tokens, each with its own weights, in the activation dtype or FP32: a joint attention's streams; a tuple's weight may hold one
+    row per head, (heads, head_dim)) and RoPE (rope: (1 | batch, tokens, 1 | heads, pairs, 2) cos / sin, one table for all heads or one per head,
     or (..., pairs, 2, 2) rotation matrices [[cos, -sin], [sin, cos]], read through their strides; None for no rotation; channel p
     with p + pairs, or interleaved 2p with 2p + 1): (q_quantized, k_quantized) as the core's staged_quantize_q / staged_quantize_k
     return them, quantized from the FP32 rotated rows (one rounding fewer than the in-place kernel followed by the core's
-    quantizer), k's mean from FP32 partial sums. q is left as it is (staged_attention writes the output into it) and k is not
-    modified (the caller releases it). None where the fusion does not apply (a core without fused_qk_layouts or a quantization
-    layout the kernels do not reproduce, no CUDA inference, head_dim not 64 / 128, norm weights on another device / dtype): the
-    caller runs norm_rope and the core's quantizers."""
+    quantizer), k's mean from FP32 partial sums. rope_first: the rotation before the norm (Hi3D), both in FP32. Heads that the core
+    pads (settings["padded_dim"]: 96 attended as 128) get INT8 rows of the padded width, zeros beyond head_dim. q is left as it is
+    (staged_attention writes the output into it) and k is not modified (the caller releases it). None where the fusion does not apply
+    (a core without fused_qk_layouts or a quantization layout the kernels do not reproduce, no CUDA inference, attended head_dim not
+    64 / 128, norm weights on another device / dtype): the caller runs norm_rope and the core's quantizers."""
     x = q if q is not None else k
+    width = settings.get("padded_dim") or x.shape[-1]
     (q_weight, q_eps, q_rows), (k_weight, k_eps, k_rows) = (_norm_parameters(norm, x.shape[1], x.device) for norm in (q_norm, k_norm))
     layouts = core.fused_qk_layouts(settings, x.shape[-1]) if _qk_quant is not None and hasattr(core, "fused_qk_layouts") else None
     # the kernel reads the weights in their own dtype (FP32 scales of some INT8 checkpoints included) and multiplies in FP32
-    if (layouts is None or x.shape[-1] not in (64, 128) or not cuda_inference(x, dtypes=(torch.bfloat16, torch.float16))
+    if (layouts is None or width not in (64, 128) or not cuda_inference(x, dtypes=(torch.bfloat16, torch.float16))
             or not all(w.device == x.device and w.dtype in (x.dtype, torch.float32) for w in (q_weight, k_weight) if w is not None)):
         return None
+    options = {"interleaved": interleaved, "rope_first": rope_first}
     quantized = [None, None]
     if k is not None:
         layout, block, sm_scale, scale_eps = layouts["k"]
         mean = settings.get("k_mean")  # a cached prefix's mean (staged_quantize_k), else k's own
-        mean = _qk_quant.norm_rope_mean(k, k_weight, rope, k_eps, interleaved=interleaved, weight_rows=k_rows) if mean is None else mean.expand(k.shape[0], -1, -1)
+        mean = _qk_quant.norm_rope_mean(k, k_weight, rope, k_eps, weight_rows=k_rows, **options) if mean is None else mean.expand(k.shape[0], -1, -1)
         quantized[1] = _qk_quant.norm_rope_quantize(k, k_weight, rope, k_eps, layout, block, mean=mean, sm_scale=sm_scale, scale_eps=scale_eps,
-                                                    interleaved=interleaved, weight_rows=k_rows)
+                                                    weight_rows=k_rows, width=width, **options)
         del mean
     if q is not None:
         layout, block, sm_scale, scale_eps = layouts["q"]
         quantized[0] = _qk_quant.norm_rope_quantize(q, q_weight, rope, q_eps, layout, block, sm_scale=sm_scale, scale_eps=scale_eps,
-                                                    interleaved=interleaved, weight_rows=q_rows)
+                                                    weight_rows=q_rows, width=width, **options)
     return tuple(quantized)
 
 

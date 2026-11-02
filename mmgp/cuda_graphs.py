@@ -44,6 +44,8 @@ from . import runtime
 
 MAX_KEYS = 8  # graphs kept per block, the least recently used dropped first: weight locations, CFG branches of other lengths, resolutions
 MOVE_BYTES = 32 << 20  # arguments from this size move into their static buffer when only their caller holds them
+ESCAPE_WARMUP = True  # comparison switch: the result of a key's first call leaves the graph pool (_escape)
+RECAPTURE_HELD = True  # comparison switch: a graph whose replay may overwrite a buffer held since a later capture is captured again
 _SCALARS = (bool, int, float, str, type(None), torch.dtype, torch.device)
 _depth = 0
 _recording = 0
@@ -439,7 +441,7 @@ class _ReadCheck(TorchDispatchMode):
 
 
 class _Graph:
-    __slots__ = ("graph", "positions", "static", "extra_static", "static_key", "mutated", "out_leaves", "out_spec", "outputs", "lifetimes", "emptied")
+    __slots__ = ("graph", "positions", "static", "extra_static", "static_key", "mutated", "out_leaves", "out_spec", "outputs", "lifetimes", "emptied", "seq")
 
 
 def _handoffs(args, kwargs):
@@ -535,6 +537,9 @@ class BlockGraphs:
         self._tensor_refs = {}
         self.spans, self.span_runs = {}, {}  # (tower, start, stop, step) -> _Span; (tower, step) -> the runs its spans were made for
         self.memo = {}  # (module, its first argument) -> its last call replayed through the fast path of call()
+        # output buffers that a capture put in the pool, by the order of that capture: the scratch of the graphs captured before may lie
+        # over them (the pool shares it in the order of the captures), which their replays overwrite (_held_later)
+        self.captures, self.later = 0, {}
         _blas_workspaces.clear()  # library caches may be released between models too; prepare them again before a new capture
         if self.forget is not None:
             self.forget()
@@ -577,7 +582,8 @@ class BlockGraphs:
             weights, providers = self.weights_key(module), tuple(provider() for provider in _key_providers)
             entry = memo[5]
             # its weights key is the same tuple object while the weights stay where they are (_graph_weights_key); an evicted graph leaves memo
-            if weights[0] is memo[3][0] and weights[1:] == memo[3][1:] and providers == memo[4] and not self.extra_inputs(module):
+            if (weights[0] is memo[3][0] and weights[1:] == memo[3][1:] and providers == memo[4] and not self.extra_inputs(module)
+                    and not self._held_later(entry)):
                 copies, borrowed, mutated, result, streams = memo[6]
                 for static, leaf in copies:
                     static.copy_(leaf)
@@ -618,7 +624,7 @@ class BlockGraphs:
                 entry = self.entries.get(key)
                 lifetimes = ()
         retained_output = entry is not None and any(k in self.borrowed and not _unshared(self.static[k]) for k in entry.static_key[len(buffers):])
-        if retained_output:
+        if retained_output or entry is not None and self._held_later(entry):  # its replay would overwrite a buffer the caller holds
             self._evict(key, static_key)
             entry = None
         if entry is None:  # first call of this key: eager (it compiles and tunes the kernels, makes the caches of the weights), then captured
@@ -675,7 +681,7 @@ class BlockGraphs:
                 _recording -= 1
                 self._prune()
             keys[key] = None
-            return out
+            return self._escape(out)
         keys[key] = keys.pop(key)  # most recently used
         if (self.state_ids and not kwargs and not extras and not entry.lifetimes and not entry.emptied and len(entry.static_key) == len(entry.static)
                 and len(leaves) == len(args) and all(leaf is arg and (not isinstance(arg, torch.Tensor) or id(arg) in self.state_ids) for leaf, arg in zip(leaves, args))):
@@ -796,10 +802,39 @@ class BlockGraphs:
         for memo_key in [memo_key for memo_key, memo in self.memo.items() if memo[5] in entries]:
             del self.memo[memo_key]
 
+    def _escape(self, out):
+        """The result of a key's first call (eager, in the graph pool) leaves the pool: the scratch of the graphs captured before may lie
+        there, which their replays overwrite while the caller still holds it (the output of a block kept while the block runs for another
+        guidance branch). Its tensors in the pool that are no static buffer are copied to ordinary memory, once per capture."""
+        from . import allocator
+        if self.pool is None or allocator.active != "vmm" or not ESCAPE_WARMUP:
+            return out
+        flat, spec = _flatten(out)
+        escaped = [leaf.clone() if isinstance(leaf, torch.Tensor) and leaf.is_cuda and _static_storages.get(_storage(leaf)) is None and allocator.in_pool(leaf, self.pool)
+                   else leaf for leaf in flat]
+        return pytree.tree_unflatten(escaped, spec)
+
+    def _held_later(self, entry):
+        """Whether a caller still holds an output buffer that a capture after this graph's put in the pool: its replay writes its scratch,
+        which may lie over it (the output of a block kept by the caller while the block runs for another guidance branch, whose graph an
+        earlier pass captured). The graph is then captured again, its scratch avoiding the buffers alive (no copy of them)."""
+        return RECAPTURE_HELD and bool(self.later) and any(seq > entry.seq and not _unshared(self.static[key]) for key, seq in self.later.items())
+
+    def forget_storage(self, tensors):
+        """The graphs whose static buffers adopted these tensors' storage go, with those buffers: their owner drops them (a cache leaving the
+        VRAM) and gets the memory back. The blocks capture their graphs again at their next calls."""
+        pointers = {tensor.untyped_storage().data_ptr() for tensor in tensors}
+        keys = {key for key, buffer in self.static.items() if buffer.untyped_storage().data_ptr() in pointers}
+        if keys:
+            for key in [key for key, entry in self.entries.items() if not keys.isdisjoint(entry.static_key)]:
+                self._evict(key)
+            self._prune()
+
     def _prune(self, keep=()):
         used = set(keep) | {k for entry in self.entries.values() for k in entry.static_key}
         if any(k not in used for k in self.static):
             self.static = {k: buffer for k, buffer in self.static.items() if k in used}
+            self.later = {k: seq for k, seq in self.later.items() if k in used}
             self.static_by_buffer, self.static_by_base = {}, {}
             for key, buffer in self.static.items():
                 self._index_buffer(key, buffer)
@@ -861,6 +896,8 @@ class BlockGraphs:
         # blas: the call uses cuBLAS, whose workspaces the capture stream then needs before the capture (they cannot be made during it)
         from . import allocator
         entry = _Graph()
+        self.captures += 1
+        entry.seq = self.captures
         outputs = self._outputs(leaves, warm_output)
         entry.positions = [index for index, leaf in enumerate(leaves) if isinstance(leaf, torch.Tensor)]
         out_signatures = [output for output in outputs if output is not None and output[0] != "argument"]
@@ -868,7 +905,11 @@ class BlockGraphs:
         for sig in [signature[index] for index in entry.positions] + list(extra_signature):
             counts[sig] = counts.get(sig, 0) + 1
         out_sources = [leaf if adopt_outputs else None for leaf, output in zip(_flatten(warm_output)[0], outputs) if output is not None and output[0] != "argument"]
+        known = set(self.static)
         output_keys, output_buffers = self._buffers(out_signatures, out_sources, counts)
+        for key in output_keys:
+            if key not in known and self.pool is not None and allocator.active == "vmm" and allocator.in_pool(self.static[key], self.pool):
+                self.later[key] = entry.seq
         plan = self._capture_output_plan
         if plan is not None:
             for source, buffer in zip(out_sources, output_buffers):

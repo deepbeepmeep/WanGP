@@ -63,3 +63,8 @@ loras_url_cache_v2.json
 
 # GPL-3.0 SeedVC component, fetched on first use from github.com/deepbeepmeep/WanGP-SeedVC
 postprocessing/seedvc/
+
+# Publish Manager build metadata automatically.
+!.github/
+!.github/workflows/
+!.github/workflows/manager-catalog.yml

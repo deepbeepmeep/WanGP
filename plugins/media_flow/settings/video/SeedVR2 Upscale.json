@@ -8,6 +8,7 @@
   "sliding_window_overlap": 0,
   "prompt": "",
   "process": {
+    "use_configured_model": true,
     "task": "upscale",
     "summary": "SeedVR2 diffusion upscaler: restores detail and reduces compression or generation degradation while upscaling."
   }

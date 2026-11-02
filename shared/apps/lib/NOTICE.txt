@@ -1,0 +1,40 @@
+Third-party browser libraries vendored by WanGP for web apps
+
+These files are served under /apps/lib/ to the sandboxed web-app pages. importmap.json maps the bare module specifiers used
+in each library's documentation ("three", "three/addons/...", "cannon-es", "phaser", "@tweenjs/tween.js", "simplex-noise",
+"tone") to these files, so no CDN is needed.
+
+three/: three 0.186.0 (r186, https://github.com/mrdoob/three.js), npm package files, unmodified.
+  three.module.js, three.core.js: build/ files (identical to shared/gradio/vendor/spark/three.module.js and three.core.js).
+  addons/: examples/jsm/ (311 modules) without the WebGPU/TSL and heavy parts: tsl/, transpiler/, inspector/, physics/ (fetches
+  Ammo/Jolt/Rapier from CDNs), lines/webgpu/, capabilities/WebGPU.js, libs/draco/ and libs/basis/ (WASM decoders: DRACOLoader,
+  KTX2Loader and 3DMLoader load but need decoders that are not vendored), and every module that imports three/webgpu,
+  three/tsl or a removed module (Addons.js, offscreen/, generators/, gpgpu/, materialx loaders, *Node*/*GPU* variants, ...).
+  TTFLoader.js and libs/demuxer_mp4.js are removed too: they import opentype.js and mp4box from CDNs.
+  The bundled helper libraries keep their own license headers (fflate MIT, lil-gui MIT, meshoptimizer MIT, chevrotain
+  Apache-2.0, potpack ISC, TinyEXR/OpenEXR code in EXRLoader.js BSD-3-Clause, SculptGL MIT in misc/SculptGL.LICENSE.txt).
+  License: MIT (three/LICENSE).
+  fonts/: helvetiker_regular, helvetiker_bold and optimer_bold typeface.json files from the r186 tag of examples/fonts/
+  (not in the npm package). They derive from the MgOpen fonts (Copyright 2004 MAGENTA Ltd.), under the permissive MgOpen
+  font license in fonts/LICENSE-MgOpen.txt.
+
+cannon-es/: cannon-es 0.20.0 (https://github.com/pmndrs/cannon-es), dist/cannon-es.js, unmodified.
+  License: MIT (cannon-es/LICENSE).
+
+phaser/: phaser 3.90.0 (https://github.com/phaserjs/phaser), dist/phaser.esm.min.js saved as phaser.esm.js, unmodified.
+  phaser.mjs is a WanGP wrapper: the ESM build has named exports only, so the wrapper re-exports them, adds the namespace as
+  the default export (both "import Phaser from 'phaser'" and "import * as Phaser from 'phaser'" work) and sets the global Phaser.
+  The bundle includes eventemitter3 (MIT), Earcut 2.2.4 (ISC) and Matter.js (MIT), see phaser/LICENSE-third-party.txt.
+  License: MIT (phaser/LICENSE.md).
+
+tween/: @tweenjs/tween.js 25.0.0 (https://github.com/tweenjs/tween.js), dist/tween.esm.js, unmodified.
+  License: MIT (tween/LICENSE).
+
+simplex-noise/: simplex-noise 4.0.3 (https://github.com/jwagner/simplex-noise.js), dist/esm/simplex-noise.js and its source
+  map, unmodified. License: MIT (simplex-noise/LICENSE).
+
+tone/: tone 15.1.22 (https://github.com/Tonejs/Tone.js). tone.mjs is build/esm/ bundled into one minified ES module with
+  esbuild 0.28.2 (format esm, target es2020), including its dependencies standardized-audio-context 25.3.77 (MIT),
+  automation-events 7.1.19 (MIT), @babel/runtime 7.29.10 (MIT) and tslib 2.8.1 (0BSD).
+  License: MIT (tone/LICENSE.md); bundled dependencies: tone/LICENSE-standardized-audio-context.txt,
+  tone/LICENSE-automation-events.txt, tone/LICENSE-babel-runtime.txt, tone/LICENSE-tslib.txt.

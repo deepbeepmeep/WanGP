@@ -36,9 +36,12 @@ Model links below select a model when this guide is opened inside WanGP. When re
 | Songs with lyrics | [YuE2](modeltype:yue2), [MiniMax Music 3](modeltype:minimax_music3), [ACE-Step 1.5 XL](modeltype:ace_step_v1_5_xl) | YuE2 adds composition, cover and score workflows. MiniMax Music 3 generates songs from lyrics and a description. ACE-Step offers fast music generation with optional planning models. |
 | A song from a hummed melody | [YuE2 Hum-to-Song](modeltype:yue2_hum) | Supply a clear hum, your lyrics and a musical style. It follows the melody, not the humming voice's identity. |
 | Instrumentals, ambience and sound effects | [Stable Audio 3](modeltype:stable_audio3_small), [YuE2](modeltype:yue2) in instrumental mode | Stable Audio covers descriptive sound and music prompts; YuE2 supports structured instrumental composition. |
-| A textured 3D asset from one image | [TRELLIS.2](modeltype:trellis2), [Hunyuan3D 2.1](modeltype:hunyuan3d_21) | Both create meshes with PBR materials. Hunyuan3D can also texture a mesh you already have. |
+| Transcripts that say who spoke, subtitles or a translation | [Nemotron 3.5 Transcribe](modeltype:nemotron_transcribe), [Q4 Experts](modeltype:nemotron_transcribe_q4) | Turns a recording or a video's soundtrack into text with speaker labels, word timings and subtitles, in 40 languages. Q4 Experts needs about half the memory. |
+| A textured 3D asset from one image | [TRELLIS.2 Shape](modeltype:trellis2_shape), [Pixal3D](modeltype:pixal3d) or [Hunyuan3D 2.1 Shape](modeltype:hunyuan3d_21_shape), with a Texturer preset | The shape model makes the mesh; a **preset** adds a Texturer in the same generation. SUPRA-Tex keeps the picture's colours and print exactly on the visible side. |
+| PBR textures for a mesh you already have | [SUPRA-Tex Texture](modeltype:supratex_texture), [Hunyuan3D 2.1 Paint](modeltype:hunyuan3d_21_paint), [TRELLIS.2 Texture](modeltype:trellis2_texture) | Give the mesh and a picture of the same object; the same texturers run on gallery meshes from the late **Post Processing** tab. They are listed from the most to the least faithful to the picture. |
 | An untextured mesh or separate object parts | [TripoSG](modeltype:triposg), [PartCrafter](modeltype:partcrafter) | TripoSG produces one detailed shape; PartCrafter generates separate part meshes from the same image. |
 | A 3D scene from photos or video | [WorldMirror 2.0](modeltype:worldmirror_2), [MapAnything](modeltype:mapanything), [Depth Anything 3 Points](modeltype:da3_points) | Use overlapping views of a static scene. Choose Gaussian splats for viewing or point clouds with camera information for further work. |
+| Add fine detail to a coarse mesh | [Hi3D](modeltype:hi3d) | Refines a Hunyuan3D, TripoSG or TRELLIS.2 shape into high-resolution geometry from the same picture; texture it afterwards with Hunyuan3D or SUPRA-Tex, or chain all three in post-processing. |
 | Split or animate an existing mesh | [GeoSAM2](modeltype:geosam2), [AnimateAnyMesh](modeltype:animate_any_mesh) | GeoSAM2 separates parts; AnimateAnyMesh creates a short animation from a motion description without a rig. |
 
 <a id="video-models"></a>
@@ -230,23 +233,30 @@ For supported three-voice modes in **H3 Audio, Qwen3 TTS Base, OmniVoice, KugelA
 
 FLAC import and 16-bit lossless export let you keep audio quality and embedded generation settings. WAV/MP3 and other offered output choices remain available.
 
+### Transcription
+
+**[Nemotron 3.5 Transcribe](modeltype:nemotron_transcribe)** turns an audio file or a video's soundtrack into text, offline, in 40 languages and for recordings of up to an hour. It labels who said what (up to eight speakers, which **Speaker Names** can name), times every word, writes subtitles, and translates to or from English. Add the names and jargon that the recording contains as **Context Terms** so that they are spelled correctly, and choose **Verbatim** to keep hesitations and fillers or **Readable** for cleaner text. The transcript appears under the player of the Audio gallery, as text or as a **Timeline** with one lane per speaker: clicking a line or a turn plays the recording from there, and the text can be copied or downloaded. It is also saved in a `.txt` file beside the audio, one line per turn with its time span and speaker, together with `.srt` subtitles. A video's soundtrack is read from the **Video to Transcribe** input that appears when **Video File (Its Soundtrack)** is chosen; its **Output** can then be **Video with Subtitles**: the video itself, unchanged, with the transcript or the translation as subtitles, shown in the Video gallery where the **CC** button switches them on and off. With **Timestamps and Subtitles**, which can also time every word (**Per Word**), a translation is timed too: each sentence is translated from its own stretch of audio, which takes longer than a single translation of the whole recording. Speaker numbers distinguish the voices of one recording; they do not identify people. The **[Q4 Experts](modeltype:nemotron_transcribe_q4)** variant needs about half the memory and suits computers with 32 GB of RAM, at a possible small loss of accuracy.
+
 <a id="3d-models"></a>
 
 ## 3D models
 
 WanGP supports creating objects from images, reconstructing scenes from photos or video, and working on existing meshes. Choose the output for your next step: a **mesh** has surfaces you can edit or texture; **Gaussian splats** render a scene from coloured 3D points and need a compatible viewer; a **point cloud** records sampled geometry and colour.
 
+The model selector starts with what you want to do: **Create** a 3D asset from an image, **Texture**, **Refine**, **Split** or **Animate** a mesh, or **Reconstruct** a scene from photos or video. The second list then offers the models for that goal.
+
 ### Create an object from one image
 
 | Model | Output and when to use it |
 | --- | --- |
-| **[TRELLIS.2](modeltype:trellis2)** | A GLB mesh with PBR textures, including base colour, metallic and roughness. Start with **1024 Cascade** for a balance of shape and detail; 512 is faster, while 1536 Cascade needs more time and memory. Vertex-colour and shape-only outputs are also available. |
-| **[Hunyuan3D 2.1](modeltype:hunyuan3d_21)** | Generate **Shape + PBR Texture**, generate **Shape Only**, or **Texture a Mesh** to paint a supplied mesh from the reference image. The separate [Shape model](modeltype:hunyuan3d_21_shape) produces geometry only. Texturing replaces the mesh's existing UVs and materials. |
+| **[TRELLIS.2 Shape](modeltype:trellis2_shape)** | An untextured GLB mesh that keeps thin and intricate structures. Start with **1024 Cascade** for a balance of shape and detail; 512 is faster, while 1536 Cascade needs more time and memory. Its presets add a Texturer in the same generation: *SUPRA-Tex PBR*, *Hunyuan3D 2.1 Paint PBR* or *TRELLIS.2 Texture PBR* (the former textured TRELLIS.2 model: the fastest, with approximate colours). |
+| **[Hunyuan3D 2.1 Shape](modeltype:hunyuan3d_21_shape)** | An untextured GLB mesh. Its preset **Hunyuan3D 2.1 Paint PBR** adds Hunyuan3D's PBR textures in the same generation (the former textured Hunyuan3D 2.1 model); [Hunyuan3D 2.1 Paint](modeltype:hunyuan3d_21_paint) paints a mesh you supply. Texturing replaces the mesh's existing UVs and materials. |
 | **[TripoSG](modeltype:triposg)** | A detailed, untextured GLB mesh. Useful when you want to edit the shape or texture it separately. Higher mesh resolution preserves finer detail but increases extraction time and face count. |
 | **[PartCrafter](modeltype:partcrafter)** | A GLB containing separate, untextured part meshes generated together. Choose the number of parts to suit the object. Parts can be moved or edited individually, but their order and colours are arbitrary and small parts may overlap or be missing. |
+| **[Pixal3D](modeltype:pixal3d)** + SUPRA-Tex | [Pixal3D](modeltype:pixal3d) builds the mesh in the picture's own camera, so it fits the image exactly; its preset **SUPRA-Tex PBR** adds PBR textures that keep the picture's colours, print and patterns on the side the picture shows, the hidden side completed to match (the former SUPRA-Tex model). [SUPRA-Tex Texture](modeltype:supratex_texture) textures a mesh you supply. SUPRA-Tex reuses Qwen Image 2.1 to read the picture's materials, which is for **non-commercial use only** (Qwen Research License). |
 | **[TripoSplat](modeltype:triposplat)** | A Gaussian-splat PLY for viewing objects with fine, fuzzy or thin details. It produces splats rather than an editable mesh, so choose another model for mesh texturing or rigging. |
 
-Use one whole, uncropped object on a plain or transparent background, preferably in a three-quarter view with even lighting. Hidden sides are inferred and may differ from the real object. For these models, **Asset Name / Description** names the output; the reference image determines its appearance. To start from text, generate an image first, then use it as the 3D reference.
+Use one whole, uncropped object on a plain or transparent background, preferably in a three-quarter view with even lighting. The background of a picture without transparency is removed automatically, cast shadows included (the 3D models use BiRefNet, a one-time download of about 1 GB). Hidden sides are inferred and may differ from the real object. For these models, **Asset Name / Description** names the output; the reference image determines its appearance. To start from text, generate an image first, then use it as the 3D reference.
 
 ### Reconstruct a scene from photos or video
 
@@ -259,14 +269,28 @@ Use one whole, uncropped object on a plain or transparent background, preferably
 
 Sharp, overlapping views with a moving camera and a static scene work best. Moving subjects, reflections and textureless surfaces are harder to reconstruct. More views and higher working resolution increase memory use and processing time. The text field names the scene; it does not alter the reconstruction.
 
-### Split and animate existing meshes
+### Refine, split and animate existing meshes
+
+- **[Hi3D](modeltype:hi3d)** refines a coarse mesh into high-resolution geometry from a picture of the same object: seams, buttons, scales and engravings that image-to-3D models only suggest. Use the **To Input Mesh** button of a Hunyuan3D Shape, TripoSG or TRELLIS.2 result together with its picture. **1024** gives a strong improvement in a few minutes on a fast GPU; **512** is quicker and **1536** adds the finest relief for about twice the time of 1024. The result keeps the input's position and scale but has no textures: texture it afterwards with [SUPRA-Tex Texture](modeltype:supratex_texture), [Hunyuan3D 2.1 Paint](modeltype:hunyuan3d_21_paint) or [TRELLIS.2 Texture](modeltype:trellis2_texture), or select a Texturer in Hi3D's own Post Processing tab, keeping enough faces that the detail survives. Hi3D keeps the overall shape, so fix missing or merged parts in the coarse mesh first. Its detail goes to solid parts: thin sheets such as leaves, fabric or paper are finer than its grid, so where it would perforate or lose them it keeps the coarse mesh's surface there, without added relief.
+
+#### 3D post-processing: refine and texture in one go
+
+The **Post Processing** tab of untextured mesh models (Hunyuan3D Shape, TripoSG, TRELLIS.2 Shape, Pixal3D, Hi3D) offers two 3D steps, run on each generated mesh with the generation's object image. Their **presets** choose ready-made combinations, for example *SUPRA-Tex PBR* or *Hi3D + SUPRA-Tex PBR*:
+
+- **3D Refiner** (Hi3D): adds fine geometric detail first.
+- **Texturer**: then paints PBR textures. From the most to the least faithful to the picture:
+  1. **SUPRA-Tex** keeps the picture's colours, print and patterns on the visible side and completes the hidden side to match. The picture must line up with the mesh: the front or a three-quarter view, at most moderately from above (a steep top-down photo misplaces the colours). Its material stage is for non-commercial use only.
+  2. **Hunyuan3D 2.1 Paint** paints all around from generated views: colours follow the picture, fine print comes out blurred. The safe choice when the picture and the mesh differ.
+  3. **TRELLIS.2 Texture** is several times faster than the others: plausible materials whose colours only approximate the picture and change with the seed, without its print or patterns.
+
+Combining them gives a shape, its fine relief and its textures in one generation. A model that already textures its meshes cannot take a Texturer, and a textured mesh cannot be refined (refining replaces the geometry and drops its textures). In late post-processing, select a mesh in the gallery and add its **Object Image**: one field, used by both steps. With **Embed Source Images** enabled in Configuration, new 3D assets keep their object image inside the GLB (about the size of the picture): late post-processing uses it when you add none, and loading the asset's settings restores it. SUPRA-Tex places the mesh from the picture's silhouette, so the picture must show the same object; regions the picture does not show are completed and can come out plainer than the visible side.
 
 - **[GeoSAM2](modeltype:geosam2)** splits an input mesh into separate parts within one GLB. Use automatic segmentation or optional point prompts to guide it. Existing textures are retained; small or hidden parts can be merged.
 - **[AnimateAnyMesh](modeltype:animate_any_mesh)** animates an input mesh from an English motion description, such as `The dragon flaps its wings and flies`. It needs no skeleton or rig and retains the mesh's textures. Motion is limited to 16 generated frames, with an optional forward-and-backward loop. It deforms the existing shape, so it cannot split a closed mesh into new pieces. Start with an upright mesh and try a few seeds.
 
 ### Reuse 3D assets
 
-Open results in the **3D gallery** to rotate, zoom and inspect them. Save a view at your chosen resolution, then use that image as a reference or the start of a video. Compatible mesh results can also become inputs for texturing, segmentation or animation. [Deepy](DEEPY.md) can inspect 3D assets from different angles and help turn a character into a turnaround sheet.
+Open results in the **3D gallery** to rotate, zoom and inspect them. Save a view at your chosen resolution, then use that image as a reference or the start of a video. Compatible mesh results can also become inputs for texturing, refinement, segmentation or animation: select one in the 3D gallery and press **To Input Mesh**, shown for models that take a mesh (those under Texture, Refine, Split and Animate). [Deepy](DEEPY.md) can inspect 3D assets from different angles and help turn a character into a turnaround sheet.
 
 ## Upscaling and finishing
 
@@ -297,14 +321,14 @@ INT8, FP8, GGUF, NVFP4, NF4 and Nunchaku are checkpoint/quantization choices, no
 
 ## Model switching and custom models
 
-WanGP downloads models on demand. Optional preprocessing and postprocessing files also download only when a workflow needs them. Switching models does not require a restart; the previous model is unloaded as needed to recover memory.
+WanGP downloads models on demand. Optional preprocessing and postprocessing files also download only when a workflow needs them. Switching models does not require a restart; the previous model is unloaded as needed to recover memory. A model normally leaves the VRAM after each generation. A few models that run as a single piece for their whole generation (Nemotron 3.5 Transcribe, HiDream O1, SenseNova U1, KugelAudio, the 3D reconstruction models and GeoSAM2) stay loaded instead when the next sample or the next queued task uses the same model, so a batch of short jobs does not reload them each time. With the *MMGP Optimized VRAM Allocator* (the default), other models and programs still get that VRAM back as soon as they need it; with PyTorch's allocator, these models are unloaded after each generation as usual.
 
 Use the model selector or toolbar search, save reusable settings, and organize media in [Workspaces](WORKSPACES.md). The refreshed browser interface lets you check progress, inspect galleries and add generation jobs from another device connected to the same running WanGP server. The queue and galleries stay synchronized; each Gradio page keeps its own unsent prompts and draft settings. See [Authentication and network access](AUTHENTICATION.md) for remote setup.
 
 [Deepy](DEEPY.md) can help select models and connect generation/editing steps. Its language-model engine is a separate choice from the image, video, audio or 3D model doing the generation; the phone-friendly Deepy Web App controls that same local workspace.
 
-User-provided checkpoints belong in `finetunes/`, while model plugins can add other families. Refresh the model list after adding definitions. See [Finetunes](FINETUNES.md), [LoRAs](LORAS.md) and [Plugins](PLUGINS.md) for compatibility and setup.
+User-provided checkpoints belong in `finetunes/`, while model Plugins can add other families. Refresh the model list after adding definitions. See [Finetunes](FINETUNES.md), [LoRAs](LORAS.md) and [Plugins](PLUGINS.md) for compatibility and setup.
 
 ---
 
-> Applies to: Choosing WanGP video, image, speech, music, sound and 3D models; model-family and variant relationships; compatible references and workflows; image-to-3D generation, scene reconstruction, mesh segmentation and animation; upscaling and finishing choices; hardware-dependent memory and acceleration trade-offs. The model selector and model Help provide the current available variants and settings.
+> Applies to: Choosing WanGP video, image, speech, music, sound, transcription and 3D models; model-family and variant relationships; compatible references and workflows; image-to-3D generation, scene reconstruction, mesh segmentation and animation; upscaling and finishing choices; hardware-dependent memory and acceleration trade-offs. The model selector and model Help provide the current available variants and settings.

@@ -23,6 +23,7 @@ from shared.deepy.config import (
     DEEPY_DEFAULT_GEN_VIDEO_WITH_SPEECH,
     DEEPY_DEFAULT_GEN_3D,
     DEEPY_DEFAULT_GEN_WORLD,
+    DEEPY_DEFAULT_TEXTURE_3D,
     DEEPY_TEMPLATE_CONFIG_MIGRATIONS,
     DEEPY_TOOL_EDIT_IMAGE_KEY,
     DEEPY_TOOL_GEN_IMAGE_KEY,
@@ -34,6 +35,7 @@ from shared.deepy.config import (
     DEEPY_TOOL_GEN_VIDEO_WITH_SPEECH_KEY,
     DEEPY_TOOL_GEN_3D_KEY,
     DEEPY_TOOL_GEN_WORLD_KEY,
+    DEEPY_TOOL_TEXTURE_3D_KEY,
     get_deepy_config_value,
     normalize_deepy_tool_edit_image,
     normalize_deepy_tool_gen_image,
@@ -45,6 +47,7 @@ from shared.deepy.config import (
     normalize_deepy_tool_gen_video_with_speech,
     normalize_deepy_tool_gen_3d,
     normalize_deepy_tool_gen_world,
+    normalize_deepy_tool_texture_3d,
 )
 
 
@@ -66,6 +69,7 @@ TOOL_DISPLAY_NAMES = {
     "gen_speech_from_sample": "Speech From Sample",
     "gen_world": "World Generator",
     "gen_3d": "3D Generator",
+    "texture_3d": "3D Texturer",
 }
 _TOOL_TEMPLATE_VALIDATION_ERRORS = {
     "gen_video": "The settings should generate a video",
@@ -78,6 +82,7 @@ _TOOL_TEMPLATE_VALIDATION_ERRORS = {
     "gen_speech_from_sample": "The model should generate only an audio output and a sample audio ois expected",
     "gen_world": "The settings should generate an explorable world",
     "gen_3d": "The settings should generate a 3D asset",
+    "texture_3d": "The settings should texture a mesh",
 }
 # The template tasks, in the order of the settings pickers: a new one needs an entry here (config key, built-in default, ui_key: its field
 # in the Deepy tool settings), a display name, a validation rule and its templates folder; the settings forms, the CLI and the MCP catalog
@@ -108,6 +113,7 @@ _TOOL_CONFIG_SPECS = {
         "ui_key": "speech_from_sample_variant",
     },
     "gen_3d": {"key": DEEPY_TOOL_GEN_3D_KEY, "default": DEEPY_DEFAULT_GEN_3D, "normalize": normalize_deepy_tool_gen_3d, "ui_key": "generator_3d_variant"},
+    "texture_3d": {"key": DEEPY_TOOL_TEXTURE_3D_KEY, "default": DEEPY_DEFAULT_TEXTURE_3D, "normalize": normalize_deepy_tool_texture_3d, "ui_key": "texturer_3d_variant"},
     "gen_world": {"key": DEEPY_TOOL_GEN_WORLD_KEY, "default": DEEPY_DEFAULT_GEN_WORLD, "normalize": normalize_deepy_tool_gen_world, "ui_key": "world_generator_variant"},
 }
 _PRESET_SOURCE_BUILTIN = "builtin"
@@ -121,6 +127,8 @@ _LEGACY_VARIANT_ALIASES = {
     "gen_image": {"Z_Image_Turbo": "Z Image Turbo", **DEEPY_TEMPLATE_CONFIG_MIGRATIONS[DEEPY_TOOL_GEN_IMAGE_KEY]},
     "gen_video": {"ltx2_22B_distilled": "LTX-2 2.3 Distilled 1.0", "LTX-2 2.3 Distilled": "LTX-2 2.3 Distilled 1.0", **DEEPY_TEMPLATE_CONFIG_MIGRATIONS[DEEPY_TOOL_GEN_VIDEO_KEY]},
     "gen_video_with_speech": {"LTX-2.3 Distilled With Sound": "LTX-2.3 Distilled 1.0 With Sound", **DEEPY_TEMPLATE_CONFIG_MIGRATIONS[DEEPY_TOOL_GEN_VIDEO_WITH_SPEECH_KEY]},
+    "gen_video_with_refs": DEEPY_TEMPLATE_CONFIG_MIGRATIONS[DEEPY_TOOL_GEN_VIDEO_WITH_REFS_KEY],
+    "gen_3d": DEEPY_TEMPLATE_CONFIG_MIGRATIONS[DEEPY_TOOL_GEN_3D_KEY],
 }
 _LIVE_FILE_PRESET_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 GENERATION_TOOL_IDS = tuple(_TOOL_CONFIG_SPECS.keys())
@@ -506,6 +514,8 @@ def validate_wangp_settings_payload_for_tool(tool_name: str, payload: dict[str, 
         "gen_speech_from_sample": audio_only and accepts_audio_prompt,
         "gen_world": isinstance(model_def, dict) and bool(model_def.get("world_outputs", False)),
         "gen_3d": isinstance(model_def, dict) and bool(model_def.get("mesh_outputs", False)),
+        # a texturing model, or a mesh model whose Texturer (temporal slot) paints its result
+        "texture_3d": isinstance(model_def, dict) and bool(model_def.get("mesh_outputs", False)) and (bool(model_def.get("mesh_texture", False)) or bool(str(payload.get("temporal_upsampling", "") or "").strip())),
     }
     return None if checks.get(lookup_name, True) else _TOOL_TEMPLATE_VALIDATION_ERRORS[lookup_name]
 

@@ -7,6 +7,7 @@ from collections import defaultdict
 from shared.utils.plugins import WAN2GPPlugin
 from shared.utils import files_locator as fl
 from shared import model_dropdowns
+from shared.gradio.app_icons import icon as app_icon
 from mmgp import quant_router
 
 VARIANT_LABEL_OTHER_NON_SHARED = "Other Non Shared"
@@ -79,6 +80,7 @@ class modelsManagerPlugin(WAN2GPPlugin):
 
     def create_model_ui(self):
         with gr.Column():
+            gr.HTML(f'<button type="button" class="wangp-model-manager-link" data-app-route="plugin_configuration" data-ckpt-return title="Back to Configuration [Alt+M]">{app_icon("back")} <span>Back to Configuration</span> <kbd>Alt+M</kbd></button>')
             gr.Markdown("### Models Manager")
             gr.Markdown(
                 "Sizes are unique GB recoverable on delete, plus shared GB used outside the branch."
@@ -540,9 +542,28 @@ class modelsManagerPlugin(WAN2GPPlugin):
             setTimeout(waitForRefreshReady, 200);
         }
 
+        // The screen the Models Manager was opened from, where its return link and Alt+M lead back.
+        let ckptReturn = {target: 'plugin_configuration', label: 'Configuration'};
+
+        function updatemodelReturnLink() {
+            const link = modelRoot().querySelector('[data-ckpt-return]');
+            link.dataset.appRoute = ckptReturn.target;
+            link.title = `Back to ${ckptReturn.label} [Alt+M]`;
+            link.querySelector('span').textContent = `Back to ${ckptReturn.label}`;
+        }
+
         function handleTabChange() {
             const active = ismodelTabActive();
+            if (!active) {
+                const root = modelRoot();
+                const tab = root.querySelector('.wangp-native-app-tabs > .tab-wrapper button[data-tab-id][aria-selected="true"]');
+                if (tab) {
+                    const appLink = root.querySelector(`#wangp-app-bar [data-app-route="${CSS.escape(tab.dataset.tabId)}"]`);
+                    ckptReturn = {target: tab.dataset.tabId, label: appLink ? appLink.getAttribute('aria-label') : tab.textContent.trim()};
+                }
+            }
             if (active && !ckptTabWasActive) {
+                updatemodelReturnLink();
                 startmodelBuild();
             }
             if (active) {
@@ -565,6 +586,12 @@ class modelsManagerPlugin(WAN2GPPlugin):
             tabObserver.observe(root, { attributes: true, subtree: true, attributeFilter: ['aria-selected'] });
             handleTabChange();
         }
+
+        document.addEventListener('keydown', (evt) => {
+            if (!evt.altKey || evt.ctrlKey || evt.metaKey || evt.shiftKey || evt.repeat || evt.key.toLowerCase() !== 'm') return;
+            evt.preventDefault();
+            window.WanGPAppBar?.navigate(ismodelTabActive() ? ckptReturn.target : 'plugin_model_manager');
+        });
 
         initmodelBridge();
         """

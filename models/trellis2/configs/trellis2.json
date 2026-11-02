@@ -56,6 +56,12 @@
         "num_blocks": [4, 16, 8, 4, 0],
         "pred_subdiv": false
     },
+    "shape_encoder": {
+        "in_channels": 6,
+        "model_channels": [64, 128, 256, 512, 1024],
+        "latent_channels": 32,
+        "num_blocks": [0, 4, 8, 16, 4]
+    },
     "image_encoder": {
         "hidden_size": 1024,
         "intermediate_size": 4096,

@@ -1,4 +1,7 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
+from models import goals_3d
+from preprocessing.rembg.assets import OBJECT_MODEL
+
 from .prompts import (ASSET_NAME_INSTRUCTIONS, DEEPY_PROMPT_INFOS, GEOSAM2_DEEPY_INFOS, GEOSAM2_DEEPY_PROMPT_INFOS, GEOSAM2_INFOS, GEOSAM2_PROMPT_INFOS,
                       PARTCRAFTER_DEEPY_INFOS, PARTCRAFTER_INFOS, PROMPT_INFOS, TRIPOSG_DEEPY_INFOS, TRIPOSG_INFOS)
 
@@ -46,7 +49,7 @@ class family_handler:
 
     @staticmethod
     def query_family_infos():
-        return {"triposg": (3030, "TripoSG")}
+        return {"triposg": (3030, "TripoSG"), **goals_3d.family_infos(goals_3d.IMAGE_TO_3D, goals_3d.MESH_PARTS)}
 
     @staticmethod
     def get_lora_dir(base_model_type):
@@ -56,9 +59,12 @@ class family_handler:
     def query_model_def(base_model_type, model_def):
         if base_model_type == GEOSAM2_ARCH:
             return {
+                "group": goals_3d.MESH_PARTS,
                 "image_outputs": True,
                 "mesh_outputs": True,
+                "mesh_postprocessing": False,  # segmented meshes: their parts would merge
                 "device_explicit": True,
+                "no_model_swap": True,  # one managed model: kept loaded between samples and queued tasks of the same model
                 "image_prompt_types_allowed": "",
                 "prompt_description": "Asset Name / Description (optional, used for file names)",
                 "prompt_optional": True,  # the prompt only names the output files
@@ -81,6 +87,8 @@ class family_handler:
             }
         parts = base_model_type == PARTCRAFTER_ARCH
         return {
+            "mesh_postprocessing": not parts,  # PartCrafter's parts would merge
+            "group": goals_3d.IMAGE_TO_3D,
             "image_outputs": True,
             "mesh_outputs": True,
             "device_explicit": True,
@@ -89,6 +97,7 @@ class family_handler:
             "one_image_ref_needed": True,
             "one_image_ref_only": True,
             "image_refs_keep_alpha": True,
+            "background_removal_model": OBJECT_MODEL,  # BiRefNet: no cast shadows in the object cutout
             "prompt_description": "Asset Name / Description (optional, used for file names)",
             "prompt_optional": True,  # the prompt only names the output files
             "no_negative_prompt": True,
@@ -97,6 +106,7 @@ class family_handler:
             "NAG": False,
             "inference_steps": True,
             "profiles_dir": [base_model_type],
+            **({} if parts else {"preset_profiles_dir": ["triposg_presets"]}),  # recipes: the shape with a 3D Refiner or a Texturer
             "custom_settings": _custom_settings(parts),
             "prompt_enhancer_def": {"selection": ["TI"], "labels": {"TI": "An Asset Name from the {image_inputs}"}, "default": ""},
             "image_prompt_enhancer_instructions": ASSET_NAME_INSTRUCTIONS,

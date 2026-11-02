@@ -1,0 +1,21 @@
+{
+    "model": {
+        "name": "TRELLIS.2 Texture 2.6B",
+        "architecture": "trellis2_texture",
+        "description": "TRELLIS.2 Texture (Microsoft): PBR textures (base colour, metallic, roughness) generated for a supplied mesh from a picture of the same object. The fastest Texturer, also usable after any 3D model, but its colours only approximate the picture: SUPRA-Tex and Hunyuan3D 2.1 Paint are more faithful.",
+        "URLs": [
+            "https://huggingface.co/DeepBeepMeep/3D/resolve/main/trellis2_texture_bf16.safetensors",
+            "https://huggingface.co/DeepBeepMeep/3D/resolve/main/trellis2_texture_int8_convrot.safetensors"
+        ]
+    },
+    "prompt": "Bronze lion statue",
+    "num_inference_steps": 12,
+    "guidance_scale": 1.0,
+    "model_mode": 1024,
+    "batch_size": 1,
+    "custom_settings": {
+        "max_faces": 0,
+        "texture_size": 2048,
+        "alpha_mode": "opaque"
+    }
+}

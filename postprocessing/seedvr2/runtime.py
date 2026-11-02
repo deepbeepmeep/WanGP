@@ -8,26 +8,21 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from accelerate import init_empty_weights
-from mmgp import offload
+from mmgp import offload, transfer
 from safetensors.torch import load_file
 from tqdm import tqdm
 
 from shared.utils import offload_registry
-from .models.dit_3b import NaDiT
+from .models.dit import NaDiT
+from .models.dit.nablocks.attention.mmattn import qkv_split_map
 from .models.video_vae_v3.modules import VideoAutoencoderKLWrapper
 from .models.video_vae_v3.modules.causal_inflation_lib import InflatedCausalConv3d
 
 
-DIT_CONFIG = {
+_DIT_COMMON_CONFIG = {
     "vid_in_channels": 33,
     "vid_out_channels": 16,
-    "vid_dim": 2560,
-    "vid_out_norm": "fusedrms",
     "txt_in_dim": 5120,
-    "txt_in_norm": "fusedln",
-    "txt_dim": 2560,
-    "emb_dim": 15360,
-    "heads": 20,
     "head_dim": 128,
     "expand_ratio": 4,
     "norm": "fusedrms",
@@ -36,15 +31,42 @@ DIT_CONFIG = {
     "qk_bias": False,
     "qk_norm": "fusedrms",
     "patch_size": (1, 2, 2),
-    "num_layers": 32,
-    "mm_layers": 10,
-    "mlp_type": "swiglu",
     "block_type": "mmdit_sr",
     "window": (4, 3, 3),
-    "window_method": [method for _ in range(16) for method in ("720pwin_by_size_bysize", "720pswin_by_size_bysize")],
     "attention_window_batch_size": 8,
-    "rope_type": "mmrope3d",
-    "rope_dim": 128,
+}
+
+DIT_CONFIGS = {
+    "3b": {
+        **_DIT_COMMON_CONFIG,
+        "vid_dim": 2560,
+        "vid_out_norm": "fusedrms",
+        "txt_in_norm": "fusedln",
+        "txt_dim": 2560,
+        "emb_dim": 15360,
+        "heads": 20,
+        "num_layers": 32,
+        "mm_layers": 10,
+        "mlp_type": "swiglu",
+        "window_method": [method for _ in range(16) for method in ("720pwin_by_size_bysize", "720pswin_by_size_bysize")],
+        "rope_type": "mmrope3d",
+        "rope_dim": 128,
+    },
+    # the original architecture: separate video and text weights in every block, GELU MLPs, video-only pixel RoPE, no output norm
+    "7b": {
+        **_DIT_COMMON_CONFIG,
+        "vid_dim": 3072,
+        "txt_dim": 3072,
+        "emb_dim": 18432,
+        "heads": 24,
+        "num_layers": 36,
+        "mm_layers": 36,
+        "mlp_type": "normal",
+        "window_method": [method for _ in range(18) for method in ("720pwin_by_size_bysize", "720pswin_by_size_bysize")],
+        "rope_type": "rope3d",
+        "rope_dim": 64,
+        "vid_only_last_layer": False,
+    },
 }
 
 VAE_CONFIG = {
@@ -133,7 +155,7 @@ def _color_fixed_frames(decoded: torch.Tensor, sample: torch.Tensor, height: int
         if callable(abort_callback) and abort_callback():
             raise InterruptedError("SeedVR2 upscaling aborted")
         stop = min(start + OUTPUT_FRAME_BATCH_SIZE, decoded.shape[2])
-        content = decoded[0, :, start:stop].to(device).permute(1, 0, 2, 3).float()
+        content = transfer.move(decoded[0, :, start:stop], device).permute(1, 0, 2, 3).float()
         style = _resize_input(sample[:, start:stop], height, width, device)
         count = stop - start
         low_input = torch.empty(count * 2, *content.shape[1:], device=device, dtype=torch.float32)
@@ -142,7 +164,7 @@ def _color_fixed_frames(decoded: torch.Tensor, sample: torch.Tensor, height: int
         style = None
         low_content, low_style = _wavelet_low(low_input).split(count)
         fixed = (content - low_content + low_style).clamp_(-1.0, 1.0).to(decoded.dtype)
-        frames[:, start:stop].copy_(fixed.permute(1, 0, 2, 3).mul_(127.5).add_(127.5).round_().clamp_(0, 255).to(torch.uint8))
+        transfer.copy_(frames[:, start:stop], fixed.permute(1, 0, 2, 3).mul_(127.5).add_(127.5).round_().clamp_(0, 255).to(torch.uint8))
     return frames
 
 
@@ -168,21 +190,23 @@ class SeedVR2Runtime:
         self.positive_embedding = None
         self.offloadobj = None
         self.profile = None
+        self.model = None
 
     @controlled_model_loading
-    def load(self, paths: SeedVR2Paths, *, init_pipe, profile) -> None:
-        if self.dit is not None and self.profile == profile:
+    def load(self, paths: SeedVR2Paths, *, model: str, init_pipe, profile) -> None:
+        if self.dit is not None and self.profile == profile and self.model == model:
             return
         self.release()
         if not torch.cuda.is_available():
             raise RuntimeError("SeedVR2 requires CUDA.")
-        self.profile = profile
+        self.profile, self.model = profile, model
         with init_empty_weights(include_buffers=True), _default_dtype(self.dtype):
-            self.dit = NaDiT(**DIT_CONFIG).eval()
+            self.dit = NaDiT(**DIT_CONFIGS[model]).eval()
             self.vae = VideoAutoencoderKLWrapper(**VAE_CONFIG).eval()
         self.dit._offload_hooks = ["forward"]
         self.vae._offload_hooks = ["decode"]
-        offload.load_model_data(self.dit, paths.transformer, writable_tensors=False, default_dtype=self.dtype, verboseLevel=-1)
+        config = DIT_CONFIGS[model]
+        offload.load_model_data(self.dit, paths.transformer, writable_tensors=False, default_dtype=self.dtype, fused_split_map=qkv_split_map(config["heads"], config["head_dim"]), verboseLevel=-1)
         offload.load_model_data(self.vae, paths.vae, writable_tensors=False, default_dtype=self.dtype, verboseLevel=-1)
         self.dit.requires_grad_(False)
         self.vae.requires_grad_(False)
@@ -209,7 +233,7 @@ class SeedVR2Runtime:
             offload_registry.unregister_offloadobj("SeedVR2", self.offloadobj)
             self.offloadobj.release()
             self.offloadobj = None
-        self.dit = self.vae = self.positive_embedding = self.profile = None
+        self.dit = self.vae = self.positive_embedding = self.profile = self.model = None
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -307,9 +331,9 @@ class SeedVR2Runtime:
 _RUNTIME = SeedVR2Runtime()
 
 
-def load_models(paths: SeedVR2Paths, *, init_pipe, profile, progress_callback=None):
+def load_models(paths: SeedVR2Paths, *, model: str, init_pipe, profile, progress_callback=None):
     _report(progress_callback, "Caching SeedVR2")
-    _RUNTIME.load(paths, init_pipe=init_pipe, profile=profile)
+    _RUNTIME.load(paths, model=model, init_pipe=init_pipe, profile=profile)
 
 
 def upscale_video(sample, scale: float, **kwargs):

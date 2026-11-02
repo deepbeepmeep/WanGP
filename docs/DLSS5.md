@@ -8,7 +8,7 @@ DLSS 5 support is optional and is not installed by the normal WanGP installer. I
 - a WanGP depth-aware worker derived from the MIT-licensed [DLSS5-Feeder](https://github.com/jlrouzies-fr/DLSS5-Feeder);
 - a buildable WanGP Frame Generation worker;
 - the optional legacy no-depth worker from the MIT-licensed Merserk [dlss5-visual-enhancer](https://github.com/Merserk/dlss5-visual-enhancer);
-- separately obtained NVIDIA DLSS runtimes, ReShade with full add-on support, and the RenoDX DLSS 5 add-on.
+- separately obtained NVIDIA DLSS runtimes, ReShade with full plugin support, and the RenoDX DLSS 5 plugin.
 
 ## WSL Neural Rendering through the Windows worker
 
@@ -101,8 +101,8 @@ WanGP/
 |   |-- host/
 |   |   |-- nr-depth-worker.exe       # WanGP depth-aware worker
 |   |   |-- nvngx.dll                 # legacy Merserk no-depth worker; optional
-|   |   |-- dxgi.dll                  # ReShade full add-on build
-|   |   |-- renodx-dlss5.addon64      # RenoDX DLSS 5 add-on
+|   |   |-- dxgi.dll                  # ReShade full plugin build
+|   |   |-- renodx-dlss5.addon64      # RenoDX DLSS 5 plugin
 |   |   `-- nvngx_dlssnr.dll          # NVIDIA Neural Rendering runtime
 |   |-- dlss/
 |   |   `-- nvngx_dlss.dll            # NVIDIA DLSS Super Resolution runtime
@@ -122,8 +122,8 @@ The worker ZIP is not a complete third-party runtime pack. Obtain and place thes
 
 | Destination | Component | Download or source |
 | --- | --- | --- |
-| `dlss5/host/dxgi.dll` | ReShade 64-bit **with full add-on support** | [reshade.me](https://reshade.me/) |
-| `dlss5/host/renodx-dlss5.addon64` | RenoDX DLSS 5 add-on 4.70 | [Direct ZIP: `renodx-dlss5_4.70.zip`](https://github.com/RankFTW/rhi-repo/releases/download/renodx-dlss5-4.70/renodx-dlss5_4.70.zip) (community RHI mirror) |
+| `dlss5/host/dxgi.dll` | ReShade 64-bit **with full plugin support** | [reshade.me](https://reshade.me/) |
+| `dlss5/host/renodx-dlss5.addon64` | RenoDX DLSS 5 plugin 4.70 | [Direct ZIP: `renodx-dlss5_4.70.zip`](https://github.com/RankFTW/rhi-repo/releases/download/renodx-dlss5-4.70/renodx-dlss5_4.70.zip) (community RHI mirror) |
 | `dlss5/host/nvngx_dlssnr.dll` | DLSS Neural Rendering 310.8.SF-v2 | [Direct ZIP: `nvngx_dlssnr_310.8.SF-v2.zip`](https://github.com/RankFTW/rhi-repo/releases/download/dlssnr-310.8.SF-v2/nvngx_dlssnr_310.8.SF-v2.zip) (community-modified, unsigned) |
 | `dlss5/dlss/nvngx_dlss.dll` | NVIDIA DLSS Super Resolution | [NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS) or another authorized NVIDIA distribution |
 | `dlss5/dlssg/nvngx_dlssg.dll` | NVIDIA DLSS Frame Generation | [NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS) or another authorized NVIDIA distribution |
@@ -140,7 +140,7 @@ renodx-dlss5_4.70.zip:          D6E356D01B429AF6288F488A4926C44F1D779A7D4586EE8C
 nvngx_dlssnr_310.8.SF-v2.zip:  1DA35941894994EB087E017577829E492454E9BAE3A6A9397027069CEB74955C
 ```
 
-The file names on the public [RenoDX GitHub releases](https://github.com/clshortfuse/renodx/releases) do not currently include this generic DLSS 5 add-on. Newer development builds are announced in the [official RenoDX Discord](https://discord.com/invite/renodx); the links above stay pinned to the versions WanGP tested.
+The file names on the public [RenoDX GitHub releases](https://github.com/clshortfuse/renodx/releases) do not currently include this generic DLSS 5 plugin. Newer development builds are announced in the [official RenoDX Discord](https://discord.com/invite/renodx); the links above stay pinned to the versions WanGP tested.
 
 NVIDIA components are governed by the [NVIDIA RTX SDK License](https://github.com/NVIDIA/DLSS/blob/main/LICENSE.txt). Review ReShade, RenoDX, and RHI licensing at their source before copying or redistributing their binaries.
 

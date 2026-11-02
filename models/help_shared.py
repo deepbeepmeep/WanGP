@@ -76,7 +76,7 @@ SPECIALITIES = {
     "audio editing": ("edit audio", "sound editing"),
     "audio inpainting": ("replace audio interval",),
     "audio continuation": ("extend audio",),
-    "sound effects": ("foley", "ambience", "sound design"),
+    "sound effects": ("SFX", "foley", "ambience", "sound design", "audio effects"),
     "text rendering": ("typography", "lettering", "text writing"),
 }
 

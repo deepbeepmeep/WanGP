@@ -1,6 +1,7 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 """3D gallery files and their preview render `<stem>.png`:
-- meshes: GLB with the generation settings in the glTF `asset.extras["wangp"]`;
+- meshes: GLB with the generation settings in the glTF `asset.extras["wangp"]` and, with the Embed Source Images option, the source
+  pictures (lossless, alpha kept) in its binary chunk, listed in `asset.extras["wangp_source_images"]`;
 - Gaussian splats: INRIA 3DGS PLY with the settings in a `comment wangp <json>` header line. Every PLY in the 3D gallery is
   a splat file: mesh PLYs are converted to GLB on import.
 
@@ -13,6 +14,7 @@ from pathlib import Path
 from shared.utils.media_imports import persist_gallery_import
 
 SETTINGS_KEY = "wangp"
+SOURCE_IMAGES_KEY = "wangp_source_images"
 
 
 def preview_path(path):
@@ -89,14 +91,49 @@ def iter_asset_views(path, angles, resolution, *, chunk, frame_no=None, mode="sh
         yield from (Image.fromarray(array) for array in arrays)  # RGBA or RGB from the channel count
 
 
-def save_mesh_metadata(path, settings):
+def _encoded_image(image):
+    """A source picture as file bytes: a file keeps its own bytes, a PIL image (the one the model received) is stored as a lossless PNG."""
+    if isinstance(image, (str, os.PathLike)):
+        return Path(image).read_bytes()
+    import io
+    buffer = io.BytesIO()
+    image.save(buffer, "PNG")
+    return buffer.getvalue()
+
+
+def save_mesh_metadata(path, settings, images=None):
+    """images: the source pictures by setting name ({"image_refs": [...]}, the Embed Source Images option), stored in a GLB only."""
     if is_splat_file(path):
         from shared.mesh3d.splats import ply_write_comments
         data = ply_write_comments(Path(path).read_bytes(), [f"{SETTINGS_KEY} {json.dumps(settings)}"])
     else:
-        from shared.mesh3d.glb import glb_read_extras, glb_write_extras
+        from shared.mesh3d.glb import glb_add_files, glb_read_extras, glb_write_extras
         data = glb_write_extras(Path(path).read_bytes(), {**glb_read_extras(path), SETTINGS_KEY: settings})
+        files = {name: [_encoded_image(image) for image in (value if isinstance(value, list) else [value]) if image is not None] for name, value in (images or {}).items()}
+        data = glb_add_files(data, files, SOURCE_IMAGES_KEY)
     Path(path).write_bytes(data)
+
+
+def extract_mesh_source_images(path, output_dir=None):
+    """The source pictures embedded in a GLB, written as files: {setting name: [paths]} as video_metadata.extract_source_images, {}
+    without any."""
+    if Path(path).suffix.lower() != ".glb":
+        return {}
+    import tempfile
+    from shared.mesh3d.glb import glb_read_files
+    files = glb_read_files(path, SOURCE_IMAGES_KEY)
+    if not files:
+        return {}
+    output_dir = output_dir or tempfile.mkdtemp()
+    os.makedirs(output_dir, exist_ok=True)
+    extracted = {}
+    for name, contents in files.items():
+        for index, content in enumerate(contents):
+            suffix = ".png" if content.startswith(b"\x89PNG") else ".jpg"
+            target = Path(output_dir) / f"{Path(path).stem}_{name}_{index}{suffix}"
+            target.write_bytes(content)
+            extracted.setdefault(name, []).append(str(target))
+    return extracted
 
 
 def read_mesh_metadata(path):

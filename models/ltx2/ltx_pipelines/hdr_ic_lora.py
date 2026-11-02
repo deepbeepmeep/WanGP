@@ -72,6 +72,7 @@ def convert_sdr_to_hdr(
     callback: Callable[..., None] | None = None,
     set_progress_status: Callable[[str], None] | None = None,
     interrupt_check: Callable[[], bool] | None = None,
+    custom_sigmas=None,
 ) -> torch.Tensor | None:
     """Convert an SDR control video ``(C, F, H, W)`` in [-1, 1] into scene-linear Rec.709 frames ``(F, H, W, 3)``.
 
@@ -102,6 +103,8 @@ def convert_sdr_to_hdr(
         return None
 
     sigmas = torch.tensor(DISTILLED_SIGMA_VALUES, device=device, dtype=torch.float32)
+    if custom_sigmas and custom_sigmas[0] is not None:
+        sigmas = torch.tensor([*custom_sigmas[0], 0.0], device=device, dtype=torch.float32)
     bind_interrupt_check(transformer, interrupt_check)
     if loras_slists is not None:
         steps = len(sigmas) - 1

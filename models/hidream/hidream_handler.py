@@ -30,7 +30,8 @@ class family_handler:
         return merge_help({
             "image_outputs": True,
             "device_explicit": True,
-            "sample_solvers": [("Flash", "flash")] if is_dev else [("Default", "default")],
+            "no_model_swap": True,  # one managed model: kept loaded between samples and queued tasks of the same model
+            "sample_solvers":[("Flash", "flash")] if is_dev else [("Default", "default")],
             "guidance_max_phases": 0 if is_dev else 1,
             "fit_into_canvas_image_refs": 0,
             "profiles_dir": [base_model_type],

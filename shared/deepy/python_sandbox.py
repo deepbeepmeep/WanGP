@@ -24,6 +24,8 @@ from shared.deepy import python_worker
 
 DEFAULT_TIMEOUT_S = 60
 MAX_TIMEOUT_S = 600
+STARTUP_TIMEOUT_S = 60
+WORKER_STDERR_BYTES = 4096
 MEMORY_MB = 4096
 IDLE_S = 600
 OUTPUT_CHARS = 5000  # printed output returned to the assistant: summaries, not whole listings
@@ -66,7 +68,7 @@ HELPERS = {
 RULES = [
     "Save finished deliverables under out/ (PNG/JPG/WEBP images, WAV/FLAC/MP3 audio, OBJ/PLY/STL/GLTF/GLB meshes; clips through wangp.publish_video): after the run each one is published to the Gallery and returned in outputs with a media_id (at most 8 per run; more means frames, which are not published). A mesh is converted to GLB, given a rendered preview and placed in the 3D gallery, where render_3d_views and inspect_media work on it; write OBJ from numpy (v x y z and f a b c lines, 1-based) for procedural props, terrains and extrusions. Other files under out/ (SRT, JSON, CSV, SVG, TXT) are returned in files with their @documents path for other tools. Everything else under the sandbox (tmp/, work files, frame sequences, comparison or debug images) is scratch and stays private: published files cannot be deleted afterwards.",
     "Write files only with relative paths inside the sandbox ('scratch/face.png', 'out/poster.png', 'tmp/frames'): other folders (/tmp, C:\\...) are refused, and C libraries such as OpenCV fail silently there (cv2.imwrite returns False), so check their result. Other tools (inspect_media, the toolbox) reach a sandbox file as @documents/sandbox/<relative path>; wangp.inspect and wangp.toolbox accept the relative path directly.",
-    "The sandbox folder is the working directory: use relative paths ('out/poster.png', 'tmp/frames'). Read Gallery media or @documents files through wangp.path(ref) (images: PIL.Image.open(wangp.path('image_3'))). Other paths are refused, and nothing outside the sandbox can be written.",
+    "The sandbox folder is the working directory: use relative paths ('out/poster.png', 'tmp/frames'). Read Gallery media or @documents files through wangp.path(ref) (images: PIL.Image.open(wangp.path('visual:IMAGE'))). Other paths are refused, and nothing outside the sandbox can be written.",
     "No GPU, raw network, processes or ffmpeg: compute, draw and compose here; generate media with WanGP's models; cut, mix, merge and inspect with the toolbox; reach the web through wangp.download / wangp.web when web search is enabled.",
     "Keep one run to one step (a trailing expression is returned as result, print() as stdout); state persists between runs, so build up gradually; restart after a broken state.",
     f"Loops over many files belong in Python with wangp.call: list a folder with wangp.listdir, call wangp.inspect / wangp.toolbox / wangp.generate per item, report each item with wangp.progress(i, len(items), name) as it starts, collect the results in a list and print only the summary or the matches you need (each call is a real tool call with its full cost, at most {MAX_TOOL_CALLS} per run; time inside the tools does not count toward timeout_s, so no checkpoint files or split runs are needed for long loops; the run result reports the calls made; if the user presses Stop the script stops at its next tool call, print or wangp.progress and keeps its variables, so keep results in a list or dict as you go and read them in the next run). Tools that write files, browse the web, manage sessions or run Python are not callable from scripts.",
@@ -76,9 +78,9 @@ ACTIONS = {
         "description": "Run Python in the persistent sandbox interpreter: a trailing expression's value comes back as result, print() output as stdout, files saved under out/ are published to the Gallery.",
         "parameters": {"type": "object", "properties": {
             "code": {"type": "string", "minLength": 1, "description": "Python source. Start with a `# title` comment naming what the code makes: it becomes the description of published media."},
-            "timeout_s": {"type": "number", "minimum": 1, "default": DEFAULT_TIMEOUT_S, "description": f"Seconds of the script's own computing before it is killed (larger values are capped at {MAX_TIMEOUT_S}; time inside WanGP's tools does not count)."},
+            "timeout_s": {"type": "number", "minimum": 1, "default": DEFAULT_TIMEOUT_S, "description": f"Seconds of the script's own computing before it is killed (larger values are capped at {MAX_TIMEOUT_S}; time inside WanGP's tools does not count). Does not extend the separate {STARTUP_TIMEOUT_S}-second worker startup limit."},
         }, "required": ["code"], "additionalProperties": False},
-        "example": {"action": "run", "arguments": {"code": "# Poster title\nfrom PIL import Image, ImageDraw\nimg = Image.open(wangp.path('image_1')).convert('RGB')\nd = ImageDraw.Draw(img)\nd.text((60, 40), 'BLUE HOUR', font=wangp.font(96, 'display'), fill='white')\nimg.save('out/poster.png')\nimg.size"}},
+        "example": {"action": "run", "arguments": {"code": "# Poster title\nfrom PIL import Image, ImageDraw\nimg = Image.open(wangp.path('visual:IMAGE')).convert('RGB')\nd = ImageDraw.Draw(img)\nd.text((60, 40), 'BLUE HOUR', font=wangp.font(96, 'display'), fill='white')\nimg.save('out/poster.png')\nimg.size"}},
     },
     "restart": {"description": "Restart the interpreter: in-memory variables are discarded, files in the sandbox are kept.", "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False}},
     "files": {
@@ -120,8 +122,8 @@ def _font_config() -> dict[str, Any]:
 class _Worker:
     """A running worker process with its pipes; killed as a whole on close."""
 
-    def __init__(self, root: Path, memory_bytes: int, low_integrity: bool):
-        config = {**_font_config(), "max_output": OUTPUT_CHARS, "max_result": RESULT_CHARS}
+    def __init__(self, root: Path, memory_bytes: int, low_integrity: bool, alias: str = ""):
+        config = {**_font_config(), "max_output": OUTPUT_CHARS, "max_result": RESULT_CHARS, "alias": alias}
         command = [sys.executable, "-I", "-B", "-u", "-X", "utf8", str(_WORKER), str(root), json.dumps(config)]
         tmp = root / "tmp"
         tmp.mkdir(exist_ok=True)
@@ -136,8 +138,11 @@ class _Worker:
         else:
             self._launch_posix(command, root, env, memory_bytes)
         self.lines: queue.Queue = queue.Queue()
+        self.stderr_tail = b""
         self._reader = threading.Thread(target=self._read, name="deepy-python-sandbox", daemon=True)
+        self._stderr_reader = threading.Thread(target=self._read_stderr, name="deepy-python-stderr", daemon=True)
         self._reader.start()
+        self._stderr_reader.start()
 
     def _launch_windows(self, command, root, env, memory_bytes, low_integrity):
         import msvcrt
@@ -153,13 +158,19 @@ class _Worker:
             attributes.bInheritHandle = True
             return win32pipe.CreatePipe(attributes, 0)
 
+        if os.path.normcase(sys.executable) != os.path.normcase(sys._base_executable):
+            # a venv's python.exe is a redirector that starts the base interpreter as its child, which the one-process job forbids:
+            # start that interpreter directly, made the venv's as the redirector does
+            command = [sys._base_executable, *command[1:]]
+            env["__PYVENV_LAUNCHER__"] = sys.executable
         stdin_read, stdin_write = pipe()
         stdout_read, stdout_write = pipe()
-        for parent_end in (stdin_write, stdout_read):
+        stderr_read, stderr_write = pipe()
+        for parent_end in (stdin_write, stdout_read, stderr_read):
             win32api.SetHandleInformation(parent_end, win32con.HANDLE_FLAG_INHERIT, 0)
         startup = win32process.STARTUPINFO()
         startup.dwFlags = win32con.STARTF_USESTDHANDLES
-        startup.hStdInput, startup.hStdOutput, startup.hStdError = stdin_read, stdout_write, stdout_write
+        startup.hStdInput, startup.hStdOutput, startup.hStdError = stdin_read, stdout_write, stderr_write
         job = win32job.CreateJobObject(None, "")
         limits = win32job.QueryInformationJobObject(job, win32job.JobObjectExtendedLimitInformation)
         limits["BasicLimitInformation"]["LimitFlags"] = (win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | win32job.JOB_OBJECT_LIMIT_ACTIVE_PROCESS | win32job.JOB_OBJECT_LIMIT_PROCESS_MEMORY
@@ -177,12 +188,18 @@ class _Worker:
         thread.Close()
         stdin_read.Close()
         stdout_write.Close()
+        stderr_write.Close()
         self._job, self._process = job, process
         self.stdout = os.fdopen(msvcrt.open_osfhandle(stdout_read.Detach(), os.O_RDONLY), "rb", buffering=0)
         self.stdin = os.fdopen(msvcrt.open_osfhandle(stdin_write.Detach(), os.O_WRONLY), "wb", buffering=0)
+        self.stderr = os.fdopen(msvcrt.open_osfhandle(stderr_read.Detach(), os.O_RDONLY), "rb", buffering=0)
 
     def _launch_posix(self, command, root, env, memory_bytes):
         import resource
+
+        # RLIMIT_NPROC also forbids threads on Linux: numerical libraries must stay single-threaded, including during import.
+        for name in ("OPENBLAS_NUM_THREADS", "OPENBLAS_DEFAULT_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "BLIS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+            env[name] = "1"
 
         def limits():
             resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
@@ -195,8 +212,8 @@ class _Worker:
             except Exception:
                 pass
 
-        self._popen = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=str(root), env=env, preexec_fn=limits, start_new_session=True, bufsize=0)
-        self.pid, self.stdin, self.stdout = self._popen.pid, self._popen.stdin, self._popen.stdout
+        self._popen = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=str(root), env=env, preexec_fn=limits, start_new_session=True, bufsize=0)
+        self.pid, self.stdin, self.stdout, self.stderr = self._popen.pid, self._popen.stdin, self._popen.stdout, self._popen.stderr
 
     def _read(self):
         try:
@@ -205,6 +222,13 @@ class _Worker:
         except (OSError, ValueError):
             pass
         self.lines.put(None)
+
+    def _read_stderr(self):
+        try:
+            while chunk := self.stderr.read(WORKER_STDERR_BYTES):
+                self.stderr_tail = (self.stderr_tail + chunk)[-WORKER_STDERR_BYTES:]
+        except (OSError, ValueError):
+            pass
 
     def alive(self) -> bool:
         if sys.platform == "win32":
@@ -215,13 +239,18 @@ class _Worker:
     def kill(self):
         try:
             if sys.platform == "win32":
+                import win32event
                 import win32job
                 win32job.TerminateJobObject(self._job, 1)
+                win32event.WaitForSingleObject(self._process, 1000)
             else:
                 self._popen.kill()
+                self._popen.wait(timeout=1)
         except Exception:
             pass
-        for stream in (self.stdin, self.stdout):
+        for reader in (self._reader, self._stderr_reader):
+            reader.join(timeout=1)
+        for stream in (self.stdin, self.stdout, self.stderr):
             try:
                 stream.close()
             except Exception:
@@ -282,7 +311,7 @@ class PythonSandbox:
     code runs (the chat Stop button)."""
 
     def __init__(self, root: Path, *, resolve_path: Callable[[str], str], publish_media: Callable[[str, str], dict | None], publish_frames: Callable[[list[str], float, str, str], dict | None], virtualize: Callable[[str], str] = str, memory_mb: int = MEMORY_MB,
-                 call_tool: Callable[[str, dict], dict] | None = None, list_dir: Callable[[str], Path] | None = None):
+                 call_tool: Callable[[str, dict], dict] | None = None, list_dir: Callable[[str], Path] | None = None, apps=None):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "out").mkdir(exist_ok=True)
@@ -290,6 +319,7 @@ class PythonSandbox:
         self._low_integrity = sys.platform == "win32" and _label_low_integrity(self.root)
         self._resolve_path, self._publish_media, self._publish_frames, self._virtualize = resolve_path, publish_media, publish_frames, virtualize
         self.call_tool, self._list_dir = call_tool, list_dir  # call_tool(name, arguments) runs a WanGP tool for a script (Prime installs its own); list_dir(ref) resolves an authorized folder
+        self.apps = apps  # shared.apps.dev.AppWorkshop when App Development is on: the app_* actions and wangp.app helpers
         self.progress: Callable[[str, dict], None] = lambda status_text, summary: None  # live status of a running script: a short status line and a summary dict for the transcript entry
         self._tool_calls: dict[str, int] = {}
         self._tool_errors = 0
@@ -314,11 +344,17 @@ class PythonSandbox:
             self._worker.kill()
             self._lost_state = self._lost_state or "crash"
         lost = self._ever_started and bool(self._lost_state)
-        self._worker = _Worker(self.root, self._memory_bytes, self._low_integrity)
+        worker = self._worker = _Worker(self.root, self._memory_bytes, self._low_integrity, self._virtualize(str(self.root)).replace("\\", "/"))
         self._ever_started = True
-        response = self._exchange({"op": "ping"}, timeout_s=60, interruptible=False)  # Stop interrupts runs, not the start-up
+        response = self._exchange({"op": "ping"}, timeout_s=STARTUP_TIMEOUT_S, interruptible=False)  # Stop interrupts runs, not the start-up
         if response.get("status") != "done":
-            raise RuntimeError(f"The Python sandbox did not start: {response.get('error', 'no answer')}")
+            self._kill("startup")
+            error = response.get("error", "no answer")
+            if response.get("status") == "timeout":
+                error = f"Worker initialization exceeded {STARTUP_TIMEOUT_S:g} s and was stopped before your code ran. timeout_s only controls script execution; increasing it does not extend startup. Check the Python environment and worker diagnostics."
+            if diagnostics := worker.stderr_tail.decode("utf-8", errors="replace").strip():
+                error += f"\nWorker stderr (last {WORKER_STDERR_BYTES} bytes):\n{diagnostics}"
+            raise RuntimeError(f"The Python sandbox did not start: {error}")
         self._facts = {"python": response.get("python"), "libraries": response.get("libraries", {})}
         return lost
 
@@ -447,6 +483,10 @@ class PythonSandbox:
                 return {"value": self._tool_call(str(request.get("tool", "")), request.get("arguments") or {})}
             if request.get("op") == "list":
                 return {"value": self._listing(str(request.get("ref", "")), str(request.get("pattern") or "*"), bool(request.get("recursive")))}
+            if request.get("op") == "app":
+                if self.apps is None:
+                    raise PermissionError("Web apps are disabled: the user can enable them in Configuration > Deepy > Python > App Development (Advanced).")
+                return {"value": self.apps.script_call(str(request.get("action", "")), dict(request.get("arguments") or {}))}
             return {"error": f"Unknown sandbox request {request.get('op')!r}."}
         except Exception as error:
             return {"error": str(error), "error_type": type(error).__name__}
@@ -547,7 +587,9 @@ class PythonSandbox:
         if tool not in TOOLS_FROM_SCRIPTS:
             raise PermissionError(f"{tool or 'this tool'} cannot be called from a script. Callable: {', '.join(sorted(TOOLS_FROM_SCRIPTS))}; sessions, external servers and Python itself are not.")
         if tool == "wangp_io" and arguments.get("action") not in IO_FROM_SCRIPTS:
-            raise PermissionError(f"wangp_io {arguments.get('action')!r} cannot be called from a script: scripts may {', '.join(sorted(IO_FROM_SCRIPTS))}. Deleting or overwriting files is a direct wangp_io call.")
+            writing = arguments.get("action") in ("write_text", "append_text", "edit")
+            raise PermissionError(f"wangp_io {arguments.get('action')!r} cannot be called from a script: scripts may {', '.join(sorted(IO_FROM_SCRIPTS))}. "
+                                  + ("A script writes the sandbox's own files (apps/..., out/...) with open(path, 'w'); other files take a direct wangp_io call." if writing else "Deleting or overwriting files is a direct wangp_io call."))
         if tool == "wangp_web_search" and (arguments.get("action") not in WEB_FROM_SCRIPTS or arguments.get("action") == "cookies" and (arguments.get("arguments") or {}).get("clear")):
             raise PermissionError(f"wangp_web_search {arguments.get('action')!r} cannot be called from a script: scripts may {', '.join(sorted(WEB_FROM_SCRIPTS))} (cookies without clear). Clearing cookies and installing LoRAs are direct wangp_web_search calls.")
         if tool == "wangp_plugins":
@@ -632,6 +674,22 @@ class PythonSandbox:
         return {"status": "done", "folder": self._virtualize(str(self.root)), "count": len(entries), "files": [entry for _mtime, entry in entries[:limit]], "truncated": len(entries) > limit}
 
     # ---- actions
+    @property
+    def actions(self) -> dict:
+        if self.apps is None:
+            return ACTIONS
+        from shared.apps.dev import ACTIONS as APP_ACTIONS
+        return {**ACTIONS, **APP_ACTIONS}
+
+    def alias_of(self, path: str) -> str | None:
+        """The @alias form of a sandbox-relative path (apps/x/main.js) naming a sandbox file, or a new file in one of its subfolders; else None."""
+        if not path or path.startswith(("@", "/", "\\")) or Path(path).is_absolute():
+            return None
+        local = (self.root / path).resolve()
+        if local.is_relative_to(self.root) and local.parent != self.root.parent and (local.exists() and local != self.root or local.parent.is_dir() and local.parent != self.root):
+            return self._virtualize(str(local))
+        return None
+
     def describe(self) -> dict:
         if not self._facts:
             try:
@@ -645,6 +703,10 @@ class PythonSandbox:
         facts = {**self._facts, "folders": {"root": self._virtualize(str(self.root)), "out": self._virtualize(str(self.root / "out"))}, "limits": {"timeout_s_default": DEFAULT_TIMEOUT_S, "timeout_s_max": MAX_TIMEOUT_S, "memory_mb": self._memory_bytes >> 20, "output_chars": OUTPUT_CHARS, "tool_calls_per_run": MAX_TOOL_CALLS}, "isolation": isolation, "helpers": HELPERS, "rules": RULES}
         if self.call_tool is not None:
             facts["tools_from_scripts"] = sorted(TOOLS_FROM_SCRIPTS)
+        if self.apps is not None:
+            apps = self.apps.describe()
+            facts["helpers"] = {**HELPERS, **apps.pop("helpers")}
+            facts["web_apps"] = apps
         return facts
 
     def run_action(self, action: str, arguments: dict) -> dict:
@@ -658,6 +720,8 @@ class PythonSandbox:
             return self.restart()
         if action == "files":
             return self.files(str(arguments.get("pattern") or "**/*"), int(arguments.get("limit") or 50))
+        if self.apps is not None and action in self.actions and action not in ACTIONS:  # the app actions
+            return self.apps.run_action(action, arguments)
         raise ValueError(f"Unknown sandbox action: {action}")
 
     def restart(self) -> dict:
@@ -696,6 +760,13 @@ class PythonSandbox:
                 result["hint"] = f"{len(deliverables)} media files were written under out/ in one run, which looks like a frame sequence: none was published. out/ is for finished deliverables; frames belong under tmp/ and become one clip through wangp.publish_video('tmp/frames/*.png', fps)."
                 deliverables = []
             unpublished = []
+            previewable = {".md", ".markdown", ".txt", ".csv", ".tsv", ".json", ".svg"} | ({".html", ".htm"} if self.apps is not None else set())  # opened in the chat; pages run scripts, so only with web apps on
+            previews = [self._virtualize(path) for path in changed if Path(path).relative_to(self.root).parts[:1] == ("out",) and Path(path).suffix.lower() in previewable]
+            if previews:
+                result["previews"] = previews[:PUBLISH_CAP]
+            if self.apps is not None and (apps := self.apps.changed(changed)):
+                result["apps"] = apps  # the chat shows each with a Play button; their files are not listed one by one
+                changed = [path for path in changed if not Path(path).is_relative_to(self.apps.root)]
             for path in changed:
                 if path in deliverables:
                     try:

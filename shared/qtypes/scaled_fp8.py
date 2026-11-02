@@ -834,19 +834,21 @@ from shared.kernels.cpu_experts import FP8_BLOCK, NativeExpertFormat
 
 
 class Fp8BlockExperts(NativeExpertFormat):
-    """Routed experts stored in FP8 E4M3FN with float32 scales per 128 x 128 block (w13 = gate then up rows)."""
+    """Routed experts stored in FP8 E4M3FN with float32 scales per block x block tile (128 by default; w13 = gate then up rows, or up
+    rows only without a gate)."""
     name, native, block = "fp8_block", FP8_BLOCK, 128
 
-    def tensors(self, experts, hidden, intermediate):
-        b, fp8 = self.block, torch.float8_e4m3fn
-        return {"w13_weight": ((experts, 2 * intermediate, hidden), fp8), "w2_weight": ((experts, hidden, intermediate), fp8),
-                "w13_scale_inv": ((experts, 2 * intermediate // b, hidden // b), torch.float32), "w2_scale_inv": ((experts, hidden // b, intermediate // b), torch.float32)}
+    def tensors(self, experts, hidden, intermediate, gated=True, blocks=None):
+        (b13, b2), fp8 = blocks or (self.block, self.block), torch.float8_e4m3fn
+        rows = (2 if gated else 1) * intermediate
+        return {"w13_weight": ((experts, rows, hidden), fp8), "w2_weight": ((experts, hidden, intermediate), fp8),
+                "w13_scale_inv": ((experts, rows // b13, hidden // b13), torch.float32), "w2_scale_inv": ((experts, hidden // b2, intermediate // b2), torch.float32)}
 
     def matches(self, tensors):
         return tensors["w13_weight"].dtype == torch.float8_e4m3fn and tensors["w13_scale_inv"].dtype == torch.float32
 
-    def dequantize_matrix(self, weight, scale):
-        rows, cols, b = *weight.shape, self.block
+    def dequantize_matrix(self, weight, scale, block):
+        rows, cols, b = *weight.shape, block
         return (weight.float().view(rows // b, b, cols // b, b) * scale[:, None, :, None]).reshape(rows, cols)
 
 

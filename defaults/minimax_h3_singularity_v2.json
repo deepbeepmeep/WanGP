@@ -1,0 +1,11 @@
+{
+    "model": {
+        "name": "MiniMax H3 Singularity V2 Ref2VA 33B",
+        "architecture": "minimax_h3_ref2va",
+        "description": "Generate synchronized video and stereo audio from text, with optional reference images, video, and audio. Full 33B Singularity V2 fine-tune, with a larger download and higher weight memory use than the pruned 20B release.",
+        "URLs": [
+            "https://huggingface.co/DeepBeepMeep/MiniMax-H3/resolve/main/Minimax-h3_Singularity_ref2va_v2_int8_convrot.safetensors"
+        ]
+    },
+    "prompt": "summary: A red fox explores a snowy forest during a five-second cinematic shot.\ndetailed_description: [Shot 1] The camera tracks alongside a red fox as it walks between snow-covered pines, pauses, and turns toward a falling snowflake. Soft morning light catches its fur and breath.\noverall_soundscape: Gentle footsteps in fresh snow, light wind through the branches, and distant birds.\nnon_diegetic_music: N/A"
+}

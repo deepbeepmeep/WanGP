@@ -16,8 +16,8 @@ hidden textbox and receives JSON responses through another one:
 - {"action": "save", "path"}: the world as explored so far (its own segments, then the moves) saved as a new world of the Worlds gallery,
   to explore or continue later ({"action": "saved", "recorded": its file name}); the gallery shows it once the viewer leaves (refreshing
   it now would replace the viewer);
-- {"action": "stats", "path"}: the whole GPU's VRAM use and load and the RAM ({"action": "stats", "stats"}), asked every second while the
-  explorer shows its statistics (also before the first move, while the world is prepared).
+- {"action": "stats", "path"}: the whole GPU's VRAM use and load and the RAM ({"action": "stats", "stats"}), requested when statistics open
+  and when the world becomes ready. Move responses also include updated statistics.
 An exploration ends with {"action": "ended"} when its task stops (aborted from the queue); a request that fails answers
 {"action": "error", "message"}.
 The explorer is the same for every world model; what differs comes from the world's model handler, whose query_world_explorer(base model

@@ -711,7 +711,7 @@ WAC.trackDisclosurePointer = function (event) {
 };
 
 // Media links in replies open like the attachment thumbnails.
-WAC.attachmentSelector = 'a.chat__attachment, .chat__transcript a[data-media-kind]';
+WAC.attachmentSelector = 'a.chat__attachment, .chat__transcript a[data-media-kind], a.chat__pending-upload-link';
 
 WAC.handleAttachmentPointerDown = function (event) {
   WAC.attachmentTouch = null;
@@ -728,6 +728,7 @@ WAC.trackAttachmentTouch = function (event) {
   if (!touch || touch.id !== event.pointerId) return;
   if (event.type === 'pointercancel' || Math.hypot(event.clientX - touch.x, event.clientY - touch.y) > 10) touch.moved = true;
   if (event.type === 'pointerup' && !touch.moved) {
+    if (window.WanGPAppPlayer && WanGPAppPlayer.open(touch.link)) return;  // web apps and previews play in the app player
     if (WAC.openAttachment && WAC.openAttachment(touch.link)) return;
     const target = touch.link.target || '_blank';
     if (target === '_blank') window.open(touch.link.href, '_blank', 'noopener');
@@ -740,7 +741,7 @@ WAC.handleAttachmentClick = function (event) {
   if (!link) return false;
   const touch = WAC.attachmentTouch;
   WAC.attachmentTouch = null;
-  if ((event.detail !== 0 && touch) || (WAC.openAttachment && WAC.openAttachment(link))) {
+  if ((event.detail !== 0 && touch) || (window.WanGPAppPlayer && WanGPAppPlayer.open(link)) || (WAC.openAttachment && WAC.openAttachment(link))) {
     event.preventDefault();
     event.stopPropagation();
   }
@@ -1006,7 +1007,7 @@ WAC.consumePayload = function (payload) {
     WAC.syncRecoveryPending = false;
   }
   if (hasRevision) WAC.chatRevision = revision;
-  if (event.pending_upload_count !== undefined) WAC.setPendingUploadCount(event.pending_upload_count);
+  if (event.pending_uploads !== undefined) WAC.setPendingUploads(event.pending_uploads);
   if (event.type === 'reset') {
     WAC.reset();
     if (chatSessionId) WAC.chatSessionId = chatSessionId;
@@ -1915,6 +1916,7 @@ WAC.upsertBlock = function (event) {
     if (existing) WAC.renderStreamingMarkdown(live, initialText);
     else WAC.queueStreamingReveal(live, initialText);
   }
+  window.WanGPAppPlayer?.sync(node);  // Deepy changed the app being played: reload it
   WAC.applyAutoscrollState(scrollState);
 };
 
@@ -2207,6 +2209,7 @@ WAC.upsertMessage = function (message, preserveIncrementalState, messageIndex) {
   WAC.hideEmpty();
   WAC.applyDisclosureState(transcript);
   WAC.syncQueuedRequestEdit();
+  window.WanGPAppPlayer?.sync(existing || node);
   WAC.applyAutoscrollState(scrollState);
 };
 
@@ -2243,16 +2246,15 @@ WAC.uploadMediaFiles = async function (files, request, notice, updateGallery, fr
   return lastId;
 };
 
-WAC.setPendingUploadCount = function (count) {
-  WAC.pendingUploadCount = count;
+WAC.setPendingUploads = function (items) {
+  WAC.pendingUploads = items;
   WAC.refreshChatDraftActions?.();
-  const counter = document.getElementById('assistant_chat_upload_count');
-  if (!counter) return;
-  counter.hidden = !count;
-  const label = count + ' media attached to the next message';
-  counter.title = label; counter.setAttribute('aria-label', label);
-  const text = 'x' + count;
-  if (counter.lastElementChild.textContent !== text) counter.lastElementChild.textContent = text;
+  const strip = document.getElementById('assistant_chat_pending_uploads');
+  if (!strip) return;
+  const html = items.map(item => item.html).join('');
+  // Repeated events carry the same previews: keep their loaded images.
+  if (WAC.pendingUploadsHtml !== html) {WAC.pendingUploadsHtml = html; strip.innerHTML = html;}
+  strip.hidden = !items.length;
 };
 
 WAC.mountChatUpload = function (request, notice, updateGallery) {
@@ -2260,13 +2262,24 @@ WAC.mountChatUpload = function (request, notice, updateGallery) {
   if (!controls || document.getElementById('assistant_chat_upload_button')) return;
   const button = document.createElement('button');
   button.id = 'assistant_chat_upload_button'; button.type = 'button';
-  button.title = 'Upload images or videos'; button.setAttribute('aria-label', button.title);
+  button.title = 'Upload images, videos or audio'; button.setAttribute('aria-label', button.title);
   button.innerHTML = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>';
   const input = document.createElement('input');
-  input.type = 'file'; input.accept = 'image/*,video/*'; input.multiple = true; input.hidden = true;
+  // Audio by extension: iOS Safari filters audio/* as video and greys out audio files.
+  input.type = 'file'; input.accept = 'image/*,video/*,.wav,.mp3,.aac,.flac,.m4a,.ogg,.opus,.wma'; input.multiple = true; input.hidden = true;
   const status = document.createElement('span');
   status.id = 'assistant_chat_upload_status'; status.setAttribute('role', 'status'); status.hidden = true;
   const uploadNotice = text => { status.textContent = text; status.hidden = !text; };
+  const strip = document.createElement('div');
+  strip.id = 'assistant_chat_pending_uploads'; strip.hidden = true;
+  WAC.pendingUploadsHtml = '';
+  strip.onclick = async event => {
+    const remove = event.target.closest('[data-unattach]');
+    if (!remove) return;
+    remove.disabled = true;
+    try {WAC.consumePayload((await request('media/unattach', {chat_session_id: WAC.chatSessionId, media_id: remove.dataset.unattach})).event);}
+    catch (error) {uploadNotice(error.message); remove.disabled = false;}
+  };
   button.onclick = () => input.click();
   input.onchange = async () => {
     if (!input.files.length) return;
@@ -2285,29 +2298,26 @@ WAC.mountChatUpload = function (request, notice, updateGallery) {
   };
   controls.append(button, input);
   if (document.body.hasAttribute('data-deepy-app')) {
-    const counter = document.createElement('span'); counter.id = 'assistant_chat_upload_count'; counter.hidden = true;
-    counter.setAttribute('role', 'status');
-    counter.innerHTML = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8" cy="8" r="1.5"/><path d="m3 17 6-6 4 4 3-3 5 5"/></svg><span></span>';
     const clear = document.createElement('button'); clear.id = 'assistant_chat_clear_draft'; clear.type = 'button';
     clear.innerHTML = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M9 6V3h6v3M6 6l1 15h10l1-15M10 10v7M14 10v7"/></svg>';
     let clearing = false;
     WAC.refreshChatDraftActions = () => {
       const hasText = !!WAC.requestInput().value;
-      clear.disabled = clearing || (!hasText && !WAC.pendingUploadCount);
+      clear.disabled = clearing || (!hasText && !WAC.pendingUploads.length);
       clear.title = hasText ? 'Clear text' : 'Remove last attachment'; clear.setAttribute('aria-label', clear.title);
     };
     clear.onclick = async () => {
       if (WAC.requestInput().value) {WAC.setRequestInputValue(''); return;}
       clearing = true; WAC.refreshChatDraftActions();
-      try {WAC.consumePayload((await request('media/unattach-last', {chat_session_id: WAC.chatSessionId})).event);}
+      try {WAC.consumePayload((await request('media/unattach', {chat_session_id: WAC.chatSessionId})).event);}
       catch (error) {uploadNotice(error.message);}
       finally {clearing = false; WAC.refreshChatDraftActions();}
     };
     WAC.requestInput().addEventListener('input', WAC.refreshChatDraftActions);
-    controls.append(status, counter, clear);
-    WAC.setPendingUploadCount(WAC.pendingUploadCount || 0);
+    controls.append(status, strip, clear);
   }
-  else controls.after(status);
+  else {controls.before(strip); controls.after(status);}
+  WAC.setPendingUploads(WAC.pendingUploads || []);
 };
 
 WAC.waitForChatUpload = async function () {
@@ -2477,7 +2487,7 @@ WAC.sync = function (messages, status, stats, acknowledgedSubmissionIds) {
 
 WAC.reset = function () {
   WAC.clearStreamingReveals();
-  WAC.setPendingUploadCount(0);
+  WAC.setPendingUploads([]);
   WAC.compactScrollState = null;
   if (WAC.queuedEditMessageId) WAC.finishQueuedRequestEdit();
   WAC.state = { order: [], messages: {}, status: null, stats: null };
@@ -2540,9 +2550,19 @@ WAC.applyEvent = function (payload) {
 WAC.syncDisclosureBridge = function () {
   const transcript = WAC.transcript();
   if (!transcript || transcript === WAC.disclosureNode) return;
-  if (WAC.disclosureNode) WAC.disclosureNode.removeEventListener('toggle', WAC.handleDisclosureToggle, true);
+  if (WAC.disclosureNode) {
+    WAC.disclosureNode.removeEventListener('toggle', WAC.handleDisclosureToggle, true);
+  }
   WAC.disclosureNode = transcript;
   WAC.disclosureNode.addEventListener('toggle', WAC.handleDisclosureToggle, true);
+};
+
+WAC.handleThumbnailError = function (event) {
+  const image = event.target;
+  const icon = image.nextElementSibling;
+  if (image.tagName !== 'IMG' || !image.classList.contains('chat__attachment-thumb') || !icon || !icon.hasAttribute('data-attachment-icon')) return;
+  image.hidden = true;  // a preview that could not be made: its typed icon instead of a broken image
+  icon.hidden = false;
 };
 
 WAC.handleScroll = function () {
@@ -2850,6 +2870,7 @@ WAC.installDockBridge = function () {
 };
 
 if (!WAC.init) {
+  document.addEventListener('error', WAC.handleThumbnailError, true);  // load errors do not bubble: caught on the way down, on every page that shows the chat
   WAC.installObserver();
   WAC.installEventBridge();
   WAC.installDockBridge();

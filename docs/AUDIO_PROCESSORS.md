@@ -115,7 +115,7 @@ with at least `name`; it may also define `type`, `description`, `required`,
 are optional so older and third-party handlers remain compatible.
 
 `control` is an internal pseudo-method used by the generation UI to reuse a
-control video audio track. Do not register a plugin method with that id.
+control video audio track. Do not register a Plugin method with that id.
 
 ## Dispatch Contract
 
@@ -156,9 +156,9 @@ audio_processor_handlers = [
 `audio_processor_api.register_audio_processors(server_config, fl)`; it should not
 import or keep one explicit variable per audio processor.
 
-Enabled plugins can expose audio processors without editing core code by adding
+Enabled Plugins can expose audio processors without editing core code by adding
 `audio_processors` to `plugin_info.json`. Entries that start with `.` are relative
-to the plugin package root; entries without a leading `.` are absolute import
+to the Plugin package root; entries without a leading `.` are absolute import
 paths:
 
 ```json
@@ -172,7 +172,7 @@ paths:
 }
 ```
 
-Only enabled/loaded plugins are considered. The plugin manager reuses cached
+Only enabled/loaded Plugins are considered. The Plugin manager reuses cached
 `plugin_info.json` metadata when registering those handlers.
 
 ## Configuration
@@ -243,9 +243,9 @@ offload_registry.unregister_offloadobj("MyAudioProcessor", offloadobj)  # in rel
 ```
 
 This lets WanGP track every extension offload object and release all extension
-resources centrally: the toolbar "Unload Models" tool and Configuration plugin
+resources centrally: the toolbar "Unload Models" tool and Configuration Plugin
 release button call `offload_registry.release_all()`.
 
 ---
 
-> Applies to: Developing audio processor plugins: handler methods, registration and shared configuration. Installed processing options are available through WanGP's post-processing controls and API.
+> Applies to: Developing audio processor Plugins: handler methods, registration and shared configuration. Installed processing options are available through WanGP's post-processing controls and API.

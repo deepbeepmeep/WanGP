@@ -4,5 +4,6 @@
     ],
     "loras_multipliers": "0.5",
     "num_inference_steps": 4,
-    "guidance_scale": 1
+    "guidance_scale": 1,
+    "sample_solver": "euler"
 }

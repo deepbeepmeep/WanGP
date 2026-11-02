@@ -248,6 +248,10 @@ def register(mcp, session, jobs, policy, *, allow_async: bool, virtualized: bool
         return policy.virtualize_result(result) if virtualized else result
 
     def wangp_plugins(plugin: str | None = None, action: str | None = None, arguments: dict[str, Any] | None = None, wait: bool = True) -> dict[str, Any]:
+        if not plugin and isinstance(arguments, dict) and isinstance(arguments.get("plugin"), str):  # the call wrapped one level too deep:
+            arguments = dict(arguments)                                                                   # {"arguments": {"plugin", "action"?, "arguments"}}
+            plugin, action = arguments.pop("plugin"), action or arguments.pop("action", None)
+            arguments = arguments.pop("arguments", arguments)
         if not plugin:
             if action or arguments:
                 raise ValueError(f"Name the plugin beside action: {{\"plugin\": \"<plugin>\", \"action\": \"{action or '<action>'}\", \"arguments\": {{...}}}}. Plugins: {', '.join(toolboxes)}. Nothing was executed.")

@@ -1,0 +1,63 @@
+name: Update Manager build catalog
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: wangp-manager-catalog
+  cancel-in-progress: false
+jobs:
+  catalog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+      - name: Load published catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/manager-catalog"
+          if git ls-remote --exit-code --heads origin manager-catalog >/dev/null; then
+            git fetch --depth=1 origin manager-catalog
+            git archive FETCH_HEAD | tar -x -C "$RUNNER_TEMP/manager-catalog"
+          fi
+      - name: Fetch only the new source history
+        shell: bash
+        run: |
+          set -euo pipefail
+          stop=$(python -c 'import json,os,pathlib; p=pathlib.Path(os.environ["RUNNER_TEMP"])/"manager-catalog/index.json"; print(json.loads(p.read_text())["head"] if p.exists() else "d951836f9fd8429dc703183623a1d25d77d7bce7")')
+          while ! git rev-list --first-parent HEAD | grep -Fx "$stop" >/dev/null; do
+            if [ "$(git rev-parse --is-shallow-repository)" = false ]; then
+              echo "Catalog head is no longer on main; explicit catalog repair is required."
+              exit 1
+            fi
+            git fetch --deepen=64 origin main
+          done
+      - name: Generate catalog pages
+        run: python -m installation.version_catalog --output "$RUNNER_TEMP/manager-catalog"
+      - name: Publish catalog atomically
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          if git show-ref --verify --quiet refs/remotes/origin/manager-catalog; then
+            git worktree add "$RUNNER_TEMP/catalog-publish" origin/manager-catalog
+          elif git ls-remote --exit-code --heads origin manager-catalog >/dev/null; then
+            git fetch origin manager-catalog:refs/remotes/origin/manager-catalog
+            git worktree add "$RUNNER_TEMP/catalog-publish" origin/manager-catalog
+          else
+            git worktree add --detach "$RUNNER_TEMP/catalog-publish" HEAD
+            git -C "$RUNNER_TEMP/catalog-publish" checkout --orphan manager-catalog
+            git -C "$RUNNER_TEMP/catalog-publish" rm -rf .
+          fi
+          cp -a "$RUNNER_TEMP/manager-catalog/." "$RUNNER_TEMP/catalog-publish/"
+          git -C "$RUNNER_TEMP/catalog-publish" add index.json pages
+          if ! git -C "$RUNNER_TEMP/catalog-publish" diff --cached --quiet; then
+            git -C "$RUNNER_TEMP/catalog-publish" commit -m "Update WanGP Manager build catalog"
+            git -C "$RUNNER_TEMP/catalog-publish" push origin HEAD:refs/heads/manager-catalog
+          fi

@@ -2,7 +2,7 @@
 # Modifications Copyright (c) 2025-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import logging
 import os
-from mmgp import offload
+from mmgp import offload, transfer
 import torch
 from shared.utils.utils import guide_to_dtype
 from shared.utils.phase_progress import vae_encoding_progress, PhaseProgress, check_abort, set_phase_status
@@ -354,7 +354,7 @@ def _exact_encode(model, x, scale, tile_size, any_end_frame):
 
 def _vae_float_to_cpu_uint8(frames):
     frames.clamp_(-1.0, 1.0).add_(1.0).mul_(127.5).round_().clamp_(0.0, 255.0)
-    return frames.to(device="cpu", dtype=torch.uint8)
+    return transfer.move(frames, "cpu", torch.uint8)  # (without a RAM copy of the video in its float dtype, nor a GPU one of a cropped view)
 
 
 def _blend_v_edge_(top_edge, tile, blend_extent):

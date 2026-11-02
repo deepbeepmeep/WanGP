@@ -119,9 +119,16 @@ class ProcessLibrary:
         process_definition = catalog.PROCESS_DEFINITIONS.get(str(process_name or "").strip())
         if not isinstance(process_definition, dict):
             return None
+        settings = process_definition["settings"]
+        if process_definition["info"].get("use_configured_model"):
+            handler = system_handlers.get_system_handler(settings["system_handler"])
+            method = handler.configured_method(settings["spatial_upsampling_method"])
+            _, _, target = spatial_upsampler_api.normalize_upsampling_value_for_method(method, settings["target_ratio"])
+            settings = {**settings, "spatial_upsampling_method": method, "target_ratio": target}
         return {
-            "settings": process_definition.get("settings", {}),
+            "settings": settings,
             "path": process_definition.get("path", ""),
+            "info": process_definition["info"],
             "source": "system",
             "name": str(process_name or "").strip(),
             "value": str(process_name or "").strip(),
@@ -272,9 +279,9 @@ class ProcessLibrary:
         split = spatial_upsampler_api.split_upsampling_value(value)
         return split[0] if split is not None else value if spatial_upsampler_api.find_upsampler_by_method(value) is not None else ""
 
-    def spatial_upsampler_parameter_state(self, process_name: str, main_state: dict | None = None, user_refs: list[str] | None = None, parameter_values=None) -> dict:
-        method = self.spatial_upsampler_method(process_name, main_state, user_refs)
-        return spatial_upsampler_api.parameter_ui_state(method, spatial_upsampler_api.PARAMETER_UI_MEDIA_FLOW, parameter_values)
+    def spatial_upsampler_parameters(self, process_name: str, main_state: dict | None = None, user_refs: list[str] | None = None) -> list[dict]:
+        """The parameters the process's spatial processor shows in Media Flow (postprocessing.parameter_ui)."""
+        return spatial_upsampler_api.method_parameters(self.spatial_upsampler_method(process_name, main_state, user_refs), ui_context=spatial_upsampler_api.PARAMETER_UI_MEDIA_FLOW)
 
     def target_control_choices(self, process_name: str, main_state: dict | None = None, user_refs: list[str] | None = None) -> list[tuple[str, str]]:
         process_definition = self.process_definition(process_name, main_state, user_refs)
@@ -283,9 +290,11 @@ class ProcessLibrary:
             return handler.target_control_choices_for_process(process_definition.get("settings", {}))
         return list(getattr(handler, "target_control_choices", [])) if handler is not None else []
 
-    def target_control_default(self, process_name: str, main_state: dict | None = None, user_refs: list[str] | None = None) -> str:
+    def target_control_default(self, process_name: str, main_state: dict | None = None, user_refs: list[str] | None = None, *, saved_value: str = "") -> str:
         process_definition = self.process_definition(process_name, main_state, user_refs)
         handler = self.system_handler_for_definition(process_definition)
+        if saved_value and process_definition and process_definition.get("info", {}).get("use_configured_model"):
+            return handler.normalize_target_control_for_process(saved_value, process_definition["settings"])
         if handler is not None and callable(getattr(handler, "target_control_default_for_process", None)):
             return handler.target_control_default_for_process(process_definition.get("settings", {}))
         return str(getattr(handler, "default_target_control", "")) if handler is not None else ""
@@ -294,7 +303,13 @@ class ProcessLibrary:
         return len(self.target_control_choices(process_name, main_state, user_refs)) > 0
 
     def target_control_label(self, process_name: str, main_state: dict | None = None, user_refs: list[str] | None = None) -> str:
-        handler = self.system_handler_for_process(process_name, main_state, user_refs)
+        definition = self.process_definition(process_name, main_state, user_refs)
+        handler = self.system_handler_for_definition(definition)
+        if definition and definition.get("info", {}).get("use_configured_model"):
+            method = definition["settings"]["spatial_upsampling_method"]
+            _, upsampler, _ = spatial_upsampler_api.method_definition(method)
+            name = next(label for label, key in upsampler["methods"] if key == method)
+            return f"Upsampling ({name})"
         return str(getattr(handler, "target_control_label", "Target")) if handler is not None else "Target"
 
     def default_chunk_size_seconds(self, process_name: str, main_state: dict | None = None, user_refs: list[str] | None = None) -> float:

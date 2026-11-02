@@ -20,6 +20,7 @@ from .dialogue import H3_DIALOGUE_GENERATION, H3_DIALOGUE_MAX_TOTAL_SECONDS, H3_
 from .minimax_h3_main import (AUDIO_VAE_FILE, LATENT_UPSCALER_FILE, LATENT_UPSCALER_FOLDER, TEXT_ENCODER_FOLDER,
                               VIDEO_VAE_FILE, VIDEO_VAE_FP8MIX_FILE, VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_FILE, VIDEO_VAE_LIGHT_INT8_FILE)
 from .pdd import PDD_BLOCK_SIZE, PDD_NUM_STEPS
+from .pika import PIKA_SOLVER, PIKA_STEPS, PIKA_VIDEO_SHIFT
 from .ptd import PTD_FOLDER, PTD_HEAD_FILE, PTD_INFOS, PTD_DEEPY_INFOS
 from .vae_upsampler import X2_VAE_DESCRIPTION, X2_VAE_FILE, X2_VAE_INT8_FILE, X2_VAE_METHOD, X2_VAE_VALUE, query_x2_vae_files
 from .viggle import VIGGLE_ARCHITECTURE, VIGGLE_ASSET_FOLDER, VIGGLE_INFOS, VIGGLE_PROMPT_FILE, VIGGLE_REPO_ID
@@ -68,7 +69,7 @@ Control Video (`video_guide`) is split across sliding windows, each window recei
 
 `audio_prompt_type`: empty = generate video and audio; `A` = `audio_guide` is the soundtrack; `K` = the control video's audio track is the soundtrack (`GV` or `VU`); `2` = keep control frames and generate their audio (`GV`). The video follows a soundtrack and WanGP keeps it as the output audio when it covers the video; a shorter one permits generated sound afterward. For visible speech in soundtrack mode, identify the character and explicitly request `speaking with natural lip movements synchronized` or equivalent lip-sync wording, without mentioning a supplied audio track or its language. Do not write the spoken words (no `<d>` dialogue): given a written line, H3 voices its own dialogue and the mouth often stops following the soundtrack. Keep the speaker's action to speaking: smiles, gestures and nods compete with the mouth. Exact lip sync is not guaranteed.
 
-Use `capabilities` for window limits. WanGP rounds overlap to compatible values (1, 18, 35, ...); `video_length` sets total duration across windows. A window may jump onto an end image its action did not reach; `sliding_window_discard_last_frames` about 5 hides it: the end image of every window but the last is generated after the discarded frames (steers, not shown); the last window ends on its end image. `input_video_strength` (default 1) softens end images and injected frames: about 0.5 eases into them with an approximate frame; 0.6 and above act like 1. Read `prompt_infos` for H3's structured prompt syntax.
+Use `capabilities` for window limits. WanGP rounds overlap to compatible values (1, 18, 35, ...); `video_length` sets total duration across windows. A window may jump onto an end image its action did not reach; `sliding_window_discard_last_frames` about 5 hides it: the end image of every window but the last is generated after the discarded frames (steers, not shown); the last window ends on its end image. Read `prompt_infos` for H3's structured prompt syntax.
 """
 
 FL2VA_INFOS = """## FL2VA — First/Last Frame to Video and Audio
@@ -108,12 +109,10 @@ Sliding windows can continue a video beyond one generation. Choose any overlap a
 
 **End images between windows:** each window lands exactly on its end image. When the action has drifted away from that picture, the last few frames jump to it. To hide this jump, set **Discard Last Frames** to about `5`: the end image of every window except the last is then generated just after the discarded frames, so it steers the action without being shown, and the next window continues from the frames before it. The last window still ends exactly on its end image.
 
-**End Image / Injected Frames Strength:** at `1` (default) end images and injected frames are matched exactly. Around `0.5` the video eases toward them instead and only approaches the picture; when the action is already close to it, the jump can remain. Values from about `0.6` behave like `1`. The setting never applies to the start image or a continued video.
-
 H3 is designed for 24 FPS, although WanGP can generate at another frame rate. MiniMax documents an official duration of 4–15 seconds per generation window; longer videos are possible through sliding windows.
 """
 
-REF2VA_DEEPY_INFOS = """Generate video and 32 kHz stereo audio from `prompt` and references. Ordered `image_refs` guide identity, objects or setting; reference flags in `video_prompt_type`: `I` preserves chosen output dimensions, `KI` derives them from the first image. `image_start` / `image_end` are timeline anchors shown before general image references. `FI` injects the first `image_refs` at `frames_positions` (`1` = first frame, `L` = window end, `X` = skip a window); remaining images are references; not with `GV`. Per window, pictures are numbered: start or continued frame (`<Picture 1>`), end image, that window's injected frames by time, then references. `video_source` and sliding windows provide continuation. A window may jump onto an end image its action did not reach; `sliding_window_discard_last_frames` about 5 hides it: the end image of every window but the last is generated after the discarded frames (steers, not shown); the last window ends on its end image. `input_video_strength` (default 1) softens end images and injected frames: about 0.5 eases into them with an approximate frame; 0.6 and above act like 1.
+REF2VA_DEEPY_INFOS = """Generate video and 32 kHz stereo audio from `prompt` and references. Ordered `image_refs` guide identity, objects or setting; reference flags in `video_prompt_type`: `I` preserves chosen output dimensions, `KI` derives them from the first image. `image_start` / `image_end` are timeline anchors shown before general image references. `FI` injects the first `image_refs` at `frames_positions` (`1` = first frame, `L` = window end, `X` = skip a window); remaining images are references; not with `GV`. Per window, pictures are numbered: start or continued frame (`<Picture 1>`), end image, that window's injected frames by time, then references. `video_source` and sliding windows provide continuation. A window may jump onto an end image its action did not reach; `sliding_window_discard_last_frames` about 5 hides it: the end image of every window but the last is generated after the discarded frames (steers, not shown); the last window ends on its end image.
 
 `video_guide`, `video_guide2` and `video_guide3` supply up to three reference videos for appearance, motion or camera; choose the corresponding video mode. `V1-U` instead takes up to three excerpts from `video_guide` at `custom_settings.h3_video_excerpt_positions`: frame numbers or seconds such as `5.2s`, each optionally followed by `/duration` (default 3s), for example `3 5.2s/4s 12s`. Reference videos preserve the chosen output size and are given whole to every sliding window. Control videos (`VU`, `GV`) use the control video's aspect ratio and are split across sliding windows, each window receiving its own section. Use Reference Video for motion transfer to image-reference characters; for depth, pose or edge control use the MiniMax H3 FL2VA ControlNet-Union model. `VU` supplies the control video's unchanged frames as `<Video 1>`: an in-context guide for LoRAs that transform a source video, such as character swap; name it `<Video 1>` in the prompt and state what to do with it. `GV` (Denoise Control Video) edits through denoising: lower strength preserves more source content; at strength 1 without a mask, the source supplies no visual conditioning. `GV` does not supply a video reference.
 
@@ -189,8 +188,6 @@ For longer videos, choose any sliding-window overlap amount and WanGP will round
 
 **End images between windows:** each window lands exactly on its end image. When the action has drifted away from that picture, the last few frames jump to it. To hide this jump, set **Discard Last Frames** to about `5`: the end image of every window except the last is then generated just after the discarded frames, so it steers the action without being shown, and the next window continues from the frames before it. The last window still ends exactly on its end image.
 
-**End Image / Injected Frames Strength:** at `1` (default) end images and injected frames are matched exactly. Around `0.5` the video eases toward them instead and only approaches the picture; when the action is already close to it, the jump can remain. Values from about `0.6` behave like `1`. The setting never applies to the start image or a continued video.
-
 H3 is designed for 24 FPS, although WanGP can generate at another frame rate. MiniMax documents an official duration of 4–15 seconds per generation window; longer videos are possible through sliding windows.
 
 See the [MiniMax H3 model card](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/README.md) for the upstream specifications and prompting guidance.
@@ -258,9 +255,13 @@ Enable **Advanced Mode**, open **General**, and choose an option under **Phases*
 
 - **One Phase (default):** generates directly at the selected resolution. Use it for standard resolutions or when whole-frame consistency matters more than high-resolution speed.
 - **Two Phases:** use it for faster high-resolution generation and improved fine detail. Most of the work is performed at a lower resolution before H3 enhances the result at the selected output resolution. This mode does not reduce the peak VRAM required by the final enhancement.
-- **Two Phases with Tiling:** use it when regular two-phase generation runs out of VRAM. It processes the final enhancement as four overlapping areas, reducing peak VRAM at the cost of extra processing time and a possible risk of visible seams or local inconsistencies.
+- **Two Phases with Tiling (experimental):** use it when regular two-phase generation runs out of VRAM. It processes the final enhancement as four overlapping areas, reducing peak VRAM at the cost of extra processing time and a possible risk of visible seams or local inconsistencies.
 
 **Phase 2 Steps** controls the final enhancement independently of the first phase; the default is 3. Other counts use evenly spaced noise levels from **Phase 2 Noise Level Start** to zero. Start with the default noise level; lower it to keep the result closer to the first phase and favor smoother tile blending, or raise it to encourage stronger new details, with a greater risk of seams or changes between tiles. More steps are not necessarily better with a few-step accelerator.
+
+Leave **Custom Sigmas** empty for the normal schedules. Use commas between values and `;` between phases; an empty phase slot keeps its normal schedule. Explicit values set that phase's steps and starting noise. The **i** beside the field explains the syntax.
+
+For FL2VA, **Open-H3 Regenerate 2K Phase 2** selects the refiner LoRA and its three-step schedule. Phase 2 uses the first phase's audio as frozen conditioning while preserving its output soundtrack. **H3 Phase 2 (Original)** restores the usual Turbo and schedule; **Vanilla Phase 1 (Reset)** returns to one-phase generation. Tiling remains experimental with the refiner.
 """
 
 H3_PHASE_TURBO_INFOS = """
@@ -279,6 +280,25 @@ Enable **Advanced Mode** to access these options:
 H3_STANDARD_SAMPLER_INFOS = """
 - **Ralston 2S:** in **Sampler Solver / Scheduler**, select **Ralston 2S** to use the anchored deterministic second-order Runge-Kutta sampler. It evaluates H3 at the start and two-thirds point of every interval, anchors the second prediction to the interval start, then combines both predictions with Ralston's `1/4, 3/4` weights. This can reduce numerical integration error and may improve fine-detail retention, motion stability, and audio/video coherence. Perceptual improvements are prompt-dependent and are not guaranteed. Its second prediction depends on the first, so they cannot run in parallel: Ralston performs two full transformer predictions per step and sampling is approximately **2x slower** than Euler or RES Multistep at the same step count. Spectrum Feature Forecasting is unsupported with Ralston 2S.
 """
+
+PIKA_INFOS = """
+
+### Pika H3 Flex
+
+Apply **Pika H3 Flex FL2VA 6 Steps** or **Pika H3 Flex Ref2VA 6 Steps** from the accelerator profiles for the matching model. FL2VA generates video and stereo audio from text, a first frame, a last frame, or both. Ref2VA uses image/video references and optional audio references; it requires at least one image or video.
+
+The profile selects **Pika Re-noise (6 Steps)**, six steps, flow shift 12 and one generation phase. Keep **Steps Skipping** off and **Custom Sigmas** empty. The sampler requires the matching Pika adapter; selecting it alone does not accelerate the base model. Use **Vanilla Phase 1 (Reset)** to return to ordinary H3 generation.
+
+Start with 480p or 768p and a 5–15 second clip. These are Pika's released local workflows; 1080p/2K/4K generation and separate audio stems from Pika's hosted API are not included. Use the existing H3 reference controls and their picture/video/audio labels. Reference-video soundtracks are included when selected as audio references. Prompt enhancement is optional and off in the Pika templates.
+"""
+
+PIKA_DEEPY_INFOS = (" Pika H3 Flex accelerator profiles select the matching FL2VA/Ref2VA rank-128 adapter at multiplier 1, "
+                   "sample_solver=pika_renoise, num_inference_steps=6, flow_shift=12, guidance_phases=1, custom_sigmas='', "
+                   "skip_steps_cache_type=''. Use the profile, not the sampler alone. Start at 480p/768p and 124–362 frames at 24 fps. "
+                   "Ref2VA requires at least one image/video; up to 9 images, 3 videos and 3 standalone audio references, 12 files total. "
+                   "Video soundtracks selected with audio_prompt_type=K stay attached to their videos. H3 reference order is images, videos, "
+                   "then standalone audios; use <Picture N>, <Video N>, <Audio N> labels. Pika has no released local high-resolution or audio-stem stage. "
+                   "Vanilla Phase 1 (Reset) restores Euler and removes accelerators while retaining additional LoRAs.")
 
 H3_AUDIO_REFINEMENT_INFOS = """
 ### Audio Refinement Extra Phase
@@ -561,7 +581,6 @@ class family_handler:
         if base_model_type == VIGGLE_ARCHITECTURE:
             result = family_handler.query_model_def(REF2VA_PRUNED_ARCHITECTURE, model_def)
             result.pop("resolution_budget_tiled", None)
-            result.pop("input_video_strength")
             result.update({
                 "profiles_dir": [VIGGLE_ARCHITECTURE],
                 "device_explicit": True,
@@ -597,7 +616,8 @@ class family_handler:
             pruned = base_model_type == CONTROL_PRUNED_ARCHITECTURE
             result = family_handler.query_model_def(FL2VA_PRUNED_ARCHITECTURE if pruned else FL2VA_ARCHITECTURE, model_def)
             result.pop("resolution_budget_tiled", None)
-            for key in ("guide_custom_choices", "custom_frames_injection", "one_image_ref_only", "switch_threshold", "input_video_strength"):
+            result["sample_solvers"] = [choice for choice in result["sample_solvers"] if choice[1] != PIKA_SOLVER]
+            for key in ("guide_custom_choices", "custom_frames_injection", "one_image_ref_only", "switch_threshold"):
                 result.pop(key)
             result.update({
                 "profiles_dir": result["profiles_dir"] + [CONTROL_ARCHITECTURE],  # main blocks are FL2VA: its LoRA accelerator profiles apply
@@ -638,6 +658,7 @@ class family_handler:
         if fasth3 and not (reference_mode and pdd):
             raise ValueError("FastH3 Omni is a Ref2VA PDD student: declare it on the Ref2VA architecture with pdd")
         fixed_schedule = pdd or fasth3
+        pika_supported = not (fixed_schedule or ptd or vdn or veda)
         text_encoder_variant = model_def.get("text_encoder_variant")
         text_encoder_files = [TEXT_ENCODER_BF16, TEXT_ENCODER_INT8] if text_encoder_variant is None else TEXT_ENCODER_VARIANTS[text_encoder_variant]
         result = {
@@ -663,6 +684,7 @@ class family_handler:
             "visible_phases": 0,
             "lora_multiplier_phases": 1 if fixed_schedule else 2,
             "phase_2_spatial_tiling": not fixed_schedule,
+            "custom_sigmas": not fixed_schedule and not ptd,
             "resolution_budget": "2048x2048",
             **({"resolution_budget_tiled": "3840x2176"} if not fixed_schedule else {}),
             "custom_settings": [{
@@ -721,7 +743,7 @@ class family_handler:
                 "end": 4.0,
                 "inc": 0.05,
             },
-            "sample_solvers": [("Euler", "euler")] if fixed_schedule else [("Euler", "euler"), ("RES Multistep", "res_multistep"), ("Ralston 2S (~2x slower)", "ralston_2s")],
+            "sample_solvers": [("Euler", "euler")] if fixed_schedule else [("Euler", "euler"), ("RES Multistep", "res_multistep"), ("Ralston 2S (~2x slower)", "ralston_2s")] + ([("Pika Re-noise (6 Steps)", PIKA_SOLVER)] if pika_supported else []),
             "no_negative_prompt": True,
             "returns_audio": True,
             "audio_window_alignment": True,
@@ -730,8 +752,6 @@ class family_handler:
             "end_image_before_discarded_frames": True,  # discarded last frames follow the end image of non-final windows
             "multimedia_generation": True,
             "image_end_frame_position": True,
-            "input_video_strength": {"label": "End Image / Injected Frames Strength (lower values let the video ease into them instead of jumping)",
-                                     "name": "End Image Strength"},
             "control_video_trim_disabled": True,
             "extract_guide_from_window_start": True,  # sliding windows get pure window-aligned guide frames; continuation comes through input_video
             "prompt_enhancer_picture_labels": True,  # enhancer images are labelled with the <Picture N> the pipeline presents
@@ -757,6 +777,7 @@ class family_handler:
             "text_prompt_enhancer_max_tokens1": 1024,
             "image_prompt_enhancer_max_tokens1": 1024,
             "profiles_dir": ["minimax_h3_vdn"] if vdn else ["minimax_h3_fasth3"] if fasth3 else [] if pdd else ["minimax_h3", "minimax_h3_ref2va" if reference_mode else "minimax_h3_fl2va"],
+            "preset_profiles_dir": [] if fixed_schedule or vdn else ["minimax_h3_presets"],
             "finetune_custom_urls": ["video_vae_file", "audio_vae_file"],
             "vae_upsamplers": {X2_VAE_METHOD: [0, 1, 2]},
             "finetunes_infos": H3_FINETUNES_INFOS,
@@ -930,11 +951,17 @@ class family_handler:
             result["deepy_infos"] += " Two-phase generation uses `num_inference_steps2` (default 3) for final enhancement and `switch_threshold` for its starting noise. Accelerator LoRAs before `|` with any nonzero phase-2 multiplier replace the automatic Turbo together, at their specified multipliers; if all are zero, the automatic Turbo is used. `1;0` means phase 1 only, `1;0.6` sets phase 2 to 0.6, and `1` applies to both phases. LoRAs after `|` keep their multipliers."
         if vdn:
             result["deepy_infos"] += " VDN loads its acceleration LoRA automatically and defaults to 8 steps."
+        if result["custom_sigmas"]:
+            result["custom_sigmas_schedulers"] = ["euler", "res_multistep", "ralston_2s"]
+            result["deepy_infos"] += " `custom_sigmas` defaults to empty. Commas separate positive descending sigmas below 1; semicolons separate exactly `guidance_phases` slots. Blank slots use normal schedules; trailing zero is ignored. Explicit schedules override that phase's steps and starting sigma without another flow shift. FL2VA and Ref2VA share the H3 presets. Open-H3 Regenerate uses `;0.909375,0.8571428571428571,0.6666666666666666` and `open_h3_regenerate_2k_lora.safetensors` at `0;1` before `|`; it uses phase-1 audio as frozen phase-2 conditioning and retains phase-1 output audio. Tiling is experimental. The presets replace accelerator LoRAs while preserving additional LoRAs and their multipliers. Original Phase 2 and Vanilla Phase 1 reset presets clear custom sigmas."
         if veda:
             result["compile"] = False
             help_text = " Veda variants always use learned sparse attention in the H3 transformer; the attention override is locked to Veda. Other attention operations use the application attention backend. It reuses the standard H3 settings, LoRAs and step counts. The predictor follows Transformer Quantization (BF16 or INT8 ConvRot). Sparsity can change fine detail or motion; compare with a standard H3 variant at the same seed. Speed benefits are greatest for large videos. Requires Triton and an NVIDIA SM80+ GPU. Veda runs without CUDA graphs or transformer compilation."
             result["infos"] += "\n\n### Veda Sparse Attention\n\n" + help_text.strip()
             result["deepy_infos"] += help_text
+        if pika_supported:
+            result["infos"] += PIKA_INFOS
+            result["deepy_infos"] += PIKA_DEEPY_INFOS
         still_infos = "\n\n**Text to Image:** generate one still image without audio. Video duration, extra frames and Audio Refinement do not apply in this mode."
         still_prompt_infos = "\n\nFor Text to Image, describe one still scene: its subject, composition, lighting and details. A plain-language image prompt is sufficient; speech and soundtrack instructions are unnecessary. The optional Write enhancer offers image prompts from text alone or from text plus the selected images. With an image, specify what to change and what to preserve."
         result["infos"] += still_infos
@@ -956,6 +983,14 @@ class family_handler:
 
     @staticmethod
     def validate_generative_settings(base_model_type, model_def, inputs):
+        pika = inputs["sample_solver"] == PIKA_SOLVER
+        if pika:
+            if base_model_type not in (FL2VA_ARCHITECTURE, FL2VA_PRUNED_ARCHITECTURE, REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE) or any(model_def.get(flag, False) for flag in ("pdd", "ptd", "vdn", "veda", "fasth3")):
+                return "Pika H3 Flex requires a standard FL2VA or Ref2VA model"
+            if inputs["num_inference_steps"] != PIKA_STEPS or inputs["flow_shift"] != PIKA_VIDEO_SHIFT or inputs["guidance_phases"] != 1:
+                return "Pika H3 Flex requires 6 steps, flow shift 12 and one generation phase; apply its matching accelerator profile"
+            if inputs["custom_sigmas"] or inputs["skip_steps_cache_type"]:
+                return "Pika H3 Flex requires empty Custom Sigmas and No Skipping"
         if model_def.get("ptd", False):
             inputs.update({"flow_shift": 12.0, "guidance_scale": 1.0, "guidance_phases": 1, "skip_steps_cache_type": ""})
         if model_def.get("veda", False):
@@ -1172,7 +1207,9 @@ class family_handler:
             return "MiniMax H3 accepts at most 3 audio references"
         _notify_audio_reference_limit(audio_durations)
         visual_count = image_count + len(video_durations)
-        if audio_count > visual_count:
+        if pika and not visual_count:
+            return "Pika H3 Flex Ref2VA requires at least one image or video reference"
+        if not pika and audio_count > visual_count:
             return f"MiniMax H3 requires at least as many reference images and videos as audio references (found {visual_count} visual and {audio_count} audio)"
         file_count = image_count + len(videos) + (0 if soundtrack_mode else audio_count)
         if file_count > 12:
@@ -1280,6 +1317,7 @@ class family_handler:
 
     @staticmethod
     def fix_settings(base_model_type, settings_version, model_def, ui_defaults):
+        ui_defaults.pop("input_video_strength", None)
         if model_def.get("veda", False):
             ui_defaults["overrides"] = set_override(ui_defaults.get("overrides", ""), "attention_mode", "veda")
         elif get_override(ui_defaults.get("overrides", ""), "attention_mode") == "veda":
@@ -1335,6 +1373,7 @@ class family_handler:
 
     @staticmethod
     def update_default_settings(base_model_type, model_def, ui_defaults):
+        ui_defaults.pop("input_video_strength", None)
         if base_model_type == VIGGLE_ARCHITECTURE:
             family_handler.update_default_settings(REF2VA_PRUNED_ARCHITECTURE, model_def, ui_defaults)
             ui_defaults.update({"num_inference_steps": 3, "flow_shift": 3.0, "video_prompt_type": "IVU",
@@ -1364,6 +1403,7 @@ class family_handler:
             "num_inference_steps": 20,
             "guidance_phases": 1,
             "num_inference_steps2": 3,
+            "custom_sigmas": "",
             "switch_threshold": H3_PHASE_2_NOISE_LEVEL_START_DEFAULT,
             "guidance_scale": 1.0,
             "flow_shift": 12.0,

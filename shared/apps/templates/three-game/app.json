@@ -1,0 +1,10 @@
+{
+  "name": "Three.js Game",
+  "kind": "web",
+  "entry": "index.html",
+  "description": "",
+  "version": 1,
+  "controls": {"WASD / Arrows": "move", "R": "restart"},
+  "canvas": "responsive",
+  "audio": false
+}

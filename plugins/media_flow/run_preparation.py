@@ -79,6 +79,7 @@ def prepare_run(
     uses_builtin_outpaint_ui: bool,
     system_handler=None,
     system_target_control: str = "",
+    expected_spatial_upsampling: str = "",
 ) -> PreparedRun:
     verbose_level = get_mmgp_verbose_level()
     try:
@@ -149,7 +150,7 @@ def prepare_run(
     requested_output_path = str(output_paths.build_requested_output_path(source_path, output_path, process_display_name, active_target_ratio, output_resolution_token, start_seconds, end_seconds, has_outpaint=uses_builtin_outpaint_ui, default_container=default_output_container))
     if continue_enabled:
         existing_identity = process_metadata.read_output_identity(requested_output_path)
-        identity_mismatch_message = process_metadata.get_output_identity_mismatch_message(requested_output_path, process_name=process_display_name, source_path=source_path, source_segment=requested_source_segment)
+        identity_mismatch_message = process_metadata.get_output_identity_mismatch_message(requested_output_path, existing_identity, process_name=process_display_name, source_path=source_path, source_segment=requested_source_segment, spatial_upsampling=expected_spatial_upsampling)
         if identity_mismatch_message is not None:
             system_supports_continue_cache = system_handler is not None and (not callable(getattr(system_handler, "supports_continue_cache_for_target", None)) or system_handler.supports_continue_cache_for_target(system_target_control))
             can_resume_from_system_state = existing_identity is None and system_supports_continue_cache and callable(getattr(system_handler, "can_resume_without_output_metadata", None)) and system_handler.can_resume_without_output_metadata(requested_output_path)

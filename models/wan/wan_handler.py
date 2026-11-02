@@ -351,6 +351,10 @@ class family_handler():
         "sliding_window" : not shotplan and (base_model_type in ["multitalk", "infinitetalk", "t2v", "t2v_2_2", "fantasy", "animate", "lynx"] or test_class_i2v(base_model_type) or test_wan_5B(base_model_type) or vace_class),  #"ti2v_2_2",
         "multiple_submodels" : multiple_submodels,
         "guidance_max_phases" : 3,
+        "custom_sigmas": True,
+        "custom_sigmas_continuous": True,
+        "custom_sigmas_switch_scale": 1000.0,
+        "custom_sigmas_schedulers": ["", "unipc", "euler", "dpm++"],
         "perturbation" : True,
         "flow_shift": True,
         "cfg_zero" : True,
@@ -980,7 +984,10 @@ class family_handler():
         guidance = wan_help(base_model_type, {**extra_model_def, **model_def})
         if base_model_type in ("vace_ditto_14B", "bernini_1.3B", "vace_standin_14B", "vace_lynx_14B", "vace_multitalk_14B"):
             extra_model_def["infos"] = guidance["infos"]
-        return merge_help(extra_model_def, guidance)
+        result = merge_help(extra_model_def, guidance)
+        result["infos"] += "\n\n**Custom Sigmas:** leave empty for the normal schedule. Separate values with commas and phase slots with `;`, using two semicolons for three phases. Blank phases keep normal schedule points within their switches. Each explicit later phase sets its switch from its first sigma. The complete schedule must descend across all phases. Supported schedulers: Euler, UniPC and DPM++. See the **i** beside the field for examples."
+        result["deepy_infos"] += " `custom_sigmas` defaults to empty. Commas separate positive descending values below 1; use exactly `guidance_phases - 1` semicolons. Blank slots retain default schedule points in their phase range; trailing zero is ignored. This is one continuous schedule: explicit phase 2/3 sets `switch_threshold`/`switch_threshold2` to its first sigma times 1000, and every phase must stay within its boundaries. `num_inference_steps` builds the automatic schedule; explicit slots replace those points and change the actual total. Compatible schedulers: `euler`, `unipc`, `dpm++` and default."
+        return result
         
 
     @staticmethod

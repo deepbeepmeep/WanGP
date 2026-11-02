@@ -9,6 +9,7 @@ from typing import NamedTuple
 import numpy as np
 import torch
 from einops import rearrange
+from mmgp import transfer
 from PIL import Image
 from torch._prims_common import DeviceLikeType
 from tqdm import tqdm
@@ -260,7 +261,7 @@ def load_video_conditioning(
         chunk = normalize_latent(resize_and_center_crop(chunk, height, width), device, dtype)
         if result is None:
             result = torch.empty((*chunk.shape[:2], video.shape[0], *chunk.shape[3:]), dtype=dtype, device="cpu")
-        result[:, :, start : start + chunk.shape[2]].copy_(chunk)
+        transfer.copy_(result[:, :, start : start + chunk.shape[2]], chunk)
     return result
 
 

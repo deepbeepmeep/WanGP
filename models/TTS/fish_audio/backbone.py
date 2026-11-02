@@ -7,6 +7,7 @@ from torch.nn import functional as F
 
 from mmgp import cuda_graphs, runtime
 from mmgp.expert_compute import SwiGLUExperts
+from shared.llm_engines.lmgp.layers.moe import softmax_topk
 from .layers import FullAttention, GatedDeltaNet, LayerContext, ZeroCenteredRMSNorm
 
 
@@ -37,10 +38,7 @@ class SparseMoeBlock(nn.Module):
 
     def route(self, x):
         flat = x.reshape(-1, x.shape[-1])
-        probabilities = self.gate(flat).float().softmax(-1)
-        weights, ids = probabilities.topk(self.top_k, dim=-1)
-        if self.norm_topk_prob:
-            weights = weights / weights.sum(-1, keepdim=True)
+        ids, weights = softmax_topk(self.gate(flat), self.top_k, self.norm_topk_prob)
         shared = self.shared_expert(flat) * self.shared_expert_gate(flat).sigmoid()
         return flat, ids, weights.to(flat.dtype), shared
 

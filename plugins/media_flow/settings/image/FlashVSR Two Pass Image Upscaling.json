@@ -8,6 +8,7 @@
   "target_ratio": "flashvsr2pass*2",
   "prompt": "",
   "process": {
+    "use_configured_model": true,
     "task": "upscale",
     "summary": "FlashVSR in two passes, which may reduce horizontal banding."
   }

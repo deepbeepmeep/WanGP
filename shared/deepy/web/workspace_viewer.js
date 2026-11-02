@@ -31,23 +31,26 @@
       this.modal.innerHTML = '<form><h2></h2><div class="wangp-workspace-body"><p></p><label data-name-label><span data-name-caption>Archive name</span><input maxlength="120" required></label><label data-target-label><span data-select-label>Target workspace</span><select required></select></label><div class="wangp-workspace-error" role="alert" hidden></div><div class="wangp-workspace-actions"><button type="button" data-cancel>Cancel</button><button type="submit">Confirm</button></div></div></form>';
       document.body.append(this.modal);
       this.modal.querySelector('[data-cancel]').onclick = () => this.modal.close();
+      this.modal.addEventListener('close', () => document.dispatchEvent(new Event('wangp-viewer-scope')));
       this.modal.querySelector('form').onsubmit = event => {event.preventDefault(); this.confirm();};
       const storageButton = document.createElement('button'); storageButton.type = 'button'; storageButton.dataset.storage = ''; storageButton.textContent = 'Storage'; storageButton.title = 'Inspect or Convert Workspace Storage';
       this.dialog.querySelector('.wv-header-actions').prepend(storageButton);
       storageButton.onclick = () => this.storage();
       this.dialog.querySelector('[data-folder-change]').onclick = () => this.storage(true);
-      this.dialog.querySelector('[data-close]').onclick = () => this.dialog.close();
+      this.dialog.querySelector('[data-close]').onclick = () => this.close();
       this.dialog.querySelector('[data-extract-settings]').onclick = () => {
         if (this.busy || this.loading || this.selected.size !== 1) return;
         window.__wangpAssistantChatNS.setBridgeValue('#wangp-workspace-extract-settings textarea', JSON.stringify({workspace: this.workspace, source: this.source, revision: this.state.revision, keys: [...this.selected], request: Date.now()}));
-        this.dialog.close();
+        this.close();
       };
       this.dialog.querySelector('[data-workspace]').onchange = event => this.changeWorkspace(event.target.value);
       this.dialog.querySelector('[data-create]').onclick = () => this.picker.open('create');
       this.picker.dialog.addEventListener('close', () => this.invalidate());
       this.dialog.querySelector('[data-protect]').onclick = () => this.protect();
       this.dialog.querySelector('[data-retention]').onclick = () => this.action('retention').catch(error => this.notice(error.message));
-      this.dialog.onclose = () => {this.requestId++; this.detailRequest?.abort(); this.grid.replaceChildren(); this.clearPreview(); this.modal.close(); clearTimeout(this.refreshTimer); clearTimeout(this.pageHover); cancelAnimationFrame(this.rubberFrame);};
+      this.dialog.onclose = () => {this.requestId++; this.detailRequest?.abort(); this.grid.replaceChildren(); this.hidePreview(); this.modal.close(); clearTimeout(this.refreshTimer); clearTimeout(this.pageHover); cancelAnimationFrame(this.rubberFrame);};
+      this.dialog.addEventListener('cancel', () => {this.hidePreview();});
+      this.dialog.addEventListener('close', () => document.dispatchEvent(new Event('wangp-viewer-scope')));
       this.dialog.querySelector('[data-import]').onclick = () => this.dialog.querySelector('[data-files]').click();
       this.dialog.querySelector('[data-files]').onchange = event => this.importFiles([...event.target.files]);
       this.dialog.querySelector('[data-refresh]').onclick = () => this.load(this.state?.page || 0);
@@ -68,6 +71,15 @@
         if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') {event.preventDefault(); this.state.items.forEach(item => this.selected.add(item.key)); this.selectionChanged();}
       };
       this.installDrag(); this.installRubber(); this.installDivider();
+      const suspend = () => {
+        if (!this.dialog.open) return;
+        const modal = document.querySelector('dialog[open]:focus-within') || [...document.querySelectorAll('dialog[open]')].at(-1);
+        if (document.hidden || !document.hasFocus() || (modal && modal !== this.dialog)) this.stopPreview();
+      };
+      document.addEventListener('visibilitychange', suspend);
+      window.addEventListener('blur', () => queueMicrotask(suspend));
+      window.addEventListener('pagehide', () => this.stopPreview());
+      document.addEventListener('click', suspend);
     }
     get selected() {return this.selections[this.source] ??= new Set();}
     // One tab per gallery of the workspace, in the order and with the import filters published by the server.
@@ -99,7 +111,15 @@
       this.navigation();
     }
     open() {
-      this.dialog.showModal(); this.resetWorkspace();
+      this.dialog.showModal();
+      if (this.previewItem?.kind === 'app' && this.workspace === this.picker.state.selected && this.state) this.load(this.page);
+      else this.resetWorkspace();
+      document.dispatchEvent(new Event('wangp-viewer-scope'));
+    }
+    close() {
+      this.hidePreview();
+      this.dialog.close();
+      document.dispatchEvent(new Event('wangp-viewer-scope'));
     }
     renderWorkspaces() {
       const select = this.dialog.querySelector('[data-workspace]'), choices = JSON.stringify(this.picker.state.items);
@@ -160,7 +180,7 @@
         this.modal.querySelector('[data-target-label]').hidden = true; this.modal.querySelector('select').disabled = true;
         this.modal.querySelector('[role=alert]').hidden = true;
         this.modal.querySelector('[type=submit]').textContent = relocate ? 'Preview Copy' : 'Convert'; this.modal.querySelector('[type=submit]').disabled = !!preview.missing.length;
-        this.modal.showModal();
+        this.stopPreview(); this.modal.showModal(); document.dispatchEvent(new Event('wangp-viewer-scope'));
       } catch (error) {this.notice(error.message);}
       finally {this.setBusy(false);}
     }
@@ -173,6 +193,7 @@
     }
     async load(page, keepScroll = false, initial = false) {
       clearTimeout(this.refreshTimer);
+      if (page !== this.page) {this.detailRequest?.abort(); this.clearPreview();}
       const request = ++this.requestId;
       this.page = this.pages[this.source] = page; this.loading = true; this.navigation();
       const requestedSelection = new Set(this.selected);
@@ -238,25 +259,49 @@
       if (!this.selected.size) {this.detailRequest?.abort(); this.detailKey = null; this.clearPreview(); this.info.srcdoc = WanGPMediaView.documentHtml('Select media to view its properties.');}
     }
     clearPreview() {
+      this.playerRequest?.abort(); this.playerRequest = null;
+      window.WanGPAppPlayer?.closeOwner(this.preview);
+      this.preview.querySelectorAll('video, audio').forEach(media => {media.pause(); media.removeAttribute('src'); media.load();});
       WanGPImageZoom.destroy(this.preview.querySelector('img'));
       this.preview.replaceChildren();
+      this.previewItem = null;
+    }
+    hidePreview() {
+      this.playerRequest?.abort(); this.playerRequest = null;
+      if (this.previewItem?.kind !== 'app') this.clearPreview();
+    }
+    stopPreview() {
+      const item = this.previewItem;
+      if (!item) return;
+      // Apps keep their browsing context while another scope is active.
+      if (item.kind === 'app') { window.WanGPAppPlayer?.refresh(); return; }
+      if (!['3d', 'world', 'app'].includes(item.kind)) {
+        this.preview.querySelectorAll('video, audio').forEach(media => media.pause());
+        return;
+      }
+      this.clearPreview();
+      this.showPoster(item);
+    }
+    showPoster(item) {
+      this.previewItem = item;
+      let preview = WanGPMediaView.thumbnail(item);
+      if (item.kind !== 'image') {
+        const play = document.createElement('button'); play.type = 'button'; play.className = 'wv-open';
+        const label = document.createElement('span'); label.textContent = item.kind === '3d' ? '▶ View 3D' : item.kind === 'world' ? '▶ Open World' : '▶ Play';
+        play.append(preview, label); play.onclick = () => this.play(item); preview = play;
+      }
+      this.preview.append(preview, this.previewActions(item));
+      if (item.kind === 'image') WanGPImageZoom.mount(preview, {viewport: this.preview, source: new URL(item.url, location.href).href});
     }
     async showDetails(key) {
       const item = this.state.items.find(item => item.key === key); if (!item) return;
-      const identity = this.workspace + this.source + key; this.detailKey = identity;
+      const identity = this.workspace + this.source + key;
+      if (item.kind === 'app' && this.detailKey === identity && this.preview.querySelector('.wangp-app-player__frame')) return;
+      this.detailKey = identity;
       this.detailRequest?.abort();
       const request = this.detailRequest = new AbortController();
       this.clearPreview();
-      if (item.url) {
-        let preview = WanGPMediaView.thumbnail(item);
-        if (item.kind === 'video' || item.kind === 'audio') {
-          const play = document.createElement('button'); play.type = 'button'; play.className = 'wv-open';
-          const label = document.createElement('span'); label.textContent = '▶ Play';
-          play.append(preview, label); play.onclick = () => this.play(item); preview = play;
-        }
-        this.preview.append(preview, this.previewActions(item));
-        if (item.kind === 'image') WanGPImageZoom.mount(preview, {viewport: this.preview, source: new URL(item.url, location.href).href});
-      }
+      if (item.url) this.showPoster(item);
       this.info.srcdoc = WanGPMediaView.documentHtml('Loading media information…');
       try {const result = await this.transport.request(this.query('workspace_viewer/info', {key}), undefined, request.signal); if (!request.signal.aborted && this.detailKey === identity) this.info.srcdoc = WanGPMediaView.documentHtml(result.html);}
       catch (error) {if (!request.signal.aborted && this.detailKey === identity) this.notice(error.message);}
@@ -297,7 +342,28 @@
       }
       return media;
     }
-    play(item) {
+    async play(item) {
+      if (['3d', 'world', 'app'].includes(item.kind)) {
+        this.playerRequest?.abort();
+        const request = this.playerRequest = new AbortController();
+        try {
+          const result = await this.transport.request(this.query('workspace_viewer/player', {key: item.key}), undefined, request.signal);
+          if (request.signal.aborted || !this.dialog.open || this.previewItem !== item || document.hidden || !document.hasFocus()) return;
+          const template = document.createElement('template'); template.innerHTML = result.html;
+          const mesh = template.content.querySelector('wangp-mesh-viewer');
+          if (mesh) mesh.dataset.preview = item.thumbnail;
+          const app = template.content.querySelector('.app-viewer-play');
+          if (app) {app.querySelector('img, .app-viewer-icon')?.remove(); app.prepend(WanGPMediaView.thumbnail(item));}
+          // Use the gallery's own controls, with playback owned by this preview.
+          template.content.querySelectorAll('video').forEach(media => {media.autoplay = false; media.controls = true; media.preload = 'metadata'; if (!media.getAttribute('src')) media.removeAttribute('src');});
+          this.preview.replaceChildren(template.content);
+          if (item.kind === 'app') {
+            const link = this.preview.querySelector('[data-app-id]');
+            if (link) {link.onclick = event => {event.preventDefault(); event.stopPropagation(); window.WanGPAppPlayer.open(link);}; link.click();}
+          }
+        } catch (error) {if (!request.signal.aborted) this.notice(error.message);}
+        return;
+      }
       const media = this.loadPreview(item);
       if (item.kind === 'video' || item.kind === 'audio') media.play().catch(() => {});
     }
@@ -340,7 +406,7 @@
       this.modal.querySelector('[role=alert]').hidden = true;
       this.modal.querySelector('[type=submit]').textContent = action === 'retention' ? 'Save' : action === 'delete' ? 'Delete permanently' : action === 'copy' ? 'Copy' : action === 'move' ? 'Move' : 'Download';
       this.modal.querySelector('[type=submit]').disabled = ['copy', 'move'].includes(action) && !target.options.length;
-      this.modal.showModal(); this.modal.querySelector(action === 'delete' ? '[data-cancel]' : action === 'archive' ? 'input' : 'select').focus();
+      this.stopPreview(); this.modal.showModal(); document.dispatchEvent(new Event('wangp-viewer-scope')); this.modal.querySelector(action === 'delete' ? '[data-cancel]' : action === 'archive' ? 'input' : 'select').focus();
     }
     async confirm() {
       const button = this.modal.querySelector('[type=submit]'); button.disabled = true;
@@ -400,6 +466,7 @@
         percent = Math.max(10, Math.min(80, percent));
         panes.style.setProperty('--wv-preview-height', percent + '%');
         divider.setAttribute('aria-valuenow', String(Math.round(percent)));
+        window.__meshGalleryNS?.refresh();
       };
       let offset = 0;
       divider.onpointerdown = event => {

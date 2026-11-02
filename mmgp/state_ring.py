@@ -35,21 +35,35 @@ ahead, as the blocks MMGP keeps in VRAM change under a dynamic preload). For a m
 records of the blocks whose weights smartPinning pins and has no staging buffers of its own: the other records cross MMGP's staging ring
 with their blocks (synchronously without it). The
 placement is decided when the first block is stored (after the pass that computed them, MMGP's plans made). release()
-frees the slots and the RAM; unlocking waits for the GPU (cudaHostUnregister), so call it at a quiet point (the end of a generation)."""
+frees the slots and the RAM; unlocking waits for the GPU (cudaHostUnregister), so call it at a quiet point (the end of a generation).
+
+A ring made with resident="dynamic" (a cache the model computes on the GPU: needs MMGP's VRAM allocator) keeps its state in VRAM first and
+in RAM only for the blocks that do not stay there. The blocks stored with current=True keep their state in VRAM, by groups of `count`
+consecutive blocks, while the VRAM left beside the peak of the pass that computes them allows it (the dynamic preload's margin), without
+any copy to RAM; the others go to RAM and stream as above. The dynamic preload of the model plans the groups kept in VRAM with its weights
+at each cycle (mmgp.auto_preload, plan()): a group that leaves the VRAM is written back to RAM first (once per store), one that comes back
+is filled when its blocks would have been streamed anyway (from their slot, or their record instead of their slot), whatever the blocks
+whose weights MMGP keeps in VRAM. VRAM pressure writes groups back and streams them (no plan: the groups stay where they are until then).
+Its records are allocated when the first block is stored, unlocked (RAM only committed until written), and locked at the start of a pass
+once written, as far as the reserved RAM allows; its slots are allocated when a block first streams. They count with the state kept in VRAM
+as the model's weights. Its tensors in VRAM have their exact shapes: CUDA graphs adopt them as the static buffers of the blocks' arguments,
+as they adopt a cache kept on the GPU (no copy at each replay, a graph per guidance branch), and let them go when they leave the VRAM."""
 import ctypes
 import functools
+import itertools
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
 from tqdm import tqdm
 
-from . import allocator, cuda_graphs, memory_pressure, offload, pinned
+from . import allocator, auto_preload, cuda_graphs, memory_pressure, offload, pinned
 
 SLOTS = 2  # GPU slots without a managed model: the block running and the next one (window + 1 with MMGP's prefetch window)
 STAGING = 2  # locked buffers of pageable records (window + 1 with MMGP), one per record transferred or being copied ahead
 RESIDENT = True  # rings made with resident=True keep state in VRAM where the preload leaves room; False streams every block (comparisons)
 _ALIGN = offload.BLOCK_ALIGN
+_serials = itertools.count()  # the order the rings were made: the dynamic preload ranks their groups in a stable order
 
 
 def _locked(size, device):
@@ -101,7 +115,8 @@ class StateRing:
     def __init__(self, blocks, device, manager=None, name="state", modules=None, model_id=None, entries=None, resident=False):
         """blocks: number of blocks whose state is stored (indices 0 .. blocks - 1, fetched in that order at each pass); modules: the
         blocks themselves (a ModuleList), whose forward then fetches their state; model_id / entries: their model and block entries in the
-        offload object (manager), whose schedule the ring follows; resident: blocks may keep their state in VRAM (see the module)."""
+        offload object (manager), whose schedule the ring follows; resident: blocks may keep their state in VRAM (see the module), "dynamic":
+        in VRAM first, placed by the model's dynamic preload."""
         self.blocks, self.device, self.manager, self.name = blocks, torch.device(device), manager, name
         self.model_id, self.entries, self.count, self.staging_count = model_id, entries, SLOTS, STAGING
         self.capacity = None  # [(shape, dtype)] of the tensors the records and the slots can hold (the largest stored since they were made)
@@ -114,13 +129,25 @@ class StateRing:
         self.handles = {}  # block -> the list store() returned: the views of its slot, or of its resident tensors
         self.resident = {}  # block -> its own GPU tensors (capacity shapes) holding its state
         self.resident_ready = {}  # block -> event of the copy filling its resident tensors on the transfer stream (fetch waits for it)
-        self.allow_resident = resident and manager is not None and entries is not None
+        self.allow_resident = bool(resident) and manager is not None and entries is not None
+        self.dynamic = self.allow_resident and resident == "dynamic"
+        self.serial = next(_serials)
+        self.written = set()  # dynamic: blocks whose record holds their state (the others are only in VRAM)
+        self.wanted = None  # dynamic: the groups the dynamic preload keeps in VRAM (None: no plan, they stay where they are)
+        self.promote = set()  # dynamic: blocks of wanted groups, filled in VRAM when they would be streamed
+        self.deferred = set()  # dynamic: groups to leave the VRAM at the next pass (the block running was one of theirs)
+        self.refused = set()  # dynamic: groups not kept in VRAM by the pass storing them (no room left beside its peak)
+        self.admitted = set()  # dynamic: groups the pass storing them keeps in VRAM
+        self.reported = None
+        self.storing = False  # dynamic: the pass storing the blocks runs (what it keeps in VRAM counts as its activations: it is measured)
+        self.last = None  # dynamic: the block last stored or fetched
         self.planning, self.thread = False, None  # residency being planned (its allocations); the thread running the blocks
         self.staged = {}  # block -> (staging buffer index, future of its copy)
         self.mmgp_staged = set()  # pageable records staged in MMGP's staging ring with their blocks (offload._schedule_ring / _transfer)
         self.generation = 0  # bumped when the stored records change: a record MMGP staged before then is not transferred
         self.current = None  # the block last fetched: its compute is not queued yet when MMGP transfers the next blocks
         self.locked_bytes = self.pageable_bytes = 0
+        self.owner, self.stride = None, 0  # dynamic: the owner of the records' RAM (locked in place once written), a record's pages
         self.modules = []
         for index, module in enumerate(modules or ()):
             rings = module.__dict__.get("_mm_state_rings")
@@ -141,6 +168,30 @@ class StateRing:
     def resident_bytes(self):
         return sum(t.untyped_storage().nbytes() for tensors in self.resident.values() for t in tensors)
 
+    @property
+    def vram_bytes(self):
+        """The VRAM counted with the model's weights: the state kept in VRAM, and the slots of a dynamic ring."""
+        slots = sum(t.untyped_storage().nbytes() for slot in self.slots for t in slot) if self.dynamic and self.slots is not None else 0
+        return self.resident_bytes + slots
+
+    @property
+    def groups(self):
+        """Number of whole groups of `count` consecutive blocks, the units kept in VRAM."""
+        return self.blocks // self.count
+
+    @property
+    def group_bytes(self):
+        """VRAM of a group kept in VRAM (a dynamic ring's tensors have their exact shapes)."""
+        return self.count * _packed([((shape[0] + (not self.dynamic), *shape[1:]), dtype) for shape, dtype in self.capacity])[1]
+
+    @property
+    def slot_bytes(self):
+        return self.count * self.record
+
+    def stages(self, block):
+        """Whether MMGP's staging ring may move the block's record with its weights (offload._schedule_ring): stored in RAM, not locked."""
+        return block in self.stored and (not self.dynamic or block in self.written and block not in self.resident and not self.records[block][1])
+
     def _room(self):
         """The VRAM the model's preload leaves to the state this ring keeps in VRAM: its room, less the state the model's other rings keep."""
         return self.manager.state_room(self.model_id) - (self.manager.state_bytes(self.model_id) - self.resident_bytes)
@@ -151,11 +202,11 @@ class StateRing:
             stream = self.__dict__.setdefault("own_stream", torch.cuda.Stream(self.device))
         return stream
 
-    def _plan(self, room, own_staging):
-        """The blocks whose records are locked, following MMGP's schedule for the tower: the blocks whose weights it streams from pinned RAM,
-        then those it keeps in VRAM (the other way round with MMGP's staging ring, which stages the records of the blocks it streams, but not
-        of those it keeps in VRAM), as many as room allows, spread over each group as MMGP spreads its pinned blocks; the records of the
-        blocks whose weights cross its staging ring are staged. Without a managed model, spread over all the blocks."""
+    def _lock_groups(self):
+        """The blocks whose records are locked first, in groups, following MMGP's schedule for the tower: the blocks whose weights it streams
+        from pinned RAM, then those it keeps in VRAM (the other way round with MMGP's staging ring, which stages the records of the blocks it
+        streams, but not of those it keeps in VRAM); the records of the blocks whose weights cross its staging ring are staged. Without a
+        managed model, all the blocks."""
         manager = self.manager
         if self.entries is not None and hasattr(manager, "needs_staging"):
             preloaded = manager.preloaded_blocks_per_model.get(self.model_id, ())
@@ -167,6 +218,12 @@ class StateRing:
                 groups = groups[::-1]
         else:
             groups = (list(range(self.blocks)),)
+        return groups
+
+    def _plan(self, room, own_staging):
+        """The blocks whose records are locked (_lock_groups), as many as room allows, spread over each group as MMGP spreads its pinned
+        blocks."""
+        groups = self._lock_groups()
         candidates = sum(len(group) for group in groups)
         lockable = room // self.record
         if lockable < self.blocks and own_staging:  # some records staged by the ring itself: room for its staging buffers first
@@ -195,6 +252,21 @@ class StateRing:
         # buffers of the ring's own for the records MMGP does not stage, but for a model MMGP does not pin (profile 5): without MMGP's ring
         # its records then cross synchronously, as its weights
         own_staging = self.entries is None or self.model_id in self.manager.pinned_models
+        if self.dynamic:  # every record in RAM of its own pages, unlocked until written (_lock_records); no slot until a block streams
+            self.stride = -(-self.record // pinned.PAGE) * pinned.PAGE
+            ram, self.owner = pinned.block(self.stride * self.blocks)
+            self.memory.append(ram)
+            for block in range(self.blocks):
+                self.full[block] = (ram[block * self.stride:block * self.stride + self.record], self.owner is None)  # None: driver pinned
+            if self.owner is None:
+                self.locked_bytes = self.record * self.blocks
+            else:
+                self.pageable_bytes = self.record * self.blocks
+                if mmgp_staging:
+                    for block in range(self.blocks):
+                        self.manager.state_records.setdefault(self.entries[block], []).append((self, block))
+                    self.mmgp_staged = set(range(self.blocks))
+            return
         locked = self._plan(room, own_staging)
         if locked:
             ram, registration = _locked(self.record * len(locked), self.device)
@@ -218,22 +290,38 @@ class StateRing:
                     self.manager.state_records.setdefault(self.entries[block], []).append((self, block))
                 self.mmgp_staged = set(pageable)
             if own_staging and room >= (len(locked) + self.staging_count) * self.record:
-                for _ in range(self.staging_count):
-                    buffer, registration = _locked(self.record, self.device)
-                    if registration is None:
-                        break
-                    self.registrations.append(registration)
-                    self.staging.append([buffer, None])  # [locked buffer, event of the transfer that reads it]
-                if len(self.staging) == self.staging_count:
-                    self.copier = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mmgp_state_ring")
-                else:
-                    self._unlock(self.staging)
+                self._make_staging()
             tqdm.write(f"[mmgp] {self.name}: {self.locked_bytes / 2 ** 20:.0f} MB locked, {self.pageable_bytes / 2 ** 20:.0f} MB in pageable RAM "
                        + ("moved ahead with their blocks through MMGP's staging ring" + (", or through locked staging buffers" if self.copier else "") if mmgp_staging
                           else "moved ahead through locked staging buffers" if self.copier
                           else "transferred synchronously (no reserved RAM left)" if own_staging else "transferred synchronously, as the weights of its model"))
+        self._ensure_slots()
+
+    def _make_staging(self):
+        """The locked buffers into which the copier thread moves pageable records ahead of their transfer."""
+        for _ in range(self.staging_count):
+            buffer, registration = _locked(self.record, self.device)
+            if registration is None:
+                break
+            self.registrations.append(registration)
+            self.staging.append([buffer, None])  # [locked buffer, event of the transfer that reads it]
+        if len(self.staging) == self.staging_count:
+            self.copier = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mmgp_state_ring")
+        else:
+            self._unlock(self.staging)
+
+    def _ensure_slots(self):
+        """The GPU slots of the streamed blocks (a dynamic ring makes them when a block first streams), the streamed blocks' views of them."""
+        if self.slots is not None:
+            return
         self.slots = [[torch.empty(shape, dtype=dtype, device=self.device) for shape, dtype in self.capacity] for _ in range(self.count)]
-        self.ready = [torch.cuda.Event() for _ in range(self.count)]
+        self.ready, self.held = [torch.cuda.Event() for _ in range(self.count)], [None] * self.count
+        if self.layout is not None:
+            self.views = [[tensor[:shape[0]] for tensor, (shape, _, _, _) in zip(slot, self.layout)] for slot in self.slots]
+            for block in self.stored - set(self.resident):
+                self.handles[block][:] = self.views[block % self.count]
+        if self.dynamic and not self.storing:
+            self.manager.state_changed(self.model_id)  # the slots count with the model's weights
 
     def _fits(self, shapes):
         return len(shapes) == len(self.capacity) and all(dtype == held_dtype and len(shape) == len(held) and shape[1:] == held[1:] and shape[0] <= held[0]
@@ -243,9 +331,10 @@ class StateRing:
         """The tensors stored from now on (after a reset): their packing in the records, the views of the slots and of the resident tensors."""
         self.layout, used = _packed(shapes)
         self.records = {block: (ram[:used], locked) for block, (ram, locked) in self.full.items()}
-        self.views = [[tensor[:shape[0]] for tensor, (shape, _) in zip(slot, shapes)] for slot in self.slots]
+        self.views = None if self.slots is None else [[tensor[:shape[0]] for tensor, (shape, _) in zip(slot, shapes)] for slot in self.slots]
         for block in range(self.blocks):
-            self.handles.setdefault(block, [])[:] = self._resident_views(block) if block in self.resident else self.views[block % self.count]
+            self.handles.setdefault(block, [])[:] = (self._resident_views(block) if block in self.resident
+                                                     else [] if self.views is None else self.views[block % self.count])
 
     def _resident_views(self, block):
         return [tensor[:shape[0]] for tensor, (shape, _, _, _) in zip(self.resident[block], self.layout)]
@@ -298,9 +387,164 @@ class StateRing:
         event = self.resident_ready.pop(block, None)
         if event is not None:  # the memory is reused after the copy that fills it
             torch.cuda.current_stream().wait_event(event)
-        del self.resident[block]
-        if self.views is not None:
-            self.handles[block][:] = self.views[block % self.count]
+        tensors = self.resident.pop(block)
+        if self.dynamic:  # CUDA graphs adopted them as the static buffers of the block's arguments: they let them go
+            self._forget(tensors)
+        self.handles[block][:] = [] if self.views is None else self.views[block % self.count]  # a dynamic ring's slots come at its fetch
+
+    def _group(self, group):
+        return range(group * self.count, (group + 1) * self.count)
+
+    def _forget(self, tensors):
+        graphs = getattr(self.manager, "cuda_graphs", {}).get(self.model_id)
+        if graphs is not None:
+            graphs.forget_storage(tensors)
+
+    def _new_resident(self, blocks, adopted=None):
+        """GPU tensors of their own for the blocks' state (or adopted: the tensors a store handed over), which CUDA graphs adopt as the static
+        buffers of the block's arguments, as they adopt a cache kept on the GPU (no copy at each replay, a graph per guidance branch); they
+        let them go when they leave the VRAM."""
+        self.planning = True  # their allocation does not release the state of this ring
+        try:
+            for block in blocks:
+                self.resident[block] = list(adopted) if adopted is not None else [torch.empty(shape, dtype=dtype, device=self.device) for shape, dtype in self.capacity]
+                if self.layout is not None:
+                    self.handles.setdefault(block, [])[:] = self._resident_views(block)
+        finally:
+            self.planning = False
+        memory_pressure.register(self, 1.5 if auto_preload.STATE_FIRST else 0)  # after the preloaded blocks when the state ranks before them
+        if not self.storing:  # the cycle storing them measures them as its activations, as a cache the model would keep on the GPU
+            self.manager.state_changed(self.model_id)
+
+    def _admit(self, group):
+        """Dynamic, a group stored by the pass computing its state: kept in VRAM if the peak of the pass so far, raised by the group, stays
+        within the VRAM by the dynamic preload's margin (no VRAM pressure: the weights the preload keeps stay); otherwise stored in RAM."""
+        if group in self.admitted:
+            return True
+        if group >= self.groups or group in self.refused:
+            return False
+        if allocator.mark_peak(self.device) + self.group_bytes + auto_preload.MARGIN > allocator.stats(self.device)["reserved"] + allocator.room(self.device):
+            self.refused.add(group)
+            return False
+        self.admitted.add(group)  # its blocks get their tensors as they are stored
+        return True
+
+    def _write_back(self, block):
+        """A block's state kept only in VRAM is copied to its record (blocking), before it leaves the VRAM."""
+        event = self.resident_ready.pop(block, None)
+        if event is not None:
+            torch.cuda.current_stream().wait_event(event)
+        for view, tensor in zip(self._views(self.full[block][0]), self._resident_views(block)):
+            view.copy_(tensor)
+        self.written.add(block)
+
+    def _demote(self, group):
+        """A group of a dynamic ring leaves the VRAM, written back to RAM first: its blocks stream their records from now on."""
+        blocks = [block for block in self._group(group) if block in self.resident]
+        for block in blocks:
+            if block in self.stored and block not in self.written:
+                self._write_back(block)
+            self._drop(block)
+        self.promote.difference_update(blocks)
+        if blocks and not self.resident:
+            memory_pressure.unregister(self)
+        return bool(blocks)
+
+    def plan(self, groups):
+        """Dynamic: the groups the model's dynamic preload keeps in VRAM, at the start of its cycle (on the thread running the blocks). The
+        others leave now (the group of the block running at the next pass); the groups planned come back as their blocks are streamed
+        (fetch), without other transfers."""
+        self.wanted = set(groups)
+        current = None if self.current is None else self.current // self.count
+        changed = False
+        for group in sorted({block // self.count for block in self.resident} - self.wanted):
+            if group == current:
+                self.deferred.add(group)
+            else:
+                changed |= self._demote(group)
+        self.promote = {block for group in self.wanted for block in self._group(group) if block in self.stored and block not in self.resident}
+        if changed:
+            self.manager.state_changed(self.model_id)
+
+    def _promote(self, block):
+        """Dynamic, before a block planned in VRAM runs: its state fills tensors of its own from its slot (prefetched there) or its record,
+        if the VRAM has room for them without pressure (otherwise it streams again at this pass)."""
+        if cuda_graphs.recording() or torch.cuda.is_current_stream_capturing():
+            return
+        stats = allocator.stats(self.device)
+        if stats["reserved"] - stats["allocated"] + allocator.room(self.device) < self.group_bytes // self.count + memory_pressure.HEADROOM:
+            return
+        self.promote.discard(block)
+        slot = block % self.count
+        prefetched = self.slots is not None and self.held[slot] == block
+        self._new_resident([block])
+        if prefetched:  # the copy into its slot, then from there
+            torch.cuda.current_stream().wait_event(self.ready[slot])
+            for target, source in zip(self.handles[block], self.views[slot]):
+                target.copy_(source)
+            self.held[slot] = None
+        else:
+            ram, locked = self.records[block]
+            stream = self._stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for target, source in zip(self.handles[block], self._views(ram)):
+                    target.copy_(source, non_blocking=locked)
+                self.resident_ready.setdefault(block, torch.cuda.Event()).record(stream)
+
+    def _lock_records(self):
+        """Dynamic, at the start of a pass: the records written since are locked (asynchronous transfers), in the order of _lock_groups, as
+        far as the reserved RAM allows; a locked record leaves MMGP's staging ring. Then the ring's own staging buffers, if records it moves
+        itself stay pageable."""
+        budget = getattr(self.manager, "max_reservable_memory", 0)
+        waiting = {block for block in self.written if not self.full[block][1]}
+        if budget > 0 and waiting and self.owner is not None:
+            for group in self._lock_groups():
+                for block in [group[position] for position in auto_preload.even_order(len(group))]:
+                    if block not in waiting:
+                        continue
+                    if budget - pinned.total_bytes - offload._pool.reserved() < self.stride or not pinned.fits(self.stride, budget):
+                        break
+                    ram = self.full[block][0]
+                    registration = pinned.lock(self.owner, ram.data_ptr(), self.stride, "state")
+                    if registration is None:
+                        pinned.refused(self.stride)
+                        break
+                    self.registrations.append(registration)
+                    self.full[block] = (ram, True)
+                    self.records[block] = (self.records[block][0], True)
+                    self.locked_bytes, self.pageable_bytes = self.locked_bytes + self.record, self.pageable_bytes - self.record
+                    if block in self.mmgp_staged:
+                        self.mmgp_staged.discard(block)
+                        records = self.manager.state_records.get(self.entries[block], [])
+                        records[:] = [(ring, index) for ring, index in records if not (ring is self and index == block)]
+                        if not records:
+                            self.manager.state_records.pop(self.entries[block], None)
+        own_staging = self.model_id in self.manager.pinned_models
+        if (own_staging and self.copier is None and budget > 0 and budget - pinned.total_bytes - offload._pool.reserved() >= self.staging_count * self.record
+                and any(not self.full[block][1] and block not in self.mmgp_staged for block in self.written)):
+            self._make_staging()
+
+    def _pass_start(self):
+        """Dynamic, before the first block of a pass: the groups the plan let go while one of their blocks ran leave the VRAM, the records
+        written since are locked."""
+        self.storing, changed = False, False
+        for group in self.deferred:
+            if self.wanted is None or group not in self.wanted:
+                changed |= self._demote(group)
+        self.deferred = set()
+        if changed:
+            self.manager.state_changed(self.model_id)
+        self._lock_records()
+        self._report()
+
+    def _report(self):
+        report = (len(self.resident), self.locked_bytes // 2 ** 20, self.pageable_bytes // 2 ** 20)
+        if report != self.reported and self.stored:
+            self.reported = report
+            streamed = len(self.stored - set(self.resident))
+            tqdm.write(f"[mmgp] {self.name}: {len(self.resident)} of {self.blocks} blocks in VRAM" + (
+                f", {streamed} streamed from RAM ({report[1]} MB of their records locked, {report[2]} MB pageable)" if streamed else ""))
 
     def _trim(self):
         """Before a pass, on the thread running the blocks: whole groups leave the VRAM while the state kept there exceeds the room (the
@@ -320,26 +564,39 @@ class StateRing:
         self.manager.state_changed(self.model_id)
 
     def drop_resident(self):
-        """All the state kept in VRAM leaves it (the model is unloaded: a quiet point)."""
+        """All the state kept in VRAM leaves it (the model is unloaded: a quiet point), written back to RAM first by a dynamic ring."""
         if self.resident:
             for block in list(self.resident):
+                if self.dynamic and block in self.stored and block not in self.written:
+                    self._write_back(block)
                 self._drop(block)
+            self.promote.clear()
             for block in range(self.blocks):
                 self.handles[block][:] = self.views[block % self.count] if self.views is not None else []
             memory_pressure.unregister(self)
             self.manager.state_changed(self.model_id)
 
-    def on_pressure(self, need):
+    def on_pressure(self, need, parked=False):
         """The allocator found the VRAM short: state kept in VRAM leaves it first (before the weights), except that of the block running;
-        only on the thread running the blocks, not while a CUDA graph is captured. Returns the bytes the allocator got back (another holder
-        of a tensor keeps it), which shrink the room of the next plans (offload.state_pressure)."""
-        if (need <= 0 or self.planning or not self.resident or threading.get_ident() != self.thread or cuda_graphs.recording()
+        only on the thread running the blocks (any thread while its offload object is parked: offload.park), not while a CUDA graph is
+        captured. Returns the bytes the allocator got back (another holder of a tensor keeps it), which shrink the room of the next plans
+        (offload.state_pressure)."""
+        if (need <= 0 or self.planning or not self.resident or not parked and threading.get_ident() != self.thread or cuda_graphs.recording()
                 or torch.cuda.is_current_stream_capturing()):
             return 0
         self._stream().wait_stream(torch.cuda.current_stream())  # the work queued so far may still read it
         before = _allocated(self.device)
         freed = 0
-        for block in sorted(self.resident, reverse=True):
+        if self.dynamic:  # whole groups, written back, the last of the plan's order first; the group running stays
+            running = None if parked or self.current is None else self.current // self.count
+            for group in reversed(auto_preload.even_order(self.groups)):
+                if freed >= need:
+                    break
+                if group != running and self._demote(group):
+                    if self.wanted is not None:
+                        self.wanted.discard(group)  # not filled again before the next plan
+                    freed = before - _allocated(self.device)
+        for block in [] if self.dynamic else sorted(self.resident, reverse=True):
             if freed >= need:
                 break
             if block != self.current:
@@ -349,16 +606,18 @@ class StateRing:
             memory_pressure.unregister(self)
         self.manager.state_changed(self.model_id)
         if freed > 0:
-            self.manager.state_pressure(self.model_id, freed)
+            if not parked:  # parked: what other models take does not count against its workload
+                self.manager.state_pressure(self.model_id, freed, dynamic=True) if self.dynamic else self.manager.state_pressure(self.model_id, freed)
             tqdm.write(f"[mmgp] {self.name}: VRAM short, {freed / 2 ** 20:.0f} MB of state kept in VRAM released")
         return max(0, freed)
 
-    def store(self, block, tensors, current=False):
+    def store(self, block, tensors, current=False, adopt=False):
         """Keeps block's tensors (GPU or CPU tensors, or lists of row pieces; the same shapes and dtypes for every block) in RAM, a blocking
         copy: the caller may then free them. Returns the list of GPU tensors the block reads (read it at each pass: the ring rebinds its
         items when the block's state enters or leaves the VRAM), which hold these values already with current=True (the pass computing them
         reads them) or for a block whose state is kept in VRAM, and from its next fetch otherwise. After a reset, blocks may store fewer rows
-        than before (views of the same memory) or more (the records and the slots are made again)."""
+        than before (views of the same memory) or more (the records and the slots are made again). adopt: a dynamic ring keeping the block in
+        VRAM may keep these GPU tensors themselves (whole tensors of the stored shapes, that the caller no longer uses), without a copy."""
         shapes = [_joined(tensor) for tensor in tensors]
         self.thread = threading.get_ident()  # the thread storing the blocks runs them
         if self.capacity is not None and not self.stored and not self._fits(shapes):  # more rows after a reset: made again
@@ -366,20 +625,43 @@ class StateRing:
         if self.capacity is None:
             self._allocate(shapes)
         if not self.stored:
-            if self.allow_resident:
+            if self.dynamic:
+                self._begin_store()
+            elif self.allow_resident:
                 self._plan_resident()
             self._set_layout(shapes)
         elif [(shape, dtype) for shape, dtype, _, _ in self.layout] != shapes:
             raise ValueError(f"{self.name}: block {block} stores tensors of another layout than the first block's")
         ram, locked = self.full[block]
-        for view, tensor in zip(self._views(ram), tensors):
-            _copy_rows(view, tensor)  # blocking (device to host)
+        # a dynamic ring keeps a block computed by this pass in VRAM if its group is kept there, without any copy to RAM
+        in_vram = self.dynamic and (block in self.resident or current and self._admit(block // self.count))
+        if in_vram:
+            self.written.discard(block)
+        else:
+            for view, tensor in zip(self._views(ram), tensors):
+                _copy_rows(view, tensor)  # blocking (device to host)
+            self.written.add(block)
         if block in self.stored:  # stored again: what MMGP staged of it before is stale
             self.generation += 1
         self.stored.add(block)
         slot = block % self.count
         self.staged.pop(block, None)
-        if block in self.resident and current:  # filled once here, not at each pass
+        if self.dynamic:
+            self.last = block
+        if self.dynamic and not in_vram:
+            self._ensure_slots()
+            self.handles[block][:] = self.views[slot]
+        if in_vram and block not in self.resident:  # the tensors handed over, or tensors of its own
+            adopted = adopt and all(isinstance(tensor, torch.Tensor) and tensor.is_cuda and (tuple(tensor.shape), tensor.dtype) == (tuple(shape), dtype)
+                                    and tensor.is_contiguous() and tensor.storage_offset() == 0 and tensor.untyped_storage().nbytes() == tensor.nbytes
+                                    for tensor, (shape, dtype) in zip(tensors, self.capacity))
+            self._new_resident([block], tensors if adopted else None)
+            if adopted:
+                tensors = ()
+        if block in self.resident and (current or in_vram):  # filled once here, not at each pass
+            event = self.resident_ready.pop(block, None)
+            if event is not None:  # a copy of its former state in flight
+                torch.cuda.current_stream().wait_event(event)
             for target, tensor in zip(self.handles[block], tensors):
                 _copy_rows(target, tensor)
         elif block in self.resident:  # from its record on the transfer stream (asynchronous from locked RAM), which fetch waits for; the
@@ -398,6 +680,15 @@ class StateRing:
         elif self.held[slot] == block:  # an earlier copy of this block in its slot is stale
             self.held[slot] = None
         return self.handles[block]
+
+    def _begin_store(self):
+        """Dynamic: blocks stored after a reset (the pass computing them). Without a plan of the dynamic preload, the peak of this pass is
+        measured from here (the cycles other models left open end first, as when a model loads)."""
+        self.wanted, self.promote, self.deferred, self.refused, self.admitted, self.storing = None, set(), set(), set(), set(), True
+        preload = getattr(self.manager, "auto_preload", None)
+        if preload is None or self.model_id not in preload.plans:
+            auto_preload.end_open_cycles(self.manager, self.model_id)
+            allocator.mark_reset(self.device)
 
     def _stage(self, block):
         """The copier thread copies block's pageable record into a free staging buffer (after the transfer that last read it)."""
@@ -460,14 +751,23 @@ class StateRing:
         if block not in self.stored:
             return
         self.thread = threading.get_ident()
-        if self.resident and block == min(self.stored):  # a pass starts: the state kept in VRAM within the room
-            self._trim()
-        if block in self.resident and not self._weights_resident(block):
-            self._stream().wait_stream(torch.cuda.current_stream())
-            self._drop(block)
-            if not self.resident:
-                memory_pressure.unregister(self)
-            self.manager.state_changed(self.model_id)
+        if self.dynamic:
+            if block == min(self.stored) and self.last != block:  # a pass starts (not another guidance branch calling the same block)
+                self._pass_start()
+            self.last = block
+            if block in self.promote:
+                self._promote(block)
+            if self.slots is None and any(stored not in self.resident for stored in self.stored):
+                self._ensure_slots()
+        else:
+            if self.resident and block == min(self.stored):  # a pass starts: the state kept in VRAM within the room
+                self._trim()
+            if block in self.resident and not self._weights_resident(block):
+                self._stream().wait_stream(torch.cuda.current_stream())
+                self._drop(block)
+                if not self.resident:
+                    memory_pressure.unregister(self)
+                self.manager.state_changed(self.model_id)
         slot, self.current = block % self.count, block
         if block not in self.resident:
             if self.held[slot] != block:
@@ -510,13 +810,17 @@ class StateRing:
         self._quiet()
         self.held, self.stored = [None] * self.count, set()
         self.generation += 1
+        self.written, self.promote, self.deferred = set(), set(), set()  # the records are stale
 
     def _free(self):
         """Frees the slots, the state kept in VRAM and the RAM (waits for the GPU); the ring stays attached to the blocks."""
         if self.copier is not None:
             self.copier.shutdown()
-        if self.resident:
+        self.stored, self.written, self.promote, self.deferred, self.refused, self.wanted, self.reported = set(), set(), set(), set(), set(), None, None
+        if self.resident:  # nothing stored: nothing written back
             self.drop_resident()
+        if self.dynamic and self.slots is not None:  # the graphs that adopted the slots let them go
+            self._forget([tensor for slot in self.slots for tensor in slot])
         self.slots, self.views, self.held, self.ready, self.stored, self.full, self.records, self.memory, self.staging, self.copier = \
             None, None, [None] * self.count, [None] * self.count, set(), {}, {}, [], [], None
         for block in self.mmgp_staged:
@@ -525,7 +829,7 @@ class StateRing:
             if not records:
                 self.manager.state_records.pop(self.entries[block], None)
         self.mmgp_staged, self.generation = set(), self.generation + 1
-        self.capacity, self.layout, self.locked_bytes, self.pageable_bytes = None, None, 0, 0
+        self.capacity, self.layout, self.locked_bytes, self.pageable_bytes, self.owner, self.stride = None, None, 0, 0, None, 0
         for registration in self.registrations:
             registration.close()
         self.registrations = []

@@ -146,7 +146,7 @@ A start image or reference image can set the canvas shape. With a start image, o
 
 | Setting | Type | Meaning |
 | --- | --- | --- |
-| `postprocess_audio` | string | Audio post-processing method. Empty disables. Built-ins include `custom`, `mmaudio`, `control`, `seedvc_one_speaker`, `seedvc_two_speakers`, and for audio edit tasks `remove_background`; plugins may register more methods. |
+| `postprocess_audio` | string | Audio post-processing method. Empty disables. Built-ins include `custom`, `mmaudio`, `control`, `seedvc_one_speaker`, `seedvc_two_speakers`, and for audio edit tasks `remove_background`; Plugins may register more methods. |
 | `postprocess_audio_prompt` | string | Positive prompt for audio processors that request a prompt. |
 | `postprocess_audio_neg_prompt` | string | Negative prompt for audio processors that request a negative prompt. |
 | `replace_voice_method` | string | Voice-replacement processor used after generated or remuxed audio. Empty disables. |

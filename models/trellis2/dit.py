@@ -4,6 +4,8 @@
 # and texture flows over the active voxels of one sample (batch 1, so the sparse attention is a plain attention over all of them).
 # Precision follows upstream: the blocks run in BF16 with FP32 norms, q/k RMS norms and RoPE; the timestep embedder, the shared
 # AdaLN projection and the input/output layers compute in FP32 (upstream keeps them FP32 and loads the BF16 checkpoint into them).
+# The q/k norms and RoPE run in the shared kernels (shared.kernels.ops), fused with the SageAttention 2 quantization when it is used;
+# the AdaLN modulation, the output projections with their (gated) residuals and the FFN run in the shared operations as well.
 # Modifications Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import numpy as np
 import torch
@@ -11,11 +13,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from shared import attention_kit
+from shared.kernels import ops
 from shared.utils.phase_progress import check_abort
 from .sparse import row_chunks
-
-_FFN_ELEMENTS = 1 << 26  # bound of the FFN intermediate of one chunk of tokens
-
 
 def fused_split_map(channels):
     """mmgp split map of the fused upstream projections: self-attention to_qkv and cross-attention to_kv become separate q/k/v linears."""
@@ -38,26 +38,17 @@ def rope_phases(coords, head_dim, rope_freq=(1.0, 10000.0)):
     return phases
 
 
-def _norm_rows(part, gamma, scale, phases=None):
-    """Upstream MultiHeadRMSNorm (F.normalize * gamma * sqrt(head_dim) in FP32, rounded) then RoPE (complex product in FP32, rounded)
-    of rows (batch, tokens, heads, head_dim)."""
-    y = (F.normalize(part.float(), dim=-1) * gamma * scale).to(part.dtype)
-    if phases is None:
-        return y
-    y = torch.view_as_complex(y.float().reshape(*y.shape[:-1], -1, 2)) * phases.unsqueeze(-2)
-    return torch.view_as_real(y).flatten(-2).to(part.dtype)
-
-
 class MultiHeadRMSNorm(nn.Module):
+    """Upstream F.normalize(x) * gamma * sqrt(head_dim) in FP32, rounded: the RMSNorm with eps 1e-24 / head_dim (F.normalize's
+    1e-12 floor on the norm) and a weight row per head."""
+
     def __init__(self, dim, heads):
         super().__init__()
-        self.scale = dim ** 0.5
         self.gamma = nn.Parameter(torch.ones(heads, dim))
 
-    def apply_(self, tensor, heads=None, phases=None):
-        """In place on tensor (batch, tokens, heads, head_dim) by chunks of tokens; heads: the head range held by tensor."""
-        gamma = self.gamma if heads is None else self.gamma[heads.start:heads.stop]
-        attention_kit.rows_(tensor, lambda part, first, last: _norm_rows(part, gamma, self.scale, None if phases is None else phases[first:last]))
+    def heads(self, heads):
+        """(weight, eps) of the shared q/k kernels for the head range heads."""
+        return self.gamma[heads.start:heads.stop], 1e-24 / self.gamma.shape[-1]
 
 
 class SelfAttention(nn.Module):
@@ -71,15 +62,17 @@ class SelfAttention(nn.Module):
         self.k_rms_norm = MultiHeadRMSNorm(self.head_dim, heads)
         self.to_out = nn.Linear(channels, channels)
 
-    def forward(self, x_list, phases):
+    def attend(self, x_list, rope):
+        """Attention output (batch, tokens, heads, head_dim) before to_out. Upstream norm then RoPE: the norm output rounded, then
+        rotated in FP32 and rounded (or quantized for SageAttention)."""
         def norm_rope(query, key, group):
-            if query is not None:
-                self.q_rms_norm.apply_(query, group.q, phases)
-            if key is not None:
-                self.k_rms_norm.apply_(key, group.kv, phases)
+            ops.interleaved_norm_rope_(query, key, rope, self.q_rms_norm.heads(group.q), self.k_rms_norm.heads(group.kv))
 
-        out = attention_kit.qkv_attention(x_list, self.to_q, self.to_k, self.to_v, self.heads, self.head_dim, norm_rope)
-        return self.to_out(out.flatten(2))
+        def fused_quant(query, key, group, core, settings):
+            return ops.split_half_norm_rope_quant_(query, key, rope, self.q_rms_norm.heads(group.q), self.k_rms_norm.heads(group.kv), core, settings,
+                                                   interleaved=True)
+
+        return attention_kit.qkv_attention(x_list, self.to_q, self.to_k, self.to_v, self.heads, self.head_dim, norm_rope, fused_quant=fused_quant)
 
 
 class CrossAttention(nn.Module):
@@ -93,14 +86,15 @@ class CrossAttention(nn.Module):
         self.k_rms_norm = MultiHeadRMSNorm(self.head_dim, heads)
         self.to_out = nn.Linear(channels, channels)
 
-    def forward(self, x_list, context):
-        query = self.to_q(x_list.pop()).unflatten(-1, (self.heads, self.head_dim))
-        self.q_rms_norm.apply_(query)
-        key = self.to_k(context).unflatten(-1, (self.heads, self.head_dim))
-        self.k_rms_norm.apply_(key)
-        qkv_list = [query, key, self.to_v(context).unflatten(-1, (self.heads, self.head_dim))]
-        del query, key
-        return self.to_out(attention_kit.kv_first_attention(qkv_list).flatten(2))
+    def attend(self, x_list, context):
+        """Attention output (batch, tokens, heads, head_dim) before to_out."""
+        def norm(query, key, group):
+            ops.interleaved_norm_rope_(query, key, None, self.q_rms_norm.heads(group.q), self.k_rms_norm.heads(group.kv))
+
+        def fused_quant(query, key, group, core, settings):
+            return ops.split_half_norm_rope_quant_(query, key, None, self.q_rms_norm.heads(group.q), self.k_rms_norm.heads(group.kv), core, settings)
+
+        return attention_kit.cross_qkv_attention(x_list, [context], self.to_q, self.to_k, self.to_v, self.heads, self.head_dim, norm, fused_quant=fused_quant)
 
 
 class FeedForward(nn.Module):
@@ -109,40 +103,32 @@ class FeedForward(nn.Module):
         self.mlp = nn.Sequential(nn.Linear(channels, hidden), nn.GELU(approximate="tanh"), nn.Linear(hidden, channels))
 
 
-def _layer_norm(x, weight=None, bias=None, eps=1e-6, scale1=None, shift=None):
-    """Upstream LayerNorm32 (FP32, rounded to the activation dtype), then h * (1 + scale) + shift as separate BF16 ops when given, into a
-    new tensor by chunks of tokens (bounded FP32 scratch)."""
-    out = torch.empty_like(x)
-    weight, bias = (None, None) if weight is None else (weight.float(), bias.float())
-    for start, stop in row_chunks(x.shape[1], x.shape[-1]):
-        part = F.layer_norm(x[:, start:stop].float(), x.shape[-1:], weight, bias, eps).to(x.dtype)
-        out[:, start:stop] = part if scale1 is None else part.mul_(scale1).add_(shift)
-    return out
-
-
 class TransformerBlock(nn.Module):
     """ModulatedTransformerCrossBlock / ModulatedSparseTransformerCrossBlock with a shared AdaLN modulation and a per-block offset."""
 
     def __init__(self, channels, ctx_channels, heads, mlp_ratio):
         super().__init__()
         self.hidden = int(channels * mlp_ratio)
+        self.norm1 = nn.LayerNorm(channels, eps=1e-6, elementwise_affine=False)
         self.norm2 = nn.LayerNorm(channels, eps=1e-6, elementwise_affine=True)
+        self.norm3 = nn.LayerNorm(channels, eps=1e-6, elementwise_affine=False)
         self.self_attn = SelfAttention(channels, heads)
         self.cross_attn = CrossAttention(channels, ctx_channels, heads)
         self.mlp = FeedForward(channels, self.hidden)
         self.modulation = nn.Parameter(torch.zeros(6 * channels))
 
-    def forward(self, x, mod, context, phases):
-        """x (1, tokens, channels) BF16, updated in place; mod (1, 6 * channels) BF16."""
+    def forward(self, x, mod, context, rope):
+        """x (1, tokens, channels) BF16, updated in place; mod (1, 6 * channels) BF16; rope (1, tokens, 1, head_dim / 2, 2) FP32."""
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (self.modulation.float() + mod).to(mod.dtype).chunk(6, dim=1)
-        scale_msa, scale_mlp = 1 + scale_msa, 1 + scale_mlp
+        rows = x.view(-1, x.shape[-1])
+        spans = [(0, rows.shape[0], 0)]
         # each attention input is handed off in its list: the attention releases it after its projections
-        x.add_(self.self_attn([_layer_norm(x, scale1=scale_msa, shift=shift_msa)], phases).mul_(gate_msa))
-        x.add_(self.cross_attn([_layer_norm(x, self.norm2.weight, self.norm2.bias, self.norm2.eps)], context))
-        # the FFN by chunks of tokens: norm, modulation, MLP and gate are row-wise, so one chunk of the intermediate exists at a time
-        for start, stop in row_chunks(x.shape[1], self.hidden, _FFN_ELEMENTS):
-            part = x[:, start:stop]
-            part.add_(self.mlp.mlp(_layer_norm(part, scale1=scale_mlp, shift=shift_mlp)).mul_(gate_mlp))
+        y = self.self_attn.attend([ops.norm_modulate([rows], self.norm1, shift_msa, scale_msa, spans).view(x.shape)], rope)
+        ops.gated_linear(self.self_attn.to_out, [y.view(rows.shape)], rows, gate_msa, spans)
+        y = self.cross_attn.attend([self.norm2(x)], context)
+        ops.linear_residual_(self.cross_attn.to_out, [y.view(rows.shape)], rows)
+        del y
+        ops.mlp([ops.norm_modulate([rows], self.norm3, shift_mlp, scale_mlp, spans)], self.mlp.mlp[0], self.mlp.mlp[2], "gelu", residual=rows, gate=gate_mlp[0])
         return x
 
 
@@ -185,9 +171,10 @@ class TrellisFlowDiT(nn.Module):
             mod = self.adaLN_modulation(self.t_embedder(t)).to(torch.bfloat16)
         hidden = [h] + [h.clone() for _ in contexts[1:]]
         del h
+        rope = torch.view_as_real(phases)[None, :, None]  # cos / sin of each channel pair
         for block in self.blocks:
             for h, context in zip(hidden, contexts):
-                block(h, mod, context, phases)
+                block(h, mod, context, rope)
             check_abort()
         outputs = []
         while hidden:

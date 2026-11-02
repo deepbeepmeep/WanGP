@@ -6,19 +6,34 @@ This guide will help you get started with WanGP video generation quickly and eas
 
 Before starting, ensure you have:
 - A compatible GPU (RTX 20XX or newer recommended)
-- Python 3.11.14 installed
+- Python 3.11.14 for manual installation; guided installers can prepare Python for you
 - At least 6GB of VRAM for basic models
 - Internet connection for model downloads
 
 ## Quick Setup
 
-### Option 1: One-Click Installation (Recommended)
-Use [Pinokio App](https://pinokio.computer/) for the easiest installation experience.
+### Method 1: Bat/SH Scripts
 
-### Option 2: Manual Installation
+Use the included `scripts/install.bat` on Windows or `scripts/install.sh` on Linux/macOS. See the [script instructions](../README.md#one-click-batsh-script-auto-installer).
+
+### Method 2: Pinokio
+
+Use [Pinokio App](https://pinokio.computer/) with the community *wan2gp* or *wan2gp-amd* scripts by **Morpheus**.
+
+### Method 3: Wan2GP Desktop
+
+[Wan2GP Desktop by GKArtist](https://github.com/GKartist75/Wan2GP-Desktop-Tauri) installs, updates and launches WanGP from a desktop window.
+
+### Method 4: WanGP Manager (Experimental, Windows)
+
+WanGP Manager is the official experimental Windows x64 app for guided installation, launching, updates and rollback. **Download:** [WanGPManager.exe](https://github.com/deepbeepmeep/WanGP/releases/latest/download/WanGPManager.exe). This permanent link downloads the latest Manager release.
+
+Run the executable and follow Manager's **Install** tab. It prepares Python and dependencies, recommends a profile for your detected GPU and lets you select a WanGP version. After installation, click **Start WanGP**, then **Open in App** or **Open in Browser**. See the [Manager instructions](../README.md#wangp-manager-experimental-windows).
+
+### Manual Installation
 ```bash
-git clone https://github.com/deepbeepmeep/Wan2GP.git
-cd Wan2GP
+git clone https://github.com/deepbeepmeep/WanGP.git
+cd WanGP
 conda create -n wan2gp python=3.11.14
 conda activate wan2gp
 pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 --index-url https://download.pytorch.org/whl/cu130
@@ -28,6 +43,8 @@ pip install -r requirements.txt
 For detailed installation instructions, see [INSTALLATION.md](INSTALLATION.md).
 
 ## First Launch
+
+With WanGP Manager, use **Start WanGP** and choose **Open in App** or **Open in Browser**. With another guided installer, use its launch action. The command below is for a manual installation.
 
 ### Basic Launch
 ```bash

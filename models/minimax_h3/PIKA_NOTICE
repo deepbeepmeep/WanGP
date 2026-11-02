@@ -1,0 +1,14 @@
+Pika H3 Flex
+
+Sampling code adapted from https://github.com/Pika-Labs/Pika-H3-Flex
+Revision: 64d81b2e98aa8aa1cf078b07a6ef3aaeae1033da
+Copyright (c) 2026 Mellis, Inc.
+The source inference code is licensed under Apache License 2.0.
+See PIKA_LICENSE.
+
+The Pika H3 Flex adapters are Model Derivatives of MiniMax H3 and are
+distributed under the MiniMax H3 Community License Agreement. Their
+upstream notices and license accompany the downloadable adapters.
+
+WanGP adaptations use its existing H3 components and native tensor layouts,
+with explicit random generators and in-place consistency sampling updates.

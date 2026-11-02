@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 import torch
 from shared.kernels import vae_ops
-from shared.utils.conv_bands import band_convs, conv_bands
+from shared.utils.conv_bands import band_convs, conv_bands, downsample_bands
 from .autoencoder import norm_swish
 from einops import rearrange
 from torch import Tensor, nn
@@ -65,9 +65,51 @@ class ResnetBlock(nn.Module):
         if self.in_channels != self.out_channels:
             self.nin_shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
 
-    def forward(self, x_list):
-        """x_list: [input], emptied so that the input can be released once read (its shortcut projection is taken first)."""
+    def forward(self, x_list, scratch=None):
+        """Consume [input]. scratch, when supplied, borrows the disjoint hidden half of this level's row-interleaved storage."""
         x = x_list.pop()
+        if vae_ops.image_norm_conv_supported(x, self.norm1):
+            if x.stride(1) != 1:
+                x = x.contiguous(memory_format=torch.channels_last)
+            if (self.in_channels == 2 * self.out_channels and x.is_contiguous(memory_format=torch.channels_last)
+                    and vae_ops.image_norm_conv_is_banded(x)):
+                # Each original NHWC row becomes two shorter NHWC rows: conv1's hidden state and the shortcut. The last row
+                # waits for the next strip to read its halo. No full-size normalized input or additional residual is needed.
+                n, _, height, width = x.shape
+                shape = (n, self.out_channels, height, width)
+                strides = (x.stride(0), 1, x.stride(2), self.out_channels)
+                hidden = x.as_strided(shape, strides)
+                residual = x.as_strided(shape, strides, x.storage_offset() + width * self.out_channels)
+                pending = None
+                for start, stop, band in vae_ops.image_norm_conv_bands(x, self.norm1, self.conv1):
+                    shortcut = self.nin_shortcut(x[:, :, start:stop])
+                    if pending is not None:
+                        row, h_row, r_row = pending
+                        hidden[:, :, row:row+1].copy_(h_row)
+                        residual[:, :, row:row+1].copy_(r_row)
+                        pending = None
+                        del h_row, r_row
+                    end = stop if stop == height else stop - 1
+                    if end < stop:
+                        pending = (end, band[:, :, -1:].clone(), shortcut[:, :, -1:].clone())
+                    hidden[:, :, start:end].copy_(band[:, :, :end-start])
+                    residual[:, :, start:end].copy_(shortcut[:, :, :end-start])
+                    del band, shortcut
+                if scratch is not None:
+                    scratch[:] = [hidden]
+                x = residual
+                h = hidden
+            else:
+                if self.in_channels != self.out_channels and scratch is not None:
+                    scratch.clear()
+                h = vae_ops.image_norm_conv([x], self.norm1, self.conv1, out=scratch[0] if scratch else None)
+                if self.in_channels != self.out_channels:
+                    x = self.nin_shortcut(x)
+            h_list, h = [h], None
+            return vae_ops.image_norm_conv(h_list, self.norm2, self.conv2, out=x, add=True)
+        if scratch is not None:
+            scratch.clear()
+        x = x.contiguous()  # small PyTorch norms use NCHW; avoid their FP32 channels-last conversion
         h = norm_swish(self.norm1, x)
         if self.in_channels != self.out_channels:
             x = self.nin_shortcut(x)
@@ -84,10 +126,7 @@ class Downsample(nn.Module):
         self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=2, padding=0)
 
     def forward(self, x: Tensor):
-        pad = (0, 1, 0, 1)
-        x = nn.functional.pad(x, pad, mode="constant", value=0)
-        x = self.conv(x)
-        return x
+        return downsample_bands(x, self.conv)
 
 
 class Upsample(nn.Module):
@@ -95,7 +134,11 @@ class Upsample(nn.Module):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
 
-    def forward(self, x: Tensor):
+    def forward(self, x_list):
+        x = x_list.pop()
+        if torch.is_autocast_enabled(x.device.type) and x.is_cuda:
+            # Convert before expansion, and release the spent hidden half of a row-interleaved workspace.
+            x = x.contiguous(memory_format=torch.channels_last)
         return conv_bands(x, self.conv, upsample=True)  # by bands of rows: no full-size upsampled input
 
 
@@ -152,6 +195,8 @@ class Encoder(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         # downsampling (only the current activation is kept: each block releases its input once read)
+        if torch.is_autocast_enabled(x.device.type) and x.is_cuda:
+            x = x.contiguous(memory_format=torch.channels_last)
         h = self.conv_in(x)
         for i_level in range(self.num_resolutions):
             for i_block in range(self.num_res_blocks):
@@ -167,8 +212,12 @@ class Encoder(nn.Module):
         h = self.mid.attn_1(h)
         h = self.mid.block_2([h])
         # end
-        h = norm_swish(self.norm_out, h)
-        h = self.conv_out(h)
+        if vae_ops.image_norm_conv_supported(h, self.norm_out):
+            h_list, h = [h], None
+            h = vae_ops.image_norm_conv(h_list, self.norm_out, self.conv_out)
+        else:
+            h = norm_swish(self.norm_out, h)
+            h = self.conv_out(h)
         h = self.quant_conv(h)
         return h
 
@@ -245,18 +294,26 @@ class Decoder(nn.Module):
         # cast to proper dtype
         h = h.to(upscale_dtype)
         # upsampling
+        scratch = []  # the hidden half of a channel-reducing block's storage, reused by the following equal-width blocks
         for i_level in reversed(range(self.num_resolutions)):
             for i_block in range(self.num_res_blocks + 1):
                 block_input, h = [h], None  # handoff: the block releases its input once read
-                h = self.up[i_level].block[i_block](block_input)
+                h = self.up[i_level].block[i_block](block_input, scratch=scratch)
                 if len(self.up[i_level].attn) > 0:
                     h = self.up[i_level].attn[i_block](h)
             if i_level != 0:
-                h = self.up[i_level].upsample(h)
+                scratch.clear()
+                h_list, h = [h], None
+                h = self.up[i_level].upsample(h_list)
 
         # end
-        h = norm_swish(self.norm_out, h)
-        h = self.conv_out(h)
+        scratch.clear()
+        if vae_ops.image_norm_conv_supported(h, self.norm_out):
+            h_list, h = [h], None
+            h = vae_ops.image_norm_conv(h_list, self.norm_out, self.conv_out)
+        else:
+            h = norm_swish(self.norm_out, h)
+            h = self.conv_out(h)
         return h
 
 

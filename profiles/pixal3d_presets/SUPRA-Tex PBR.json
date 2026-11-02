@@ -1,0 +1,11 @@
+{
+    "spatial_upsampling": "",
+    "spatial_postprocessing_parameters": {},
+    "temporal_upsampling": "supratex",
+    "temporal_postprocessing_parameters": {
+        "texture_size": 2048,
+        "texture_max_faces": 0
+    },
+    "settings_version": 2.82,
+    "help": "The former SUPRA-Tex model: PBR textures keeping the picture's colours and print."
+}

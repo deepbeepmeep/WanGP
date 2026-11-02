@@ -6,13 +6,13 @@ from typing import Any
 
 from shared.deepy import media_registry
 from shared.deepy.engine import get_or_create_assistant_session
-from shared.utils.gallery_sources import GALLERY_SOURCES, VIDEO, WORLD_EXTENSIONS, gallery_source, source_for_kind
+from shared.utils.gallery_sources import APP_EXTENSIONS, GALLERY_SOURCES, VIDEO, WORLD_EXTENSIONS, gallery_source, source_for_kind
 from shared.utils.utils import get_video_info, has_mesh_file_extension
 
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff", ".jfif", ".pjpeg"}
 _VIDEO_EXTENSIONS = {".mkv", ".mov", ".mp4", ".webm"}
 _AUDIO_EXTENSIONS = {".wav", ".mp3", ".aac", ".flac", ".m4a", ".ogg", ".wma", ".opus"}
-_SCOPE_GROUPS = {"media": ("Media", VIDEO.id, None), "image": ("Images", VIDEO.id, "image"), "video": ("Videos", VIDEO.id, "video"), "audio": ("Audio", "audio", None), "3d": ("3D Assets", "mesh", None), "world": ("Worlds", "world", None)}
+_SCOPE_GROUPS = {"media": ("Media", VIDEO.id, None), "image": ("Images", VIDEO.id, "image"), "video": ("Videos", VIDEO.id, "video"), "audio": ("Audio", "audio", None), "3d": ("3D Assets", "mesh", None), "world": ("Worlds", "world", None), "app": ("Apps", "app", None)}
 
 
 class Gallery:
@@ -37,6 +37,8 @@ class Gallery:
             return "3d"
         if ext in WORLD_EXTENSIONS:
             return "world"
+        if ext in APP_EXTENSIONS:
+            return "app"
         return "any"
 
     def _resolve_lists(self, source_id: str) -> tuple[list[Any], list[Any]]:
@@ -78,17 +80,16 @@ class Gallery:
         source_id = "audio" if any_audio else source_for_kind(detected_type).id
         file_list, file_settings_list = self._resolve_lists(source_id)
         normalized_path = os.path.normcase(path)
-        for index, existing_path in enumerate(file_list):
-            if os.path.normcase(str(existing_path or "")) != normalized_path:
-                continue
-            self._select_index(index, source_id)
-            record = self._register(path, file_settings_list[index] if index < len(file_settings_list) else configs)
-            return {"record": record, "added": False}
+        # Like the WebUI import, media already in the gallery move to its end with their settings.
+        existing = next((index for index, existing_path in enumerate(file_list) if os.path.normcase(str(existing_path or "")) == normalized_path), None)
+        if existing is not None:
+            file_list.pop(existing)
+            configs = file_settings_list.pop(existing)
         file_list.append(path)
         file_settings_list.append(configs if isinstance(configs, dict) else None)
         self._select_index(len(file_list) - 1, source_id)
         record = self._register(path, configs)
-        return {"record": record, "added": True}
+        return {"record": record, "added": existing is None}
 
     def counts(self) -> dict[str, int]:
         gen = self._gen()
@@ -152,7 +153,7 @@ class Gallery:
         gen = self._gen()
         lines = []
         groups = []
-        for group_scope in (("media", "audio", "3d", "world") if scope == "all" else (scope,)):
+        for group_scope in (("media", "audio", "3d", "world", "app") if scope == "all" else (scope,)):
             header, source_id, media_type = _SCOPE_GROUPS[group_scope]
             items = self._iter_records(source_id)
             groups.append((header, items if media_type is None else [item for item in items if item[2].get("media_type") == media_type]))

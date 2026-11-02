@@ -7,6 +7,8 @@ description: Plan, draft and revise stories longer than one context window (nove
 
 Keep the authoritative manuscript in `@documents/story.md`, the scene plan in `@documents/outline.md`, and a compact canon index in `@documents/continuity.md`. Use `rg` for bounded searches, `append_text` for new units and `edit` for exact revisions; do not rebuild the story, its plan or its canon from conversational memory or a compaction summary.
 
+For a story the reader plays through (choices, clues, puzzles, branches), plan its steps with wangp://skills/progression-design as well.
+
 Before drafting, write the outline: premise, genre, voice, point of view and tense, setting rules, then one entry per chapter or scene with its purpose, the characters present, what changes and the promises it opens or pays off. Give every unit a unique, searchable heading such as `## Chapter 03 - The Flooded Archive`, identical in the outline and the manuscript.
 
 The canon index holds one fact per line, starting with a type and a stable ID so that one search finds everything known about a name: `PERSON:`, `PLACE:`, `OBJECT:`, `RULE:`, `KNOWS:` (who knows what, since which unit), `EVENT:` (unit, what happened, consequence) and `PROMISE:` (where it was opened, status, planned payoff), for example `EVENT: ch05 | the archive floods | the ledger is lost; Ilan blames Mara`. Keep stable descriptions apart from current state: update a changed state by editing its line, and keep the history in `EVENT:` lines.

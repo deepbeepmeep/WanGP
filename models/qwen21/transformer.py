@@ -42,11 +42,12 @@ QwenImage21KVLayerCache = attention_kit.PrefixLayer  # a dataclass: CUDA graphs 
 
 
 class QwenImage21KVCache(attention_kit.PrefixCache):
-    """The prefix cache of the text and condition-image tokens (attention_kit.PrefixCache: INT8 with quantize, in RAM with ram) and
-    the layout of the cached steps. native=False when the cached prefixes are read in 16 bits (NAG)."""
+    """The prefix cache of the text and condition-image tokens (attention_kit.PrefixCache: INT8 with quantize, in RAM with ram, in VRAM as
+    far as it fits beside the weights with dynamic) and the layout of the cached steps. native=False when the cached prefixes are read in
+    16 bits (NAG)."""
 
-    def __init__(self, blocks, quantize: bool=False, native: bool=True, ram: bool=False):
-        super().__init__(blocks, quantize, native, ram, "Qwen Image 2.1 KV cache")
+    def __init__(self, blocks, quantize: bool=False, native: bool=True, ram: bool=False, dynamic: bool=False):
+        super().__init__(blocks, quantize, native, ram, "Qwen Image 2.1 KV cache", dynamic)
         self.layout = None
 
     @property
@@ -445,7 +446,7 @@ class QwenImage21Transformer2DModel(ModelMixin, ConfigMixin):
         self.gradient_checkpointing = False
 
     @staticmethod
-    def build_token_metadata(image_pad_mask: torch.Tensor, img_shapes: list[tuple[int, int, int]]) -> tuple[torch.Tensor, torch.Tensor]:
+    def build_token_metadata(image_pad_mask: torch.Tensor, img_shapes: list[tuple[int, int, int]], num_target_images: int=1) -> tuple[torch.Tensor, torch.Tensor]:
         image_positions = image_pad_mask.nonzero(as_tuple=True)[0]
         block_lengths = [math.prod(shape) for shape in img_shapes]
         if sum(block_lengths) != image_positions.numel():
@@ -454,10 +455,11 @@ class QwenImage21Transformer2DModel(ModelMixin, ConfigMixin):
         block_ids = torch.repeat_interleave(torch.arange(len(block_lengths), device=image_pad_mask.device), torch.tensor(block_lengths, device=image_pad_mask.device))
         image_ids[image_positions] = block_ids
         target_token_mask = torch.zeros_like(image_pad_mask)
-        target_token_mask[image_positions[-block_lengths[-1]:]] = True
+        # the last num_target_images blocks are the denoised target (several maps attend jointly, each with its own RoPE block)
+        target_token_mask[image_positions[-sum(block_lengths[-num_target_images:]):]] = True
         return (image_ids, target_token_mask)
 
-    def _prepare(self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor, timestep: torch.Tensor, img_shapes: list[list[tuple[int, int, int]]], img_mask: torch.Tensor, encoder_hidden_states_mask: torch.Tensor | None=None, attention_kwargs: dict[str, Any] | None=None, kv_cache: QwenImage21KVCache | None=None, kv_cache_mode: str | None=None, return_dict: bool=True, target_rope_offset: tuple[int, int]=(0, 0)) -> torch.Tensor | Transformer2DModelOutput:
+    def _prepare(self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor, timestep: torch.Tensor, img_shapes: list[list[tuple[int, int, int]]], img_mask: torch.Tensor, encoder_hidden_states_mask: torch.Tensor | None=None, attention_kwargs: dict[str, Any] | None=None, kv_cache: QwenImage21KVCache | None=None, kv_cache_mode: str | None=None, return_dict: bool=True, target_rope_offset: tuple[int, int]=(0, 0), num_target_images: int=1) -> torch.Tensor | Transformer2DModelOutput:
         if kv_cache_mode == 'cached':
             rotary_emb, attention_mask, target_tokens = kv_cache.layout
             hidden_states = self.img_in(hidden_states[:, -target_tokens:])
@@ -474,12 +476,12 @@ class QwenImage21Transformer2DModel(ModelMixin, ConfigMixin):
         encoder_hidden_states = self.txt_in(encoder_hidden_states)
         repeats = torch.where(img_mask, _IMG_TOKENS_PER_SLOT, 1)[0]
         image_pad_mask = torch.repeat_interleave(img_mask[0], repeats)
-        target_tokens = math.prod(img_shapes[0][-1])
+        target_tokens = sum(math.prod(shape) for shape in img_shapes[0][-num_target_images:])
         joint_hidden_states = torch.cat([encoder_hidden_states, encoder_hidden_states.new_zeros(batch_size, target_tokens // 4, encoder_hidden_states.shape[2])], dim=1)
         joint_hidden_states = joint_hidden_states.repeat_interleave(repeats, dim=1)
         joint_hidden_states[:, image_pad_mask] = hidden_states
         rotary_emb = self.pos_embed(img_shapes[0], image_pad_mask, device=hidden_states.device, target_offset=target_rope_offset)
-        image_ids, target_token_mask = self.build_token_metadata(image_pad_mask, img_shapes[0])
+        image_ids, target_token_mask = self.build_token_metadata(image_pad_mask, img_shapes[0], num_target_images)
         timestep = timestep.to(hidden_states.dtype)
         if self.config.causal_condition:
             timestep = torch.cat([timestep, timestep.new_zeros(1)], dim=0)

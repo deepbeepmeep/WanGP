@@ -1,8 +1,9 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 """Length-independent launch setup for the FLA 0.4 inference kernels used by Qwen.
 
-Reuse the installed FLA kernel bodies and their license/provenance. Only JIT
-specialization, unused tuning labels, and the convolution launch grid change.
+Reuse the installed FLA kernel bodies and their license/provenance. Adjust JIT
+specialization, unused tuning labels, and the convolution launch grid. Triton
+3.9 also needs block accesses lowered to ordinary masked loads and stores.
 The package on disk is never edited. Install before the first model forward.
 """
 from copy import copy
@@ -19,6 +20,7 @@ from .triton_autotune import InferenceAutotuner
 
 _INSTALLED = False
 _CONV_BT = 16
+_MASKED_POINTERS = tuple(map(int, triton.__version__.split(".")[:2])) >= (3, 9)
 _KERNELS = {
     "fla.modules.convolution": ("causal_conv1d_fwd_kernel", "causal_conv1d_states_fwd_kernel"),
     "fla.modules.l2norm": ("l2norm_fwd_kernel",),
@@ -40,8 +42,12 @@ def _clone_kernel(kernel):
         fn.__module__, fn.__qualname__ = original.__module__, original.__qualname__
         fn.__annotations__ = {name: value for name, value in original.__annotations__.items() if name not in ("B", "T", "NB")}
         runtime = tuple(name for name in ("B", "T", "NB") if name in kernel.arg_names)
-        return triton.jit(fn, do_not_specialize=tuple(kernel.do_not_specialize) + runtime,
-                          do_not_specialize_on_alignment=tuple(kernel.do_not_specialize_on_alignment) + runtime)
+        cloned = triton.jit(fn, do_not_specialize=tuple(kernel.do_not_specialize) + runtime,
+                            do_not_specialize_on_alignment=tuple(kernel.do_not_specialize_on_alignment) + runtime)
+        if _MASKED_POINTERS:
+            from .fla_block_pointers import lower_block_pointers
+            lower_block_pointers(cloned)
+        return cloned
     if not isinstance(kernel, (Autotuner, Heuristics)):
         raise TypeError(f"Unsupported FLA kernel wrapper: {type(kernel).__name__}")
     cloned = copy(kernel)
@@ -93,6 +99,9 @@ def configure_fla_inference_kernels():
     # Build all replacements before installing any of them.
     replacements = [(import_module(module), name, _clone_kernel(getattr(import_module(module), name)))
                     for module, names in _KERNELS.items() for name in names]
+    if _MASKED_POINTERS:
+        conv = import_module("fla.modules.convolution")
+        replacements.append((conv, "causal_conv1d_update_kernel", _clone_kernel(conv.causal_conv1d_update_kernel)))
     for module, name, kernel in replacements:
         setattr(module, name, kernel)
     conv = import_module("fla.modules.convolution")

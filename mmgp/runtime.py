@@ -163,7 +163,9 @@ def state_ring(blocks, name="state", resident=False):
     blocks whose weights are pinned, then, for a model MMGP pins, for those kept in VRAM, as far as the reserved RAM allows; the others moved
     ahead through MMGP's staging ring with their blocks): each block's forward fetches its state. The model calls store(block, tensors) once per block, and release() at the end.
     resident: blocks whose weights MMGP keeps in VRAM may keep their state there too, in the room their preload leaves (see mmgp.state_ring;
-    the model then reads the lists store() returns at each pass)."""
+    the model then reads the lists store() returns at each pass). resident="dynamic" (where dynamic_state(blocks)): a cache the model
+    computes on the GPU stays in VRAM first, the model's dynamic preload planning it with its weights, and goes to RAM only for the blocks
+    that do not stay there."""
     from .state_ring import StateRing
     owner = _owner(blocks)
     if owner is None:
@@ -173,6 +175,13 @@ def state_ring(blocks, name="state", resident=False):
     entries = [f"{model_id}/{prefix}{index}" for index in range(len(blocks))]  # the blocks' entries: the ring follows their schedule
     return StateRing(len(blocks), torch.device("cuda", torch.cuda.current_device()), manager, name, modules=blocks, model_id=model_id, entries=entries,
                      resident=resident)
+
+
+def dynamic_state(module):
+    """Whether a state ring of these blocks can place its state dynamically (state_ring(blocks, resident="dynamic")): their model is managed
+    by MMGP with its VRAM allocator, which reports the VRAM shortages."""
+    from . import allocator
+    return _owner(module) is not None and allocator.active == "vmm"
 
 
 def weights_resident(module):
@@ -272,3 +281,67 @@ def requires_layer_offload(module):
     if manager.auto_preload is not None and model_id in manager.auto_preload.plans:
         return True
     return any(name.startswith(model_id + "/") and size for name, size in manager.blocks_of_modules_sizes.items())
+
+
+DISPOSABLE_PRIORITY = 2  # in the VRAM pressure order (mmgp.memory_pressure): after expert copies and ring state (0) and preloaded blocks (1)
+
+
+class Disposable:
+    """VRAM held by a managed model's own code beside its weights (a cache, a workspace) that it can do without and rebuild: see
+    disposable()."""
+
+    def __init__(self, manager, model_id, name, release):
+        self.manager, self.model_id, self.name, self._release = manager, model_id, name, release
+        self.released, self.idle_thread, self.idle_depth = False, None, 0
+        if manager is not None:
+            from . import memory_pressure
+            memory_pressure.register(self, DISPOSABLE_PRIORITY)
+
+    def close(self):
+        """The asset is gone (freed by its owner): no more release."""
+        self.released = True
+        if self.manager is not None:
+            from . import memory_pressure
+            memory_pressure.unregister(self)
+
+    @contextmanager
+    def idle(self):
+        """Its owner does not use it meanwhile (code on this thread that runs other models): MMGP may release it if VRAM runs short."""
+        import threading
+        self.idle_thread, self.idle_depth = threading.get_ident(), self.idle_depth + 1
+        try:
+            yield
+        finally:
+            self.idle_depth -= 1
+
+    def on_pressure(self, need, parked=False):
+        """mmgp.memory_pressure: released when VRAM runs short, while its model's offload object is parked (any thread) or while its owner
+        declared it idle (its thread), never during a CUDA graph capture. Returns the bytes the allocator got back."""
+        import threading
+        from . import allocator
+        if need <= 0 or self.released or torch.cuda.is_current_stream_capturing() or not (parked or self.idle_depth and threading.get_ident() == self.idle_thread):
+            return 0
+        before = allocator.stats()["allocated"]
+        self.close()
+        try:
+            self._release()
+        except Exception as exc:  # the owner's code, inside an allocation: the allocation goes on with what was freed
+            from tqdm import tqdm
+            tqdm.write(f"VRAM short: the release of {self.name} failed: {exc}")
+        freed = max(0, before - allocator.stats()["allocated"])
+        if freed:
+            from tqdm import tqdm
+            tqdm.write(f"VRAM short, {freed / 2**20:0.0f} MB of {self.name} released")
+        return freed
+
+
+def disposable(module, name, release):
+    """Declare VRAM that the code of a managed model holds beside its weights and can do without (e.g. the KV cache of a language model, a
+    workspace): MMGP releases it, calling release(), only when an allocation finds the VRAM short (the automatic preloads of other models do
+    not plan with it), in its pressure order: after the expert copies, the state kept in VRAM and the preloaded blocks, and only while it is
+    not in use, i.e. while the model's offload object is parked (offload.park) or inside the returned Disposable's idle() scope on the
+    owner's thread. release() frees the asset (it may copy it to RAM; it must not allocate VRAM) and runs at most once: the owner checks
+    `released` before its next use and rebuilds it (declaring it again). close() when the owner frees it itself. Unmanaged modules get a
+    Disposable that is never released."""
+    owner = _owner(module)
+    return Disposable(None, None, name, release) if owner is None else Disposable(owner[0], owner[1], name, release)

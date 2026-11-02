@@ -181,7 +181,8 @@ class ChunkExecutor:
                 if not getattr(context.system_handler, "hide_prompt", False):
                     process_settings = dict(process_settings, prompt=prompts.resolve_prompt_for_chunk(context.prompt_schedule, float(actual_done) / float(context.fps_float), context.default_prompt_text))
                 settings = context.system_handler.build_queue_settings(process_settings, source_path=context.source_path, start_frame=actual_control_start_frame, frame_count=plan_requested_frames, target_control=context.system_target_control, seed=chunk_index, continue_cache=progress.continue_cache, audio_track_no=context.selected_audio_track)
-                settings["spatial_upsampler_parameters"] = dict(context.spatial_upsampler_parameters or {})
+                # the process's own values (the LTX Detail Refiner's style prompt) completed with the user's
+                settings["spatial_postprocessing_parameters"] = {**dict(settings.get("spatial_postprocessing_parameters") or {}), **dict(context.spatial_upsampler_parameters or {})}
                 self.reset_live_chunk_status(context.state)
                 job = self.api_session.submit_task(settings, callbacks=callbacks)
                 self.active_job["job"] = job
@@ -338,7 +339,7 @@ class ChunkExecutor:
                 continue
 
             settings = build_task_settings(context.process_settings, is_user_process=context.is_user_process)
-            settings["spatial_upsampler_parameters"] = dict(context.spatial_upsampler_parameters or {})
+            settings["spatial_postprocessing_parameters"] = {**dict(settings.get("spatial_postprocessing_parameters") or {}), **dict(context.spatial_upsampler_parameters or {})}
             chunk_prompt_start_seconds = float(actual_done) / float(context.fps_float)
             settings["model_type"] = context.model_type
             settings["prompt"] = prompts.resolve_prompt_for_chunk(context.prompt_schedule, chunk_prompt_start_seconds, context.default_prompt_text)

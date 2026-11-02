@@ -69,8 +69,8 @@ class DropdownDeps:
 
 
 def compact_name(family_name, model_name):
-    if model_name.startswith(family_name):
-        suffix = model_name[len(family_name):]
+    suffix = model_name[len(family_name):]
+    if model_name.startswith(family_name) and not suffix[:1].isalpha():  # a whole word: "Animate" leaves "AnimateAnyMesh" whole
         version = family_name.rsplit(" ", 1)[-1]
         if suffix.startswith(".") and version.isdigit():
             return version + suffix
@@ -129,7 +129,8 @@ def expand_model_selection(selection, model_types, get_parent_model_type, get_mo
         if level == 3:
             expanded.append(key)
         else:
-            expanded += [model_type for model_type in model_types if (get_model_family(model_type, for_ui=True) if level == 1 else get_parent_model_type(model_type)) == key]
+            # a family: its group in the selector, or the handler's family (3D models are grouped by goal since 2026-10-29)
+            expanded += [model_type for model_type in model_types if (key in (get_model_family(model_type, for_ui=True), get_model_family(model_type)) if level == 1 else get_parent_model_type(model_type) == key)]
     return list(dict.fromkeys(expanded))
 
 
@@ -617,7 +618,8 @@ def create_models_hierarchy(rows):
         if L == 0 and len(prefix_non) > 1:
             L = n
 
-        shares_last = any(mid != pid and mid not in outliers and lt and lt[-1] == p_last for _, mid, _, lt, _ in kids)
+        # a size shared as last word joins the header ("Wan2.1 Text2Video 14B"); a shared word stays in the variants ("INT8 Experts" / "Q4 Experts")
+        shares_last = any(c.isdigit() for c in p_last) and any(mid != pid and mid not in outliers and lt and lt[-1] == p_last for _, mid, _, lt, _ in kids)
         header_tokens_disp = p_tok[:L] + ([p_tok[-1]] if shares_last and L < n else [])
         header = " ".join(header_tokens_disp)
         header_has_last = (L == n) or (shares_last and L < n)

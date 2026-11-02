@@ -76,6 +76,7 @@ class family_handler:
         return {
             "image_outputs": True,
             "device_explicit": True,
+            "no_model_swap": True,  # one managed model: kept loaded between samples and queued tasks of the same model
             "cuda_graphs": ["transformer"],
             "dtype": "bf16",
             "no_negative_prompt": True,

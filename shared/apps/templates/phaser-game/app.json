@@ -1,0 +1,10 @@
+{
+  "name": "Phaser Game",
+  "kind": "web",
+  "entry": "index.html",
+  "description": "",
+  "version": 1,
+  "controls": {"Left / Right": "run", "Up / Space": "jump", "R": "restart"},
+  "canvas": "16:9",
+  "audio": false
+}

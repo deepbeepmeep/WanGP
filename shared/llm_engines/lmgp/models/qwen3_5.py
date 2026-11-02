@@ -901,6 +901,17 @@ class Qwen3_5Block(nn.Module):
             if self.recurrent_state_buffer.numel() > 0:
                 self.recurrent_state_buffer.zero_()
 
+    def snapshot_sequence_state(self):
+        # the live buffers with their copies: a restore writes into the tensors that graphs read, even if a side request replaced them
+        if self.layer_type != "linear_attention":
+            return None
+        return {name: (getattr(self, name), getattr(self, name).to("cpu", copy=True)) for name in ("conv_state_buffer", "recurrent_state_buffer")}
+
+    def restore_sequence_state(self, snapshot):
+        for name, (tensor, copy) in (snapshot or {}).items():
+            setattr(self, name, tensor)
+            tensor.copy_(copy)
+
     def prepare_speculative_state(self, max_verify_tokens: int) -> None:
         if self.layer_type != "linear_attention":
             return
@@ -977,6 +988,7 @@ class Qwen3_5Block(nn.Module):
             self.speculative_conv_state_buffer = torch.empty(0)
             self.speculative_recurrent_state_buffer = torch.empty(0)
             self.speculative_replay = None
+            self._replay_ssm_parameters = None  # its GPU copies of ssm_a / ssm_dt, made again with the next replay
 
     def _get_runtime_conv_state(self, batch_size: int, hidden_states: torch.Tensor) -> torch.Tensor:
         if (
@@ -1634,12 +1646,17 @@ class Qwen3_5MTP(nn.Module):
             clear_head_cache()
         self._cache = None
 
-    def snapshot_sequence_state(self, previous: dict | None = None, reuse_tokens: int = 0) -> dict:
+    def snapshot_sequence_state(self, previous: dict | None = None, reuse_tokens: int = 0) -> dict | None:
+        if self._cache is None:  # no cache: an empty state (speculative decoding off, or released)
+            return None
         if not isinstance(self._cache, Qwen3_5StaticCache):
             raise RuntimeError("MTP static cache is not prepared.")
         return self._cache.snapshot(previous=previous, reuse_tokens=reuse_tokens)
 
-    def restore_sequence_state(self, snapshot: dict) -> None:
+    def restore_sequence_state(self, snapshot: dict | None) -> None:
+        if snapshot is None:
+            self.reset_sequence_state()
+            return
         if not isinstance(self._cache, Qwen3_5StaticCache):
             raise RuntimeError("MTP static cache is not prepared.")
         self._cache.restore(snapshot)

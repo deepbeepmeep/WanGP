@@ -1,0 +1,10 @@
+{
+  "name": "Physics Toy",
+  "kind": "web",
+  "entry": "index.html",
+  "description": "",
+  "version": 1,
+  "controls": {"Click": "throw a ball", "Drag": "orbit", "R": "rebuild the tower"},
+  "canvas": "responsive",
+  "audio": false
+}

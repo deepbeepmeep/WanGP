@@ -18,7 +18,7 @@ from typing import Any
 import ffmpeg
 from PIL import Image
 
-from shared.deepy.image_channels import image_color_details
+from shared.deepy.image_channels import image_color_details, upright_size
 from shared.deepy.media_registry import detect_media_type
 from shared.utils.video_decode import resolve_media_binary
 
@@ -402,7 +402,7 @@ def _probe_media(path: Path, media_type: str) -> dict[str, Any]:
 
 def _query_image(path: Path) -> dict[str, Any]:
     with Image.open(path) as image:
-        width, height = image.size
+        width, height = upright_size(image)
         color_details = image_color_details(image)
         frame_count = int(getattr(image, "n_frames", 1) or 1)
         duration = sum(float(image.seek(index) or image.info.get("duration", 0) or 0) for index in range(frame_count)) / 1000 if frame_count > 1 else None
@@ -430,6 +430,44 @@ def file_info(path: str, policy: FileAccessPolicy | None = None) -> dict[str, An
         return {"status": "error", "path": str(target), "size_bytes": target.stat().st_size, "error": str(exc) or "Unable to inspect file."}
 
 
+ARCHIVE_ENTRIES_SHOWN = 50
+
+
+def _query_archive(file_path: Path) -> dict[str, Any]:
+    """A ZIP archive (an RGBA video's PNG frames, for example): its entries, the first ones by name."""
+    with zipfile.ZipFile(file_path) as archive:
+        names = archive.namelist()
+    return {"status": "done", "path": str(file_path), "filename": file_path.name, "size_bytes": file_path.stat().st_size, "file_type": "archive",
+            "entry_count": len(names), "entries": names[:ARCHIVE_ENTRIES_SHOWN], "error": ""}
+
+
+def query_text_lines(path: str, start_line: int = 1) -> dict[str, Any]:
+    """UTF-8 text from start_line (from 1) in whole lines, up to TEXT_MAX_CHARS characters; next_line when the file goes on."""
+    file_path = _resolved_path(path)
+    lines = file_path.read_text(encoding="utf-8").splitlines()
+    shown, size = [], 0
+    for line in lines[max(start_line, 1) - 1:]:
+        if shown and size + len(line) + 1 > TEXT_MAX_CHARS:
+            break
+        shown.append(line)
+        size += len(line) + 1
+    end_line = max(start_line, 1) - 1 + len(shown)
+    return {"status": "done", "path": str(file_path), "filename": file_path.name, "file_type": "text", "text": "\n".join(shown), "start_line": max(start_line, 1),
+            "end_line": end_line, "line_count": len(lines), **({"next_line": end_line + 1} if end_line < len(lines) else {}), "error": ""}
+
+
+def query_side_file(path: str, start_line: int = 1) -> dict[str, Any]:
+    """A file saved beside a media item: a media file's details, an archive's entries, or text read by lines from start_line (any length)."""
+    file_path = _resolved_path(path)
+    if detect_media_type(str(file_path)) in {"image", "video", "audio"} or zipfile.is_zipfile(file_path):
+        return query_file(path)
+    try:
+        return query_text_lines(path, start_line)
+    except UnicodeError:  # a binary companion (a MIDI score, ...): what it is
+        return {"status": "done", "path": str(file_path), "filename": file_path.name, "size_bytes": file_path.stat().st_size, "file_type": "file",
+                "mime_type": mimetypes.guess_type(file_path.name)[0] or "application/octet-stream", "error": ""}
+
+
 def query_file(path: str) -> dict[str, Any]:
     file_path = _resolved_path(path)
     if not file_path.is_file():
@@ -440,6 +478,8 @@ def query_file(path: str) -> dict[str, Any]:
             return _query_image(file_path)
         if media_type in {"video", "audio"}:
             return _probe_media(file_path, media_type)
+        if zipfile.is_zipfile(file_path):
+            return _query_archive(file_path)
         with file_path.open("r", encoding="utf-8") as reader:
             text = reader.read(TEXT_MAX_CHARS + 1)
         if len(text) > TEXT_MAX_CHARS:

@@ -80,7 +80,7 @@ You can ask Deepy to:
 - create a talking video from a still image and speech audio
 - create speech from a description or voice sample, generate songs, and generate sound from a description
 - inspect images, video frames, and 3D assets, or compare several visuals
-- report useful media details such as dimensions, duration, FPS, frame count, and audio tracks, and for 3D assets their size and animation frames
+- report useful media details such as dimensions, duration, FPS, frame count, and audio tracks, and for 3D assets their size and animation frames, and list the files a model saved beside a media item (its transcript and subtitles, the transparent frames of an RGBA video) and read the text ones, without needing file access
 - extract images, clips, or audio; transcribe audio or video; mute or replace a video soundtrack; resize or crop media; compose assets side by side; and merge videos
 - find available LoRAs, explain the active tool defaults, and answer WanGP usage questions
 
@@ -94,7 +94,7 @@ Prime can also:
 - measure audio levels and silences, separate vocals, convert or combine image channels, and mask named objects
 - run Python in a sandbox to place exact text and layouts over generated images, draw charts and infographics, assemble grids and picture-book pages, extract palettes, write subtitle files from measured timings, build animated clips frame by frame, and model procedural 3D props that join the 3D gallery
 - look things up on the web when you enable it: facts, dates, current events, references, what a real place, object or style looks like before writing a prompt about it, and LoRAs from Civitai and Hugging Face for a style or an effect, installed for the model it is about to use
-- run the workflows that enabled plugins offer, such as Media Flow's restoration, outpainting, upscaling and interpolation of long videos and whole folders (see [Plugin workflows](#plugin-workflows-prime))
+- run the workflows that enabled Plugins offer, such as Media Flow's restoration, outpainting, upscaling and interpolation of long videos and whole folders (see [Plugin workflows](#plugin-workflows-prime))
 
 Zero keeps a shorter tool list so that it stays fast and leaves most of its context for the conversation.
 
@@ -108,6 +108,12 @@ Deepy Prime can write and run small Python programs when a result needs exact te
 Those programs can also call WanGP's own media tools, one by one, as Deepy would: scan a folder of photos and ask the visual inspector about each one, transcribe every clip, make a variation of each image, then report only the result. This keeps long loops out of the conversation, where each step would otherwise cost time and context, and each call still runs on the same loaded models with the same access rules.
 
 The programs run in a separate interpreter on the CPU, inside a sandbox folder of the session (`documents/sandbox`). They can read Gallery media and the session's documents, write only inside that folder, and have no network, no child processes and no access to the GPU or to WanGP's models. Memory and running time are limited, and Deepy can restart the interpreter when an experiment breaks its state. On Windows the operating system itself refuses writes outside the sandbox folder; reads of other files are refused by the interpreter. Turn the sandbox off with **Configuration > Prompt Enhancer / Deepy > Python > Enable Python Sandbox** if you prefer Deepy to work with its media tools only.
+
+Notes, tables, JSON and SVG files that a program saves as deliverables open as previews in the chat. With **App Development (Advanced)** set to **Web Apps** in the same tab, Deepy can also build interactive animations, games and three.js scenes that you play in WanGP and keep in the Apps gallery: see the Apps documentation.
+
+## Advanced transcription (Prime)
+
+Deepy uses Whisper by default. Choose a Nemotron model in **Configuration > Prompt Enhancer / Deepy > Transcription > Transcription Model** (**Nemotron Q4 Experts** is recommended) to let Deepy Prime transcribe recordings with NVIDIA Nemotron 3.5 Transcribe: who said what (up to eight speakers), when each word was spoken, subtitles with the speaker named at each change, a translation to or from English, and names or jargon spelled the way you give them. Ask for example "transcribe this interview with speaker names as subtitles" or "translate what they say into English". Deepy runs it as a normal WanGP generation, so it waits in the queue like other jobs, the model downloads on first use (about 19 GB for **Q4 Experts**, which suits 32 GB of RAM, about 33 GB for **INT8 Experts**, best with 64 GB), and the transcribed audio joins the Audio gallery with the transcript beside it: a `.txt` file with one line per turn, its time span and its speaker, plus `.srt` subtitles. Once a Nemotron model is chosen, **Names and Jargon** takes the names, places, products and terms that come up in your recordings, separated by commas or lines: Deepy passes them to every transcription, besides the terms it picks for each recording. Speaker numbers tell the voices of one recording apart; Deepy cannot tell who a speaker is unless the recording or you say so: once you tell it who is who, it can name them in the transcript. Ask for word-level timing when you need it (one timed line per word), or for a copy of a video with the transcript or translation as subtitles that players switch on and off; Deepy reads long transcripts part by part without needing file access. For a quick transcript without speakers, Deepy keeps using its fast Whisper transcription.
 
 ## Web search (Prime)
 
@@ -123,20 +129,20 @@ Sites that set cookies (consent choices, preferences) get them back on later vis
 
 ## Plugin workflows (Prime)
 
-Enabled plugins can offer Deepy Prime their own workflows. With the bundled Media Flow plugin, Deepy can process existing videos and images with Media Flow's ready-made templates: remove blur, compression artifacts or a stylized color grade, convert SDR to HDR, add detail, outpaint to a new aspect ratio, upscale, or add frames for smoother motion. It handles what single post-processing treatments do not: videos of any length, processed in chunks with the original audio kept, and whole folders, lists or wildcard patterns as one batch.
+Enabled Plugins can offer Deepy Prime their own workflows. With the bundled Media Flow Plugin, Deepy can process existing videos and images with Media Flow's ready-made templates: remove blur, compression artifacts or a stylized color grade, convert SDR to HDR, add detail, outpaint to a new aspect ratio, upscale, or add frames for smoother motion. It handles what single post-processing treatments do not: videos of any length, processed in chunks with the original audio kept, and whole folders, lists or wildcard patterns as one batch.
 
-Describe the job, for example "remove the blur from @documents/interview.mp4", "upscale every video in @test/clips by 2 as one resumable batch" or "outpaint this clip to 16:9", or name the plugin ("with Media Flow"). Deepy picks a plugin when the request fits it, lists the plugin's templates for the task, chooses the recommended one unless you name another, and can tell you which settings a template accepts.
+Describe the job, for example "remove the blur from @documents/interview.mp4", "upscale every video in @test/clips by 2 as one resumable batch" or "outpaint this clip to 16:9", or name the Plugin ("with Media Flow"). Deepy picks a Plugin when the request fits it, lists the Plugin's templates for the task, chooses the recommended one unless you name another, and can tell you which settings a template accepts.
 
-- **Progress:** each plugin action shows a card named after the plugin, such as "Media Flow: Run", with live progress (files done, chunk of the current file) in the card and on the status bar.
-- **GPU:** while a plugin action runs, Deepy unloads its own model so that the action's generations have the GPU, and reloads it to answer.
+- **Progress:** each Plugin action shows a card named after the Plugin, such as "Media Flow: Run", with live progress (files done, chunk of the current file) in the card and on the status bar.
+- **GPU:** while a Plugin action runs, Deepy unloads its own model so that the action's generations have the GPU, and reloads it to answer.
 - **Stopping and resuming:** the chat **Stop** button stops a Media Flow run after its current chunk. Ask Deepy to run the same job again and it continues where it stopped, also after a restart.
 - **Outputs:** results go next to each source when Deepy may write in that folder, otherwise into the outputs folder (`media_flow`), or where you ask. Deepy links them in its answer. Its usual file access rules apply: it can only process media it may read and write into folders it may write.
 - **One run at a time:** Media Flow runs one process at a time, shared with its tab. If the tab is already busy, Deepy says so, and can report that run's progress or stop it when you ask.
-- **Python:** Python scripts can call plugin workflows too, for example to process a selection of files found by a script.
+- **Python:** Python scripts can call Plugin workflows too, for example to process a selection of files found by a script.
 
-Only plugins that offer workflows to Deepy appear, and only while they are enabled; changes take effect after a restart. Deepy Zero does not use plugin workflows. External MCP agents connected to WanGP can use the same workflows.
+Only Plugins that offer workflows to Deepy appear, and only while they are enabled; changes take effect after a restart. Deepy Zero does not use Plugin workflows. External MCP agents connected to WanGP can use the same workflows.
 
-Plugin developers: see [Plugin toolboxes for agents](PLUGINS.md#plugin-toolboxes-for-agents) in the plugin guide.
+Plugin developers: see [Plugin toolboxes for agents](PLUGINS.md#plugin-toolboxes-for-agents) in the Plugin guide.
 
 ## Everyday workflow
 
@@ -153,9 +159,11 @@ You can override supported values in a request, including width, height, frame c
 
 ### Import and attach media
 
-In Gradio, either use the chat **+** button or open **Media Info / Late Post Processing / Import Media > Import Media to Galleries**. In the Web app, use the chat **+** for media needed by the next request, or import files from a gallery.
+In Gradio, either use the chat **+** button or open **Media Info / Late Post Processing / Import Media > Import Media to Galleries**. In the Web app, use the chat **+** for media needed by the next request, or import files from a gallery. The chat **+** accepts images, videos and audio.
 
-The attachment counter shows how many files are waiting for the next request. Sending the request consumes those attachments. Removing an attachment from the composer does not delete its workspace file.
+Files waiting for the next request appear as thumbnails above the message box: click one to view it, or its **×** to remove it. Sending the request consumes those attachments, and your message keeps them above its text, so you can see what each request used without searching the gallery. Removing an attachment from the composer does not delete its workspace file.
+
+Importing a file that is already in the gallery moves it to the end of the gallery, beside your latest creations, instead of jumping back to its old place.
 
 ### Select media and refer to it naturally
 
@@ -306,16 +314,16 @@ The lock protects a workspace from automatic archiving. The broom sets an inacti
 
 See [Gallery Workspaces](WORKSPACES.md) for the relationship between workspaces and galleries, the complete workspace-manager workflow, synchronization rules, dedicated Deepy workspaces, safe deletion, archiving, restoration, and backups.
 
-### When a plugin asks Deepy
+### When a Plugin asks Deepy
 
-Plugins can send Deepy requests of their own, with media, for example to edit the selected picture and turn it into a video. The bundled **Sample Plugin** shows one once enabled in the plugin manager: its **Ask Deepy to add a red hat and to make a singing video** button sends the selected picture with that request and puts a download link to the video beside the button.
+Plugins can send Deepy requests of their own, with media, for example to edit the selected picture and turn it into a video. The bundled **Sample App** shows one once enabled in **Apps & PlugIn Manager**: its **Ask Deepy to add a red hat and to make a singing video** button sends the selected picture with that request and puts a download link to the video beside the button.
 
-- **Waiting:** a plugin's request starts when Deepy and the generation queue are free.
-- **While it runs:** Deepy shows the plugin's own conversation, its requests marked with the plugin's name. The gallery shows the workspace the plugin chose: a new workspace that stays in the list so you can browse the results later, a temporary one removed when the plugin is done, a workspace the plugin keeps for its project, or the one you had open, in which case the results join your gallery.
-- **Control:** you can follow, pause and stop the plugin's work as any Deepy turn, and a message you send goes to the plugin's conversation. Changing conversation or workspace is refused until the plugin's request ends.
-- **Afterwards:** your conversation and workspace come back, also when saved sessions are disabled; Deepy reloads your conversation as when resuming a session. Plugin conversations are kept by their plugin and do not appear in the session list.
+- **Waiting:** a Plugin's request starts when Deepy and the generation queue are free.
+- **While it runs:** Deepy shows the Plugin's own conversation, its requests marked with the Plugin's name. The gallery shows the workspace the Plugin chose: a new workspace that stays in the list so you can browse the results later, a temporary one removed when the Plugin is done, a workspace the Plugin keeps for its project, or the one you had open, in which case the results join your gallery.
+- **Control:** you can follow, pause and stop the Plugin's work as any Deepy turn, and a message you send goes to the Plugin's conversation. Changing conversation or workspace is refused until the Plugin's request ends.
+- **Afterwards:** your conversation and workspace come back, also when saved sessions are disabled; Deepy reloads your conversation as when resuming a session. Plugin conversations are kept by their Plugin and do not appear in the session list.
 
-Plugin developers: see [Running Deepy Jobs](PLUGINS.md#running-deepy-jobs) in the plugin guide.
+Plugin developers: see [Running Deepy Jobs](PLUGINS.md#running-deepy-jobs) in the Plugin guide.
 
 ## Use Deepy on a phone
 
@@ -473,9 +481,11 @@ This controls how long a local Deepy model stays in GPU memory. It is not shown 
 
 - **Unload from VRAM as soon as possible** frees memory after Deepy becomes idle, but the next request must reload the model and starts more slowly. **Recommended for:** GPUs that need nearly all available VRAM for image or video generation; this is the safest default.
 - **Unload if VRAM is requested by another WanGP component** keeps Deepy responsive between requests but gives its memory back when another operation needs it. **Recommended for:** most systems with enough VRAM to hold Deepy during normal browsing and light generation.
-- **Always loaded in VRAM** gives the fastest Deepy response times but permanently reduces the memory available to generation models. **Recommended for:** high-VRAM systems primarily used for Deepy, or remote/heavily offloaded generation workflows.
+- **Always loaded in VRAM** gives the fastest Deepy response times. A generation still gets the memory it needs: it takes the parts of Deepy it requires, and Deepy's conversation memory only when nothing else is left (it is then saved to RAM, not lost). Deepy's next answer brings them back without starting the conversation over. **Recommended for:** systems where you alternate between Deepy and generations, or where Deepy asks for progress while a generation runs.
 
-If generations fail to fit after changing this setting, move one level toward earlier unloading.
+In every mode, quick tools that need little memory (image and video inspection, transcription, masks, vocal removal) keep Deepy loaded while they run and take from it only the memory they need, so Deepy continues right after them. With **Always loaded in VRAM**, a prompt enhancement runs beside Deepy's conversation instead of interrupting it.
+
+These partial releases need the *MMGP Optimized VRAM Allocator* (the default, see [CLI.md](CLI.md#vram-allocator)); with PyTorch's allocator, Deepy is released whole as described above. If generations fail to fit after changing this setting, move one level toward earlier unloading.
 
 ### Context Window Tokens
 
@@ -520,7 +530,7 @@ When enabled, this reduces rambling and repeated phrases across Deepy's response
 
 ### Filesystem access
 
-Under **Configuration > Prompt Enhancer / Deepy**, Prime groups its options into **Filesystem**, **Guidance**, **MCP Servers**, **Python**, and **Internet Access** tabs. Deepy Zero shows only **Filesystem**. The **Internet Access** tab contains Web Search, the Civitai API key, the Hugging Face token, and their OS Credential Manager options.
+Under **Configuration > Prompt Enhancer / Deepy**, Prime groups its options into **Filesystem**, **Guidance**, **MCP Servers**, **Python**, **Internet Access**, and **Transcription** tabs. Deepy Zero shows only **Filesystem**. The **Internet Access** tab contains Web Search, the Civitai API key, the Hugging Face token, and their OS Credential Manager options. The **Transcription** tab chooses the transcription model (Whisper only, or a Nemotron model for Advanced Transcription) and, for Nemotron, your names and jargon.
 
 Filesystem access determines which local files Deepy can inspect or create. Use the smallest scope that supports the task.
 
@@ -618,4 +628,4 @@ Create a portrait for an introduction video, generate a short speech explaining 
 
 ---
 
-> Applies to: Choosing, enabling, launching, configuring, and using Deepy Zero or Deepy Prime in Gradio, CLI, and the standalone Web app, including media, templates, plugin workflows, sessions, workspaces, phone access, voice input, and network protection.
+> Applies to: Choosing, enabling, launching, configuring, and using Deepy Zero or Deepy Prime in Gradio, CLI, and the standalone Web app, including media, templates, Plugin workflows, sessions, workspaces, phone access, voice input, and network protection.

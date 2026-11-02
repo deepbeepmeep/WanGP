@@ -14,7 +14,7 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.loaders import FromOriginalModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from tqdm import tqdm
-from mmgp import offload
+from mmgp import offload, transfer
 
 try:
     from .music_vocoder import ADaMoSHiFiGANV1
@@ -368,7 +368,7 @@ class MusicDCAE(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 # No user length, use max possible capped by actual
                 target_len = min(max_possible_len, current_wav_len)
             
-            processed_pred_wavs.append(wav[:, :max(0, target_len)].cpu()) # Ensure length is non-negative
+            processed_pred_wavs.append(transfer.move(wav[:, :max(0, target_len)], "cpu")) # Ensure length is non-negative
 
         return final_output_sr, processed_pred_wavs
 

@@ -1,0 +1,10 @@
+{
+  "name": "Audio Visualizer",
+  "kind": "web",
+  "entry": "index.html",
+  "description": "",
+  "version": 1,
+  "controls": {"Click": "start or stop the music"},
+  "canvas": "responsive",
+  "audio": true
+}

@@ -79,6 +79,7 @@ def _get_kugelaudio_model_def():
         "supports_early_stop": True,
         "profiles_dir": ["kugelaudio_0_open"],
         "lm_decoder": True,
+        "no_model_swap": True,  # one managed model: kept loaded between samples and queued tasks of the same model
         "duration_slider": dict(KUGELAUDIO_DURATION_SLIDER),
         "custom_settings": [one.copy() for one in KUGELAUDIO_CUSTOM_SETTINGS],
         "preserve_empty_prompt_lines": True,

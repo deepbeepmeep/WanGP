@@ -1,4 +1,5 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
+from models import goals_3d
 from shared.utils.hf import build_hf_url
 
 from .prompts import DEEPY_INFOS, DEEPY_PROMPT_INFOS, INFOS, MOTION_ENHANCER, PROMPT_INFOS
@@ -28,7 +29,7 @@ class family_handler:
 
     @staticmethod
     def query_family_infos():
-        return {"animate_any_mesh": (3040, "AnimateAnyMesh")}
+        return {"animate_any_mesh": (3040, "AnimateAnyMesh"), **goals_3d.family_infos(goals_3d.ANIMATE_MESH)}
 
     @staticmethod
     def get_lora_dir(base_model_type):
@@ -37,8 +38,10 @@ class family_handler:
     @staticmethod
     def query_model_def(base_model_type, model_def):
         return {
+            "group": goals_3d.ANIMATE_MESH,
             "image_outputs": True,
             "mesh_outputs": True,
+            "mesh_postprocessing": False,  # animated meshes
             "device_explicit": True,
             "no_negative_prompt": True,
             "embedded_guidance": False,

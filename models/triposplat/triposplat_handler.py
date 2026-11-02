@@ -1,4 +1,7 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
+from models import goals_3d
+from preprocessing.rembg.assets import OBJECT_MODEL
+
 from .prompts import ASSET_NAME_INSTRUCTIONS, TRIPOSPLAT_DEEPY_INFOS, TRIPOSPLAT_DEEPY_PROMPT_INFOS, TRIPOSPLAT_INFOS, TRIPOSPLAT_PROMPT_INFOS
 from .settings import CUSTOM_SETTINGS
 
@@ -21,7 +24,7 @@ class family_handler:
 
     @staticmethod
     def query_family_infos():
-        return {"triposplat": (3030, "TripoSplat")}
+        return {"triposplat": (3030, "TripoSplat"), **goals_3d.family_infos(goals_3d.IMAGE_TO_3D)}
 
     @staticmethod
     def get_lora_dir(base_model_type):
@@ -30,14 +33,17 @@ class family_handler:
     @staticmethod
     def query_model_def(base_model_type, model_def):
         return {
+            "group": goals_3d.IMAGE_TO_3D,
             "image_outputs": True,
             "mesh_outputs": True,
+            "mesh_postprocessing": False,  # Gaussian splats
             "device_explicit": True,
             "dtype": "fp16",
             "image_ref_choices": {"choices": [("Object Image", "I")], "letters_filter": "I", "default": "I"},
             "one_image_ref_needed": True,
             "one_image_ref_only": True,
             "image_refs_keep_alpha": True,
+            "background_removal_model": OBJECT_MODEL,  # BiRefNet: no cast shadows in the object cutout
             "prompt_description": "Asset Name / Description (optional, used for file names)",
             "prompt_optional": True,  # the prompt only names the output files
             "no_negative_prompt": True,
