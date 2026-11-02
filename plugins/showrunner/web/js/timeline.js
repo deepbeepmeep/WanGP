@@ -62,6 +62,7 @@ export function mountTimeline(container, doc) {
     segs = segments(doc, actions.take);
     setupSequencer();
     sequencer.setSegments(segs);
+    sequencer.setAudioTracks(doc.edit.audio_tracks);
     if (!fitted) fit();
     const song = analysis();
     const total = Math.max(totalSeconds(), song?.duration_s || 0);
