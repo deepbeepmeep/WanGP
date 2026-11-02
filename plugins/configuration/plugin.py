@@ -633,6 +633,32 @@ class ConfigTabPlugin(WAN2GPPlugin):
                             elem_classes="cbx_bottom",
                             interactive=not self.args.lock_config,
                         )
+                    with gr.Row(visible=not deepy_remote_default) as self.enhancer_retry_row:
+                        self.prompt_enhancer_retry_enabled_choice = gr.Checkbox(
+                            value=bool(self.server_config.get("prompt_enhancer_retry_enabled", False)),
+                            label="Retry Prompt Enhancer When It Returns No Output",
+                            info="Re-runs the enhancer when it returns no prompt, an empty prompt or the wrong number of prompts.",
+                            elem_classes="cbx_bottom",
+                            interactive=not self.args.lock_config,
+                        )
+                        self.prompt_enhancer_retry_attempts_choice = gr.Slider(
+                            2,
+                            10,
+                            value=int(self.server_config.get("prompt_enhancer_retry_attempts", 3)),
+                            step=1,
+                            show_reset_button=False,
+                            label="Max Attempts",
+                            interactive=not self.args.lock_config,
+                        )
+                        self.prompt_enhancer_retry_delay_choice = gr.Slider(
+                            1,
+                            60,
+                            value=float(self.server_config.get("prompt_enhancer_retry_delay", 5.0)),
+                            step=1,
+                            show_reset_button=False,
+                            label="Retry Delay (seconds)",
+                            interactive=not self.args.lock_config,
+                        )
                     speculative_choices, speculative_method, token_choices, speculative_tokens = speculative_decoding_ui_state(
                         enhancer_enabled_value, enhancer_quantization_value, self.server_config.get(PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY, PROMPT_ENHANCER_SPECULATIVE_DECODING_DEFAULT))
                     with gr.Row(visible=not deepy_remote_default and enhancer_enabled_value in QWEN_PROMPT_ENHANCER_IDS) as self.enhancer_speculative_row:
@@ -1068,6 +1094,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             *self.opencode_config_ui.save_components,
             self.enhancer_enabled_choice, self.enhancer_quantization_choice, self.enhancer_speculative_decoding_choice, self.enhancer_speculative_tokens_choice, self.enhancer_mode_choice,
             self.prompt_enhancer_temperature_choice, self.prompt_enhancer_top_p_choice, self.prompt_enhancer_randomize_seed_choice,
+            self.prompt_enhancer_retry_enabled_choice, self.prompt_enhancer_retry_attempts_choice, self.prompt_enhancer_retry_delay_choice,
             self.matanyone_version_choice, self.whisper_model_choice,
             self.deepy_type_choice, self.deepy_vram_mode_choice, self.deepy_voice_language_choice, self.voice_mode_choice, self.deepy_allow_read_file_system_choice, self.deepy_file_system_paths_choice, self.deepy_read_everywhere_choice,
             self.deepy_context_tokens_choice, self.deepy_kv_cache_quantization_choice, self.deepy_kv_cache_exact_choice, self.deepy_compaction_type_choice, self.deepy_repetition_penalty_choice, self.deepy_zero_custom_system_prompt_choice, self.deepy_prime_custom_system_prompt_choice, self.deepy_prime_mcp_servers_choice, self.deepy_mcp_auto_discover_paths_choice, self.deepy_python_sandbox_choice, self.python_apps_choice, self.deepy_web_search_choice, self.deepy_advanced_transcription_choice, self.deepy_transcription_terms_choice, self.civitai_api_key_choice, self.civitai_api_key_secure_choice, self.huggingface_token_choice, self.huggingface_token_secure_choice,
@@ -1180,6 +1207,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             opencode_executable_choice, opencode_base_url_choice, opencode_provider_choice, opencode_model_choice, opencode_reasoning_effort_choice, opencode_config_choice,
             enhancer_enabled_choice, enhancer_quantization_choice, enhancer_speculative_decoding_choice, enhancer_speculative_tokens_choice, enhancer_mode_choice,
             prompt_enhancer_temperature_choice, prompt_enhancer_top_p_choice, prompt_enhancer_randomize_seed_choice,
+            prompt_enhancer_retry_enabled_choice, prompt_enhancer_retry_attempts_choice, prompt_enhancer_retry_delay_choice,
             matanyone_version_choice, whisper_model_choice,
             deepy_type_choice, deepy_vram_mode_choice, deepy_voice_language_choice, voice_mode_choice, deepy_allow_read_file_system_choice, deepy_file_system_paths_choice, deepy_read_everywhere_choice,
             deepy_context_tokens_choice, deepy_kv_cache_quantization_choice, deepy_kv_cache_exact_choice, deepy_compaction_type_choice, deepy_repetition_penalty_choice, deepy_zero_custom_system_prompt_choice, deepy_prime_custom_system_prompt_choice, deepy_prime_mcp_servers_choice, deepy_mcp_auto_discover_paths_choice, deepy_python_sandbox_choice, python_apps_choice, deepy_web_search_choice, deepy_advanced_transcription_choice, deepy_transcription_terms_choice, civitai_api_key_choice, civitai_api_key_secure_choice, huggingface_token_choice, huggingface_token_secure_choice,
@@ -1356,6 +1384,9 @@ class ConfigTabPlugin(WAN2GPPlugin):
                 "prompt_enhancer_temperature": prompt_enhancer_temperature_choice,
                 "prompt_enhancer_top_p": prompt_enhancer_top_p_choice,
                 "prompt_enhancer_randomize_seed": prompt_enhancer_randomize_seed_choice,
+                "prompt_enhancer_retry_enabled": prompt_enhancer_retry_enabled_choice,
+                "prompt_enhancer_retry_attempts": prompt_enhancer_retry_attempts_choice,
+                "prompt_enhancer_retry_delay": prompt_enhancer_retry_delay_choice,
             })
         if qwen_local:
             new_server_config.update({
@@ -1446,7 +1477,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             "attention_mode", "vae_config", "boost", "int8_kernels", "fp8_kernels", "kernel_precision", "attention_head_split", "save_path", "image_save_path", "audio_save_path", "mesh_save_path",
             "metadata_type", "clear_file_list", "multi_prompts_gen_type", "keep_intermediate_sliding_windows", "fit_canvas", "depth_anything_v2_variant",
             "notification_sound_enabled", "notification_sound_volume", *notifications.CONFIG_KEYS, "audio_processors", "temporal_upsamplers", "spatial_upsamplers", "matanyone_version",
-            "prompt_enhancer_temperature", "prompt_enhancer_top_p", "prompt_enhancer_randomize_seed", "prompt_enhancer_quantization", PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY, "enhancer_mode",
+            "prompt_enhancer_temperature", "prompt_enhancer_top_p", "prompt_enhancer_randomize_seed", "prompt_enhancer_retry_enabled", "prompt_enhancer_retry_attempts", "prompt_enhancer_retry_delay", "prompt_enhancer_quantization", PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY, "enhancer_mode",
             DEEPY_ENABLED_KEY, DEEPY_TYPE_KEY, DEEPY_VRAM_MODE_KEY, DEEPY_ALLOW_READ_FILE_SYSTEM_KEY, DEEPY_FILE_SYSTEM_PATHS_KEY, DEEPY_READ_EVERYWHERE_KEY, DEEPY_CONTEXT_TOKENS_KEY, DEEPY_KV_CACHE_QUANTIZATION_KEY, DEEPY_COMPACTION_TYPE_KEY, DEEPY_COMPACTION_THINKING_KEY, DEEPY_REPETITION_PENALTY_KEY, DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY, DEEPY_PRIME_CUSTOM_SYSTEM_PROMPT_KEY, DEEPY_PRIME_MCP_SERVERS_KEY, DEEPY_MCP_AUTO_DISCOVER_PATHS_KEY, PYTHON_APPS_KEY, DEEPY_ADVANCED_TRANSCRIPTION_KEY, DEEPY_TRANSCRIPTION_TERMS_KEY,
             LLM_CONFIG_KEY,
             "max_frames_multiplier", "display_stats", "keep_resolution_on_model_switch", "enable_4k_resolutions", "max_reserved_loras", "video_output_codec", "hdr_video_crf", "video_container",
