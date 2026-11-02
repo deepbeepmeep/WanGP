@@ -1,10 +1,12 @@
 """
 Service for sending messages to Deepy (the built-in Qwen3.5 VL LLM).
 
-Uses the same prompt enhancer runtime as prompt enhancement but sends
-a conversational prompt instead of a cinematic prompt template.
+Deepy uses Qwen35AssistantRuntime (vLLM-backed) for text generation.
+This service follows the same pattern: it loads the prompt enhancer runtime,
+instantiates Qwen35AssistantRuntime, and calls generate_action().
 
 Lazy-loads the runtime on first use and caches it for subsequent requests.
+Unloads VRAM after each call so subsequent heavy models fit.
 
 NOTE: Qwen3.5-based Deepy requires CUDA. On Mac (MPS) or CPU-only
 systems, Deepy is unavailable and the service will raise a clear error.
@@ -26,7 +28,6 @@ import torch
 
 # Lazy-loaded runtime
 _deepy_lock = threading.RLock()
-_deepy_gpus_lock = threading.Lock()
 _deepy_runtime = None  # PromptEnhancerRuntime
 _deepy_model_loaded: Optional[int] = None  # tracks which enhancer_enabled is loaded
 _deepy_download_in_progress: bool = False
@@ -183,86 +184,11 @@ def _build_deepy_prompt(prompt: str, image: Optional[bytes] = None) -> str:
     parts = []
 
     if image is not None:
-        # Create a base64 data URI for the image
         b64 = base64.b64encode(image).decode("ascii")
-        # Qwen3.5 VL uses image: prefix for multimodal input
         parts.append(f"image: data:image/png;base64,{b64}")
 
     parts.append(prompt)
     return "\n\n".join(parts)
-
-
-def _generate_response(
-    runtime,
-    system_prompt: str,
-    user_prompt: str,
-    max_new_tokens: int,
-    temperature: float,
-    top_p: float,
-    seed: int,
-) -> str:
-    """Generate a response using the Qwen3.5 VL model.
-
-    Must be called while holding _deepy_lock.
-    """
-    # Prepare inputs for Qwen3.5 VL
-    try:
-        from shared.prompt_enhancer.qwen35_assistant_runtime import (
-            render_assistant_messages,
-        )
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-
-        token_ids = render_assistant_messages(
-            runtime.llm_tokenizer,
-            messages,
-            tools=None,
-            add_generation_prompt=True,
-            thinking_enabled=False,
-        )
-        input_tensor = torch.tensor([token_ids], dtype=torch.long)
-
-    except ImportError:
-        # Fallback: manual prompt formatting for older codebases
-        input_str = f"<|system|>\n{system_prompt}\n<|user|>\n{user_prompt}\n<|assistant|>\n"
-        inputs = runtime.llm_tokenizer(
-            input_str,
-            return_tensors="pt",
-            truncation=True,
-            max_length=8192,
-        )
-        input_tensor = inputs.input_ids
-
-    # Move to CUDA
-    input_tensor = input_tensor.to("cuda")
-
-    # Generate
-    with torch.no_grad():
-        outputs = runtime.llm_model.generate(
-            input_tensor,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=temperature,
-            top_p=top_p,
-            seed=seed,
-            pad_token_id=runtime.llm_tokenizer.pad_token_id,
-            eos_token_id=runtime.llm_tokenizer.eos_token_id,
-        )
-
-    # Decode
-    generated = outputs[0][input_tensor.shape[1]:]
-    response = runtime.llm_tokenizer.decode(generated, skip_special_tokens=True)
-
-    # Clean up response — strip assistant markers if present
-    response = response.strip()
-    for marker in ["Assistant:", "<|assistant|>"]:
-        if response.startswith(marker):
-            response = response[len(marker):].strip()
-
-    return response
 
 
 def run_deepy_message(
@@ -272,54 +198,71 @@ def run_deepy_message(
     temperature: float = 0.7,
     top_p: float = 0.9,
     seed: Optional[int] = None,
-    enhancer_enabled: int = 4,
+    enhancer_enabled: int = 4,  # Default: Qwen3.5-9B Abliterated
 ) -> tuple[str, int]:
     """Send a message to Deepy and return the response.
 
-    IMPORTANT: The caller (endpoint) is responsible for holding _deepy_lock
-    for the entire operation (get → generate → unload) to prevent races.
-    This function acquires _deepy_lock internally for the full duration.
-
-    Args:
-        prompt: The text prompt to send to the LLM.
-        image: Optional raw image bytes for the LLM to process.
-        max_new_tokens: Maximum tokens to generate.
-        temperature: Sampling temperature.
-        top_p: Top-p sampling parameter.
-        seed: Random seed (None or -1 for random).
-        enhancer_enabled: Model variant (3=Qwen3.5-4B, 4=Qwen3.5-9B).
-
-    Returns:
-        (response_text, seed_used) tuple.
+    Uses Qwen35AssistantRuntime (vLLM-backed) just like Deepy does internally.
+    Must be called while holding _deepy_lock.
     """
-    check_deepy_hardware(enhancer_enabled)
+    if seed is None or seed < 0:
+        seed = secrets.randbits(32)
 
-    with _deepy_lock:
-        runtime = get_deepy(enhancer_enabled)
-        _materialize_deepy_models(runtime, enhancer_enabled)
+    from shared.deepy import ZERO_SYSTEM_PROMPT
 
-        # Ensure the project root is in sys.path for imports
-        import sys
-        project_root = _resolve_project_root()
-        if str(project_root) not in sys.path:
-            sys.path.insert(0, str(project_root))
+    # Build the prompt
+    system_prompt = ZERO_SYSTEM_PROMPT
+    user_prompt = _build_deepy_prompt(prompt, image)
 
-        # Resolve seed
-        if seed is None or seed < 0:
-            seed = secrets.randbits(32)
+    # Get the prompt enhancer runtime (already loaded by caller)
+    runtime = get_deepy(enhancer_enabled)
+    _materialize_deepy_models(runtime, enhancer_enabled)
 
-        # Build the conversational prompt
-        from shared.deepy import ZERO_SYSTEM_PROMPT
-        system_prompt = ZERO_SYSTEM_PROMPT
-        user_prompt = _build_deepy_prompt(prompt, image)
+    # Ensure the project root is in sys.path for imports
+    import sys
+    project_root = _resolve_project_root()
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
 
-        # Generate response
-        response_text = _generate_response(
-            runtime, system_prompt, user_prompt,
-            max_new_tokens, temperature, top_p, seed,
-        )
+    # Import Qwen35AssistantRuntime — this is what Deepy uses for text generation
+    from shared.prompt_enhancer.qwen35_assistant_runtime import (
+        Qwen35AssistantRuntime,
+        Qwen35AssistantSessionState,
+    )
 
-        # Free VRAM after use so subsequent heavy models (e.g. i2v) fit.
-        unload_deepy_runtime()
+    # Build a minimal session state for the conversation
+    session_state = Qwen35AssistantSessionState(
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
 
-        return response_text, seed
+    # Create the runtime (wraps the Qwen3.5 model, uses vLLM for generation)
+    assistant_runtime = Qwen35AssistantRuntime(
+        model=runtime.llm_model,
+        tokenizer=runtime.llm_tokenizer,
+    )
+
+    # Generate using vLLM (same as Deepy does)
+    result = assistant_runtime.generate_action(
+        phase="statement",
+        seed=seed,
+        do_sample=True,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=None,
+        thinking_enabled=False,
+        max_new_tokens=max_new_tokens,
+    )
+
+    # Clean up response
+    response = result.raw_text.strip()
+    for marker in ["Assistant:", "<|assistant|>", "assistant:"]:
+        if response.startswith(marker):
+            response = response[len(marker):].strip()
+
+    # Free VRAM after use so subsequent heavy models fit
+    unload_deepy_runtime()
+
+    return response, seed
