@@ -26,7 +26,7 @@ export function segments(doc, take) {
 }
 
 export class Sequencer {
-  constructor(stage, { songUrl, songOffset = 0, songMode = 'song', fileUrl, onTime, onSegment }) {
+  constructor(stage, { songUrl, songOffset = 0, songMode = 'song', audioTracks = [], fileUrl, onTime, onSegment }) {
     this.stage = stage;
     this.fileUrl = fileUrl;
     this.onTime = onTime;
@@ -34,12 +34,63 @@ export class Sequencer {
     this.songMode = songMode;
     this.songOffset = songOffset;
     this.layers = [this.layer(), this.layer()];
-    this.audio = songUrl ? Object.assign(new Audio(songUrl), { preload: 'auto' }) : null;
+    this.audio = songUrl ? Object.assign(new Audio(songUrl), { preload: 'auto', volume: songMode === 'mix' ? 0.5 : 1 }) : null;
     this.time = 0;
     this.playing = false;
     this.segs = [];
     this.current = -1;
     this.frame = null;
+    this.tracks = [];
+    this.tracksKey = '';
+    this.context = null;
+    this.setAudioTracks(audioTracks);
+  }
+
+  setAudioTracks(tracks = []) {
+    const definitions = tracks.filter(track => track.path).map(track => ({ path: track.path, start: Math.max(0, +track.start_s || 0), gain: 10 ** ((+track.gain_db || 0) / 20) }));
+    const key = JSON.stringify(definitions);
+    if (key === this.tracksKey) return;
+    this.clearTracks();
+    this.tracksKey = key;
+    this.tracks = definitions.map(track => ({ ...track, audio: Object.assign(new Audio(this.fileUrl(track.path)), { preload: 'auto' }) }));
+    if (this.playing) this.prepareTracks();
+    this.syncTracks(true);
+  }
+
+  prepareTracks() {
+    if (!this.tracks.length) return;
+    this.context ||= new AudioContext();
+    this.context.resume().catch(() => {});  // called by the transport's user gesture
+    for (const track of this.tracks) {
+      if (track.source) continue;
+      track.source = this.context.createMediaElementSource(track.audio);
+      track.level = this.context.createGain();  // HTMLMediaElement.volume cannot represent gains above 0 dB
+      track.level.gain.value = track.gain;
+      track.source.connect(track.level).connect(this.context.destination);
+    }
+  }
+
+  syncTracks(force = false) {
+    for (const track of this.tracks) {
+      const audio = track.audio, offset = this.time - track.start;
+      const duration = Number.isFinite(audio.duration) ? audio.duration : Infinity;
+      const target = Math.max(0, Math.min(offset, duration));
+      if (force || Math.abs(audio.currentTime - target) > 0.25) { try { audio.currentTime = target; } catch { /* metadata not loaded yet */ } }
+      if (this.playing && offset >= 0 && offset < duration && this.time < this.total) {
+        if (audio.paused) audio.play().catch(() => {});
+      } else if (!audio.paused) audio.pause();
+    }
+  }
+
+  clearTracks() {
+    for (const track of this.tracks) {
+      track.audio.pause();
+      track.source?.disconnect();
+      track.level?.disconnect();
+      track.audio.removeAttribute('src');
+      track.audio.load();
+    }
+    this.tracks = [];
   }
 
   layer() {
@@ -86,6 +137,7 @@ export class Sequencer {
   }
 
   render() {
+    this.syncTracks();
     const time = this.time;
     const index = this.indexAt(time);
     const seg = this.segs[index];
@@ -139,6 +191,7 @@ export class Sequencer {
     if (this.audio) { try { this.audio.currentTime = this.songOffset + this.time; } catch { /* not ready */ } }
     this.stage.style.background = '#000';
     this.render();
+    this.syncTracks(true);
     this.onTime?.(this.time);
   }
 
@@ -146,6 +199,8 @@ export class Sequencer {
     if (!this.segs.length) return;
     if (this.time >= this.total - 0.05) this.seek(0);
     this.playing = true;
+    this.prepareTracks();
+    this.syncTracks(true);
     if (this.audio && this.songMode !== 'clips') { this.audio.currentTime = this.songOffset + this.time; this.audio.play().catch(() => {}); }
     this.last = performance.now();
     const tick = now => {
@@ -166,6 +221,7 @@ export class Sequencer {
     this.playing = false;
     cancelAnimationFrame(this.frame);
     this.audio?.pause();
+    this.tracks.forEach(track => track.audio.pause());
     this.layers.forEach(layer => layer.video.pause());
   }
 
@@ -173,6 +229,9 @@ export class Sequencer {
 
   destroy() {
     this.pause();
+    this.clearTracks();
+    this.context?.close().catch(() => {});
+    this.context = null;
     this.layers.forEach(layer => { layer.video.removeAttribute('src'); layer.video.load(); layer.element.remove(); });
     if (this.audio) { this.audio.removeAttribute('src'); this.audio.load(); }
   }
