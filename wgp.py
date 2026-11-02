@@ -147,6 +147,7 @@ from shared.prompt_enhancer import labels as prompt_enhancer_labels
 from shared.prompt_enhancer.progress import EnhancementProgress
 from shared.prompt_enhancer import in_process as prompt_enhancer_in_process
 from shared.prompt_enhancer.config import PROMPT_ENHANCER_SPECULATIVE_DECODING_DEFAULT, PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY, normalize_prompt_enhancer_speculative_decoding
+from shared.prompt_enhancer import retry as prompt_enhancer_retry
 import base64
 import io
 from PIL import Image
@@ -2894,6 +2895,9 @@ if not Path(config_load_filename).is_file():
         "prompt_enhancer_temperature": 0.6,
         "prompt_enhancer_top_p": 0.9,
         "prompt_enhancer_randomize_seed": True,
+        "prompt_enhancer_retry_enabled": False,
+        "prompt_enhancer_retry_attempts": prompt_enhancer_retry.DEFAULT_MAX_ATTEMPTS,
+        "prompt_enhancer_retry_delay": prompt_enhancer_retry.DEFAULT_RETRY_DELAY,
         "audio_save_path": "outputs",
         **notifications.default_config(),
     }
@@ -3733,6 +3737,9 @@ if "keep_intermediate_sliding_windows" not in server_config: server_config["keep
 if "prompt_enhancer_temperature" not in server_config: server_config["prompt_enhancer_temperature"] = 0.6
 if "prompt_enhancer_top_p" not in server_config: server_config["prompt_enhancer_top_p"] = 0.9
 if "prompt_enhancer_randomize_seed" not in server_config: server_config["prompt_enhancer_randomize_seed"] = True
+if "prompt_enhancer_retry_enabled" not in server_config: server_config["prompt_enhancer_retry_enabled"] = False
+if "prompt_enhancer_retry_attempts" not in server_config: server_config["prompt_enhancer_retry_attempts"] = prompt_enhancer_retry.DEFAULT_MAX_ATTEMPTS
+if "prompt_enhancer_retry_delay" not in server_config: server_config["prompt_enhancer_retry_delay"] = prompt_enhancer_retry.DEFAULT_RETRY_DELAY
 set_deepy_runtime_config(server_config, server_config_filename)
 if "int8_kernels" not in server_config: server_config["int8_kernels"] = "auto"
 if "fp8_kernels" not in server_config: server_config["fp8_kernels"] = "auto"
@@ -6928,6 +6935,29 @@ class DynamicClass:
         """Alias for assign() - more dict-like"""
         return self.assign(**dict)
 
+def prompt_enhancer_retry_settings():
+    """(max_attempts, delay) for prompt enhancer retries, read from server_config."""
+    return prompt_enhancer_retry.normalize_settings(
+        server_config.get("prompt_enhancer_retry_enabled", False),
+        server_config.get("prompt_enhancer_retry_attempts", prompt_enhancer_retry.DEFAULT_MAX_ATTEMPTS),
+        server_config.get("prompt_enhancer_retry_delay", prompt_enhancer_retry.DEFAULT_RETRY_DELAY),
+    )
+
+
+def enhance_prompts_with_retries(call, routed, expected_count, max_attempts=None, delay=None, label=""):
+    """Run an enhancer call, retrying when it returns no usable prompt (config driven)."""
+    if max_attempts is None or delay is None:
+        max_attempts, delay = prompt_enhancer_retry_settings()
+    return prompt_enhancer_retry.enhance_with_retries(
+        call,
+        routed=routed,
+        expected_count=expected_count,
+        max_attempts=max_attempts,
+        delay=delay,
+        label=label,
+    )
+
+
 def process_prompt_enhancer(model_type, model_def, prompt_enhancer, original_prompts,  image_start, original_image_refs, is_image, audio_only, seed, prompt_enhancer_instructions = None, text_encoder_max_tokens = 512, enhancer_kwargs = None, batch_images = False):
     global enhancer_offloadobj
     prompt_enhancer_mode = str(prompt_enhancer or "")
@@ -8162,9 +8192,19 @@ def generate_media(
                     original_prompts, enhancer_kwargs["image_contexts"] = prompt_enhancer_images.prepare_auto(original_prompts, None if fake_start_image else image_start, image_end, original_image_refs, windows=scheduled_windows if scheduler_active else default_windows, fps=fps, window_size=sliding_window_size, positions=frames_positions, source_frames=first_window_available_overlap, reset_alignment=reset_control_aligment, model_def=model_def, discard_frames=sliding_window_discard_last_frames, reuse_frames=default_reuse_frames, multi_prompt_output=multi_prompt_output, video=not is_image and not audio_only, video_prompt_type=video_prompt_type, control_image=enhancer_kwargs["control_image"], continuation_image=continuation_image)
                     prompts_to_enhance = original_prompts[:1] if multi_prompt_output else original_prompts
                 if routed:
-                    enhanced = prompt_enhancer_chaining.run_chain(prompt_enhancer, original_prompts, original_alt_prompts, alt_prompt_inherits, lambda step, values: process_prompt_enhancer(model_type, model_def, step.mode, values, enhancer_start if enhancer_start is not None else image_end, original_image_refs, is_image, audio_only, seed, enhancer_kwargs=enhancer_kwargs, batch_images=True))
+                    enhanced = enhance_prompts_with_retries(
+                        lambda: prompt_enhancer_chaining.run_chain(prompt_enhancer, original_prompts, original_alt_prompts, alt_prompt_inherits, lambda step, values: process_prompt_enhancer(model_type, model_def, step.mode, values, enhancer_start if enhancer_start is not None else image_end, original_image_refs, is_image, audio_only, seed, enhancer_kwargs=enhancer_kwargs, batch_images=True)),
+                        routed=True,
+                        expected_count=len(original_prompts),
+                        label=f" task {task.get('id')}",
+                    )
                 else:
-                    enhanced = process_prompt_enhancer(model_type, model_def, prompt_enhancer, prompts_to_enhance, enhancer_start if enhancer_start is not None else image_end, original_image_refs, is_image, audio_only, seed, enhancer_kwargs=enhancer_kwargs)
+                    enhanced = enhance_prompts_with_retries(
+                        lambda: process_prompt_enhancer(model_type, model_def, prompt_enhancer, prompts_to_enhance, enhancer_start if enhancer_start is not None else image_end, original_image_refs, is_image, audio_only, seed, enhancer_kwargs=enhancer_kwargs),
+                        routed=False,
+                        expected_count=len(prompts_to_enhance),
+                        label=f" task {task.get('id')}",
+                    )
             finally:
                 release_prompt_enhancer()
             if enhanced is not None:
