@@ -108,3 +108,57 @@ class PromptEnhanceResponse(BaseModel):
         default=None,
         description="The seed used for generation",
     )
+
+
+class DeepyMessageRequest(BaseModel):
+    """Request model for Deepy (LLM) messaging endpoint."""
+
+    prompt: str = Field(
+        ...,
+        min_length=1,
+        max_length=4000,
+        description="The text prompt to send to the LLM",
+    )
+    image: Optional[str] = Field(
+        default=None,
+        description="Base64-encoded image (data URI: data:image/png;base64,...)",
+    )
+    max_new_tokens: int = Field(
+        default=512,
+        ge=64,
+        le=4096,
+        description="Maximum number of tokens to generate",
+    )
+    temperature: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=2.0,
+        description="Sampling temperature",
+    )
+    top_p: float = Field(
+        default=0.9,
+        ge=0.0,
+        le=1.0,
+        description="Top-p sampling parameter",
+    )
+    seed: int = Field(
+        default=-1,
+        description="Random seed (-1 for random)",
+    )
+
+
+class DeepyMessageResponse(BaseModel):
+    """Response model for Deepy message."""
+
+    response: str = Field(
+        ...,
+        description="The LLM's response text",
+    )
+    model_used: str = Field(
+        ...,
+        description="The model that was used (Qwen3.5 VL)",
+    )
+    seed_used: Optional[int] = Field(
+        default=None,
+        description="The seed used for generation",
+    )

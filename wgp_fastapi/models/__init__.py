@@ -26,6 +26,8 @@ from wgp_fastapi.models.prompt_enhance import (
     PromptEnhancerModel,
     PromptEnhanceRequest,
     PromptEnhanceResponse,
+    DeepyMessageRequest,
+    DeepyMessageResponse,
 )
 from wgp_fastapi.models.nsfw import (
     NsfwImageResponse,
@@ -61,6 +63,8 @@ __all__ = [
     "PromptEnhancerModel",
     "PromptEnhanceRequest",
     "PromptEnhanceResponse",
+    "DeepyMessageRequest",
+    "DeepyMessageResponse",
     "NsfwImageResponse",
     "NsfwTextRequest",
     "NsfwTextResponse",

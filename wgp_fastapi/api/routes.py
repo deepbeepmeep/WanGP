@@ -1524,6 +1524,95 @@ async def prompt_enhance(
 
 
 @app.post(
+    "/api/v1/deepy-message",
+    response_model=DeepyMessageResponse,
+    summary="Deepy LLM Message",
+    description="Send a message to the built-in Deepy LLM (Qwen3.5 VL). "
+    "Accepts a text prompt and an optional base64-encoded image. "
+    "Async: waits until Deepy loads the model and generates a response, then returns it.",
+)
+async def deepy_message(
+    prompt: str,
+    image: Optional[str] = Form(
+        None,
+        description="Base64-encoded image as a data URI (e.g. data:image/png;base64,...)",
+    ),
+    model: str = Form(
+        "qwen35_9b_abliterated",
+        description="Model variant: qwen35_9b_abliterated or qwen35_4b_abliterated",
+    ),
+    max_new_tokens: int = Form(
+        512,
+        ge=64,
+        le=4096,
+        description="Maximum tokens to generate",
+    ),
+    temperature: float = Form(
+        0.7,
+        ge=0.0,
+        le=2.0,
+        description="Sampling temperature",
+    ),
+    top_p: float = Form(
+        0.9,
+        ge=0.0,
+        le=1.0,
+        description="Top-p sampling parameter",
+    ),
+    seed: int = Form(
+        -1,
+        description="Random seed (-1 for random)",
+    ),
+) -> DeepyMessageResponse:
+    """Send a message to Deepy LLM and get a response."""
+    try:
+        # Parse enhancer_enabled from model string
+        enhancer_map = {
+            "qwen35_9b_abliterated": 4,
+            "qwen35_4b_abliterated": 3,
+        }
+        enhancer_enabled = enhancer_map.get(model, 4)
+
+        # Decode optional image from data URI
+        image_bytes = None
+        if image:
+            # Strip data URI prefix to get raw base64
+            if "," in image:
+                image = image.split(",", 1)[1]
+            import base64
+            image_bytes = base64.b64decode(image)
+
+        # Call the service (it handles loading, generation, and VRAM cleanup)
+        from wgp_fastapi.services.deepy_message import run_deepy_message
+
+        response_text, used_seed = run_deepy_message(
+            prompt=prompt,
+            image=image_bytes,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            seed=seed if seed >= 0 else None,
+            enhancer_enabled=enhancer_enabled,
+        )
+
+        return DeepyMessageResponse(
+            response=response_text,
+            model_used=model,
+            seed_used=used_seed,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+
+        tb = traceback.format_exc()
+        print(f"[ERROR] deepy-message endpoint failed: {e}")
+        print(tb)
+        raise HTTPException(status_code=500, detail={"error": str(e), "type": type(e).__name__, "traceback": tb})
+
+
+@app.post(
     "/api/v1/nsfw-check/text",
     response_model=NsfwTextResponse,
     summary="NSFW Text Check",
