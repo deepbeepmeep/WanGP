@@ -83,7 +83,16 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 ## 🔥 Latest Updates : 
 
-## 2nd of November 2026: WanGP v19.10 - More Treats Than You Can Handle
+
+## 2nd of November 2026: WanGP v19.10 - The Show must Go On
+
+## Showrunner 0.2.0
+  - **Places that stay the same**: a kitchen or a cockpit no longer changes from shot to shot. The showrunner makes a picture of each recurring place and shoots in it, or uses your own photo.
+  - **Fix what is wrong, keep the rest**: pause on a problem or pick shots, say what should change or press **+** to insert a shot. Only that changes; compare with the previous version and go back in one click. Bigger changes (a new actor, a new song) stay one sentence away in the chat.
+  - **Voices and songs that hold together**: each voice is checked against its cast card and each line against its voice, so a man does not sound like a woman and a voice does not change between lines. Lines that are not really sung are found before any shot depends on them, subtitles follow the singing, and a shot inserted in a music video keeps every later shot in sync with the song.
+  - **Deep Review**: one click measures a finished version against its script (words, subtitles, voices, lips, sound and picture), then the showrunner looks at every shot. Each finding says where and what, and goes to the fix window in one click.
+  - **Faster and clearer at every step**: a new request on the production you just worked on starts in seconds, the panel says what the showrunner is doing right now, silent shots play their whole video, and comparing versions has a bar to jump to any moment. Turn on **Show the Deepy tab** in **Settings** to follow Deepy's thoughts and every step.
+## 30th of October 2026: WanGP v19.02 - More Treats Than You Can Handle
 
 - **Showrunner**: from a brief to a finished production of up to ten minutes: a music video, a short film, an ad, a trailer or an illustrated story. Deepy Prime becomes your showrunner: it plans every shot, casts, shoots, checks its own takes, redoes the failed ones and assembles the cut ([Showrunner guide](docs/SHOWRUNNER.md)).
   - **The same cast from start to finish**: faces, outfits and voices stay consistent across dozens of shots, costume changes included, and long productions get titles and chapter cards.
@@ -93,12 +102,6 @@ WanGP is a one-stop super app for open source generative models: create videos, 
   - **Every version kept**: compare versions side by side, go back to one or branch it into a new production. Exports come with subtitles and a levelled soundtrack.
   - **Works with your models**: Showrunner uses Deepy's templates, your own included, and can pause to free the GPU for other work. It needs Deepy Prime, with a local model or a remote agent.
 
-- **Showrunner v19.10 update**:
-  - **Places that stay the same**: a kitchen or a cockpit no longer changes from shot to shot. The showrunner makes a picture of each recurring place and shoots in it, or uses your own photo.
-  - **Fix what is wrong, keep the rest**: pause on a problem or pick shots, say what should change or press **+** to insert a shot. Only that changes; compare with the previous version and go back in one click. Bigger changes (a new actor, a new song) stay one sentence away in the chat.
-  - **Voices and songs that hold together**: each voice is checked against its cast card and each line against its voice, so a man does not sound like a woman and a voice does not change between lines. Lines that are not really sung are found before any shot depends on them, subtitles follow the singing, and a shot inserted in a music video keeps every later shot in sync with the song.
-  - **Deep Review**: one click measures a finished version against its script (words, subtitles, voices, lips, sound and picture), then the showrunner looks at every shot. Each finding says where and what, and goes to the fix window in one click.
-  - **Faster and clearer at every step**: a new request on the production you just worked on starts in seconds, the panel says what the showrunner is doing right now, silent shots play their whole video, and comparing versions has a bar to jump to any moment. Turn on **Show the Deepy tab** in **Settings** to follow Deepy's thoughts and every step.
 
 - **Nemotron Transcription**: turn speech into text offline, with little VRAM: who said what (up to eight speakers, even talking over each other), when each word was said, subtitles, and translation to or from English, for recordings of up to an hour in 40 languages. **Q4 Experts** (32 GB of RAM) is the recommended version.
   - **Audio or video**: transcribe an audio file or a video's soundtrack.
