@@ -1368,7 +1368,7 @@ class MiniMaxH3Pipeline:
                         final = step == model_steps - 1
                         if not target_video_condition_frames:
                             velocity_list, video_velocity = [video_velocity], None
-                            pika_renoise_(video, velocity_list, sigma_video, sigma_video_next, renoise_generator, final=final)
+                            video_denoised = pika_renoise_(video, velocity_list, sigma_video, sigma_video_next, renoise_generator, final=final, return_denoised=tiny_vae_preview)
                         if audio_tail.shape[-1] and not freeze_audio:
                             velocity_list, audio_velocity = [audio_velocity[..., target_audio_condition_latents:]], None
                             pika_renoise_(audio_tail, velocity_list, stage_sigmas_audio[step], stage_sigmas_audio[step + 1], renoise_generator, final=final, audio=True)
