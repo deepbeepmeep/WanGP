@@ -62,6 +62,8 @@ from wgp_fastapi.models import (
     PromptEnhancerModel,
     PromptEnhanceRequest,
     PromptEnhanceResponse,
+    DeepyMessageRequest,
+    DeepyMessageResponse,
     KreaImageRequest,
     KreaImageResponse,
     KreaImageModel,
