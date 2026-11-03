@@ -147,7 +147,9 @@ def resolve_root(explicit: str | None) -> Path:
     else:
         # scripts/install_dlss5.py -> WanGP root
         root = Path(__file__).resolve().parents[1]
-    if not (root / "run.sh").is_file() and not (root / "src").is_dir():
+    # wgp.py is what a checkout of the repository always carries. The launcher
+    # scripts are personal and gitignored, so they cannot gate a fresh clone.
+    if not (root / "wgp.py").is_file() and not (root / "src").is_dir():
         print(f"ERROR: no WanGP checkout found at {root}")
         print("       pass --wan-gp-root DIR pointing at the WanGP repository.")
         raise SystemExit(1)
