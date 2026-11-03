@@ -67,10 +67,12 @@ _TOOLBOX_ACTIONS = {
     "inspect_media",
     "inspect_video",
     "inspect_audio",
+    "check_lip_sync",
     "extract_image",
     "extract_video",
     "extract_audio",
     "transcribe_media",
+    "advanced_transcription",
     "mute_video",
     "remove_vocals",
     "replace_audio",
@@ -89,10 +91,12 @@ _TOOLBOX_MEDIA_PARAMETERS = {
     "inspect_video": ("media_id",),
     "view_media": ("media_ids",),
     "inspect_audio": ("media_id",),
+    "check_lip_sync": ("media_id", "voice_id"),
     "extract_image": ("media_id",),
     "extract_video": ("media_id",),
     "extract_audio": ("media_id",),
     "transcribe_media": ("media_id",),
+    "advanced_transcription": ("media_id",),
     "mute_video": ("media_id",),
     "remove_vocals": ("media_id",),
     "replace_audio": ("video_id", "audio_id"),
@@ -726,7 +730,8 @@ def _deepy_template_settings(session, tool_id: str, template: str) -> dict[str, 
     requested_template = str(template or "").strip()
     resolved_template = catalog["default_template"] if requested_template.casefold() == "default" else deepy_tool_settings.find_tool_variant(tool_id, requested_template, current_variant=catalog["default_template"])
     if resolved_template is None:
-        raise ValueError(f"Unknown Deepy template '{template}' for tool '{tool_id}'.")
+        owners = [tool for tool in deepy_tool_settings.GENERATION_TOOL_IDS if deepy_tool_settings.find_tool_variant(tool, requested_template)]
+        raise ValueError(f"Unknown Deepy template '{template}' for tool '{tool_id}'." + (f" It belongs to {owners[0]}: write '{owners[0]}/{requested_template}'." if owners else ""))
     template_settings = session.merge_settings_with_defaults(deepy_tool_settings.clone_tool_preset(tool_id, resolved_template))
     general_properties = _deepy_general_properties(session)
     effective_settings = session.prepare_settings_for_export(template_settings)
@@ -2062,7 +2067,7 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
         action_name = str(action or "").strip()
         actions = _toolbox_discovery(sandbox_toolbox, allow_read_file_system)
         if api_version != "2.1":
-            actions = [action for action in actions if action["name"] != "inspect_audio"]
+            actions = [action for action in actions if action["name"] not in ("inspect_audio", "check_lip_sync")]
         if not action_name:
             compact_actions = [{"name": candidate["name"], "description": candidate.get("description", "")} for candidate in actions]
             return {"status": "discovery", "actions": compact_actions, "count": len(compact_actions), "next": "Call again with one action and omit arguments to get its exact schema."}

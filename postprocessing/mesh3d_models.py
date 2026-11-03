@@ -42,6 +42,9 @@ class ModelRuntime:
 class MethodValueMixin:
     """Processor values without multiplier: the method key itself."""
 
+    def query_checkpoint_inventory(self):
+        return [{"model_types": [self.runtime.model_type]}]
+
     def _method_keys(self):
         definition = self.query_temporal_upsampler_def() if hasattr(self, "query_temporal_upsampler_def") else self.query_upsampler_def()
         return [key for _, key in definition["methods"]]

@@ -43,7 +43,8 @@ class GallerySource:
 
 
 VIDEO = GallerySource("video", "Images / Videos", ("image", "video"), "", "video_images", "Video / Images", "image/*,video/*", "visual")
-AUDIO = GallerySource("audio", "Audio", ("audio",), "audio_", "audio", "Audio", "audio/*", "audio")
+# Audio imports filter by extension: iOS Safari treats audio/* as video and greys out audio files.
+AUDIO = GallerySource("audio", "Audio", ("audio",), "audio_", "audio", "Audio", ".wav,.mp3,.aac,.flac,.m4a,.ogg,.opus,.wma", "audio")
 MESH = GallerySource("mesh", "3D", ("3d",), "mesh_", "mesh", "3D", ".glb,.obj,.ply,.stl", "3d")
 WORLD = GallerySource("world", "Worlds", ("world",), "world_", "world", "Worlds", ".wgpworld", "world")
 APP = GallerySource("app", "Apps", ("app",), "app_", "apps", "Apps", ".wgpapp", "app")

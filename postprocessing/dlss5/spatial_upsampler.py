@@ -32,6 +32,14 @@ class DLSS5SpatialUpsampler(api.SimpleScaleSuffixMixin):
     def config(self):
         return api.read_config_section(self.server_config, self)
 
+    def query_checkpoint_inventory(self):
+        from preprocessing.processors import depth_checkpoint_inventory, query_preprocessor_download_def
+
+        if USE_DEPTH_GUIDE:
+            for entry in depth_checkpoint_inventory():
+                yield {"name": "DLSS 5", "variant": f"{entry['name']} {entry['variant']}", "download_defs": entry["download_defs"]}
+        yield {"name": "DLSS 5", "variant": "RAFT Optical Flow", "download_defs": [query_preprocessor_download_def("flow")]}
+
     def query_download_defs(self, enabled_only=True):
         from preprocessing.processors import query_preprocessor_download_def
 

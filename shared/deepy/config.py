@@ -32,6 +32,7 @@ DEEPY_TOOL_GEN_3D_KEY = "deepy_tool_gen_3d"
 DEEPY_TOOL_TEXTURE_3D_KEY = "deepy_tool_texture_3d"
 DEEPY_CONTEXT_TOKENS_KEY = "deepy_context_tokens"
 DEEPY_KV_CACHE_QUANTIZATION_KEY = "deepy_kv_cache_quantization"
+DEEPY_KEPT_KV_CACHES_KEY = "deepy_kept_kv_caches"
 DEEPY_COMPACTION_TYPE_KEY = "deepy_compaction_type"
 DEEPY_COMPACTION_THINKING_KEY = "deepy_compaction_thinking"
 DEEPY_REPETITION_PENALTY_KEY = "deepy_repetition_penalty"
@@ -58,9 +59,14 @@ DEEPY_TEMPLATE_CONFIG_MIGRATIONS = {
     },
     DEEPY_TOOL_GEN_VIDEO_KEY: {
         "MiniMax H3 FL2VA Turbo Lightx2v 8 Steps": "MiniMax H3 FL2VA Pruned Turbo Lightx2v 8 Steps",
+        "Pika H3 Flex FL2VA 6 Steps": "Pika H3 Flex FL2VA Pruned 6 Steps",  # Pika templates moved to the pruned models (2026-10-31)
     },
     DEEPY_TOOL_GEN_VIDEO_WITH_SPEECH_KEY: {
         "MiniMax H3 FL2VA Turbo Lightx2v 8 Steps With Sound": "MiniMax H3 FL2VA Pruned Turbo Lightx2v 8 Steps With Sound",
+        "Pika H3 Flex Ref2VA 6 Steps With Audio References": "Pika H3 Flex Ref2VA Pruned 6 Steps With Audio References",
+    },
+    DEEPY_TOOL_GEN_VIDEO_WITH_REFS_KEY: {
+        "Pika H3 Flex Ref2VA 6 Steps": "Pika H3 Flex Ref2VA Pruned 6 Steps",
     },
     DEEPY_TOOL_GEN_3D_KEY: {
         "TRELLIS.2 4B": "TRELLIS.2 + SUPRA-Tex PBR 4B + 2.1B",  # TRELLIS.2 split into a Shape model and a Texturer (2026-10-29)
@@ -101,6 +107,8 @@ DEEPY_REPETITION_PENALTY_DEFAULT = True
 DEEPY_KV_CACHE_QUANTIZATION_AUTO = "auto"
 DEEPY_KV_CACHE_QUANTIZATION_DEFAULT = DEEPY_KV_CACHE_QUANTIZATION_AUTO
 DEEPY_KV_CACHE_QUANTIZATION_MIN_GGUF_KERNELS_VERSION = "1.0.13"
+DEEPY_KEPT_KV_CACHES_DEFAULT = 2
+DEEPY_KEPT_KV_CACHES_MAX = 4
 DEEPY_ALLOW_READ_FILE_SYSTEM_DEFAULT = False
 DEEPY_FILE_SYSTEM_ACCESS_DISABLED = "disabled"
 DEEPY_FILE_SYSTEM_ACCESS_READ = "read"
@@ -114,6 +122,14 @@ PYTHON_APPS_KEY = "python_apps"  # shared config group of App Development (Advan
 PYTHON_APPS_LEVELS = ("off", "apps", "plugins")
 DEEPY_WEB_SEARCH_KEY = "deepy_web_search"
 DEEPY_WEB_SEARCH_DEFAULT = "disabled"
+DEEPY_ADVANCED_TRANSCRIPTION_KEY = "deepy_advanced_transcription"  # the transcription model of Prime's advanced_transcription toolbox action, or disabled
+DEEPY_ADVANCED_TRANSCRIPTION_DEFAULT = "disabled"
+DEEPY_ADVANCED_TRANSCRIPTION_CHOICES = [
+    ("Use Whisper Only", "disabled"),
+    ("Nemotron INT8 Experts", "nemotron_transcribe"),
+    ("Nemotron Q4 Experts (Recommended)", "nemotron_transcribe_q4"),
+]
+DEEPY_TRANSCRIPTION_TERMS_KEY = "deepy_transcription_terms"  # names and jargon added to every advanced transcription (Nemotron context terms)
 CIVITAI_API_KEY_KEY = "civitai_api_key"  # shared config: Civitai downloads of LoRAs through Deepy's web toolbox (searching needs none); plaintext only when not stored securely
 CIVITAI_API_KEY_SECURE_KEY = "civitai_api_key_secure"  # the key lives in the OS credential manager under the credential id below
 CIVITAI_API_KEY_CREDENTIAL_ID_KEY = "civitai_api_key_credential_id"
@@ -234,7 +250,7 @@ def normalize_deepy_tool_gen_video_with_speech(value: Any) -> str:
 
 
 def normalize_deepy_tool_gen_video_with_refs(value: Any) -> str:
-    return _normalize_deepy_variant(value, {}, DEEPY_DEFAULT_GEN_VIDEO_WITH_REFS)
+    return _normalize_deepy_variant(value, DEEPY_TEMPLATE_CONFIG_MIGRATIONS[DEEPY_TOOL_GEN_VIDEO_WITH_REFS_KEY], DEEPY_DEFAULT_GEN_VIDEO_WITH_REFS)
 
 
 def normalize_deepy_tool_gen_song(value: Any) -> str:
@@ -267,6 +283,14 @@ def normalize_deepy_context_tokens(value: Any) -> int:
     except Exception:
         tokens = DEEPY_CONTEXT_TOKENS_DEFAULT
     return max(DEEPY_CONTEXT_TOKENS_MIN, min(DEEPY_CONTEXT_TOKENS_MAX, tokens))
+
+
+def normalize_deepy_kept_kv_caches(value: Any) -> int:
+    """How many conversations keep their KV cache in RAM, the current one included, one each; 0 keeps none."""
+    try:
+        return max(0, min(DEEPY_KEPT_KV_CACHES_MAX, int(value)))
+    except (TypeError, ValueError):
+        return DEEPY_KEPT_KV_CACHES_DEFAULT
 
 
 def normalize_deepy_kv_cache_quantization(value: Any) -> str:
@@ -316,6 +340,19 @@ def get_gguf_kernels_version() -> str:
         return ""
 
 
+@lru_cache(maxsize=1)
+def deepy_lower_kv_cache_supported() -> bool:
+    """A KV cache below INT8 reads through Triton kernels, on NVIDIA GPUs with native BF16 conversions; elsewhere it would go through the dense paths."""
+    from importlib.util import find_spec
+
+    import torch
+
+    if find_spec("triton") is None or not torch.cuda.is_available() or torch.version.hip is not None:
+        return False
+    from shared.kernels.dispatch import triton_dtype_supported
+    return triton_dtype_supported(0, torch.bfloat16)
+
+
 def resolve_deepy_kv_cache_quantization(value: Any) -> tuple[str, str]:
     mode = normalize_deepy_kv_cache_quantization(value)
     if mode != DEEPY_KV_CACHE_QUANTIZATION_AUTO:
@@ -325,6 +362,9 @@ def resolve_deepy_kv_cache_quantization(value: Any) -> tuple[str, str]:
         supported = bool(installed_version) and Version(installed_version) >= Version(DEEPY_KV_CACHE_QUANTIZATION_MIN_GGUF_KERNELS_VERSION)
     except InvalidVersion:
         supported = False
+    if supported and deepy_lower_kv_cache_supported():
+        from shared.llm_engines.lmgp.layers.kv_formats import DEFAULT_EXACT
+        return f"q4:{DEFAULT_EXACT}", f"Q4 KV Cache quantization enabled automatically because GGUF kernels {installed_version} and the Triton kernels were found."
     if supported:
         return "int8", f"Fast KV Cache quantization enabled automatically because GGUF kernels {installed_version} were found."
     found = f" {installed_version}" if installed_version else ""
@@ -521,6 +561,22 @@ def normalize_deepy_web_search(value: Any) -> str:
     return "enabled" if str(value or "").strip().lower() in {"enabled", "on", "true", "1", "yes"} else "disabled"
 
 
+def normalize_deepy_advanced_transcription(value: Any) -> str:
+    value = str(value or "").strip()
+    return value if value in {choice for _label, choice in DEEPY_ADVANCED_TRANSCRIPTION_CHOICES} else DEEPY_ADVANCED_TRANSCRIPTION_DEFAULT
+
+
+def advanced_transcription_model() -> str:
+    """The model type of Prime's advanced transcription, or "" while the user has not enabled it."""
+    model_type = normalize_deepy_advanced_transcription(get_deepy_config_value(DEEPY_ADVANCED_TRANSCRIPTION_KEY, DEEPY_ADVANCED_TRANSCRIPTION_DEFAULT))
+    return "" if model_type == DEEPY_ADVANCED_TRANSCRIPTION_DEFAULT else model_type
+
+
+def advanced_transcription_terms() -> str:
+    """The user's names and jargon for every advanced transcription, comma- or line-separated."""
+    return str(get_deepy_config_value(DEEPY_TRANSCRIPTION_TERMS_KEY, "") or "").strip()
+
+
 def normalize_deepy_mcp_auto_discover_paths(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "on", "yes"}
@@ -619,6 +675,7 @@ def normalize_deepy_runtime_config(server_config: dict[str, Any] | None) -> dict
     if qwen_local:
         runtime_config[DEEPY_REPETITION_PENALTY_KEY] = normalize_deepy_repetition_penalty(runtime_config.get(DEEPY_REPETITION_PENALTY_KEY, DEEPY_REPETITION_PENALTY_DEFAULT))
         runtime_config[DEEPY_KV_CACHE_QUANTIZATION_KEY] = normalize_deepy_kv_cache_quantization(runtime_config.get(DEEPY_KV_CACHE_QUANTIZATION_KEY, DEEPY_KV_CACHE_QUANTIZATION_DEFAULT))
+        runtime_config[DEEPY_KEPT_KV_CACHES_KEY] = normalize_deepy_kept_kv_caches(runtime_config.get(DEEPY_KEPT_KV_CACHES_KEY, DEEPY_KEPT_KV_CACHES_DEFAULT))
     if runtime_config[DEEPY_ENABLED_KEY] and (qwen_local or remote):
         runtime_config[DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY] = normalize_deepy_custom_system_prompt(runtime_config.get(DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY, ""))
         runtime_config[DEEPY_PRIME_CUSTOM_SYSTEM_PROMPT_KEY] = normalize_deepy_prime_guidance(runtime_config.get(DEEPY_PRIME_CUSTOM_SYSTEM_PROMPT_KEY, DEEPY_PRIME_GUIDANCE_DEFAULT))
@@ -659,6 +716,7 @@ def get_deepy_default_runtime_config() -> dict[str, Any]:
         DEEPY_COMPACTION_TYPE_KEY: DEEPY_COMPACTION_TYPE_DEFAULT,
         DEEPY_COMPACTION_THINKING_KEY: DEEPY_COMPACTION_THINKING_DEFAULT,
         DEEPY_REPETITION_PENALTY_KEY: DEEPY_REPETITION_PENALTY_DEFAULT,
+        DEEPY_KEPT_KV_CACHES_KEY: DEEPY_KEPT_KV_CACHES_DEFAULT,
         DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY: "",
         DEEPY_PRIME_CUSTOM_SYSTEM_PROMPT_KEY: DEEPY_PRIME_GUIDANCE_DEFAULT,
         DEEPY_MODEL_SPEED_KEY: "fast",

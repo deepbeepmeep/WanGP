@@ -1,14 +1,60 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
-"""Image color metadata and channel operations for Deepy media tools."""
+"""Image orientation and color metadata, and channel operations for Deepy media tools."""
 
 from __future__ import annotations
 
+import struct
 from pathlib import Path
 
-from PIL import Image, ImageColor
+from PIL import Image, ImageColor, ImageOps
 
 
 CHANNELS = "RGBA"
+EXIF_ORIENTATION = 0x0112
+PNG_METADATA_CHUNKS = (b"eXIf", b"tEXt", b"zTXt", b"iTXt")  # where Pillow finds an orientation: EXIF, a raw EXIF profile or XMP
+PNG_TAIL_BYTES = 128 << 10
+
+
+def _png_metadata_after_data(path: str) -> bool:
+    """Whether a PNG has metadata chunks after its image data. They sit just before its end: the last 128 KiB show them after the
+    last IDAT chunk. A tail without one belongs to a file of few large chunks, whose headers are walked instead."""
+    with open(path, "rb") as file:
+        file.seek(max(0, file.seek(0, 2) - PNG_TAIL_BYTES))
+        tail = file.read()
+        if (data := tail.rfind(b"IDAT")) >= 0:
+            return any(kind in tail[data:] for kind in PNG_METADATA_CHUNKS)  # a false match only costs Pillow's decode
+        file.seek(8)
+        seen_data = False
+        while len(header := file.read(8)) == 8:
+            length, kind = struct.unpack(">I4s", header)
+            if kind == b"IEND":
+                return False
+            if kind == b"IDAT":
+                seen_data = True
+            elif seen_data and kind in PNG_METADATA_CHUNKS:
+                return True
+            file.seek(length + 4, 1)
+    return False
+
+
+def exif_orientation(image: Image.Image) -> int:
+    """EXIF orientation of an opened image as Pillow, and so WanGP's generation, reads it (an EXIF block, a raw EXIF profile or XMP),
+    without decoding its pixels: Pillow decodes a whole PNG to look for them after its image data, only needed when some are there."""
+    if image.format == "PNG" and "exif" not in image.info and not _png_metadata_after_data(image.filename):
+        return Image.Image.getexif(image).get(EXIF_ORIENTATION, 1)  # the chunks read at opening hold all the metadata
+    return image.getexif().get(EXIF_ORIENTATION, 1)
+
+
+def upright(image: Image.Image) -> Image.Image:
+    """The image as the Gallery and WanGP's generation show it: a photo's EXIF orientation applied to its pixels, in place."""
+    if exif_orientation(image) != 1:
+        ImageOps.exif_transpose(image, in_place=True)
+    return image
+
+
+def upright_size(image: Image.Image) -> tuple[int, int]:
+    """(width, height) as displayed, without decoding the pixels: EXIF orientations 5 to 8 turn the image a quarter."""
+    return image.size[::-1] if exif_orientation(image) in (5, 6, 7, 8) else image.size
 
 
 def image_color_details(image: Image.Image) -> dict:
@@ -29,7 +75,7 @@ def image_color_details(image: Image.Image) -> dict:
 
 def _load_image(path: str) -> Image.Image:
     with Image.open(Path(path)) as image:
-        return image.copy()
+        return upright(image).copy()
 
 
 def _flatten(image: Image.Image, background: str | None) -> Image.Image:

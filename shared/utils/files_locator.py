@@ -208,6 +208,12 @@ def locate_folder(folder_name, error_if_none = True):
     return None
 
 
+def installed_copies(relative_path):
+    """All installed copies of one declared checkpoint path, including lower-priority roots."""
+    candidates = [relative_path] if os.path.isabs(relative_path) else [os.path.join(root, relative_path) for root in _checkpoints_paths]
+    return [candidate for candidate in candidates if os.path.isfile(candidate)]
+
+
 def locate_file(file_name, create_path_if_none = False, error_if_none = True, extra_paths = None):
     if file_name.startswith("http"):
         file_name = os.path.basename(file_name)

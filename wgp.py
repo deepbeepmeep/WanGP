@@ -1,8 +1,10 @@
 ############# WanGP Copyright DeepBeepMeep 2025-2026 #############
 import os, sys
+# A pipe or a file defaults to the ANSI code page with strict errors: any other character in a print would raise
+for _stream in (sys.stdout, sys.stderr): _stream.reconfigure(encoding="utf-8", errors="replace")
 from tqdm import tqdm
 
-WanGP_version = "18.888"
+WanGP_version = "19.13"
 _welcome_message = f" WanGP v{WanGP_version} - Copyright (c) 2024-2026 DeepBeepMeep "
 tqdm.write(f"\033[1m\033[93m{_welcome_message:*^100}\033[0m")
 
@@ -58,7 +60,7 @@ from shared.utils.config_store import config_lock, read_config, write_config, wr
 import warnings
 warnings.filterwarnings('ignore', message='Failed to find.*', module='triton')
 warnings.filterwarnings("ignore", message=r"Failed to launch Triton kernels, likely due to missing CUDA toolkit; falling back to a slower .* implementation\.\.\.", category=UserWarning, module=r"whisper\.timing")
-from mmgp import offload, safetensors2, profile_type , quant_router, cuda_graphs
+from mmgp import offload, safetensors2, profile_type , quant_router, cuda_graphs, transfer
 try:
     import triton
 except ImportError:
@@ -92,6 +94,7 @@ from shared.utils.audio_metadata import read_audio_metadata, extract_creation_da
 from shared.utils.media_recording import record_file_metadata as shared_record_file_metadata
 from shared.utils.settings_bundle import is_wangp_settings_filename
 from shared.utils.video_decode import decode_video_frames_ffmpeg, probe_video_stream_metadata
+from shared.utils.video_metadata import extract_source_images  # also a plugin global (Queue Editor)
 from shared.utils.virtual_media import get_virtual_image, get_virtual_media_entry, get_virtual_media_vsource, media_source_exists, parse_virtual_media_path, replace_virtual_media_source, strip_virtual_media_suffix
 from shared.utils.frame_scheduler import SLASH_BLOCK_RE, build_default_window_plan, build_extension_window, build_frame_scheduler, fit_video_length, floor_frame_count, has_slash_commands, normalize_frame_count, set_video_length_rounding, prepare_loras_mult_windows
 from shared.match_archi import match_nvidia_architecture
@@ -1211,6 +1214,7 @@ def validate_settings(state, model_type, single_prompt, inputs, silent=False):
     inputs["custom_settings"] = parsed_custom_settings
     clear_custom_setting_slots(inputs)
     inputs["guidance_phases"], inputs["video_prompt_type"] = normalize_phase_2_tiling_selection(model_def, inputs["guidance_phases"], inputs["video_prompt_type"])
+    inputs["audio_prompt_type"] = apply_guide_audio_letters(model_def, inputs["image_mode"], inputs["video_prompt_type"], inputs["audio_prompt_type"])  # before the handler checks
     sigma_overrides = set()
     if model_def.get("custom_sigmas", False):
         try:
@@ -2734,6 +2738,8 @@ family_handlers.append("models.hy_nomas.hy_nomas_handler")
 family_handlers.append("models.evoke.evoke_handler")
 family_handlers.append("models.hi3d.hi3d_handler")
 family_handlers.append("models.supratex.supratex_handler")
+family_handlers.append("models.TTS.nemotron_transcribe.nemotron_transcribe_handler")
+family_handlers.append("models.glb_coder.glb_coder_handler")
 DEFAULT_LORA_ROOT = "loras" #"models.cosmos3.cosmos3_handler",
 
 def get_lora_root():
@@ -2880,7 +2886,6 @@ if not Path(config_load_filename).is_file():
         "queue_color_scheme": "pastel",
         "process_queues_when_browser_unfocused": 1,
         "multi_prompts_gen_type": prompt_parser.DEFAULT_MULTI_PROMPTS_MODE,
-        "model_hierarchy_type": 1,
         upsampler_api.UPSAMPLER_CONFIG_KEY: upsampler_api.default_config_sections(),
         audio_processor_api.AUDIO_PROCESSOR_CONFIG_KEY: audio_processor_api.default_config_sections(),
         temporal_upsampler_api.TEMPORAL_UPSAMPLER_CONFIG_KEY: temporal_upsampler_api.default_config_sections(),
@@ -2928,7 +2933,6 @@ deepy_voice.install_gradio_routes(get_service=lambda: _deepy_hybrid, language=ar
 checkpoints_paths = server_config.get("checkpoints_paths", None)
 if checkpoints_paths is None: checkpoints_paths = server_config["checkpoints_paths"] = fl.default_checkpoints_paths
 fl.set_checkpoints_paths(checkpoints_paths)
-three_levels_hierarchy = server_config.get("model_hierarchy_type", 1) == 1
 
 if app is None:
     app = WAN2GPApplication()
@@ -4686,6 +4690,13 @@ def get_gen_info(state):
         cache = dict()
         state["gen"] = cache
     return cache
+
+def queued_model_type_after(gen, task):
+    # the model type of the task queued after this one (the UI, API and CLI runners keep the running task first in gen["queue"]), None at
+    # the end of the queue or for a runner that keeps no queue there
+    queue = list(gen.get("queue", []))
+    position = next((index for index, entry in enumerate(queue) if entry is task), None)
+    return None if position is None or position + 1 >= len(queue) else queue[position + 1]["params"].get("model_type")
 
 def build_callback(state, pipe, send_cmd, status, num_inference_steps, preview_meta=None, tiny_preview=None):
     gen = get_gen_info(state)
@@ -7762,6 +7773,10 @@ def generate_media(
             raise gr.Error("Error while loading Loras: " + ", ".join(error_files))
         if trans2_lora is not None: 
             offload.sync_models_loras(trans_lora, trans2_lora)
+        if model_def.get("no_model_swap", False):  # blocks kept in VRAM by the previous task (only the LoRAs changed): their GPU copies
+            for lora_model in (trans_lora, trans2_lora):
+                if lora_model is not None:
+                    offloadobj.refresh_loras(lora_model)
         
     seed = None if seed == -1 else seed
     # negative_prompt = "" # not applicable in the inference
@@ -8842,7 +8857,7 @@ def generate_media(
             drop_generated_audio = False
             audio_repair_samples = 0
             side_files = {}
-            meshes = splats = None
+            meshes = splats = video_file = None
             post_decode_pre_trim = 0
             output_audio_sampling_rate= audio_sampling_rate
             sample_is_hdr = False
@@ -8863,13 +8878,17 @@ def generate_media(
                     post_decode_pre_trim = samples.get("post_decode_pre_trim", 0) 
                     meshes = samples.get("meshes", None)
                     splats = samples.get("splats", None)
+                    video_file = samples.get("video_file", None)  # a finished video made by the model (a temporary file it hands over), saved instead of "x"
                     samples = samples.get("x", None)
 
                 if samples is not None and (audio_only or is_image or sample_is_hdr):
                     samples = samples.to("cpu") # a video stays where it was decoded until it is converted to uint8 below, the RAM only gets the uint8 frames
   
             clear_gen_cache()
-            offloadobj.unload_all()
+            # a model whose generation never swaps models stays loaded (parked: other models and programs reclaim its VRAM as they need it)
+            # for the next sample of this task, or for the next queued task of the same model (decided at the end of the task)
+            if not (model_def.get("no_model_swap", False) and offloadobj.park()):
+                offloadobj.unload_all()
             gc.collect()
             torch.cuda.empty_cache()
             ram_debug_mark("output processing")
@@ -8917,7 +8936,7 @@ def generate_media(
                     else:
                         pre_audio_guide, pre_audio_guide_sample_rate = None, 0
 
-                    pre_video_guide = sample[:, -next_overlap_frames:].to("cpu", copy=True) if next_overlap_frames > 0 else None if scheduler_active else sample[:, max_source_video_frames:].to("cpu", copy=True)
+                    pre_video_guide = transfer.move(sample[:, -next_overlap_frames:], "cpu") if next_overlap_frames > 0 else None if scheduler_active else transfer.move(sample[:, max_source_video_frames:], "cpu")
                     pre_video_guide_is_hdr = sample_is_hdr
                     if pre_video_guide is not None and pre_video_guide.dtype == torch.uint8:
                         pre_video_guide =  pre_video_guide.float().div_(127.5).sub_(1.0)
@@ -9023,7 +9042,7 @@ def generate_media(
 
                 if mesh_outputs and splats is None and mesh_postprocessing.selected(spatial_upsampling, temporal_upsampling):
                     processed = [perform_mesh_postprocessing(asset, spatial_upsampling, temporal_upsampling, spatial_values=parameter_ui.runtime_values(spatial_postprocessing_parameters, postprocessing_reference_images), temporal_values=parameter_ui.runtime_values(temporal_postprocessing_parameters, postprocessing_reference_images),
-                                                             reference_image=original_image_refs[0] if original_image_refs else None,
+                                                             reference_image=original_image_refs,
                                                              seed=seed, abort_callback=lambda: media_abort_requested(gen), progress_callback=upsampler_progress) for asset in meshes]
                     if gen.get("abort", False):
                         abort = True
@@ -9073,7 +9092,10 @@ def generate_media(
                     any_soundtrack_processor = bool(postprocess_audio and not soundtrack_error and audio_processor_api.AUDIO_PROCESSOR_TYPE_SOUNDTRACK in postprocess_audio_meta["types"])
                 time_flag = datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d-%Hh%Mm%Ss")
                 save_prompt = SLASH_BLOCK_RE.sub("", original_prompts[0]).strip()  # file names show the prompt, not window commands
-                if audio_only:
+                if video_file is not None:
+                    extension = os.path.splitext(video_file)[1][1:]
+                    output_dir = save_path
+                elif audio_only:
                     audio_codec = server_config.get("audio_stand_alone_output_codec", "wav")
                     extension = get_audio_codec_extension(audio_codec)
                     output_dir = audio_save_path
@@ -9106,7 +9128,10 @@ def generate_media(
 
                 if not is_image:
                     set_progress_status(saving_status)
-                if audio_only:
+                if video_file is not None:
+                    os.makedirs(output_dir, exist_ok=True)
+                    shutil.move(video_file, video_path)
+                elif audio_only:
                     audio_path = os.path.join(output_dir, file_name)
                     audio_path = save_audio_file(audio_path, sample.squeeze(0), output_audio_sampling_rate, audio_codec)
                     video_path = audio_path
@@ -9272,14 +9297,14 @@ def generate_media(
                 configs["creation_timestamp"] = int(end_time)
                 # if sample_is_image: configs["is_image"] = True
                 keep_intermediate_windows = server_config.get("keep_intermediate_sliding_windows", 1)
-                record_file_metadata(video_path, configs, is_image, audio_only, gen, embedded_images=embedded_images, replace_last_file=sliding_window and window_no > 1 and not keep_intermediate_windows, notify_generation=not sliding_window or keep_intermediate_windows or window_no == total_windows, output_role="intermediate" if sliding_window and window_no < total_windows else "final")
+                record_file_metadata(video_path, configs, is_image, audio_only and video_file is None, gen, embedded_images=embedded_images, replace_last_file=sliding_window and window_no > 1 and not keep_intermediate_windows, notify_generation=not sliding_window or keep_intermediate_windows or window_no == total_windows, output_role="intermediate" if sliding_window and window_no < total_windows else "final")
                 output_side_files = process_side_files(video_path[0] if isinstance(video_path, list) else video_path, side_files, return_files=api_return_side_files)
                 for side_name in output_side_files:  # a saved world file joins the Worlds gallery
                     side_path = os.path.join(os.path.dirname(video_path[0] if isinstance(video_path, list) else video_path), side_name)
                     if has_world_file_extension(side_name) and os.path.isfile(side_path):
                         record_file_metadata(side_path, configs, False, False, gen, notify_generation=False, record_notification=False)
                 if api_return_video_uint8 or api_return_audio or return_flashvsr_continue_cache or (api_return_side_files and output_side_files):
-                    media_type = "audio" if audio_only else "3d" if mesh_outputs else "world" if world_only else ("image" if is_image else "video")
+                    media_type = "audio" if audio_only and video_file is None else "3d" if mesh_outputs else "world" if world_only else ("image" if is_image else "video")
                     artifact_audio = output_new_audio_data if api_return_audio else None
                     if artifact_audio is None and api_return_audio and audio_only and sample is not None:
                         artifact_audio = sample.squeeze(0).detach().cpu().float().numpy()
@@ -9310,6 +9335,8 @@ def generate_media(
 
     if not trans2 is None:
        trans2.cache = None
+    if model_def.get("no_model_swap", False) and (gen.get("abort", False) or queued_model_type_after(gen, task) != model_type):
+        offloadobj.unload_all()  # kept loaded only for the next queued task of the same model
  
     if len(control_audio_tracks) > 0 or len(source_audio_tracks) > 0:
         cleanup_temp_audio_files(control_audio_tracks + source_audio_tracks)
@@ -9739,6 +9766,7 @@ def process_tasks_cli(queue, state):
         # Update gen state for this task
         gen["prompt_no"] = task_no
         gen["prompts_max"] = total_tasks
+        gen["queue"] = queue[task_idx:]  # the running task first, as in the UI queue (queued_model_type_after)
 
         params = validated_params.copy()
         params['state'] = state
@@ -9822,6 +9850,7 @@ def process_tasks_cli(queue, state):
             failed += 1
             notification_run.task_failed()
 
+    gen["queue"] = []
     release_ram_cache()  # the queue is done: the RAM a next generation of the same model would have reused goes back to the system
     elapsed = time.time() - start_time
     print(f"\n{'='*50}")
@@ -11701,6 +11730,37 @@ def del_in_sequence(source_str, letters):
             ret = ret.replace(letter, "")
     return ret    
 
+def set_audio_sources(audio_prompt_type, sources, letters_filter):
+    audio_prompt_type = add_to_sequence(del_in_sequence(audio_prompt_type, letters_filter), sources)
+    return audio_prompt_type if all_letters(audio_prompt_type, "AB") else del_in_sequence(audio_prompt_type, "N")
+
+def apply_guide_audio_letters(model_def, image_mode, video_prompt_type, audio_prompt_type):
+    """A Control Video choice can also pick the audio source: guide_custom_choices "audio_letters" maps each choice to the letters it sets among "audio_letters_filter"."""
+    guide_custom_choices = get_guide_custom_choices(model_def, image_mode)
+    if guide_custom_choices is None or "audio_letters" not in guide_custom_choices:
+        return audio_prompt_type
+    choice = filter_letters(video_prompt_type, guide_custom_choices["letters_filter"])
+    return set_audio_sources(audio_prompt_type, guide_custom_choices["audio_letters"][choice], guide_custom_choices["audio_letters_filter"])
+
+def audio_inputs_refresh_update(old_audio_prompt_type, audio_prompt_type):
+    """The new audio letters and, only when they changed, a new value of the hidden trigger that refreshes the audio inputs."""
+    if audio_prompt_type == old_audio_prompt_type:
+        return gr.update(), gr.update()
+    return audio_prompt_type, str(time.time_ns())
+
+def audio_inputs_visibility(model_def, image_mode, video_prompt_type, audio_prompt_type):
+    """Visibility of the audio inputs, shared by the form build and refresh_audio_inputs."""
+    any_audio = model_def.get("any_audio_prompt", False) and image_mode == 0
+    multi_speakers = not model_def.get("one_speaker_only", False) and not model_def.get("audio_only", False) and (model_def.get("multitalk_class", False) or model_def.get("speaker_locations", False))
+    custom_audio_option_flag = get_audio_prompt_type_custom_option_def(model_def)[1]
+    visible = {"audio_guide": any_audio and "A" in audio_prompt_type, "audio_guide2": any_audio and "B" in audio_prompt_type, "audio_guide3": any_audio and "D" in audio_prompt_type,
+               "speakers_locations_row": any_audio and multi_speakers and any_letters(audio_prompt_type, "BX"), "remove_background_sound": any_audio and any_letters(audio_prompt_type, "ABXK"),
+               "normalize_audio_volumes": any_audio and all_letters(audio_prompt_type, "AB"), "audio_prompt_type_custom_option": any_audio and len(custom_audio_option_flag) > 0}
+    visible["audio_options_row"] = visible["remove_background_sound"] or visible["normalize_audio_volumes"] or visible["audio_prompt_type_custom_option"]
+    visible["audio_guide_row"] = any_audio and any_letters(audio_prompt_type, "AB")
+    visible["force_control_video_trim"] = force_control_video_trim_visible(model_def, image_mode, video_prompt_type, audio_prompt_type)
+    return visible
+
 def normalize_phase_2_tiling_selection(model_def, guidance_phases, video_prompt_type):
     return resolution_utils.normalize_phase_2_tiling_selection(model_def, guidance_phases, video_prompt_type)
 
@@ -11776,39 +11836,23 @@ def refresh_audio_prompt_type_custom_option(state, audio_prompt_type, custom_aud
         audio_prompt_type = add_to_sequence(audio_prompt_type, custom_audio_option_flag)
     return audio_prompt_type
 
-def refresh_audio_prompt_type_sources(state, audio_prompt_type, audio_prompt_type_sources, video_prompt_type, image_mode):
-    model_type = get_state_model_type(state)
-    model_def = get_model_def(model_type)
-    letters_filter=  "XCPABOKF"
+def refresh_audio_prompt_type_sources(state, audio_prompt_type, audio_prompt_type_sources):
+    model_def = get_model_def(get_state_model_type(state))
+    letters_filter = "XCPABOKF"
     audio_prompt_type_sources_def = model_def.get("audio_prompt_type_sources", None)
     if audio_prompt_type_sources_def is not None:
         letters_filter = audio_prompt_type_sources_def.get("letters_filter", letters_filter)
-    audio_prompt_type = del_in_sequence(audio_prompt_type, letters_filter)
-    audio_prompt_type = add_to_sequence(audio_prompt_type, audio_prompt_type_sources)
-    audio_only = model_def.get("audio_only", False) if model_def is not None else False
-    speakers_visible = ("B" in audio_prompt_type or "X" in audio_prompt_type) and not audio_only and (model_def.get("multitalk_class", False) or model_def.get("speaker_locations", False))
-    remove_background_visible = any_letters(audio_prompt_type, "ABXK")
-    normalize_audio_visible = all_letters(audio_prompt_type, "AB")
-    _, custom_audio_option_flag = get_audio_prompt_type_custom_option_def(model_def)
-    custom_audio_option_visible = len(custom_audio_option_flag) > 0
-    audio_options_visible = remove_background_visible or normalize_audio_visible or custom_audio_option_visible
-    if not normalize_audio_visible:
-        audio_prompt_type = del_in_sequence(audio_prompt_type, "N")
-    if not custom_audio_option_visible and len(custom_audio_option_flag) > 0:
-        audio_prompt_type = del_in_sequence(audio_prompt_type, custom_audio_option_flag)
-    return (
-        audio_prompt_type,
-        gr.update(visible="A" in audio_prompt_type),
-        gr.update(visible="B" in audio_prompt_type),
-        gr.update(visible="D" in audio_prompt_type),
-        gr.update(visible=speakers_visible),
-        gr.update(visible=remove_background_visible),
-        gr.update(visible=normalize_audio_visible),
-        gr.update(visible=custom_audio_option_visible, value=custom_audio_option_flag in audio_prompt_type),
-        gr.update(visible=audio_options_visible),
-        gr.update(visible=any_letters(audio_prompt_type, "AB")),
-        gr.update(visible=force_control_video_trim_visible(model_def, image_mode, video_prompt_type, audio_prompt_type)),
-    )
+    return audio_inputs_refresh_update(audio_prompt_type, set_audio_sources(audio_prompt_type, audio_prompt_type_sources, letters_filter))
+
+def refresh_audio_inputs(state, audio_prompt_type, video_prompt_type, image_mode):
+    model_def = get_model_def(get_state_model_type(state))
+    visible = audio_inputs_visibility(model_def, image_mode, video_prompt_type, audio_prompt_type)
+    custom_audio_option_flag = get_audio_prompt_type_custom_option_def(model_def)[1]
+    updates = {name: gr.update(visible=value) for name, value in visible.items()}
+    updates["audio_prompt_type_custom_option"] = gr.update(visible=visible["audio_prompt_type_custom_option"], value=custom_audio_option_flag in audio_prompt_type)
+    return [updates[name] for name in AUDIO_INPUTS]
+
+AUDIO_INPUTS = ("audio_guide", "audio_guide2", "audio_guide3", "speakers_locations_row", "remove_background_sound", "normalize_audio_volumes", "audio_prompt_type_custom_option", "audio_options_row", "audio_guide_row", "force_control_video_trim")
 
 def refresh_image_prompt_type_radio(state, image_prompt_type, image_prompt_type_radio, video_prompt_type):
     image_prompt_type = del_in_sequence(image_prompt_type, "VLTS")
@@ -11939,7 +11983,8 @@ def refresh_video_prompt_type_video_guide(state, filter_type, video_prompt_type,
     mask_strength_always_enabled = model_def.get("mask_strength_always_enabled", False)  
     magic_image_btn, magic_video_btn = MagicMaskUI.button_updates(image_mode, video_prompt_type)
     video_guides = video_guides_shown(model_def, image_mode)
-    return video_prompt_type, gr.update(visible=visible and video_guides), gr.update(visible="+" in video_prompt_type and video_guides), gr.update(visible="*" in video_prompt_type and video_guides), image_guide, gr.update(visible=keep_frames_video_guide_visible), gr.update(visible=visible and "G" in video_prompt_type), gr.update(visible=mask_visible and (mask_strength_always_enabled or "G" in video_prompt_type)), gr.update(visible=(visible or injected_frames_positions_visible(video_prompt_type) or "K" in video_prompt_type) and any_outpainting), mask_selector_update, gr.update(visible=mask_visible and not image_outputs), image_mask, image_mask_guide, gr.update(visible=mask_visible), gr.update(visible=ref_images_visible), gr.update(visible=remove_background_images_ref_visible), gr.update(visible=injected_frames_positions_visible(video_prompt_type)), gr.update(visible=custom_options and not custom_checkbox), gr.update(visible=custom_options and custom_checkbox), gr.update(visible=input_video_strength_visible(model_def, image_prompt_type, video_prompt_type)), magic_image_btn, magic_video_btn, gr.update(visible=force_control_video_trim_visible(model_def, image_mode, video_prompt_type, audio_prompt_type))
+    new_audio_prompt_type = apply_guide_audio_letters(model_def, image_mode, video_prompt_type, audio_prompt_type)
+    return video_prompt_type, gr.update(visible=visible and video_guides), gr.update(visible="+" in video_prompt_type and video_guides), gr.update(visible="*" in video_prompt_type and video_guides), image_guide, gr.update(visible=keep_frames_video_guide_visible), gr.update(visible=visible and "G" in video_prompt_type), gr.update(visible=mask_visible and (mask_strength_always_enabled or "G" in video_prompt_type)), gr.update(visible=(visible or injected_frames_positions_visible(video_prompt_type) or "K" in video_prompt_type) and any_outpainting), mask_selector_update, gr.update(visible=mask_visible and not image_outputs), image_mask, image_mask_guide, gr.update(visible=mask_visible), gr.update(visible=ref_images_visible), gr.update(visible=remove_background_images_ref_visible), gr.update(visible=injected_frames_positions_visible(video_prompt_type)), gr.update(visible=custom_options and not custom_checkbox), gr.update(visible=custom_options and custom_checkbox), gr.update(visible=input_video_strength_visible(model_def, image_prompt_type, video_prompt_type)), magic_image_btn, magic_video_btn, gr.update(visible=force_control_video_trim_visible(model_def, image_mode, video_prompt_type, new_audio_prompt_type)), *audio_inputs_refresh_update(audio_prompt_type, new_audio_prompt_type)
 
 def refresh_video_prompt_type_video_custom_dropbox(state, video_prompt_type, video_prompt_type_video_custom_dropbox):
     model_type = get_state_model_type(state)
@@ -13019,14 +13064,17 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
             else:
                 audio_prompt_type_sources_value = ""
                 audio_prompt_type_sources = gr.Dropdown(choices=[""], value="", visible=False)
+            audio_prompt_type_value = apply_guide_audio_letters(model_def, image_mode_value, video_prompt_type_value, audio_prompt_type_value)
+            audio_inputs_visible = audio_inputs_visibility(model_def, image_mode_value, video_prompt_type_value, audio_prompt_type_value)
 
             audio_prompt_type = gr.Text(value=audio_prompt_type_value, visible=False)
+            audio_inputs_refresh = gr.Text(value="", visible=False)  # a new value refreshes the audio inputs; written only by user edits that change the audio letters
 
-            with gr.Row(visible = any_audio_prompt and any_letters(audio_prompt_type_sources_value,"AB") and not image_outputs) as audio_guide_row:
+            with gr.Row(visible=audio_inputs_visible["audio_guide_row"]) as audio_guide_row:
                 any_audio_guide = any_audio_prompt and not image_outputs
-                audio_guide = gr.Audio(value= ui_defaults.get("audio_guide", None), type="filepath", label= model_def.get("audio_guide_label","Voice to follow"), show_download_button= True, visible= any_audio_prompt and any_letters(audio_prompt_type_value, "A") )
-                audio_guide2 = gr.Audio(value= ui_defaults.get("audio_guide2", None), type="filepath", label=model_def.get("audio_guide2_label","Voice to follow #2"), show_download_button= True, visible= any_audio_prompt and "B" in audio_prompt_type_value )
-                audio_guide3 = gr.Audio(value= ui_defaults.get("audio_guide3", None), type="filepath", label=model_def.get("audio_guide3_label","Voice to follow #3"), show_download_button= True, visible= any_audio_prompt and "D" in audio_prompt_type_value )
+                audio_guide = gr.Audio(value= ui_defaults.get("audio_guide", None), type="filepath", label= model_def.get("audio_guide_label","Voice to follow"), show_download_button= True, visible=audio_inputs_visible["audio_guide"])
+                audio_guide2 = gr.Audio(value= ui_defaults.get("audio_guide2", None), type="filepath", label=model_def.get("audio_guide2_label","Voice to follow #2"), show_download_button= True, visible=audio_inputs_visible["audio_guide2"])
+                audio_guide3 = gr.Audio(value= ui_defaults.get("audio_guide3", None), type="filepath", label=model_def.get("audio_guide3_label","Voice to follow #3"), show_download_button= True, visible=audio_inputs_visible["audio_guide3"])
             custom_guide_def = model_def.get("custom_guide", None)
             any_custom_guide= custom_guide_def is not None
             any_mesh_input = "3d" in model_metadata.custom_guide_kinds(model_def)  # the input kinds model discovery (Deepy, MCP) reports
@@ -13035,15 +13083,12 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                     custom_guide = gr.File(value= None, type="filepath", label= "Custom Guide", height=41, visible= False )
                 else:
                     custom_guide = gr.File(value=ui_defaults.get("custom_guide", custom_guide_def.get("default")), type="filepath", label=custom_guide_def.get("label", "Custom Guide"), height=41, visible=True, file_types=custom_guide_def.get("file_types", ["*.*"]), elem_classes="wangp-settings-upload")
-            remove_background_visible = any_audio_prompt and any_letters(audio_prompt_type_value, "ABXK") and not image_outputs
-            normalize_audio_visible = any_audio_prompt and all_letters(audio_prompt_type_value, "AB") and not image_outputs
             custom_audio_option_label, custom_audio_option_flag = get_audio_prompt_type_custom_option_def(model_def)
-            custom_audio_option_visible = any_audio_prompt and len(custom_audio_option_flag) > 0 and not image_outputs
-            with gr.Row(visible=remove_background_visible or normalize_audio_visible or custom_audio_option_visible) as audio_options_row:
-                remove_background_sound = gr.Checkbox(label="Remove Background Music / Noise" if audio_only else "Ignore Background Music (for better LipSync)", value="V" in audio_prompt_type_value, visible=remove_background_visible)
-                normalize_audio_volumes = gr.Checkbox(label="Normalize Audio Volumes", value="N" in audio_prompt_type_value, visible=normalize_audio_visible)
-                audio_prompt_type_custom_option = gr.Checkbox(label=custom_audio_option_label, value=custom_audio_option_flag in audio_prompt_type_value, visible=custom_audio_option_visible)
-            with gr.Row(visible = any_audio_prompt and any_multi_speakers and (model_def.get("multitalk_class", False) or model_def.get("speaker_locations", False)) and ("B" in audio_prompt_type_value or "X" in audio_prompt_type_value) and not image_outputs ) as speakers_locations_row:
+            with gr.Row(visible=audio_inputs_visible["audio_options_row"]) as audio_options_row:
+                remove_background_sound = gr.Checkbox(label="Remove Background Music / Noise" if audio_only else "Ignore Background Music (for better LipSync)", value="V" in audio_prompt_type_value, visible=audio_inputs_visible["remove_background_sound"])
+                normalize_audio_volumes = gr.Checkbox(label="Normalize Audio Volumes", value="N" in audio_prompt_type_value, visible=audio_inputs_visible["normalize_audio_volumes"])
+                audio_prompt_type_custom_option = gr.Checkbox(label=custom_audio_option_label, value=custom_audio_option_flag in audio_prompt_type_value, visible=audio_inputs_visible["audio_prompt_type_custom_option"])
+            with gr.Row(visible=audio_inputs_visible["speakers_locations_row"]) as speakers_locations_row:
                 speakers_locations = gr.Text( ui_get("speakers_locations"), label="Speakers Locations separated by a Space. Each Location = Left:Right or a BBox Left:Top:Right:Bottom", visible= True)
 
             advanced_prompt = advanced_ui
@@ -13828,6 +13873,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                 attention_mode_override.input(fn=refresh_attention_sparsity, inputs=[state, attention_mode_override], outputs=[attention_sparsity], show_progress="hidden")
                 gen_status = WangpProgress.component(visible=True, value=render_idle_generation_status(state_dict))
                 main_bridge_elem_ids = tab_id == 'generate'
+                status_trigger = gr.Text(interactive= False, visible=False)  # unbound: plugins whose queue chains still output to it
                 load_queue_trigger = gr.Text(interactive= False, visible=False, elem_id="wangp_main_load_queue_trigger" if main_bridge_elem_ids else None)
                 abort_client_id= gr.Text(interactive= False, visible=False, elem_id="wangp_main_abort_client_id" if main_bridge_elem_ids else None)
                 default_files = []
@@ -14045,7 +14091,8 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
             remove_background_sound.input(fn=refresh_remove_background_sound, inputs=[state, audio_prompt_type, remove_background_sound], outputs=[audio_prompt_type])
             normalize_audio_volumes.input(fn=refresh_normalize_audio_volumes, inputs=[state, audio_prompt_type, normalize_audio_volumes], outputs=[audio_prompt_type])
             audio_prompt_type_custom_option.input(fn=refresh_audio_prompt_type_custom_option, inputs=[state, audio_prompt_type, audio_prompt_type_custom_option], outputs=[audio_prompt_type])
-            audio_prompt_type_sources.change(fn=refresh_audio_prompt_type_sources, inputs=[state, audio_prompt_type, audio_prompt_type_sources, video_prompt_type, image_mode], outputs=[audio_prompt_type, audio_guide, audio_guide2, audio_guide3, speakers_locations_row, remove_background_sound, normalize_audio_volumes, audio_prompt_type_custom_option, audio_options_row, audio_guide_row, force_control_video_trim])
+            audio_prompt_type_sources.input(fn=refresh_audio_prompt_type_sources, inputs=[state, audio_prompt_type, audio_prompt_type_sources], outputs=[audio_prompt_type, audio_inputs_refresh], show_progress="hidden", queue=False)
+            audio_inputs_refresh.change(fn=refresh_audio_inputs, inputs=[state, audio_prompt_type, video_prompt_type, image_mode], outputs=[audio_guide, audio_guide2, audio_guide3, speakers_locations_row, remove_background_sound, normalize_audio_volumes, audio_prompt_type_custom_option, audio_options_row, audio_guide_row, force_control_video_trim], show_progress="hidden", queue=False)
             prompt_enhancer_mode_dropdown.input(fn=build_prompt_enhancer_value, inputs=[prompt_enhancer_mode_dropdown, prompt_enhancer_think], outputs=[prompt_enhancer], show_progress="hidden")
             prompt_enhancer_think.input(fn=build_prompt_enhancer_value, inputs=[prompt_enhancer_mode_dropdown, prompt_enhancer_think], outputs=[prompt_enhancer], show_progress="hidden")
             image_prompt_type_radio.change(fn=refresh_image_prompt_type_radio, inputs=[state, image_prompt_type, image_prompt_type_radio, video_prompt_type], outputs=[image_prompt_type, image_start_row, image_end_row, video_source, input_video_strength, keep_frames_video_source, image_prompt_type_endcheckbox], show_progress="hidden").then(fn=None, inputs=None, outputs=None, js="() => window.wangpRefreshInputModes()")
@@ -14054,8 +14101,8 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
             enhancer_label_inputs = [image_mode, video_prompt_type, image_prompt_type, image_start, image_end, image_refs, image_guide, image_mask_guide, video_source]
             enhancer_metadata_sources = [(model_choice_target, "value"), *zip(enhancer_label_inputs, ["value", "value", "value", "presence", "presence", "count", "presence", "editor", "presence"])]
             metadata_events.bind([component.change for component in enhancer_label_inputs], enhancer_metadata_sources, lambda s, values: refresh_prompt_enhancer_labels(s, values, tab_id=tab_id), state, prompt_enhancer_mode_dropdown)
-            video_prompt_type_video_guide.input(fn=refresh_video_prompt_type_video_guide,     inputs = [state, gr.State(""),   video_prompt_type, video_prompt_type_video_guide,     image_mode, image_mask_guide, image_guide, image_mask, image_prompt_type, audio_prompt_type], outputs = [video_prompt_type, video_guide, video_guide2, video_guide3, image_guide, keep_frames_video_guide, denoising_strength, masking_strength, video_guide_outpainting_col, video_prompt_type_video_mask, video_mask, image_mask, image_mask_guide, mask_expand, image_refs_row, remove_background_images_ref, frames_positions, video_prompt_type_video_custom_dropbox, video_prompt_type_video_custom_checkbox, input_video_strength, magic_mask_image_btn, magic_mask_video_btn, force_control_video_trim], show_progress="hidden", queue=False)
-            video_prompt_type_video_guide_alt.input(fn=refresh_video_prompt_type_video_guide, inputs = [state, gr.State("alt"),video_prompt_type, video_prompt_type_video_guide_alt, image_mode, image_mask_guide, image_guide, image_mask, image_prompt_type, audio_prompt_type], outputs = [video_prompt_type, video_guide, video_guide2, video_guide3, image_guide, keep_frames_video_guide, denoising_strength, masking_strength, video_guide_outpainting_col, video_prompt_type_video_mask, video_mask, image_mask, image_mask_guide, mask_expand, image_refs_row, remove_background_images_ref, frames_positions, video_prompt_type_video_custom_dropbox, video_prompt_type_video_custom_checkbox, input_video_strength, magic_mask_image_btn, magic_mask_video_btn, force_control_video_trim], show_progress="hidden", queue=False)
+            video_prompt_type_video_guide.input(fn=refresh_video_prompt_type_video_guide,     inputs = [state, gr.State(""),   video_prompt_type, video_prompt_type_video_guide,     image_mode, image_mask_guide, image_guide, image_mask, image_prompt_type, audio_prompt_type], outputs = [video_prompt_type, video_guide, video_guide2, video_guide3, image_guide, keep_frames_video_guide, denoising_strength, masking_strength, video_guide_outpainting_col, video_prompt_type_video_mask, video_mask, image_mask, image_mask_guide, mask_expand, image_refs_row, remove_background_images_ref, frames_positions, video_prompt_type_video_custom_dropbox, video_prompt_type_video_custom_checkbox, input_video_strength, magic_mask_image_btn, magic_mask_video_btn, force_control_video_trim, audio_prompt_type, audio_inputs_refresh], show_progress="hidden", queue=False)
+            video_prompt_type_video_guide_alt.input(fn=refresh_video_prompt_type_video_guide, inputs = [state, gr.State("alt"),video_prompt_type, video_prompt_type_video_guide_alt, image_mode, image_mask_guide, image_guide, image_mask, image_prompt_type, audio_prompt_type], outputs = [video_prompt_type, video_guide, video_guide2, video_guide3, image_guide, keep_frames_video_guide, denoising_strength, masking_strength, video_guide_outpainting_col, video_prompt_type_video_mask, video_mask, image_mask, image_mask_guide, mask_expand, image_refs_row, remove_background_images_ref, frames_positions, video_prompt_type_video_custom_dropbox, video_prompt_type_video_custom_checkbox, input_video_strength, magic_mask_image_btn, magic_mask_video_btn, force_control_video_trim, audio_prompt_type, audio_inputs_refresh], show_progress="hidden", queue=False)
             custom_visibility_inputs = [video_prompt_type, audio_prompt_type, model_mode]
             custom_visibility_outputs = custom_settings_rows + custom_setting_extra_inputs + [custom_guide_row]
             metadata_events.bind([video_prompt_type.change, audio_prompt_type.change], [(model_choice_target, "value"), *[(component, "value") for component in custom_visibility_inputs]], lambda s, values: refresh_custom_settings_visibility(s, *values[1:]), state, custom_visibility_outputs)
@@ -14473,6 +14520,8 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                 if model_filter is not None:
                     model_output_filter.bind_filter(model_filter, deps_factory=_get_dropdown_deps, state=state, model_choice_target=model_choice_target, current_model_type_getter=get_state_model_type)
                 refresh_models_trigger.change(fn=refresh_model_dropdowns, inputs=[state], outputs=[model_family, model_base_type_choice, model_choice, refresh_form_trigger], show_progress="hidden")
+                if _deepy_hybrid is not None:  # every page, once the shared service reports downloaded files
+                    gr.Button(visible=False, elem_id='deepy_hybrid_models_sync').click(fn=refresh_model_dropdowns, inputs=[state], outputs=[model_family, model_base_type_choice, model_choice, refresh_form_trigger], show_progress="hidden", queue=False)
 
                 model_choice.select(fn=change_model_choice_target, outputs=[model_choice_target], show_progress="hidden", queue=False)
             
@@ -14643,7 +14692,6 @@ def _get_dropdown_deps():
         transformer_types=transformer_types,
         displayed_model_types=displayed_model_types,
         transformer_type=transformer_type,
-        three_levels_hierarchy=three_levels_hierarchy,
         families_infos=families_infos,
         server_config=server_config,
         transformer_quantization=transformer_quantization,
@@ -14656,7 +14704,6 @@ def _get_dropdown_deps():
         get_lora_dir=get_lora_dir,
         get_lora_local_path=get_lora_local_path,
         get_parent_model_type=get_parent_model_type,
-        get_base_model_type=get_base_model_type,
         get_model_family=get_model_family,
         get_model_name=get_model_name,
         get_transformer_dtype=get_transformer_dtype,
@@ -14669,7 +14716,6 @@ def _get_finetune_editor_deps():
         families_infos=families_infos,
         transformer_types=transformer_types,
         displayed_model_types=displayed_model_types,
-        three_levels_hierarchy=three_levels_hierarchy,
         get_model_def=get_model_def,
         get_model_name=get_model_name,
         get_base_model_type=get_base_model_type,
@@ -14695,8 +14741,8 @@ def create_models_hierarchy(rows):
 def create_models_selector_hierarchy(dropdown_types=None):
     return model_dropdowns.create_models_selector_hierarchy(_get_dropdown_deps(), dropdown_types)
 
-def get_sorted_dropdown(dropdown_types, current_model_family, current_model_type, three_levels = True):
-    return model_dropdowns.get_sorted_dropdown(_get_dropdown_deps(), dropdown_types, current_model_family, current_model_type, three_levels)
+def get_sorted_dropdown(dropdown_types, current_model_family, current_model_type):
+    return model_dropdowns.get_sorted_dropdown(_get_dropdown_deps(), dropdown_types, current_model_family, current_model_type)
 
 def generate_dropdown_model_list(current_model_type, state=None):
     return model_dropdowns.generate_dropdown_model_list(_get_dropdown_deps(), current_model_type, state)

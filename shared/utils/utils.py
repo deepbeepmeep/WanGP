@@ -18,6 +18,7 @@ import os
 import tempfile
 import time
 from functools import lru_cache
+from mmgp import transfer
 from . import files_locator as fl
 from .video_decode import probe_video_stream_metadata, decode_video_frames_ffmpeg, get_video_summary_extras
 from .virtual_media import get_virtual_image, parse_virtual_media_path, strip_virtual_media_suffix
@@ -459,7 +460,7 @@ def convert_video_tensor_to_uint8_chunked(video, value_range=(-1, 1), max_buffer
         work = buffer.narrow(time_dim, 0, size)
         work.copy_(video.narrow(time_dim, start, size))
         work.sub_(min_val).mul_(scale).clamp_(0, 255)
-        output.narrow(time_dim, start, size).copy_(work)
+        transfer.copy_(output.narrow(time_dim, start, size), work)  # (to RAM, without temporaries of the chunk)
     return output
 
 def save_image(tensor_image, name, frame_no = -1):

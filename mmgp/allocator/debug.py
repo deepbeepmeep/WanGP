@@ -21,6 +21,12 @@ Without debug mode the tags cost nothing (a plain attribute, an empty context).
 The origin is asked from inside the allocation, which takes the GIL: a thread holding the GIL while waiting for a lock that the
 allocating thread holds would deadlock (PyTorch's own memory history has the same constraint).
 
+Chunk log, for memory that two owners share (a different question: not what fills the VRAM, but who wrote over what). MMGP_VRAM_CHUNK_LOG=<file> starts it
+with the process; or start_chunk_log(path). It keeps the history of every chunk (up to 6 M events, about 430 MB of RAM), and writes to the file, with the Python
+stack, when a chunk gets two owners, with the chunk's history and the pools (the first REPORTED_VIOLATIONS times). MMGP_VRAM_WATCH_SIZES=4325376,... adds a line with
+thread, stream and stack for allocations of exactly these sizes (4325376 bytes: a cuBLAS workspace). chunk_report(tensor) writes what the allocator knows of a tensor's
+chunk, at the moment damage is seen; pools_report(label) lists the pools and their live blocks. Off, each event costs one relaxed load.
+
 Command line: python -m mmgp.allocator.debug summary report.json | diff before.json after.json"""
 import contextlib
 import ctypes
@@ -30,8 +36,10 @@ import re
 import sys
 import threading
 import time
+import traceback
 
 import torch
+from tqdm import tqdm
 
 from . import events as _events
 
@@ -193,6 +201,51 @@ def _watch_mmgp(rec):  # a phase per model that mmgp's offload loads to the GPU,
             return _original(self, model_id, *args, **kwargs)
         setattr(offload.offload, attribute, wrapped)
         rec.patched.append((offload.offload, attribute, original))
+
+
+_CHUNK_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_uint64, ctypes.c_uint64)
+REPORTED_VIOLATIONS = 3
+_chunk_log = None
+_chunk_violations = 0
+
+
+def start_chunk_log(path, watch_sizes=()):
+    """See the module's description. The callback runs from inside the allocation, without the allocator's lock."""
+    global _chunk_log
+    lib = _library()
+    lib.vmm_chunk_log_report.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p)
+    lib.vmm_chunk_log_pools.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p)
+
+    @_CHUNK_CALLBACK
+    def event(reason, pointer, size):
+        global _chunk_violations
+        reason = reason.decode()
+        stack = " < ".join(f"{os.path.basename(frame.filename)}:{frame.lineno} {frame.name}" for frame in reversed(traceback.extract_stack(limit=16)[:-1]))
+        with open(path, "a", encoding="utf-8") as out:
+            out.write(f"{reason}: allocation at {pointer:#x}, size {size}, thread {threading.current_thread().name}, stream {torch.cuda.current_stream().cuda_stream:#x}, from {stack}\n")
+        if reason.startswith("watched"):
+            return
+        _chunk_violations += 1
+        if _chunk_violations <= REPORTED_VIOLATIONS:
+            tqdm.write(f"[MMGP] VRAM chunk log: {reason}, written to {path}")
+            lib.vmm_chunk_log_report(None, _device(), os.fsencode(path))
+            lib.vmm_chunk_log_pools(_device(), os.fsencode(path), f"at violation {_chunk_violations}".encode())
+
+    watched = (ctypes.c_size_t * len(watch_sizes))(*watch_sizes)
+    _chunk_log = event, path
+    lib.vmm_chunk_log_start.argtypes = (_CHUNK_CALLBACK, ctypes.POINTER(ctypes.c_size_t), ctypes.c_int)
+    lib.vmm_chunk_log_start(event, watched, len(watch_sizes))
+
+
+def chunk_report(target, path=None):
+    """What the allocator knows of the chunk behind a tensor or an address: its owners and mappings now, its history, every violation and the end of the log."""
+    pointer = target if isinstance(target, int) else target.untyped_storage().data_ptr()
+    _library().vmm_chunk_log_report(ctypes.c_void_p(pointer), _device(), os.fsencode(path or _chunk_log[1]))
+
+
+def pools_report(label, path=None):
+    """The allocator's pools now: their chunks, and the sizes of their live blocks."""
+    _library().vmm_chunk_log_pools(_device(), os.fsencode(path or _chunk_log[1]), label.encode())
 
 
 def start(min_mb=16, stacks=True, max_stacks_per_s=0, watch_mmgp=True):

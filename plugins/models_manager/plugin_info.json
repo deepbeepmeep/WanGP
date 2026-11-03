@@ -2,9 +2,8 @@
   "name": "Models Manager",
   "author": "DeepBeepMeep",
   "version": "1.0.1",
-  "description": "Inspect and manage installed model dependencies",
+  "description": "Inspect installed models, shared dependencies and disk usage. Choose which model files to remove and see how much space you can reclaim.",
   "date": "",
   "wan2gp_version": "",
   "uninstallable": false
 }
-

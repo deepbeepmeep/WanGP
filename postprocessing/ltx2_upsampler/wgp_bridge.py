@@ -119,6 +119,12 @@ class LTXVideoUpsamplerBridge(SimpleScaleSuffixMixin):
             return "LTX video upsampling only supports x2"
         return ""
 
+    def query_checkpoint_inventory(self):
+        from .runtime import LORA_KEYS
+        for label, method in self.METHODS:
+            model = MODEL_TYPES[method]
+            yield {"name": "LTX", "variant": label.removeprefix("LTX "), "model_types": [model], "model_lora_keys": {model: LORA_KEYS[method]}}
+
     def download(self, process_files: Callable[..., Any], send_cmd=None, status_text: str | None = None, spatial_upsampling=None) -> bool:
         split = self.split_value(spatial_upsampling)
         if split is None:

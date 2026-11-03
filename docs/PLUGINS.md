@@ -1,8 +1,22 @@
 # Wan2GP Plugin System
 
-This system allows you to extend and customize the Wan2GP user interface and functionality without modifying the core application code. This document will guide you through the process of creating and installing your own plugins.
+This system allows you to extend and customize the Wan2GP user interface and functionality without modifying the core application code. This document will guide you through the process of creating and installing your own Plugins.
 
-For configuration forms shared across browser windows, use the [shared form synchronization API](FORM_SYNC.md), including draft preservation and conflict handling. Generation drafts, such as the Sample plugin's Prompt Copy, stay local to the invoking browser.
+For configuration forms shared across browser windows, use the [shared form synchronization API](FORM_SYNC.md), including draft preservation and conflict handling. Generation drafts, such as the Sample App's Prompt Copy, stay local to the invoking browser.
+
+## Discover Apps Included with WanGP
+
+The app bar is the main way to move between **Media Generator**, **Mask Generator** and your installed apps. Each app has an icon and a name. **More Apps** lists only the apps that do not fit when the window is narrow. Selecting an app keeps the other labels and icons in place. The icon buttons on the right open **Configuration** (**Alt+C**), **Apps & PlugIn Manager** (**Alt+P**) and **Infos** (**Alt+I**). Infos brings the guides together with **About** as its final page.
+
+**Media Flow** and **Showrunner** come enabled with WanGP. Media Flow restores, upscales and processes long videos or folders; Showrunner plans and assembles complete productions with Deepy Prime. Each app keeps its yellow **New!** badge until its own tab has been opened, even if it was already enabled. Viewing or dismissing an introduction from the app bar does not clear the badge; visits are remembered across restarts. Select one to see an illustrated introduction, then choose **Keep It** to open it or **Remove It** to hide it from your app bar. Removal hides the app immediately and stops it loading at the next startup. Your choice is saved across restarts. The introduction also appears when you first open the app through its folder URL. After a visit, it remains available from the app's **info icon** beside its ID in **Apps & PlugIn Manager**.
+
+Media Flow and Showrunner appear in the normal **Enabled Apps & Plugins** list, where you can reorder or disable them. Disabled apps appear under **Available Locally** on the right; these two are listed first with a subtle highlight. Their info icons open the illustrated information cards; **Featured** appears at the top right of these apps. Restoring an app already loaded in the current session works immediately; otherwise restart WanGP after enabling it. Showrunner requires Deepy Prime, configured in **Configuration → Prompt Enhancer / Deepy**.
+
+Both apps have a **Full Screen** control. `/media-flow/` and `/showrunner/` on your WanGP address open the corresponding app directly in full screen. The address keeps that folder URL, which you can bookmark or share. **WanGP** returns to the same tab, preserving its form or editor. Expanding and returning reuse the existing page.
+
+**Models Manager** is always installed. Open **Configuration → General → Manage Models & Disk Space**, beside **Selectable Generative Models**, or press **Alt+M**. Once disk usage is ready, **Models** lists generative models and finetunes, and **System** lists local Deepy and prompt enhancer variants, preprocessors, postprocessors, preview decoders and checkpoints reported by loaded plugins. Expand a family and select an entry to see its files. A file used by multiple models or variants stays **Shared** at every level and counts once per total. **Total Used** and the drive totals cover both tabs. **Delete Exclusive** removes only files that no entry outside the selected branch uses. The compact **Back to ...** link (or **Alt+M** again) returns to the screen you came from.
+
+Apps and plugins use the same Plugin system described below. Developer APIs, Plugin identifiers and installation folders keep their existing names.
 
 ## Table of Contents
 1.  [Plugin Structure](#plugin-structure)
@@ -30,28 +44,50 @@ For configuration forms shared across browser windows, use the [shared form sync
 
 Plugins are standard Python packages (folders) located within the main `plugins/` directory. This structure allows for multiple files, dependencies, and proper packaging.
 
-Don't hesitate to have a look at the Sample PlugIn "wan2gp_sample" as it illustrates:
--How to get Settings from the Main Form and then Modify them
--How to suspend the Video Gen (and release VRAM) to execute your own GPU intensive process.
--How to switch back automatically to the Main Tab
--How to trigger a Video Gen from a plugin an track its progress
+The Sample App in `plugins/sample/` illustrates how to:
 
-A valid plugin folder must contain at a minimum:
+- Read and modify settings from the main form.
+- Suspend generation and release VRAM for your own GPU work.
+- Switch back to the main tab automatically.
+- Start generation from a Plugin and track its progress.
+
+A valid Plugin folder must contain at a minimum:
 *   `__init__.py`: An empty file that tells Python to treat the directory as a package.
 *   `plugin.py`: The main file containing your class that inherits from `WAN2GPPlugin`.
 
-Community plugin folder names should use the `wan2gp-` prefix, for example `wan2gp-stable-diffusion-1-4`.
+Community Plugin folder names should use the `wan2gp-` prefix, for example `wan2gp-stable-diffusion-1-4`.
 
-Plugins may also include `plugin_info.json` for Plugin Manager metadata. Its optional `type` property can be a string or a list of strings. Missing `type` values default to `"app"`. Supported values are:
-*   `"app"`: an application plugin, usually with its own tab.
-*   `"extension"`: a feature plugin that does not add its own tab.
-*   `"processor"`: a processing plugin, such as a spatial upsampler today or future preprocessors/audio postprocessors.
-*   `"model"`: a plugin that provides model integrations.
+Plugins may also include `plugin_info.json` for metadata shown in **Apps & PlugIn Manager**. Its optional `type` property can be a string or a list of strings. Missing `type` values default to `"app"`. Supported values are:
+*   `"app"`: an application Plugin, usually with its own tab.
+*   `"extension"`: a feature Plugin that does not add its own tab.
+*   `"processor"`: a processing Plugin, such as a spatial upsampler today or future preprocessors/audio postprocessors.
+*   `"model"`: a Plugin that provides model integrations.
 
-Model plugins declare their model integration in `plugin_info.json`. They may omit `plugin.py` when they only provide handlers and metadata. Use:
-*   `model_handlers`: a string or list of model handler module paths. Paths beginning with `.` or `./` are relative to the plugin package root; absolute import paths are also supported. Each module must expose a `family_handler` object, matching WanGP's built-in model handlers.
-*   `defaults`: the root folder containing model definition JSON files, equivalent to WanGP's built-in `defaults/`. Paths beginning with `.` are relative to the plugin root.
-*   `profiles`: the root folder containing built-in profile JSON folders, equivalent to WanGP's built-in `profiles/`. Paths beginning with `.` are relative to the plugin root.
+### Optional Discovery Metadata
+
+Any Plugin type can provide an `info_card` in `plugin_info.json`. This adds an info icon immediately after its ID in the first line of its enabled, available-local or downloadable card. The card does not enable the Plugin or clear its **New!** badge. Omit `info_card` to keep a simple row.
+
+```json
+{
+  "name": "My App",
+  "type": "app",
+  "important": false,
+  "info_card": {
+    "tagline": "A Short Benefit",
+    "description": "Explain what users can do with this Plugin.",
+    "details": "Optional requirements or practical limits.",
+    "image": "assets/preview.webp",
+    "image_alt": "A useful description of the preview"
+  }
+}
+```
+
+All card fields are optional plain text. `description` defaults to the Plugin description. Images can use HTTPS, a file inside the Plugin folder, or a shared `icons/` path. Without an image, the card uses the app icon. Downloadable catalog cards can use HTTPS images; packaged local images become available after installation. The optional Boolean `important` flag adds a **Featured** badge at the top right of its card, places it first and highlights it in the right-hand available lists. It does not change the user's enabled-app order. Media Flow and Showrunner set it to `true`; Sample App and Motion Designer provide cards without that priority.
+
+Model Plugins declare their model integration in `plugin_info.json`. They may omit `plugin.py` when they only provide handlers and metadata. Use:
+*   `model_handlers`: a string or list of model handler module paths. Paths beginning with `.` or `./` are relative to the Plugin package root; absolute import paths are also supported. Each module must expose a `family_handler` object, matching WanGP's built-in model handlers.
+*   `defaults`: the root folder containing model definition JSON files, equivalent to WanGP's built-in `defaults/`. Paths beginning with `.` are relative to the Plugin root.
+*   `profiles`: the root folder containing built-in profile JSON folders, equivalent to WanGP's built-in `profiles/`. Paths beginning with `.` are relative to the Plugin root.
 
 Example:
 ```json
@@ -66,34 +102,47 @@ Example:
 
 ### Reference Plugins and Specialized APIs
 
-Reference plugins:
-*   [Stable Diffusion 1.4 Model Plugin](https://github.com/deepbeepmeep/wan2gp-stable-diffusion-1-4): compact model plugin template that adds Stable Diffusion 1.4 using MMGP-managed UNet, text encoder, and VAE components.
+**Reporting checkpoints to Models Manager.** Implement `query_checkpoint_inventory()` on the plugin or its registered processor. It lists **all** supported downloads, even when the extension is turned off or another variant is selected. Return or yield one entry per distinct set of checkpoints. Iterate the choices your extension offers and reuse the same per-variant definitions as the downloader. The manager must be able to call this offline without mutating settings, loading weights, or downloading anything.
+
+```python
+def query_checkpoint_inventory(self):
+    for label, model in self.MODEL_CHOICES:
+        for precision in self.PRECISIONS:
+            yield {"name": label, "variant": precision, "download_defs": [self.model_download_def(model, precision)]}
+```
+
+A fixed-checkpoint extension can keep its existing `query_download_def()` or `query_download_defs()`. The manager calls it only if the inventory hook is absent or returns `None`; an empty inventory explicitly declares no checkpoints. Legacy queries receive `enabled_only=False` if supported. That flag does **not** enumerate other configuration values: an extension with variant-dependent downloads must implement the inventory hook. Processors registered by a plugin are discovered automatically; the plugin need not repeat their declarations.
+
+`name` defaults to the owner's name, and `family` defaults to the processor category or **Plugin Extensions**. Set `variant` to group entries as **family → model → variant**. Entries without a variant appear directly under their family. Use `files` for exact checkpoint-relative or absolute file paths, including the individual files of a folder snapshot without a file list. Use `model_types` for WanGP models the processor reuses and `model_lora_keys` to map a model ID to model-definition keys for required LoRAs. Report only model assets that the user may remove through Models Manager.
+
+Reference Plugins:
+*   [Stable Diffusion 1.4 Model Plugin](https://github.com/deepbeepmeep/wan2gp-stable-diffusion-1-4): compact model Plugin template that adds Stable Diffusion 1.4 using MMGP-managed UNet, text encoder, and VAE components.
 *   [Spatial Pixel Duplicate](https://github.com/deepbeepmeep/wan2gp-pixel-upsampler): compact reference spatial upsampler that performs exact nearest-neighbor pixel duplication and documents the handler contract.
 *   [Temporal Blend](https://github.com/deepbeepmeep/wan2gp-blender-upsampler): compact reference temporal upsampler that averages neighboring frames for model-free x2 interpolation and documents the handler contract.
 
-Specialized plugin APIs:
-*   Spatial upsamplers are documented in [Spatial Upsampler Plugin API](SPATIAL_UPSAMPLERS.md). Use this guide for post-processing upsamplers, VAE upsampler capability declarations, plugin-discovered `spatial_upsampler_handlers`, and extension offload object registration.
-*   Temporal upsamplers are documented in [Temporal Upsampler Plugin API](TEMPORAL_UPSAMPLERS.md). Use this guide for frame interpolation handlers, plugin-discovered `temporal_upsampler_handlers`, and temporal upsampler config sections.
-*   Audio processors are documented in [Audio Processor Plugin API](AUDIO_PROCESSORS.md). Use this guide for soundtrack, voice replacement, standalone audio edit handlers, plugin-discovered `audio_processors`, and audio processor config sections.
+Specialized Plugin APIs:
+*   Spatial upsamplers are documented in [Spatial Upsampler Plugin API](SPATIAL_UPSAMPLERS.md). Use this guide for post-processing upsamplers, VAE upsampler capability declarations, Plugin-discovered `spatial_upsampler_handlers`, and extension offload object registration.
+*   Temporal upsamplers are documented in [Temporal Upsampler Plugin API](TEMPORAL_UPSAMPLERS.md). Use this guide for frame interpolation handlers, Plugin-discovered `temporal_upsampler_handlers`, and temporal upsampler config sections.
+*   Audio processors are documented in [Audio Processor Plugin API](AUDIO_PROCESSORS.md). Use this guide for soundtrack, voice replacement, standalone audio edit handlers, Plugin-discovered `audio_processors`, and audio processor config sections.
 
-A complete plugin folder typically looks like this:
+A complete Plugin folder typically looks like this:
 
 ```
 plugins/
 └── my-awesome-plugin/
     ├── __init__.py         # (Required, can be empty) Makes this a Python package.
-    ├── plugin.py           # (Required) Main plugin logic and class definition.
-    ├── requirements.txt    # (Optional) Lists pip dependencies for your plugin.
+    ├── plugin.py           # (Required) Main Plugin logic and class definition.
+    ├── requirements.txt    # (Optional) Lists pip dependencies for your Plugin.
     └── ...                 # Other helper .py files, assets, etc.
 ```
 
 ## Getting Started: Creating a Plugin
 
-1.  **Create a Plugin Folder**: Inside the main `plugins/` directory, create a new folder for your plugin (e.g., `my-awesome-plugin`).
+1.  **Create a Plugin Folder**: Inside the main `plugins/` directory, create a new folder for your Plugin (e.g., `my-awesome-plugin`).
 
 2.  **Create Core Files**:
     *   Inside `my-awesome-plugin/`, create an empty file named `__init__.py`.
-    *   Create another file named `plugin.py`. This will be the entry point for your plugin.
+    *   Create another file named `plugin.py`. This will be the entry point for your Plugin.
 
 3.  **Define a Plugin Class**: In `plugin.py`, create a class that inherits from `WAN2GPPlugin` and set its metadata attributes.
 
@@ -105,37 +154,37 @@ plugins/
             super().__init__()
             self.name = "My Awesome Plugin"
             self.version = "1.0.0"
-            self.description = "This plugin adds awesome new features."
+            self.description = "This Plugin adds awesome new features."
     ```
 
-4.  **Add Dependencies (Optional)**: If your plugin requires external Python libraries (e.g., `numpy`), list them in a `requirements.txt` file inside your plugin folder. These will be installed automatically when a user installs your plugin via the UI.
+4.  **Add Dependencies (Optional)**: If your Plugin requires external Python libraries (e.g., `numpy`), list them in a `requirements.txt` file inside your Plugin folder. These will be installed automatically when a user installs your Plugin via the UI.
 
 5.  **Enable and Test**:
     *   Start Wan2GP.
-    *   Go to the **Plugins** tab.
-    *   You should see your new plugin (`my-awesome-plugin`) in the list.
-    *   Check the box to enable it and click "Save Settings".
-    *   **Restart the Wan2GP application.** Your plugin will now be active.
+    *   Go to the **Apps & PlugIn Manager** screen.
+    *   You should see your new Plugin (`my-awesome-plugin`) in the list.
+    *   Under **Available Locally**, click **Install** (for a community Plugin) or **Enable** (for a bundled app). Changes are saved automatically.
+    *   **Restart the Wan2GP application.** Your Plugin will now be active.
 
 ## Plugin Distribution and Installation
 
 #### Packaging for Distribution
-To share your plugin, simply upload your entire plugin folder (e.g., `my-awesome-plugin/`) to a public GitHub repository.
+To share your Plugin, simply upload your entire Plugin folder (e.g., `my-awesome-plugin/`) to a public GitHub repository.
 
 #### Installing from the UI
-Users can install your plugin directly from the Wan2GP interface:
-1.  Go to the **Plugins** tab.
-2.  Under "Install New Plugin," paste the full URL of your plugin's GitHub repository.
-3.  Click "Download and Install Plugin."
+Users can install your Plugin directly from the Wan2GP interface:
+1.  Go to the **Apps & PlugIn Manager** screen.
+2.  Under **Install from URL**, paste the full URL of your Plugin's GitHub repository.
+3.  Click **Download and Install from URL**.
 4.  The system will clone the repository and install any dependencies from `requirements.txt`.
-5.  The new plugin will appear in the "Available Plugins" list. The user must then enable it and restart the application to activate it.
+5.  After a successful installation, it appears under **Enabled Apps & Plugins**. Restart WanGP to activate it.
 
-The plugin manager also supports updating plugins (if installed from git) and uninstalling them.
+The Plugin manager also supports updating Plugins (if installed from git) and uninstalling them.
 
 ## Plugin API Reference
 
 ### The `WAN2GPPlugin` Class
-Every plugin must define its main class in `plugin.py` inheriting from `WAN2GPPlugin`.
+Every Plugin must define its main class in `plugin.py` inheriting from `WAN2GPPlugin`.
 
 ```python
 # in plugins/my-awesome-plugin/plugin.py
@@ -145,10 +194,10 @@ import gradio as gr
 class MyAwesomePlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
-        # Metadata for the Plugin Manager UI
+        # Metadata for the Apps & PlugIn Manager UI
         self.name = "My Awesome Plugin"
         self.version = "1.0.0"
-        self.description = "A short description of what my plugin does."
+        self.description = "A short description of what my Plugin does."
         
     def setup_ui(self):
         # UI setup calls go here
@@ -160,12 +209,12 @@ class MyAwesomePlugin(WAN2GPPlugin):
 ```
 
 ### Core Methods
-These are the methods you can override or call to build your plugin.
+These are the methods you can override or call to build your Plugin.
 
 #### `setup_ui(self)`
-This method is called when your plugin is first loaded. It's the place to declare new tabs or request access to components and globals before the main UI is built.
+This method is called when your Plugin is first loaded. It's the place to declare new tabs or request access to components and globals before the main UI is built.
 
-*   **`self.add_tab(tab_id, label, component_constructor, position)`**: Adds a new top-level tab to the UI.
+*   **`self.add_tab(tab_id, label, component_constructor, position=-1, *, icon=None)`**: Adds an app to the main bar. Optionally pass SVG markup as `icon`; otherwise WanGP supplies an app icon. The native Gradio tab remains available behind the app bar, so existing selection, deselection, component insertion and `main_tabs` navigation continue to work.
 *   **`self.request_component(component_id)`**: Requests access to an existing Gradio component by its `elem_id`. The component will be available as an attribute (e.g., `self.loras_multipliers`) in `post_ui_setup`.
 *   **`self.request_global(global_name)`**: Requests access to a global variable or function from the main `wgp.py` application. The global will be available as an attribute (e.g., `self.server_config`).
 
@@ -179,7 +228,7 @@ This method runs after the entire main UI has been built. Use it to wire up even
 If you used `add_tab`, these methods will be called automatically when your tab is selected or deselected, respectively. This is useful for loading data or managing resources.
 
 #### `on_model_change(self, state, model_type)`
-This optional callback runs when the main model selection changes in the Gradio UI. `state["model_type"]` has already been updated, so plugins can use it to refresh per-model caches, reset plugin state, or synchronize custom UI logic.
+This optional callback runs when the main model selection changes in the Gradio UI. `state["model_type"]` has already been updated, so Plugins can use it to refresh per-model caches, reset Plugin state, or synchronize custom UI logic.
 
 #### Switching the Main Model
 Plugins can reuse WanGP's normal model-switch flow by requesting the hidden target component and the public helper:
@@ -191,17 +240,17 @@ def setup_ui(self):
     self.request_global("switch_to_model")
 ```
 
-`switch_to_model(model_type, open_media_tab=False)` returns two values: the model switch target update and a main-tab update. Wire them to `[self.model_choice_target, self.main_tabs]`. Keep `open_media_tab=False` to stay in the plugin, or pass `True` to open the Media Generator tab.
+`switch_to_model(model_type, open_media_tab=False)` returns two values: the model switch target update and a main-tab update. Wire them to `[self.model_choice_target, self.main_tabs]`. Keep `open_media_tab=False` to stay in the Plugin, or pass `True` to open the Media Generator tab.
 
 #### `set_global(self, variable_name, new_value)`
-Allows your plugin to safely modify a global variable in the main `wgp.py` application.
+Allows your Plugin to safely modify a global variable in the main `wgp.py` application.
 
 #### `register_data_hook(self, hook_name, callback)`
 Allows you to intercept and modify data at key points. For example, the `before_metadata_save` hook lets you add custom data to the metadata before it's saved to a file.
 
 ### Deepy Tool Registration
 
-An enabled plugin can expose ordinary Python callables to either Deepy runtime. Register tools in `setup_ui`; a plugin does not need to create a tab. The plugin manager publishes the declarations after `setup_ui` completes, and only tools belonging to enabled plugins are visible. Plugin and tool changes require a WanGP restart, and already-open Deepy sessions do not refresh their tool catalog.
+An enabled Plugin can expose ordinary Python callables to either Deepy runtime. Register tools in `setup_ui`; a Plugin does not need to create a tab. The Plugin manager publishes the declarations after `setup_ui` completes, and only tools belonging to enabled Plugins are visible. Plugin and tool changes require a WanGP restart, and already-open Deepy sessions do not refresh their tool catalog.
 
 #### Deepy Prime MCP tools
 
@@ -226,11 +275,11 @@ Arguments:
 *   `name`: Optional MCP tool name. It defaults to `function.__name__` and must match `[A-Za-z_][A-Za-z0-9_]*`.
 *   `display_name`: Optional short label shown in the Deepy chat UI. It defaults to the title-cased tool name.
 *   `description`: Optional model-facing description. It defaults to the function docstring.
-*   `pause_runtime`: When `True`, WanGP pauses/releases Deepy's local model runtime before calling the tool so the plugin can use its resources. Set it to `False` for lightweight CPU-only work.
+*   `pause_runtime`: When `True`, WanGP pauses/releases Deepy's local model runtime before calling the tool so the Plugin can use its resources. Set it to `False` for lightweight CPU-only work.
 *   `pause_reason`: Internal pause category reported to Deepy's runtime. Plugins normally leave this as `"tool"`.
-*   `requires_file_system`: When `True`, the tool is omitted unless Deepy's filesystem-reading option is enabled. This controls discovery only; the plugin remains responsible for validating paths and access inside the callable.
+*   `requires_file_system`: When `True`, the tool is omitted unless Deepy's filesystem-reading option is enabled. This controls discovery only; the Plugin remains responsible for validating paths and access inside the callable.
 
-The helper returns the original callable. A Prime tool name cannot replace a built-in MCP tool or one registered by another enabled plugin.
+The helper returns the original callable. A Prime tool name cannot replace a built-in MCP tool or one registered by another enabled Plugin.
 
 #### Deepy Zero native tools
 
@@ -257,7 +306,7 @@ This registers a synchronous callable in Deepy Zero's native tool list. `name`, 
 *   `required`: Optional Boolean override. Without it, parameters without a Python default are required and parameters with a default are optional.
 *   Any additional JSON-schema properties that should be advertised to the model, such as `enum`, `minimum`, `maximum`, `items`, or `maxItems`.
 
-Unknown parameter names are rejected during plugin setup. A Zero tool name cannot replace a built-in Zero tool or one registered by another enabled plugin.
+Unknown parameter names are rejected during Plugin setup. A Zero tool name cannot replace a built-in Zero tool or one registered by another enabled Plugin.
 
 #### Shared callable contract
 
@@ -267,7 +316,7 @@ Registration happens before requested WanGP globals and Gradio components are in
 
 #### Plugin toolboxes for agents
 
-A plugin with several related functions can publish them as one toolbox instead of separate tools. Every agent reaches it through the `wangp_plugins` tool: MCP clients, Deepy Prime and Deepy Python scripts (`wangp.plugins()`, `wangp.plugin(plugin, action, ...)`). Agents discover it step by step, so an enabled toolbox costs only one line in their context until it is used:
+A Plugin with several related functions can publish them as one toolbox instead of separate tools. Every agent reaches it through the `wangp_plugins` tool: MCP clients, Deepy Prime and Deepy Python scripts (`wangp.plugins()`, `wangp.plugin(plugin, action, ...)`). Agents discover it step by step, so an enabled toolbox costs only one line in their context until it is used:
 
 1.  The `wangp_plugins` description lists one summary line per toolbox.
 2.  `wangp_plugins(plugin="<id>")` returns the toolbox guide and its actions with their call signatures.
@@ -276,7 +325,7 @@ A plugin with several related functions can publish them as one toolbox instead 
 
 ```python
 def setup_ui(self):
-    self.register_deepy_toolbox("One line: what the plugin does and for which media.", guide="How to choose and combine the actions.")
+    self.register_deepy_toolbox("One line: what the Plugin does and for which media.", guide="How to choose and combine the actions.")
     self.register_deepy_action(self.list_presets, uses_gpu=False, summary="List the presets.")
     self.register_deepy_action(self.process, summary="Process a file or a folder.", paths={"source": "read", "output": "write"},
                                routing="Processing a whole folder of clips", instead_of="wangp_postprocess")
@@ -286,15 +335,15 @@ def process(self, ctx, source: str | list[str], output: str | None = None, stren
     ...
 ```
 
-`register_deepy_toolbox(summary, *, guide="", toolbox_id=None, display_name=None)` declares the toolbox once. Its identifier defaults to the plugin folder name and its display name to the plugin name.
+`register_deepy_toolbox(summary, *, guide="", toolbox_id=None, display_name=None)` declares the toolbox once. Its identifier defaults to the Plugin folder name and its display name to the Plugin name.
 
 `register_deepy_action(function, *, name=None, summary=None, description=None, parameters=None, example=None, uses_gpu=True, paths=None, routing="", instead_of="", scripts=True)` adds an action:
 
 *   `function(ctx, **arguments)` is synchronous and takes the call context as its first parameter. The argument schema comes from the type hints, the description from the docstring.
 *   `parameters`: optional per-argument JSON-schema entries (`description`, `enum`, `minimum`, ...) merged into the derived schema. An entry with its own `type`, `anyOf` or `enum` replaces the derived one.
-*   `uses_gpu`: Deepy releases the GPU before every call of the action, so that the generations the action submits can run. Without that release, a generation submitted by the plugin would wait for Deepy, which is waiting for the plugin. Leave it `True` unless the action never runs GPU work. Discovery and contract reads never release Deepy.
-*   `paths`: argument roles, `"read"` or `"write"`. Before the call, WanGP turns Gallery media ids and `@alias` paths into absolute paths and checks them against the caller's file access. Folders and wildcard patterns (`@documents/clips/*.mp4`) are accepted; the folder part is authorized and the pattern is kept for the plugin to expand.
-*   `routing`: when to choose this action. WanGP adds it to the agents' instructions, so a request is routed to the plugin without hand-written prompt changes. `instead_of` names a WanGP tool the action competes with, such as `wangp_postprocess`, whose discovery then mentions the action.
+*   `uses_gpu`: Deepy releases the GPU before every call of the action, so that the generations the action submits can run. Without that release, a generation submitted by the Plugin would wait for Deepy, which is waiting for the Plugin. Leave it `True` unless the action never runs GPU work. Discovery and contract reads never release Deepy.
+*   `paths`: argument roles, `"read"` or `"write"`. Before the call, WanGP turns Gallery media ids and `@alias` paths into absolute paths and checks them against the caller's file access. Folders and wildcard patterns (`@documents/clips/*.mp4`) are accepted; the folder part is authorized and the pattern is kept for the Plugin to expand.
+*   `routing`: when to choose this action. WanGP adds it to the agents' instructions, so a request is routed to the Plugin without hand-written prompt changes. `instead_of` names a WanGP tool the action competes with, such as `wangp_postprocess`, whose discovery then mentions the action.
 *   `scripts=False` keeps an action out of Deepy Python scripts (for example one that stops a job).
 
 The context `ctx` gives:
@@ -305,11 +354,11 @@ The context `ctx` gives:
 *   `ctx.call(tool, arguments)`: another WanGP tool, run on the action's thread. Its arguments and result name files as the caller does (`@outputs/...`): `ctx.resolve(path)` gives a file's real path. A GPU tool releases Deepy first. In Deepy, a generation run this way shows its steps on the status bar and moves the action's progress bar within its current item (report `done`/`total` items with `ctx.progress` before each one).
 *   `ctx.can_write(path)`, `ctx.outputs_dir`, `ctx.virtualize(path)` and `ctx.resolve(path)`: the caller's write access, WanGP's outputs folder, the caller's name for a path and the real path of a name.
 
-An action returns a dictionary. Its `status` defaults to `done`; use `stopped` or `error` for other outcomes. A `gr.Error` raised by shared validation code reaches the agent as a tool error. MCP clients may pass `wait=false` to run an action as a background job followed with `wangp_session` `get_job`, `wait_jobs` and `cancel_job`. The bundled Media Flow plugin is a complete example: it exposes its templates by task and runs them on single files, folders or wildcard batches.
+An action returns a dictionary. Its `status` defaults to `done`; use `stopped` or `error` for other outcomes. A `gr.Error` raised by shared validation code reaches the agent as a tool error. MCP clients may pass `wait=false` to run an action as a background job followed with `wangp_session` `get_job`, `wait_jobs` and `cancel_job`. The bundled Media Flow Plugin is a complete example: it exposes its templates by task and runs them on single files, folders or wildcard batches.
 
 #### Plugin skills
 
-A skill is a Markdown method that Deepy Prime and MCP agents read when a task calls for it, like WanGP's own `wangp://skills/...` (Deepy Zero does not read skills). A plugin ships its skills in its own folder, one folder per skill, and WanGP serves them while the plugin is enabled; no registration call is needed:
+A skill is a Markdown method that Deepy Prime and MCP agents read when a task calls for it, like WanGP's own `wangp://skills/...` (Deepy Zero does not read skills). A Plugin ships its skills in its own folder, one folder per skill, and WanGP serves them while the Plugin is enabled; no registration call is needed:
 
 ```
 plugins/my_plugin/
@@ -329,14 +378,14 @@ routing: Drawing a comic page or strip
 ---
 ```
 
-*   **General skill (with `routing`):** it extends Deepy for every conversation. It is served as `wangp://skills/<name>` and listed with WanGP's skills. Its routing line joins the agents' instructions ("Drawing a comic page or strip: read wangp://skills/comic-pages"), at the cost of that one line in every session. A name already used by WanGP or another enabled plugin is refused.
-*   **Toolbox skill (without `routing`):** it is the method for the plugin's own toolbox and jobs, for example how to plan, which templates to choose and how to review results. It is served as `wangp://skills/<plugin folder>/<name>`, outside the skills listing. The toolbox discovery (`wangp_plugins(plugin="<id>")`) names it next to the guide, and a job's `instructions` can name it too, so agents read it only when they use the plugin.
+*   **General skill (with `routing`):** it extends Deepy for every conversation. It is served as `wangp://skills/<name>` and listed with WanGP's skills. Its routing line joins the agents' instructions ("Drawing a comic page or strip: read wangp://skills/comic-pages"), at the cost of that one line in every session. A name already used by WanGP or another enabled Plugin is refused.
+*   **Toolbox skill (without `routing`):** it is the method for the Plugin's own toolbox and jobs, for example how to plan, which templates to choose and how to review results. It is served as `wangp://skills/<plugin folder>/<name>`, outside the skills listing. The toolbox discovery (`wangp_plugins(plugin="<id>")`) names it next to the guide, and a job's `instructions` can name it too, so agents read it only when they use the Plugin.
 
-Prefer toolbox skills. Write a general skill only when the method helps outside the plugin's own toolbox.
+Prefer toolbox skills. Write a general skill only when the method helps outside the Plugin's own toolbox.
 
 ### Running Deepy Jobs
 
-A plugin can also send its own request to Deepy, with media, and follow its progress. `self.deepy` gives the plugin's Deepy client in the WanGP web UI (it raises an error before the UI has started or in command-line runs).
+A Plugin can also send its own request to Deepy, with media, and follow its progress. `self.deepy` gives the Plugin's Deepy client in the WanGP web UI (it raises an error before the UI has started or in command-line runs).
 
 ```python
 clips = self.deepy.gallery(kind="video")
@@ -352,15 +401,15 @@ with self.deepy.run("Make it 6 s", session_dir="D:/my_plugin/sessions/trailer-12
     result = job.result()
 ```
 
-**How a job runs.** Deepy has one conversation at a time, so a job waits until Deepy and the generation queue are idle (and until earlier plugin jobs have finished). It then sets the user's conversation and workspace aside, shows its own conversation and workspace in Deepy and in the gallery while it runs, and brings the user's back when it ends. The user's conversation is restored whether or not saved sessions are enabled; Deepy reloads its context then, as when resuming a session. Meanwhile the user sees the request (badged with the plugin's name) and Deepy's work, and can stop it, but cannot switch conversation or workspace. Do not wait for a job inside a Deepy tool: the job would wait for that tool's request to finish.
+**How a job runs.** Deepy has one conversation at a time, so a job waits until Deepy and the generation queue are idle (and until earlier Plugin jobs have finished). It then sets the user's conversation and workspace aside, shows its own conversation and workspace in Deepy and in the gallery while it runs, and brings the user's back when it ends. The user's conversation is restored whether or not saved sessions are enabled; Deepy reloads its context then, as when resuming a session. Meanwhile the user sees the request (badged with the Plugin's name) and Deepy's work, and can stop it, but cannot switch conversation or workspace. Do not wait for a job inside a Deepy tool: the job would wait for that tool's request to finish.
 
 **Listing media.** `self.deepy.gallery(workspace=None, kind=None)` lists the media of a workspace, the one shown by default: dictionaries with `id`, `path`, `kind` (`image`, `video`, `audio` or `3d`), `name`, `selected` and `workspace`. `self.deepy.selected()` is the media selected in the shown gallery (or `None`) and `self.deepy.workspaces()` lists the workspaces with their `id`, `name`, `storage_mode` and whether the UI `shown` them. The `id` is a Gallery media id, the form Deepy tools and MCP agents use (for example `visual:3f2a91c04b7e`). `run()` accepts these ids from any workspace, and also the ids Deepy reports for media of the shown gallery.
 
 **`run(prompt, media=(), *, media_mode="copy", session_dir=None, workspace=None, title=None, instructions=None)`** returns a running `DeepyJob` at once. It raises an error when Deepy cannot run requests: check `self.deepy.unavailable_reason` (an empty string when Deepy is ready) beforehand to tell the user why, for example with `gr.Info`.
 
 *   `prompt`: the request, sent as one message.
-*   `media`: Gallery media ids (from any workspace), items returned by `gallery()`, or paths to image, video, audio or 3D files. They are attached to this request only, never to a message the user is writing. A path does not need to be readable by Deepy's own file access: the plugin imports the file into the job's gallery, as a browser upload does, and Deepy then uses it by its media id.
-*   `media_mode`: `"copy"` copies each file into the job's workspace, so the job keeps working if the plugin deletes its file; media already in the job's gallery (for example the user's selection with `workspace="current"`) are used as they are. `"link"` uses the file where it is, without a copy; the plugin must keep the file available. Linking needs a workspace with shared storage: it is refused for a workspace that keeps its media in its own folder (temporary workspaces, workspaces of a `session_dir`, and dedicated storage).
+*   `media`: Gallery media ids (from any workspace), items returned by `gallery()`, or paths to image, video, audio or 3D files. They are attached to this request only, never to a message the user is writing. A path does not need to be readable by Deepy's own file access: the Plugin imports the file into the job's gallery, as a browser upload does, and Deepy then uses it by its media id.
+*   `media_mode`: `"copy"` copies each file into the job's workspace, so the job keeps working if the Plugin deletes its file; media already in the job's gallery (for example the user's selection with `workspace="current"`) are used as they are. `"link"` uses the file where it is, without a copy; the Plugin must keep the file available. Linking needs a workspace with shared storage: it is refused for a workspace that keeps its media in its own folder (temporary workspaces, workspaces of a `session_dir`, and dedicated storage).
 *   `workspace`: where Deepy's work goes.
     *   The id of an existing workspace, for example one from `self.deepy.ensure_workspace(...)`: the job works there, and the workspace stays after the job.
     *   `"isolated"` (the default with `session_dir`): a new workspace for this session. It stays in the workspace list, so the user can browse the results later, and the session uses it again when resumed. With `session_dir` its media are stored in `session_dir/gallery`; otherwise it follows the "Default Storage for New Workspaces" setting.
@@ -368,7 +417,7 @@ with self.deepy.run("Make it 6 s", session_dir="D:/my_plugin/sessions/trailer-12
     *   `"current"`: the workspace the user has open; Deepy's outputs join the user's gallery.
 *   `session_dir`: a folder holding the conversation (`session.json`, `context.json`, the chat journal) and, with an isolated workspace, its media. An empty or missing folder starts a new session; a folder holding a session resumes it, right after the previous job or days later. The folder must be outside Deepy's sessions folder, and the session belongs to the Deepy version (Zero or Prime) that created it. Plugin sessions are not listed in the Deepy session picker. Without `session_dir`, the job's conversation is discarded when the job is closed.
 *   `title`: the session (and isolated workspace) name; by default it is derived from the first request.
-*   `instructions`: standing rules for this job, added to Deepy Prime's system prompt while the job runs and removed when it ends; they never reach the user's conversation. Deepy Zero ignores them. Keep them short and the same from one job to the next (a changed text makes Deepy process the session's context again) and put what is specific to the request in `prompt`; a longer method belongs in a plugin skill they name.
+*   `instructions`: standing rules for this job, added to Deepy Prime's system prompt while the job runs and removed when it ends; they never reach the user's conversation. Deepy Zero ignores them. Keep them short and the same from one job to the next (a changed text makes Deepy process the session's context again) and put what is specific to the request in `prompt`; a longer method belongs in a Plugin skill they name.
 
 **Following a job.** `job.events(timeout=None)` yields `SessionEvent(kind, data)` objects until the job ends:
 
@@ -377,23 +426,45 @@ with self.deepy.run("Make it 6 s", session_dir="D:/my_plugin/sessions/trailer-12
 | `queued` | `None`: the job waits for Deepy to be idle. |
 | `started` | `{"session_dir", "workspace_id"}`: Deepy now shows the job. |
 | `status` | `{"kind", "text"}`: Deepy's status line (starting, thinking, paused...). |
-| `text` | `{"text", "delta"}`: Deepy's reply so far, and what was added. |
-| `tool` | `{"id", "name", "label", "status", "status_text"}` when a Deepy action starts or changes state (`running`, `done`, `error`, `interrupted`). |
+| `text` | `{"text", "delta", "last"}`: all Deepy said so far, what was added, and its last message alone. |
+| `thought` | `{"id", "text", "delta", "streaming"}` while Deepy thinks, when its model does: one `id` per thought, the thought so far, what was added, and whether it is still being written. Up to three updates per second. |
+| `stats` | The line Deepy's chat shows, as `{"text"}`, with the numbers behind it. With a local model: `avg_prefill_tokens_per_second`, `avg_generated_tokens_per_second`, `consumed_tokens`, `max_tokens`, and `prefilling_tokens` while it reads that many tokens before writing. Up to three updates per second. |
+| `tool` | `{"id", "name", "label", "status", "status_text"}` when a Deepy action starts or changes state (`running`, `done`, `error`, `interrupted`); a failed action adds `"error"`, its reason. |
 | `progress` | A `ProgressUpdate` (`phase`, `status`, `progress` in percent, `current_step`, `total_steps`, `unit`) for generations run by the job. |
 | `output` | `{"id", "path", "kind", "name", "label"}` for each media file Deepy writes. |
+| `chat` | When you set `job.chat_events = True` right after `run`: each update of Deepy's chat, for Deepy's window in your page (see below). |
 | `done`, `cancelled`, `error` | The `DeepyResult`; always the last event. |
 
-`job.result(timeout=None)` waits for the `DeepyResult`: `status` (`"done"`, `"cancelled"` or `"error"`), `text` (Deepy's reply), `outputs` (as in `output` events), `session_dir` and `error`. The job ends once the user's conversation has been brought back. `job.cancel()` stops a job that is waiting, or interrupts Deepy's work on it; a stop from the Deepy chat ends the job as `cancelled` too. `job.close()` (or leaving a `with` block) cancels a job still running and deletes its private files, temporary workspace included.
+`job.result(timeout=None)` waits for the `DeepyResult`: `status` (`"done"`, `"cancelled"` or `"error"`), `text` (all Deepy said during the job), `reply` (its last message alone), `outputs` (as in `output` events), `session_dir` and `error`. The job ends once the user's conversation has been brought back. `job.cancel()` stops a job that is waiting, or interrupts Deepy's work on it; a stop from the Deepy chat ends the job as `cancelled` too. `job.close()` (or leaving a `with` block) cancels a job still running and deletes its private files, temporary workspace included.
 
 **Steering a running job.** `job.steer(text)` sends Deepy a message while it works on the job; Deepy applies it at its next step, as a message typed in the Deepy chat while it works. The reply and media that follow belong to the job's result. It raises an error once the job has ended: send the message with a new `run()` on the same `session_dir`.
 
-**Workspaces of your own.** `self.deepy.ensure_workspace(name, folder)` returns the id of the workspace that keeps its media in `folder`, created with `name` the first time and never archived for inactivity: a plugin can keep a project's media in its own folder and pass the id as `workspace` to `run()`. `self.deepy.deepy_type` is the Deepy version jobs run with (`"zero"` or `"prime"`).
+**Pausing and resuming.** A job kept in a `session_dir` can be stopped with `job.cancel()` and continued later, even after WanGP restarts: a new `run()` on the same `session_dir` finds the conversation again, so the request only needs to say what to finish. To leave the GPU free meanwhile, `self.deepy.release_vram(timeout=120)` takes Deepy's model out of VRAM once Deepy is idle (it returns `False` if Deepy is still busy after `timeout` seconds); the model comes back at Deepy's next request.
 
-**Generating without Deepy.** `self.deepy.web_session(workspace=None)` returns a `WanGPSession` whose `submit_task(settings, callbacks=None)` adds tasks to the web UI's queue from any thread, for example from a plugin web app. With a workspace id, its generations record in that workspace without changing the gallery the user is viewing.
+**Workspaces of your own.** `self.deepy.ensure_workspace(name, folder)` returns the id of the workspace that keeps its media in `folder`, created with `name` the first time and never archived for inactivity: a Plugin can keep a project's media in its own folder and pass the id as `workspace` to `run()`. `self.deepy.deepy_type` is the Deepy version jobs run with (`"zero"` or `"prime"`).
+
+**Generating without Deepy.** `self.deepy.web_session(workspace=None)` returns a `WanGPSession` whose `submit_task(settings, callbacks=None)` adds tasks to the web UI's queue from any thread, for example from a Plugin web app. With a workspace id, its generations record in that workspace without changing the gallery the user is viewing.
 
 ### Plugin Web Apps
 
-A plugin can serve its own page, for an interface that does not fit Gradio components (a full-screen editor, a dashboard). In `setup_ui`:
+Declare navigation in `plugin_info.json`; the Plugin manager provides the controls, URL routing and return behavior for ordinary Gradio tabs and embedded web apps alike:
+
+```json
+{
+  "name": "My App",
+  "app_url": "/my-app",
+  "fullscreen": true,
+  "app_tab": "my_tab"
+}
+```
+
+- `app_url` is an optional short local path, with one lowercase segment. It opens the app's tab, in full screen when supported. WanGP routes and URLs claimed by another plugin are rejected. The existing `url` property remains the repository URL.
+- `fullscreen` adds the shared **Full Screen** and **WanGP** return controls. Full screen expands the existing tab in place, preserving form values, iframe state and running event subscriptions. Refreshing its address reopens that tab in full screen.
+- `app_tab` selects the tab declared with `add_tab(tab_id=...)`; omit it to use the first declared tab. A Plugin must have a matching tab. Other tabs retain normal navigation.
+
+Both navigation properties are optional and independent. A fullscreen app without `app_url` uses `/plugins/<folder_id>/`. Only enabled, loaded plugins register their routes. Folder URLs keep their address and open the requested app without showing another tab first, behind WanGP's existing authentication. Returning with **WanGP** shows the same app in the main interface at WanGP's root address. Ordinary tab switching keeps this root address; only fullscreen or opening a folder link uses the app's folder URL. Use the shared controls rather than creating a separate return link to the WanGP root.
+
+A Plugin can also serve its own page when its interface does not fit Gradio components. In `setup_ui`:
 
 ```python
 self.register_web_app("/my_plugin", self.create_web_app)
@@ -409,7 +480,37 @@ def create_web_app(self):
     return app
 ```
 
-`register_web_app(path, factory)` serves `factory()`, an ASGI application such as a FastAPI app, at `path` (one lowercase segment, not a WanGP route) from the WanGP server, behind its authentication. The factory runs once when the server starts, after WanGP's globals have been injected. The page is also reachable on its own, full screen, at `http://<server>/<path>/`, and a tab can embed it with an `<iframe src="/my_plugin/">` in a `gr.HTML` component. Use relative URLs in the page so that it works wherever it is mounted. The bundled Showrunner plugin is a complete example: its page, JSON API and event stream are such an app.
+`register_web_app(path, factory)` serves `factory()`, an ASGI application such as a FastAPI app, at `path` from the WanGP server, behind its authentication. The factory runs once when the server starts, after WanGP's globals have been injected. If `app_url` uses that same path, embed the web page with `<iframe src="./my_plugin/?embedded=1">`; the embedded request reaches the web page while the public URL opens its WanGP tab. API and asset subpaths continue to reach the web app. Use relative URLs in the page so that it works wherever it is mounted. Wrap a full-height iframe in `<div class="wangp-addon-web-view">` to fit it to the shared fullscreen view. The bundled Showrunner Plugin is an example; Media Flow uses ordinary Gradio components and needs only the JSON declarations. Web apps without these declarations retain their existing independent URLs.
+
+A web page in an iframe can carry the Full Screen control in its own header, which saves the bar above the page. Each time the page draws its header, it calls `window.parent.WanGPAddonNavigation?.headerButton(window.frameElement, header, className)`: the header gets a button that opens Full Screen from the tab and goes back to WanGP from full screen, with its tooltip, and the bar goes away. `className` is optional and styles the button as the page's own. Pages that do not call it keep the bar.
+
+#### Deepy's Window in Your Page
+
+Your web page can show Deepy's chat window, with Deepy's own look, streaming and scrolling (it follows the latest words unless the reader scrolled up), in an iframe:
+
+```html
+<iframe src="../deepy/window?contour=0&input=0&avatars=0&wide=1"></iframe>
+```
+
+| Option | Effect |
+| --- | --- |
+| `contour=0` | No border around the window. |
+| `input=0` | No text input: the window only shows the conversation. |
+| `stats=0` | No line of speeds under the conversation. |
+| `avatars=0` | No name beside the messages. |
+| `stop=0` | No Pause and Stop on the status line. |
+| `actions=0` | No buttons on the messages. |
+| `compact=0` | Every step shown, instead of grouped under each answer. |
+| `wide=1` | Messages use the whole width, for a narrow panel. |
+| `font=0.84` | Text size. |
+| `theme=dark` | Dark colors, also with `DeepyWindow.theme("dark")`. |
+
+Once the iframe has loaded, your page drives it through `frame.contentWindow.DeepyWindow`:
+
+- `replay(events)` shows a conversation at once, from `shared.deepy.session_store.read_ui_updates(session_dir, after=0)`, which returns `events`, a `next` position to pass as `after` next time, and `restart` when the conversation was rewound.
+- `update(data)` applies one `chat` event of a running job.
+- `reset()` empties the window, `rejoin()` comes before `update` again after your page skipped some, and `shown()` puts the reader back in place when the iframe returns from being hidden.
+- `onGap` is called when an update could not be placed: read the saved conversation again. `onSubmit(text)` receives what the user typed in its input.
 
 ## Examples
 
@@ -487,7 +588,7 @@ class InjectorPlugin(WAN2GPPlugin):
 
     def post_ui_setup(self, components: dict):
         def create_inserted_component():
-            return gr.HTML(value="<div style='padding: 10px; color: gray; text-align: center;'>--- Injected by a plugin! ---</div>")
+            return gr.HTML(value="<div style='padding: 10px; color: gray; text-align: center;'>--- Injected by a Plugin! ---</div>")
 
         self.insert_after(
             target_component_id="loras_multipliers",
@@ -497,7 +598,7 @@ class InjectorPlugin(WAN2GPPlugin):
 
 ### Example 3: Advanced UI Injection and Interaction
 
-This plugin injects a button that interacts with other components on the page.
+This Plugin injects a button that interacts with other components on the page.
 
 **File Structure:**
 ```
@@ -610,7 +711,7 @@ class GlobalAccessPlugin(WAN2GPPlugin):
 ```
 
 ### Example 5: Using Helper Modules (Relative Imports)
-This example shows how to organize your code into multiple files within your plugin package.
+This example shows how to organize your code into multiple files within your Plugin package.
 
 **File Structure:**
 ```
@@ -667,7 +768,7 @@ class PresetLookupPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = "Preset Lookup"
-        self.description = "Lets Deepy search this plugin's presets."
+        self.description = "Lets Deepy search this Plugin's presets."
 
     def setup_ui(self):
         self.register_deepy_prime_tool(
@@ -688,12 +789,12 @@ class PresetLookupPlugin(WAN2GPPlugin):
         )
 
     def search_presets(self, query: str, limit: int = 5) -> dict:
-        """Search the plugin preset catalog and return the best matches."""
+        """Search the Plugin preset catalog and return the best matches."""
         matches = self._search_catalog(query)[:limit]
         return {"status": "done", "matches": matches}
 
     def _search_catalog(self, query: str) -> list[dict]:
-        # Replace with the plugin's real lookup implementation.
+        # Replace with the Plugin's real lookup implementation.
         return [{"name": "Example", "description": query}]
 ```
 
@@ -713,4 +814,4 @@ Some common `elem_id`s include:
 
 ---
 
-> Applies to: Installing and developing WanGP plugins. Registration and handler examples are Python code; exposed tools depend on the plugins enabled in the installation.
+> Applies to: Installing and developing WanGP Plugins. Registration and handler examples are Python code; exposed tools depend on the Plugins enabled in the installation.

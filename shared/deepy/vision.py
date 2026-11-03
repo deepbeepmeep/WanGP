@@ -8,6 +8,7 @@ from typing import Any
 import torch
 from PIL import Image
 
+from shared.deepy.image_channels import upright
 from shared.llm_engines.lmgp.models.qwen3_5 import Qwen3_5ForCausalLM
 from shared.prompt_enhancer.qwen35_vl import TEXT_MODEL_ID as _TEXT_MODEL_ID, VISION_MODEL_ID as _VISION_MODEL_ID, _prepare_multimodal_vllm_prompt, vision_beside_text
 from shared.utils.video_decode import decode_video_frame_indices_ffmpeg
@@ -118,7 +119,7 @@ def normalize_inspection_bbox(bbox: Any) -> list[int] | None:
 
 
 def prepare_inspection_image(image: Any, max_edge: int | None = None, max_pixels: int | None = None, bbox: list[int] | None = None) -> Image.Image:
-    prepared = image.convert("RGB")
+    prepared = upright(image).convert("RGB")
     if bbox is not None:
         x_min, y_min, x_max, y_max = bbox
         width, height = prepared.size

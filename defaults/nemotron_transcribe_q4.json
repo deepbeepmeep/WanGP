@@ -1,0 +1,27 @@
+{
+    "model": {
+        "name": "Transcription Nemotron 3.5 Transcribe 30B-A4B Q4 Experts",
+        "architecture": "nemotron_transcribe",
+        "description": "The same transcription, speaker attribution, subtitles and translation with the expert layers in 4-bit: about 19 GB of files and half the RAM and VRAM of the default variant, so it suits PCs with 32 GB of RAM, at a possible small loss of accuracy.",
+        "size": "lighter",
+        "URLs": "nemotron_transcribe",
+        "preload_URLs": [
+            "https://huggingface.co/DeepBeepMeep/Nemotron/resolve/main/NemotronTranscribe_30B_A4B_experts_int4.safetensors"
+        ]
+    },
+    "prompt": "# Optional context terms, e.g. Dr. Amara Okafor, Kubernetes, etcd (lines starting with # are ignored)",
+    "audio_prompt_type": "A",
+    "model_mode": 0,
+    "custom_settings": {
+        "speakers": 1,
+        "speaker_names": "",
+        "word_timestamps": 1,
+        "style": "verbatim",
+        "target_language": "English",
+        "output": "audio"
+    },
+    "num_inference_steps": 1,
+    "guidance_scale": 1.0,
+    "video_length": 0,
+    "prompt_enhancer": ""
+}

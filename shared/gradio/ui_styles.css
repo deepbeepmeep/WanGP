@@ -843,6 +843,9 @@ user-select: text;
 .deepy-prime-recommendation .prose p {
     margin: 0 !important;
 }
+.deepy-prime-recommendation .prose p + p {
+    margin-top: calc(6px * var(--wangp-ui-scale)) !important;
+}
 
 .toast-wrap { max-width: min(920px, calc(100vw - 2rem)) !important; }
 .toast-wrap > div, .toast-wrap .toast-body, .gradio-container [role="alert"] { max-width: 100% !important; }
@@ -928,7 +931,7 @@ user-select: text;
 
 /* Shared inputs of the post-processing parameters: two per line, whichever of them the selected processors show. */
 /* a post-processing slot: its selector and its processor's parameters, set apart from the other slot */
-div.wangp-postprocessing-slot, .postprocess div.wangp-postprocessing-slot { border: 1px solid var(--border-color-primary) !important; border-radius: var(--radius-lg) !important; margin-bottom: var(--spacing-lg) !important; }
+div.wangp-postprocessing-slot:not(.postprocess *) { border: 1px solid var(--border-color-primary) !important; border-radius: var(--radius-lg) !important; margin-bottom: var(--spacing-lg) !important; }
 .wangp-postprocessing-parameters, .wangp-postprocessing-parameters > .form { flex-wrap: wrap !important; }
 .wangp-postprocessing-parameters > .form { flex: 1 1 100% !important; }
 .wangp-postprocessing-parameters .wangp-postprocessing-parameter { flex: 1 1 calc(50% - var(--layout-gap)) !important; min-width: calc(50% - var(--layout-gap)) !important; }

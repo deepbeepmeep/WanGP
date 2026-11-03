@@ -110,18 +110,23 @@ def detect_table(table):
     return _unique(matches)
 
 
+def _conditioning_tensors(source):
+    keys = source.keys()
+    table_keys = [key for key in keys if key.endswith("adaln_t_table") and not key.endswith("ref2va_adaln_t_table")]
+    if len(table_keys) == 1:
+        return table_keys[0], source.get_tensor(table_keys[0]), None
+    time_keys = [key for key in keys if key.endswith("time_embedder.proj_in.weight")]
+    if len(time_keys) != 1:
+        return None, None, None
+    prefix = time_keys[0][:-len("proj_in.weight")]
+    return None, None, {key: source.get_tensor(prefix + key) for key in TIME_KEYS}
+
+
 def checkpoint_tensors(filename):
     """Read only the conditioning table or four timestep tensors, never transformer weights."""
     with safe_open(str(filename), framework="pt", device="cpu") as source:
-        keys = source.keys()
-        table_keys = [key for key in keys if key.endswith("adaln_t_table") and not key.endswith("ref2va_adaln_t_table")]
-        if len(table_keys) == 1:
-            return source.metadata() or {}, source.get_tensor(table_keys[0]), None
-        time_keys = [key for key in keys if key.endswith("time_embedder.proj_in.weight")]
-        if len(time_keys) != 1:
-            return source.metadata() or {}, None, None
-        prefix = time_keys[0][:-len("proj_in.weight")]
-        return source.metadata() or {}, None, {key: source.get_tensor(prefix + key) for key in TIME_KEYS}
+        _, table, times = _conditioning_tensors(source)
+        return source.metadata() or {}, table, times
 
 
 def validate_checkpoint_package(package, table, times):
@@ -133,27 +138,54 @@ def validate_checkpoint_package(package, table, times):
         raise ValueError("MiniMax H3 affine metadata has no checkpoint conditioning tensors to validate")
 
 
+def _native_package(source, table_key, table, name):
+    if table.ndim != 2 or not 2 <= table.shape[0] <= 4097 or table.shape[1] not in (4, 8, 64) or not table.is_floating_point():
+        return None
+    keys = source.keys()
+    prefix = table_key.removesuffix("adaln_t_table")
+    basis_key, mean_key = prefix + "adaln_basis", prefix + "adaln_mean"
+    if basis_key not in keys or mean_key not in keys:
+        return None
+    if source.get_slice(basis_key).get_shape() != [table.shape[1], 2688] or source.get_slice(mean_key).get_shape() != [2688]:
+        return None
+    basis, mean = source.get_tensor(basis_key), source.get_tensor(mean_key)
+    if not basis.is_floating_point() or not mean.is_floating_point():
+        return None
+    # The full timestep embedding is table @ basis + mean.
+    table, affine = table.float(), torch.cat((basis.float(), mean.float().unsqueeze(0)))
+    if not torch.isfinite(table).all() or not torch.isfinite(affine).all():
+        return None
+    if torch.linalg.matrix_rank(affine[:-1].double()) != table.shape[1]:
+        return None
+    return AffinePackage(name, table, affine)
+
+
 @lru_cache(maxsize=16)
-def _detect_checkpoint(path, mtime, size):
-    metadata, table, times = checkpoint_tensors(path)
-    if METADATA_KEY in metadata:
-        package = decode_package(metadata[METADATA_KEY])
-        validate_checkpoint_package(package, table, times)
-        return package
-    if table is not None:
-        return detect_table(table)
+def _detect_checkpoint(path, mtime, size, allow_native):
+    with safe_open(path, framework="pt", device="cpu") as source:
+        table_key, table, times = _conditioning_tensors(source)
+        metadata = source.metadata() or {}
+        if METADATA_KEY in metadata:
+            package = decode_package(metadata[METADATA_KEY])
+            validate_checkpoint_package(package, table, times)
+            return package
+        if table is not None:
+            package = detect_table(table)
+            if package is None and allow_native:
+                package = _native_package(source, table_key, table, Path(path).stem)
+            return package
     if times is not None:
         fingerprint = time_fingerprint(times)
         return _unique([package for package in local_packages() if package.full_fingerprint == fingerprint])
     return None
 
 
-def detect_checkpoint(filename):
+def detect_checkpoint(filename, *, allow_native=True):
     path = Path(filename)
     if path.suffix.lower() not in (".safetensors", ".sft"):
         return None
     stat = path.stat()
-    return _detect_checkpoint(str(path.resolve()), stat.st_mtime_ns, stat.st_size)
+    return _detect_checkpoint(str(path.resolve()), stat.st_mtime_ns, stat.st_size, allow_native)
 
 
 def source_tag(package):

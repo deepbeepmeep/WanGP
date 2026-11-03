@@ -3,10 +3,10 @@
 # Modifications Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import gc
 import time
-import itertools
 import math
 import torch
 
+from mmgp import cuda_graphs, transfer
 from ..config import Config
 from .sequence import Sequence
 from ..layers import kv_formats as kvf
@@ -46,13 +46,6 @@ def _kv_page_tensors(runner) -> list[tuple[str, torch.Tensor, int]]:
     if runner.config.kv_cache_int8:
         tensors.append(("kv_cache_scales", runner.kv_cache_scales, 2))
     return tensors
-
-
-def _copy_pages(tensor: torch.Tensor, saved: torch.Tensor, axis: int) -> None:
-    """saved's pages into the first pages of tensor, one contiguous destination at a time."""
-    count = saved.shape[axis]
-    for index in itertools.product(*(range(n) for n in tensor.shape[:axis])):
-        tensor[index].narrow(0, 0, count).copy_(saved[index])
 
 
 _OUTSIDE_SPANS = (False, False, False)  # (code fence, inline backticks, double quotes)
@@ -909,15 +902,15 @@ class ModelRunner:
             return None
         rows = self.kv_layout.overlay_rows(self.block_size)
         base = seq.overlay_slot * rows
-        return {"data": self.kv_overlay[:, :, base:base + rows].to("cpu", copy=True), "scales": self.kv_overlay_scales[:, :, base:base + rows].to("cpu", copy=True), "ring_high": int(seq.ring_high)}
+        return {"data": transfer.move(self.kv_overlay[:, :, base:base + rows], "cpu"), "scales": transfer.move(self.kv_overlay_scales[:, :, base:base + rows], "cpu"), "ring_high": int(seq.ring_high)}
 
     def restore_overlay(self, seq: Sequence, saved: dict | None) -> None:
         if saved is None or getattr(self, "kv_overlay", None) is None or seq.overlay_slot < 0:
             return
         rows = self.kv_layout.overlay_rows(self.block_size)
         base = seq.overlay_slot * rows
-        self.kv_overlay[:, :, base:base + rows].copy_(saved["data"])
-        self.kv_overlay_scales[:, :, base:base + rows].copy_(saved["scales"])
+        transfer.copy_(self.kv_overlay[:, :, base:base + rows], saved["data"])
+        transfer.copy_(self.kv_overlay_scales[:, :, base:base + rows], saved["scales"])
         seq.ring_high = int(saved["ring_high"])
 
     def _fill_overlays_from_body(self, seq: Sequence, count: int) -> None:
@@ -1073,9 +1066,9 @@ class ModelRunner:
         if not self.enforce_eager:
             # Capture writes dummy KV slots. Restore live pages only AFTER capture.
             self.capture_cudagraph()
-        # Each destination is contiguous, avoiding a full-cache GPU staging copy.
+        # saved's pages into the first pages of each tensor, without a full-cache GPU staging copy
         for (_name, tensor, axis), saved in zip(_kv_page_tensors(self), staged):
-            _copy_pages(tensor, saved, axis)
+            transfer.copy_(tensor.narrow(axis, 0, saved.shape[axis]), saved)
         del staged
         self._runtime_signature = self._get_graph_capture_signature()
         print(f"[LM Engine] KV cache grew: {old_tokens} -> {tokens}/{config.kv_cache_max_tokens} generation tokens per branch; {config.num_kvcache_blocks} pages.")
@@ -2235,7 +2228,7 @@ class ModelRunner:
         self.graphs = {}
         self.graph_pool = self._graph_pool_seed
         # Kitchen's CUTLASS workspace is per stream and must exist before capture.
-        capture_stream = torch.cuda.Stream(device=model_device)
+        capture_stream = cuda_graphs.capture_stream(torch.cuda.current_device())
 
         choose_short_batch_kernels = None
         try:

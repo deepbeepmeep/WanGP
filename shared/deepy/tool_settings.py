@@ -127,6 +127,7 @@ _LEGACY_VARIANT_ALIASES = {
     "gen_image": {"Z_Image_Turbo": "Z Image Turbo", **DEEPY_TEMPLATE_CONFIG_MIGRATIONS[DEEPY_TOOL_GEN_IMAGE_KEY]},
     "gen_video": {"ltx2_22B_distilled": "LTX-2 2.3 Distilled 1.0", "LTX-2 2.3 Distilled": "LTX-2 2.3 Distilled 1.0", **DEEPY_TEMPLATE_CONFIG_MIGRATIONS[DEEPY_TOOL_GEN_VIDEO_KEY]},
     "gen_video_with_speech": {"LTX-2.3 Distilled With Sound": "LTX-2.3 Distilled 1.0 With Sound", **DEEPY_TEMPLATE_CONFIG_MIGRATIONS[DEEPY_TOOL_GEN_VIDEO_WITH_SPEECH_KEY]},
+    "gen_video_with_refs": DEEPY_TEMPLATE_CONFIG_MIGRATIONS[DEEPY_TOOL_GEN_VIDEO_WITH_REFS_KEY],
     "gen_3d": DEEPY_TEMPLATE_CONFIG_MIGRATIONS[DEEPY_TOOL_GEN_3D_KEY],
 }
 _LIVE_FILE_PRESET_CACHE: dict[tuple[str, str], dict[str, Any]] = {}

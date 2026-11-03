@@ -1,6 +1,6 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
-"""CUDA memory settings applied when WanGP starts, before anything initializes CUDA: an emulated smaller GPU (--max-vram), a RAM budget (--max-ram) or a
-simulated PC with less RAM (--ram-stress), the VRAM allocator
+"""CUDA memory settings applied when WanGP starts, before anything initializes CUDA: an emulated smaller GPU (--max-vram), a RAM budget (--max-ram), a
+simulated PC with less RAM or GPU under real pressure (--ram-stress / --vram-stress GB[:OTHERS]), the VRAM allocator
 (Configuration > RAM/VRAM Management or --vram-allocator), its debug mode (--vram-debug) and the per-thread stack reserve of the CUDA context; the RAM debug
 mode (--ram-debug) and the MMGP RAM allocator (Configuration > RAM/VRAM Management or --ram-allocator); and the folder of the driver's
 compute cache (Configuration > Performance)."""
@@ -88,11 +88,23 @@ def requested_vram_allocator(argv, config_filename):
     return _requested(argv, config_filename, "--vram-allocator", VRAM_ALLOCATOR_KEY) or "vmm_spill"
 
 
+def _stress(argv, option):
+    """--ram-stress / --vram-stress GB[:OTHERS]: the simulated machine's size and, optionally, what the system and other programs use of it."""
+    value = _argv_value(argv, option)
+    if value is None:
+        return None
+    size, _, others = value.partition(":")
+    return float(size), float(others) if others else None
+
+
 def apply_startup_settings(argv, config_filename):
-    stress_gb, max_ram = _argv_value(argv, "--ram-stress"), _argv_value(argv, "--max-ram")
-    if stress_gb is not None:  # before mmgp.offload reads the RAM at import; a budget then applies within the simulated PC
+    ram_stress_value, max_ram = _stress(argv, "--ram-stress"), _argv_value(argv, "--max-ram")
+    max_vram, vram_stress_value = _argv_value(argv, "--max-vram"), _stress(argv, "--vram-stress")
+    if max_vram is not None and vram_stress_value is not None:
+        raise ValueError("--vram-stress emulates its own GPU: use it without --max-vram")
+    if ram_stress_value is not None:  # before mmgp.offload reads the RAM at import; a budget then applies within the simulated PC
         from mmgp import ram_stress
-        ram_stress.start(float(stress_gb))
+        ram_stress.start(*ram_stress_value)
     if max_ram is not None:
         from mmgp import virtual_gpu
         virtual_gpu.install_ram(float(max_ram))
@@ -108,15 +120,20 @@ def apply_startup_settings(argv, config_filename):
             print(f"[RAM] MMGP RAM Allocator not available ({error}): PyTorch's CPU allocator is used")
         else:
             print("[RAM] MMGP RAM Allocator: the RAM of freed CPU tensors goes back to the system")
-    max_vram = _argv_value(argv, "--max-vram")
-    if max_vram is not None and torch.cuda.is_available():  # before the VRAM allocator, which takes the emulated card's limit when it installs
+    # before the VRAM allocator, which takes the emulated card's limit when it installs, and before WanGP allocates VRAM
+    if max_vram is not None and torch.cuda.is_available():
         from mmgp import virtual_gpu
         virtual_gpu.install(float(max_vram))
+    if vram_stress_value is not None and torch.cuda.is_available():
+        from mmgp import vram_stress
+        gpu = _argv_value(argv, "--gpu") or ""
+        vram_stress.start(*vram_stress_value, device=int(gpu.split(":")[1]) if ":" in gpu else 0)
     if torch.version.hip is None:
         _apply_compute_cache(argv, config_filename)
     if torch.version.hip is None and torch.cuda.is_available():
         _apply_cuda_settings(argv, config_filename, torch)
-    if max_vram is not None and torch.cuda.is_available() and VRAM_ALLOCATOR not in ("vmm", "vmm_spill"):
+    if (max_vram is not None or vram_stress_value is not None) and torch.cuda.is_available() and VRAM_ALLOCATOR not in ("vmm", "vmm_spill"):
+        from mmgp import virtual_gpu
         virtual_gpu.limit_torch_allocator()
     debug_value = _argv_value(argv, "--ram-debug")
     debug_mb = float(debug_value) if debug_value and not debug_value.startswith("-") else 16 if "--ram-debug" in argv else 0

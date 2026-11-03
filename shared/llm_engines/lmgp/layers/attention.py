@@ -719,7 +719,7 @@ def _q8_paged_prefill(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Ten
             q, k_cache, v_cache, k_scale, v_scale, context.block_tables, context.cu_seqlens_q, context.cu_seqlens_k, output,
             q.stride(0), q.stride(1), k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
             k_scale.stride(0), k_scale.stride(1), k_scale.stride(2), context.block_tables.stride(0), output.stride(0), output.stride(1), softmax_scale,
-            q.shape[1], k_cache.shape[2], q.shape[2], k_cache.shape[1], BLOCK_M=32, BLOCK_N=32, num_warps=4, num_stages=2,
+            q.shape[1], k_cache.shape[2], q.shape[2], k_cache.shape[1], BLOCK_M=32, BLOCK_N=32, num_warps=4, num_stages=_Q8_EXACT_PREFILL_STAGES,
         )
         return output
     q8_paged_prefill_kernel[grid](
@@ -1019,3 +1019,6 @@ if triton is not None and tl is not None:
         if BF16_BITS:
             return bf16_bits.bf16_bits_to_fp32(tl.load(pointer))
         return tl.load(pointer).to(tl.float32)
+
+    # Triton 3.2 aborts when pipelining the exact Q8 prefill kernel's rank-three loads.
+    _Q8_EXACT_PREFILL_STAGES = 1 if triton.__version__.split(".")[:2] == ["3", "2"] else 2

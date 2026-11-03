@@ -1,0 +1,18 @@
+{
+    "settings_version": 2.82,
+    "model_type": "triposplat_idol",
+    "type": "Speridlabs Idol",
+    "prompt": "",
+    "image_mode": 1,
+    "video_prompt_type": "I",
+    "model_mode": "synthetic",
+    "batch_size": 1,
+    "remove_background_images_ref": 1,
+    "multi_prompts_gen_type": "FG",
+    "num_inference_steps": 50,
+    "guidance_scale": 4.0,
+    "flow_shift": 3.0,
+    "custom_settings": {
+        "num_gaussians": 262144
+    }
+}

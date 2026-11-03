@@ -19,12 +19,18 @@ The timeline comes first: every shot, sound and subtitle is placed on it, and th
 
 ## 3. Speech and sound
 
-- Drive each speaking shot by its own speech clip (`gen_video_with_speech`) with a `video_length` at least as long as the speech: the video stops shortly after the speech ends.
+- One voice per speaker for the whole film: make each speaker's voice sample once (`gen_speech_from_description` of a neutral sentence,
+  or the user's recording) and speak every line with `gen_speech_from_sample` from it. Describing the voice again for each line gives
+  another voice each time.
+- Drive each speaking shot by its own speech clip (`gen_video_with_speech`) with `video_length` set to the speech's duration in seconds (such as `"6.4s"`).
+- A line shorter than its shot: pad the clip with silence to the shot's length, and cut the shot about 0.35 s after the line ends. The
+  model fills the silence with invented words, so the part after the line is not usable.
 - Describe a speaking shot as the person speaking to camera with natural lip movements synchronized, and nothing that competes with the mouth: no written line of dialogue, no language or audio mention, no smiling, waving or nodding. Written dialogue in the prompt leaves the lips still in about half of the shots.
 - A lip-synced shot carries its speech in its own soundtrack, aligned with the lips: mix with `include_video_audio: true`, add only music and other sounds, and duck the music under it with `ducking: {"tracks": [<music index>], "under": ["video"]}`. Placing the speech files again at computed offsets drifts them away from the lips.
 - Narration over inserts: one clip per insert, placed where the insert starts (`remux_media` mix `offsets_s`).
 - `merge_videos` with cuts keeps every clip's speech aligned; a crossfade fades the last `transition_s` of the outgoing clip's sound, so cut around speech.
-- Generate the music at least as long as the whole cut, and mix once: `remux_media` mix with the music ducked under the voices and `normalize_lufs`. Its `quiet_ranges_seconds` must be empty unless a silence is intended.
+- A change of actor is a change of look and of voice: make the new master and voice sample once, rewrite every prompt that describes them, shoot their shots again and speak their lines again from the new sample.
+- Generate the music at least as long as the whole cut, again when shots are added, and mix once: `remux_media` mix with the music ducked under the voices and `normalize_lufs`. Its `quiet_ranges_seconds` must be empty unless a silence is intended.
 
 ## 4. Other languages
 
@@ -37,6 +43,7 @@ The timeline comes first: every shot, sound and subtitle is placed on it, and th
 
 ## 6. Check before reporting
 
+- A full-frame card (a chapter, an end card) hides the picture: compare its times with the subtitle times, and start it after the last line it would cover.
 - One `inspect_video` over each inserted shot, asking which object it shows; compare the answer with what the speech names at that moment and with the same object in the neighbouring shots.
 - For each language track, compare its transcription's segment times with the timeline: each segment must start where its shot starts.
 - `black_ranges_seconds` and `cut_times_seconds` (generated videos, Inspect Video, View Media) and `quiet_ranges_seconds` (mix) are measurements: fix them unless intended, and report what was measured, not what was hoped. Inside a generated shot, and above all an interview or lip-synced shot, a cut is the model cutting away: use the part before it or regenerate the shot shorter.

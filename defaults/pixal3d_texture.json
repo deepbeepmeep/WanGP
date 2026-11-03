@@ -1,0 +1,22 @@
+{
+    "model": {
+        "name": "Pixal3D Native Texture",
+        "architecture": "pixal3d_texture",
+        "description": "Paints an existing mesh with base colour, metallic and roughness maps from one matching image or four views. Turnarounds can supply markings on the sides and back. The reference and mesh must depict the same shape.",
+        "URLs": [
+            "https://huggingface.co/DeepBeepMeep/3D/resolve/main/pixal3d_texture_bf16.safetensors",
+            "https://huggingface.co/DeepBeepMeep/3D/resolve/main/pixal3d_texture_int8_convrot.safetensors"
+        ]
+    },
+    "prompt": "Painted ceramic pitcher with a blue handle",
+    "image_mode": 1,
+    "video_prompt_type": "I",
+    "num_inference_steps": 12,
+    "guidance_scale": 1.0,
+    "batch_size": 1,
+    "seed": 42,
+    "custom_settings": {
+        "max_faces": 0,
+        "texture_size": 2048
+    }
+}

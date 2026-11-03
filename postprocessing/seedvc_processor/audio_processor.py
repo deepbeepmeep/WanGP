@@ -82,6 +82,10 @@ class SeedVCProcessor:
         self._sync_bridge_config()
         return self.bridge.enabled()
 
+    def format_choice_label(self, label, method) -> str:
+        version = self.bridge._VERSIONS.get(read_config_section(self.server_config, self)["mode"])
+        return label.replace("SeedVC", f"SeedVC {version}") if version else label
+
     def validate_method(self, method, voice_sample=None, voice_sample2=None, **_kwargs) -> str:
         if not self.enabled():
             return "SeedVC is disabled in Configuration > Extensions"
@@ -91,6 +95,13 @@ class SeedVCProcessor:
         if metadata["needs_voice_sample2"] and voice_sample2 is None:
             return "You must provide a second voice sample"
         return ""
+
+    def query_checkpoint_inventory(self):
+        from .assets import query_download_def
+        from .bridge import SEEDVC_RESTORE_BACKGROUND_STEM
+        from shared.utils.download import query_audio_background_replacement_download_def
+        shared = [query_audio_background_replacement_download_def()] if SEEDVC_RESTORE_BACKGROUND_STEM else []
+        return [{"name": "SeedVC", "variant": label, "download_defs": query_download_def(mode) + shared} for mode, label in self.bridge._VERSIONS.items()]
 
     def query_download_defs(self, enabled_only: bool = True) -> list[dict[str, Any]]:
         self._sync_bridge_config()

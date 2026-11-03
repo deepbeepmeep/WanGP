@@ -188,9 +188,10 @@ def _validate_gguf_cuda_module(module):
     raw_weight = torch.from_numpy(quantized_weight).contiguous().cuda()
     input_tensor = torch.linspace(-0.5, 0.5, 64, dtype=torch.float32, device="cuda").reshape(2, 32)
     fast_out = module.linear(raw_weight, "Q4_0", [1, 32], input_tensor, None, torch.float32)
-    dense_weight = torch.from_numpy(gguf.quants.dequantize(quantized_weight, gguf.GGMLQuantizationType.Q4_0)).to(device=input_tensor.device, dtype=torch.float32)
-    ref_out = torch.nn.functional.linear(input_tensor, dense_weight, None)
-    torch.cuda.synchronize()
+    dense_weight = torch.from_numpy(gguf.quants.dequantize(quantized_weight, gguf.GGMLQuantizationType.Q4_0)).to(dtype=torch.float32)
+    # On the CPU: on the GPU, cuBLAS would keep a workspace for this thread and stream.
+    ref_out = torch.nn.functional.linear(input_tensor.cpu(), dense_weight, None)
+    fast_out = fast_out.cpu()
     if fast_out.shape != ref_out.shape:
         raise RuntimeError(f"Q4 self-test shape mismatch: {tuple(fast_out.shape)} vs {tuple(ref_out.shape)}")
     if not torch.allclose(fast_out, ref_out, atol=2e-2, rtol=2e-2):

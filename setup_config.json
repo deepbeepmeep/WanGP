@@ -178,12 +178,12 @@
         }
     },
     "gpu_profiles": {
-        "GTX_10":      { "python": "3.10", "torch": "cu128", "triton": null,     "sage": null,       "sparge": null, "flash": null, "kernels": [] },
-        "RTX_20":      { "python": "3.11", "torch": "cu130", "triton": "v33", "sage": "v1", "sparge": null, "flash": null, "kernels": ["wgpkernels", "nunchaku_cu13", "gguf"] },
-        "RTX_30":      { "python": "3.11", "torch": "cu130", "triton": "v37", "sage": "v220_cu13", "sparge": "v010_cu13", "flash": "v210", "kernels": ["wgpkernels", "nunchaku_cu13", "gguf"] },
-        "RTX_40":      { "python": "3.11", "torch": "cu130", "triton": "v37", "sage": "v220_cu13", "sparge": "v010_cu13", "flash": "v210", "kernels": ["wgpkernels", "nunchaku_cu13", "gguf"] },
-        "RTX_50":      { "python": "3.11", "torch": "cu130", "triton": "v37", "sage": "v220_cu13", "sparge": "v010_cu13", "flash": "v210", "kernels": ["wgpkernels", "nunchaku_cu13","light2xv", "gguf"] },
-        "AMD":         { "python": "3.12", "torch": "rocm10", "triton": "v38", "sage": "v1", "sparge": null, "flash": "v284_rocm", "kernels": ["wgpkernels", "gguf"], "attention": "sdpa" },
-        "MPS":         { "python": "3.11", "torch": "mps", "triton": null, "sage": null, "sparge": null, "flash": null, "kernels": [], "attention": "sdpa" }
+        "GTX_10":      { "platforms": ["win", "linux"], "python": "3.10", "torch": "cu128", "triton": null,     "sage": null,       "sparge": null, "flash": null, "kernels": [] },
+        "RTX_20":      { "platforms": ["win", "linux"], "python": "3.11", "torch": "cu130", "triton": "v33", "sage": "v1", "sparge": null, "flash": null, "kernels": ["wgpkernels", "nunchaku_cu13", "gguf"] },
+        "RTX_30":      { "platforms": ["win", "linux"], "python": "3.11", "torch": "cu130", "triton": "v37", "sage": "v220_cu13", "sparge": "v010_cu13", "flash": "v210", "kernels": ["wgpkernels", "nunchaku_cu13", "gguf"] },
+        "RTX_40":      { "platforms": ["win", "linux"], "python": "3.11", "torch": "cu130", "triton": "v37", "sage": "v220_cu13", "sparge": "v010_cu13", "flash": "v210", "kernels": ["wgpkernels", "nunchaku_cu13", "gguf"] },
+        "RTX_50":      { "platforms": ["win", "linux"], "python": "3.11", "torch": "cu130", "triton": "v37", "sage": "v220_cu13", "sparge": "v010_cu13", "flash": "v210", "kernels": ["wgpkernels", "nunchaku_cu13","light2xv", "gguf"] },
+        "AMD":         { "platforms": ["win", "linux"], "python": "3.12", "torch": "rocm10", "triton": "v38", "sage": "v1", "sparge": null, "flash": "v284_rocm", "kernels": ["wgpkernels", "gguf"], "attention": "sdpa" },
+        "MPS":         { "platforms": ["macos"], "python": "3.11", "torch": "mps", "triton": null, "sage": null, "sparge": null, "flash": null, "kernels": [], "attention": "sdpa" }
     }
 }

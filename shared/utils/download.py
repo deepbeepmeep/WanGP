@@ -179,6 +179,7 @@ def process_files_def(repoId=None, sourceFolderList=None, fileList=None, targetF
 
     gen = resolve_download_gen(gen)
     check_download_cancelled(gen)
+    install_hf_download_patch()
     if targetFolderList is None:
         targetFolderList = [None] * len(sourceFolderList)
     downloads = []

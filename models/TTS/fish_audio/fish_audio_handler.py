@@ -79,7 +79,7 @@ class family_handler:
             "coTenantsMap": {"transformer": ["transformer2"], "transformer2": ["transformer"]}}
         if int(profile) in (0, 2, 4, 5):
             # Both stages run at every audio frame: streaming them would cost a full transfer of their weights per frame. They stay
-            # whole in VRAM, also with a VRAM preload (their routed experts stay on the CPU).
+            # whole in VRAM; their routed experts take what a VRAM Preload leaves beyond them, or the free VRAM with a dynamic preload.
             offload_def["budgets"] = {"transformer": 0, "transformer2": 0}
         return pipeline, offload_def
 

@@ -2,8 +2,18 @@
   "name": "Media Flow",
   "author": "DeepBeepMeep",
   "version": "1.2.0",
-  "description": "Replacement for the Full Video Process plugin: batch outpainting, deblurring, and compression artifact removal for videos and images. Optimized for long videos with low RAM requirements.",
+  "description": "Restore, upscale, outpaint and smooth videos, images or entire folders, with resumable processing for long videos and original audio preserved.",
   "date": "",
   "wan2gp_version": "",
-  "uninstallable": false
+  "uninstallable": false,
+  "info_card": {
+    "tagline": "Give Your Media a New Life",
+    "description": "Restore, upscale, outpaint and smooth videos or entire folders. Pause and resume long jobs while preserving the original audio.",
+    "details": "Images · Long Videos · Resumable Batches",
+    "image": "icons/apps/media_flow.webp",
+    "image_alt": "Media Flow with a video frame preview and processing controls"
+  },
+  "important": true,
+  "app_url": "/media-flow",
+  "fullscreen": true
 }

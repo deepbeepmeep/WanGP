@@ -1,0 +1,96 @@
+.wangp-native-app-tabs > .tab-wrapper { position: fixed !important; left: -100000px !important; top: 0 !important; width: 100000px !important; height: 1px !important; visibility: hidden !important; pointer-events: none !important; overflow: hidden !important; }
+#wangp-app-bar { --app-muted: color-mix(in srgb, var(--body-text-color) 75%, var(--block-background-fill)); position: relative; z-index: 60; overflow: visible !important; }
+#wangp-app-bar .html-container { overflow: visible; padding: 0; }
+#wangp-app-bar .html-container.pending { opacity: 1; }
+#wangp-app-bar .app-bar { display: flex; align-items: center; gap: 4px; padding: 0; border-bottom: 1px solid var(--border-color-primary); color: var(--body-text-color); }
+#wangp-app-bar svg { width: 19px; height: 19px; flex: 0 0 19px; }
+#wangp-app-bar .app-bar-viewport { flex: 1; min-width: 0; overflow: hidden; }
+#wangp-app-bar .app-bar-apps { display: flex; gap: 2px; }
+#wangp-app-bar .app-bar-apps .app-bar-link { max-width: none; }
+#wangp-app-bar .app-bar-link { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: flex-start; gap: 6px; max-width: 100%; min-height: 37px; padding: 8px 6px; border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: transparent; color: var(--body-text-color); cursor: pointer; font: 400 13px/1.3 var(--font); white-space: nowrap; }
+#wangp-app-bar .app-bar-label { display: grid; text-align: left; }
+#wangp-app-bar .app-bar-label > span, #wangp-app-bar .app-bar-label::after { grid-area: 1 / 1; }
+#wangp-app-bar .app-bar-label::after { content: attr(data-label); font-weight: 700; visibility: hidden; pointer-events: none; }
+#wangp-app-bar .app-bar-new.is-seen { display: none; }
+#wangp-app-bar .app-bar-more[aria-current="page"] { color: var(--studio-accent, var(--color-accent)); border-bottom: 2px solid currentColor; }
+#wangp-app-bar .app-bar-link:hover, #wangp-app-bar .app-bar-more:hover { background: var(--background-fill-secondary); }
+#wangp-app-bar .app-bar-link[aria-current="page"] { border-bottom-color: var(--studio-accent, var(--color-accent)); color: var(--studio-accent, var(--color-accent)); font-weight: 700; }
+#wangp-app-bar .app-bar-link[aria-current="page"] .app-bar-label { font-weight: 700; }
+#wangp-app-bar .app-bar-link[aria-current="page"] svg { stroke-width: 2.5; }
+#wangp-app-bar .app-bar-new { color: #856200; background: #ffe584; border: 1px solid #e5bd42; padding: 2px 5px; border-radius: 5px; font-size: 10px; font-weight: 700; }
+#wangp-app-bar .app-bar-utilities { display: flex; flex: 0 0 auto; gap: 2px; padding-left: 8px; margin-left: auto; }
+#wangp-app-bar .app-bar-utility { justify-content: center; width: 38px; height: 37px; padding: 8px; }
+#wangp-app-bar .app-bar-utility .app-bar-label { display: none; }
+#wangp-app-bar .app-bar-utility { position: relative; }
+#wangp-app-bar .app-bar-utility::after { content: attr(data-tooltip); position: absolute; top: calc(100% + 8px); right: 0; z-index: 1; padding: 4px 7px; border-radius: 4px; background: var(--body-text-color); color: var(--body-background-fill); font: 400 12px/1.2 var(--font); white-space: nowrap; opacity: 0; pointer-events: none; transition: opacity 120ms ease; }
+#wangp-app-bar .app-bar-utility:hover::after { opacity: 1; transition-delay: 1000ms; }
+#wangp-app-bar .app-bar-overflow { flex: 0 0 auto; }
+#wangp-app-bar .app-bar-more { display: grid; place-items: center; width: 34px; height: 37px; color: var(--body-text-color); cursor: pointer; }
+#wangp-app-bar .app-bar-menu { position: absolute; top: calc(100% + 6px); right: 145px; min-width: 230px; max-width: calc(100vw - 24px); max-height: 65dvh; overflow-y: auto; padding: 7px; border: 1px solid var(--border-color-primary); border-radius: 14px; box-shadow: 0 14px 45px #00000030; background: var(--block-background-fill); }
+#wangp-app-bar .app-bar-menu .app-bar-link { display: flex; width: 100%; border-bottom-color: transparent; border-radius: 6px; }
+#wangp-app-bar [hidden] { display: none !important; }
+#wangp-app-bar button:focus-visible { outline: 2px solid var(--studio-accent, var(--color-accent)); outline-offset: 2px; }
+#wangp-app-bar:has(.app-welcome-backdrop:not([hidden])) { z-index: 1700; }
+#wangp-app-bar .app-welcome-backdrop { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; padding: 24px; background: #08132580; backdrop-filter: blur(5px); }
+#wangp-app-bar .app-welcome { position: relative; width: min(1000px, 100%); max-height: 90dvh; overflow: auto; border-radius: 22px; border: 1px solid var(--border-color-primary); background: var(--block-background-fill); color: var(--body-text-color); box-shadow: 0 24px 90px #00000050; }
+#wangp-app-bar .app-welcome-close { position: absolute; top: 12px; right: 12px; z-index: 2; width: 32px; height: 32px; border-radius: 50%; background: var(--block-background-fill); color: var(--body-text-color); cursor: pointer; font-size: 23px; }
+#wangp-app-bar .app-intro { display: grid; grid-template-columns: 1.05fr 1fr; }
+#wangp-app-bar .app-intro > img { width: 100%; height: 100%; object-fit: contain; background: var(--background-fill-secondary); }
+#wangp-app-bar .app-intro-visual { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 24px; min-height: 230px; padding: 28px; background: linear-gradient(145deg, var(--background-fill-secondary), color-mix(in srgb, var(--color-accent) 14%, var(--block-background-fill))); color: var(--studio-accent, var(--color-accent)); font-size: 24px; font-weight: 700; }
+#wangp-app-bar .app-intro-visual svg { width: 100px; height: 100px; flex-basis: 100px; }
+#wangp-app-bar [data-app-onboarding] > .app-intro-detail { margin-top: 12px; }
+#wangp-app-bar .app-intro-body { display: flex; flex-direction: column; gap: 16px; padding: 40px 32px 30px; }
+#wangp-app-bar .app-intro-body h2 { font-size: 28px; line-height: 1.2; margin: 0; color: var(--body-text-color); }
+#wangp-app-bar .app-intro-body p { margin: 0; font-size: 14px; line-height: 1.65; color: var(--body-text-color); }
+#wangp-app-bar .app-intro-body .app-intro-tagline { font-size: 18px; font-weight: 600; color: var(--studio-accent, var(--color-accent)); }
+#wangp-app-bar .app-intro-body .app-intro-detail { font-size: 12px; color: var(--app-muted); }
+#wangp-app-bar .app-intro-actions { display: flex; gap: 10px; margin-top: 8px; }
+#wangp-app-bar .app-intro-actions button { flex: 1; padding: 12px 16px; border: 1px solid var(--border-color-primary); border-radius: 10px; font-weight: 600; cursor: pointer; }
+#wangp-app-bar [data-app-decision="keep"] { background: var(--button-primary-background-fill); color: var(--button-primary-text-color); }
+#wangp-app-bar [data-app-decision="remove"] { background: var(--background-fill-secondary); color: var(--body-text-color); }
+.wangp-model-manager-link { --mm-accent: var(--studio-accent, var(--color-accent)); display: inline-flex; align-items: center; gap: 8px; width: fit-content; margin: 6px 8px !important; padding: 7px 14px 7px 12px !important; border: 1px solid color-mix(in srgb, var(--mm-accent) 50%, transparent) !important; border-radius: 999px; background: color-mix(in srgb, var(--mm-accent) 10%, transparent) !important; box-shadow: none !important; color: var(--mm-accent) !important; cursor: pointer; font-size: 14px !important; font-weight: 600 !important; }
+.wangp-model-manager-link:hover { background: color-mix(in srgb, var(--mm-accent) 20%, transparent) !important; }
+.ckpt-selection-heading { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 1fr); align-items: center; }
+.ckpt-selection-heading > span { padding-right: 12px; font: var(--block-title-text-weight) var(--block-title-text-size)/var(--line-sm) var(--font); color: var(--block-title-text-color); }
+.gradio-container .ckpt-selection-heading .wangp-model-manager-link { width: 100%; margin: 0 !important; padding: 5px 10px !important; gap: 6px; font-size: var(--block-title-text-size) !important; justify-content: flex-start; text-align: left; }
+.ckpt-selection-heading kbd { white-space: nowrap; }
+@media (max-width: 700px) {
+    .ckpt-selection-heading { grid-template-columns: 1fr; gap: 6px; }
+    .gradio-container .ckpt-selection-heading .wangp-model-manager-link { width: fit-content; }
+}
+.ckpt-heading { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px 16px; }
+.ckpt-heading > div { display: grid; gap: 4px; flex: 1 1 20rem; }
+.gradio-container .ckpt-heading h3, .gradio-container .ckpt-heading p { margin: 0 !important; }
+.ckpt-heading .wangp-model-manager-link { margin: 0 !important; padding: 3px 9px !important; font-size: 12px !important; }
+.ckpt-heading .wangp-model-manager-link svg { width: 15px; height: 15px; flex-basis: 15px; }
+.wangp-model-manager-link svg { width: 22px; height: 22px; flex: 0 0 22px; }
+.wangp-model-manager-link kbd { padding: 1px 6px; border: 1px solid var(--border-color-primary); border-radius: 5px; background: var(--background-fill-secondary); color: var(--body-text-color); font: 600 11px/1.5 var(--font-mono, monospace); }
+.wangp-addon-toolbar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; padding: 4px 0 10px; color: var(--body-text-color); }
+.wangp-addon-toolbar > div { display: flex; align-items: center; gap: 12px; }
+.wangp-addon-toolbar a { display: inline-flex; align-items: center; gap: 6px; color: var(--body-text-color) !important; font-size: 13px; text-decoration: none !important; }
+.wangp-addon-toolbar a:hover { color: var(--studio-accent, var(--color-accent)) !important; }
+.wangp-addon-toolbar svg { width: 18px; height: 18px; }
+.wangp-addon-toolbar [data-addon-return] { display: none; }
+.wangp-addon-fullscreen-open { overflow: hidden !important; }
+html:not(.wangp-main-tab) footer { display: none !important; }
+.wangp-addon-own-controls .wangp-addon-toolbar { display: none !important; }
+.wangp-addon-own-controls .wangp-addon-web-view iframe { height: calc(100vh - 170px) !important; }
+.wangp-addon-fullscreen.wangp-addon-own-controls { padding: 0 !important; }
+.wangp-addon-fullscreen.wangp-addon-own-controls .wangp-addon-web-view iframe { position: fixed; inset: 0; width: 100vw !important; height: 100dvh !important; min-height: 0 !important; }
+.wangp-addon-fullscreen { position: fixed !important; inset: 0 !important; z-index: 80 !important; overflow: auto !important; box-sizing: border-box; padding: 12px !important; background: var(--body-background-fill) !important; border: 0 !important; border-radius: 0 !important; }
+.wangp-addon-fullscreen .block.wangp-addon-controls { position: sticky; top: 0; z-index: 2; background: var(--body-background-fill); }
+.wangp-addon-fullscreen [data-addon-fullscreen] { display: none; }
+.wangp-addon-fullscreen [data-addon-return] { display: inline-flex; }
+.wangp-addon-fullscreen .wangp-addon-web-view iframe { height: calc(100dvh - 60px) !important; min-height: 0 !important; }
+.wangp-addon-route-status { padding: 10px; color: var(--body-text-color); background: var(--background-fill-secondary); }
+@media (max-width: 760px) {
+    #wangp-app-bar .app-bar { gap: 2px; }
+    #wangp-app-bar .app-bar-link { padding: 8px 6px; font-size: 12px; }
+    #wangp-app-bar .app-bar-utilities { gap: 0; padding-left: 3px; }
+    #wangp-app-bar .app-bar-utility { width: 34px; height: 37px; padding: 7px; }
+    #wangp-app-bar .app-bar-menu { right: 6px; }
+    #wangp-app-bar .app-welcome-backdrop { padding: 12px; }
+    #wangp-app-bar .app-intro { grid-template-columns: 1fr; }
+    #wangp-app-bar .app-intro > img { max-height: 220px; }
+    #wangp-app-bar .app-intro-body { padding: 22px; gap: 12px; }
+}

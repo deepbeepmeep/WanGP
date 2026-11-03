@@ -67,7 +67,7 @@ ACTIONS = {
             "max_size": {"type": "integer", "minimum": 16, "description": "Pictures and video: longest side in pixels; .glb models: their textures' (1024 by default)."},
             "transparent": {"type": "boolean", "default": False, "description": "Pictures to .png or .webp: remove the background around the subject (a sprite, a character, an object on a plain background) and crop to it."},
         }, "required": ["media", "app", "path"], "additionalProperties": False},
-        "example": {"action": "import_asset", "arguments": {"media": "image_3", "app": "orbit-garden", "path": "assets/fox.png", "max_size": 256, "transparent": True}},
+        "example": {"action": "import_asset", "arguments": {"media": "visual:IMAGE", "app": "orbit-garden", "path": "assets/fox.png", "max_size": 256, "transparent": True}},
     },
     "app_publish": {
         "description": "Publish a working web app to the Apps gallery as a new version (a .wgpapp file the user keeps, plays full screen and can share).",

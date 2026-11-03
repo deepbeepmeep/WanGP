@@ -261,7 +261,7 @@ Enable **Advanced Mode**, open **General**, and choose an option under **Phases*
 
 Leave **Custom Sigmas** empty for the normal schedules. Use commas between values and `;` between phases; an empty phase slot keeps its normal schedule. Explicit values set that phase's steps and starting noise. The **i** beside the field explains the syntax.
 
-For FL2VA, **Open-H3 Regenerate 2K Phase 2** selects the refiner LoRA and its three-step schedule. Phase 2 uses encoded silent audio as conditioning while preserving the first phase's output soundtrack. **H3 Phase 2 (Original)** restores the usual Turbo and schedule; **Vanilla Phase 1 (Reset)** returns to one-phase generation. Tiling remains experimental with the refiner.
+For FL2VA, **Open-H3 Regenerate 2K Phase 2** selects the refiner LoRA and its three-step schedule. Phase 2 uses the first phase's audio as frozen conditioning while preserving its output soundtrack. **H3 Phase 2 (Original)** restores the usual Turbo and schedule; **Vanilla Phase 1 (Reset)** returns to one-phase generation. Tiling remains experimental with the refiner.
 """
 
 H3_PHASE_TURBO_INFOS = """
@@ -285,7 +285,7 @@ PIKA_INFOS = """
 
 ### Pika H3 Flex
 
-Apply **Pika H3 Flex FL2VA 6 Steps** or **Pika H3 Flex Ref2VA 6 Steps** from the accelerator profiles for the matching model. FL2VA generates video and stereo audio from text, a first frame, a last frame, or both. Ref2VA uses image/video references and optional audio references; it requires at least one image or video.
+Apply **Pika H3 Flex FL2VA 6 Steps** or **Pika H3 Flex Ref2VA 6 Steps** from the accelerator profiles for the matching model. FL2VA generates video and stereo audio from text, a first frame, a last frame, or both. Ref2VA can generate from text alone or with injected frames. Image, video and audio references are optional.
 
 The profile selects **Pika Re-noise (6 Steps)**, six steps, flow shift 12 and one generation phase. Keep **Steps Skipping** off and **Custom Sigmas** empty. The sampler requires the matching Pika adapter; selecting it alone does not accelerate the base model. Use **Vanilla Phase 1 (Reset)** to return to ordinary H3 generation.
 
@@ -295,7 +295,7 @@ Start with 480p or 768p and a 5–15 second clip. These are Pika's released loca
 PIKA_DEEPY_INFOS = (" Pika H3 Flex accelerator profiles select the matching FL2VA/Ref2VA rank-128 adapter at multiplier 1, "
                    "sample_solver=pika_renoise, num_inference_steps=6, flow_shift=12, guidance_phases=1, custom_sigmas='', "
                    "skip_steps_cache_type=''. Use the profile, not the sampler alone. Start at 480p/768p and 124–362 frames at 24 fps. "
-                   "Ref2VA requires at least one image/video; up to 9 images, 3 videos and 3 standalone audio references, 12 files total. "
+                   "Ref2VA supports text alone or injected frames without additional references. It accepts up to 9 reference images, 3 videos and 3 standalone audio clips, with 12 reference files total. "
                    "Video soundtracks selected with audio_prompt_type=K stay attached to their videos. H3 reference order is images, videos, "
                    "then standalone audios; use <Picture N>, <Video N>, <Audio N> labels. Pika has no released local high-resolution or audio-stem stage. "
                    "Vanilla Phase 1 (Reset) restores Euler and removes accelerators while retaining additional LoRAs.")
@@ -953,7 +953,7 @@ class family_handler:
             result["deepy_infos"] += " VDN loads its acceleration LoRA automatically and defaults to 8 steps."
         if result["custom_sigmas"]:
             result["custom_sigmas_schedulers"] = ["euler", "res_multistep", "ralston_2s"]
-            result["deepy_infos"] += " `custom_sigmas` defaults to empty. Commas separate positive descending sigmas below 1; semicolons separate exactly `guidance_phases` slots. Blank slots use normal schedules; trailing zero is ignored. Explicit schedules override that phase's steps and starting sigma without another flow shift. FL2VA and Ref2VA share the H3 presets. Open-H3 Regenerate uses `;0.909375,0.8571428571428571,0.6666666666666666` and `open_h3_regenerate_2k_lora.safetensors` at `0;1` before `|`; it supplies silent phase-2 audio conditioning and retains phase-1 output audio. Tiling is experimental. The presets replace accelerator LoRAs while preserving additional LoRAs and their multipliers. Original Phase 2 and Vanilla Phase 1 reset presets clear custom sigmas."
+            result["deepy_infos"] += " `custom_sigmas` defaults to empty. Commas separate positive descending sigmas below 1; semicolons separate exactly `guidance_phases` slots. Blank slots use normal schedules; trailing zero is ignored. Explicit schedules override that phase's steps and starting sigma without another flow shift. FL2VA and Ref2VA share the H3 presets. Open-H3 Regenerate uses `;0.909375,0.8571428571428571,0.6666666666666666` and `open_h3_regenerate_2k_lora.safetensors` at `0;1` before `|`; it uses phase-1 audio as frozen phase-2 conditioning and retains phase-1 output audio. Tiling is experimental. The presets replace accelerator LoRAs while preserving additional LoRAs and their multipliers. Original Phase 2 and Vanilla Phase 1 reset presets clear custom sigmas."
         if veda:
             result["compile"] = False
             help_text = " Veda variants always use learned sparse attention in the H3 transformer; the attention override is locked to Veda. Other attention operations use the application attention backend. It reuses the standard H3 settings, LoRAs and step counts. The predictor follows Transformer Quantization (BF16 or INT8 ConvRot). Sparsity can change fine detail or motion; compare with a standard H3 variant at the same seed. Speed benefits are greatest for large videos. Requires Triton and an NVIDIA SM80+ GPU. Veda runs without CUDA graphs or transformer compilation."
@@ -1207,8 +1207,6 @@ class family_handler:
             return "MiniMax H3 accepts at most 3 audio references"
         _notify_audio_reference_limit(audio_durations)
         visual_count = image_count + len(video_durations)
-        if pika and not visual_count:
-            return "Pika H3 Flex Ref2VA requires at least one image or video reference"
         if not pika and audio_count > visual_count:
             return f"MiniMax H3 requires at least as many reference images and videos as audio references (found {visual_count} visual and {audio_count} audio)"
         file_count = image_count + len(videos) + (0 if soundtrack_mode else audio_count)

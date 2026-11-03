@@ -1,52 +1,4 @@
 # Copyright (c) 2024-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
-# ------------------ Memory Management 4.4.1 for the GPU Poor by DeepBeepMeep (mmgp)------------------
-#
-# This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
-# This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
-# times in a pipe (eg VAE).
-#
-# Requirements:
-# - VRAM: minimum 12 GB, recommended 24 GB (RTX 3090/ RTX 4090)
-# - RAM: minimum 24 GB, recommended 48 - 64 GB 
-# 
-# It is almost plug and play and just needs to be invoked from the main app just after the model pipeline has been created.
-# Make sure that the pipeline explictly loads the models in the CPU device 
-#   for instance: pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.bfloat16).to("cpu")
-# For a quick setup, you may want to choose between 5 profiles depending on your hardware, for instance:
-#   from mmgp import offload, profile_type
-#   offload.profile(pipe, profile_type.HighRAM_LowVRAM_Fast)
-# Alternatively you may want to your own parameters, for instance:
-#   from mmgp import offload
-#   offload.all(pipe, pinToMemory=true, extraModelsToQuantize = ["text_encoder_2"] )
-# The 'transformer' model that contains usually the video or image generator is quantized on the fly by default to 8 bits so that it can fit into 24 GB of VRAM. 
-# You can prevent the transformer quantization by adding the parameter quantizeTransformer = False
-# If you want to save time on disk and reduce the loading time, you may want to load directly a prequantized model. In that case you need to set the option quantizeTransformer to False to turn off on the fly quantization.
-# You can specify a list of additional models string ids to quantize (for instance the text_encoder) using the optional argument extraModelsToQuantize. This may be useful if you have less than 48 GB of RAM.
-# Note that there is little advantage on the GPU / VRAM side to quantize text encoders as their inputs are usually quite light. 
-# Conversely if you have more than 48GB RAM you may want to enable RAM pinning with the option pinnedMemory = True. You will get in return super fast loading / unloading of models
-# (this can save significant time if the same pipeline is run multiple times in a row)
-# 
-# Sometime there isn't an explicit pipe object as each submodel is loaded separately in the main app. If this is the case, you need to create a dictionary that manually maps all the models.
-#
-# For instance :
-# for flux derived models: pipe = { "text_encoder": clip, "text_encoder_2": t5, "transformer": model, "vae":ae }
-# for mochi: pipe = { "text_encoder": self.text_encoder, "transformer": self.dit, "vae":self.decoder }
-#
-# Please note that there should be always one model whose Id is 'transformer'. It corresponds to the main image / video model which usually needs to be quantized (this is done on the fly by default when loading the model)
-# 
-# Becareful, lots of models use the T5 XXL as a text encoder. However, quite often their corresponding pipeline configurations point at the official Google T5 XXL repository 
-# where there is a huge 40GB model to download and load. It is cumbersorme as it is a 32 bits model and contains the decoder part of T5 that is not used. 
-# I suggest you use instead one of the 16 bits encoder only version available around, for instance:
-# text_encoder_2 = T5EncoderModel.from_pretrained("black-forest-labs/FLUX.1-dev", subfolder="text_encoder_2", torch_dtype=torch.float16)
-#
-# Sometime just providing the pipe won't be sufficient as you will need to change the content of the core model: 
-# - For instance you may need to disable an existing CPU offload logic that already exists (such as manual calls to move tensors between cuda and the cpu)
-# - mmpg to tries to fake the device as being "cuda" but sometimes some code won't be fooled and it will create tensors in the cpu device and this may cause some issues.
-# 
-# You may contact me on twitter @deepbeepmeep
-#
-
-
 
 #
 
@@ -1111,10 +1063,12 @@ def _preload_floors(model_ids, sizes, requested, preload, cotenants, priority):
     and the preload (0 stays 0). The models of a group kept in VRAM together (_cotenant_groups) share the preload as a total instead: each
     keeps its own budget, and what the preload leaves beyond those goes to them in priority order (priority, else PRELOAD_PRIORITY, then
     their order), each up to its size; the first one also gets what remains beyond its size (every block preloaded: room for state kept
-    in VRAM, mmgp.state_ring). A model in several groups gets the smallest of its shares."""
+    in VRAM, mmgp.state_ring). A model in several groups gets the smallest of its shares.
+    Also returns the share of the preload of each whole model (budget 0): its expert copies take what it leaves beyond the model."""
     floors = {model_id: requested[model_id] if requested[model_id] == 0 or preload == 0 else max(requested[model_id], preload) for model_id in model_ids}
+    whole = {model_id: preload for model_id in model_ids if requested[model_id] == 0}
     if preload == 0:
-        return floors
+        return floors, whole
     order = list(priority or PRELOAD_PRIORITY)
     shares = {}
     for group in _cotenant_groups(model_ids, cotenants):
@@ -1131,7 +1085,9 @@ def _preload_floors(model_ids, sizes, requested, preload, cotenants, priority):
             shares[model_id] = min(shares.get(model_id, held[model_id]), held[model_id])
     for model_id, share in shares.items():
         floors[model_id] = 0 if requested[model_id] == 0 else max(requested[model_id], share)
-    return floors
+        if requested[model_id] == 0:
+            whole[model_id] = share
+    return floors, whole
 
 
 def _evenly(entries):
@@ -4846,6 +4802,21 @@ class offload:
         loras_modules = {parent_module: loras_model_data[parent_module] for parent_module, _, _, _, _ in self.blocks_of_modules[entry_name] if parent_module in loras_model_data}
         if loras_modules:
             self._move_loras(loras_active_adapters, loras_modules, True, model, skip_idle=True)
+
+    def refresh_loras(self, model):
+        """LoRAs loaded into a model (or into a module of a managed model) whose blocks stay in VRAM, e.g. a model kept loaded between
+        generations: the GPU copies a load of these blocks would have made, for every active adapter (one idle at this step may be scaled up
+        at a later one, and a block kept in VRAM is not loaded again). Blocks loaded later get theirs as usual."""
+        loras_active_adapters = getattr(model, "_loras_active_adapters", None)
+        loras_model_data = getattr(model, "_loras_model_data", None)
+        if not loras_active_adapters or loras_model_data is None:
+            return
+        for entry_name, modules in self.blocks_of_modules.items():
+            if entry_name.split("/", 1)[0] not in self.active_models_ids or not modules or not builtins.all(getattr(parent_module, n).is_cuda for parent_module, n, *_ in modules[-1:]):
+                continue
+            loras_modules = {parent_module: loras_model_data[parent_module] for parent_module, *_ in modules if parent_module in loras_model_data}
+            if loras_modules:
+                self._move_loras(loras_active_adapters, loras_modules, True, model)
             
     @torch.compiler.disable()
     def gpu_load_blocks(self, model_id, blocks_name, preload = False):
@@ -6144,6 +6115,7 @@ def {fname}(module, *args, **kwargs):
         self.inflight = {}
         self._release_ring()
         _pool.close(self)
+        _managers.discard(self)
         self.stager.release()
         self.stager = None
         self.block_items.clear() # cached tensors and bulk-copy views also own the registered RAM
@@ -6263,8 +6235,9 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
         each other, coTenantsMap) share it as a total instead: each keeps its own budget, and what it leaves beyond those goes to them in
         the order of preloadPriority (default: transformer, transformer2, then the others), each up to its size; what remains then is room
         for state kept in VRAM (mmgp.state_ring). At most vram_safety_coefficient of the VRAM
-    preloadExperts: with an explicit budget, use its remaining space for individual GPU experts after ordinary blocks. Dynamic
-        preload applies the same priority independently. False keeps experts on CPU for fixed-budget execution. With pinnedMemory=True,
+    preloadExperts: with an explicit budget, use its remaining space for individual GPU experts after ordinary blocks; a model loaded
+        whole (budget 0) gives them what its share of minimumBudget leaves beyond its other weights. Dynamic preload applies the same
+        priority independently. False keeps experts on CPU for fixed-budget execution. With pinnedMemory=True,
         the reserved RAM the models leave also holds pinned copies of the experts that can go to the GPU, most used first, so that
         placing them is a plain transfer; the experts that stay on the CPU are never pinned.
         (in fact the real usage is twice this number). It is very efficient to reduce VRAM consumption but this feature may be very slow
@@ -6517,7 +6490,7 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
     # together
     requested = {model_id: models[model_id]._budget if hasattr(models[model_id], "_budget") else model_budgets[model_id] if model_id in model_budgets else budget
                  for model_id in models}
-    preload_floors = _preload_floors(list(models), model_sizes, requested, minimum_budget, self.cotenants_map, preloadPriority)
+    preload_floors, whole_shares = _preload_floors(list(models), model_sizes, requested, minimum_budget, self.cotenants_map, preloadPriority)
     for model_id in models:
         current_model_size = model_sizes[model_id]
         model_budget = preload_floors[model_id]
@@ -6535,7 +6508,8 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
                 new_budget = self.device_mem_capacity -  model_minimumVRAM
                 new_budget = 1 if new_budget  < 0 else new_budget
                 model_budget =  new_budget if model_budget == 0 or new_budget < model_budget else model_budget
-        expert_budgets[model_id] = model_budget if preloadExperts else 0
+        # a model loaded whole (budget 0) leaves its expert copies what its share of the preload holds beyond its other weights
+        expert_budgets[model_id] = (model_budget or whole_shares.get(model_id, 0)) if preloadExperts else 0
         coef =vram_safety_coefficient
         self.state_rooms[model_id] = 0 # room for state kept in VRAM (mmgp.state_ring): what a budget leaves (here, or tune_preloading)
         if  model_budget > 0 and current_model_size <= model_budget:

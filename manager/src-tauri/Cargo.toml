@@ -1,0 +1,27 @@
+[package]
+name = "wangp-manager"
+version = "0.1.13"
+description = "Install, launch and maintain WanGP"
+edition = "2021"
+rust-version = "1.90"
+
+[build-dependencies]
+tauri-build = { version = "=2.7.4", features = [] }
+
+[dependencies]
+tauri = { version = "=2.12.5", features = [] }
+tauri-plugin-dialog = "=2.8.4"
+tauri-plugin-single-instance = "=2.5.5"
+tauri-plugin-clipboard-manager = "=2.5.0"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+uuid = { version = "=1.29.0", features = ["v4"] }
+sha2 = "=0.10.9"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_Security", "Win32_Security_Cryptography", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

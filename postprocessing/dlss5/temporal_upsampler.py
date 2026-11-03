@@ -29,6 +29,11 @@ class DLSSGTemporalUpsampler(api.SimpleScaleSuffixMixin):
         method = str(method or "").strip().lower()
         return next((variant for variant in dlssg_variants() if variant.method == method), None)
 
+    def query_checkpoint_inventory(self):
+        from preprocessing.processors import query_preprocessor_download_def
+
+        return [{"name": "DLSS 5", "variant": "Frame Generation - RAFT Optical Flow", "download_defs": [query_preprocessor_download_def("flow")]}]
+
     def query_download_defs(self, enabled_only=True):
         from preprocessing.processors import query_preprocessor_download_def
 

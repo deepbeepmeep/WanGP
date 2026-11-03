@@ -11,7 +11,7 @@ import types
 import math
 from contextlib import contextmanager
 from functools import partial
-from mmgp import offload
+from mmgp import offload, transfer
 import torch
 import torch.nn as nn
 import torch.cuda.amp as amp
@@ -898,7 +898,7 @@ class WanAny2V:
 
         # Animate 2
         if animate2:
-            input_frames = guide_to_float(input_frames[:, :frame_num].to(self.device)).to(self.VAE_dtype)  # uint8 guides converted on the GPU
+            input_frames = guide_to_float(transfer.move(input_frames[:, :frame_num], self.device)).to(self.VAE_dtype)  # uint8 guides converted on the GPU
             if not input_ref_images:
                 input_ref_images = [image_start if image_start is not None else convert_image_to_tensor(pre_video_frame)]
             image_ref = input_ref_images[0].to(device=self.device, dtype=self.VAE_dtype)

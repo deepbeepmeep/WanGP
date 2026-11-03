@@ -16,11 +16,15 @@ def block_draft_spec(method, *, bonsai=False):
     return BLOCK_DRAFT_ASSETS["dflash2_bonsai" if method == "dflash2" and bonsai else method]
 
 
+def draft_download_def(spec):
+    return dict(repoId="DeepBeepMeep/Wan2.1", sourceFolderList=[spec["folder"]], fileList=[[spec["config"], spec["weights"]]])
+
+
 def ensure_block_draft_assets(process_files_def, method, variant, backend):
     if variant != "27b":
         raise ValueError("Parallel draft models require Qwen3.8-27B or Bonsai 2 27B.")
     spec = block_draft_spec(method, bonsai=backend == "gguf_ptq1")
-    process_files_def(repoId="DeepBeepMeep/Wan2.1", sourceFolderList=[spec["folder"]], fileList=[[spec["config"], spec["weights"]]])
+    process_files_def(**draft_download_def(spec))
 
 
 def _load_draft_config(config_path):

@@ -1,10 +1,12 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
-"""Opt-in HTTP/Xet download cancellation and progress, scoped to the calling thread."""
+"""Task-scoped download progress/cancellation and process-wide Ctrl+C shutdown."""
 
 import os
+import signal
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from functools import wraps
 
@@ -13,7 +15,33 @@ class DownloadCancelled(Exception):
     pass
 
 
+_sigint_requested = False
+
+
+def _install_sigint_handler():
+    # WanGP imports this module on the main thread before starting its workers.
+    # Downloads may begin on any thread, where signal.signal is not permitted.
+    if threading.current_thread() is not threading.main_thread():
+        return
+    previous = signal.getsignal(signal.SIGINT)
+    if not callable(previous) or getattr(previous, "_wangp_download_sigint", False):
+        return
+
+    def interrupt(signum, frame):
+        global _sigint_requested
+        # No locks, I/O or joins in a signal handler. Workers observe this flag
+        # and close their own transfers. Keep it set so queued files cannot start
+        # while the main thread and thread pools are shutting down.
+        _sigint_requested = True
+        previous(signum, frame)
+
+    interrupt._wangp_download_sigint = True
+    signal.signal(signal.SIGINT, interrupt)
+
+
 def check_download_cancelled(gen):
+    if _sigint_requested:
+        raise DownloadCancelled("Download cancelled by Ctrl+C")
     from shared.utils.media_control import current_control
     control = current_control()
     if control is not None and control.gen is gen:
@@ -50,6 +78,8 @@ class _DownloadProgress:
 
     def update(self, completed, total, force=False):
         check_download_cancelled(self.gen)
+        if self.gen is None:
+            return
         now = time.monotonic()
         if self.initial is None:
             self.initial = completed
@@ -64,14 +94,13 @@ class _DownloadProgress:
 @contextmanager
 def download_context(gen, filename, show_filename=True, file_index=1, file_count=1):
     check_download_cancelled(gen)
-    progress = None if gen is None else _DownloadProgress(gen, filename, show_filename, file_index, file_count)
+    progress = _DownloadProgress(gen, filename, show_filename, file_index, file_count)
     token = _current_download.set(progress)
     try:
-        if progress is not None:
-            progress.update(0, None, force=True)
+        progress.update(0, None, force=True)
         yield
         check_download_cancelled(gen)
-        if progress is not None:
+        if gen is not None:
             report = gen["download_progress"]
             if (report["total"] is not None and report["completed"] == report["total"]) or (report["total"] is None and report["completed"] > 0):
                 gen["download_progress_completed"] = dict(report, total=report["completed"], finished_at=time.monotonic())
@@ -80,7 +109,7 @@ def download_context(gen, filename, show_filename=True, file_index=1, file_count
                     callback(gen["download_progress_completed"])
     finally:
         _current_download.reset(token)
-        if progress is not None:
+        if gen is not None:
             gen.pop("download_progress", None)
             callback = gen.get("download_progress_callback")
             if callback is not None:
@@ -189,6 +218,7 @@ def _xet_get(*, incomplete_path, xet_file_data, headers, expected_size=None, dis
 def install_hf_download_patch():
     from huggingface_hub import file_download as hf
 
+    _install_sigint_handler()
     if getattr(hf.http_get, "_wangp_download_patch", False):
         return
     original_http_get = hf.http_get
@@ -209,18 +239,22 @@ def install_hf_download_patch():
 
     @wraps(original_download)
     def download_to_tmp_and_move(incomplete_path, destination_path, *args, **kwargs):
-        progress = _current_download.get()
-        if progress is None:
-            return original_download(incomplete_path, destination_path, *args, **kwargs)
-        check_download_cancelled(progress.gen)
-        try:
-            return original_download(incomplete_path, destination_path, *args, **kwargs)
-        except DownloadCancelled:
-            # The original function has closed the file; its caller still owns the HF lock.
-            incomplete_path.unlink(missing_ok=True)
-            raise
+        # HF snapshot workers and callers without a generation task need an owned,
+        # cancellable Xet session too, rather than HF's blocking legacy downloader.
+        context = nullcontext() if _current_download.get() is not None else download_context(None, kwargs.get("filename") or destination_path.name)
+        with context:
+            check_download_cancelled(_current_download.get().gen)
+            try:
+                return original_download(incomplete_path, destination_path, *args, **kwargs)
+            except (DownloadCancelled, KeyboardInterrupt):
+                # The original function has closed the file; its caller still owns the HF lock.
+                incomplete_path.unlink(missing_ok=True)
+                raise
 
     http_get._wangp_download_patch = True
     hf.http_get = http_get
     hf.xet_get = xet_get
     hf._download_to_tmp_and_move = download_to_tmp_and_move
+
+
+_install_sigint_handler()

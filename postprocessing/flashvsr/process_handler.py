@@ -27,6 +27,12 @@ class FlashVSRProcessHandler:
     hide_output_resolution = True
     hide_prompt = True
 
+    def configured_method(self, method: str) -> str:
+        bridge = upsampler_api.require_upsampler_by_method(method)
+        model = bridge.model()
+        two_pass = bridge.is_two_pass_upsampling(method)
+        return next(key for key, version in bridge.METHOD_MODELS.items() if version == model and bridge.is_two_pass_upsampling(key) == two_pass)
+
     @property
     def overlap_frames(self) -> int:
         """Default overlap for the original FlashVSR v1.1 process."""

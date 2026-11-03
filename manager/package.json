@@ -1,0 +1,13 @@
+{
+  "name": "wangp-manager",
+  "version": "0.1.13",
+  "private": true,
+  "scripts": {
+    "tauri": "tauri",
+    "build": "tauri build --no-bundle",
+    "build:installer": "tauri build --bundles nsis"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.4"
+  }
+}

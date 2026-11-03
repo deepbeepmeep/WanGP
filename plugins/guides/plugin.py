@@ -10,6 +10,7 @@ class GuidesPlugin(WAN2GPPlugin):
         self.goto_model_type = None
 
     def setup_ui(self):
+        self.request_global("app")
         self.request_component("state")
         self.request_component("main_tabs")
         self.request_component("model_choice_target")
@@ -17,7 +18,7 @@ class GuidesPlugin(WAN2GPPlugin):
         self.add_custom_js(self._script_block())
         self.add_tab(
             tab_id="info",
-            label="Guides",
+            label="Infos",
             component_constructor=self.create_guides_ui,
         )
 
@@ -80,6 +81,8 @@ class GuidesPlugin(WAN2GPPlugin):
                 gr.Markdown(finetunes)
             with gr.Tab("Plugins", id="plugins"):
                 gr.Markdown(plugins)
+            with gr.Tab("About", id="about"):
+                self.app.plugin_manager.plugins["about"].create_about_ui()
 
     def _apply_overview_selection(self, state, model_type):
         return model_type

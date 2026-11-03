@@ -511,3 +511,25 @@ class QLinearInt8ConvRot(QModuleMixin, torch.nn.Linear):
         if wrapped is not self.weight:
             self.weight = torch.nn.Parameter(wrapped, requires_grad=self.weight.requires_grad)
         return result
+
+from shared.kernels.cpu_experts import INT8_ROWS, NativeExpertFormat
+
+
+class Int8RowsExperts(NativeExpertFormat):
+    """Routed experts in INT8 with a float32 scale per row (w13 = gate then up rows, or up rows only without a gate), optionally quantized
+    after a ConvRot rotation of groups of input columns (the bank's convrot_group_size tensor)."""
+    name, native = "int8_rows", INT8_ROWS
+
+    def tensors(self, experts, hidden, intermediate, gated=True, blocks=None):
+        rows = (2 if gated else 1) * intermediate
+        return {"w13_weight": ((experts, rows, hidden), torch.int8), "w2_weight": ((experts, hidden, intermediate), torch.int8),
+                "w13_scales": ((experts, rows, 1), torch.float32), "w2_scales": ((experts, hidden, 1), torch.float32)}
+
+    def matches(self, tensors):
+        return tensors["w13_weight"].dtype == torch.int8 and tensors["w13_scales"].dtype == torch.float32
+
+    def dequantize_matrix(self, weight, scale, block):
+        return weight.float() * scale.float()
+
+
+EXPERT_FORMATS = (Int8RowsExperts(),)

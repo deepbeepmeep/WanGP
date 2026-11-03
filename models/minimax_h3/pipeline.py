@@ -13,7 +13,7 @@ import torchaudio.functional as audio_F
 from PIL import Image
 from tqdm import tqdm
 
-from mmgp import offload
+from mmgp import offload, transfer
 from shared.utils.loras_mutipliers import extract_loras_side, parse_loras_multipliers, update_loras_slists
 from shared.utils.text_encoder_cache import TextEncoderCache
 from shared.utils.phase_progress import control_video_encoding, generation_progress
@@ -46,6 +46,8 @@ SOL_ATTN_TAU_END = 0.8
 H3_TWO_PHASE_SCALE = 2.0
 H3_PHASE_2_SIGMAS = (H3_PHASE_2_NOISE_LEVEL_START_DEFAULT, 0.6316, 0.3158, 0.0)
 H3_PHASE_2_SAMPLE_SOLVER = "euler"
+# Keep phase-1 audio as frozen conditioning; True restores Regenerate's silent conditioning.
+H3_REGENERATE_SILENT_AUDIO = False
 H3_PHASE_2_TILE_COUNT = 4
 H3_PHASE_2_TILE_OVERLAP_RATIO = 0.25
 H3_PHASE_2_TILE_ALIGNMENT = 32
@@ -1104,8 +1106,6 @@ class MiniMaxH3Pipeline:
         if self.reference_mode:
             visual_ref_count = sum(ref["kind"] in ("image", "video", "video_audio") for ref in refs)
             audio_ref_count = sum(ref["kind"] in ("audio", "video_audio") for ref in refs)
-            if pika and not visual_ref_count:
-                raise ValueError("Pika H3 Flex Ref2VA requires at least one image or video reference")
             if not pika and not self.audio_only and audio_ref_count > visual_ref_count:
                 raise ValueError(f"MiniMax H3 requires at least as many image and video references as audio references (found {visual_ref_count} visual and {audio_ref_count} audio)")
             standalone_audio_count = sum(ref["kind"] == "audio" for ref in refs)
@@ -1524,7 +1524,7 @@ class MiniMaxH3Pipeline:
                 regenerate = any(value != 0 for value in (multiplier if isinstance(multiplier, list) else [multiplier]))
                 if regenerate:
                     break
-            if regenerate:
+            if regenerate and H3_REGENERATE_SILENT_AUDIO:
                 if set_progress_status is not None:
                     set_progress_status("Encoding Silent Audio for Phase 2")
                 saved_phase_1_audio = audio
@@ -1585,7 +1585,7 @@ class MiniMaxH3Pipeline:
                     phase_2_source_video = _resize_video(control_source, target_height, target_width)
                     with control_video_encoding(control_video):
                         phase_2_source_latents = _encode_video_source(self.vae, phase_2_source_video, self.device, outpainting_dims)
-                    phase_2_source_latents = phase_2_source_latents[:, :, :latent_t].to(device="cpu", dtype=phase_2_latent_canvas.dtype, non_blocking=False)
+                    phase_2_source_latents = transfer.move(phase_2_source_latents[:, :, :latent_t], "cpu", phase_2_latent_canvas.dtype)
                     if input_masks is not None:
                         phase_2_source_mask = input_masks[:, history_count:history_count + phase_2_source_video.shape[1]]
                         phase_2_editable_mask = _resize_video_mask(phase_2_source_mask, phase_2_source_latents.shape[-3:], self.vae.config.clip_length,

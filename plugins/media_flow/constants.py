@@ -12,7 +12,7 @@ ADD_USER_SETTINGS_MODEL_TYPE = "__add_user_settings__"
 ADD_USER_SETTINGS_LABEL = "<Add User Settings>"
 NO_USER_SETTINGS_VALUE = "__no_user_settings__"
 NO_USER_SETTINGS_LABEL = "<No choice>"
-USER_SETTINGS_HINT_HTML = "<div style='font-size:10px;line-height:1;opacity:.65;'>* user settings</div>"
+USER_SETTINGS_HINT_HTML = "<div class='mf-hint'>* linked user settings</div>"
 MAX_STATUS_REFRESH_HZ = 3.0
 STATUS_REFRESH_INTERVAL_SECONDS = 1.0 / MAX_STATUS_REFRESH_HZ
 SUPPORTED_OUTPUT_CONTAINERS = SUPPORTED_VIDEO_CONTAINERS

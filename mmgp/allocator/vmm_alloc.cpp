@@ -243,6 +243,7 @@ using Event = std::shared_ptr<CUevent_st>;  // recorded when memory was freed, s
 using MempoolId = std::pair<unsigned long long, unsigned long long>;  // c10::cuda::MempoolId_t
 using CaptureFilter = std::function<bool(CUstream)>;                  // true for the streams that allocate to a capture's pool
 thread_local bool warmup_paused = false;
+thread_local bool long_lived = false;
 thread_local char thread_tag;  // its address identifies the calling thread: a warmup routes the allocations of its own thread only
 
 struct Range {
@@ -382,6 +383,21 @@ struct Device {
 
 // Never destroyed: the detached unmapping thread still waits on them while the process exits (on Linux, destroying a condition variable
 // with a waiter blocks the exit), and the driver may already be shut down when static destructors would release events and memory.
+// Chunk log (debug.start_chunk_log, MMGP_VRAM_CHUNK_LOG): the history of every chunk, and a call back when a chunk gets two owners or an allocation of a
+// watched size is made. Off, each event costs one relaxed load.
+struct ChunkEvent { uint64_t seq; double time; uint64_t handle; const char* what; const void* pool; int ordinary; uint64_t a, b; const void* thread; };
+constexpr size_t chunk_log_events = 6000000;
+std::atomic<bool> chunk_log_on{false};
+std::mutex& chunk_log_lock = *new std::mutex;
+std::deque<ChunkEvent>& chunk_log = *new std::deque<ChunkEvent>;
+std::vector<size_t>& chunk_log_watched = *new std::vector<size_t>;
+uint64_t chunk_log_seq = 0;
+const char* chunk_log_violation = nullptr;
+uint64_t chunk_log_violating = 0;  // the chunk of the last violation
+void (*chunk_log_callback)(const char*, uint64_t, uint64_t) = nullptr;
+const auto chunk_log_begin = std::chrono::steady_clock::now();
+void log_chunk(uint64_t handle, const char* what, const void* pool = nullptr, int ordinary = -1, uint64_t a = 0, uint64_t b = 0);
+
 std::mutex& lock = *new std::mutex;
 size_t large_threshold = 256ull << 20, chunk_size = 32ull << 20;
 size_t mid_threshold = 4ull << 20;
@@ -605,7 +621,15 @@ void unmap_retired() {
     }
 }
 
+void log_chunk(uint64_t handle, const char* what, const void* pool, int ordinary, uint64_t a, uint64_t b) {
+    if (!chunk_log_on.load(std::memory_order_relaxed)) return;
+    std::lock_guard<std::mutex> guard(chunk_log_lock);
+    chunk_log.push_back({++chunk_log_seq, std::chrono::duration<double>(std::chrono::steady_clock::now() - chunk_log_begin).count(), handle, what, pool, ordinary, a, b, &thread_tag});
+    if (chunk_log.size() > chunk_log_events) chunk_log.pop_front();
+}
+
 void retire(Stale range) {
+    if (chunk_log_on.load(std::memory_order_relaxed)) for (auto handle : range.chunks) log_chunk((uint64_t)handle, "retire stale mapping", nullptr, -1, range.va, range.freed ? 1 : 0);
     {
         std::lock_guard<std::mutex> guard(retired_lock);
         for (auto handle : range.chunks) ++unmapping_chunks[handle];
@@ -958,6 +982,7 @@ bool take_pool_chunks(Device& d, std::vector<CUmemGenericAllocationHandle>& chun
             bool ready = !spare.freed || (known && spare.stream == ordered) || cu.EventQuery(spare.freed.get()) == CUDA_SUCCESS;
             if (!ready && !others) { ++i; continue; }
             if (!ready) stream_wait(stream, spare.freed);
+            log_chunk((uint64_t)spare.handle, "taken from spare", &pool, pool.ordinary, (uint64_t)stream, spare.freed ? 1 : 0);
             chunks.push_back(spare.handle);
             taken.push_back(spare);
             d.spare[i] = d.spare.back();
@@ -983,6 +1008,7 @@ bool take_pool_chunks(Device& d, std::vector<CUmemGenericAllocationHandle>& chun
     while (chunks.size() < need) {
         CUmemGenericAllocationHandle handle;
         if (create_chunk(d, &handle, need - chunks.size()) != CUDA_SUCCESS) break;
+        log_chunk((uint64_t)handle, "new chunk", &pool, pool.ordinary, 0, 0);
         chunks.push_back(handle);
         taken.push_back({handle, nullptr, nullptr});
         ++d.chunks_total;
@@ -1010,8 +1036,10 @@ bool take_pool_chunks(Device& d, std::vector<CUmemGenericAllocationHandle>& chun
 
 bool map_pool_chunks(Device& d, CUdeviceptr start, const std::vector<CUmemGenericAllocationHandle>& chunks) {
     size_t mapped = 0;
-    for (; mapped < chunks.size(); ++mapped)
+    for (; mapped < chunks.size(); ++mapped) {
         if (cu.MemMap(start + mapped * chunk_size, chunk_size, 0, chunks[mapped], 0) != CUDA_SUCCESS) break;
+        log_chunk((uint64_t)chunks[mapped], "mapped", nullptr, -1, start + mapped * chunk_size, 0);
+    }
     if (mapped == chunks.size() && cu.MemSetAccess(start, mapped * chunk_size, &d.access, 1) == CUDA_SUCCESS) return true;
     if (mapped) {
         {   // a lent chunk may still have a stale mapping that the thread removes (see unmapping_chunks)
@@ -1073,8 +1101,28 @@ bool ensure_eager_arena(Device& d, Pool& pool, const MempoolId& id, CUstream str
     return true;
 }
 
+void log_chunk_use(Pool& pool, CUmemGenericAllocationHandle handle, CUdeviceptr mapping, const PoolUse& use, bool acquire) {
+    auto violation = [&](const char* what, const void* owner, int ordinary, uint64_t a, uint64_t b) {
+        log_chunk((uint64_t)handle, what, owner, ordinary, a, b);
+        chunk_log_violation = what;
+        chunk_log_violating = (uint64_t)handle;
+    };
+    log_chunk((uint64_t)handle, acquire ? "acquire" : "drop", &pool, pool.ordinary, mapping, use.refs);
+    if (acquire && use.refs && use.mapping != mapping) violation("VIOLATION live at two addresses in one pool", &pool, pool.ordinary, mapping, use.mapping);
+    if (!acquire && use.refs == 0) violation("VIOLATION dropped below zero", &pool, pool.ordinary, mapping, use.mapping);
+    if (!acquire) return;
+    for (auto& device : devices) {
+        for (auto& other : device.second.pools) {
+            auto found = other.second.uses.find(handle);
+            if (&other.second != &pool && found != other.second.uses.end()) violation("VIOLATION also owned by another pool", &other.second, other.second.ordinary, found->second.refs, found->second.mapping);
+        }
+        for (auto& spare : device.second.spare) if (spare.handle == handle) violation("VIOLATION acquired while spare", &pool, pool.ordinary, mapping, 0);
+    }
+}
+
 void use_pool_chunk(Pool& pool, CUmemGenericAllocationHandle handle, CUdeviceptr mapping, bool acquire) {
     PoolUse& use = pool.uses.at(handle);
+    if (chunk_log_on.load(std::memory_order_relaxed)) log_chunk_use(pool, handle, mapping, use, acquire);
     if (acquire) {
         if (use.refs++ == 0) {
             use.mapping = mapping;
@@ -1265,7 +1313,11 @@ void release_pool_memory(Device& d, std::map<MempoolId, Pool>::iterator pool) { 
         cu.MemUnmap(range.first, range.second.size);
         cu.MemAddressFree(range.first, range.second.size);
     }
-    for (auto handle : pool->second.chunks) cu.MemRelease(handle);
+    log_chunk(0, "pool destroyed", &pool->second, pool->second.ordinary, pool->first.first, pool->first.second);
+    for (auto handle : pool->second.chunks) {
+        log_chunk((uint64_t)handle, "released to the driver", &pool->second, pool->second.ordinary, 0, 0);
+        cu.MemRelease(handle);
+    }
     size_t hosted = pool->second.host_chunks.size();
     if (pool->second.ordinary) d.chunks_total -= static_cast<int64_t>(pool->second.chunks.size());
     else d.pools_bytes -= static_cast<int64_t>((pool->second.chunks.size() - hosted) * chunk_size);
@@ -1603,6 +1655,7 @@ void evict_eager_free(Device& d, Pool& pool, bool release, CUstream owner = null
         }
     }
     for (auto handle : pool.available_chunks) {
+        log_chunk((uint64_t)handle, release ? "evicted and released" : freed ? "lent to spare (stream busy)" : "evicted to spare", &pool, pool.ordinary, (uint64_t)owner, 0);
         if (release) cu.MemRelease(handle);
         else d.spare.push_back({handle, freed, owner});
         pool.uses.erase(handle);
@@ -1742,6 +1795,7 @@ void* planned_graph_allocation(Device& d, const MempoolId& id, size_t size, CUst
 
 EXPORT void* vmm_alloc(size_t size, int device, CUstream stream) {
     if (size == 0) return nullptr;
+    if (long_lived) stream = nullptr;
     size_t threshold = debug_threshold.load(std::memory_order_relaxed);
     int64_t origin = -1;
     if (threshold && size >= threshold && !in_debug_origin) {  // debug mode: asked to Python before taking the lock, as it takes the GIL
@@ -1798,6 +1852,16 @@ EXPORT void* vmm_alloc(size_t size, int device, CUstream stream) {
     }
     count(d, static_cast<int64_t>(size));
     if (threshold) debug_allocated(d, ptr, size, origin, kind, threshold);
+    if (chunk_log_on.load(std::memory_order_relaxed)) {
+        log_chunk(0, to_pool ? "alloc in graph pool" : "alloc ordinary", nullptr, -1, reinterpret_cast<uint64_t>(ptr), size);
+        const char* reason = chunk_log_violation;
+        if (!reason && std::find(chunk_log_watched.begin(), chunk_log_watched.end(), size) != chunk_log_watched.end()) reason = to_pool ? "watched size in a graph pool" : "watched size";
+        chunk_log_violation = nullptr;
+        if (reason) {
+            guard.unlock();
+            chunk_log_callback(reason, reinterpret_cast<uint64_t>(ptr), size);
+        }
+    }
     return ptr;
 }
 
@@ -1807,6 +1871,7 @@ EXPORT void vmm_free(void* ptr, size_t size, int device, CUstream stream) {
     Device& d = devices.at(device);
     bind_context(d);
     CUdeviceptr dptr = reinterpret_cast<CUdeviceptr>(ptr);
+    log_chunk(0, "free", nullptr, -1, dptr, size);
     RelaxedCapture relaxed(any_capture());
     if (debug_threshold.load(std::memory_order_relaxed)) debug_freed(d, dptr);
     count(d, -static_cast<int64_t>(size));
@@ -1928,6 +1993,7 @@ void use_lifetime(Device& d, GraphLifetime& lifetime, bool acquire) {
         }
     }
     Pool& pool = d.pools.at(lifetime.pool);
+    log_chunk(0, acquire ? "lifetime acquire" : "lifetime release", &pool, pool.ordinary, lifetime.ptr, lifetime.bytes);
     auto large = pool.large_ranges.find(lifetime.ptr);
     if (large != pool.large_ranges.end()) {
         for (size_t i = 0; i < large->second.chunks.size(); ++i)
@@ -2115,6 +2181,7 @@ EXPORT unsigned long long vmm_begin_warmup(int device, unsigned long long first,
     std::lock_guard<std::mutex> guard(lock);
     Device& d = device_state(device);
     ++d.pools[{first, second}].use_count;
+    log_chunk(0, "warmup begin", &d.pools[{first, second}], 0, first, second);
     // the allocations of this thread on this stream: the default stream has the same handle in every thread
     const void* thread = &thread_tag;
     d.captures.push_back({{first, second}, [stream, thread](CUstream current) { return !warmup_paused && current == stream && &thread_tag == thread; },
@@ -2128,6 +2195,7 @@ EXPORT void vmm_end_warmup(int device, unsigned long long first, unsigned long l
     // With the warmup go the entries its thread began after it: the captures run inside it have ended, and an entry left is that of a capture
     // whose end failed (PyTorch's capture_end raises before ending its allocation to the pool when the capture was invalidated). Left in
     // place, it would keep the device in capture mode: no memory pressure callback, recovery nor pool release until the process exits.
+    log_chunk(0, "warmup end", nullptr, -1, first, second);
     auto warmup = std::find_if(d.captures.begin(), d.captures.end(), [token](const Capture& capture) { return capture.warmup == token; });
     const void* thread = warmup->thread;
     for (size_t i = d.captures.size(), start = warmup - d.captures.begin(); i-- > start;)
@@ -2140,6 +2208,12 @@ EXPORT void vmm_end_warmup(int device, unsigned long long first, unsigned long l
     }
 }
 
+EXPORT int vmm_long_lived(int on) {  // this thread's next allocations stay, among the default stream's memory (long_lived_allocations)
+    int previous = long_lived;
+    long_lived = on != 0;
+    return previous;
+}
+
 EXPORT int vmm_pause_warmup(int paused) {
     int previous = warmup_paused;
     warmup_paused = paused != 0;
@@ -2148,6 +2222,7 @@ EXPORT int vmm_pause_warmup(int paused) {
 
 EXPORT void vmm_release_pool(int device, MempoolId id) {
     std::lock_guard<std::mutex> guard(lock);
+    log_chunk(0, "pool release asked", nullptr, -1, id.first, id.second);
     Device& d = device_state(device);
     auto pool = d.pools.find(id);
     if (pool == d.pools.end()) return;
@@ -2155,6 +2230,15 @@ EXPORT void vmm_release_pool(int device, MempoolId id) {
         RelaxedCapture relaxed(any_capture());
         release_pool_memory(d, pool);
     }
+}
+
+EXPORT int64_t vmm_graph_pools(int device) {  // graph pools in use: every CUDA graph, warmup and allocation of theirs holds one
+    std::lock_guard<std::mutex> guard(lock);
+    auto found = devices.find(device);
+    if (found == devices.end()) return 0;
+    int64_t count = 0;
+    for (auto& entry : found->second.pools) count += !entry.second.ordinary && (entry.second.use_count > 0 || entry.second.live > 0);
+    return count;
 }
 
 EXPORT int64_t vmm_pool_live(int device, unsigned long long first, unsigned long long second) {  // allocations alive in a graph pool
@@ -2179,6 +2263,120 @@ EXPORT void vmm_configure(size_t large, size_t chunk, int spill_modes) {  // spi
     chunk_size = chunk;
     spill = (spill_modes & 1) != 0;
     driver_spill = (spill_modes & 2) != 0;
+}
+
+// Whether a live allocation has a chunk that another live allocation uses at another address: the allocation had lent it (an output plan, a
+// lifetime view) and took it back while memory allocated meanwhile stays on it. use_pool_chunk keeps the mapping of the chunk's first user.
+EXPORT int vmm_storage_shared(void* ptr, int device) {
+    std::lock_guard<std::mutex> guard(lock);
+    auto found = devices.find(device);
+    if (found == devices.end()) return 0;
+    CUdeviceptr dptr = reinterpret_cast<CUdeviceptr>(ptr);
+    auto owner = found->second.pool_of.find(dptr);
+    if (owner == found->second.pool_of.end()) return 0;
+    Pool& pool = found->second.pools.at(owner->second);
+    auto large = pool.large_ranges.find(dptr);
+    if (large != pool.large_ranges.end()) {
+        for (size_t i = 0; i < large->second.chunks.size(); ++i)
+            if (pool.uses.at(large->second.chunks[i]).mapping != dptr + i * chunk_size) return 1;
+        return 0;
+    }
+    const PoolBlock& block = pool.blocks.at(dptr);
+    const PoolArena& arena = pool.arenas[block.small ? 0 : 1];
+    size_t first = (dptr - arena.va) / chunk_size, last = (dptr + block.size - 1 - arena.va) / chunk_size;
+    for (size_t i = first; i <= last; ++i)
+        if (arena.chunks[i] && pool.uses.at(arena.chunks[i]).mapping != arena.va + i * chunk_size) return 1;
+    return 0;
+}
+
+EXPORT void vmm_chunk_log_start(void (*callback)(const char*, uint64_t, uint64_t), const size_t* watched, int count) {
+    std::lock_guard<std::mutex> guard(lock);
+    chunk_log_callback = callback;
+    chunk_log_watched.assign(watched, watched + count);
+    chunk_log_on.store(true);
+}
+
+// Every pool of a device: what it holds, and the sizes of its live blocks.
+EXPORT void vmm_chunk_log_pools(int device, const char* path, const char* label) {
+    std::lock_guard<std::mutex> guard(lock);
+    FILE* out = fopen(path, "a");
+    if (!out) return;
+    Device& d = devices.at(device);
+    fprintf(out, "\n=== %s: allocated %lld, chunks %lld, spare %zu, small cached %lld\n", label, (long long)d.allocated, (long long)d.chunks_total, d.spare.size(), (long long)d.small_cached);
+    for (auto& entry : d.pools) {
+        Pool& pool = entry.second;
+        fprintf(out, "pool (%llx, %llx) ordinary %d use_count %d live %zu chunks %zu available %zu; live blocks:", (unsigned long long)entry.first.first, (unsigned long long)entry.first.second, pool.ordinary, pool.use_count, pool.live, pool.chunks.size(), pool.available_chunks.size());
+        for (auto& block : pool.blocks) if (!block.second.free) fprintf(out, " %zu", block.second.size);
+        fprintf(out, "\n");
+    }
+    fclose(out);
+}
+
+// The chunk behind an address, or of the last violation: its owners and mappings now, its whole history, every violation and the end of the log.
+EXPORT void vmm_chunk_log_report(void* pointer, int device, const char* path) {
+    std::lock_guard<std::mutex> guard(lock);
+    std::lock_guard<std::mutex> events(chunk_log_lock);
+    FILE* out = fopen(path, "a");
+    if (!out) return;
+    Device& d = devices.at(device);
+    CUdeviceptr ptr = reinterpret_cast<CUdeviceptr>(pointer);
+    uint64_t handle = pointer ? 0 : chunk_log_violating;
+    auto print_event = [&](const ChunkEvent& event) {
+        fprintf(out, "%llu %.4f %llx %s pool=%p ord=%d a=%llx b=%llx thread=%p\n", (unsigned long long)event.seq, event.time, (unsigned long long)event.handle, event.what, event.pool, event.ordinary, (unsigned long long)event.a, (unsigned long long)event.b, event.thread);
+    };
+    fprintf(out, "\n=== report for address %llx, chunk size %zu, log %zu events\n", (unsigned long long)ptr, chunk_size, chunk_log.size());
+    for (auto& entry : d.pools) {
+        Pool& pool = entry.second;
+        for (auto& range : pool.large_ranges) {
+            if (range.first <= ptr && ptr < range.first + range.second.size) {
+                handle = (uint64_t)range.second.chunks[(ptr - range.first) / chunk_size];
+                auto block = pool.blocks.find(range.first);
+                fprintf(out, "address is in a large range %llx size %zu chunk index %zu of pool %p (%llx, %llx) ordinary %d, block free %d\n", (unsigned long long)range.first, range.second.size, (size_t)((ptr - range.first) / chunk_size), (void*)&pool,
+                        (unsigned long long)entry.first.first, (unsigned long long)entry.first.second, pool.ordinary, block == pool.blocks.end() ? -1 : (int)block->second.free);
+            }
+        }
+        for (int a = 0; a < 2; ++a) {
+            PoolArena& arena = pool.arenas[a];
+            if (arena.va && arena.va <= ptr && ptr < arena.va + arena.size) {
+                handle = (uint64_t)arena.chunks[(ptr - arena.va) / chunk_size];
+                fprintf(out, "address is in arena %d of pool %p (%llx, %llx) ordinary %d slot %zu\n", a, (void*)&pool, (unsigned long long)entry.first.first, (unsigned long long)entry.first.second, pool.ordinary, (size_t)((ptr - arena.va) / chunk_size));
+            }
+        }
+    }
+    fprintf(out, "chunk %llx\n", (unsigned long long)handle);
+    for (auto& entry : d.pools) {
+        Pool& pool = entry.second;
+        auto use = pool.uses.find((CUmemGenericAllocationHandle)handle);
+        fprintf(out, "pool %p (%llx, %llx) ordinary %d use_count %d live %zu chunks %zu available %zu", (void*)&pool, (unsigned long long)entry.first.first, (unsigned long long)entry.first.second, pool.ordinary, pool.use_count, pool.live, pool.chunks.size(), pool.available_chunks.size());
+        if (use != pool.uses.end()) fprintf(out, " OWNS IT: refs %zu mapping %llx available %d", use->second.refs, (unsigned long long)use->second.mapping, (int)pool.available_chunks.count((CUmemGenericAllocationHandle)handle));
+        fprintf(out, "\n");
+        for (auto& range : pool.large_ranges) {
+            for (size_t i = 0; i < range.second.chunks.size(); ++i) {
+                if ((uint64_t)range.second.chunks[i] != handle) continue;
+                auto block = pool.blocks.find(range.first);
+                fprintf(out, "   mapped in large range %llx size %zu index %zu block free %d\n", (unsigned long long)range.first, range.second.size, i, block == pool.blocks.end() ? -1 : (int)block->second.free);
+            }
+        }
+        for (int a = 0; a < 2; ++a) {
+            PoolArena& arena = pool.arenas[a];
+            for (size_t i = 0; i < arena.chunks.size(); ++i) {
+                if ((uint64_t)arena.chunks[i] != handle) continue;
+                CUdeviceptr low = arena.va + i * chunk_size, high = low + chunk_size;
+                fprintf(out, "   mapped in arena %d slot %zu va %llx; live blocks there:", a, i, (unsigned long long)low);
+                for (auto& block : pool.blocks)
+                    if (!block.second.free && block.second.segment == arena.va && block.first < high && block.first + block.second.size > low) fprintf(out, " [%llx size %zu]", (unsigned long long)block.first, block.second.size);
+                fprintf(out, "\n");
+            }
+        }
+    }
+    for (auto& spare : d.spare) if ((uint64_t)spare.handle == handle) fprintf(out, "chunk is in the spare list\n");
+    fprintf(out, "--- history of this chunk (seq, time, chunk, what, pool, ordinary, a, b, thread)\n");
+    for (auto& event : chunk_log) if (event.handle == handle) print_event(event);
+    fprintf(out, "--- every violation\n");
+    for (auto& event : chunk_log) if (strncmp(event.what, "VIOLATION", 9) == 0) print_event(event);
+    fprintf(out, "--- the last 2500 events of the log\n");
+    for (size_t i = chunk_log.size() > 2500 ? chunk_log.size() - 2500 : 0; i < chunk_log.size(); ++i) print_event(chunk_log[i]);
+    fclose(out);
 }
 
 EXPORT void vmm_set_vram_limit(int64_t bytes) {  // the VRAM this process may reserve on each device, 0 for no limit but the GPU's

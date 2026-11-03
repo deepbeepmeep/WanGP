@@ -9,6 +9,7 @@ import hashlib
 import types
 from collections import deque
 import numpy as np
+from mmgp import transfer
 
 CACHE_T = 2
 FLASHVSR_LQ_PROJ_SPATIAL_TILING = True
@@ -286,7 +287,7 @@ class CausalConv3d(nn.Conv3d):
             cache_t = cache_x.shape[2]
             old_x = x
             x = old_x.new_empty(*old_x.shape[:2], cache_t + old_x.shape[2], *old_x.shape[3:])
-            x[:, :, :cache_t, :, :].copy_(cache_x, non_blocking=True)
+            transfer.copy_(x[:, :, :cache_t, :, :], cache_x, non_blocking=True)  # (a cache in RAM: without a GPU copy of it)
             x[:, :, cache_t:, :, :].copy_(old_x)
             del cache_x, old_x
             padding[4] -= cache_t
@@ -517,22 +518,20 @@ class Causal_LQ4x_Proj(nn.Module):
                     del first_frame
                 x_tile = self.pixel_shuffle(video_tile)
                 del video_tile
-                tail1 = x_tile[:, :, -min(CACHE_T, x_tile.shape[2]):, y0 - in_y0:y1 - in_y0, x0 - in_x0:x1 - in_x0].detach().to("cpu")
+                tail = min(CACHE_T, x_tile.shape[2])
                 if cache1_x is None:
-                    cache1_x = torch.empty((x_tile.shape[0], x_tile.shape[1], tail1.shape[2], height, width), dtype=tail1.dtype, device="cpu")
-                cache1_x[:, :, :, y0:y1, x0:x1].copy_(tail1)
-                del tail1
+                    cache1_x = torch.empty((x_tile.shape[0], x_tile.shape[1], tail, height, width), dtype=x_tile.dtype, device="cpu")
+                transfer.copy_(cache1_x[:, :, :, y0:y1, x0:x1], x_tile[:, :, -tail:, y0 - in_y0:y1 - in_y0, x0 - in_x0:x1 - in_x0].detach())
                 cache1_tile = None if old_cache1 is None else old_cache1[:, :, :, in_y0:in_y1, in_x0:in_x1]
                 x_list = [x_tile]
                 del x_tile
                 tile = self.conv1(x_list, cache1_tile)
                 tile = self.norm1(tile)
                 tile = self.act1(tile)
-                tail = tile[:, :, -min(CACHE_T, tile.shape[2]):, y0 - in_y0:y1 - in_y0, x0 - in_x0:x1 - in_x0].detach().to("cpu")
+                tail = min(CACHE_T, tile.shape[2])
                 if cache2_x is None:
-                    cache2_x = torch.empty((tile.shape[0], tile.shape[1], tail.shape[2], height, width), dtype=tail.dtype, device="cpu")
-                cache2_x[:, :, :, y0:y1, x0:x1].copy_(tail)
-                del tail
+                    cache2_x = torch.empty((tile.shape[0], tile.shape[1], tail, height, width), dtype=tile.dtype, device="cpu")
+                transfer.copy_(cache2_x[:, :, :, y0:y1, x0:x1], tile[:, :, -tail:, y0 - in_y0:y1 - in_y0, x0 - in_x0:x1 - in_x0].detach())
                 if not need_output:
                     del tile
                     continue

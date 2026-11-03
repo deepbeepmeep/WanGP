@@ -80,17 +80,16 @@ class Gallery:
         source_id = "audio" if any_audio else source_for_kind(detected_type).id
         file_list, file_settings_list = self._resolve_lists(source_id)
         normalized_path = os.path.normcase(path)
-        for index, existing_path in enumerate(file_list):
-            if os.path.normcase(str(existing_path or "")) != normalized_path:
-                continue
-            self._select_index(index, source_id)
-            record = self._register(path, file_settings_list[index] if index < len(file_settings_list) else configs)
-            return {"record": record, "added": False}
+        # Like the WebUI import, media already in the gallery move to its end with their settings.
+        existing = next((index for index, existing_path in enumerate(file_list) if os.path.normcase(str(existing_path or "")) == normalized_path), None)
+        if existing is not None:
+            file_list.pop(existing)
+            configs = file_settings_list.pop(existing)
         file_list.append(path)
         file_settings_list.append(configs if isinstance(configs, dict) else None)
         self._select_index(len(file_list) - 1, source_id)
         record = self._register(path, configs)
-        return {"record": record, "added": True}
+        return {"record": record, "added": existing is None}
 
     def counts(self) -> dict[str, int]:
         gen = self._gen()

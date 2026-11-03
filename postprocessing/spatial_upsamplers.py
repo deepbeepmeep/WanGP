@@ -695,6 +695,23 @@ def normalize_upsampling_value(value) -> str:
     return normalized or text
 
 
+def method_preference_changes(old_config, new_config):
+    """Remap live selections only when the user changes the configured model. Saved settings keep their explicit method."""
+    replacements = {}
+    for handler in upsampler_handlers(UPSAMPLER_TYPE_POSTPROCESSING):
+        if not hasattr(handler, "preferred_method") or read_config_section(old_config, handler).get("model") == read_config_section(new_config, handler).get("model"):
+            continue
+        for _, method in _handler_def(handler).get("methods", []):
+            if not handler.method_visible(method):
+                replacements[method] = handler.preferred_method(method)
+    return replacements
+
+
+def apply_method_preference(value, replacements):
+    split = split_upsampling_value(value) if replacements else None
+    return build_upsampling_value(replacements[split[0]], split[1]) if split and split[0] in replacements else value
+
+
 def format_upsampling_label(value) -> str:
     text = str(value or "").strip()
     if not text:

@@ -11,6 +11,7 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP, Qwen3RMSNorm, Qwe
 
 from ..layers import attention as shared_attention
 from shared.utils.cancellation import check_cancelled
+from mmgp import transfer
 
 
 def rotate(x, cos, sin):
@@ -289,14 +290,14 @@ class BlockDraft(nn.Module):
         # CPU copies are blocking; snapshots survive vision lending and teardown.
         if self._keys is None:  # no cache: an empty state
             return None
-        return {"seq_length": self._length, "keys": self._keys[:, :, :self._length].to("cpu", copy=True), "values": self._values[:, :, :self._length].to("cpu", copy=True), "positions": self._positions[:self._length].to("cpu", copy=True)}
+        return {"seq_length": self._length, "keys": transfer.move(self._keys[:, :, :self._length], "cpu"), "values": transfer.move(self._values[:, :, :self._length], "cpu"), "positions": self._positions[:self._length].to("cpu", copy=True)}
 
     def restore_sequence_state(self, snapshot):
         if snapshot is None:
             self.reset_sequence_state()
             return
         self._length = snapshot["seq_length"]
-        self._keys[:, :, :self._length].copy_(snapshot["keys"])
-        self._values[:, :, :self._length].copy_(snapshot["values"])
+        transfer.copy_(self._keys[:, :, :self._length], snapshot["keys"])
+        transfer.copy_(self._values[:, :, :self._length], snapshot["values"])
         self._positions[:self._length].copy_(snapshot["positions"])
         self._cache_lengths.fill_(self._length)

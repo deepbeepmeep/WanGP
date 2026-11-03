@@ -12,7 +12,7 @@ Models paint the picture; Python places exact text and measured layouts over it.
 ```python
 # Poster title over the key art
 from PIL import Image, ImageDraw, ImageFilter
-img = Image.open(wangp.path("image_2")).convert("RGB")
+img = Image.open(wangp.path("visual:IMAGE")).convert("RGB")
 W, H = img.size
 title = "BLUE HOUR JAZZ"
 font = wangp.font(int(H * 0.11), "display", bold=True)

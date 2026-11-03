@@ -343,12 +343,18 @@ def _message_has_renderable_output(record: dict[str, Any]) -> bool:
     return str(record.get("role", "")).strip() != "assistant" or bool(_ensure_message_blocks(record)) or bool(record.get("attachments"))
 
 
-def pending_upload_count(session) -> int:
-    return sum(bool(item.get('chat_upload')) for item in session.pending_chat_media)
+def _chat_upload_attachments(media: list[dict[str, Any]]) -> list[tuple[str, dict[str, Any]]]:
+    # Uploads saved before they kept their path, or whose file is gone, have no card.
+    return [(item['media_id'], attachment) for item in media if item.get('chat_upload') and (attachment := _attachment_from_path(item.get('path', ''), item['title']))]
+
+
+def pending_uploads(session) -> list[dict[str, str]]:
+    """Composer previews of the chat uploads waiting for the next message."""
+    return [{'id': media_id, 'html': _render_pending_upload(media_id, attachment)} for media_id, attachment in _chat_upload_attachments(session.pending_chat_media)]
 
 
 def build_pending_upload_event(session) -> str:
-    return _event_payload({'type': 'pending_uploads', 'pending_upload_count': pending_upload_count(session)}, session, _touch_chat(session))
+    return _event_payload({'type': 'pending_uploads', 'pending_uploads': pending_uploads(session)}, session, _touch_chat(session))
 
 
 def build_sync_event(session, status: dict[str, Any] | None | object = _UNSET, stats: dict[str, Any] | None = None, acknowledged_submission_ids: list[str] | tuple[str, ...] | None = None) -> str:
@@ -361,7 +367,7 @@ def build_sync_event(session, status: dict[str, Any] | None | object = _UNSET, s
         messages = [_render_message_payload(record) for record in list(session.chat_transcript) if _message_has_renderable_output(record)]
         if revision == int(session.chat_revision or 0):
             break
-    event = {"type": "sync", "messages": messages, "status": status, "pending_upload_count": pending_upload_count(session)}
+    event = {"type": "sync", "messages": messages, "status": status, "pending_uploads": pending_uploads(session)}
     if stats is None:
         stored_stats = getattr(session, "remote_usage_stats", None)
         if isinstance(stored_stats, dict):
@@ -411,7 +417,8 @@ def add_user_message(session, text: str, queued: bool = False, client_submission
             if media:
                 record["runtime_media"] = media
         elif session.pending_chat_media:
-            record["runtime_media"] = [{key: value for key, value in item.items() if key != 'chat_upload'} for item in session.pending_chat_media]
+            record["runtime_media"] = [{key: value for key, value in item.items() if key not in ('chat_upload', 'path')} for item in session.pending_chat_media]
+            record["attachments"] = [attachment for _media_id, attachment in _chat_upload_attachments(session.pending_chat_media)]
             session.pending_chat_media = []
         session.chat_transcript.append(record)
     revision = _touch_chat(session)
@@ -736,7 +743,7 @@ def _message_index(session, record: dict[str, Any]) -> int:
 def _message_upsert_event(session, record: dict[str, Any], revision: int) -> str:
     event = {"type": "upsert_message", "message": _render_message_payload(record), "message_index": _message_index(session, record)}
     if record['role'] == 'user':
-        event['pending_upload_count'] = pending_upload_count(session)
+        event['pending_uploads'] = pending_uploads(session)
     return _event_payload(event, session, revision)
 
 
@@ -1051,7 +1058,7 @@ def build_tool_call_label(
         return _finish_tool_call_label(f"Create{details} {color or 'Color'} Frame")
     if normalized_name == "inspect_video":
         source = _short_tool_label_value(arguments.get("media_id"))
-        start_time, end_time = arguments.get("start_time_seconds"), arguments.get("end_time_seconds")
+        start_time, end_time = arguments.get("start_s", arguments.get("start_time_seconds")), arguments.get("end_s", arguments.get("end_time_seconds"))  # labels see the raw call: former names too
         try:
             range_label = f" from {float(start_time):g}s to {float(end_time):g}s"
         except (TypeError, ValueError):
@@ -1074,7 +1081,7 @@ def build_tool_call_label(
             extension = os.path.splitext(source_basename)[1].casefold()
             if extension in _IMAGE_EXTENSIONS:
                 images += 1
-            elif extension in _VIDEO_EXTENSIONS or isinstance(item, dict) and any(item.get(key) is not None for key in ("frame_no", "time_seconds")):
+            elif extension in _VIDEO_EXTENSIONS or isinstance(item, dict) and any(item.get(key) is not None for key in ("frame_no", "time_s", "time_seconds")):
                 frames += 1
                 if extension in _VIDEO_EXTENSIONS:
                     video_names.append(source_name)
@@ -1765,7 +1772,7 @@ def _bundled_thumbnail_url(thumbnail_path: str) -> str:
     return register_file_download(path)["url"]
 
 
-def _attachment_icon(kind: str) -> str:
+def _attachment_icon(kind: str, hidden: bool = False) -> str:
     icons = {
         "archive": "<rect x='4' y='6' width='40' height='10' rx='2'></rect><path d='M8 16v22a4 4 0 0 0 4 4h24a4 4 0 0 0 4-4V16'></path><path d='M19 25h10'></path>",
         "audio": "<path d='M18 36V13l19-4v23'></path><path d='M18 19l19-4'></path><ellipse cx='13' cy='37' rx='5' ry='4'></ellipse><ellipse cx='32' cy='33' rx='5' ry='4'></ellipse>",
@@ -1779,7 +1786,7 @@ def _attachment_icon(kind: str) -> str:
         "file": "<path d='M13 5h15l7 7v31H13z'></path><path d='M28 5v8h7M19 23h10M19 29h10M19 35h7'></path>",
     }
     icon_kind = kind if kind in icons else "file"
-    return f"<div class='chat__attachment-thumb chat__attachment-thumb--icon chat__attachment-thumb--{icon_kind}' data-attachment-icon='{icon_kind}'><svg viewBox='0 0 48 48' aria-hidden='true' focusable='false'>{icons[icon_kind]}</svg></div>"
+    return f"<div class='chat__attachment-thumb chat__attachment-thumb--icon chat__attachment-thumb--{icon_kind}' data-attachment-icon='{icon_kind}'{' hidden' if hidden else ''}><svg viewBox='0 0 48 48' aria-hidden='true' focusable='false'>{icons[icon_kind]}</svg></div>"
 
 
 def _render_copy_button(source: str, label: str, text: str | None = None) -> str:
@@ -1852,7 +1859,9 @@ def _render_message_payload(record: dict[str, Any]) -> dict[str, Any]:
         ]
     )
     copy_text = "\n\n".join(str(block.get("text", "")).strip() for block in _ensure_message_blocks(record) if isinstance(block, dict) and block.get("type") == "markdown" and len(str(block.get("text", "")).strip()) > 0)
-    return _compose_message_payload(record, f"{blocks_html}{attachments_html}", copy_text)
+    # A request shows its uploads above its text, as messaging apps do.
+    body_html = f"{attachments_html}{blocks_html}" if record.get("role") == "user" else f"{blocks_html}{attachments_html}"
+    return _compose_message_payload(record, body_html, copy_text)
 
 
 def _render_message_blocks(record: dict[str, Any]) -> tuple[str, set[str]]:
@@ -2152,8 +2161,8 @@ def _render_attachments(attachments: list[dict[str, Any]]) -> str:
         format_attribute = f" data-media-format='{html.escape(media_format[1:])}'" if kind == '3d' else ''
         thumb_url = str(attachment.get("thumb_url", "")).strip()
         subtitle_html = f"<span class='chat__attachment-subtitle'>{subtitle}</span>" if len(subtitle) > 0 else ""
-        thumb_html = (
-            f"<img class='chat__attachment-thumb' loading='lazy' src='{html.escape(thumb_url)}' alt='{label}'>"
+        thumb_html = (  # the typed icon waits beside a preview, which chat.js swaps for it when the preview cannot be made (an unreadable video)
+            f"<img class='chat__attachment-thumb' loading='lazy' src='{html.escape(thumb_url)}' alt='{label}'>{_attachment_icon(kind.strip().lower(), hidden=True)}"
             if len(thumb_url) > 0
             else _attachment_icon(kind.strip().lower())
         )
@@ -2170,3 +2179,16 @@ def _render_attachments(attachments: list[dict[str, Any]]) -> str:
     if len(cards) == 0:
         return ""
     return f"<div class='chat__attachments'>{''.join(cards)}</div>"
+
+
+def _render_pending_upload(media_id: str, attachment: dict[str, Any]) -> str:
+    label = html.escape(attachment["label"])
+    kind = html.escape(attachment["kind"])
+    thumb_url = attachment["thumb_url"]
+    thumb_html = f"<img class='chat__attachment-thumb' src='{html.escape(thumb_url)}' alt=''>{_attachment_icon(attachment['kind'], hidden=True)}" if thumb_url else _attachment_icon(attachment["kind"])
+    return (
+        f"<span class='chat__pending-upload' title='{label}'>"
+        f"<a class='chat__pending-upload-link' data-media-kind='{kind}' href='{html.escape(attachment['href'])}' target='_blank' rel='noopener'>{thumb_html}<span class='chat__attachment-title' hidden>{label}</span></a>"
+        f"<button type='button' data-unattach='{html.escape(media_id)}' aria-label='Remove {label}'>×</button>"
+        "</span>"
+    )

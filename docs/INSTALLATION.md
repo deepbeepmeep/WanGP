@@ -1,6 +1,18 @@
 # Manual Installation Guide For Windows & Linux
 
-This guide covers manual installation for different GPU generations and operating systems. Alternatively you may use the 1 click install / update scripts (please check the repo readme for instructions).
+This guide covers manual installation for different GPU generations and operating systems. The [README's four guided installation methods](../README.md#-quick-start) also cover the Bat/SH scripts, Pinokio, Wan2GP Desktop and **WanGP Manager (Experimental, Windows x64)**.
+
+WanGP Manager guides installation, installs Python and dependencies, launches WanGP in an app window or browser, and manages updates and rollback. **Download:** [WanGPManager.exe](https://github.com/deepbeepmeep/WanGP/releases/latest/download/WanGPManager.exe). This permanent link downloads the latest Manager release. See the [Manager instructions](../README.md#wangp-manager-experimental-windows).
+
+For an existing installation, choose **Install / Add → Use existing installation** at the top of the page. Browse to the WanGP folder: Manager detects its saved environment and local `env_uv`, `venv`, `.venv` or `env` folders. A single compatible environment is selected automatically. Under **Choose another Conda environment or Python**, you can pick a discovered Conda environment or browse to Python. Discovery and registration leave packages unchanged.
+
+Choose **Update WanGP → Prepare latest update**, review the result and confirm **Update WanGP**. Manager checks the current Python environment against the selected version, optional kernels and installed plugins. Automatic updates keep compatible packages, including on the first update of an existing installation. When packages need to change, Manager validates a separate Conda clone or a new virtual environment before switching. **Choose another version or change dependencies** lets you select an older build.
+
+Under **Saved versions and rollback**, use **Preview restore** to return to a saved source and environment pair. Use **Remove** to discard a rollback version. Manager reclaims an environment it created after its last reference is removed. It preserves imported environments and environments used by another saved version, the active installation or another registered installation.
+
+Existing-installation updates require Git and a WanGP Git checkout with no pending tracked source edits; Conda installations also require Conda. Stop WanGP and save or stash those edits first. Allow disk space for another environment; retained environments are kept for rollback. Launch through Manager or WanGP's installation scripts to use the selected environment: activating the original Conda environment by its old name still selects the unchanged original. Manager keeps the chosen source revision separate from your Git branches. Installations without a Git checkout or virtual environment can be launched, but cannot be updated through this workflow.
+
+To update **Manager itself**, use **Preferences → Check for Manager updates**, download the latest installer, close Manager and run it. The installer defaults to **Update in place** when upgrading and preserves your installation list and preferences; uninstalling first is unnecessary. The permanent download URL stays the same across releases.
 
 It is recommended to use Python 3.10.9, PyTorch 2.7.1 with Cuda 12.8 for GTX 10XX and Python 3.11.14, PyTorch 2.10 with Cuda 13.0/13.1 for RTX 20XX - RTX 50XX. RTX 20XX requires Triton 3.2.
 

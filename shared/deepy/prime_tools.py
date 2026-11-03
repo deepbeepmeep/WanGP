@@ -512,7 +512,7 @@ class DeepyPrimeTools:
                         reported = time.monotonic()
                         text = str(live.get("status") or live.get("phase") or "Running")[:120]
                         self._update_tool_progress("running", text, {"status": "running", "job_id": job_id, "progress": {"done": round(float(live["progress"]), 1), "total": 100, "text": text}})
-                    if snapshot.get("webui_submission_ready") and not queue_triggered:
+                    if snapshot.get("webui_submission_ready") and not queue_triggered and not (cancel_requested or job.cancel_requested or self._is_interrupted()):  # a stopped job never reaches the queue
                         self.send_cmd("load_queue_trigger", {"job_id": job_id, "token": snapshot.get("webui_load_queue_token", "")})
                         queue_triggered = True
                         self._update_tool_progress("running", "Running", {"status": "running", "job_id": job_id})
@@ -565,7 +565,7 @@ class DeepyPrimeTools:
             f"Use properties defined in template settings files: {bool(settings['use_template_properties'])}.",
         ]
         if settings["use_template_properties"]:  # named as settings: "width" and "height" are not setting names
-            lines.append("When using a Deepy template, retain its resolution, video_length, duration_seconds and seed unless the user asks for an override.")
+            lines.append("When using a Deepy template, retain its resolution, video_length, duration_seconds and seed unless the user or the task states otherwise (a production brief's format, for instance).")
         else:
             lines.extend([
                 f"Default resolution: \"{int(settings['width'])}x{int(settings['height'])}\".",
@@ -574,6 +574,7 @@ class DeepyPrimeTools:
                 f"Default seed: {int(settings['seed'])}.",
             ])
             lines.append("Override compatible template/model defaults with the resolution, video_length, duration_seconds and seed above when the user does not specify them.")
+        lines.append("A supplied speech or song that must be heard whole sets video_length instead: its duration in seconds, such as \"10.2s\", which WanGP fits to the model's frame steps.")
         lines.append("The generate tool fills omitted dimensions, duration, and seed from Deepy's standing defaults before model factory defaults; pass the template values explicitly to preserve them.")
         return "\n".join(lines)
 
@@ -698,6 +699,8 @@ class DeepyPrimeTools:
             from shared.mcp.plugin_toolbox import transcript_label
 
             return transcript_label(arguments, humanize)
+        if tool_name == "wangp_validate" and isinstance(arguments.get("settings"), list) and len(arguments["settings"]) > 1:
+            return f"Validate {len(arguments['settings'])} Tasks"
         if tool_name == "wangp_web_search":
             action = str(arguments.get("action", "") or "").strip()
             action_arguments = arguments.get("arguments")
@@ -836,12 +839,18 @@ class DeepyPrimeTools:
         inner = arguments.get("arguments")
         if toolbox and isinstance(inner, dict) and inner.get("action") == arguments.get("action") is not None and set(inner) == {"action", "arguments"} and isinstance(inner["arguments"], dict):
             arguments["arguments"] = inner = inner["arguments"]  # the whole call repeated inside arguments under the same action
+        if toolbox and arguments.get("action") is not None and isinstance(inner, dict) and "arguments" in inner and inner["arguments"] is None:
+            arguments["arguments"] = inner = None  # the action's contract, asked for with its null written one level too deep
         if toolbox and arguments.get("action") is None and isinstance(inner, dict):
-            if set(inner) == {"arguments"} and isinstance(inner["arguments"], dict):
+            if set(arguments) == {"arguments"} and set(inner) & set(properties) - {"action", "arguments"} and set(inner) <= set(properties):
+                arguments.pop("arguments")  # the whole call nested in arguments with its other top-level parameters (wangp_plugins' plugin)
+                arguments.update(inner)
+                inner = arguments.get("arguments")
+            if isinstance(inner, dict) and set(inner) == {"arguments"} and isinstance(inner["arguments"], dict):
                 arguments["arguments"] = inner = inner["arguments"]  # arguments nested twice
-            if isinstance(inner.get("action"), str) and set(inner) <= {"action", "arguments"}:
+            if isinstance(inner, dict) and isinstance(inner.get("action"), str) and set(inner) <= {"action", "arguments"}:
                 arguments.update(action=inner["action"], arguments=inner.get("arguments", {}))  # the whole call nested in arguments: unwrap it
-            elif isinstance(inner.get("action"), str):
+            elif isinstance(inner, dict) and isinstance(inner.get("action"), str):
                 arguments["action"] = inner.pop("action")  # the action written among its own arguments
         unknown = set(arguments) - set(properties)
         if set(properties) == {"action", "arguments"} and isinstance(arguments.get("arguments"), dict) and unknown and not unknown & set(arguments["arguments"]):
@@ -884,6 +893,10 @@ class DeepyPrimeTools:
                 hint = ' For rg, use {"action":"rg","arguments":{"command":"-n pattern -- @documents/file.txt"}}.' if tool_name == "wangp_io" and arguments.get("action") == "rg" else ""
                 return 'arguments must be an object: {"action":"<action>","arguments":{...}}.' + hint
             if not arguments.get("action") and nested:
+                if tool_name == "wangp_plugins":  # name the plugin's call as it should be written, with the caller's own plugin
+                    plugin = json.dumps(arguments.get("plugin") or "<plugin>")
+                    return (f'No action was named. Write the call flat, the action beside plugin and arguments: {{"plugin": {plugin}, "action": "<action>", "arguments": {{...}}}}; '
+                            f'{{"plugin": {plugin}}} alone lists its actions. Nothing was executed.')
                 likely = next((hint for key, hint in (("old_string", "edit"), ("text", "write_text (mode 'overwrite' replaces a file) or append_text"), ("command", "rg")) if key in nested), "")
                 return ('No action was named: write it at the top level, beside arguments: {"action":"<action>","arguments":{...}}' + (f"; with these arguments: {likely}" if likely and tool_name == "wangp_io" else "")
                         + ". Nothing was executed.")

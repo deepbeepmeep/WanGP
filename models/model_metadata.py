@@ -109,6 +109,8 @@ def infer_outputs(model_def):
     outputs = infer_main_outputs(model_def)
     if model_def.get("returns_audio", False) and "audio" not in outputs:
         outputs.append("audio")
+    # other kinds of output a model can also give, such as "text" side files (a transcript) or an optional "video"
+    outputs += [output for output in model_def.get("extra_outputs", []) if output not in outputs]
     return outputs
 
 
@@ -184,6 +186,9 @@ def infer_media_inputs(model_def):
             "reference": bool(model_def.get("reference_audio_enabled", False)),
             # A control audio drives the output and is kept as its soundtrack.
             "control": bool(model_def.get("output_audio_is_input_audio", False)) or _choice_values_contain(model_def.get("audio_prompt_type_sources", None), "S"),
+            # the soundtrack of a video (audio_prompt_type "K": the Control Video's first audio track) as the audio input
+            "soundtrack": _choice_values_contain(model_def.get("audio_prompt_type_sources", None), "K")
+                          or guide_custom_choices is not None and "K" in "".join(guide_custom_choices.get("audio_letters", {}).values()),
             "output": bool(model_def.get("audio_only", False) or model_def.get("returns_audio", False)),
         },
     }

@@ -1,0 +1,22 @@
+{
+    "model": {
+        "name": "Pixal3D Multi-View Shape",
+        "architecture": "pixal3d_mv_shape",
+        "description": "Builds one 3D mesh from four views of an object or a turnaround sheet. Side and rear references guide details that a single photo would leave unseen. Use equally spaced, consistently framed views.",
+        "URLs": [
+            "https://huggingface.co/DeepBeepMeep/3D/resolve/main/pixal3d_mv_shape_bf16.safetensors",
+            "https://huggingface.co/DeepBeepMeep/3D/resolve/main/pixal3d_mv_shape_int8_convrot.safetensors"
+        ]
+    },
+    "prompt": "Painted ceramic pitcher with a blue handle",
+    "image_mode": 1,
+    "video_prompt_type": "I",
+    "num_inference_steps": 12,
+    "guidance_scale": 7.5,
+    "batch_size": 1,
+    "seed": 42,
+    "custom_settings": {
+        "max_faces": 500000,
+        "shape_resolution": 1024
+    }
+}

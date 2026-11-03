@@ -38,11 +38,26 @@ Decoded-media handlers also declare `postprocessing_category`:
 
 FlashVSR v1.1 and FlashVSR+ Turbo have separate selections, including their
 two-pass variants. **Configuration > Extensions > FlashVSR > Model** controls
-which version is normally shown. **Extract Settings** restores the saved
+which version is normally shown. Saving a version change updates the generation
+and gallery menus immediately. A selected FlashVSR method keeps its scale and
+one-pass or two-pass setting. **Extract Settings** restores the saved
 version and scale even if the current configuration hides that version;
 running those restored settings uses that version without changing the
 configuration preference. Existing `flashvsr` and `flashvsr2pass` settings mean
 FlashVSR v1.1; `flashvsrplus` and `flashvsrplus2pass` mean FlashVSR+ Turbo.
+
+## SeedVR2 Models
+
+SeedVR2 3B and SeedVR2 7B have separate selections, and
+**Configuration > Extensions > SeedVR2 > SeedVR2 Model** controls which one is
+normally shown (3B by default). Saving a change switches an active SeedVR2
+selection to that model at the same scale. The two trade appearance for fidelity: in the
+authors' comparisons 3B looks better on AI-generated and real-world video,
+while 7B stays closer to the source on degraded footage. 7B downloads as an
+INT8 file a little larger than 3B and runs slightly slower. **Extract Settings**
+restores the saved model even when the configuration hides it. Existing
+`seedvr2` settings mean SeedVR2 3B; `seedvr2_7b` means SeedVR2 7B. Media Flow's
+SeedVR2 processes use the configured model.
 
 ## Handler contract
 
@@ -87,6 +102,7 @@ class MyUpsampler:
     def upscale(self, sample, value, *, seed, ..., abort_callback, progress_callback): ...
     # progress_callback(phase, current=None, total=None, unit=None): unit (e.g. "tiles") labels the counter, default "steps"
     def download(self, process_files, send_cmd=None, status_text=None, spatial_upsampling=None): ...
+    def query_checkpoint_inventory(self): ...                 # all checkpoint variants, independent of the selected settings; see PLUGINS.md
     def load_upsampler(self, value, **kwargs): ...            # optional pre-dispatch load hook
     def supports_loaded_model(self, value, context, **kwargs): ... # optional core-model borrowing
     def release_private_runtime(self): ...                    # optional before borrowing core model
@@ -241,13 +257,13 @@ spatial_upsampler_handlers = [
 it should not import or keep one explicit variable per spatial upsampler.
 
 For a minimal external handler, see the
-[Spatial Pixel Duplicate reference plugin](https://github.com/deepbeepmeep/wan2gp-pixel-upsampler).
+[Spatial Pixel Duplicate reference Plugin](https://github.com/deepbeepmeep/wan2gp-pixel-upsampler).
 It exposes `pixel*1` through `pixel*4` and supplies the description displayed by
 the Spatial Upsampling information button.
 
-Enabled plugins can expose upsamplers without editing core code by adding
+Enabled Plugins can expose upsamplers without editing core code by adding
 `spatial_upsampler_handlers` to `plugin_info.json`. Entries that start with `.`
-are relative to the plugin package root; entries without a leading `.` are
+are relative to the Plugin package root; entries without a leading `.` are
 absolute import paths:
 
 ```json
@@ -261,7 +277,7 @@ absolute import paths:
 }
 ```
 
-Only enabled/loaded plugins are considered. The plugin manager reuses its cached
+Only enabled/loaded Plugins are considered. The Plugin manager reuses its cached
 `plugin_info.json` metadata when registering those handlers, so the file is not
 parsed a second time for upsampler discovery.
 
@@ -269,7 +285,8 @@ Upsampler settings are stored under `wgp_config["spatial_upsamplers"][config_key
 Handlers can read old top-level keys during migration with `legacy_config()`, but
 those keys are deleted after the nested section is written.
 
-SeedVR2 stores `window_size` under `spatial_upsamplers.seedvr2`. `0` selects the
+SeedVR2 stores `model` (`3b` or `7b`) and `window_size` under
+`spatial_upsamplers.seedvr2`. For `window_size`, `0` selects the
 GPU-based automatic limit, `-1` disables windowing, and positive values are
 finite frame limits. SeedVR2 aligns finite limits down to its required `4n+1`
 input shape and crossfades three overlapping output frames.
@@ -287,7 +304,7 @@ stride-aligned windows (81 frames with a 17-frame overlap by default);
 overlapping windows address the same deterministic global noise and time
 coordinates. Both versions are shown in Post Processing and Late Postprocessing,
 and Media Flow keeps explicit processes for both versions. The Configuration
-plugin exposes only the shared LTX window size and overlap controls under
+Plugin exposes only the shared LTX window size and overlap controls under
 `spatial_upsamplers.ltx2`. Both values follow
 the VAE's `8n+1` frame cadence; window size ranges from 9 to 481 frames, with 81
 as the default. The values are read at the start of every native or Media Flow
@@ -368,9 +385,9 @@ offload_registry.unregister_offloadobj("MyUpsampler", offloadobj)  # in release_
 ```
 
 This lets WanGP track every extension offload object and release all extension
-resources centrally: the toolbar "Unload Models" tool (and the Configuration plugin
+resources centrally: the toolbar "Unload Models" tool (and the Configuration Plugin
 release button) calls `offload_registry.release_all()`.
 
 ---
 
-> Applies to: Developing spatial upsampler/refiner plugins: handlers, registration and shared configuration. Installed processing options are available through WanGP's post-processing controls and API.
+> Applies to: Developing spatial upsampler/refiner Plugins: handlers, registration and shared configuration. Installed processing options are available through WanGP's post-processing controls and API.

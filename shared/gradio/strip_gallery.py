@@ -8,6 +8,7 @@ gallery source id (`<id>_gallery_html`, `<id>_gallery_state_paths`, ...), so eac
 import html
 import json
 import os
+import re
 import uuid
 import zipfile
 from collections import OrderedDict
@@ -72,6 +73,13 @@ class StripGallery:
 
     def _player_value(self, path):
         return path
+
+    def _create_details(self, path):
+        """Components under the player that follow the selection (none by default)."""
+        return []
+
+    def _details_value(self, path):
+        return []
 
     def _thumbnail_body(self, info):
         raise NotImplementedError
@@ -299,6 +307,7 @@ for (const id of __STRIP_GALLERY_IDS__) SG.whenElement('#' + id + '_gallery_html
             default_path = infos[selected_index]["path"] if infos and 0 <= selected_index < len(infos) else (infos[0]["path"] if infos else None)
             with gr.Column(elem_classes=["strip-player-wrapper", f"{self.source.id}-player-wrapper"]):
                 self.player = self._create_player(default_path)
+            self.details = self._create_details(default_path)
 
             # The thumbnails strip; its id is the stable anchor of the MutationObserver
             self.gallery_html = gr.HTML(value=self._create_gallery_html(infos, selected_index), elem_id=self.element_id("html"), elem_classes="strip-gallery-root")
@@ -309,9 +318,9 @@ for (const id of __STRIP_GALLERY_IDS__) SG.whenElement('#' + id + '_gallery_html
             # Hidden textbox and button capturing thumbnail clicks
             self.click_data = gr.Textbox(value="", visible=False, elem_id=self.element_id("click_data"))
             self.click_trigger = gr.Button(visible=False, elem_id=self.element_id("click_trigger"))
-            self.click_trigger.click(fn=self._select, inputs=[self.click_data, self.state_paths, self.state_selected], outputs=[self.player, self.gallery_html, self.state_paths, self.state_selected, self.click_data], show_progress="hidden")
+            self.click_trigger.click(fn=self._select, inputs=[self.click_data, self.state_paths, self.state_selected], outputs=[self.player, *self.details, self.gallery_html, self.state_paths, self.state_selected, self.click_data], show_progress="hidden")
             # Programmatic updates
-            self.refresh_trigger.change(fn=self._refresh_gallery, inputs=[self.refresh_trigger, self.state_paths, self.state_selected], outputs=[self.player, self.gallery_html, self.state_selected], show_progress="hidden")
+            self.refresh_trigger.change(fn=self._refresh_gallery, inputs=[self.refresh_trigger, self.state_paths, self.state_selected], outputs=[self.player, *self.details, self.gallery_html, self.state_selected], show_progress="hidden")
 
     def _select(self, click_value, paths_json, current_selected):
         """Handle a thumbnail selection (manual)."""
@@ -321,20 +330,24 @@ for (const id of __STRIP_GALLERY_IDS__) SG.whenElement('#' + id + '_gallery_html
             paths = json.loads(paths_json) if paths_json else []
             infos = self._process_paths(paths)
             if not infos:
-                return self._player_value(None), self._create_gallery_html([], 0), paths_json, -1, ""
+                return *self._player_updates(None), self._create_gallery_html([], 0), paths_json, -1, ""
             new_index = int(click_value)
             if 0 <= new_index < len(infos):
                 selected_path = infos[new_index]["path"]
                 if not os.path.exists(selected_path):
                     selected_path = None
-                return self._player_value(selected_path), self._create_gallery_html(infos, new_index), paths_json, new_index, ""
+                return *self._player_updates(selected_path), self._create_gallery_html(infos, new_index), paths_json, new_index, ""
         except Exception:
             pass
         return self._render_from_state(paths_json, current_selected)
 
     def _refresh_gallery(self, refresh_id, paths_json, selected_idx):
-        rendered = self._render_from_state(paths_json, selected_idx)
-        return rendered[0], rendered[1], rendered[3]
+        *players, gallery_html, _paths_json, selected_idx, _click_data = self._render_from_state(paths_json, selected_idx)
+        return *players, gallery_html, selected_idx
+
+    def _player_updates(self, path):
+        """The player's value and the details under it."""
+        return self._player_value(path), *self._details_value(path)
 
     @classmethod
     def _get_cached_creation_datetime(cls, path):
@@ -411,6 +424,61 @@ for (const id of __STRIP_GALLERY_IDS__) SG.whenElement('#' + id + '_gallery_html
             .strip-player-wrapper {{ margin-bottom: 0 !important; padding-bottom: 0 !important; }}
             .audio-player-wrapper {{ min-height: 200px; max-height: 200px; overflow: hidden; }}
             .audio-player-wrapper .audio {{ height: 100% !important; margin-bottom: 0 !important; }}
+            .strip-transcript {{
+                display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border: 1px solid var(--studio-border); border-radius: 8px;
+                background: var(--studio-surface); color: var(--body-text-color);
+            }}
+            .strip-transcript .strip-transcript-bar {{ display: flex; align-items: center; gap: 6px; }}
+            .strip-transcript .strip-transcript-title {{ margin-right: auto; font-weight: 600; }}
+            .strip-transcript .strip-transcript-bar .strip-transcript-button {{  /* outranks Gradio's .prose a */
+                padding: 2px 10px; border-radius: 6px; border: 1px solid var(--studio-border); background: var(--studio-input); color: var(--body-text-color);
+                font-size: 13px; line-height: 20px; text-decoration: none; cursor: pointer;
+            }}
+            .strip-transcript .strip-transcript-bar .strip-transcript-button:hover {{ border-color: var(--studio-accent); }}
+            .strip-transcript .strip-transcript-lines {{ max-height: 220px; overflow-y: auto; font-size: 14px; line-height: 1.45; }}
+            .strip-transcript .strip-transcript-line {{ display: flex; gap: 10px; padding: 2px 4px; border-radius: 4px; }}
+            .strip-transcript .strip-transcript-line[data-start] {{ cursor: pointer; }}
+            .strip-transcript .strip-transcript-line[data-start]:hover {{ background: var(--studio-soft); }}
+            .strip-transcript .strip-transcript-time {{ flex-shrink: 0; min-width: 42px; color: var(--studio-accent); font-variant-numeric: tabular-nums; }}
+            .strip-transcript .strip-transcript-line.selected {{ background: var(--studio-soft); }}
+            .strip-transcript b[style] {{ color: var(--speaker); }}
+            /* the text or the timeline: the page's view, kept across selections (:root data-transcript-view) */
+            .strip-transcript .strip-transcript-timeline {{ display: none; flex-direction: column; gap: 4px; }}
+            :root[data-transcript-view="timeline"] .strip-transcript.has-timeline .strip-transcript-lines {{ display: none; }}
+            :root[data-transcript-view="timeline"] .strip-transcript.has-timeline .strip-transcript-timeline {{ display: flex; }}
+            .strip-transcript .strip-transcript-bar .strip-transcript-icon {{
+                display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 26px; padding: 0; border-radius: 6px;
+                border: 1px solid var(--studio-border); background: var(--studio-input); color: var(--body-text-color); cursor: pointer;
+            }}
+            .strip-transcript .strip-transcript-bar .strip-transcript-icon:hover {{ border-color: var(--studio-accent); }}
+            .strip-transcript .strip-transcript-switch {{ display: inline-flex; }}
+            .strip-transcript .strip-transcript-bar .strip-transcript-switch .strip-transcript-icon:first-child {{ border-radius: 6px 0 0 6px; }}
+            .strip-transcript .strip-transcript-bar .strip-transcript-switch .strip-transcript-icon:last-child {{ border-radius: 0 6px 6px 0; border-left: 0; }}
+            :root:not([data-transcript-view="timeline"]) .strip-transcript .strip-transcript-bar .strip-transcript-switch [data-view="text"],
+            :root[data-transcript-view="timeline"] .strip-transcript .strip-transcript-bar .strip-transcript-switch [data-view="timeline"] {{
+                background: var(--studio-accent); border-color: var(--studio-accent); color: var(--button-primary-text-color, #fff);
+            }}
+            .strip-transcript .strip-transcript-copy .icon-done, .strip-transcript .strip-transcript-copy .icon-failed,
+            .strip-transcript .strip-transcript-copy.copied .icon-copy, .strip-transcript .strip-transcript-copy.failed .icon-copy {{ display: none; }}
+            .strip-transcript .strip-transcript-copy.copied .icon-done, .strip-transcript .strip-transcript-copy.failed .icon-failed {{ display: inline; }}
+            .strip-transcript .strip-transcript-lane, .strip-transcript .strip-transcript-axis {{ display: flex; align-items: center; gap: 8px; }}
+            .strip-transcript .strip-transcript-speaker {{
+                flex: 0 0 84px; font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--speaker, var(--body-text-color));
+            }}
+            .strip-transcript .strip-transcript-track {{ position: relative; flex: 1; height: 20px; border-radius: 4px; background: var(--studio-input); }}
+            .strip-transcript .strip-transcript-segment {{
+                position: absolute; top: 3px; bottom: 3px; min-width: 3px; border-radius: 3px; background: var(--speaker, var(--studio-accent)); opacity: 0.7; cursor: pointer;
+            }}
+            .strip-transcript .strip-transcript-segment:hover, .strip-transcript .strip-transcript-segment.selected {{ opacity: 1; outline: 2px solid var(--body-text-color); z-index: 1; }}
+            .strip-transcript .strip-transcript-axis > div {{
+                flex: 1; display: flex; justify-content: space-between; font-size: 11px; color: var(--body-text-color-subdued); font-variant-numeric: tabular-nums;
+            }}
+            .strip-transcript .strip-transcript-selection {{
+                min-height: 44px; max-height: 120px; overflow-y: auto; margin-top: 4px; padding: 4px 6px; border-radius: 6px; background: var(--studio-input);
+                font-size: 14px; line-height: 1.45; color: var(--body-text-color-subdued);
+            }}
+            .strip-transcript .strip-transcript-selection:empty::before {{ content: attr(data-empty); }}
+            .strip-transcript .strip-transcript-selection .strip-transcript-line {{ color: var(--body-text-color); }}
             .strip-gallery-container .selected-filename {{
                 padding: 4px 12px; background: var(--bg-selected-filename); border-radius: 4px; font-size: 14px; font-weight: 500;
                 margin: 0 0 8px 0; text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-primary);
@@ -579,7 +647,7 @@ for (const id of __STRIP_GALLERY_IDS__) SG.whenElement('#' + id + '_gallery_html
         selected_path = infos[local_index]['path'] if 0 <= local_index < len(infos) else None
         if selected_path and not os.path.exists(selected_path):
             selected_path = None
-        return self._player_value(selected_path), self._create_gallery_html(infos, local_index, offset), paths_json, selected_idx, ''
+        return *self._player_updates(selected_path), self._create_gallery_html(infos, local_index, offset), paths_json, selected_idx, ''
 
 
 class AudioGallery(StripGallery):
@@ -599,28 +667,168 @@ class AudioGallery(StripGallery):
     def _extra_file_info(self, path):
         return {"duration": self._get_audio_duration(path)}
 
+    _own_javascript = r"""
+// ===== AudioGallery: the transcript under the player =====
+if (!SG.transcriptInit) {
+  // The view (text or timeline) is the page's: it stays when another recording is selected, and is remembered by the browser
+  try { const view = localStorage.getItem('wangp-transcript-view'); if (view) document.documentElement.dataset.transcriptView = view; } catch (_) {}
+  document.addEventListener('click', function (e) {
+    const panel = e.target.closest && e.target.closest('.strip-transcript');
+    if (!panel) return;
+    const copy = e.target.closest('.strip-transcript-copy');
+    if (copy) {  // the clipboard icon turns into a check mark (or a cross when the browser refuses)
+      const done = (state) => { copy.classList.add(state); setTimeout(() => copy.classList.remove(state), 1200); };
+      if (!navigator.clipboard) { done('failed'); return; }
+      navigator.clipboard.writeText(panel.querySelector('.strip-transcript-source').value).then(() => done('copied'), () => done('failed'));
+      return;
+    }
+    const view = e.target.closest('.strip-transcript-switch [data-view]');
+    if (view) {
+      document.documentElement.dataset.transcriptView = view.dataset.view;
+      try { localStorage.setItem('wangp-transcript-view', view.dataset.view); } catch (_) {}
+      return;
+    }
+    // A timed line or a timeline segment: shown below the timeline, and the player moves to its start; a click beside them unselects
+    const item = e.target.closest('.strip-transcript-line[data-start], .strip-transcript-segment');
+    if (!item && e.target.closest('a, button')) return;
+    const selection = panel.querySelector('.strip-transcript-selection');
+    panel.querySelectorAll('.selected').forEach((el) => el.classList.remove('selected'));
+    if (!item) {
+      if (selection) selection.replaceChildren();
+      return;
+    }
+    const row = panel.querySelector('.strip-transcript-lines .strip-transcript-line[data-index="' + item.dataset.index + '"]');
+    if (selection) selection.innerHTML = row.outerHTML;
+    for (const el of [row, panel.querySelector('.strip-transcript-segment[data-index="' + item.dataset.index + '"]')]) if (el) el.classList.add('selected');
+    SG.seekAudio(panel, Number(item.dataset.start) / Number(panel.dataset.duration));
+  });
+  SG.transcriptInit = true;
+}
+// The waveform player keeps its audio element out of the page: it seeks where its waveform is clicked
+SG.seekAudio = function (panel, fraction) {
+  const gallery = panel.closest('.column');  // the gallery's column: its player is beside the transcript (each tab has its galleries)
+  const host = [...gallery.querySelectorAll('.audio-player-wrapper #waveform > div')].find((el) => el.shadowRoot);
+  const wave = host && host.shadowRoot.querySelector('[part="wrapper"]');
+  if (!wave) return;
+  const r = wave.getBoundingClientRect();
+  wave.dispatchEvent(new MouseEvent('click', { clientX: r.left + r.width * Math.min(Math.max(fraction, 0), 1), clientY: r.top + r.height / 2, bubbles: true }));
+};
+"""
+
+    def _create_details(self, path):
+        transcript = self._transcript_html(path)
+        return [gr.HTML(value=transcript, visible=bool(transcript), elem_id=self.element_id("transcript"), elem_classes="strip-transcript-root")]
+
+    def _details_value(self, path):
+        transcript = self._transcript_html(path)
+        return [gr.update(value=transcript, visible=bool(transcript))]
+
+    _timed_line = re.compile(r"\[(\d+):(\d\d):(\d\d(?:\.\d+)?) - (\d+):(\d\d):(\d\d(?:\.\d+)?)\]\s*(.*)")  # a "[start - end] text" line of a transcript
+    _speaker_hues = (210, 25, 140, 280, 350, 50, 180, 320)
+
+    _text_icon = '<path d="M4 6h16M4 12h16M4 18h10"/>'
+    _timeline_icon = '<rect x="3" y="4" width="9" height="4" rx="1"/><rect x="12" y="10" width="9" height="4" rx="1"/><rect x="6" y="16" width="10" height="4" rx="1"/>'
+    _copy_icon = '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>'
+    _done_icon = '<path d="M20 6 9 17l-5-5"/>'
+    _failed_icon = '<path d="M18 6 6 18M6 6l12 12"/>'
+
+    @staticmethod
+    def _icon(drawing, classes=""):
+        return (f'<svg class="{classes}" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"'
+                f' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{drawing}</svg>')
+
+    @staticmethod
+    def _clock(seconds):
+        minutes, seconds = divmod(int(seconds), 60)
+        return f"{minutes // 60}:{minutes % 60:02}:{seconds:02}" if minutes >= 60 else f"{minutes}:{seconds:02}"
+
+    @staticmethod
+    def _speaker_names(path):
+        """The names that the recording's generation gave its speakers (custom setting speaker_names), in the order of Speaker 1, 2..."""
+        from shared.utils.audio_metadata import read_audio_metadata
+        from shared.utils.speech_dialogue import parse_speaker_names
+        try:
+            metadata = read_audio_metadata(path) or {}
+        except Exception:  # an imported file without readable WanGP metadata
+            return []
+        return parse_speaker_names((metadata.get("custom_settings") or {}).get("speaker_names") or "")
+
+    @classmethod
+    def _transcript_html(cls, path):
+        """The text a model saved beside the audio (its .txt side file), shown under the player as text or as a timeline with one lane per
+        speaker; a timed line or segment plays the recording from its start. "" without one."""
+        from shared.utils.side_files import saved_side_files
+        files = saved_side_files(path) if path is not None else {}
+        if ".txt" not in files:
+            return ""
+        text = files[".txt"].read_text(encoding="utf-8").strip()
+        duration = cls._audio_seconds(path)
+        names = cls._speaker_names(path)
+        labels = sorted({name for name in names if name}, key=len, reverse=True)  # the longest first: a name may begin with another one
+        speaker_line = re.compile("(" + "".join(re.escape(name) + "|" for name in labels) + r"Speaker \d+):\s*(.*)")
+        rows, lanes = [], {}
+        for index, line in enumerate(filter(None, (line.strip() for line in text.splitlines()))):
+            timed = cls._timed_line.fullmatch(line)
+            body = timed.group(7) if timed else line
+            speaker = speaker_line.fullmatch(body)
+            number = (names.index(speaker.group(1)) + 1 if speaker.group(1) in names else int(speaker.group(1)[len("Speaker "):])) if speaker else 0
+            color = f' style="--speaker: hsl({cls._speaker_hues[(number - 1) % len(cls._speaker_hues)]} 65% 50%)"' if speaker else ""
+            body = f"<b{color}>{html.escape(speaker.group(1))}:</b> {html.escape(speaker.group(2))}" if speaker else html.escape(body)
+            if timed is None:
+                rows.append(f'<div class="strip-transcript-line"><span>{body}</span></div>')
+                continue
+            start, end = (int(timed.group(i)) * 3600 + int(timed.group(i + 1)) * 60 + float(timed.group(i + 2)) for i in (1, 4))
+            rows.append(f'<div class="strip-transcript-line" data-index="{index}" data-start="{start:.2f}" title="Play from {cls._clock(start)}">'
+                        f'<span class="strip-transcript-time">{cls._clock(start)}</span><span>{body}</span></div>')
+            lane = lanes.setdefault(number, {"label": speaker.group(1) if speaker else "Speech", "color": color, "segments": []})
+            left, right = (100 * min(max(seconds, 0), duration) / duration for seconds in (start, end)) if duration > 0 else (0, 0)
+            lane["segments"].append(f'<div class="strip-transcript-segment" data-index="{index}" data-start="{start:.2f}" style="left: {left:.3f}%; width: {right - left:.3f}%"'
+                                    f' title="{cls._clock(start)} - {cls._clock(end)}"></div>')
+        timeline = ""
+        if lanes and duration > 0:  # one lane per speaker ("Speech" when the speakers are not labelled)
+            lanes_html = "".join(f'<div class="strip-transcript-lane"{lane["color"]}><span class="strip-transcript-speaker" title="{html.escape(lane["label"])}">{html.escape(lane["label"])}</span>'
+                                 f'<div class="strip-transcript-track">{"".join(lane["segments"])}</div></div>' for number, lane in sorted(lanes.items()))
+            ticks = "".join(f"<span>{cls._clock(duration * step / 4)}</span>" for step in range(5))
+            timeline = (f'<div class="strip-transcript-timeline">{lanes_html}<div class="strip-transcript-axis"><span class="strip-transcript-speaker"></span><div>{ticks}</div></div>'
+                        f'<div class="strip-transcript-selection" data-empty="Select a turn to read what was said."></div></div>')
+        view_switch = ('<span class="strip-transcript-switch" role="group" aria-label="View">'
+                       f'<button type="button" class="strip-transcript-icon" data-view="text" title="Text" aria-label="Text">{cls._icon(cls._text_icon)}</button>'
+                       f'<button type="button" class="strip-transcript-icon" data-view="timeline" title="Timeline of the Speakers" aria-label="Timeline">{cls._icon(cls._timeline_icon)}</button>'
+                       '</span>') if timeline else ""
+        copy_button = (f'<button type="button" class="strip-transcript-icon strip-transcript-copy" title="Copy to Clipboard" aria-label="Copy to Clipboard">'
+                       f'{cls._icon(cls._copy_icon, "icon-copy")}{cls._icon(cls._done_icon, "icon-done")}{cls._icon(cls._failed_icon, "icon-failed")}</button>')
+        downloads = "".join(f'<a class="strip-transcript-button" href="{html.escape(gradio_file_url(files[suffix]))}" download="{html.escape(files[suffix].name)}" title="Download">{suffix}</a>'
+                            for suffix in (".txt", ".srt") if suffix in files)
+        return (f'<div class="strip-transcript{" has-timeline" if timeline else ""}" data-duration="{duration:.3f}"><div class="strip-transcript-bar"><span class="strip-transcript-title">Transcript</span>'
+                f'{view_switch}{copy_button}{downloads}</div>'
+                f'<div class="strip-transcript-lines">{"".join(rows)}</div>{timeline}<textarea class="strip-transcript-source" hidden>{html.escape(text)}</textarea></div>')
+
     def _thumbnail_body(self, info):
         duration = "0:00" if info["deleted"] else info["duration"]
         return f'<div class="thumbnail-date">{info["date"]}</div><div class="thumbnail-time">{info["time"]}</div><div class="thumbnail-detail">{duration}</div>'
 
+    @staticmethod
+    def _audio_seconds(audio_path):
+        import contextlib
+        import wave
+        try:
+            with contextlib.closing(wave.open(audio_path, "r")) as f:
+                return f.getnframes() / float(f.getframerate())
+        except Exception:
+            pass
+        try:
+            from mutagen import File
+            audio = File(audio_path)
+            if audio and getattr(audio, "info", None):
+                return audio.info.length
+        except Exception:
+            pass
+        return os.path.getsize(audio_path) / 32000  # rough estimate from the file size
+
     def _get_audio_duration(self, audio_path):
         """Audio duration formatted as M:SS."""
         try:
-            import contextlib
-            import wave
-            try:
-                with contextlib.closing(wave.open(audio_path, "r")) as f:
-                    return self._format_duration(f.getnframes() / float(f.getframerate()))
-            except Exception:
-                pass
-            try:
-                from mutagen import File
-                audio = File(audio_path)
-                if audio and getattr(audio, "info", None):
-                    return self._format_duration(audio.info.length)
-            except Exception:
-                pass
-            return self._format_duration(os.path.getsize(audio_path) / 32000)  # rough estimate from the file size
+            return self._format_duration(self._audio_seconds(audio_path))
         except Exception:
             return "0:00"
 

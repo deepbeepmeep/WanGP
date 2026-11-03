@@ -1,0 +1,310 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
+"""Media facts for the Showrunner UI, all on the CPU: probing, poster frames, waveforms, and the beats and sections of a song."""
+from __future__ import annotations
+
+import hashlib
+import json
+import shutil
+import subprocess
+import uuid
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from shared.utils.video_decode import resolve_media_binary
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
+ANALYSIS_VERSION = 3  # part of the song analysis cache key: bump when analyze_song changes
+
+
+def kind_of(path: str | Path) -> str | None:
+    suffix = Path(path).suffix.lower()
+    return "image" if suffix in IMAGE_EXTENSIONS else "video" if suffix in VIDEO_EXTENSIONS else "audio" if suffix in AUDIO_EXTENSIONS else None
+
+
+def _run(arguments: list[str], **kwargs) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(arguments, capture_output=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), **kwargs)
+    except subprocess.CalledProcessError as error:  # the tool's own last words say what went wrong, not its exit status
+        stderr = error.stderr.decode("utf-8", "replace") if isinstance(error.stderr, bytes) else str(error.stderr or "")
+        lines = [line for line in stderr.splitlines() if line.strip()]
+        raise RuntimeError(f"{Path(arguments[0]).stem} failed: {' | '.join(lines[:3]) or f'exit status {error.returncode}'}") from None
+
+
+@lru_cache(maxsize=1)
+def ffmpeg() -> str:
+    return resolve_media_binary("ffmpeg")
+
+
+@lru_cache(maxsize=1)
+def ffprobe() -> str:
+    return resolve_media_binary("ffprobe")
+
+
+def probe(path: str | Path) -> dict[str, Any]:
+    """Duration, size, frame rate and audio presence of a media file (images: size only)."""
+    path = Path(path)
+    kind = kind_of(path)
+    if kind == "image":
+        from PIL import Image
+        from shared.deepy.image_channels import upright_size
+        with Image.open(path) as image:
+            width, height = upright_size(image)  # a phone photo as it is shown: its EXIF orientation applied
+            return {"kind": "image", "width": width, "height": height, "duration_s": None, "has_audio": False}
+    output = _run([ffprobe(), "-v", "error", "-show_entries", "format=duration:stream=codec_type,codec_name,width,height,avg_frame_rate,r_frame_rate,duration", "-of", "json", str(path)]).stdout
+    data = json.loads(output or b"{}")
+    streams = data.get("streams", [])
+    video = next((stream for stream in streams if stream.get("codec_type") == "video"), None)
+    length = (video or {}).get("duration") or data.get("format", {}).get("duration")  # a video's picture: its audio stream may run longer than its frames
+    info = {"kind": kind or ("video" if video else "audio"), "duration_s": round(float(length or 0.0), 3) or None,
+            "has_audio": any(stream.get("codec_type") == "audio" for stream in streams)}
+    if video:
+        rate = video.get("avg_frame_rate") or video.get("r_frame_rate") or "0/1"
+        numerator, _, denominator = rate.partition("/")
+        info.update(width=video.get("width"), height=video.get("height"), codec=video.get("codec_name"), fps=round(float(numerator) / float(denominator or 1), 3) if float(denominator or 1) else None)
+    return info
+
+
+def generation_time(path: str | Path) -> float | None:
+    """The seconds WanGP took to generate a video, as it records them in the file's metadata (None for other files)."""
+    path = Path(path)
+    if kind_of(path) != "video" or not path.is_file():
+        return None
+    stat = path.stat()
+    return _generation_time(str(path), stat.st_mtime_ns, stat.st_size)
+
+
+@lru_cache(maxsize=4096)
+def _generation_time(path: str, mtime_ns: int, size: int) -> float | None:
+    from shared.utils.video_metadata import read_metadata_from_video
+    metadata = read_metadata_from_video(path)
+    return float(metadata["generation_time"]) if isinstance(metadata, dict) and metadata.get("generation_time") else None
+
+
+def poster(path: str | Path, out: str | Path, *, at_s: float | None = None, width: int = 640) -> Path:
+    """A JPEG frame of a video (a third of the way in by default) or a resized copy of an image."""
+    path, out = Path(path), Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if kind_of(path) == "image":
+        from PIL import Image
+        from shared.deepy.image_channels import upright
+        with Image.open(path) as image:
+            image = upright(image).convert("RGB")
+            image.thumbnail((width, width * 4))
+            image.save(out, quality=88)
+        return out
+    if at_s is None:
+        duration = probe(path).get("duration_s") or 0.0
+        at_s = duration / 3
+    _run([ffmpeg(), "-y", "-v", "error", "-ss", f"{max(0.0, at_s):.3f}", "-i", str(path), "-frames:v", "1", "-vf", f"scale={width}:-2", "-q:v", "3", str(out)])
+    return out
+
+
+def filmstrip(path: str | Path, out: str | Path, *, frames: int = 8, height: int = 90) -> Path:
+    """One image holding `frames` evenly spaced frames of a video side by side (timeline thumbnails)."""
+    path, out = Path(path), Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    duration = probe(path).get("duration_s") or 1.0
+    _run([ffmpeg(), "-y", "-v", "error", "-i", str(path), "-vf", f"fps={frames / max(duration, 0.1):.5f},scale=-2:{height},tile={frames}x1", "-frames:v", "1", "-q:v", "4", str(out)])
+    return out
+
+
+def subtitles_vtt(path: str | Path) -> str:
+    """The first subtitle track of a video as WebVTT, the format browsers show ("" without one)."""
+    tracks = _run([ffprobe(), "-v", "error", "-select_streams", "s", "-show_entries", "stream=index", "-of", "csv=p=0", str(path)]).stdout.split()
+    return _run([ffmpeg(), "-v", "error", "-i", str(path), "-map", "0:s:0", "-f", "webvtt", "-"]).stdout.decode("utf-8", "replace") if tracks else ""
+
+
+def subtitle_cues(path: str | Path) -> list[tuple[float, float, str]]:
+    """The cues of a video's first subtitle track: (start_s, end_s, text)."""
+    seconds = lambda stamp: sum(float(part) * 60 ** index for index, part in enumerate(reversed(stamp.split(":"))))
+    cues = []
+    for block in subtitles_vtt(path).replace("\r", "").split("\n\n"):
+        lines = block.strip().split("\n")
+        timing = next((index for index, line in enumerate(lines) if " --> " in line), None)
+        if timing is not None:
+            start, end = lines[timing].split(" --> ")
+            cues.append((seconds(start.strip()), seconds(end.split()[0]), " ".join(lines[timing + 1:]).strip()))
+    return cues
+
+
+def audio_slice(path: str | Path, start_s: float, end_s: float, out_folder: str | Path) -> Path:
+    """The [start_s, end_s] excerpt of an audio file as a WAV in out_folder, cut once and reused (a shot's driving audio)."""
+    out = Path(out_folder) / f"{Path(path).stem}-{start_s:.3f}-{end_s:.3f}.wav"
+    if not out.is_file():
+        out.parent.mkdir(parents=True, exist_ok=True)
+        _run([ffmpeg(), "-y", "-v", "error", "-ss", f"{start_s:.3f}", "-t", f"{end_s - start_s:.3f}", "-i", str(path), "-vn", "-c:a", "pcm_s16le", str(out)])
+    return out
+
+
+def take_sound(path: str | Path, speed: float, out_folder: str | Path, tempo: str = "") -> Path:
+    """The whole sound of a take as a WAV in out_folder, at the speed it plays in the edit (tempo: its filters), made once."""
+    out = Path(out_folder) / f"{Path(path).stem}-sound{'' if speed == 1.0 else f'-{speed:g}x'}.wav"
+    if not out.is_file():
+        out.parent.mkdir(parents=True, exist_ok=True)
+        _run([ffmpeg(), "-y", "-v", "error", "-i", str(path), "-vn", *(["-af", tempo] if tempo else []), "-c:a", "pcm_s16le", str(out)])
+    return out
+
+
+def padded_audio(path: str | Path, duration_s: float, out_folder: str | Path) -> Path:
+    """An audio file followed by silence up to duration_s, as a WAV in out_folder (a short line driving a longer lip-synced shot)."""
+    out = Path(out_folder) / f"{Path(path).stem}-to-{duration_s:.3f}.wav"
+    if not out.is_file():
+        out.parent.mkdir(parents=True, exist_ok=True)
+        _run([ffmpeg(), "-y", "-v", "error", "-i", str(path), "-vn", "-af", f"apad=whole_dur={duration_s:.3f}", "-c:a", "pcm_s16le", str(out)])
+    return out
+
+
+def joined_audio(paths: list[str | Path], out_folder: str | Path, gap_s: float = 0.3) -> Path:
+    """Audio files one after the other with gap_s of silence between them, as a WAV in out_folder (the lines of a shot driving it together)."""
+    key = hashlib.sha1(json.dumps([[str(path), Path(path).stat().st_mtime_ns] for path in paths] + [gap_s]).encode("utf-8")).hexdigest()[:12]
+    out = Path(out_folder) / f"lines-{key}.wav"
+    if not out.is_file():
+        out.parent.mkdir(parents=True, exist_ok=True)
+        inputs = [arg for path in paths for arg in ("-i", str(path))]
+        chains = [f"[{index}:a]aresample=48000,aformat=channel_layouts=mono" + (f",apad=pad_dur={gap_s:.3f}" if index < len(paths) - 1 else "") + f"[l{index}]" for index in range(len(paths))]
+        graph = ";".join(chains) + ";" + "".join(f"[l{index}]" for index in range(len(paths))) + f"concat=n={len(paths)}:v=0:a=1[out]"
+        _run([ffmpeg(), "-y", "-v", "error", *inputs, "-filter_complex", graph, "-map", "[out]", "-c:a", "pcm_s16le", str(out)])
+    return out
+
+
+def _decode_mono(path: str | Path, rate: int) -> np.ndarray:
+    raw = _run([ffmpeg(), "-v", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", str(rate), "-f", "f32le", "-"]).stdout
+    return np.frombuffer(raw, dtype=np.float32)
+
+
+def peaks(path: str | Path, buckets: int = 1600) -> dict[str, Any]:
+    """Waveform envelope: per bucket the peak and RMS of the mono mix, normalized to the loudest peak."""
+    rate = 8000
+    samples = _decode_mono(path, rate)
+    if samples.size == 0:
+        return {"duration_s": 0.0, "peak": [], "rms": []}
+    buckets = max(1, min(buckets, samples.size))
+    edges = np.linspace(0, samples.size, buckets + 1).astype(np.int64)
+    peak = np.maximum.reduceat(np.abs(samples), edges[:-1])
+    rms = np.sqrt(np.add.reduceat(samples * samples, edges[:-1]) / np.maximum(np.diff(edges), 1))
+    scale = float(peak.max()) or 1.0
+    return {"duration_s": round(samples.size / rate, 3), "peak": np.round(peak / scale, 4).tolist(), "rms": np.round(rms / scale, 4).tolist()}
+
+
+def analyze_song(path: str | Path) -> dict[str, Any]:
+    """Tempo, beats, bars (every fourth beat), an energy curve and sections (repeated parts share a letter) of a song."""
+    import librosa
+
+    rate = 22050
+    samples = _decode_mono(path, rate)
+    duration = samples.size / rate
+    if duration < 1.0:
+        return {"duration_s": round(duration, 3), "bpm": None, "beats": [], "bars": [], "energy": [], "sections": []}
+    hop = 512
+    onset = librosa.onset.onset_strength(y=samples, sr=rate, hop_length=hop)
+    tempo, beat_frames = librosa.beat.beat_track(onset_envelope=onset, sr=rate, hop_length=hop, units="frames")
+    beats = librosa.frames_to_time(beat_frames, sr=rate, hop_length=hop)
+    # Bars: the beat phase whose onsets are strongest is taken as the downbeat.
+    phase = int(np.argmax([onset[beat_frames[offset::4]].mean() if len(beat_frames[offset::4]) else 0 for offset in range(4)])) if len(beat_frames) >= 8 else 0
+    bars = beats[phase::4]
+    rms = librosa.feature.rms(y=samples, hop_length=hop)[0]
+    points = 400
+    energy_edges = np.linspace(0, rms.size, points + 1).astype(np.int64)
+    energy = np.add.reduceat(rms, energy_edges[:-1]) / np.maximum(np.diff(energy_edges), 1)
+    energy = energy / (energy.max() or 1.0)
+    return {"duration_s": round(duration, 3), "bpm": round(float(np.atleast_1d(tempo)[0]), 1), "beats": np.round(beats, 3).tolist(), "bars": np.round(bars, 3).tolist(),
+            "energy": np.round(energy, 4).tolist(), "sections": _sections(samples, rate, hop, duration, beats, energy) if duration >= 12 else []}
+
+
+def _sections(samples, rate, hop, duration, beats, energy) -> list[dict[str, Any]]:
+    """Foote novelty on a self-similarity matrix of half-second frames (chroma, timbre, loudness), boundaries refined to the beat
+    with the strongest before/after contrast; sections whose sound matches share a letter, and the loudest repeated letter is the chorus."""
+    import librosa
+    import scipy.signal
+
+    def standard(matrix):
+        return (matrix - matrix.mean(axis=1, keepdims=True)) / (matrix.std(axis=1, keepdims=True) + 1e-6)
+
+    features = np.vstack([standard(librosa.feature.chroma_cqt(y=samples, sr=rate, hop_length=hop)), standard(librosa.feature.mfcc(y=samples, sr=rate, hop_length=hop, n_mfcc=13)),
+                          2 * standard(np.log(librosa.feature.rms(y=samples, hop_length=hop) + 1e-5))])
+    frame = 0.5
+    per = max(1, int(round(frame * rate / hop)))
+    count = features.shape[1] // per
+    grid = features[:, :count * per].reshape(features.shape[0], count, per).mean(axis=2)
+    unit = grid / (np.linalg.norm(grid, axis=0, keepdims=True) + 1e-9)
+    similarity = unit.T @ unit
+    half = 12
+    window = scipy.signal.windows.gaussian(2 * half, half / 2)
+    kernel = np.outer(window, window) * np.block([[np.ones((half, half)), -np.ones((half, half))], [-np.ones((half, half)), np.ones((half, half))]])
+    padded = np.pad(similarity, half, mode="edge")
+    novelty = np.maximum(np.array([np.sum(padded[index:index + 2 * half, index:index + 2 * half] * kernel) for index in range(count)]), 0)
+    novelty /= novelty.max() or 1.0
+    peaks, _ = scipy.signal.find_peaks(novelty, distance=int(6 / frame), height=0.3, prominence=0.1)
+
+    def contrast(time):
+        center = int(time / frame)
+        before, after = grid[:, max(0, center - 4):center], grid[:, center:center + 4]
+        return float(np.linalg.norm(before.mean(axis=1) - after.mean(axis=1))) if before.size and after.size else 0.0
+
+    bounds = []
+    for peak in peaks:
+        time = peak * frame
+        candidates = [beat for beat in beats if abs(beat - time) <= 1.5] or [time]
+        bounds.append(max(candidates, key=contrast))
+    bounds = [0.0] + sorted(round(float(value), 3) for value in bounds if 3.0 < value < duration - 3.0) + [round(duration, 3)]
+    spans = list(zip(bounds[:-1], bounds[1:]))
+    # A repeated part plays the same chords in the same order: compare sections along the diagonals of their chroma self-similarity block
+    # (best lag over at least 60 % of the shorter one), then group them by average linkage. Averaged features miss repeats, chords change inside a part.
+    chroma = grid[:12] / (np.linalg.norm(grid[:12], axis=0, keepdims=True) + 1e-9)
+    frames = [(min(int(start / frame), count - 1), min(count, max(int(start / frame) + 1, int(end / frame)))) for start, end in spans]
+
+    def repeat(first, second):
+        block = chroma[:, frames[first][0]:frames[first][1]].T @ chroma[:, frames[second][0]:frames[second][1]]
+        shortest = min(block.shape)
+        return max((float(np.diagonal(block, offset).mean()) for offset in range(-block.shape[0] + 1, block.shape[1]) if len(np.diagonal(block, offset)) >= 0.6 * shortest), default=-1.0)
+
+    scores = np.array([[repeat(first, second) if first != second else 1.0 for second in range(len(spans))] for first in range(len(spans))])
+    groups = [[index] for index in range(len(spans))]
+    while len(groups) > 1:
+        linkage, left, right = max((float(scores[np.ix_(groups[i], groups[j])].mean()), i, j) for i in range(len(groups)) for j in range(i + 1, len(groups)))
+        if linkage < 0.6:
+            break
+        groups[left] += groups.pop(right)
+    groups.sort(key=min)
+    labels = [chr(ord("A") + next(number for number, group in enumerate(groups) if index in group)) for index in range(len(spans))]
+    points = len(energy)
+    loudness = [float(energy[int(start / duration * points):max(int(start / duration * points) + 1, int(end / duration * points))].mean()) for start, end in spans]
+    repeated = {label for label in labels if labels.count(label) > 1}
+    chorus = max(repeated, key=lambda label: np.mean([value for value, item in zip(loudness, labels) if item == label])) if repeated else None
+    verse = next((label for label in labels if label in repeated and label != chorus), None)  # the first other repeated part; later ones are refrains
+    sections = []
+    for index, ((start, end), label) in enumerate(zip(spans, labels)):
+        if label == chorus:
+            name = "Chorus"
+        elif index == len(spans) - 1 and len(spans) > 2 and (label not in repeated or loudness[index] < 0.6 * max(loudness)):
+            name = "Outro"
+        elif label in repeated:
+            name = "Verse" if label == verse else "Refrain"
+        elif index == 0 and len(spans) > 1:
+            name = "Intro"
+        else:
+            name = "Bridge" if len(spans) > 1 else "Song"
+        sections.append({"start_s": start, "end_s": end, "label": label, "name": name, "energy": round(loudness[index], 3)})
+    return sections
+
+
+def import_file(source: str | Path, media_folder: str | Path, *, move: bool = False, name: str | None = None) -> Path:
+    """Copy (or move) a file into a production's media folder under a unique, readable name (name: the original file name)."""
+    source, media_folder = Path(source), Path(media_folder)
+    media_folder.mkdir(parents=True, exist_ok=True)
+    original = Path(name or source.name)
+    stem = "".join(char if char.isalnum() or char in "-_" else "_" for char in original.stem)[:48] or "media"
+    target = media_folder / f"{stem}-{uuid.uuid4().hex[:6]}{original.suffix.lower()}"
+    (shutil.move if move else shutil.copy2)(str(source), str(target))
+    return target
+
+
+def cache_key(path: str | Path, *parts: Any) -> str:
+    path = Path(path)
+    stat = path.stat()
+    return hashlib.sha1(f"{path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}|{parts}".encode()).hexdigest()[:20]

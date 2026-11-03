@@ -149,7 +149,7 @@ Both flavours offer the same controls in full 33B and lighter pruned 20B version
 
 - **Spatial upsampler improvements**: high-resolution MiniMax H3 generation can be slow, so a practical alternative is to generate at a lower resolution, such as 480p, and upscale the result afterward.
  - **FlashVSR optimizations**: FlashVSR has been further optimized to reduce system RAM usage.
- - **SeedVR2**: this high-quality image and video upsampler previously required too much VRAM for longer videos on many consumer GPUs. The WanGP integration reduces its VRAM requirement to roughly one-third of the original implementation. SeedVR2 is available under *Advanced Mode / Post Processing*, in *Late Post Processing*, and through the *Media Flow* plugin.
+ - **SeedVR2**: this high-quality image and video upsampler previously required too much VRAM for longer videos on many consumer GPUs. The WanGP integration reduces its VRAM requirement to roughly one-third of the original implementation. SeedVR2 is available under *Advanced Mode / Post Processing*, in *Late Post Processing*, and through the *Media Flow* Plugin.
 
 - **Memory priority**: MiniMax H3 defaults to *Lower VRAM*. If system RAM is the limiting factor and you have spare VRAM, select *Lower RAM* under *Advanced Mode / Misc. / Priority*.
 
@@ -161,7 +161,7 @@ Both flavours offer the same controls in full 33B and lighter pruned 20B version
 *WanGP v12.42*: Added Spectrum, SeedVR2, the memory-priority selector, and updated pruned checkpoints.
 ## 25th of July 2026: Featured Plugins / Apps
 
-WanGP's growing community has developed more than 20 plugins that expand what you can do. Here is a selection of seven newly available community plugins, all of which can be installed or updated directly from the WanGP Plugin Manager:
+WanGP's growing community has developed more than 20 plugins that expand what you can do. Here is a selection of seven newly available community plugins, all of which can be installed or updated directly from WanGP's Apps & PlugIn Manager:
 
 - **Finetune Manager** by *GKartist* — Browse community finetunes, load them into WanGP, and create, improve, or share your own.
 - **Image Suite** by *saintorphan* — Create and edit images with text-to-image, image-to-image, layered canvases, masks, inpainting, cropping, resizing, and color adjustments.
@@ -264,9 +264,9 @@ Version *update 12.21* introduces RAM optimisations when using many *sliding win
 
 - **Chain of Zoom Upsampler**: new upsampler that can magnify up to x16, quite good with hair and skin. However it expects low quality image so it may reinvent existing details. WanGP optimized: low VRAM and up to x4 times faster
 
-- **Upsampler & Model Plugins**: PlugIn developers can now create plugins that add new *Spatial Upsampler* or new *Models*
+- **Upsampler & Model Plugins**: Plugin developers can now create Plugins that add new *Spatial Upsampler* or new *Models*
 
-As sample plugins, enjoy:
+As sample Plugins, enjoy:
    - **Stable Diffusion 1.4**: the father of all image generators !
    - **Pixel Upsampler**: upsample by duplicating the same pixel for a grandiose Pixel Art effect !
 
@@ -345,7 +345,7 @@ It has never been easier to do voice cloning directly in video models:
 
 - **LongCat 1.5 Avatar**: with this new *Talking Head* model you are going to become at last a fan of *LongCat*. It is fast (8 steps distilled) and delivers high quality potentially unlimited gens using *Sliding Windows*.
 
-- **Settings can now store Audio/Video/Images**: you can ask WanGP to store (in option) all the media you use frequently in a WanGP *Settings file*. This is very convenient for instance if you always use the same *Voice sample* or *Reference Images*. Even better, you can use these settings with *Deepy* of the *Full Video Process* plugin
+- **Settings can now store Audio/Video/Images**: you can ask WanGP to store (in option) all the media you use frequently in a WanGP *Settings file*. This is very convenient for instance if you always use the same *Voice sample* or *Reference Images*. Even better, you can use these settings with *Deepy* of the *Full Video Process* Plugin
 
 - **Extensions Enabled by Default**: most extensions (upsampling, mmaudio, prompt enhancer, ...) are now enabled by Default so that they are easier to be found. Don't worry their corresponding checkpoints will be downloaded only if you actually use these extensions
 
@@ -385,7 +385,7 @@ FlashVSR is available in the following contexts:
 - a *Late Postprocessing* that can be applied on already generated videos
 - in Model *WanGP System Video Postprocessing* of the *MediaFlow* Plugin you can Upsample a few hours long Video !
 
-Please note as FlashVSR is now natively supported by WanGP and highly optimized, you may no longer need the *FlashVSR Plugin* developed by @h4k4z3. In any case many thanks to @h4k4z3 for developing this plugin which was very useful.
+Please note as FlashVSR is now natively supported by WanGP and highly optimized, you may no longer need the *FlashVSR Plugin* developed by @h4k4z3. In any case many thanks to @h4k4z3 for developing this Plugin which was very useful.
 
 ### 2nd of May 2026: WanGP v11.52, a Kind of Magic
 
@@ -408,11 +408,11 @@ It is highly recommended to apply the *Lightx2v 4 steps* lora profile. Also for 
 More nice goodies for **LTX-2**:
 - **HDR Control Video support**: you can now provide an HDR Control Video it will be automatically converted to SDR if model doesnt support HDR
 
-- **LTX 2.3 SDR to HDR**: thanks to a new HDR Ic lora, you can now convert SDR Videos to HDR using LTX 2.3. This feature is available as a new *Control Video process* and also in the *MediaFlow* plugin. Please note that the embedded Gradio Gallery video player converts automatically any HDR content to SDR, so if you want to enjoy the full HDR content you will need an external media player (for instance *MPC-BE*)
+- **LTX 2.3 SDR to HDR**: thanks to a new HDR Ic lora, you can now convert SDR Videos to HDR using LTX 2.3. This feature is available as a new *Control Video process* and also in the *MediaFlow* Plugin. Please note that the embedded Gradio Gallery video player converts automatically any HDR content to SDR, so if you want to enjoy the full HDR content you will need an external media player (for instance *MPC-BE*)
 
 - **LTX 2.3 Control Video Injection in Phase 2**: up to now even if you picked 2 phases, the *Control Video* was only injected in Phase 1 (Phase 2 was only used for upsampling). Now if you have chosen for at least one Ic Lora, a non null mutiplier for phase 2, the control video will be injected also for phase 2. This will increase output quality with 2 phases but will require more VRAM for phase 2.
 
-- **MediaFlow Custom Settings**: you can now reuse your own presaved settings in the plugin. As you will  link the plugin to your settings any change to the saved settings  will be immediatly available in the plugin. If you find some great combination of loras / model / settings to be used with this Plugin please share them on the discord server so that I can add them in the official list.
+- **MediaFlow Custom Settings**: you can now reuse your own presaved settings in the Plugin. As you will  link the Plugin to your settings any change to the saved settings  will be immediatly available in the Plugin. If you find some great combination of loras / model / settings to be used with this Plugin please share them on the discord server so that I can add them in the official list.
 
 *update 11.41*: added MediaFlow Custom Settings
 
@@ -439,11 +439,11 @@ Lots of nice goodies for **LTX-2**:
 
 - **Injected Frames & Sliding Windows**: injected frames were not properly injected starting from window no 2. This is now supported.
 
-- **MediaFlow Plugin**: this *bundled PlugIn* which needs to be enabled first in *the PlugIn tab*, right now supports only *Outpainting*. It relies on *LTX2 Lora outpainting*. It is more or less a *Super Sliding Windows* mode but without the *RAM restrictions* and no risk to explode the *Video Gallery* with huge files. If you are patient enough you can change the Aspect Ratio of a few hours movie (check out below the 1 min sample). Behold how *Sliding Windows transitions* are almost invisible !
+- **MediaFlow Plugin**: this *bundled Plugin* which needs to be enabled first in *the Plugin tab*, right now supports only *Outpainting*. It relies on *LTX2 Lora outpainting*. It is more or less a *Super Sliding Windows* mode but without the *RAM restrictions* and no risk to explode the *Video Gallery* with huge files. If you are patient enough you can change the Aspect Ratio of a few hours movie (check out below the 1 min sample). Behold how *Sliding Windows transitions* are almost invisible !
 
 - **NEW Processes for Full Video Plugin**: *Refocus* (remove blur), *Ungrade* (remove stylized color grading) and *Uncompress* (remove compression artifacts) have been added. Many thanks to *Oumoumad Mohamed* who created the Ic Loras (including the *Outpainting* lora ) that power these processes. If you have found some Ic Loras that are useful and dont cause glitches with Sliding Windows, let me know and I will add them.
 
-- **WanGP API Video Gen**: *Plugin Developers* can now *Queue a Gen* directly from a plugin. This opens the possibility of plugins that place various gen orders and then combine the results (hint: we could have our very own version of *LTX-Destop* inside WanGP).
+- **WanGP API Video Gen**: *Plugin Developers* can now *Queue a Gen* directly from a Plugin. This opens the possibility of Plugins that place various gen orders and then combine the results (hint: we could have our very own version of *LTX-Destop* inside WanGP).
 
 - **New One Click Install / Update Scripts**: We have to thank **Tophness / @steve_Jabz** for that one. *Huge Kudos to him!* The scripts will not only install WanGP but also all the *Kernels* (among *Triton, Sage, Flash, GGuf, Lightx2v, Nunchaku*) supported by your GPU. Please have a look at the instructions further down. Dont't hesitate to share feedback or report any issue.
 
@@ -748,14 +748,14 @@ Note that Z Image Base is very sensitive to the *Attention Mode*: it is not comp
 - **Various Improvements**:
    - Video /Audio Galleries now support deletions of gens done outside WanGP
    - added *MP3 support* for audio outputs
-   - *Check for Updates* button for *Plugins* to see in a glance if any of your plugin can be updated
+   - *Check for Updates* button for *Plugins* to see in a glance if any of your Plugin can be updated
    - *Prompt Enhancer* generates a different enhanced prompt each timee you click on it. You can define in the config tab its gen parameters (top k, temperature)
    - New *Root Loras* folder can be defined in the config Tab. Useful if you have multiple WanGP instances or want to store easily all your loras in a different hard drive 
    - added new setting *Attention Mode Override* in the *Misc* tab
    - Experimental: allowed changing *Configuration* during a *Generation*
 
 *update 10.51*: new Heart Mula Finetune better at following instructions, Extra settings (cfg, top k) for TTS models, Rife v4\
-*update 10.52*: updated plugin list and added version tracking\
+*update 10.52*: updated Plugin list and added version tracking\
 *update 10.53*: video/audio galleries now support deletions\
 *update 10.54*: added Z Image Base, prompt enhancers improvements, configurable loras root folder\
 *update 10.55*: blocked Sage with Z Image on RTX30xx and added override attention mode settings, allowed changing config during generation\
@@ -768,7 +768,7 @@ WanGP comes again to the rescue:
 
 - **GGUF support**: as some of you know, I am not a big fan of this format because when used with image / video generative models we don't get any speed boost (matrices multiplications are still done at 16 bits), VRAM savings are small and quality is worse than with int8/fp8. Still gguf has one advantage: it consumes less RAM and harddrive space. So enjoy gguf support. I have added ready to use *Kijai gguf finetunes* for *LTX-2*.
 
-- **Models Manager PlugIn**: use this *Plugin* to identify how much space is taken by each *model* / *finetune* and delete the ones you no longer use. Try to avoid deleting shared files otherwise they will be downloaded again.  
+- **Models Manager Plugin**: use this *Plugin* to identify how much space is taken by each *model* / *finetune* and delete the ones you no longer use. Try to avoid deleting shared files otherwise they will be downloaded again.
 
 - **LTX-2 Dual Video & Audio Control**: you no longer need to extract the audio track of a *Control Video* if you want to use it as well to drive the video generation. New mode will allow you to use both motion and audio from Video Control.
 
@@ -986,7 +986,7 @@ Please note Hunyuan v1 Loras are not compatible since the latent space is differ
 ### November 21 2025: WanGP v9.52, And there was motion
 
 In this release WanGP turns you into a Motion Master:
-- **Motion Designer**: this new preinstalled home made Graphical Plugin will let you design trajectories for *Vace* and for *Wan 2.2 i2v Time to Move*. 
+- **Motion Designer**: this new preinstalled home made Graphical Plugin will let you design trajectories for *Vace* and for *Wan 2.2 i2v Time to Move*.
 
 - **Vace Motion**: this is a less known feature of the almighty *Vace* (this was last Vace feature not yet implemented in WanGP), just put some moving rectangles in your *Control Video* (in Vace raw format) and you will be able to move around people / objects or even the camera. The *Motion Designer* will let you create these trajectories in only a few clicks.
 
@@ -1031,7 +1031,7 @@ In this release WanGP turns you into a Motion Master:
 
 This finetune loves long prompts. Therefore to increase the prompt readability WanGP supports now multilines prompts (in option).
 
-*update 9.35*: Added a Sample PlugIn App that shows how to collect and modify settings from a PlugIn\
+*update 9.35*: Added a Sample App that shows how to collect and modify settings from a Plugin\
 *update 9.37*: Added i2v Enhanced Lightning
 
 ### October 29 2025: WanGP v9.21, Why isn't all my VRAM used ?
@@ -1077,7 +1077,7 @@ Upgraded Features:
 Huge Kudos & Thanks to **Tophness** that has outdone himself with these Great Features:
 - **Multicolors Queue** items with **Drag & Drop** to reorder them
 - **Edit a Gen Request** that is already in the queue
-- Added **Plugin support** to WanGP : found that features are missing in WanGP, you can now add tabs at the top in WanGP. Each tab may contain a full embedded App that can share data with the Video Generator of WanGP. Please check the Plugin guide written by Tophness and don't hesitate to contact him or me on the Discord if you have a plugin you want to share. I have added a new Plugins channels to discuss idea of plugins and help each other developing plugins. *Idea for a PlugIn that may end up popular*: a screen where you view the hard drive space used per model and that will let you remove unused models weights
+- Added **Plugin support** to WanGP : found that features are missing in WanGP, you can now add tabs at the top in WanGP. Each tab may contain a full embedded App that can share data with the Video Generator of WanGP. Please check the Plugin guide written by Tophness and don't hesitate to contact him or me on the Discord if you have a Plugin you want to share. I have added a new Plugins channels to discuss idea of Plugins and help each other developing Plugins. *Idea for a Plugin that may end up popular*: a screen where you view the hard drive space used per model and that will let you remove unused models weights
 - Two Plugins ready to use designed & developped by **Tophness**: an **Extended Gallery** and a **Lora multipliers Wizard**
 
 WanGP v9 is now targetting Pytorch 2.8 although it should still work with 2.7, don't forget to upgrade by doing:
@@ -1360,7 +1360,7 @@ While waiting for Wan 2.2, you will appreciate the model selection hierarchy whi
 I am really convinced that Vace can do everything the other models can do and in a better way especially as Vace can be combined with Multitalk.
 
 Here are some new Vace improvements:
-- I have provided a default finetune named *Vace Cocktail*  which is a model created on the fly using the Wan text 2 video model and the Loras used to build FusioniX. The weight of the *Detail Enhancer* Lora has been reduced to improve identity preservation. Copy the model definition in *defaults/vace_14B_cocktail.json* in the *finetunes/* folder to change the Cocktail composition. Cocktail contains already some Loras acccelerators so no need to add on top a Lora Accvid, Causvid or Fusionix, ... . The whole point of Cocktail is to be able  to build you own FusioniX (which originally is a combination of 4 loras) but without the inconvenient of FusioniX.
+- I have provided a default finetune named *Vace Cocktail*  which is a model created on the fly using the Wan text 2 video model and the Loras used to build FusioniX. The weight of the *Detail Enhancer* Lora has been reduced to improve identity preservation. Copy the model definition in *defaults/vace_14B_cocktail.json* in the *finetunes/* folder to change the Cocktail composition. Cocktail contains already some Loras acccelerators so no need to plugin top a Lora Accvid, Causvid or Fusionix, ... . The whole point of Cocktail is to be able  to build you own FusioniX (which originally is a combination of 4 loras) but without the inconvenient of FusioniX.
 - Talking about identity preservation, it tends to go away when one generates a single Frame instead of a Video which is shame for our Vace photoshop. But there is a solution : I have added an Advanced Quality option, that tells WanGP to generate a little more than a frame (it will still keep only the first frame). It will be a little slower but you will be amazed how Vace Cocktail combined with this option will preserve identities (bye bye *Phantom*). 
 - As in practise I have observed one switches frequently between *Vace text2video* and *Vace text2image* I have put them in the same place they are now just one tab away, no need to reload the model. Likewise *Wan text2video* and *Wan tex2image* have been merged.
 - Color fixing when using Sliding Windows. A new postprocessing *Color Correction* applied automatically by default (you can disable it in the *Advanced tab Sliding Window*) will try to match the colors of the new window with that of the previous window. It doesnt fix all the unwanted artifacts of the new window but at least this makes the transition smoother. Thanks to the multitalk team for the original code.

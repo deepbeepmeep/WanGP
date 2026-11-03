@@ -29,6 +29,7 @@ from diffusers.models.upsampling import Upsample2D
 from diffusers.utils import is_torch_version
 from diffusers.utils.accelerate_utils import apply_forward_hook
 from einops import rearrange
+from mmgp import transfer
 from shared.attention import pay_attention
 from tqdm import tqdm
 from ....common.half_precision_fixes import safe_pad_operation, safe_interpolate_operation
@@ -1716,7 +1717,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                         pending_rows = decoded_tile.new_empty((*decoded_tile.shape[:3], h_out - next_y, output_w))
                     pending_rows[..., x_out:x_out + next_x].copy_(decoded_tile[:, :, :, next_y:, :next_x])
                 final = decoded_tile[:, :, :, :next_y, :next_x].div_(count[:, :, :, y_out:y_out + next_y, x_out:x_out + next_x].clamp(min=1e-6))
-                result[:, :, : decoded_tile.shape[2], y_out:y_out + next_y, x_out:x_out + next_x].copy_(final)
+                transfer.copy_(result[:, :, : decoded_tile.shape[2], y_out:y_out + next_y, x_out:x_out + next_x], final)  # (to RAM, without a GPU copy of the tile)
                 final = decoded_tile = None
 
         if z.shape[2] == 1:  # single frame

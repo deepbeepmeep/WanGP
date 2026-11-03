@@ -186,8 +186,8 @@ class Residency:
     def prepare(self, grow_only=False):
         """At a model/cycle boundary, after the ordinary preload has priority."""
         self.thread = threading.get_ident()
-        if self.changing:
-            return
+        if self.changing or cuda_graphs.recording() or torch.cuda.is_current_stream_capturing():
+            return  # never inside a graph capture (a decoding pass of a model called as a module): its next eager call places them
         if not self._nonexperts_resident():
             self.unload(reset=False)
             return

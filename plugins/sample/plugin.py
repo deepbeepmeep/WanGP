@@ -10,7 +10,7 @@ from shared.gradio.strip_gallery import gradio_file_url
 from shared.utils.plugins import WAN2GPPlugin
 from shared.utils.process_locks import acquire_GPU_ressources, any_GPU_process_running, release_GPU_ressources
 
-PlugIn_Name = "Sample Plugin"
+PlugIn_Name = "Sample App"
 PlugIn_Id = "SamplePlugin"
 Deepy_Request = "add a red hat and then generate a 5s video of the person singing"
 # The button keeps its label on one line; the box beside it holds the video link once Deepy has made it.
@@ -21,7 +21,7 @@ Deepy_Link_Placeholder = Deepy_Style + '<div class="sample-deepy-link"><span>The
 def acquire_GPU(state):
     GPU_process_running = any_GPU_process_running(state, PlugIn_Id)
     if GPU_process_running:
-        gr.Error("Another PlugIn is using the GPU")
+        gr.Error("Another Plugin is using the GPU")
     acquire_GPU_ressources(state, PlugIn_Id, PlugIn_Name, gr=gr)
 
 
@@ -163,7 +163,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             state = self.state
             settings = self.get_current_model_settings(state.value)
             prompt = settings["prompt"]
-            gr.HTML("<B><B>Sample Plugin that illustrates</B>:<BR>-How to get Settings from Main Form and then Modify them<BR>-How to suspend the Video Gen (and release VRAM) to execute your own GPU intensive process.<BR>-How to switch back automatically to the Main Tab<BR>-How to trigger a Video Gen from a plugin an track its progress<BR>-How to ask Deepy to work on the selected picture and get its video back<BR>-Add a new finetune on the fly")
+            gr.HTML("<B><B>Sample App that illustrates</B>:<BR>-How to get Settings from Main Form and then Modify them<BR>-How to suspend the Video Gen (and release VRAM) to execute your own GPU intensive process.<BR>-How to switch back automatically to the Main Tab<BR>-How to trigger a Video Gen from a Plugin and track its progress<BR>-How to ask Deepy to work on the selected picture and get its video back<BR>-Add a new finetune on the fly")
             sample_text = gr.Text(label="Prompt Copy", value=prompt, lines=5)
             update_btn = gr.Button("Update Prompt On Main Page")
             gr.Markdown()

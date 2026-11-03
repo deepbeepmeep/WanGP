@@ -64,6 +64,7 @@ class family_handler:
                 "mesh_outputs": True,
                 "mesh_postprocessing": False,  # segmented meshes: their parts would merge
                 "device_explicit": True,
+                "no_model_swap": True,  # one managed model: kept loaded between samples and queued tasks of the same model
                 "image_prompt_types_allowed": "",
                 "prompt_description": "Asset Name / Description (optional, used for file names)",
                 "prompt_optional": True,  # the prompt only names the output files

@@ -7,6 +7,16 @@ SPEAKER_LINE_PATTERN = re.compile(r"^([ \t]*)Speaker[ \t]*(\d+)[ \t]*:[ \t]*", r
 SPEAKER_PATTERN = re.compile(r"Speaker\s*(\d+)\s*:\s*", re.IGNORECASE)
 
 
+def parse_speaker_names(text):
+    """The names given to Speaker 1, 2... in that order, separated by commas or lines; an empty entry keeps "Speaker N"."""
+    return [name.replace(":", "").strip() for name in re.split(r"[,\n]", text)]
+
+
+def speaker_label(number, names):
+    """The label of Speaker `number` (from 1): its name when one was given."""
+    return names[number - 1] if number <= len(names) and names[number - 1] else f"Speaker {number}"
+
+
 def parse_dialogue(text, speaker_count, *, line_labels=False, canonical_ids=False):
     """Return zero-based (speaker, text) turns. Continuations belong to the preceding label.
 

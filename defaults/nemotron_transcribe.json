@@ -1,0 +1,30 @@
+{
+    "model": {
+        "name": "Transcription Nemotron 3.5 Transcribe 30B-A4B INT8 Experts",
+        "architecture": "nemotron_transcribe",
+        "description": "Transcribes an audio or video recording into text that says who spoke and when, with word timings and subtitles, or translates it to or from English; offline, in 40 languages, for recordings of up to an hour. This variant gives the reference accuracy for high-end PCs (about 33 GB of files, 64 GB of RAM recommended). Speaker numbers tell the voices of one recording apart; they do not identify people.",
+        "size": "large",
+        "URLs": [
+            "https://huggingface.co/DeepBeepMeep/Nemotron/resolve/main/NemotronTranscribe_30B_A4B_lm_bf16.safetensors",
+            "https://huggingface.co/DeepBeepMeep/Nemotron/resolve/main/NemotronTranscribe_30B_A4B_lm_int8_convrot.safetensors"
+        ],
+        "preload_URLs": [
+            "https://huggingface.co/DeepBeepMeep/Nemotron/resolve/main/NemotronTranscribe_30B_A4B_experts_int8_convrot.safetensors"
+        ]
+    },
+    "prompt": "# Optional context terms, e.g. Dr. Amara Okafor, Kubernetes, etcd (lines starting with # are ignored)",
+    "audio_prompt_type": "A",
+    "model_mode": 0,
+    "custom_settings": {
+        "speakers": 1,
+        "speaker_names": "",
+        "word_timestamps": 1,
+        "style": "verbatim",
+        "target_language": "English",
+        "output": "audio"
+    },
+    "num_inference_steps": 1,
+    "guidance_scale": 1.0,
+    "video_length": 0,
+    "prompt_enhancer": ""
+}

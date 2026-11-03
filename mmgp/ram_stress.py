@@ -1,11 +1,12 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 """A PC with less RAM simulated under real memory pressure: a helper process locks RAM until the system has only what such a PC would leave
-available (RAM_OVERHEAD_GB used by the system and other programs beside this process when it starts), and psutil reports that PC's total
-RAM, as MMGP reads it at import: MMGP plans as there, and the system trims and pages as there. The helper keeps its RAM locked until this
-process ends (it waits for the end of its stdin, a pipe from this process). The other programs have less RAM too: while the available RAM
-stays under SAFETY_GB for 10 s, the helper gives back 1 GiB.
+available (what the system and other programs use beside this process when it starts: RAM_OVERHEAD_GB unless given), and psutil reports
+that PC's total RAM, as MMGP reads it at import: MMGP plans as there, and the system trims and pages as there. The helper keeps its RAM
+locked until this process ends (it waits for the end of its stdin, a pipe from this process). The other programs have less RAM too: while
+the available RAM stays under SAFETY_GB for 10 s, the helper gives back 1 GiB.
 
-    from mmgp import ram_stress; ram_stress.start(32)    # before mmgp.offload is imported (WanGP: --ram-stress 32)
+    from mmgp import ram_stress; ram_stress.start(32)       # before mmgp.offload is imported (WanGP: --ram-stress 32)
+    from mmgp import ram_stress; ram_stress.start(64, 2.5)  # 2.5 GB used by the system and other programs (WanGP: --ram-stress 64:2.5)
 
 Linux needs the right to lock that much memory (ulimit -l)."""
 import ctypes
@@ -22,14 +23,17 @@ SAFETY_GB = 1
 state = {}  # total (bytes), helper (process) once started
 
 
-def start(ram_gb):
-    """Simulates a PC with ram_gb (GiB) of RAM, before mmgp.offload reads the RAM at import."""
+def start(ram_gb, others_gb=None):
+    """Simulates a PC with ram_gb (GiB) of RAM, of which the system and other programs use others_gb (RAM_OVERHEAD_GB by default), before
+    mmgp.offload reads the RAM at import."""
     import psutil
     if state:
         raise RuntimeError("The RAM stress is already started.")
+    others = RAM_OVERHEAD_GB if others_gb is None else float(others_gb)
     total = int(float(ram_gb) * GB)
-    target = total - int(RAM_OVERHEAD_GB * GB) - psutil.Process().memory_info().rss
-    print(f"[MMGP] RAM stress: locking {max(0, psutil.virtual_memory().available - target) / GB:.0f} GiB of RAM for a {float(ram_gb):g} GB PC...", flush=True)
+    target = total - int(others * GB) - psutil.Process().memory_info().rss
+    print(f"[MMGP] RAM stress: locking {max(0, psutil.virtual_memory().available - target) / GB:.0f} GiB of RAM for a {float(ram_gb):g} GB PC "
+          f"({others:g} GB used by the system and other programs)...", flush=True)
     helper = hold(target)
     state.update(total=total, helper=helper)
     real_virtual_memory = psutil.virtual_memory

@@ -3,6 +3,16 @@ cd /d "%~dp0.."
 setlocal enabledelayedexpansion
 title WanGP
 
+if exist "..\.manager\installation.json" goto MANAGED
+if exist "..\.manager\active_operation.json" goto MANAGED
+goto LEGACY
+
+:MANAGED
+python -m installation launch --installation ".." -- %*
+exit /b %errorlevel%
+
+:LEGACY
+
 if not exist "envs.json" (
     echo [!] No environments data found. Please run install.bat first or add your existing environment with manage.bat if you already have one.
     pause

@@ -36,7 +36,6 @@ class FinetuneEditorDeps:
     families_infos: dict
     transformer_types: list
     displayed_model_types: list
-    three_levels_hierarchy: bool
     get_model_def: Callable
     get_model_name: Callable
     get_base_model_type: Callable

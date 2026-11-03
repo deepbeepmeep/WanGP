@@ -51,13 +51,16 @@ class HybridService(DeepyService):
         self.gallery_revision = 0
         self.settings_revision = 0
         self.preview_revision = 0
+        # Model lists mark downloaded models: rebuilt in every page only after a transfer completed.
+        self.models_revision = 0
+        self._published_models_revision = 0
+        self._models_download = state['gen'].get('download_progress_completed')
         self._preview_image = None
         self._settings_signature = None
         self._catalog_revision = 0
         self._model_forms = {}
         self._model_forms_lock = threading.Lock()
         self._queue_worker = None
-        self._queue_updates = (None, None, None)
         self._queue_revision = 0
         self._gallery_update = None
         self.autoloaded_queue = False
@@ -201,7 +204,7 @@ class HybridService(DeepyService):
                         gen['current_gallery_source'] = gen['last_gallery_source']
                     # (files of every gallery, selections, active gallery, settings identities, gallery size limit)
                     signature = (tuple(tuple(gen[source.files_key]) for source in GALLERY_SOURCES), tuple(gen[source.selected_key] for source in GALLERY_SOURCES), gen['current_gallery_source'], tuple(tuple(map(id, list.__iter__(gen[source.settings_key]))) for source in GALLERY_SOURCES), self._deps.get_server_config().get('clear_file_list', 5))
-                    gallery_view = (signature, self.generation_running, self._gallery_update)
+                    gallery_view = (signature, self.generation_running, self._gallery_update, tuple(map(id, gen['queue'])))  # the page refresh also renders the queue
                     settings = (json.dumps(self._session.tool_ui_settings, sort_keys=True), self._session.storage_session_id, self._session.storage_title, self._catalog_revision)
                     changed = False
                     preview = gen.get('preview')
@@ -223,16 +226,22 @@ class HybridService(DeepyService):
                         self._settings_signature = settings
                         self.settings_revision += 1
                         changed = True
+                    if self.models_revision != self._published_models_revision:
+                        self._published_models_revision = self.models_revision
+                        changed = True
                     if changed:
-                        self.publish('host_view', {'gallery': self.gallery_revision, 'settings': self.settings_revision, 'preview': self.preview_revision})
+                        self.publish('host_view', self.host_view())
             except Exception:
                 traceback.print_exc()
                 self.publish_error('Could not synchronize the Gradio view.')
 
+    def host_view(self):
+        return {'gallery': self.gallery_revision, 'settings': self.settings_revision, 'preview': self.preview_revision, 'models': self.models_revision}
+
     def snapshot(self):
         result = super().snapshot()
         result['hybrid'] = True
-        result['host_view'] = {'gallery': self.gallery_revision, 'settings': self.settings_revision, 'preview': self.preview_revision}
+        result['host_view'] = self.host_view()
         result['forms'] = self.forms.revisions()
         result['generation_state'] = self.generation_view()
         return result
@@ -270,7 +279,6 @@ class HybridService(DeepyService):
     def start_generation(self):
         with self._mutation_lock:
             if self._queue_worker is None and self._state['gen']['queue']:
-                self._queue_updates = (None, None, None)
                 self._queue_worker = threading.Thread(target=self._run_generation, name='WanGP generation service', daemon=True)
                 self._queue_worker.start()
             return self._queue_worker
@@ -284,7 +292,6 @@ class HybridService(DeepyService):
         try:
             for updates in self._process_queue(self._state):
                 with self._condition:
-                    self._queue_updates = updates
                     self._queue_revision += 1
                     # Only output-trigger timestamps request a gallery/details
                     # refresh. Preview frames yield an empty Text component here.
@@ -309,6 +316,7 @@ class HybridService(DeepyService):
                     self._active_generation_client_id = ''
                     self._condition.notify_all()
                 self._generation_event('exit', None)
+                self._refresh_models()  # files of failed or cancelled loads, and other assets
                 self.host_changed()
         # Tasks loaded after this worker emptied its queue went to a new list it never read.
         if self._state['gen']['queue'] is not queue:
@@ -322,11 +330,21 @@ class HybridService(DeepyService):
             self._generation_event(command, data)
         elif command == 'output':
             self.host_changed()
+        elif command == 'refresh_models':
+            self._refresh_models()
+
+    def _refresh_models(self):
+        download = self._state['gen'].get('download_progress_completed')
+        if download is not self._models_download:
+            self._models_download = download
+            self.models_revision += 1
+            self.host_changed()
 
     def load_inline_queue(self):
         """Admit API submissions into the live queue without a browser request or waiting for running work."""
         self._deps.load_queue_action(None, self._state, SimpleNamespace(target=1))
         self.start_generation()
+        self.host_changed()  # every page lists the new tasks, also behind a running generation
 
     def _process_inline_queue(self, payload=None):
         self._deps.load_queue_action(None, self._state, SimpleNamespace(target=1))
@@ -344,12 +362,11 @@ class HybridService(DeepyService):
                 self._condition.wait_for(lambda: self._queue_revision != revision or self._queue_worker is not worker, timeout=1)
                 changed = self._queue_revision != revision
                 revision = self._queue_revision
-                updates = self._queue_updates
                 finished = self._queue_worker is not worker
             if changed:
-                # Shared view revisions deliver galleries and previews to every
-                # page. Do not refresh them a second time in the initiating page.
-                yield gr.update(), gr.update(), gr.update() if updates[2] is None else updates[2]
+                # Shared view revisions deliver galleries, previews and model lists
+                # to every page. Do not refresh them a second time in the initiating page.
+                yield gr.update(), gr.update(), gr.update()
             if finished:
                 break
 
@@ -368,20 +385,14 @@ class HybridService(DeepyService):
             self._host_worker.join(5)
 
     @asynccontextmanager
-    async def lifespan(self, app, *, auth=None, voice_language=None, https_port=None):
+    async def lifespan(self, app, *, base_url, auth=None, voice_language=None, https_port=None):
         from shared.deepy.server import create_app
-        from shared.utils.plugins import get_plugin_web_apps
+        from shared.utils.plugin_navigation import mount_web_apps
         from starlette.concurrency import run_in_threadpool
         app.mount('/deepy', create_app(self, auth=auth, voice_language=voice_language, https_port=https_port))
         from shared.apps import server as apps_server
         apps_server.mount(app, auth.public_url if auth is not None else None)
-        for web_app in get_plugin_web_apps():
-            try:
-                app.mount(web_app.path, web_app.factory())
-                print(f"Plugin web app: {web_app.path}/ ({web_app.plugin_id})")
-            except Exception:
-                print(f"[Plugins] Could not start the web app of plugin '{web_app.plugin_id}':")
-                traceback.print_exc()
+        mount_web_apps(app, base_url)
         try:
             await run_in_threadpool(self._deps.load_queue_action, None, self._state, SimpleNamespace(target=None))
             self.start_generation()
@@ -414,7 +425,8 @@ def launch_gradio(demo, service, args, **kwargs):
         demo.run_startup_events()
         await demo.run_extra_startup_events()
         app.startup_events_triggered = True
-        async with service.lifespan(app, auth=auth, voice_language=args.deepy_voice_language, https_port=https_port):
+        base_url = auth.public_url or f'{"https" if cert else "http"}://{host}:{https_port or port}'
+        async with service.lifespan(app, base_url=base_url, auth=auth, voice_language=args.deepy_voice_language, https_port=https_port):
             # Agents start after the saved queue has been restored.
             if args.mcp_webui:
                 threading.Thread(target=mcp_server.run, name='WanGP MCP server', daemon=True).start()
@@ -425,7 +437,8 @@ def launch_gradio(demo, service, args, **kwargs):
     from shared.authentication.tls import HTTPSRedirect
     from shared.gradio.proxy_public_url import PublicURLMiddleware
     from shared.apps.server import AppFrameGuard
-    middleware = [Middleware(AppFrameGuard), Middleware(WebAuthMiddleware, auth=auth)]
+    from shared.utils.plugin_navigation import AddonNavigationMiddleware
+    middleware = [Middleware(AppFrameGuard), Middleware(WebAuthMiddleware, auth=auth), Middleware(AddonNavigationMiddleware)]
     if auth.public_url is not None:
         middleware.insert(0, Middleware(PublicURLMiddleware, public_url=auth.public_url))
     if https_port is not None:

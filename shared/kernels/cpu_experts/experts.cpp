@@ -1,8 +1,10 @@
 // Copyright (c) 2026 DeepBeepMeep - WanGP Community License 2.0 (see LICENSE.txt)
-// Routed SwiGLU experts on the CPU: float32 activations and accumulation, weights read from their checkpoint storage (no copies).
-// Formats: FP8 E4M3FN with float32 scales per 128x128 block, and symmetric INT4 (two values per byte, the even column in the low
-// nibble, offset by 8) with FP16 scales per group of input columns. An optional ConvRot rotation (a regular Hadamard transform of each
-// group of input features, applied to the weights before quantization) is applied to the activations of both projections.
+// Routed experts on the CPU: float32 activations and accumulation, weights read from their checkpoint storage (no copies).
+// Activations: SwiGLU (gate then up rows in w13) or squared ReLU (up rows only in w13).
+// Formats: FP8 E4M3FN with float32 scales per block x block tile, symmetric INT4 (two values per byte, the even column in the low
+// nibble, offset by 8) with FP16 scales per group of input columns, and INT8 rows with a float32 scale per row. The scale block of
+// w13 and of w2 may differ. An optional ConvRot rotation (a regular Hadamard transform of each group of input features, applied to the
+// weights before quantization) is applied to the activations of both projections.
 #include <immintrin.h>
 #include <cstdint>
 #include <cstring>
@@ -23,7 +25,8 @@ __asm__(".symver expf,expf@GLIBC_2.2.5");
 #endif
 #endif
 
-enum { FP8_BLOCK = 0, INT4_GROUP = 1 };
+enum { FP8_BLOCK = 0, INT4_GROUP = 1, INT8_ROWS = 2 };
+enum { SWIGLU = 0, RELU2 = 1 };
 
 #ifdef _WIN32
 static std::vector<DWORD_PTR> worker_cpus() {
@@ -116,6 +119,27 @@ struct Int4Group {
     static size_t scale_row(int row, int cols, int block) { return size_t(row) * (cols / block); }
 };
 
+struct Int8Rows {
+    using ScaleT = float;
+    struct Row {
+        const uint8_t* p;
+        void operator()(int k, __m256 (&w)[4]) const {
+            __m256i v = _mm256_loadu_si256((const __m256i*)(p + k));
+            __m128i lo = _mm256_castsi256_si128(v), hi = _mm256_extracti128_si256(v, 1);
+            w[0] = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo));
+            w[1] = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo, 8)));
+            w[2] = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi));
+            w[3] = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi, 8)));
+        }
+    };
+    struct Scale { const float* p; float operator[](int g) const { return p[g]; } };
+    static size_t row_bytes(int cols) { return cols; }
+    // One scale per row: the block is the row width
+    static size_t scale_row(int row, int cols, int block) { return size_t(row) * (cols / block); }
+};
+
+static inline float activate_relu2(float v) { v = v > 0.f ? v : 0.f; return v * v; }
+
 template <class F>
 static inline void decode_row(const uint8_t* w, float* out, int cols) {
     typename F::Row row{w};
@@ -181,12 +205,13 @@ static void rotate(float* v, int features, int n) {
 
 // ids: int32 [batch, topk]. An id of -1, or one marked in resident (uint8 per expert, may be null), is computed elsewhere.
 // Returns the number of (token, expert) pairs computed here, or a negative error; out is left unwritten when there are none.
+// block: the scale block of w13 (input columns h), block2 that of w2 (input columns i).
 template <class F>
 static int moe_forward_format(const uint8_t* w13, const uint8_t* w2, const typename F::ScaleT* s13, const typename F::ScaleT* s2,
                               const float* x, const int32_t* ids, const float* probabilities, const uint8_t* resident, float* out,
-                              int batch, int h, int i, int e, int topk, int block, int threads, int rotation) {
+                              int batch, int h, int i, int e, int topk, int block, int block2, int threads, int rotation, int act) {
     using Row = typename F::Row; using Scale = typename F::Scale;
-    const int pairs = batch * topk;
+    const int pairs = batch * topk, projections = act == SWIGLU ? 2 : 1;
     // Plain arrays rather than std::vector, whose GCC 11+ code needs a recent libstdc++
     try {
         std::unique_ptr<int[]> active(new int[pairs]);
@@ -212,7 +237,7 @@ static int moe_forward_format(const uint8_t* w13, const uint8_t* w2, const typen
         const float* xs = rotation ? rotated.get() : x;
         // Per expert: weight bytes and scales of the gate (then up) projection and of the down projection
         const size_t gate_bytes = size_t(i) * F::row_bytes(h), down_bytes = size_t(h) * F::row_bytes(i);
-        const size_t gate_scales = F::scale_row(i, h, block), down_scales = F::scale_row(h, i, block);
+        const size_t gate_scales = F::scale_row(i, h, block), down_scales = F::scale_row(h, i, block2);
 #ifdef _WIN32
         static const auto cpus = worker_cpus();
 #endif
@@ -233,8 +258,12 @@ static int moe_forward_format(const uint8_t* w13, const uint8_t* w2, const typen
                 #pragma omp for schedule(static)
                 for (int task = 0; task < count * i; ++task) {
                     int pair = active[task / i], row = task % i; size_t id = ids[pair];
-                    auto w = w13 + id * gate_bytes * 2; auto s = s13 + id * gate_scales * 2;
+                    auto w = w13 + id * gate_bytes * projections; auto s = s13 + id * gate_scales * projections;
                     const float* input = xs + size_t(pair / topk) * h;
+                    if (act == RELU2) {
+                        mid[task] = activate_relu2(dot(Row{w + row * F::row_bytes(h)}, input, Scale{s + F::scale_row(row, h, block)}, h, block));
+                        continue;
+                    }
                     float gate, up;
                     dot2(Row{w + row * F::row_bytes(h)}, Row{w + gate_bytes + row * F::row_bytes(h)}, input, Scale{s + F::scale_row(row, h, block)},
                          Scale{s + gate_scales + F::scale_row(row, h, block)}, h, block, &gate, &up);
@@ -246,9 +275,19 @@ static int moe_forward_format(const uint8_t* w13, const uint8_t* w2, const typen
                 #pragma omp for schedule(dynamic, 16)
                 for (int task = 0; task < groups * i; ++task) {
                     int group = task / i, row = task % i, first = starts[group]; size_t id = ids[order[first]];
-                    auto w = w13 + id * gate_bytes * 2; auto s = s13 + id * gate_scales * 2;
+                    auto w = w13 + id * gate_bytes * projections; auto s = s13 + id * gate_scales * projections;
                     Scale s0{s + F::scale_row(row, h, block)}, s1{s + gate_scales + F::scale_row(row, h, block)};
                     float gate, up;
+                    if (act == RELU2) {
+                        if (starts[group + 1] - first == 1) {
+                            mid[size_t(first)*i + row] = activate_relu2(dot(Row{w + row * F::row_bytes(h)}, xs + size_t(order[first] / topk) * h, s0, h, block));
+                            continue;
+                        }
+                        decode_row<F>(w + row * F::row_bytes(h), rows, h);
+                        for (int k = first; k < starts[group + 1]; ++k)
+                            mid[size_t(k)*i + row] = activate_relu2(dot(FloatRow{rows}, xs + size_t(order[k] / topk) * h, s0, h, block));
+                        continue;
+                    }
                     if (starts[group + 1] - first == 1) {  // an expert of one token reads its rows directly
                         dot2(Row{w + row * F::row_bytes(h)}, Row{w + gate_bytes + row * F::row_bytes(h)}, xs + size_t(order[first] / topk) * h, s0, s1, h, block, &gate, &up);
                         mid[size_t(first)*i + row] = (gate / (1.f + std::exp(-gate))) * up;
@@ -271,22 +310,22 @@ static int moe_forward_format(const uint8_t* w13, const uint8_t* w2, const typen
                 for (int task = 0; task < count * h; ++task) {
                     int slot = task / h, pair = active[slot], row = task % h; size_t id = ids[pair];
                     values[size_t(pair)*h + row] = dot(Row{w2 + id*down_bytes + row * F::row_bytes(i)}, mid.get() + size_t(slot)*i,
-                                                       Scale{s2 + id*down_scales + F::scale_row(row, i, block)}, i, block);
+                                                       Scale{s2 + id*down_scales + F::scale_row(row, i, block2)}, i, block2);
                 }
             } else {
                 float* down = scratch.get() + size_t(omp_get_thread_num()) * (2 * h + i) + 2 * h;
                 #pragma omp for schedule(dynamic, 16)
                 for (int task = 0; task < groups * h; ++task) {
                     int group = task / h, row = task % h, first = starts[group]; size_t id = ids[order[first]];
-                    Scale scale{s2 + id*down_scales + F::scale_row(row, i, block)};
+                    Scale scale{s2 + id*down_scales + F::scale_row(row, i, block2)};
                     const uint8_t* weights = w2 + id*down_bytes + row * F::row_bytes(i);
                     if (starts[group + 1] - first == 1) {
-                        values[size_t(order[first])*h + row] = dot(Row{weights}, mid.get() + size_t(first)*i, scale, i, block);
+                        values[size_t(order[first])*h + row] = dot(Row{weights}, mid.get() + size_t(first)*i, scale, i, block2);
                         continue;
                     }
                     decode_row<F>(weights, down, i);
                     for (int k = first; k < starts[group + 1]; ++k)
-                        values[size_t(order[k])*h + row] = dot(FloatRow{down}, mid.get() + size_t(k)*i, scale, i, block);
+                        values[size_t(order[k])*h + row] = dot(FloatRow{down}, mid.get() + size_t(k)*i, scale, i, block2);
                 }
             }
             #pragma omp for schedule(static)
@@ -306,17 +345,23 @@ static int moe_forward_format(const uint8_t* w13, const uint8_t* w2, const typen
     } catch (...) { return -3; }
 }
 
-// format: FP8_BLOCK (E4M3FN weights, float32 scales) or INT4_GROUP (packed weights, FP16 scales); block: the scale block (FP8) or
-// group (INT4) size, a multiple of 32 dividing h and i; rotation: the ConvRot group (a power of 4 dividing h and i) or 0.
-API int moe_forward(int format, int rotation, const uint8_t* w13, const uint8_t* w2, const void* s13, const void* s2,
+// format: FP8_BLOCK (E4M3FN weights, float32 scales), INT4_GROUP (packed weights, FP16 scales) or INT8_ROWS (int8 weights, float32
+// scales per row); block / block2: the scale block (FP8), group (INT4) or row width (INT8) of w13 / w2, multiples of 32 dividing their
+// input columns h / i (FP8 tiles also divide the rows: i and h); rotation: the ConvRot group (a power of 4 dividing h and i) or 0;
+// act: SWIGLU (w13 = gate then up, 2 * i rows) or RELU2 (w13 = up, i rows).
+API int moe_forward(int format, int rotation, int act, const uint8_t* w13, const uint8_t* w2, const void* s13, const void* s2,
                     const float* x, const int32_t* ids, const float* probabilities, const uint8_t* resident, float* out,
-                    int batch, int h, int i, int e, int topk, int block, int threads) {
-    if (batch < 0 || h <= 0 || i <= 0 || e <= 0 || topk <= 0 || block <= 0 || block % 32 || h % block || i % block || threads <= 0) return -1;
+                    int batch, int h, int i, int e, int topk, int block, int block2, int threads) {
+    if (batch < 0 || h <= 0 || i <= 0 || e <= 0 || topk <= 0 || block <= 0 || block2 <= 0 || block % 32 || block2 % 32 || h % block || i % block2 || threads <= 0) return -1;
+    if (format == FP8_BLOCK && (i % block || h % block2)) return -1;
+    if (act != SWIGLU && act != RELU2) return -1;
     if (rotation && (rotation < 4 || (rotation & (rotation - 1)) || !(rotation & 0x55555555) || h % rotation || i % rotation)) return -1;
     if (format == FP8_BLOCK)
-        return moe_forward_format<Fp8Block>(w13, w2, (const float*)s13, (const float*)s2, x, ids, probabilities, resident, out, batch, h, i, e, topk, block, threads, rotation);
+        return moe_forward_format<Fp8Block>(w13, w2, (const float*)s13, (const float*)s2, x, ids, probabilities, resident, out, batch, h, i, e, topk, block, block2, threads, rotation, act);
     if (format == INT4_GROUP)
-        return moe_forward_format<Int4Group>(w13, w2, (const uint16_t*)s13, (const uint16_t*)s2, x, ids, probabilities, resident, out, batch, h, i, e, topk, block, threads, rotation);
+        return moe_forward_format<Int4Group>(w13, w2, (const uint16_t*)s13, (const uint16_t*)s2, x, ids, probabilities, resident, out, batch, h, i, e, topk, block, block2, threads, rotation, act);
+    if (format == INT8_ROWS)
+        return moe_forward_format<Int8Rows>(w13, w2, (const float*)s13, (const float*)s2, x, ids, probabilities, resident, out, batch, h, i, e, topk, block, block2, threads, rotation, act);
     return -4;
 }
 
@@ -327,7 +372,7 @@ API int moe_forward(int format, int rotation, const uint8_t* w13, const uint8_t*
 struct MoeJob {
     const uint8_t* w13; const uint8_t* w2; const void* s13; const void* s2;
     const int32_t* payload; const uint8_t* resident; float* out;
-    int32_t format, rotation, batch, h, i, e, topk, block, threads, status;
+    int32_t format, rotation, act, batch, h, i, e, topk, block, block2, threads, status;
 };
 
 API void moe_host_job(void* data) {
@@ -335,8 +380,8 @@ API void moe_host_job(void* data) {
     const float* x = (const float*)j->payload;
     const float* probabilities = x + size_t(j->batch) * j->h;
     const int32_t* ids = j->payload + size_t(j->batch) * (j->h + j->topk);
-    int count = moe_forward(j->format, j->rotation, j->w13, j->w2, j->s13, j->s2, x, ids, probabilities, j->resident, j->out,
-                            j->batch, j->h, j->i, j->e, j->topk, j->block, j->threads);
+    int count = moe_forward(j->format, j->rotation, j->act, j->w13, j->w2, j->s13, j->s2, x, ids, probabilities, j->resident, j->out,
+                            j->batch, j->h, j->i, j->e, j->topk, j->block, j->block2, j->threads);
     if (count == 0) std::fill(j->out, j->out + size_t(j->batch) * j->h, 0.f);
     if (count < 0) j->status = count;
 }

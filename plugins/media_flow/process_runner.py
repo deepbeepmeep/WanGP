@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import shutil
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import gradio as gr
@@ -472,6 +472,9 @@ class ProcessRunner:
         if len(items) == 0:
             yield self.info_exit(f"Batch has no source {media_kind}s to process.")
             return
+        batch_process_definition = process_definition if process_definition.get("info", {}).get("use_configured_model") else None
+        if batch_process_definition is not None:
+            request = replace(request, target_ratio=system_handler.normalize_target_control_for_process(request.target_ratio, process_definition["settings"]))
         self._reset_generated_artifacts()
         signature = batch_queue.build_signature(request, items, batch_name=batch_name, process_model_type=model_type, media_kind=media_kind)
         signature_hash = batch_queue.signature_hash(signature)
@@ -592,6 +595,7 @@ class ProcessRunner:
                         batch_source_path=batch_source_path,
                         spatial_upsampler_parameters=request.spatial_upsampler_parameters,
                         batch_internal=True,
+                        batch_process_definition=batch_process_definition,
                     )
                     result = self.active_job.get("last_process_result")
                     if not isinstance(result, ProcessRunResult):
@@ -640,11 +644,11 @@ class ProcessRunner:
         finally:
             self.active_job["batch_running"] = False
 
-    def start_process(self, state=None, process_name="", user_refs=None, source_path="", source_image_path=None, process_strength=None, output_path="", prompt_text="", continue_enabled=True, preview_enabled=True, source_audio_track="", output_resolution="720p", target_ratio="", chunk_size_seconds=10.0, sliding_window_overlap=1, start_seconds="", end_seconds="", batch_mode="single", batch_name="", batch_source_path="", batch_image_source_path=None, spatial_upsampler_parameters=None, batch_internal=False):
+    def start_process(self, state=None, process_name="", user_refs=None, source_path="", source_image_path=None, process_strength=None, output_path="", prompt_text="", continue_enabled=True, preview_enabled=True, source_audio_track="", output_resolution="720p", target_ratio="", chunk_size_seconds=10.0, sliding_window_overlap=1, start_seconds="", end_seconds="", batch_mode="single", batch_name="", batch_source_path="", batch_image_source_path=None, spatial_upsampler_parameters=None, batch_internal=False, batch_process_definition=None):
         self.active_job[catalog.PREVIEW_OUTPUT_STORAGE_KEY] = catalog.normalize_preview_enabled(preview_enabled)
         if not self._preview_enabled():
             self.preview_state["image"] = None
-        process_definition = self.library.process_definition(str(process_name or "").strip(), state, list(user_refs or []))
+        process_definition = batch_process_definition or self.library.process_definition(str(process_name or "").strip(), state, list(user_refs or []))
         selected_source_path = source_path
         selected_batch_source_path = batch_source_path
         if process_definition is not None and self._process_is_image(process_definition):
@@ -798,10 +802,12 @@ class ProcessRunner:
         self.active_job["running"] = True
         try:
             video.clear_process_full_video_source()
+            upsampler_metadata = {"spatial_upsampling": system_target_control} if process_definition.get("info", {}).get("use_configured_model") else {}
             yield self.ui_update(status_ui.render_chunk_status_html(1, 0, 1, "Initializing", "Preparing processing job..."), self.ui_skip, str(time.time_ns()), start_enabled=False, abort_enabled=False)
             started_ui = True
             try:
                 prepared_run = prepare_run(
+                    expected_spatial_upsampling=upsampler_metadata.get("spatial_upsampling", ""),
                     plugin=self.plugin,
                     get_model_def=self.get_model_def,
                     process_name=request.process_name,
@@ -1065,6 +1071,7 @@ class ProcessRunner:
                 "video_length": int(resumed_unique_frames),
                 "frame_count": int(resumed_unique_frames),
                 process_metadata.PROCESS_FULL_VIDEO_METADATA_KEY: {
+                    **upsampler_metadata,
                     "process": process_display_name,
                     "written_unique_frames": int(resumed_unique_frames),
                     "chunks": int(total_chunks_display),
@@ -1244,6 +1251,7 @@ class ProcessRunner:
                     raise gr.Error(f"Final output contains {actual_output_frames} readable frame(s), but {total_written_unique_frames} frame(s) were written.")
             total_generation_time = existing_output_generation_time + process_metadata.read_metadata_generation_time(metadata_source_path) if merged_continuation else process_metadata.read_metadata_generation_time(metadata_source_path)
             output_process_metadata = {
+                **upsampler_metadata,
                 "process": process_display_name,
                 "written_unique_frames": int(total_written_unique_frames),
                 "chunks": int(total_chunks_display),

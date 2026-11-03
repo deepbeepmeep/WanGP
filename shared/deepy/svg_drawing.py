@@ -24,6 +24,8 @@ from pathlib import Path
 
 from PIL import Image, ImageColor
 
+from shared.deepy.image_channels import exif_orientation, upright
+
 SVG_NS, XLINK_NS = "http://www.w3.org/2000/svg", "http://www.w3.org/1999/xlink"
 HREFS = ("href", f"{{{XLINK_NS}}}href")
 MAX_SVG_CHARS, MAX_EMBEDDED_CHARS, MAX_SIDE, MAX_REFERENCES = 2_000_000, 64_000_000, 4096, 32  # markup and embedded base64 are measured separately
@@ -84,15 +86,16 @@ def rewrite(svg: str, replacements: dict[str, str]) -> str:
 
 
 def data_uri(path: str) -> str:
-    """An image file as a data URI: PNG, JPEG and GIF as they are, other formats converted to PNG (first frame)."""
+    """An image file as a data URI: PNG, JPEG and GIF as they are, other formats and EXIF-rotated photos (resvg ignores the
+    orientation) converted to upright PNG (first frame)."""
     mime = EMBEDDED_TYPES.get(Path(path).suffix.lower())
-    if mime is not None:
-        data = Path(path).read_bytes()
-    else:
-        with Image.open(path) as image:
+    with Image.open(path) as image:
+        if mime is not None and exif_orientation(image) == 1:
+            data = Path(path).read_bytes()
+        else:
             buffer = io.BytesIO()
-            image.convert("RGBA").save(buffer, "PNG")
-        data, mime = buffer.getvalue(), "image/png"
+            upright(image).convert("RGBA").save(buffer, "PNG")
+            data, mime = buffer.getvalue(), "image/png"
     return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
 
 

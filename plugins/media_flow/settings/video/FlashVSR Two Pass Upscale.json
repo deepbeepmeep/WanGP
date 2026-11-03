@@ -8,6 +8,7 @@
   "sliding_window_overlap": 0,
   "prompt": "",
   "process": {
+    "use_configured_model": true,
     "task": "upscale",
     "summary": "FlashVSR in two passes, which may reduce horizontal banding."
   }
