@@ -65,6 +65,9 @@ export function mountBrief(container, doc) {
             <div class="field"><div class="label">${icon('gauge')} Pacing</div>
               <div class="slider-row"><input type="range" class="range" id="pacing" min="-2" max="2" step="1" value="${brief.pacing || 0}"><span class="value" id="pacing-v">${PACING[(brief.pacing || 0) + 2]}</span></div></div>
           </div>
+          <div class="field"><div class="label">${icon('clock')} Shot length <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">empty lets the showrunner choose; long shots take longer to render</span></div>
+            <div class="slider-row" style="justify-content:flex-start"><input class="input" id="shot-min" type="number" min="1" max="60" step="1" value="${brief.shot_min_s ?? ''}" placeholder="Auto" aria-label="Shortest video shot in seconds" title="The shortest video shot, in seconds" style="width:76px;flex:none;padding:6px 8px"><span class="muted">to</span>
+              <input class="input" id="shot-max" type="number" min="1" max="60" step="1" value="${brief.shot_max_s ?? ''}" placeholder="Auto" aria-label="Longest video shot in seconds" title="The longest video shot, in seconds" style="width:76px;flex:none;padding:6px 8px"><span class="muted">s</span></div></div>
           <div class="field"><div class="label">${icon('palette')} Style</div>
             <div class="styles">${STYLES.map(style => `<button class="chip clickable ${brief.style_tags.includes(style) ? 'on' : ''}" data-style="${style}">${style}</button>`).join('')}</div>
             <input class="input" id="style" style="margin-top:10px" placeholder="Anything else about the look: lighting, era, references, palette…" value="${esc(brief.style)}"></div>
@@ -130,6 +133,11 @@ export function mountBrief(container, doc) {
     root.querySelector('#match-song')?.addEventListener('click', () => actions.ops([{ op: 'brief', fields: { duration_s: null } }]).then(render));
     const pacing = root.querySelector('#pacing');
     pacing.oninput = () => { root.querySelector('#pacing-v').textContent = PACING[+pacing.value + 2]; queue({ pacing: +pacing.value }); };
+    [['#shot-min', 'shot_min_s'], ['#shot-max', 'shot_max_s']].forEach(([selector, field]) => {
+      const input = root.querySelector(selector);
+      input.oninput = () => { if (input.value === '' || (+input.value >= 1 && +input.value <= 60)) queue({ [field]: +input.value || null }); };  // out of range: kept until the field is left
+      input.onchange = () => { if (input.value !== '') input.value = Math.min(60, Math.max(1, Math.round(+input.value))); queue({ [field]: +input.value || null }); };
+    });
     const budget = root.querySelector('#budget');
     budget.oninput = () => { root.querySelector('#budget-v').textContent = +budget.value ? `${budget.value} min` : 'Auto'; queue({ budget_minutes: +budget.value || null }); };
     root.querySelector('#plan-first').parentElement.onclick = () => actions.ops([{ op: 'brief', fields: { plan_first: !state.doc.brief.plan_first } }]).then(render);

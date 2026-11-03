@@ -645,7 +645,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                     with gr.Row(visible=not deepy_remote_default and enhancer_enabled_value in QWEN_PROMPT_ENHANCER_IDS) as self.enhancer_speculative_row:
                         self.enhancer_speculative_decoding_choice = gr.Dropdown(
                             choices=speculative_choices, value=speculative_method, label="Speculative Decoding",
-                            info="Speculative decoding uses extra VRAM. On GPUs up to 16 GB, Auto enables MTP only when the whole model fits in VRAM with it, and never at 8 GB or less (10 GB for Bonsai PTQ1).",
+                            info="Speculative decoding uses extra VRAM. Auto keeps MTP off at 8 GB or less and, from 13 to 16 GB, enables it only when the whole model fits in VRAM with it. On Qwen3.8 27B it uses 4 draft tokens from 24 GB (12 GB with Bonsai), 2 below.",
                             interactive=not self.args.lock_config,
                         )
                         self.enhancer_speculative_tokens_choice = gr.Dropdown(
@@ -961,7 +961,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
         for requirement_input in (self.enhancer_enabled_choice, self.deepy_context_tokens_choice, self.deepy_compaction_type_choice, self.deepy_llm_engine_choice):
             requirement_input.input(fn=update_deepy_requirement, inputs=deepy_requirement_inputs, outputs=[self.deepy_requirement_md], show_progress="hidden")
 
-        def enforce_deepy_prime_requirements(deepy_type_choice, deepy_context_tokens_choice, deepy_compaction_type_choice, enhancer_enabled_choice, deepy_kv_cache_quantization_choice, deepy_llm_engine_choice, enhancer_quantization_choice):
+        def enforce_deepy_prime_requirements(deepy_type_choice, deepy_context_tokens_choice, deepy_compaction_type_choice, enhancer_enabled_choice, deepy_kv_cache_quantization_choice, deepy_llm_engine_choice, enhancer_quantization_choice, speculative_method):
             if deepy_type_choice == DEEPY_TYPE_DISABLED:
                 return gr.update(), gr.update(), "", DEEPY_TYPE_DISABLED, gr.update()
             qwen_local = not is_remote_engine(deepy_llm_engine_choice) and enhancer_enabled_choice in QWEN_PROMPT_ENHANCER_IDS
@@ -969,6 +969,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             deepy_enabled_choice, deepy_type_choice = split_deepy_mode(deepy_type_choice)
             runtime_config["enhancer_enabled"] = enhancer_enabled_choice
             runtime_config["prompt_enhancer_quantization"] = enhancer_quantization_choice
+            runtime_config[PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY] = {"method": speculative_method}
             runtime_config[DEEPY_ENABLED_KEY] = deepy_enabled_choice
             runtime_config[DEEPY_TYPE_KEY] = deepy_type_choice
             if qwen_local and normalize_deepy_type(deepy_type_choice) == DEEPY_TYPE_PRIME:
@@ -984,7 +985,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             recommendation = deepy_onboarding_notice(runtime_config)
             return context_update, compaction_update, deepy_requirement_message(runtime_config), deepy_mode_from_config(deepy_enabled_choice, deepy_type_choice), gr.update(value=recommendation, visible=bool(recommendation))
 
-        self.deepy_type_choice.input(fn=enforce_deepy_prime_requirements, inputs=[self.deepy_type_choice, self.deepy_context_tokens_choice, self.deepy_compaction_type_choice, self.enhancer_enabled_choice, self.deepy_kv_cache_quantization_choice, self.deepy_llm_engine_choice, self.enhancer_quantization_choice], outputs=[self.deepy_context_tokens_choice, self.deepy_compaction_type_choice, self.deepy_requirement_md, self.deepy_type_value, self.deepy_prime_recommendation], show_progress="hidden")
+        self.deepy_type_choice.input(fn=enforce_deepy_prime_requirements, inputs=[self.deepy_type_choice, self.deepy_context_tokens_choice, self.deepy_compaction_type_choice, self.enhancer_enabled_choice, self.deepy_kv_cache_quantization_choice, self.deepy_llm_engine_choice, self.enhancer_quantization_choice, self.enhancer_speculative_decoding_choice], outputs=[self.deepy_context_tokens_choice, self.deepy_compaction_type_choice, self.deepy_requirement_md, self.deepy_type_value, self.deepy_prime_recommendation], show_progress="hidden")
 
         def update_deepy_context_label(enhancer_enabled_choice, deepy_context_tokens_choice, deepy_kv_cache_quantization_choice, deepy_type_choice, deepy_llm_engine_choice, deepy_kv_cache_exact_choice):
             if deepy_type_choice == DEEPY_TYPE_DISABLED or is_remote_engine(deepy_llm_engine_choice) or enhancer_enabled_choice not in QWEN_PROMPT_ENHANCER_IDS:
@@ -1037,15 +1038,15 @@ class ConfigTabPlugin(WAN2GPPlugin):
 
         remote_engine_state_inputs = [self.deepy_llm_engine_choice, self.enhancer_quantization_choice, self.deepy_type_choice, self.enhancer_enabled_choice]
 
-        def update_deepy_notice(deepy_engine, enhancer_quantization, deepy_type, enhancer_enabled):
+        def update_deepy_notice(deepy_engine, enhancer_quantization, deepy_type, enhancer_enabled, speculative_method, context_tokens):
             enhancer_id = local_enhancer_id(deepy_engine, enhancer_enabled)
             _, quantization, _ = prompt_enhancer_quantization_ui_state(enhancer_id, quantization_after_engine_switch(enhancer_enabled, enhancer_id, enhancer_quantization))  # what the form shows for this engine
             deepy_enabled, deepy_kind = split_deepy_mode(deepy_type)
-            notice = deepy_onboarding_notice({**self.server_config, "prompt_enhancer_quantization": quantization, DEEPY_ENABLED_KEY: deepy_enabled, DEEPY_TYPE_KEY: deepy_kind, LLM_CONFIG_KEY: {**normalize_llm_config(self.server_config), "deepy": deepy_engine}})
+            notice = deepy_onboarding_notice({**self.server_config, "prompt_enhancer_quantization": quantization, PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY: {"method": speculative_method}, DEEPY_CONTEXT_TOKENS_KEY: context_tokens, DEEPY_ENABLED_KEY: deepy_enabled, DEEPY_TYPE_KEY: deepy_kind, LLM_CONFIG_KEY: {**normalize_llm_config(self.server_config), "deepy": deepy_engine}})
             return gr.update(value=notice, visible=bool(notice))
 
-        for notice_input in (self.deepy_llm_engine_choice, self.enhancer_quantization_choice):
-            notice_input.input(fn=update_deepy_notice, inputs=remote_engine_state_inputs, outputs=[self.deepy_prime_recommendation], show_progress="hidden", queue=False)
+        for notice_input in (self.deepy_llm_engine_choice, self.enhancer_quantization_choice, self.enhancer_speculative_decoding_choice, self.deepy_context_tokens_choice):
+            notice_input.input(fn=update_deepy_notice, inputs=[*remote_engine_state_inputs, self.enhancer_speculative_decoding_choice, self.deepy_context_tokens_choice], outputs=[self.deepy_prime_recommendation], show_progress="hidden", queue=False)
         remote_engine_outputs = [
             self.remote_llm_warning_md, self.remote_llm_auth_md, self.codex_config_ui.group, self.claude_config_ui.group, self.opencode_config_ui.group,
             self.enhancer_enabled_choice, self.enhancer_quantization_choice,

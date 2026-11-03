@@ -62,6 +62,7 @@ temporal_upsampler_handlers = [
     "postprocessing.dlss5.temporal_upsampler.DLSSGTemporalUpsampler",
     "postprocessing.hunyuan3d_paint.texturer.Hunyuan3DPaintTexturer",
     "postprocessing.supratex.texturer.SupraTexTexturer",
+    "postprocessing.pixal3d_texture.texturer.Pixal3DTexturer",
     "postprocessing.trellis2_texture.texturer.Trellis2Texturer",
 ]
 _temporal_upsampler_handlers: list[Any] = []

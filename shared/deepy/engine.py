@@ -6911,6 +6911,9 @@ class AssistantEngine:
         tokens = max(0, int(token_count or 0))
         if tokens > 0:
             self._emit_stats(force=True, prefilling_tokens=tokens)  # before the timer starts: the speeds stay those of the finished prefills
+        runtime = self.runtime
+        if runtime is not None:
+            runtime.prefill_setup_seconds = 0.0
         started_at = time.perf_counter()
         self._prefill_started_at = started_at if tokens > 0 else None
         self._live_prefill_tokens = tokens
@@ -6927,7 +6930,7 @@ class AssistantEngine:
             if long_call:
                 self.runtime.context_progress = None
                 self._close_context_progress()
-            elapsed_seconds = max(0.0, time.perf_counter() - started_at)
+            elapsed_seconds = max(0.0, time.perf_counter() - started_at - (0.0 if runtime is None else runtime.prefill_setup_seconds))
             self._prefill_started_at = None
             self._live_prefill_tokens = 0
             should_record = record_if(result) if callable(record_if) else bool(record_if)

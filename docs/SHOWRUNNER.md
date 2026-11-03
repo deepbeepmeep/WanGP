@@ -6,8 +6,17 @@ you follow, review and change anything on a storyboard and a timeline.
 
 Showrunner comes enabled with WanGP. Open **Showrunner** in the app bar; on first use, choose **Keep It** in its introduction. If you removed it, restore it from **Available Locally** in **Apps & PlugIn Manager**. **Full Screen** at the top of the tab expands the editor in place; **WanGP** returns to the Showrunner tab with your production and view preserved. Open `/showrunner/` on the WanGP address to go directly to the fullscreen editor. Full screen keeps this folder URL, which you can bookmark or share. In the tab as in full screen, the address also names the production and the page you have open: a reload or a copied link opens them again.
 
-Showrunner needs **Deepy Prime**, with a local model or a remote agent (Configuration > Deepy): running a production takes a planner that
-can follow a long plan. Everything you do yourself (reviewing, editing, re-rendering a take, assembling) works without Deepy. With a local model, Showrunner tells you when Deepy's settings hold a production back: it recommends at least 64K of context, so that Deepy does not keep condensing the conversation and losing details, and a **KV Cache Quantization** of Q4 or lower to fit that context in less VRAM.
+Showrunner needs **Deepy Prime**, with a local model or a remote agent (Configuration > Prompt Enhancer / Deepy): running a production takes a planner that
+can follow a long plan. On first launch, WanGP sets it up on the Qwen3.8 version that suits your NVIDIA GPU, with nothing to configure. Everything you do yourself (reviewing, editing, re-rendering a take, assembling) works without Deepy.
+
+With a local model, Showrunner tells you when Deepy's settings hold a production back:
+
+- **Context Window Tokens** below 64K, when your GPU has room for more: Deepy keeps condensing the conversation and loses details.
+- A **KV Cache Quantization** of INT8 or BF16, when Q4 or lower is available: Q4 fits that context in less VRAM.
+- A Qwen3.8 version too heavy for your GPU: part of the model may not fit in VRAM, and Deepy can become very slow.
+- A **Speculative Decoding** choice that does not suit your GPU: one that pushes the model out of VRAM, or **Disabled** when Deepy could run about twice as fast with it. **Auto** chooses for you.
+
+Deepy's own chat warns about the last two as well.
 
 **Guide** at the top of every page opens this guide at the part about the page you are on (or press **?**).
 
@@ -49,7 +58,8 @@ The production opens on its **Brief**, which saves itself as you type:
 - **Cast**: drop a photo of each person or recurring object so that they look the same in every shot, and describe how each speaker
   sounds (or drop a recording of their voice) so that they sound the same in every line (see **The Cast**).
 - **Look and format**: aspect ratio, resolution, total duration from 5 seconds to ten minutes (drag the slider, or type the seconds in
-  the field next to it; or **Match the song**), pacing from calm to frenetic, and style tags.
+  the field next to it; or **Match the song**), pacing from calm to frenetic, **Shot length** and style tags. Leave **Shot length** empty and the showrunner
+  chooses, with most shots lasting about 4 to 7 seconds. Give a range to set it yourself, such as 8 to 15 seconds for long takes (or only one end of it): long shots take longer to render.
 - **Review the plan before shooting** (on by default): the showrunner stops after planning so that you can edit the storyboard before any
   video is generated. Turn it off to let it plan and shoot in one go.
 - **Review the takes before the edit** (off by default): the showrunner shoots and checks the shots, then waits for you instead of
@@ -70,7 +80,8 @@ Press **Plan with the showrunner**.
 The **Cast** page holds the people, recurring things and places of the production (a singer, a villain, the red car, the studio), each on a card:
 
 - **Pictures**: drop photos on the card. The highlighted one is the **reference picture** of every shot the member appears in; click
-  another to use it instead. **Ask the showrunner for master images** makes a clean front-facing picture for members without one.
+  another to use it instead. **Ask the showrunner for master images** makes a clean front-facing picture for members without one, and
+  **New picture** asks for a new one from the description, after a recast or when the picture no longer matches it.
   When your photos do not match the production's style (a photo in a watercolor story), the showrunner draws the reference picture
   in that style from them, so the person keeps their face and clothes and every shot keeps the style; your photos stay on the card.
 - **Name, role and description**: what must stay the same in every shot (age, look, clothes).
@@ -120,7 +131,7 @@ is shot (hover to play it), its status and the showrunner's opinion of the take.
 - **Reorder** shots by dragging the cards; a shot dropped among another sequence's shots joins that sequence. Several shots can be
   selected with Ctrl or Shift and moved together; Shift selects only the shots the current filter shows.
 - **Lock** a shot (or a cast member) to keep it exactly as it is: the showrunner never changes it.
-- **Exclude** a shot to keep it out of the edit without deleting it.
+- **Exclude** a shot to keep it out of the edit without deleting it: its card stays on the Board with a crossed-out eye, and the **Excluded** filter lists these shots.
 - **Drop media** from your computer onto a shot to use it as a take, or onto the cast to add reference pictures and voices. Media you drop
   elsewhere, and media the showrunner made outside the shots, wait in the **Media bin** at the bottom: click one to play or view it (in a picture, scroll or use + and − to zoom, hold and drag to
   move inside it), drag it where you need it. The **×** on an item takes it out of the bin: its file stays in the production's folder, and undo
@@ -192,7 +203,7 @@ over the song. Shots that are not shot yet appear as cards in their place, so th
 - The **Text** lane holds titles, lower thirds (a name and a role), captions and full-frame chapter or end cards. **+ Text** adds one at
   the playhead: choose its style and its design (the production's, or another), write its words and its time on screen. Drag it to move
   it, drag its edges to change how long it stays, double-click it (or select it and press Enter) to edit it, Delete to remove it. Texts
-  that overlap sit on two rows. It plays over the preview as it will in the export, fading in and out. Yellow texts are yours, purple
+  that overlap sit on two rows. It plays over the preview as it will in the export, fading in and out; an end card that reaches the end of the cut only fades in, and stays to the last frame. To change how long one of the showrunner's texts takes to fade, ask it ("let the end card fade in over 8 s"). Yellow texts are yours, purple
   ones the showrunner's: the showrunner never changes yours. Text is drawn, never asked of a video model, so it is always sharp, and it reads
   exactly as it was typed (read what the showrunner typed: double-click a text to correct it). A full-frame card hides the picture under it: after moving shots, check that a card does not cover a moment you want
   to see.
@@ -239,7 +250,7 @@ does it and closes the bar (**Shoot**, **Assemble**, **Open Board**), and when t
 Showrunner tab says why, and **Continue** picks it up. The note only shows while the page is open: if you were
 elsewhere, it is there when you come back. To hear about it sooner, turn on **Tell me when a task ends** in **Settings**: when the
 showrunner finishes a task or stops on an error, WanGP plays its notification sound on the computer it runs on and sends what comes next to
-your notification destinations (**Config > Notification**), if you have set any.
+your notification destinations (**Configuration > Notifications**), if you have set any.
 
 The panel on the right has two tabs:
 
@@ -260,6 +271,8 @@ new versions) and the shots it touched glow for a moment on the board. Shots app
 During a long wait, the line above the input tells a slow step from a stuck one: what Deepy is doing now and how many tokens it is reading before it
 can answer. Rest the pointer on it for Deepy's speed in tokens per second and how full its context is; the Deepy tab shows them under its window.
 
+Deepy keeps your latest conversations ready in RAM, so that it answers quickly when you come back to a production (**KV Caches Kept in RAM** in Configuration > Prompt Enhancer / Deepy, 2 by default). When this production's is no longer there, Deepy reads the conversation again, which can take up to a minute, and a bar in the Showrunner tab shows how far it has got.
+
 **Pause** stops the showrunner after its current step (the shot or voice it is generating is finished and kept) and frees the GPU for
 other work: WanGP's models and Deepy's leave the video memory. **Pause now** also stops what it is generating; that shot is generated
 again later. The production shows **Paused**, also after you close the page or restart WanGP. **Resume** continues the same task where
@@ -277,7 +290,7 @@ else in Showrunner and in WanGP stays available.
 **Assemble** renders the edit as one video: the included shots in order with their chosen takes, trims and transitions, the text over
 it and the chosen soundtrack. When the takes can simply be joined, they are, with no loss of quality; otherwise the edit is encoded once with your output settings (Configuration > Outputs). Shots without a take are left
 out: Assemble says which ones before it starts. The length you set in the Brief is a target: a shot with a spoken line ends a moment after its line, so the cut can come out shorter than planned. The showrunner tells you, and you can ask it to give those shots more room.
-Other shots last a length their model really makes (with MiniMax H3: 4.46, 5.17, 5.88 s and so on), so that every action plays to its end; a music video cuts on its song instead. For faster cuts, turn on **Let the showrunner pick any shot length** in **Settings**: a shot then plays the start of its video, and the end of its action can be lost. A take plays for its shot's planned length (generations often come out slightly
+Other shots last a length their model really makes (with MiniMax H3: 4.46, 5.17, 5.88 s and so on), so that every action plays to its end; a music video cuts on its song instead, following **Shot length** as far as the song allows. For faster cuts, turn on **Let the showrunner pick any shot length** in **Settings**: a shot then plays the start of its video, and the end of its action can be lost. A take plays for its shot's planned length (generations often come out slightly
 longer), so the cuts land where the showrunner planned them and lip-synced shots stay on their part of the song; trim a shot to use
 another part of its take.
 
@@ -285,7 +298,7 @@ another part of its take.
 and a download button (the file keeps its name), and a checklist of what is left before the final cut. The showrunner names versions
 the same way. When the version you watch carries subtitles, **Subtitles** at the top of the player shows or hides them (the choice is
 remembered). When you change the edit after assembling, Deliver says that the last version is out of date, and the
-home page marks the production **Changed since delivery**.
+home page marks the production **Changed since delivery**. **Showrunner review**, beside **Assemble** on that page, has the showrunner assemble the edit, watch it and report what it finds; for a closer look, see Deep Review.
 
 **Sound and subtitles**, on the Deliver page, sums up what the export plays and shows besides the picture:
 

@@ -51,6 +51,8 @@ def _brief_text(doc: dict[str, Any]) -> str:
     pacing = int(brief.get("pacing") or 0)
     if pacing:
         lines.append("Pacing: " + ("faster cuts than usual." if pacing > 0 else "longer, calmer shots than usual."))
+    if model.shot_range_words(doc):
+        lines.append(f"Shot length, the user's choice: video shots of {model.shot_range_words(doc)}.")
     if brief.get("budget_minutes"):
         lines.append(f"GPU budget: about {brief['budget_minutes']:g} minutes of generation in total.")
     if brief.get("review_before_edit"):

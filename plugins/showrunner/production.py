@@ -55,7 +55,7 @@ def normalize(doc: dict[str, Any]) -> dict[str, Any]:
     brief = doc.setdefault("brief", {})
     for key, value in {"kind": "free", "text": "", "song": None, "script": "", "references": [], "duration_s": None, "aspect": "16:9", "resolution": "720p",
                        "style_tags": [], "style": "", "pacing": 0, "language": "en", "plan_first": True, "budget_minutes": None, "templates": {},
-                       "read_other_productions": True, "review_before_edit": False}.items():
+                       "read_other_productions": True, "review_before_edit": False, "shot_min_s": None, "shot_max_s": None}.items():
         brief.setdefault(key, copy.deepcopy(value))
     if brief["kind"] not in KINDS:
         brief["kind"] = "free"
@@ -572,8 +572,19 @@ def summary(doc: dict[str, Any], sequence: str | None = None) -> dict[str, Any]:
 # Operations ---------------------------------------------------------------------------------------------------------------------------
 
 BRIEF_FIELDS = {"kind", "title", "text", "song", "script", "references", "duration_s", "aspect", "resolution", "style_tags", "style", "pacing", "language", "plan_first", "budget_minutes",
-                "templates", "read_other_productions", "review_before_edit"}
+                "templates", "read_other_productions", "review_before_edit", "shot_min_s", "shot_max_s"}
 DEFAULT_LENGTH_S = 30.0  # what the Brief shows and plans for until the user sets a length
+
+
+def shot_range(doc: dict[str, Any]) -> tuple[float | None, float | None]:
+    """The length the user wants for video shots, in seconds: either end may be open, and both are for the showrunner's own choice."""
+    low, high = doc["brief"].get("shot_min_s") or None, doc["brief"].get("shot_max_s") or None
+    return (high, low) if low and high and low > high else (low, high)
+
+
+def shot_range_words(doc: dict[str, Any]) -> str:
+    low, high = shot_range(doc)
+    return f"{low:g} to {high:g} s" if low and high else f"at least {low:g} s" if low else f"at most {high:g} s" if high else ""
 GENERATION_SHORTHAND = {"prompt", "negative_prompt", "audio_guide", "image_refs", "image_start", "video_length", "seed", "template", "settings"}
 SHOT_FIELDS = {"title", "section", "intent", "camera", "cast", "dialogue", "duration_s", "audio_slice", "generation", "status", "locked", "included", "chosen_take", "trim", "speed", "sound",
                "transition", "notes"}

@@ -548,6 +548,7 @@ class Qwen35AssistantRuntime:
             raise RuntimeError("Prompt enhancer tokenizer is missing for assistant runtime.")
         self.debug_enabled = bool(debug_enabled)
         self.context_progress = None  # called with (done, total) while a conversation is prefilled
+        self.prefill_setup_seconds = 0.0  # of the prefill being timed: preparing the runtime (engine, graph capture), which is no measure of its speed
         self.telemetry_enabled = self.debug_enabled and _DEEPY_TELEMETRY_ENABLED
         self._runtime_extra_tokens = getattr(model, "_prompt_enhancer_thinking_extra_tokens", 0)
         self._assistant_presence_state = None
@@ -1110,7 +1111,9 @@ class Qwen35AssistantRuntime:
         normalized_token_ids = [int(token_id) for token_id in token_ids]
         if len(normalized_token_ids) == 0:
             raise ValueError("Cannot prefill assistant context with an empty token sequence.")
+        setup_started_at = time.perf_counter()
         _engine, llm = self._ensure_clean_runtime(max_context_tokens=len(normalized_token_ids), max_new_tokens=1, seed=seed)
+        self.prefill_setup_seconds += time.perf_counter() - setup_started_at
         speculative = bool(getattr(self.model, "_prompt_enhancer_speculative_decoding", False))
         # Without MTP, the first decode step processes the final context token,
         # so the scheduled prefill leaves it for the suffix path below.

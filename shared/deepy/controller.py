@@ -15,6 +15,7 @@ from typing import Any, Callable
 import gradio as gr
 from shared.utils.config_store import config_lock, write_config
 
+from shared.deepy.onboarding import deepy_performance_warning
 from shared.deepy.config import (
     DEEPY_KEPT_KV_CACHES_DEFAULT,
     DEEPY_KEPT_KV_CACHES_KEY,
@@ -887,6 +888,12 @@ class DeepyController:
         from shared.deepy.drivers import gradio_chat_updates
         yield from gradio_chat_updates(self.iter_commands(state, ask_request, client_submission_id, steering), lambda: self._deps.get_new_refresh_id())
 
+    def _warn_about_performance(self, session) -> None:
+        """Settings too heavy for this GPU are the first thing to look at when Deepy is slow: a note in the chat, once per conversation, that the model does not read."""
+        note = deepy_performance_warning(self._server_config(), icons=True)
+        if note and not any(block.get("text") == note for record in session.chat_transcript for block in record.get("blocks", [])):
+            assistant_chat.add_assistant_note(session, note)
+
     def iter_commands(self, state, ask_request, client_submission_id: str = "", steering: bool = False, *, media: list[dict[str, str]] | None = None, author: str = "You"):
         debug_enabled = self._sync_debug_enabled()
         submission_id = str(client_submission_id or "").strip()[:128]
@@ -921,6 +928,7 @@ class DeepyController:
                 self._prepare_session_request_locked(session, request_blocks[0])
             # The host lock must be acquired outside all queue-lock scopes.
             self.workspace_host.ensure_session_workspace()
+        self._warn_about_performance(session)
         if steering:
             with self._queue_state_lock:
                 steering_active = bool(session.worker_active and session.control_queue is not None)

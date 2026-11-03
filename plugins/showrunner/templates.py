@@ -12,6 +12,7 @@ from . import production as model
 
 VIDEO_TASKS = ("gen_video", "gen_video_with_speech", "gen_video_with_refs")
 DRAWN = "draw_svg"  # the template of a shot the director draws (a card, a diagram, a map) and records with record_take
+SHOT_RANGE_MARGIN_S = 0.5  # a model's lengths come in steps: the nearest one to the user's range is not outside it
 RULE = ("Shots that show a cast member take that member's pictures as reference images (a template whose inputs include references), "
         "not as image_start: a start image becomes the shot's first frame, so its framing, aspect and setting leak into the shot. "
         "Lip-synced shots also need a template that takes the song slice as driving audio.")
@@ -159,6 +160,21 @@ def take_lengths(entry: dict[str, Any], count: int = 5) -> list[float]:
     return [_seconds(first + index * step, fps) for index in range(count)]
 
 
+def take_lengths_in_range(entry: dict[str, Any], low: float | None, high: float | None) -> list[float]:
+    """The lengths a template's model really makes inside the user's range, up to its longest window; the nearest one when none falls inside."""
+    first, step, fps = entry["take_frames"]
+    last = entry["longest_frames"] or first + 4 * step
+    lengths = [_seconds(frames, fps) for frames in range(first, last + 1, step)]
+    margin = step / fps / 2  # what the model makes nearest to the end of the range
+    inside = [length for length in lengths if (low is None or length >= low - margin) and (high is None or length <= high + margin)]
+    return inside or [min(lengths, key=lambda length: abs(length - (low or high)))]
+
+
+def outside_shot_range(doc: dict[str, Any], duration: float) -> bool:
+    low, high = model.shot_range(doc)
+    return bool(low and duration < low - SHOT_RANGE_MARGIN_S or high and duration > high + SHOT_RANGE_MARGIN_S)
+
+
 def whole_take(doc: dict[str, Any], catalog: list[dict[str, Any]], shot: dict[str, Any]) -> float:
     """The nearest length a shot's model really makes when the shot's plan is another one, else 0: the edit plays a take from its start, so a shot shorter than its take
     would lose the end of its action. A speaking shot ends after its line (the model fills what follows with invented words), the song decides the cuts of a music video
@@ -212,6 +228,11 @@ def advice(doc: dict[str, Any], catalog: list[dict[str, Any]], any_length: bool 
         result["shot_length"] = ("A shot lasts one of its template's take_lengths_s, the only lengths its model makes (others are moved to the nearest): shorter, the end of its action would be lost. A speaking shot "
                                  "is the exception, as it ends after its line. Count your shots from this: a faster pace takes fewer words per shot, not shorter shots.")
         result["take_lengths_s"] = {template: take_lengths(resolve(catalog, template)) for template in shortest}
+    if wanted := model.shot_range_words(doc):
+        result["shot_length_range"] = (f"The user wants video shots of {wanted}: plan them so, whatever the pacing. " + ("Cut on the song's bars inside this range, as far as the song allows."
+                                       if cut_on_the_song(doc) else "A speaking shot is the exception, as it ends after its line."))
+        if "take_lengths_s" in result:
+            result["take_lengths_s"] = {template: take_lengths_in_range(resolve(catalog, template), *model.shot_range(doc)) for template in shortest}
     return result
 
 
@@ -253,6 +274,8 @@ def lint(doc: dict[str, Any], catalog: list[dict[str, Any]], shot_ids: list[str]
         elif (role := role_of(entry)) in user and user[role] != entry_name(entry) and shot.get("updated_by") != "user" \
                 and (shown or not resolve(catalog, user[role])["refs"]):  # a pick that needs references does not fit a shot without the cast
             warnings.append(f"{shot['id']} uses {entry_name(entry)} but the user picked {user[role]} for this kind of shot: use it.")
+        if entry["task"] in VIDEO_TASKS and shot.get("included", True) and shot.get("updated_by") != "user" and not driven and not cut_on_the_song(doc) and outside_shot_range(doc, float(shot.get("duration_s") or 0.0)):
+            warnings.append(f"{shot['id']} lasts {float(shot.get('duration_s') or 0.0):g} s, but the user wants video shots of {model.shot_range_words(doc)}: change its length, or say why it must differ.")
         if lines and "<d>" in str(settings.get("prompt") or ""):  # the model would speak in a voice of its own, not the speaker's sample
             warnings.append(f"{shot['id']} writes its spoken words in the prompt (<d>): the model voices them itself, in a voice of its own. "
                             "Speak the lines with `speak` and leave their words out of the prompt: render drives the lips with the recordings.")

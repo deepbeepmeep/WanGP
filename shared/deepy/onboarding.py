@@ -9,12 +9,24 @@ from shared.deepy.config import (
     DEEPY_COMPACTION_SUMMARIZE_MIN_TOKENS,
     DEEPY_COMPACTION_TYPE_KEY,
     DEEPY_COMPACTION_TYPE_SUMMARIZE,
+    DEEPY_CONTEXT_TOKENS_DEFAULT,
     DEEPY_CONTEXT_TOKENS_KEY,
     DEEPY_ENABLED_KEY,
+    DEEPY_KV_CACHE_QUANTIZATION_DEFAULT,
+    DEEPY_KV_CACHE_QUANTIZATION_KEY,
     DEEPY_TYPE_KEY,
     DEEPY_TYPE_PRIME,
     deepy_mode_from_config,
+    estimate_deepy_kv_cache_mb,
     get_gguf_kernels_version,
+    normalize_deepy_context_tokens,
+)
+from shared.prompt_enhancer.config import (
+    PROMPT_ENHANCER_SPECULATIVE_DECODING_AUTO,
+    PROMPT_ENHANCER_SPECULATIVE_DECODING_DEFAULT,
+    PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY,
+    resolve_prompt_enhancer_speculative_decoding,
+    speculative_decoding_runtime,
 )
 from shared.remote_llm.config import ENGINE_QWEN38_27B, LLM_CONFIG_KEY, local_enhancer_id, normalize_llm_config
 
@@ -25,6 +37,11 @@ QWEN38_QUANTIZATIONS = {"gguf_ptq1": "Bonsai Q1", "gguf_q2": "Q2", "gguf_q3": "Q
 BONSAI_MIN_GGUF_KERNELS_VERSION = "1.0.22"
 DEEPY_FULL_CONTEXT_TOKENS = 64000  # a production's conversation is long, and below this Deepy keeps condensing it
 DEEPY_FULL_CONTEXT_MIN_VRAM_GB = 10  # below, Bonsai no longer fits in VRAM with this context
+QWEN38_VRAM_GIB = {"gguf_ptq1": 6.3, "gguf_q2": 9.8, "gguf_q3": 12.1, "gguf": 15.8}  # each version without its KV cache: the weights the GPU holds, activations and margins
+OTHER_PROGRAMS_VRAM_GIB = 1.5
+MTP_WEIGHTS_VRAM_GIB = 0.42
+MTP_KV_VRAM_GIB_PER_TOKEN = 4 / 2**20  # its own BF16 KV cache
+BLOCK_DRAFTER_VRAM_GIB = 4.5  # DSpark and DFlash2
 
 
 def detected_nvidia_vram_gb() -> float:
@@ -88,21 +105,46 @@ def apply_first_launch_deepy_prime_defaults(server_config: dict[str, Any], vram_
     return label
 
 
-def qwen38_quantization_warning(server_config: dict[str, Any], vram_gb: float | None = None) -> str:
-    """A warning when the local Qwen3.8 27B runs a version less compressed than the one that suits this GPU."""
-    recommended = qwen38_recommended_quantization(vram_gb)
+def qwen38_auto_mtp(server_config: dict[str, Any], quantization: str, reported_vram_gb: int) -> tuple[bool, float, float, float]:
+    """What Auto would decide for this GPU, version, context and KV cache: (it takes MTP, VRAM the version needs, VRAM MTP adds, VRAM available), in GiB."""
+    enhancer = local_enhancer_id(ENGINE_QWEN38_27B)
+    tokens = server_config.get(DEEPY_CONTEXT_TOKENS_KEY, DEEPY_CONTEXT_TOKENS_DEFAULT)
+    needed = QWEN38_VRAM_GIB[quantization] + estimate_deepy_kv_cache_mb(enhancer, tokens, server_config.get(DEEPY_KV_CACHE_QUANTIZATION_KEY, DEEPY_KV_CACHE_QUANTIZATION_DEFAULT))[1] / 1024
+    extra, available = MTP_WEIGHTS_VRAM_GIB + normalize_deepy_context_tokens(tokens) * MTP_KV_VRAM_GIB_PER_TOKEN, reported_vram_gb - OTHER_PROGRAMS_VRAM_GIB
+    fit = lambda: (int(needed * 2**30), int(extra * 2**30), int(available * 2**30))
+    return speculative_decoding_runtime(resolve_prompt_enhancer_speculative_decoding(enhancer, "auto", reported_vram_gb, qwen_backend=quantization, fit=fit)[0])[0] != 0, needed, extra, available
+
+
+def performance_warnings(server_config: dict[str, Any], vram_gb: float | None = None) -> list[tuple[str, str, str]]:
+    """What the settings of the local Qwen3.8 27B cost on this GPU, as (icon, title, text): a version less compressed than the one that suits it; a speculative decoding chosen by hand that pushes the model out of VRAM
+    (MTP where Auto would keep it off for this version, a block drafter that does not fit); MTP disabled while this version fits in VRAM with it."""
+    reported_vram_gb = reported_vram(vram_gb)
     chosen = server_config.get("prompt_enhancer_quantization")
-    if recommended is None or normalize_llm_config(server_config)["deepy"] != ENGINE_QWEN38_27B or chosen not in QWEN38_QUANTIZATIONS:
-        return ""
-    order = list(QWEN38_QUANTIZATIONS)
-    if order.index(chosen) <= order.index(recommended):
-        return ""
-    return (f"⚠️ **Qwen3.8 {QWEN38_QUANTIZATIONS[chosen]} may perform poorly on your GPU** — with {reported_vram(vram_gb)} GB of VRAM, part of the model may not fit and Deepy and the Prompt Enhancer "
-            f"can become very slow. For this GPU, select **{QWEN38_QUANTIZATIONS[recommended]}** under Qwen LLM Quantization below.")
+    if reported_vram_gb <= 0 or normalize_llm_config(server_config)["deepy"] != ENGINE_QWEN38_27B or chosen not in QWEN38_QUANTIZATIONS:
+        return []
+    warnings, recommended, order = [], qwen38_recommended_quantization(reported_vram_gb), list(QWEN38_QUANTIZATIONS)
+    if order.index(chosen) > order.index(recommended):
+        warnings.append(("⚠️", f"Qwen3.8 {QWEN38_QUANTIZATIONS[chosen]} may perform poorly on your GPU", f"with {reported_vram_gb} GB of VRAM, part of the model may not fit and Deepy and the Prompt Enhancer can become very slow. For this GPU, select {QWEN38_QUANTIZATIONS[recommended]} under Qwen LLM Quantization"))
+    mode = speculative_decoding_runtime(server_config.get(PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY, PROMPT_ENHANCER_SPECULATIVE_DECODING_DEFAULT))[0]
+    if mode == PROMPT_ENHANCER_SPECULATIVE_DECODING_AUTO:
+        return warnings
+    auto_takes_mtp, needed, extra, available = qwen38_auto_mtp(server_config, chosen, reported_vram_gb)
+    if mode == 0:
+        if auto_takes_mtp and needed + extra <= available:
+            warnings.append(("💡", "Deepy could run about twice as fast on your GPU", f"with {reported_vram_gb} GB of VRAM, Qwen3.8 {QWEN38_QUANTIZATIONS[chosen]} fits in VRAM with MTP, which is disabled. Set Speculative Decoding to Auto"))
+    elif not auto_takes_mtp if mode == 1 else needed + BLOCK_DRAFTER_VRAM_GIB > available:
+        warnings.append(("⚠️", "Speculative Decoding may slow Deepy down on your GPU", f"with {reported_vram_gb} GB of VRAM, it pushes part of Qwen3.8 {QWEN38_QUANTIZATIONS[chosen]} out of VRAM. Set Speculative Decoding to Auto"))
+    return warnings
+
+
+def deepy_performance_warning(server_config: dict[str, Any], vram_gb: float | None = None, icons: bool = False) -> str:
+    """The warnings as plain text, for Showrunner's notice and, with their icons, Deepy's chat."""
+    return " ".join(f"{icon + ' ' if icons else ''}{title}: {text} in Configuration > Prompt Enhancer / Deepy." for icon, title, text in performance_warnings(server_config, vram_gb))
 
 
 def deepy_onboarding_notice(server_config: dict[str, Any], vram_gb: float | None = None) -> str:
-    return "\n\n".join(message for message in (qwen38_quantization_warning(server_config, vram_gb), deepy_prime_upgrade_message(server_config, vram_gb)) if message)
+    warnings = [f"{icon} **{title}** — {text} below." for icon, title, text in performance_warnings(server_config, vram_gb)]
+    return "\n\n".join(message for message in (*warnings, deepy_prime_upgrade_message(server_config, vram_gb)) if message)
 
 
 def deepy_prime_upgrade_message(server_config: dict[str, Any], vram_gb: float | None = None) -> str:

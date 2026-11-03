@@ -1,0 +1,11 @@
+{
+    "spatial_upsampling": "",
+    "spatial_postprocessing_parameters": {},
+    "temporal_upsampling": "pixal3d_texture",
+    "temporal_postprocessing_parameters": {
+        "texture_size": 2048,
+        "texture_max_faces": 0
+    },
+    "settings_version": 2.82,
+    "help": "Paint the mesh from the same four object views with native Pixal3D PBR materials."
+}

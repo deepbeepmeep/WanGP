@@ -57,7 +57,7 @@ merges, this document and its actions replace them:
 - Pacing is part of the direction: the edit plays the song (or the score) straight through, so a shot lasts what its moment needs, not
   the model's longest window. In a music video most shots last one to three bars (a bar is 2 s at 120 BPM), faster in choruses and with
   the brief's pacing, as far as `shot_length` allows; a sung line holds longer. A film's dialogue sets its own rhythm. Planning every shot at the longest window saves
-  renders but gives a slow, monotonous cut.
+  renders but gives a slow, monotonous cut. A shot length the user set in the brief (`shot_length_range` in `template_advice`) comes first: it can go well beyond these habits.
 - Every speaker gets a voice in the cast: a `voice_description` (age, timbre, accent, pace: "a woman in her seventies, warm and slow,
   a faint Breton accent") or the user's voice sample. The narrator is a cast member with role narrator and no pictures. `speak` makes
   each speaker's voice sample once from the description and speaks every line from it, so the voice stays the same from the first

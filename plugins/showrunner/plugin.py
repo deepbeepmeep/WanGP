@@ -72,12 +72,14 @@ class WanGPHost:
 
     def deepy_advice(self) -> str:
         from shared.deepy.config import DEEPY_CONTEXT_TOKENS_DEFAULT, DEEPY_CONTEXT_TOKENS_KEY, DEEPY_KV_CACHE_QUANTIZATION_DEFAULT, DEEPY_KV_CACHE_QUANTIZATION_KEY, deepy_lower_kv_cache_supported, get_deepy_runtime_config, normalize_deepy_context_tokens, resolve_deepy_kv_cache_quantization
-        from shared.deepy.onboarding import DEEPY_FULL_CONTEXT_MIN_VRAM_GB, reported_vram
+        from shared.deepy.onboarding import DEEPY_FULL_CONTEXT_MIN_VRAM_GB, deepy_performance_warning, reported_vram
         from shared.remote_llm.config import is_remote_engine, resolve_role_engine
         config = get_deepy_runtime_config()
         if is_remote_engine(resolve_role_engine(config, "deepy")):  # a remote agent has its own context
             return ""
-        return advice_for_deepy(normalize_deepy_context_tokens(config.get(DEEPY_CONTEXT_TOKENS_KEY, DEEPY_CONTEXT_TOKENS_DEFAULT)), resolve_deepy_kv_cache_quantization(config.get(DEEPY_KV_CACHE_QUANTIZATION_KEY, DEEPY_KV_CACHE_QUANTIZATION_DEFAULT))[0], deepy_lower_kv_cache_supported(), reported_vram() == 0 or reported_vram() >= DEEPY_FULL_CONTEXT_MIN_VRAM_GB)
+        warning, vram = deepy_performance_warning(config), reported_vram()
+        advice = advice_for_deepy(normalize_deepy_context_tokens(config.get(DEEPY_CONTEXT_TOKENS_KEY, DEEPY_CONTEXT_TOKENS_DEFAULT)), resolve_deepy_kv_cache_quantization(config.get(DEEPY_KV_CACHE_QUANTIZATION_KEY, DEEPY_KV_CACHE_QUANTIZATION_DEFAULT))[0], deepy_lower_kv_cache_supported(), not warning and (vram == 0 or vram >= DEEPY_FULL_CONTEXT_MIN_VRAM_GB))
+        return " ".join(part for part in (warning, advice) if part)
 
     def production_workspace(self, title: str, folder: Path) -> str:
         return self._client().ensure_workspace(f"Showrunner - {title}"[:120], folder)
@@ -166,7 +168,8 @@ class WanGPHost:
                                 "soundtrack": "AS" in (sources.get("selection") or []),  # its model can follow an audio_guide kept as the soundtrack
                                 "sized_by_ref": "K" in refs,  # its output takes the first reference's size, not the production's format
                                 "shortest_s": math.floor(model_def.get("frames_minimum", 0) / model_def.get("fps", 16) * 1000) / 1000,  # the shortest take its model makes
-                                "take_frames": [model_def.get("frames_minimum", 0), model_def.get("frames_steps", 1), model_def.get("fps", 16)]})  # its first length and the steps after it
+                                "take_frames": [model_def.get("frames_minimum", 0), model_def.get("frames_steps", 1), model_def.get("fps", 16)],  # its first length and the steps after it
+                                "longest_frames": (model_def.get("sliding_window_defaults") or {}).get("window_max")})  # its longest window, when it has windows
         return catalog
 
     def default_templates(self) -> dict:

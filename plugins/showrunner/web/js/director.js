@@ -47,7 +47,7 @@ export function mountDirector(root) {
     const line = doc.director.state === 'pausing' ? 'Pausing after its current step…' : !busy ? (paused() ? `Paused · ${task.toLowerCase()}` : info.available ? 'Ready · Deepy Prime' : 'Unavailable')
       : deepyWait(live) || step || live.status?.text || task;
     const percent = live.progress ? `<span class="mono">${Math.round(live.progress.progress || 0)}%</span>` : '';
-    const reload = busy && live.status?.progress ? `<div class="progress" title="Reloading this production's conversation into Deepy"><i style="width:${Math.round(100 * live.status.progress.done / live.status.progress.total)}%"></i></div>` : '';
+    const reload = busy && live.status?.kind === 'loading' && live.status.progress ? `<div class="progress" title="Reloading this production's conversation into Deepy"><i style="width:${Math.round(100 * live.status.progress.done / live.status.progress.total)}%"></i></div>` : '';
     write(root.querySelector('#d-status'), `<div class="d-line">${busy ? '<span class="typing"><i></i><i></i><i></i></span>' : ''}<span class="d-doing" ${busy && live.stats?.text ? `title="${esc(live.stats.text)}"` : ''}>${shotNames(line)}</span>${percent}</div>${live.progress ? `<div class="progress"><i style="width:${live.progress.progress || 0}%"></i></div>` : ''}${reload}`);
     input.placeholder = busy ? 'Your note reaches it at its next step…' : paused() ? 'Your note resumes its task…' : 'Ask for a change: "make shot 3 at night"…';
   }

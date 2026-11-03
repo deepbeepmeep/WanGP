@@ -18,7 +18,7 @@ from tqdm import tqdm
 from shared.kernels import ops
 from shared.utils.phase_progress import PhaseProgress, check_abort, set_phase_status
 from models.trellis2 import sampler
-from models.trellis2.dit import CrossAttention, TrellisFlowDiT, TransformerBlock
+from models.trellis2.dit import CrossAttention, TrellisFlowDiT, TransformerBlock, fused_split_map
 from models.trellis2.dinov3 import image_to_pixels
 from models.trellis2.sparse import SparseTensor
 
@@ -68,21 +68,63 @@ class Pixal3DFlow(TrellisFlowDiT):
     def __init__(self, in_channels, out_channels, proj_in_channels, model_channels=1536, cond_channels=1024, num_blocks=30, num_heads=12,
                  mlp_ratio=5.3334, rope_freq=(1.0, 10000.0), resolution=None):
         super().__init__(in_channels, out_channels, model_channels, cond_channels, num_blocks, num_heads, mlp_ratio, rope_freq, resolution)
+        self.split_linear_modules_map = fused_split_map(model_channels)
         self.blocks = nn.ModuleList([ProjBlock(model_channels, cond_channels, num_heads, mlp_ratio, proj_in_channels) for _ in range(num_blocks)])
 
 
-def project_features(features, coords, grid, camera_angle_x, distance, mesh_scale, image_size):
+class Pixal3DStages(nn.ModuleDict):
+    """Stage-qualified adapters use the same stage names as the packed checkpoints."""
+
+    def __init__(self, flows):
+        super().__init__(flows)
+        self.split_linear_modules_map = next(iter(flows.values())).split_linear_modules_map
+
+    def preprocess_loras(self, model_type, state_dict):
+        from shared.utils.lora_mapping import convert_lora_keys
+
+        mapped = convert_lora_keys(state_dict, dict(self.named_modules()), split_linear_modules_map=self.split_linear_modules_map)
+        # Each flow is a separately profiled MMGP model. Keep split adapters local to its
+        # projections: aliases named from the container cannot be looked up from a child flow.
+        for key in list(mapped):
+            name, separator, suffix = key.partition(".lora_")
+            if not separator:
+                name, separator, suffix = key.rpartition(".")
+            parent, _, projection = name.rpartition(".")
+            spec = self.split_linear_modules_map.get(projection)
+            if spec is None or suffix not in ("A.weight", "B.weight", "alpha", "dora_scale"):
+                continue
+            value = mapped.pop(key)
+            names = spec["mapped_modules"]
+            if suffix in ("B.weight", "dora_scale"):
+                parts = value.split(spec["split_sizes"], dim=0)
+            else:
+                parts = [value, *(value.clone() for _ in names[1:])]
+            for child, part in zip(names, parts):
+                mapped[parent + "." + child + separator + suffix] = part
+        return mapped
+
+
+def project_features(features, coords, grid, camera_angle_x, distance, mesh_scale, image_size, view=0):
     """ProjGrid: features (1, C, h, w) of the image sampled (bilinear, border) at the projections of the voxels coords (N, 3) of a
     grid^3 grid spanning [-1, 1] (endpoints included), seen by Pixal3D's front camera. Returns (N, C) BF16."""
     points = (2 * coords.double() / (grid - 1) - 1) / (2 * mesh_scale)  # x right, y up, z towards the camera
-    depth = distance - points[:, 2]
+    # Camera orbit: front (+Z), right (+X), back (-Z), left (-X), in the GLB frame.
+    x, y, z = points.unbind(1)
+    if view == 1:
+        x, z = -z, x
+    elif view == 2:
+        x, z = -x, -z
+    elif view == 3:
+        x, z = z, -x
+    depth = distance - z
     focal = 16.0 / math.tan(camera_angle_x / 2.0) * image_size / 32.0
-    pixels = torch.stack([focal * points[:, 0] / (depth + 1e-8) + image_size / 2, -focal * points[:, 1] / (depth + 1e-8) + image_size / 2], 1)
+    pixels = torch.stack([focal * x / (depth + 1e-8) + image_size / 2, -focal * y / (depth + 1e-8) + image_size / 2], 1)
     grid_points = ((pixels + 0.5) / image_size * 2 - 1).float().view(1, -1, 1, 2)
     out = torch.empty((coords.shape[0], features.shape[1]), dtype=torch.bfloat16, device=features.device)
-    for start in range(0, coords.shape[0], 1 << 15):
-        part = grid_points[:, start:start + (1 << 15)]
-        out[start:start + part.shape[1]] = F.grid_sample(features.float(), part, mode="bilinear", align_corners=False, padding_mode="border")[0, :, :, 0].T
+    for start in range(0, features.shape[1], 128):
+        planes = features[:, start:start + 128].float()
+        out[:, start:start + 128] = F.grid_sample(planes, grid_points, mode="bilinear", align_corners=False, padding_mode="border")[0, :, :, 0].T
+        check_abort()
     return out
 
 
@@ -112,18 +154,43 @@ class Pixal3DGeometry:
         patches = tokens[:, GLOBAL_TOKENS:].transpose(1, 2).reshape(1, -1, side, side).float()
         return tokens[:, :GLOBAL_TOKENS].to(torch.bfloat16), patches
 
-    def _naf(self, image, size, patches):
+    def _naf(self, image, size, patches, target):
         pixels = torch.from_numpy(np.array(image.resize((size, size), Image.LANCZOS).convert("RGB"), copy=True)).to(self.device)
         pixels = pixels.permute(2, 0, 1)[None].float().div_(255)
-        return self.naf(pixels, patches, NAF_SIZE)
+        return self.naf(pixels, patches, target)
 
-    def _denoise(self, flow, noise, cond, coords, params, title, callback, dense=False):
+    def conditioning(self, images, size, coords, grid, angle, distance, naf_size=0, dino=None):
+        """Project each view into the shared voxel grid before averaging its aligned features."""
+        total_global = total_proj = None
+        for view, image in enumerate(images):
+            global_tokens, patches = dino[view] if dino is not None else self._dino(image, size)
+            projected = project_features(patches, coords, grid, angle, distance, 1.0, size, view)
+            if naf_size:
+                high = self._naf(image, size, patches, naf_size)
+                detail = project_features(high, coords, grid, angle, distance, 1.0, size, view)
+                del high
+                projected = torch.cat((projected, detail), dim=1)
+                del detail
+            if len(images) == 1:
+                return global_tokens, projected
+            if total_proj is None:
+                total_global, total_proj = global_tokens.float(), projected.float()
+            else:
+                total_global.add_(global_tokens)
+                total_proj.add_(projected)
+            del projected
+            check_abort()
+        return total_global.div_(len(images)).bfloat16(), total_proj.div_(len(images)).bfloat16()
+
+    def _denoise(self, flow, noise, cond, coords, params, title, callback, dense=False, concat=None):
         steps = params["steps"]
         phases = flow.phases(coords).to(self.device)
         channels = noise.shape[1]
 
         def model(x, t, contexts):
             tokens = x.view(1, channels, -1).transpose(1, 2).contiguous() if dense else x[None]
+            if concat is not None:
+                tokens = torch.cat((tokens, concat[None]), dim=-1)
             outputs = flow(tokens, t, contexts, phases)
             return [out.transpose(1, 2).reshape(noise.shape) if dense else out[0] for out in outputs]
 
@@ -144,19 +211,19 @@ class Pixal3DGeometry:
         finally:
             bar.close()
 
-    def generate(self, image, camera_angle_x, distance, generator, steps, guidance, callback=None, mesh_scale=1.0, max_tokens=MAX_TOKENS):
+    def generate(self, images, camera_angle_x, distance, generator, steps, guidance, callback=None, max_tokens=MAX_TOKENS, resolution=1536):
         """Shape latents (N, 32) FP32 (denormalized), their voxels (N, 3) and the surface resolution of the cascade."""
-        set_phase_status("Encoding Image")
-        global_512, patches_512 = self._dino(image, 512)
+        image_phase = "Encoding Four Object Views" if len(images) == 4 else "Encoding Image"
+        set_phase_status(image_phase)
+        dino = [self._dino(image, 512) for image in images]
         samplers = self.config["samplers"]
-        project = lambda features, coords, grid, size: project_features(features, coords, grid, camera_angle_x, distance, mesh_scale, size)
         # sparse structure: the dense 16^3 grid, DINOv3 features only
         flow = self.flows["ss_flow"]
         grid = flow.resolution
         axis = torch.arange(grid, device="cpu")
         dense = torch.stack(torch.meshgrid(axis, axis, axis, indexing="ij"), dim=-1).reshape(-1, 3)
         noise = torch.randn(1, flow.in_channels, grid, grid, grid, generator=generator, device="cpu").to(self.device)
-        cond = (global_512, project(patches_512, dense.to(self.device), grid, 512))
+        cond = self.conditioning(images, 512, dense.to(self.device), grid, camera_angle_x, distance, dino=dino)
         latent = self._denoise(flow, noise, cond, dense, dict(samplers["structure"], steps=steps, guidance_strength=guidance), "Denoising Structure", callback, dense=True)
         del cond, noise
         set_phase_status("Decoding Structure")
@@ -165,10 +232,9 @@ class Pixal3DGeometry:
         coords = torch.argwhere(F.max_pool3d(occupied.float(), ratio, ratio, 0)[0, 0] > 0.5).int()
         del latent, occupied
         # coarse shape at 512: DINOv3 and NAF features
-        set_phase_status("Encoding Image")
-        upsampled = self._naf(image, 512, patches_512)
-        cond = (global_512, torch.cat([project(patches_512, coords, SS_RESOLUTION, 512), project(upsampled, coords, SS_RESOLUTION, 512)], 1))
-        del upsampled
+        set_phase_status(image_phase)
+        cond = self.conditioning(images, 512, coords, SS_RESOLUTION, camera_angle_x, distance, NAF_SIZE, dino)
+        del dino
         mean, std = (torch.tensor(self.config["shape_normalization"][key], dtype=torch.float32, device=self.device)[None] for key in ("mean", "std"))
         flow = self.flows["shape_lowres"]
         noise = torch.randn(coords.shape[0], flow.in_channels, generator=generator, device="cpu").to(self.device)
@@ -178,7 +244,6 @@ class Pixal3DGeometry:
             fine = self.shape_decoder([SparseTensor(coarse, coords)], None, True, progress=progress.advance)
         del coarse
         # fine shape: Pixal3D's quantization of the 512 voxels to the fine latent grid, at most max_tokens of them
-        resolution = 1536
         while True:
             grid = resolution // 16
             coords = ((fine.float() + 0.5) / 512 * (grid - 1)).round().int().unique(dim=0)
@@ -186,11 +251,8 @@ class Pixal3DGeometry:
                 break
             resolution -= 128
         del fine
-        set_phase_status("Encoding Image")
-        global_1024, patches_1024 = self._dino(image, 1024)
-        upsampled = self._naf(image, 1024, patches_1024)
-        cond = (global_1024, torch.cat([project(patches_1024, coords, grid, 1024), project(upsampled, coords, grid, 1024)], 1))
-        del upsampled, patches_1024
+        set_phase_status(image_phase)
+        cond = self.conditioning(images, 1024, coords, grid, camera_angle_x, distance, NAF_SIZE)
         flow = self.flows["shape_highres"]
         noise = torch.randn(coords.shape[0], flow.in_channels, generator=generator, device="cpu").to(self.device)
         latents = self._denoise(flow, noise, cond, coords, dict(samplers["shape"], steps=steps, guidance_strength=guidance), "Denoising Shape", callback) * std + mean

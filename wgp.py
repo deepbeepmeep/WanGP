@@ -4,7 +4,7 @@ import os, sys
 for _stream in (sys.stdout, sys.stderr): _stream.reconfigure(encoding="utf-8", errors="replace")
 from tqdm import tqdm
 
-WanGP_version = "19.12"
+WanGP_version = "19.13"
 _welcome_message = f" WanGP v{WanGP_version} - Copyright (c) 2024-2026 DeepBeepMeep "
 tqdm.write(f"\033[1m\033[93m{_welcome_message:*^100}\033[0m")
 
@@ -2739,6 +2739,7 @@ family_handlers.append("models.evoke.evoke_handler")
 family_handlers.append("models.hi3d.hi3d_handler")
 family_handlers.append("models.supratex.supratex_handler")
 family_handlers.append("models.TTS.nemotron_transcribe.nemotron_transcribe_handler")
+family_handlers.append("models.glb_coder.glb_coder_handler")
 DEFAULT_LORA_ROOT = "loras" #"models.cosmos3.cosmos3_handler",
 
 def get_lora_root():
@@ -9041,7 +9042,7 @@ def generate_media(
 
                 if mesh_outputs and splats is None and mesh_postprocessing.selected(spatial_upsampling, temporal_upsampling):
                     processed = [perform_mesh_postprocessing(asset, spatial_upsampling, temporal_upsampling, spatial_values=parameter_ui.runtime_values(spatial_postprocessing_parameters, postprocessing_reference_images), temporal_values=parameter_ui.runtime_values(temporal_postprocessing_parameters, postprocessing_reference_images),
-                                                             reference_image=original_image_refs[0] if original_image_refs else None,
+                                                             reference_image=original_image_refs,
                                                              seed=seed, abort_callback=lambda: media_abort_requested(gen), progress_callback=upsampler_progress) for asset in meshes]
                     if gen.get("abort", False):
                         abort = True

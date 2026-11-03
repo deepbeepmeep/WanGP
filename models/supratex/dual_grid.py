@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 
 _TRIANGLES = 1 << 18  # triangles per chunk of the scanline and overlap enumerations
+_OVERLAP_BUDGET = 1 << 20
 _SOLVE_ROWS = 1 << 20
 
 
@@ -89,14 +90,35 @@ def _keys(voxels, grid):
     return (voxels[..., 0] * grid + voxels[..., 1]) * grid + voxels[..., 2]
 
 
-def _face_overlaps(triangles, grid):
-    """Voxels overlapped by each triangle (upstream face_qef plane / projection tests): (triangle index, voxel (3,))."""
+def _face_overlaps(triangles, grid, active_voxels, start=0):
+    """Yield bounded batches of overlapping active cells. A single oblique triangle's box can span the entire grid."""
+    from shared.utils.phase_progress import check_abort
+
+    lo = triangles.amin(1).trunc().long().clamp_min(0)
+    hi = ((triangles.amax(1) + 1).trunc().long().clamp(max=grid)) - 1
+    count = (hi - lo + 1).clamp_min(0).prod(1).sum().item()
+    if count <= _OVERLAP_BUDGET:
+        rows, voxels = _enumerate(lo, hi)
+        keep = _triangle_box_mask(triangles, rows, voxels)
+        yield start + rows[keep], voxels[keep]
+    elif len(triangles) > 1:
+        middle = len(triangles) // 2
+        yield from _face_overlaps(triangles[:middle], grid, active_voxels, start)
+        yield from _face_overlaps(triangles[middle:], grid, active_voxels, start + middle)
+    else:
+        # Only cells with edge crossings receive a face quadric. Test those directly instead of expanding a cubic box.
+        for cells in active_voxels.split(_OVERLAP_BUDGET):
+            check_abort()
+            voxels = cells[((cells >= lo) & (cells <= hi)).all(1)]
+            rows = voxels.new_zeros(len(voxels))
+            keep = _triangle_box_mask(triangles, rows, voxels)
+            yield start + rows[keep], voxels[keep]
+
+
+def _triangle_box_mask(triangles, rows, voxels):
     v0, v1, v2 = triangles.unbind(1)
     e0, e1, e2 = v1 - v0, v2 - v1, v0 - v2
     n = F.normalize(torch.linalg.cross(e0, e1), dim=-1)
-    lo = triangles.amin(1).trunc().long().clamp_min(0)
-    hi = ((triangles.amax(1) + 1).trunc().long().clamp(max=grid)) - 1
-    rows, voxels = _enumerate(lo, hi)
     p = voxels.float()
     nr, a, b, c, e = n[rows], v0[rows], v1[rows], v2[rows], (e0[rows], e1[rows], e2[rows])
     corner = (nr > 0).float()
@@ -111,7 +133,7 @@ def _face_overlaps(triangles, grid):
             nu, nv = -mul * edge[:, v], mul * edge[:, u]
             d = -(nu * start[:, u] + nv * start[:, v]) + nu.clamp_min(0) + nv.clamp_min(0)
             keep &= nu * p[:, u] + nv * p[:, v] + d >= 0
-    return rows[keep], voxels[keep]
+    return keep
 
 
 def _boundary_segments(vertices, faces):
@@ -249,9 +271,9 @@ def mesh_to_flexible_dual_grid(vertices, faces, grid_size, face_weight=1.0, boun
 
     if face_weight > 0:
         for start in range(0, len(faces), _TRIANGLES):
-            rows, overlapped = _face_overlaps(vertices[faces[start:start + _TRIANGLES]], grid_size)
-            found, hit = existing(overlapped)
-            _accumulate(quadric, found[hit], planes[start + rows[hit]] * face_weight)
+            for rows, overlapped in _face_overlaps(vertices[faces[start:start + _TRIANGLES]], grid_size, voxels, start):
+                found, hit = existing(overlapped)
+                _accumulate(quadric, found[hit], planes[rows[hit]] * face_weight)
     if boundary_weight > 0:
         segments = _boundary_segments(vertices, faces)
         if len(segments):

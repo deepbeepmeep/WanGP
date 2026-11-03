@@ -84,7 +84,7 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 ## 🔥 Latest Updates : 
 
 
-## 2nd of November 2026: WanGP v19.10 - The Show must Go On
+## 2nd of November 2026: WanGP v19.12 - The Show must Go On
 
 ## Showrunner 0.2.0
   - **Places that stay the same**: a kitchen or a cockpit no longer changes from shot to shot. The showrunner makes a picture of each recurring place and shoots in it, or uses your own photo.
@@ -92,6 +92,14 @@ WanGP is a one-stop super app for open source generative models: create videos, 
   - **Voices and songs that hold together**: each voice is checked against its cast card and each line against its voice, so a man does not sound like a woman and a voice does not change between lines. Lines that are not really sung are found before any shot depends on them, subtitles follow the singing, and a shot inserted in a music video keeps every later shot in sync with the song.
   - **Deep Review**: one click measures a finished version against its script (words, subtitles, voices, lips, sound and picture), then the showrunner looks at every shot. Each finding says where and what, and goes to the fix window in one click.
   - **Faster and clearer at every step**: a new request on the production you just worked on starts in seconds, the panel says what the showrunner is doing right now, silent shots play their whole video, and comparing versions has a bar to jump to any moment. Turn on **Show the Deepy tab** in **Settings** to follow Deepy's thoughts and every step.
+
+## 3D
+
+- **Qwen3.5 GLB 3D Coder 4B** turns a description and an optional reference image into a low-poly game asset. Ask for movement to export an animated GLB, or enable **Save Three.js Source** to keep the editable scene.
+- **Pixal3D Multi-View Shape** builds a mesh from front, right, back and left views. Upload four images in that order or one horizontal turnaround sheet.
+- **Pixal3D Native Texture** paints PBR materials on a new or existing mesh from one image or four views. Both models are available in BF16 and INT8 ConvRot.
+- **Speridlabs Idol** brings new weights to TripoSplat. Turn a single photo or render of an object into a 3D Gaussian splat you can rotate in the gallery or export as a PLY. Select **Create → TripoSplat Image to Gaussian Splats → Speridlabs Idol**. Choose **Photograph** for a wider crop, and raise **Gaussian Count** from 256K to 1M for finer detail.
+
 ## 30th of October 2026: WanGP v19.02 - More Treats Than You Can Handle
 
 - **Showrunner**: from a brief to a finished production of up to ten minutes: a music video, a short film, an ad, a trailer or an illustrated story. Deepy Prime becomes your showrunner: it plans every shot, casts, shoots, checks its own takes, redoes the failed ones and assembles the cut ([Showrunner guide](docs/SHOWRUNNER.md)).

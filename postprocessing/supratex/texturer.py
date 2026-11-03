@@ -18,8 +18,15 @@ _BOTH = (PARAMETER_UI_POSTPROCESSING, PARAMETER_UI_LATE_POSTPROCESSING)
 
 
 class SupraTexTexturer(MethodValueMixin):
+    name, method, model_type, position = NAME, METHOD, MODEL_TYPE, 10
+    description = ("The most faithful Texturer when the image lines up with the mesh. Completes PBR textures (base colour, metallic, roughness) in 3D from the object image: the visible side keeps the image's colours, "
+                   "print and patterns, the hidden side is completed consistently. The mesh and the image must show the same object, facing the same way. "
+                   "Its material stage is non-commercial (Qwen Research License).")
+    reference_label = "Object Image"
+    reference_help = "Picture of the object the mesh represents, seen from the mesh's front (its first image is used; a transparent background is best)."
+
     def __init__(self, server_config: dict[str, Any] | None = None, files_locator=None):
-        self.runtime = ModelRuntime(NAME, MODEL_TYPE)
+        self.runtime = ModelRuntime(self.name, self.model_type)
 
     @staticmethod
     def persistent_models() -> bool:
@@ -28,23 +35,21 @@ class SupraTexTexturer(MethodValueMixin):
     @classmethod
     def query_temporal_upsampler_def(cls) -> dict[str, Any]:
         return {
-            "name": NAME,
+            "name": cls.name,
             "media": (MEDIA_3D,),
             "postprocessing_category": CATEGORY_TEXTURER,
-            "config_key": "supratex",
-            "pos": 10,
-            "methods": [("SUPRA-Tex", METHOD)],
-            "description": "The most faithful Texturer when the image lines up with the mesh. Completes PBR textures (base colour, metallic, roughness) in 3D from the object image: the visible side keeps the image's colours, "
-                           "print and patterns, the hidden side is completed consistently. The mesh and the image must show the same object, facing the same way. "
-                           "Its material stage is non-commercial (Qwen Research License).",
-            "method_parameters": {METHOD: [
+            "config_key": cls.method,
+            "pos": cls.position,
+            "methods": [(cls.name, cls.method)],
+            "description": cls.description,
+            "method_parameters": {cls.method: [
                 {"name": "texture_size", "setting": "texture_size", "type": "integer", "component": "dropdown", "ui": _BOTH, "required": False, "default": 2048,
                  "choices": [("1024", 1024), ("2048", 2048), ("4096", 4096)], "enum": [1024, 2048, 4096], "label": "Texture Size", "description": "Size of the PBR texture images."},
                 {"name": "texture_max_faces", "setting": "max_faces", "type": "integer", "component": "slider", "ui": _BOTH, "required": False, "default": 0,
                  "minimum": 0, "maximum": 4000000, "step": 50000, "label": "Textured Max Faces (0 = keep all)",
                  "description": "Face count the mesh is reduced to before texturing; 0 keeps every face (a refined mesh keeps its detail, unwrapping takes longer)."},
                 {"name": "reference_images", "setting": "reference_image", "type": "array", "component": "images", "ui": (PARAMETER_UI_LATE_POSTPROCESSING,), "required": True,
-                 "default": [], "label": "Object Image", "description": "Picture of the object the mesh represents, seen from the mesh's front (its first image is used; a transparent background is best).",
+                 "default": [], "label": cls.reference_label, "description": cls.reference_help,
                  "multiple": True, "media_type": "image"},
             ]},
         }
@@ -53,17 +58,20 @@ class SupraTexTexturer(MethodValueMixin):
         return True
 
     def validate_upsampling(self, temporal_upsampling, *, source_is_image: bool = False) -> str:
-        return "" if self.split_value(temporal_upsampling) is not None else "Invalid SUPRA-Tex selection"
+        return "" if self.split_value(temporal_upsampling) is not None else f"Invalid {self.name} selection"
 
     def supports_loaded_model(self, temporal_upsampling, context, **_kwargs) -> bool:
-        return context.base_model_type == MODEL_TYPE
+        return context.base_model_type == self.model_type
+
+    def object_images(self, value):
+        return object_image(value)
 
     def texture(self, mesh, temporal_upsampling, *, loaded_model_context=None, reference_image=None, texture_size=2048, max_faces=0, seed=0, object_camera=None,
                 abort_callback=None, progress_callback=None, **_kwargs):
         """object_camera: the camera of a Pixal3D mesh (its GLB's OBJECT_CAMERA), used instead of fitting one to the image's silhouette."""
-        image = object_image(reference_image)
-        if image is None:
-            raise ValueError("SUPRA-Tex needs the Object Image of the mesh")
+        image = self.object_images(reference_image)
+        if not image:
+            raise ValueError(f"{self.name} needs the Object Image of the mesh")
         model = self.runtime.model(loaded_model_context)
         callback, set_status = pipeline_callbacks(model, abort_callback, progress_callback)
         return self.runtime.run(model.texture_mesh, mesh, image, int(seed), int(max_faces), int(texture_size), object_camera=object_camera, callback=callback,

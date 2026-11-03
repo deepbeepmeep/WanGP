@@ -444,7 +444,7 @@ export function nextStep(doc) {
 export function deepyWait(live) {
   if (live.queued) return 'Waiting its turn: Deepy is working on another production';
   if (live.running && /compact/i.test(live.status?.text || '')) return 'Deepy is condensing a long conversation to make room';  // it prefills as part of that too
-  if (live.running && live.status?.progress) return "Reloading this production's conversation into Deepy";
+  if (live.running && live.status?.kind === 'loading' && live.status.progress) return "Reloading this production's conversation into Deepy";  // a tool's status has a progress too (Render: 0/4)
   return live.running && live.status?.kind === 'loading' ? live.status.text : '';
 }
 
