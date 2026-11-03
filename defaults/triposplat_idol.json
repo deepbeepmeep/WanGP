@@ -1,0 +1,24 @@
+{
+    "model": {
+        "name": "Speridlabs Idol",
+        "architecture": "triposplat",
+        "splat_variant": "idol",
+        "description": "Idol turns one render or photograph of an object into a 3D Gaussian splat. It supports up to one million Gaussians for fine detail and offers a wider crop for photographs. Hidden sides are inferred from the single view.",
+        "URLs": [
+            "https://huggingface.co/DeepBeepMeep/3D/resolve/main/idol_bf16.safetensors",
+            "https://huggingface.co/DeepBeepMeep/3D/resolve/main/idol_int8_convrot.safetensors"
+        ]
+    },
+    "prompt": "Axolotl figurine",
+    "image_mode": 1,
+    "video_prompt_type": "I",
+    "model_mode": "synthetic",
+    "num_inference_steps": 50,
+    "guidance_scale": 4.0,
+    "flow_shift": 3.0,
+    "batch_size": 1,
+    "seed": 42,
+    "custom_settings": {
+        "num_gaussians": 262144
+    }
+}

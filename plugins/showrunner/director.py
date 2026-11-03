@@ -9,11 +9,14 @@ import hashlib
 import threading
 import time
 from pathlib import Path
+import re
 from typing import Any
+
+from shared.deepy import session_store
 
 from . import media, production as model
 
-TASKS = ("plan", "shoot", "continue", "message", "reshoot", "assemble", "resume")
+TASKS = ("plan", "shoot", "continue", "message", "reshoot", "assemble", "review", "resume")
 KIND_SKILLS = {"music_video": "wangp://skills/music-video", "short_film": "wangp://skills/edited-film", "trailer": "wangp://skills/edited-film",
                "story": "wangp://skills/production", "ad": "wangp://skills/production", "free": "wangp://skills/production"}  # long-story-writing is for long texts, and only listed with long-text tools
 KIND_NAMES = {"music_video": "music video", "short_film": "short film", "ad": "ad", "trailer": "trailer", "story": "illustrated story", "free": "production"}
@@ -39,8 +42,8 @@ def _brief_text(doc: dict[str, Any]) -> str:
     if brief.get("references"):
         lines.append("Reference media: " + ", ".join(_name(path) for path in brief["references"]))
     format_parts = [f"aspect {brief['aspect']}", f"{brief['resolution']}"]
-    if brief.get("duration_s"):
-        format_parts.append(f"about {brief['duration_s']:g} s in total")
+    if brief.get("duration_s") or not brief.get("song"):
+        format_parts.append(f"about {brief.get('duration_s') or model.DEFAULT_LENGTH_S:g} s in total")
     lines.append("Format: " + ", ".join(format_parts) + ".")
     style = ", ".join([*brief.get("style_tags", []), brief.get("style", "")]).strip(", ")
     if style:
@@ -48,6 +51,8 @@ def _brief_text(doc: dict[str, Any]) -> str:
     pacing = int(brief.get("pacing") or 0)
     if pacing:
         lines.append("Pacing: " + ("faster cuts than usual." if pacing > 0 else "longer, calmer shots than usual."))
+    if model.shot_range_words(doc):
+        lines.append(f"Shot length, the user's choice: video shots of {model.shot_range_words(doc)}.")
     if brief.get("budget_minutes"):
         lines.append(f"GPU budget: about {brief['budget_minutes']:g} minutes of generation in total.")
     if brief.get("review_before_edit"):
@@ -74,18 +79,27 @@ You are the showrunner of a production for the user: you plan, cast, shoot, edit
 - Render shots with `render`: it adds the cast's pictures and the driving audio (song slice or spoken line) that the shot's template needs, which a direct wangp_generate call does not. `assemble` reports the delivered file's streams, loudness and true peak: do not parse the export yourself.
 - Locked shots and cast members are the user's, and the user's edits and verdicts override yours. Read the document again after each long step.
 - Shots showing a cast member take that member's pictures as reference images, never as the start image. Follow template_advice and fix the warnings returned.
-- A shot's generation names its template and gives only what the shot changes (prompt, media, length): the template brings the model, LoRAs and steps, and `plan` validates the shots.
+- A shot's generation names its template and gives only what the shot changes (prompt, media): the template brings the model, LoRAs and steps, the brief the resolution and its duration_s the length. `plan` and `add_shots` validate the shots and return what they will render at (`renders`): quote those numbers when you tell the user a size or a length.
 - Words meant to be read (titles, taglines, names, captions) are edit overlays or drawn cards, never part of a video prompt: video models misspell them.
 - Spoken and sung words get subtitles unless the brief says otherwise: write them in their shots' dialogue.
 - Each speaker keeps one voice for the whole production: give every speaker (the narrator too, as a cast member with role narrator) a voice_description and make their lines with `speak`. A voice described again for each line comes out different every time.
 - Choose a text design that suits the production (style.text_design) and vary cards with it; a chapter card over a dimmed still of the scene it opens beats a plain page.
 - Inspect every take before you judge it, and log one short line for each decision the user should know about.
-- Your replies and log lines are for the user, a filmmaker: short and in plain words. Name people by their names and an export by its version number (assemble returns it: "version 3"); leave out file paths, revisions, settings keys, model, template and tool names (shot ids are fine: the page shows them as shot numbers)."""
+- Your replies and log lines are for the user, a filmmaker: short and in plain words. Name a shot by its id (s7: the page shows its number) or its title, never "shot 7", people by their names and an export by its version number (assemble returns it: "version 3"); leave out file paths, revisions, settings keys, model, template and tool names (shot ids are fine: the page shows them as shot numbers)."""
 
 
 def _task_words(task: str, message: str = "", shots: list[str] | tuple[str, ...] = ()) -> str:
-    return {"plan": "planning the production", "shoot": "shooting the production", "reshoot": f"re-shooting {', '.join(shots)}", "assemble": "assembling the edit",
+    return {"plan": "planning the production", "shoot": f"shooting {', '.join(shots)}" if shots else "shooting the production", "reshoot": f"re-shooting {', '.join(shots)}", "assemble": "assembling the edit", "review": "reviewing the last version in depth",
             "continue": "continuing the production"}.get(task) or f"working on the user's note: {message}"
+
+
+def repeating_failure(failures: dict[str, int], tool: dict[str, Any]) -> bool:
+    """Whether this failed call is the third of its kind in the task (the tool and its error, without the numbers and file names that change from one try to the next). A loop of guesses around one
+    tool failure cost a production half an hour."""
+    words = re.sub(r"[@\w\-. ]*[\\/][^\s'\"]*|\d+", "#", str(tool.get("error") or ""))[:80]
+    key = f"{tool.get('label') or tool.get('name')}|{words}"
+    failures[key] = failures.get(key, 0) + 1
+    return failures[key] == 3
 
 
 def method_key() -> str:
@@ -100,33 +114,43 @@ def build_prompt(doc: dict[str, Any], task: str, message: str = "", shots: list[
     header = (f"[Showrunner] Production \"{doc['title']}\" (production id: {doc['id']}). Method for its kind: {KIND_SKILLS[kind]}. "
               f"Read it with wangp_plugins(plugin=\"showrunner\", action=\"production\", arguments={{\"production\": \"{doc['id']}\"}}).")
     if task == "plan":
-        body = ("Plan the production from its brief: cast (with a master image of each recurring person or object that has no picture yet, and one in the "
+        body = ("Plan the production from its brief: cast (with a master image of each recurring person, object and place that has no picture yet, and one in the "
                 "production's style for a member whose pictures have another look), style, and every shot with its template, complete generation settings and "
                 "duration. Do not render shots: the user reviews and edits the plan first, then asks you to shoot.")
         length = doc["brief"].get("duration_s") or (doc["audio"].get("analysis") or {}).get("duration_s") or 0
         if length > 90:
             body += f" It runs about {length / 60:.1f} minutes: outline its sequences first, then plan each sequence's shots (the skill's long productions section)."
+    elif task == "shoot" and shots:
+        body = (f"Shoot {', '.join(shots)} and leave every other shot and its takes as they are: the user asked for these alone and nothing is wrong with them, so there is no fault to look for. "
+                "Render them, inspect each take and record a verdict, then stop and say how it came out. Do not assemble: the user decides what comes next.")
     elif task == "shoot":
         review = doc["brief"].get("review_before_edit")
         body = ("Shoot the production: render the included shots that still need a good take, in order, inspect each take and record a verdict, then "
                 + ("stop and ask the user to review the takes: they approve them before the edit is assembled." if review else "assemble the edit, check it and report."))
         length = doc["brief"].get("duration_s") or (doc["audio"].get("analysis") or {}).get("duration_s") or 0
         if len(doc["shots"]) > 24 or length > 90:
-            body += " Work sequence by sequence" + ("." if review else " and assemble after each one, so the user can follow the edit as it grows.")
+            body += " Work sequence by sequence" + ("." if review or length <= 300 else " and assemble after each one, so the user can follow the edit as it grows.")
     elif task == "reshoot":
-        body = (f"Re-shoot shots {', '.join(shots)}: read the user's notes and verdicts in the document first, render new takes, inspect them and record verdicts.")
+        note = f' The user says: "{message}".' if message else " The user wrote no note: if no note or verdict in the document says what is wrong, shoot them again without looking for a fault."
+        body = (f"Fix shots {', '.join(shots)} and leave every other shot and its takes as they are.{note} Read the user's notes and verdicts in the document first. What the user asks for is theirs to decide, a new length or other content included: do it. When they say what is wrong rather "
+                "what to do, find the cause before you shoot: when a new take would not change it (the song, a subtitle, a trim, a card), fix that instead, and when that touches other shots, say which and what it costs before you do it. "
+                "Render new takes where they are needed, inspect them and record verdicts, then " + ("stop and ask the user to review them." if doc["brief"].get("review_before_edit") else "assemble a new version, check that the fault is gone and say what changed."))
     elif task == "assemble":
         body = "Assemble the edit with the showrunner assemble action, check the result (picture, sound, length) and report what you find."
+    elif task == "review":
+        body = ("Review the last version in depth, and change nothing. Run the showrunner deep_review action: it measures words, subtitles, voices, lips, sound and picture, and says when each shot starts (shots_at). Then look at a frame of "
+                "every shot of the version against the pictures of its cast and place (inspect_media): another face, an extra person, another set, a costume that changed. Record what differs with deep_review(add=[{shot, at_s, text}]), one short "
+                "sentence each. Then tell the user the faults that matter most, in a few lines, and what you would do about them. Do not fix anything: the user decides.")
     elif task == "continue":
         last = doc["director"].get("last") or {}
         ended = {"interrupted": "was interrupted (WanGP stopped)", "cancelled": "was stopped", "error": "failed"}.get(str(last.get("status")), "ended")
         body = (f"Continue the production where it stopped: read the document to see what is left. The previous task {ended}: nothing it started "
-                "(a render, a generation) is still running, and a call it was waiting for will not return; render again what has no take.")
+                "(a render, a generation) is still running, and a call it was waiting for will not return; render again what has no take. Takes that have your verdict are judged: do not inspect them again.")
     elif task == "resume":
         paused = doc["director"].get("paused") or {}
         body = (f"The user paused you while you were {_task_words(paused.get('task') or 'continue', paused.get('message', ''), paused.get('shots') or ())}, and now resumes: "
                 "finish that task. Read the document first: the user may have changed shots, verdicts or the edit meanwhile. Nothing you started is still "
-                "running and a call you were waiting for will not return: render again what has no take.")
+                "running and a call you were waiting for will not return: render again what has no take. Takes that have your verdict are judged: do not inspect them again.")
         if message:
             body += f"\n\nThe user adds: {message}"
     else:
@@ -141,8 +165,14 @@ class Director:
         self._jobs: dict[str, Any] = {}
         self._pausing: dict[str, bool] = {}  # productions whose director stops after its current step
         self._tools: dict[str, set] = {}  # the tool calls each director job is running
+        self._failures: dict[str, dict[str, int]] = {}  # a task's failed calls, by kind
+        self._noted: dict[str, bool] = {}  # a note written during a batch
         self._live: dict[str, dict[str, Any]] = {}  # what each production's last job showed (its text and steps), for a page that missed the events
         self._lock = threading.Lock()
+
+    def conversation(self, production_id: str, after: int = 0) -> dict[str, Any]:
+        """What the Deepy tab shows when it opens or catches up: the conversation Deepy saved, since `after`."""
+        return session_store.read_ui_updates(self.store.get(production_id).folder / "session", after)
 
     def status(self, production_id: str) -> dict[str, Any]:
         production = self.store.get(production_id)
@@ -159,7 +189,7 @@ class Director:
         live = self._live.get(production_id)
         return {"state": doc["director"].get("state", "idle"), "task": doc["director"].get("task"), "running": job is not None and not job.done(),
                 "available": info["available"], "reason": info["reason"], "info": info, "last": doc["director"].get("last"),
-                **({"live": {"text": live["text"], "tools": list(live["tools"].values())[-20:]}} if live else {})}
+                **({"live": {**live, "tools": list(live["tools"].values())[-20:]}} if live else {})}
 
     def start(self, production_id: str, task: str, message: str = "", shots: list[str] | None = None) -> dict[str, Any]:
         if task not in TASKS:
@@ -188,10 +218,13 @@ class Director:
             if doc["director"].get("method", "") != method and (production.folder / "session" / "context.json").is_file():
                 prompt += "\n\nThe Showrunner method changed since your last task in this production: read wangp://skills/showrunner/directing again before you act."
             job = self.host.run_director(prompt, session_dir=production.folder / "session", workspace=workspace, title=f"Showrunner - {doc['title']}", instructions=INSTRUCTIONS)
+            job.chat_events = True
             self._jobs[production_id] = job
             self._pausing.pop(production_id, None)
             self._tools[production_id] = set()
-            self._live[production_id] = {"text": "", "tools": {}}
+            self._live[production_id] = {"text": "", "tools": {}, "status": None, "thought": None, "stats": None}
+            self._failures[production_id] = {}
+            self._noted.pop(production_id, None)
         # a resumed task keeps the paused one's task, note and shots: pausing again resumes the same work
         paused = (doc["director"].get("paused") or {}) if task == "resume" else {}
         work = {"task": paused.get("task") or "continue", "message": paused.get("message", ""), "shots": paused.get("shots") or []} if task == "resume" else \
@@ -206,8 +239,8 @@ class Director:
     def _log_line(task, message, shots):
         if task == "resume":
             return f"Asked the showrunner to resume: {message}" if message else "Asked the showrunner to resume."
-        what = {"plan": "Asked the showrunner to plan the production.", "shoot": "Asked the showrunner to shoot the production.", "continue": "Asked the showrunner to continue.",
-                "assemble": "Asked the showrunner to assemble the edit.", "reshoot": f"Asked the showrunner to re-shoot {', '.join(shots or [])}."}.get(task)
+        what = {"plan": "Asked the showrunner to plan the production.", "shoot": f"Asked the showrunner to shoot {', '.join(shots)}." if shots else "Asked the showrunner to shoot the production.", "continue": "Asked the showrunner to continue.",
+                "assemble": "Asked the showrunner to assemble the edit.", "review": "Asked the showrunner for a deep review of the last version.", "reshoot": f"Asked the showrunner to fix {', '.join(shots or [])}{': ' + message if message else '.'}"}.get(task)
         return what or f"Told the showrunner: {message}"
 
     def steer(self, production_id: str, text: str) -> None:
@@ -217,7 +250,12 @@ class Director:
             self.start(production_id, "resume" if self.status(production_id)["state"] == "paused" else "message", text)
             return
         job.steer(text)
+        self._noted[production_id] = True
         self.store.get(production_id).apply([{"op": "log", "text": f"Told the showrunner: {text}"}], by="user", record=False)
+
+    def note_waiting(self, production_id: str) -> bool:
+        """The user wrote while a long batch runs: said once, for the toolbox to stop between its shots, as a note otherwise waits until the whole batch has ended."""
+        return self._noted.pop(production_id, False)
 
     def stop(self, production_id: str) -> None:
         with self._lock:
@@ -259,10 +297,20 @@ class Director:
         return {"state": "paused", "paused": {"task": director.get("task"), "message": director.get("message", ""), "shots": director.get("shots") or [], "time": time.time()},
                 "last": {"status": "paused", "task": director.get("task"), "time": time.time()}}
 
+    def _tell_user(self, production, error: str | None) -> None:
+        """Settings > Tell me when a task ends: the sound and the user's notification destinations, for when the page is out of sight. A task's end stays
+        a success when its notification fails."""
+        try:
+            if self.host.settings()["notify_turns"]:
+                doc = production.snapshot()
+                self.host.notify(f"Showrunner: {doc['title']}", f"It stopped with an error: {str(error)[:300]}" if error else model.next_step(doc))
+        except Exception as failure:
+            print(f"[Showrunner] The notification failed: {failure}", flush=True)
+
     def _follow(self, production_id: str, job) -> None:
         production = self.store.get(production_id)
         publish = lambda kind, data=None: self.store.publish({"type": "director", "production": production_id, "event": kind, "data": data})
-        live = self._live.setdefault(production_id, {"text": "", "tools": {}})
+        live = self._live[production_id]
         try:
             for event in job.events():
                 if event.kind == "queued":
@@ -271,11 +319,23 @@ class Director:
                     production.apply([{"op": "director", "fields": {"state": "running"}}], by="system", record=False)
                     publish("started")
                 elif event.kind == "text":
-                    live["text"] = event.data["text"][-4000:]
+                    live["text"] = (event.data.get("last") or event.data["text"])[-4000:]
                     publish("text", {"text": live["text"]})
                 elif event.kind == "status":
+                    live["status"] = event.data
                     publish("status", event.data)
+                elif event.kind == "thought":
+                    live["thought"] = {"text": event.data["text"][-4000:], "streaming": event.data["streaming"]}
+                    publish("thought", live["thought"])
+                elif event.kind == "chat":
+                    if self.host.settings()["show_deepy_tab"]:  # the Deepy tab streams it
+                        publish("chat", event.data)
+                elif event.kind == "stats":
+                    live["stats"] = event.data
+                    publish("stats", event.data)
                 elif event.kind == "tool":
+                    if event.data.get("status") == "error" and repeating_failure(self._failures.setdefault(production_id, {}), event.data):
+                        job.steer("(Automatic note, not from the user.) This call has failed the same way three times. Stop trying other ways around it: go on with the rest of the task if you can, and say in your report what fails and the exact error.")
                     running = self._tools.setdefault(production_id, set())
                     (running.add if event.data.get("status") == "running" else running.discard)(event.data.get("id"))
                     live["tools"][event.data.get("id")] = event.data
@@ -296,7 +356,7 @@ class Director:
                 publish("paused", {"status": "paused"})
                 self.host.release_gpu()
                 return
-            last = {"status": result.status, "text": (result.text or "")[-1500:], "error": result.error, "time": time.time()}
+            last = {"status": result.status, "text": (getattr(result, "reply", "") or result.text or "")[:4000], "error": result.error, "time": time.time()}
             ops = [{"op": "director", "fields": {"state": "idle", "last": last}}]
             if result.status == "done" and production.snapshot()["director"].get("task") == "plan":
                 ops.append({"op": "stage", "stage": "review"})
@@ -305,7 +365,11 @@ class Director:
             elif result.status == "cancelled":
                 ops.append({"op": "log", "text": "The showrunner was stopped."})
             production.apply(ops, by="system", record=False)
+            if last["text"]:  # its last words stay in the conversation
+                production.apply([{"op": "log", "text": last["text"]}], by="deepy", record=False)
             publish(result.status, last)
+            if result.status in ("done", "error"):
+                self._tell_user(production, result.error if result.status == "error" else None)
         except Exception as error:  # the job thread reports to the page instead of dying silently
             production.apply([{"op": "director", "fields": {"state": "idle", "last": {"status": "error", "error": str(error), "time": time.time()}}}], by="system", record=False)
             publish("error", {"error": str(error)})
@@ -315,15 +379,24 @@ class Director:
             job.close()
 
     def _bin_output(self, production, output: dict[str, Any]) -> None:
-        """Media Deepy made that no take records yet (masters, tests, songs) go to the production's bin, where the user can use them."""
+        """Media Deepy made that no take records yet (masters, tests, songs) go to the production's bin, where the user can use them; a take
+        recorded later leaves it. What it made only to measure or to cut (a vocal stem, a song's slices, frames of a take) stays out."""
         path = output.get("path")
+        if path and _WORKING_FILE.search(Path(path).name):
+            return
         doc = production.snapshot()
         recorded = {str(production.resolve(take["path"])) for shot in doc["shots"] for take in shot["takes"]} | {str(production.resolve(item["path"])) for item in doc.get("bin", [])}
         if path and str(path) not in recorded:
-            item = {"path": production.rel(path), "media": output.get("id"), "kind": output.get("kind"), "name": output.get("name"), "by": "deepy"}
+            name = _WITHOUT_STAMP.sub("", str(output.get("name") or Path(path).stem))
+            same = sum(1 for item in doc["bin"] if str(item.get("name") or "").split(" (")[0] == name)
+            item = {"path": production.rel(path), "media": output.get("id"), "kind": output.get("kind"), "name": f"{name} ({same + 1})" if same else name, "by": "deepy"}
             if item["kind"] in ("video", "image") and Path(path).is_file():  # the bin shows what it is, as for the user's imports
                 item["poster"] = production.rel(media.poster(Path(path), production.folder / "cache" / f"{media.cache_key(Path(path))}.jpg"))
             production.apply([{"op": "bin_add", "item": item}], by="system", record=False)
+
+
+_WORKING_FILE = re.compile(r"(_post|_audio(\(\d+\))?|_frame\d+\S*)\.\w+$")
+_WITHOUT_STAMP = re.compile(r"^\d{4}-\d{2}-\d{2}-\d{2}h\d{2}m\d{2}s_seed\d+_")
 
 
 def media_entries(result: Any) -> list[dict[str, Any]]:

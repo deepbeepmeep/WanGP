@@ -18,6 +18,7 @@ const ICONS = {
   plus: '<path d="M12 5v14M5 12h14"/>',
   upload: '<path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>',
   download: '<path d="M12 4v12M7 11l5 5 5-5"/><path d="M4 18v1a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-1"/>',
+  settings: '<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/>',
   play: '<path d="M7 4.5v15l13-7.5z" fill="currentColor"/>',
   pause: '<rect x="6" y="4.5" width="4" height="15" rx="1" fill="currentColor"/><rect x="14" y="4.5" width="4" height="15" rx="1" fill="currentColor"/>',
   stop: '<rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/>',
@@ -85,6 +86,12 @@ export function shotRefs(text, shots, cast = [], versions = []) {
     return index < 0 ? match : `<span class="shot-ref" title="${esc(shots[index].title || '')} (${match})">shot ${index + 1}</span>`;
   });
 }
+// "Mia, the lead singer": what the Add dialogs ask for, a name and a role.
+export function personFields(text) {
+  const [name, ...role] = text.trim().split(',');
+  return role.length ? { name: name.trim(), role: role.join(',').trim() } : { name: name.trim() };
+}
+
 export function shotText(text, shots, cast = [], versions = []) {
   return versionRefs(text, versions).replace(/\b([sc])(\d+)\b/g, match => {
     if (match[0] === 'c') return cast.find(member => member.id === match)?.name || match;
@@ -133,6 +140,25 @@ export function formatDuration(seconds) {
   if (!seconds) return '0s';
   if (seconds < 60) return `${+seconds.toFixed(1)}s`;
   return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+}
+
+// The bar of a comparison player: it moves both videos together, to any moment of the longer one.
+export const COMPARE_SEEK = '<div class="compare-bar"><span class="mono" id="cmp-time">0:00</span><input type="range" id="cmp-seek" min="0" max="1000" value="0" aria-label="Move through both videos" title="Move through both videos"></div>';
+export function bindCompareSeek(root) {
+  const a = root.querySelector('#cmp-a'), b = root.querySelector('#cmp-b'), seek = root.querySelector('#cmp-seek'), time = root.querySelector('#cmp-time');
+  const length = () => Math.max(a.duration || 0, b.duration || 0);
+  let moving = false;
+  const show = () => {
+    if (!length()) return;
+    if (!moving) seek.value = Math.round(a.currentTime / length() * 1000);
+    time.textContent = `${formatTime(a.currentTime)} / ${formatTime(length())}`;
+  };
+  const jump = seconds => { a.currentTime = seconds; b.currentTime = seconds; show(); };
+  for (const video of [a, b]) video.addEventListener('loadedmetadata', show);
+  a.addEventListener('timeupdate', show);
+  seek.addEventListener('input', () => { moving = true; jump(seek.value / 1000 * length()); });
+  seek.addEventListener('change', () => { moving = false; });
+  return jump;
 }
 
 export function count(number, word) { return `${number} ${word}${number === 1 ? '' : 's'}`; }  // "1 shot", "3 shots"
@@ -227,9 +253,28 @@ export function promptDialog({ title, text = '', value = '', placeholder = '', o
 }
 
 let openMenu = null;
+// A button's attributes: greyed out with the reason it cannot be used now as its tooltip, or usable with its own tooltip.
+// What a local Deepy's settings cost a production: until closed, as long as it says the same.
+let closedAdvice = null;
+export function adviceBar(info) {
+  try { closedAdvice ??= localStorage.getItem('sr.advice'); } catch { /* a convenience */ }
+  return info?.advice && info.advice !== closedAdvice ? `<div class="next-step advice">${icon('alert')}<span class="grow">${esc(info.advice)}</span><button class="btn ghost icon" id="advice-close" title="Close" aria-label="Close">${icon('x')}</button></div>` : '';
+}
+export function bindAdvice(root, info) {
+  root.querySelector('#advice-close')?.addEventListener('click', () => {
+    closedAdvice = info.advice;
+    try { localStorage.setItem('sr.advice', info.advice); } catch { /* a convenience */ }
+    root.querySelector('.advice')?.remove();
+  });
+}
+
+export function availability(reason, title = '') {
+  return reason ? `disabled title="${esc(reason)}"` : title ? `title="${esc(title)}"` : '';
+}
+
 export function menu(anchor, items) {
   closeMenu();
-  const element = h(`<div class="menu" role="menu">${items.map((item, index) => item === '-' ? '<hr>' : `<button data-i="${index}" class="${item.danger ? 'danger' : ''}">${icon(item.icon || 'chevron')}<span>${esc(item.label)}</span></button>`).join('')}</div>`);
+  const element = h(`<div class="menu" role="menu">${items.map((item, index) => item === '-' ? '<hr>' : `<button data-i="${index}" class="${item.danger ? 'danger' : ''}" ${availability(item.unavailable)}>${icon(item.icon || 'chevron')}<span>${esc(item.label)}</span></button>`).join('')}</div>`);
   document.body.append(element);
   const rect = anchor instanceof Element ? anchor.getBoundingClientRect() : { left: anchor.x, right: anchor.x, top: anchor.y, bottom: anchor.y };
   const width = element.offsetWidth, height = element.offsetHeight;

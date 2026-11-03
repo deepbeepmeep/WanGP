@@ -1,0 +1,33 @@
+<!doctype html>
+<!-- Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt) -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Deepy</title>
+  <link rel="stylesheet" href="assets/chat.css">
+  <link rel="stylesheet" href="assets/app.css">
+  <link rel="stylesheet" href="assets/window.css">
+  <script>
+    // Read by chat.js as it loads, as Deepy's app sets them: this window has no connection of its own.
+    window.__wangpAssistantChatNS = {handleEventNodeMutation() {}, readEventSource() {}, installEventBridge() { window.addEventListener('resize', () => window.__wangpAssistantChatNS.scheduleComposerLayout()); }};
+  </script>
+  <script defer src="assets/chat.js"></script>
+  <script defer src="assets/compact_actions.js"></script>
+  <script defer src="assets/window.js"></script>
+</head>
+<body data-deepy-app data-deepy-window>
+  <main>
+    <section id="chat-view" class="view" aria-label="Deepy chat">
+      <div id="assistant_chat_dock"><div id="assistant_chat_panel">
+        <div id="assistant_chat_shell_block"><!-- CHAT --></div>
+        <div id="assistant_chat_controls">
+          <div id="assistant_chat_request"><textarea aria-label="Request" placeholder="What would you like to create?" rows="1"></textarea></div>
+          <button id="assistant_chat_ask_button" type="button">Ask</button>
+        </div>
+        <div id="assistant_chat_stats_block"><!-- STATS --></div>
+      </div></div>
+    </section>
+  </main>
+</body>
+</html>

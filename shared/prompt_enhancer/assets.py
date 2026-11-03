@@ -168,46 +168,94 @@ QWEN35_VARIANT_SPECS = {
 }
 
 
-def _qwen35_variant_files(variant: str) -> list[str]:
-    spec = QWEN35_VARIANT_SPECS[variant]
-    return list(spec["root_files"]) + [spec[key] for key in ("vision_filename", "text_int8_filename", "text_gguf_filename", "text_gguf_q3_filename", "text_gguf_q2_filename", "text_gguf_ptq1_filename", "text_gguf_q8_filename", "text_mtp_filename", "text_gguf_q3_mtp_filename", "text_gguf_ptq1_mtp_filename") if key in spec]
+QWEN_CHECKPOINTS = {
+    "quanto_int8": ("text_int8_filename", "Quanto INT8"),
+    "gguf": ("text_gguf_filename", "GGUF Q4_K_M"),
+    "gguf_q8": ("text_gguf_q8_filename", "GGUF Q8_0"),
+    "gguf_q3": ("text_gguf_q3_filename", "GGUF IQ3_S"),
+    "gguf_q2": ("text_gguf_q2_filename", "GGUF IQ2_M"),
+    "gguf_ptq1": ("text_gguf_ptq1_filename", "GGUF PTQ1_0"),
+}
+
+
+def _files(repo, folder, names, target=None):
+    definition = {"repoId": repo, "sourceFolderList": [folder], "fileList": [list(names)]}
+    if target is not None:
+        definition["targetFolderList"] = [target]
+    return definition
+
+
+def qwen_download_defs(spec, backend, speculative_decoding=False):
+    folder = spec.get("repo_subfolder", "")
+    shared_files = list(spec["root_files"])
+    gguf = backend.startswith("gguf")
+    key = QWEN_CHECKPOINTS[backend][0] if gguf else "text_int8_filename"
+    filename = spec[key]
+    checkpoint_folder = spec.get("gguf_repo_subfolder", folder) if gguf else folder
+    draft_key = {"gguf_q3": "text_gguf_q3_mtp_filename", "gguf_ptq1": "text_gguf_ptq1_mtp_filename"}.get(backend, "text_mtp_filename")
+    draft = [spec[draft_key]] if speculative_decoding and draft_key in spec else []
+    defs = []
+    if spec["root_repo"] == spec["gguf_repo"]:
+        if checkpoint_folder != folder:
+            defs.append(_files(spec["gguf_repo"], checkpoint_folder, [filename], spec["assets_dir_name"]))
+        shared_files.append(spec["vision_filename"])
+        if checkpoint_folder == folder:
+            shared_files.append(filename)
+        shared_files.extend(draft)
+    defs.append(_files(spec["root_repo"], folder, shared_files, None if folder else spec["assets_dir_name"]))
+    if spec["root_repo"] != spec["gguf_repo"]:
+        defs.append(_files(spec["gguf_repo"], checkpoint_folder, [spec["vision_filename"], filename, *draft]))
+    if spec.get("text_required_files"):
+        defs.append(_files(spec["text_repo"], folder, spec["text_required_files"]))
+    return defs
+
+
+def florence_llama_download_def(enhancer_id):
+    folder, files = (LLAMA32_FOLDER, LLAMA32_FILES) if enhancer_id == 1 else (LLAMAJOY_FOLDER, LLAMAJOY_FILES)
+    return {"repoId": PROMPT_ENHANCER_REPO, "sourceFolderList": [FLORENCE2_FOLDER, folder], "fileList": [FLORENCE2_FILES, files]}
+
+
+def checkpoint_inventory():
+    """Local model choices, including unselected formats and optional draft weights."""
+    from shared.utils.files_locator import installed_copies
+    from .block_draft import BLOCK_DRAFT_ASSETS, draft_download_def
+
+    for number, label in [(1, "Llama 3.2 3B"), (2, "Llama Joy 8B")]:
+        yield {"name": "Florence 2", "variant": label, "download_defs": [florence_llama_download_def(number)]}
+    bonsai = "Bonsai 2 27B"
+    for spec in QWEN35_VARIANT_SPECS.values():
+        for backend, (key, label) in QWEN_CHECKPOINTS.items():
+            if key in spec:
+                defs = qwen_download_defs(spec, backend)
+                # Manually installed GGUF/vision weights can also be resolved by the runtime at the checkpoint root or beside the tokenizer.
+                aliases = {}
+                for definition in defs:
+                    source = definition["sourceFolderList"][0]
+                    target = definition.get("targetFolderList", [""])[0]
+                    for filename in definition["fileList"][0]:
+                        if filename in (spec[key], spec["vision_filename"]):
+                            path = "/".join(part for part in (target, source, filename) if part)
+                            aliases[path] = [filename, f"{spec['assets_dir_name']}/{filename}"]
+                model = bonsai if backend == "gguf_ptq1" else spec["display_name"]
+                yield {"name": model, "variant": label, "download_defs": defs, "alternate_paths": aliases}
+        for key, model, label in [("text_mtp_filename", spec["display_name"], "MTP"), ("text_gguf_q3_mtp_filename", spec["display_name"], "Q3 MTP"), ("text_gguf_ptq1_mtp_filename", bonsai, "MTP")]:
+            if key in spec:
+                yield {"name": model, "variant": label, "download_defs": [_files(spec["gguf_repo"], spec["assets_dir_name"], [spec[key]])]}
+    for name, spec in BLOCK_DRAFT_ASSETS.items():
+        model = bonsai if name.endswith("_bonsai") else QWEN35_VARIANT_SPECS[QWEN38_VARIANT_27B]["display_name"]
+        method = "DSpark" if name == "dspark" else "DFlash2"
+        yield {"name": model, "variant": f"{method} Draft", "download_defs": [draft_download_def(spec)]}
+
+    # Earlier 9B weights can remain beside the current releases after an upgrade.
+    spec = QWEN35_VARIANT_SPECS[QWEN35_VARIANT_9B]
+    for filename, label in [(QWEN35_TEXT_INT8_FILENAME_V1, "Quanto INT8 v1"), (QWEN35_TEXT_INT8_FILENAME_V2, "Quanto INT8 v2"),
+                            ("Qwen3.5-9B-Abliterated-text-Q4_K_M.gguf", "GGUF Q4_K_M (original)")]:
+        if filename not in (spec["text_int8_filename"], spec["text_gguf_filename"]):
+            paths = [f"{spec['assets_dir_name']}/{filename}", filename]
+            installed = [path for path in paths if installed_copies(path)]
+            if installed:
+                yield {"name": spec["display_name"], "variant": label, "files": installed}
 
 
 def query_prompt_enhancer_download_defs() -> list[dict[str, Any]]:
-    return [
-        {
-            "repoId": PROMPT_ENHANCER_REPO,
-            "sourceFolderList": [FLORENCE2_FOLDER, LLAMA32_FOLDER],
-            "fileList": [FLORENCE2_FILES, LLAMA32_FILES],
-        },
-        {
-            "repoId": PROMPT_ENHANCER_REPO,
-            "sourceFolderList": [FLORENCE2_FOLDER, LLAMAJOY_FOLDER],
-            "fileList": [FLORENCE2_FILES, LLAMAJOY_FILES],
-        },
-        {
-            "repoId": QWEN35_ABLITERATED_REPO,
-            "sourceFolderList": [
-                QWEN35_VARIANT_SPECS[QWEN35_VARIANT_4B]["repo_subfolder"],
-                QWEN35_VARIANT_SPECS[QWEN35_VARIANT_9B]["repo_subfolder"],
-            ],
-            "fileList": [_qwen35_variant_files(QWEN35_VARIANT_4B), _qwen35_variant_files(QWEN35_VARIANT_9B)],
-        },
-        {
-            "repoId": QWEN35_ABLITERATED_REPO,
-            "sourceFolderList": [QWEN35_VARIANT_SPECS[QWEN38_VARIANT_9B]["gguf_repo_subfolder"]],
-            "targetFolderList": [QWEN35_VARIANT_SPECS[QWEN38_VARIANT_9B]["assets_dir_name"]],
-            "fileList": [[QWEN38_9B_TEXT_GGUF_FILENAME, QWEN38_9B_TEXT_GGUF_Q8_FILENAME]],
-        },
-        {
-            "repoId": QWEN38_27B_ASSETS_REPO,
-            "sourceFolderList": [""],
-            "targetFolderList": [QWEN35_VARIANT_SPECS[QWEN38_VARIANT_27B]["assets_dir_name"]],
-            "fileList": [list(QWEN35_VARIANT_SPECS[QWEN38_VARIANT_27B]["root_files"])],
-        },
-        {
-            "repoId": QWEN38_27B_GGUF_REPO,
-            "sourceFolderList": [QWEN38_27B_GGUF_REPO_SUBFOLDER],
-            "fileList": [[QWEN38_27B_TEXT_GGUF_FILENAME, QWEN38_27B_TEXT_GGUF_Q3_FILENAME, QWEN38_27B_TEXT_GGUF_Q2_FILENAME, QWEN38_27B_TEXT_GGUF_PTQ1_FILENAME, QWEN38_27B_MTP_GGUF_FILENAME, QWEN38_27B_VISION_FILENAME]],
-        },
-    ]
+    return [definition for entry in checkpoint_inventory() for definition in entry.get("download_defs", ())]

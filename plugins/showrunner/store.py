@@ -26,7 +26,14 @@ def _slug(text: str) -> str:
 def _write_json(path: Path, payload: Any) -> None:
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(json.dumps(payload, indent=1, ensure_ascii=False), encoding="utf-8")
-    os.replace(temporary, path)
+    for attempt in range(40):  # Windows refuses to replace a file another process has open, for as long as it reads it: an antivirus, a search index, a backup
+        try:
+            os.replace(temporary, path)
+            return
+        except PermissionError:
+            if attempt == 39:
+                raise
+            time.sleep(0.05)
 
 
 def _media_settings(settings: dict[str, Any], convert: Callable[[str], str]) -> dict[str, Any]:
@@ -282,7 +289,7 @@ class ProductionStore:
             posters = [take["poster"] for shot in doc["shots"] if (take := model.chosen_take(shot)) and take.get("poster")][:4]
             items.append({"id": production_id, "title": doc["title"], "kind": doc["brief"]["kind"], "stage": doc["stage"], "updated": doc["updated"],
                           "created": doc["created"], "shots": len(doc["shots"]), "approved": sum(shot["status"] == "approved" for shot in doc["shots"]),
-                          "rendered": sum(bool(shot["takes"]) for shot in doc["shots"]), "duration_s": round(sum(item["duration_s"] for item in model.timeline(doc)), 1),
+                          "rendered": sum(bool(shot["takes"]) for shot in doc["shots"]), "duration_s": model.cut_length(doc),
                           "aspect": doc["brief"]["aspect"], "posters": posters, "director": doc["director"].get("state", "idle"), "archived": doc["archived"],
                           "deliverables": len(doc["deliverables"]), "latest": (doc["deliverables"] or [{}])[-1].get("path"),
                           "changed_since_delivery": bool(doc["deliverables"]) and doc["deliverables"][-1].get("edit_key") not in (None, model.edit_key(doc))})  # exports made before edit keys: unknown

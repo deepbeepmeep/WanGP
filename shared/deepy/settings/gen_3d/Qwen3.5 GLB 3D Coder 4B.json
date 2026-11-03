@@ -1,0 +1,11 @@
+{
+    "settings_version": 2.82,
+    "model_type": "qwen35_glb_coder",
+    "type": "Qwen3.5 GLB 3D Coder 4B",
+    "prompt": "",
+    "image_mode": 1,
+    "video_prompt_type": "",
+    "batch_size": 1,
+    "custom_settings": {"kv_cache_layout": "int8", "kv_cache_size": 64000, "save_source": 0},
+    "multi_prompts_gen_type": "FG"
+}

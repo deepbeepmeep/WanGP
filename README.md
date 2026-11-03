@@ -14,7 +14,7 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 | **Video** | **Wan 2.1/2.2** and derived models, **MiniMax H3**, **LTX-2/2.3/2.5**, **Hunyuan Video 1/1.5**, **LongCat**, **Kandinsky**, **LTXV**, **MagiHuman** |
 | **Image** | **Fibo 2.0**, **Flux 3 Klein** and **Flux 1/2**, **MOSS Image / Edit**, **Krea 2**, **Qwen Image**, **Z-Image**, **SenseNova**, **Ideogram 4**, **HiDream** |
 | **Audio / TTS** | **Fish Audio Drama 3**, **MOSS-TTS v1.5**, **Qwen3 TTS**, **MiniMax H3 Voice Clone**, **Ace Step 1/2/XL**, **Omnivoice**, **Index TTS2/2.5**, **KugelAudio**, **HeartMula**, **Chatterbox**, **Minimax Music**, **Stable Audio 3** |
-| **3D** | **Hunyuan3D 2.1**, **TRELLIS.2**, **TripoSG**, **TripoSplat**, **PartCrafter**, **WorldMirror 2.0**, **MapAnything**, **Depth Anything 3 Points**, **MoGe-2** |
+| **3D** | **Hunyuan3D 2.1**, **TRELLIS.2**, **TripoSG**, **TripoSplat** (including **Idol**), **PartCrafter**, **WorldMirror 2.0**, **MapAnything**, **Depth Anything 3 Points**, **MoGe-2** |
 | **Interactive worlds** | **Hy-Nomas 8B** from text; **EVOKE Turbo 14B** from an image. Walk, look around, introduce events and save your journey. |
 
 ### Create a World, Then Explore It
@@ -83,7 +83,24 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 ## 🔥 Latest Updates : 
 
-## 31st of October 2026: WanGP v19.0 - More Treats Than You Can Handle
+
+## 2nd of November 2026: WanGP v19.12 - The Show must Go On
+
+## Showrunner 0.2.0
+  - **Places that stay the same**: a kitchen or a cockpit no longer changes from shot to shot. The showrunner makes a picture of each recurring place and shoots in it, or uses your own photo.
+  - **Fix what is wrong, keep the rest**: pause on a problem or pick shots, say what should change or press **+** to insert a shot. Only that changes; compare with the previous version and go back in one click. Bigger changes (a new actor, a new song) stay one sentence away in the chat.
+  - **Voices and songs that hold together**: each voice is checked against its cast card and each line against its voice, so a man does not sound like a woman and a voice does not change between lines. Lines that are not really sung are found before any shot depends on them, subtitles follow the singing, and a shot inserted in a music video keeps every later shot in sync with the song.
+  - **Deep Review**: one click measures a finished version against its script (words, subtitles, voices, lips, sound and picture), then the showrunner looks at every shot. Each finding says where and what, and goes to the fix window in one click.
+  - **Faster and clearer at every step**: a new request on the production you just worked on starts in seconds, the panel says what the showrunner is doing right now, silent shots play their whole video, and comparing versions has a bar to jump to any moment. Turn on **Show the Deepy tab** in **Settings** to follow Deepy's thoughts and every step.
+
+## 3D
+
+- **Qwen3.5 GLB 3D Coder 4B** turns a description and an optional reference image into a low-poly game asset. Ask for movement to export an animated GLB, or enable **Save Three.js Source** to keep the editable scene.
+- **Pixal3D Multi-View Shape** builds a mesh from front, right, back and left views. Upload four images in that order or one horizontal turnaround sheet.
+- **Pixal3D Native Texture** paints PBR materials on a new or existing mesh from one image or four views. Both models are available in BF16 and INT8 ConvRot.
+- **Speridlabs Idol** brings new weights to TripoSplat. Turn a single photo or render of an object into a 3D Gaussian splat you can rotate in the gallery or export as a PLY. Select **Create → TripoSplat Image to Gaussian Splats → Speridlabs Idol**. Choose **Photograph** for a wider crop, and raise **Gaussian Count** from 256K to 1M for finer detail.
+
+## 30th of October 2026: WanGP v19.02 - More Treats Than You Can Handle
 
 - **Showrunner**: from a brief to a finished production of up to ten minutes: a music video, a short film, an ad, a trailer or an illustrated story. Deepy Prime becomes your showrunner: it plans every shot, casts, shoots, checks its own takes, redoes the failed ones and assembles the cut ([Showrunner guide](docs/SHOWRUNNER.md)).
   - **The same cast from start to finish**: faces, outfits and voices stay consistent across dozens of shots, costume changes included, and long productions get titles and chapter cards.
@@ -92,6 +109,7 @@ WanGP is a one-stop super app for open source generative models: create videos, 
   - **Instant editing**: the Timeline plays the cut at once, without rendering, and titles are drawn over the picture, so they are always sharp and spelled right.
   - **Every version kept**: compare versions side by side, go back to one or branch it into a new production. Exports come with subtitles and a levelled soundtrack.
   - **Works with your models**: Showrunner uses Deepy's templates, your own included, and can pause to free the GPU for other work. It needs Deepy Prime, with a local model or a remote agent.
+
 
 - **Nemotron Transcription**: turn speech into text offline, with little VRAM: who said what (up to eight speakers, even talking over each other), when each word was said, subtitles, and translation to or from English, for recordings of up to an hour in 40 languages. **Q4 Experts** (32 GB of RAM) is the recommended version.
   - **Audio or video**: transcribe an audio file or a video's soundtrack.
@@ -230,7 +248,7 @@ Deepy Prime, your built-in personal assistant, can now:
 - **Faster Startup on RTX 50xx, Happier SSD**: on Blackwell GPUs, the NVIDIA driver optimizes the GPU code again at every launch and keeps the result in a shared 1 GB cache, too small to hold it all: 10-15 s lost at each first generation, and a cache rewritten on your SSD every time. Tick *Config → Performance → WanGP Compute Cache* to give WanGP its own cache (up to 2 GB): the work is done once and for all.
 
 - **3D Gen Models**: WanGP enters the third dimension, with plenty of synergies with the other models: rotate a 3D asset in the new *3D Viewer*, snap a view at the resolution you want and use it as a start image, or turn your generated images and videos into 3D.
-  - *One picture to a 3D asset*: **Hunyuan3D 2.1** (mesh + PBR textures), **TRELLIS.2** (textured PBR mesh), **TripoSG** (detailed mesh), **TripoSplat** (Gaussian splats), **PartCrafter** (one mesh per part)
+  - *One picture to a 3D asset*: **Hunyuan3D 2.1** (mesh + PBR textures), **TRELLIS.2** (textured PBR mesh), **TripoSG** (detailed mesh), **TripoSplat** and **Idol** (Gaussian splats), **PartCrafter** (one mesh per part)
   - *Photos or video to a 3D scene*: **WorldMirror 2.0**, **MapAnything**, **Depth Anything 3 Points**, and **MoGe-2** from a single photo
   - *Mesh tools*: **GeoSAM2** splits a mesh into its parts, **AnimateAnyMesh** animates a mesh from a text description
 

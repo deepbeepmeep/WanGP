@@ -189,6 +189,12 @@ class PiDBridge:
     def config_requires_release(self, old_config: dict[str, Any], new_config: dict[str, Any], changed_keys: set[str]) -> bool:
         return old_config != new_config or bool({"image_profile", "attention_mode"} & changed_keys)
 
+    def query_checkpoint_inventory(self):
+        for label, method in pid_post_upsampling_choices():
+            version = pid_version_for_upsampling(method)
+            defs = get_pid_download_def(pid_backbone_for_upsampling(method), ckpt_type=("2kto4k",) if version == "1.5" else None, version=version)
+            yield {"name": label, "variant": f"v{'1.0' if version == '1' else version}", "download_defs": defs}
+
     def _required_files(self, backbone, spatial_upsampling):
         version = pid_version_for_upsampling(spatial_upsampling)
         ckpt_types = ("2kto4k",) if version == "1.5" else pid_checkpoint_types_for_tiling_threshold(self.config()["tiling_threshold"])

@@ -1,18 +1,34 @@
 // Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 // Deliver: the assembled versions of the edit, what is left before the final cut, and the files to take away.
+import { COMPARE_SEEK, bindCompareSeek } from './ui.js';
+import { segments } from './sequencer.js';
+import { askForFix, shotAt } from './fix.js';
 import { state, actions } from './app.js';
 import { api } from './api.js';
-import { icon, esc, ago, formatDuration, toast, pickFiles, h, confirmDialog, count } from './ui.js';
+import { icon, esc, ago, formatDuration, formatTime, toast, pickFiles, h, confirmDialog, count, availability } from './ui.js';
 
 export function mountDeliver(container) {
   let selected = null, compareWith = null, changes = null;
   const number = id => state.doc.deliverables.findIndex(item => item.id === id) + 1;  // versions are numbered in the order they were made
+  let seen = null;
+  function markSeen() {  // the next step stops asking to watch a version that is on this page, also one that arrives while it is open
+    const latest = state.doc.deliverables.at(-1)?.id;
+    if (!latest || latest === seen) return;
+    seen = latest;
+    try { localStorage.setItem(`sr.watched.${state.pid}`, latest); } catch { /* a convenience */ }
+    actions.refreshDirector?.();
+  }
+  markSeen();
   const subtitles = new Map();  // each export's subtitles for the player: a WebVTT object URL, '' without any (read once)
   let showSubtitles = false;
-  try { showSubtitles = localStorage.getItem('sr.subtitles') === '1'; } catch { /* a convenience */ }
+  try { showSubtitles = localStorage.getItem('sr.subtitles') !== '0'; } catch { /* a convenience */ }
   function render() {
     const doc = state.doc;
     const versions = [...doc.deliverables].reverse();
+    if (state.compareLatest) {  // the next step asked for it: the new version against the one before
+      state.compareLatest = false;
+      if (versions.length > 1) return compare(versions[0].id, versions[1].id);
+    }
     const current = versions.find(item => item.id === selected) || versions[0];
     const other = compareWith && compareWith !== current?.id ? versions.find(item => item.id === compareWith) : null;
     const included = doc.shots.filter(shot => shot.included);
@@ -28,22 +44,26 @@ export function mountDeliver(container) {
         <div class="col" style="gap:10px"><div class="player" id="d-player" style="--aspect:${doc.brief.aspect.replace(':', '/')}">${other ? compareHtml(current, other)
           : current ? `<video id="d-video" data-path="${esc(current.path)}" src="${actions.file(current.path)}" controls playsinline poster="${current.poster ? actions.file(current.poster) : ''}">${subtitleTrack(current.path)}</video>${subtitleSwitch(current.path)}`
           : `<div class="empty"><div class="col" style="align-items:center">${icon('film')}<b>No version yet</b><span>Assemble the edit to watch it here.</span></div></div>`}</div>
+          ${current === latest && !other && current ? `<div class="row fix-row"><button class="btn" id="fix-here" ${availability(actions.directorBlocked(), 'Pauses the video on the shot playing: say what should change, the showrunner fixes that and keeps the rest')}>${icon('director')} Something's wrong here</button><span class="muted">Pause on it and say what should change: the rest stays as it is.</span></div>` : ''}
           ${other ? `<div class="panel" style="padding:14px 16px"><div class="label">${icon('compare')} From version ${Math.min(number(current.id), number(other.id))} to version ${Math.max(number(current.id), number(other.id))}</div>
-            ${changes ? (changes.length ? `<ul class="changes">${changes.map(line => `<li>${esc(line)}</li>`).join('')}</ul>` : '<div class="muted">No change in the edit.</div>') : '<div class="muted">Reading both versions…</div>'}</div>` : ''}</div>
+            ${changes ? (changes.length ? `<ul class="changes">${changes.map(line => `<li>${esc(line)}</li>`).join('')}</ul>` : '<div class="muted">No change in the edit.</div>') : '<div class="muted">Reading both versions…</div>'}
+            <div class="row fix-row" style="margin-top:10px"><button class="btn small" id="keep-older">${icon('undo')} Go back to version ${Math.min(number(current.id), number(other.id))}</button><span class="muted">One change you can undo; the newer version stays in the list.</span></div></div>` : ''}</div>
         <div class="col" style="gap:14px">
           ${stale ? `<div class="stale-note">${icon('alert')}<span><b>The edit changed since the last version.</b> Assemble again to include your latest changes.</span></div>` : ''}
           <div class="panel" style="padding:16px"><div class="label">${icon('target')} Before the final cut</div><div class="checklist">
-            ${check(shot === included.length && included.length, `${shot}/${included.length} shots shot`)}${check(approved === included.length && included.length, `${approved}/${included.length} approved by you`, review ? `${review} waiting for your review` : '')}
+            ${check(shot === included.length && included.length, `${shot}/${included.length} shots shot`)}${doc.brief.review_before_edit ? check(approved === included.length && included.length, `${approved}/${included.length} approved by you`, review ? `${review} waiting for your review` : '') : ''}
             ${check(doc.brief.song || doc.edit.audio_mode === 'clips', doc.edit.audio_mode === 'song' ? 'Soundtrack: the song' : doc.edit.audio_mode === 'mix' ? 'Soundtrack: song and shot sound' : 'Soundtrack: shot sound')}</div>
-            <div class="row" style="margin-top:12px"><button class="btn ${latest && !stale ? '' : 'primary'} grow" id="assemble" ${shot ? '' : 'disabled title="Shoot at least one shot first"'}>${icon('film')} ${latest ? 'Assemble again' : 'Assemble'}</button>
-              <button class="btn" id="ask" title="The showrunner assembles the edit, watches it and reports">${icon('director')} Showrunner review</button></div></div>
+            <div class="row" style="margin-top:12px"><button class="btn ${latest && !stale ? '' : 'primary'} grow" id="assemble" ${availability(actions.assembleBlocked(doc))}>${icon('film')} ${latest ? 'Assemble again' : 'Assemble'}</button>
+              <button class="btn" id="ask" ${availability(actions.directorBlocked() || actions.assembleBlocked(doc), 'The showrunner assembles the edit, watches it and reports')}>${icon('director')} Showrunner review</button></div></div>
           ${current ? `<div class="panel" style="padding:16px"><div class="label">${icon('info')} Version ${number(current.id)} · ${esc(clock(current.time))}</div><div class="col" style="gap:6px;font-size:13px">
             <div class="row"><span class="muted grow">Length</span><b>${formatDuration(current.duration_s)}</b></div>
             <div class="row"><span class="muted grow">Picture</span><b>${current.width || '?'}×${current.height || '?'}${current.fps ? ` · ${current.fps} fps` : ''}</b></div>
             <div class="row"><span class="muted grow">Made by</span><b>${current.by === 'deepy' ? 'the showrunner' : 'you'} · ${esc(method(current))}</b></div>
             <div class="row"><span class="muted grow">When</span><b>${ago(current.time)}</b></div></div>
+            <select class="select" id="other-format" style="margin-top:12px" title="Makes the shots again in another format; this version stays as it is" ${actions.directorBlocked() ? 'disabled' : ''}><option value="">Make it in another format…</option>${['16:9', '9:16', '1:1', '4:3', '2.39:1'].filter(aspect => aspect !== doc.brief.aspect).map(aspect => `<option value="${aspect}">${aspect}${aspect === '9:16' ? ' (vertical)' : aspect === '1:1' ? ' (square)' : ''}</option>`).join('')}</select>
             <a class="btn ${stale ? '' : 'primary'}" style="margin-top:12px;width:100%" href="${actions.file(current.path, true)}" download="${esc(name(current))}">${icon('download')} Download${current === latest && stale ? ' (previous edit)' : ''}</a></div>` : ''}
         </div></div>
+      ${current === latest && !other ? reviewPanel(latest, actions.directorBlocked()) : ''}
       ${soundPanel(doc)}
       ${versions.length ? `<div class="panel"><div class="panel-head"><h3>Versions</h3><span class="hint">click to watch · compare two · open one to bring back what it used</span></div><div class="versions">${versions.map(item => `<div class="version ${item.id === current?.id ? 'on' : ''} ${item.id === other?.id ? 'cmp' : ''}" data-version="${item.id}">
           ${item.poster ? `<img src="${actions.file(item.poster)}" alt="">` : ''}<div class="grow"><b>Version ${number(item.id)}</b> <span class="muted">· ${esc(clock(item.time))}</span><div class="muted" style="font-size:12px">${formatDuration(item.duration_s)} · ${item.width || '?'}×${item.height || '?'} · ${esc(method(item))}</div></div><span class="muted" style="font-size:12px">${ago(item.time)}</span>
@@ -58,21 +78,46 @@ export function mountDeliver(container) {
       render();
     };
     container.querySelector('#ask').onclick = () => actions.direct('assemble');
+    container.querySelector('#deep-review')?.addEventListener('click', () => actions.direct('review', '', [], { show: true }));
+    container.querySelector('#review-fix-all')?.addEventListener('click', () => {
+      const found = latest.review.findings.filter(item => item.shots.length);
+      askForFix([...new Set(found.flatMap(item => item.shots))], null, undefined, found.map(item => `${item.at_s == null ? '' : `${formatTime(item.at_s)}: `}${item.text}`).join('\n'));
+    });
+    container.querySelectorAll('[data-review-at]').forEach(button => button.onclick = () => {
+      const video = container.querySelector('#d-video');
+      if (video) { video.currentTime = +button.dataset.reviewAt; video.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
+    });
+    container.querySelectorAll('[data-review-fix]').forEach(button => button.onclick = () => {
+      const item = latest.review.findings[+button.dataset.reviewFix];
+      askForFix(item.shots, item.at_s, undefined, item.text);
+    });
+    container.querySelector('#fix-here')?.addEventListener('click', () => {
+      const video = container.querySelector('#d-video');
+      video.pause();
+      if (video.currentTime > 0) askForFix([shotAt(doc, video.currentTime)].filter(Boolean), video.currentTime);
+      else askForFix([]);
+    });
+    container.querySelector('#other-format')?.addEventListener('change', event => { const aspect = event.target.value; event.target.value = ''; if (aspect) actions.makeFormat(aspect); });
     bindSound();
     container.querySelectorAll('[data-version]').forEach(element => element.onclick = () => { selected = element.dataset.version; compareWith = null; render(); });
-    container.querySelectorAll('[data-compare]').forEach(button => button.onclick = async event => {
-      event.stopPropagation();
-      selected = current.id;
-      compareWith = button.dataset.compare;
-      changes = null;
-      render();
-      container.querySelector('#d-player').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-      try { changes = (await api.version(state.pid, compareWith, current.id)).changes; } catch (error) { changes = [error.message]; }
-      render();
+    container.querySelectorAll('[data-compare]').forEach(button => button.onclick = event => { event.stopPropagation(); compare(current.id, button.dataset.compare); });
+    container.querySelector('#keep-older')?.addEventListener('click', async () => {
+      const older = number(current.id) < number(other.id) ? current : other;
+      try { await api.restoreVersion(state.pid, older.id); toast(`Version ${number(older.id)} restored. Undo: Ctrl+Z`, 'ok', 6000); } catch (error) { toast(error.message, 'error', 7000); }
     });
     container.querySelectorAll('[data-open]').forEach(button => button.onclick = event => { event.stopPropagation(); openVersion(button.dataset.open); });
     if (other) bindCompare();
     else if (current) subtitles.has(current.path) ? bindSubtitles() : readSubtitles(current.path);
+  }
+
+  async function compare(id, against) {
+    selected = id;
+    compareWith = against;
+    changes = null;
+    render();
+    container.querySelector('#d-player').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    try { changes = (await api.version(state.pid, against, id)).changes; } catch (error) { changes = [error.message]; }
+    render();
   }
 
   // The subtitles a version carries, over the player on request: the export keeps them as a track the viewer turns on.
@@ -117,6 +162,7 @@ export function mountDeliver(container) {
       <div class="compare" id="cmp-clip" style="clip-path:inset(0 0 0 50%)"><video id="cmp-b" src="${actions.file(b.path)}"${poster(b)} preload="auto" playsinline muted></video></div>
       <div class="compare-handle" id="cmp-handle" style="left:50%"></div>
       <span class="tag compare-label" style="left:8px">A · version ${number(a.id)}</span><span class="tag compare-label" style="right:8px;left:auto;background:rgba(56,225,208,.85);color:#002b28">B · version ${number(b.id)}</span>
+      ${COMPARE_SEEK}
       <div class="row" style="position:absolute;bottom:8px;left:50%;transform:translateX(-50%);z-index:4;flex-wrap:nowrap"><button class="btn small" id="cmp-play">${icon('play')} Play both</button>
         <button class="btn small" id="cmp-sound" title="Hear the other version">${icon('audio')} Sound: A</button><button class="btn small" id="cmp-done">${icon('x')} Done</button></div>`;
   }
@@ -139,6 +185,13 @@ export function mountDeliver(container) {
     };
     container.querySelector('#cmp-sound').onclick = event => { a.muted = !a.muted; b.muted = !a.muted; event.currentTarget.innerHTML = `${icon('audio')} Sound: ${a.muted ? 'B' : 'A'}`; };
     container.querySelector('#cmp-done').onclick = () => { compareWith = null; render(); };
+    const jump = bindCompareSeek(container);
+    // A change names its shot by its place in the later cut: a click goes there, when that cut is the current one.
+    const places = segments(state.doc, actions.take), newest = state.doc.deliverables.at(-1)?.id;
+    if (newest === selected || newest === compareWith) container.querySelectorAll('.changes li').forEach(item => {
+      const place = places[+(/^Shot (\d+)/.exec(item.textContent)?.[1] || 0) - 1];
+      if (place) { item.classList.add('jump'); item.title = 'Go to this shot'; item.onclick = () => jump(place.start + 0.05); }
+    });
   }
 
   // A version opened: what it used (shots and their takes, cast, text, sound), each piece one click from coming back, and the whole
@@ -189,13 +242,13 @@ export function mountDeliver(container) {
   }
 
   render();
-  return { update: render, assembling: render, destroy() { subtitles.forEach(url => url && URL.revokeObjectURL(url)); } };
+  return { update() { markSeen(); render(); }, assembling: render, destroy() { subtitles.forEach(url => url && URL.revokeObjectURL(url)); } };
 }
 
 // When a version was made: the time, with the day when it was not today.
 function clock(timestamp) {
   const date = new Date(timestamp * 1000), today = date.toDateString() === new Date().toDateString();
-  return date.toLocaleString(undefined, today ? { hour: '2-digit', minute: '2-digit' } : { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+  return (today ? 'made at ' : 'made ') + date.toLocaleString(undefined, today ? { hour: '2-digit', minute: '2-digit' } : { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
 }
 
 // What a version used, beside today's production: a piece already in use is marked, the others get a "Bring back".
@@ -232,6 +285,21 @@ function versionHtml(number, data, now) {
     </div>
     <div class="actions"><button class="btn" data-branch title="A new production starting from this version; this one stays as it is">${icon('layers')} Duplicate from this version</button>
       <button class="btn primary" data-restore title="Go back to this version, as one change you can undo">${icon('undo')} Restore this version</button></div>`;
+}
+
+// Deep Review: a version measured against its script, on request. A fault is measured, a check is for the user's eyes.
+function reviewPanel(version, blocked) {
+  if (!version) return '';
+  const findings = version.review?.findings || [], faults = findings.filter(item => item.level === 'fault').length;
+  const summary = !version.review ? 'Measures this version against its script: words, subtitles, voices, lips, sound and picture, then looks at every shot. It takes some minutes and changes nothing.'
+    : findings.length ? `${count(faults, 'fault')} measured, ${count(findings.length - faults, 'thing')} to check by eye.` : 'Nothing found.';
+  const row = (item, index) => `<div class="review-row ${item.level}"><span class="tag">${item.level === 'fault' ? 'Fault' : 'Check'}</span>
+    ${item.at_s == null ? '<span class="review-at"></span>' : `<button class="btn small ghost review-at mono" data-review-at="${item.at_s}" title="Go to this moment">${formatTime(item.at_s)}</button>`}
+    <span class="grow">${esc(item.text)}</span><button class="btn small" data-review-fix="${index}" ${availability(blocked, 'Opens the fix window with this shot and this note')}>Fix…</button></div>`;
+  return `<div class="panel"><div class="panel-head"><h3>Deep Review</h3><span class="hint">${esc(summary)}</span><span class="grow"></span>
+      <button class="btn small" id="deep-review" ${availability(blocked, 'Takes some minutes and changes nothing')}>${icon('target')} ${version.review ? 'Review again' : 'Deep Review'}</button>
+      ${findings.some(item => item.shots.length) ? `<button class="btn small" id="review-fix-all" ${availability(blocked, 'Opens the fix window with these shots and these notes, to edit before you send them')}>${icon('director')} Fix these…</button>` : ''}</div>
+    ${findings.length ? `<div class="review-list">${findings.map(row).join('')}</div>` : ''}</div>`;
 }
 
 function soundPanel(doc) {

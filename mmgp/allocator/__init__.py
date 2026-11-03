@@ -131,6 +131,12 @@ def install(mode="vmm", large_mb=256, chunk_mb=32, spill=False):
     lib.vmm_pool_live.restype = ctypes.c_int64
     lib.vmm_in_pool.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_ulonglong, ctypes.c_ulonglong)
     lib.vmm_in_pool.restype = ctypes.c_int
+    lib.vmm_storage_shared.argtypes = (ctypes.c_void_p, ctypes.c_int)
+    lib.vmm_storage_shared.restype = ctypes.c_int
+    lib.vmm_long_lived.argtypes = (ctypes.c_int,)
+    lib.vmm_long_lived.restype = ctypes.c_int
+    lib.vmm_graph_pools.argtypes = (ctypes.c_int,)
+    lib.vmm_graph_pools.restype = ctypes.c_int64
     _install_oom_error(lib)
     _lib, active = lib, mode
     _redirect_torch_memory_functions()
@@ -139,6 +145,9 @@ def install(mode="vmm", large_mb=256, chunk_mb=32, spill=False):
         set_vram_limit(virtual_gpu.state["limit"])
     from . import ram
     ram._link_vram_allocator()  # the RAM allocator, when installed first, gives its cache back before a spill is refused
+    if os.environ.get("MMGP_VRAM_CHUNK_LOG"):
+        from . import debug
+        debug.start_chunk_log(os.environ["MMGP_VRAM_CHUNK_LOG"], [int(size) for size in os.environ.get("MMGP_VRAM_WATCH_SIZES", "").split(",") if size])
 
 
 def _install_oom_error(lib):
@@ -184,6 +193,11 @@ def graph_warmup(pool):
     finally:
         _warmup.depth -= 1
         _lib.vmm_end_warmup(device, *pool, token)
+
+
+def no_graphs(device=None):
+    """No CUDA graph exists on this device: each one holds its pool. Only this allocator knows, so False under any other."""
+    return active == "vmm" and not _lib.vmm_graph_pools(_device_index(device))
 
 
 def pool_live(pool, device=None):
@@ -288,6 +302,11 @@ def graph_storage_overlaps(first, second):
             bool(_lib.vmm_graph_storage_overlaps(first.untyped_storage().data_ptr(), second.untyped_storage().data_ptr(), first.device.index)))
 
 
+def storage_shared(tensor):
+    """Whether a chunk this tensor lent during a call (an output plan, a lifetime view) came back with memory allocated meanwhile still on it."""
+    return active == "vmm" and tensor.is_cuda and bool(_lib.vmm_storage_shared(tensor.untyped_storage().data_ptr(), tensor.device.index))
+
+
 def same_graph_storage(first, second):
     return (active == "vmm" and first.is_cuda and first.device == second.device and first.storage_offset() == second.storage_offset() == 0 and
             first.shape == second.shape and first.stride() == second.stride() and first.dtype == second.dtype and
@@ -305,6 +324,20 @@ def normal_allocations():
         yield
     finally:
         _lib.vmm_pause_warmup(previous)
+
+
+@contextlib.contextmanager
+def long_lived_allocations():
+    """For a small allocation that stays, whichever stream asks for it (a library's workspace): it goes among the default stream's memory, whose
+    chunks other tensors use too, rather than taking a whole chunk in that stream's pool. What it frees must have nothing in flight."""
+    if active != "vmm":
+        yield
+        return
+    previous = _lib.vmm_long_lived(1)
+    try:
+        yield
+    finally:
+        _lib.vmm_long_lived(previous)
 
 
 def stats(device=None):

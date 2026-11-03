@@ -35,6 +35,7 @@ class MyTemporalUpsampler:
     def download(self, process_files, send_cmd=None, status_text=None, temporal_upsampling=None): ...
     def query_download_def(self, *, enabled_only=True): ...    # -> one process_files definition
     def query_download_defs(self, *, enabled_only=True): ...   # -> list of process_files definitions
+    def query_checkpoint_inventory(self): ...                  # all checkpoint variants, independent of the selected settings; see PLUGINS.md
     def load_upsampler(self, value, **kwargs): ...             # optional pre-dispatch load hook
     def supports_loaded_model(self, value, context): ...       # optional core-model borrowing
     def release_private_runtime(self): ...                     # optional before borrowing core model

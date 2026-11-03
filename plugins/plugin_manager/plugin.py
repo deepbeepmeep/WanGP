@@ -44,7 +44,7 @@ class PluginManagerUIPlugin(WAN2GPPlugin):
         )
 
     def _build_navigation_html(self):
-        return self.app.app_bar.render()
+        return self.app.app_bar.refresh_default()
 
     def information_cards_html(self):
         catalog = dict(getattr(self, '_community_plugins_cache', None) or {})
@@ -700,6 +700,7 @@ class PluginManagerUIPlugin(WAN2GPPlugin):
             self._save_and_restart(enabled_plugins)
         else:  # a new order needs no restart: the app bar follows it
             update_config(self.server_config, self.server_config_filename, {"enabled_plugins": enabled_plugins})
+            self.app.app_bar.refresh_default()
 
     def _install_plugin_and_refresh(self, url, progress=WangpProgress()):
         progress(0, desc="Starting installation...")

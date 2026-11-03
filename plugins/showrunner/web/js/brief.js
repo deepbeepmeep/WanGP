@@ -2,13 +2,20 @@
 // Brief: what to make, from which material, in which format and style. Every change saves itself.
 import { state, actions } from './app.js';
 import { api } from './api.js';
-import { icon, esc, fieldSaver, drawWave, formatTime, formatDuration, sectionColor, pickFiles, toast, confirmDialog, promptDialog, AUDIO_ACCEPT } from './ui.js';
+import { icon, esc, fieldSaver, drawWave, formatTime, formatDuration, sectionColor, pickFiles, toast, confirmDialog, promptDialog, availability, AUDIO_ACCEPT, personFields } from './ui.js';
 import { kindTiles, KINDS } from './home.js';
 import { modelRows, openDefaultModels } from './models.js';
 
 const STYLES = ['Cinematic', 'Anime', 'Documentary', 'Noir', 'Neon', 'Pastel', 'Claymation', 'Watercolor', 'Vintage film', 'VHS', 'Epic', 'Minimal', 'Dreamy', 'Gritty', 'Surreal', 'Cyberpunk'];
 const ASPECT_FRAMES = { '16:9': [44, 25], '9:16': [20, 34], '1:1': [30, 30], '4:3': [38, 28], '2.39:1': [50, 21] };
 const PACING = ['Very calm', 'Calm', 'Balanced', 'Energetic', 'Frenetic'];
+
+// A format chosen after shooting changes nothing by itself: the note says so, with the button that does it.
+function formatNote(doc) {
+  const latest = doc.deliverables.at(-1), [width, height] = doc.brief.aspect.split(':').map(Number);
+  if (!latest?.width || Math.abs(latest.width / latest.height - width / height) < 0.08) return '';
+  return `<div class="stale-note" style="margin-top:8px">${icon('alert')}<span class="grow">Your last version is ${latest.width}×${latest.height}: this choice changes nothing until the shots are made again in ${esc(doc.brief.aspect)}.</span><button class="btn small" id="make-format" ${availability(actions.directorBlocked())}>Make a ${esc(doc.brief.aspect)} version</button></div>`;
+}
 
 export function mountBrief(container, doc) {
   container.innerHTML = '<div class="brief" id="brief"></div>';
@@ -49,7 +56,7 @@ export function mountBrief(container, doc) {
       <section class="panel"><div class="panel-head"><span class="num">6</span><h3>Look and format</h3></div>
         <div class="col" style="gap:18px">
           <div class="field"><div class="label">${icon('ratio')} Aspect ratio</div><div class="aspects">${Object.entries(ASPECT_FRAMES).map(([aspect, [width, height]]) =>
-            `<button class="aspect ${brief.aspect === aspect ? 'on' : ''}" data-aspect="${aspect}"><i style="width:${width}px;height:${height}px"></i>${aspect}<span class="muted" style="font-size:10.5px">${{ '16:9': 'Widescreen', '9:16': 'Vertical', '1:1': 'Square', '4:3': 'Classic', '2.39:1': 'Scope' }[aspect]}</span></button>`).join('')}</div></div>
+            `<button class="aspect ${brief.aspect === aspect ? 'on' : ''}" data-aspect="${aspect}"><i style="width:${width}px;height:${height}px"></i>${aspect}<span class="muted" style="font-size:10.5px">${{ '16:9': 'Widescreen', '9:16': 'Vertical', '1:1': 'Square', '4:3': 'Classic', '2.39:1': 'Scope' }[aspect]}</span></button>`).join('')}</div>${formatNote(state.doc)}</div>
           <div class="three">
             <div class="field"><div class="label">${icon('image')} Resolution</div><div class="seg" id="res">${['480p', '720p', '1080p'].map(value => `<button class="${brief.resolution === value ? 'on' : ''}" data-res="${value}">${value}</button>`).join('')}</div></div>
             <div class="field"><div class="label">${icon('clock')} Duration ${brief.song && analysis ? `<button class="chip clickable ${!brief.duration_s ? 'on' : ''}" id="match-song" style="height:20px;margin-left:4px">${icon('music')}Match the song</button>` : ''}</div>
@@ -58,6 +65,9 @@ export function mountBrief(container, doc) {
             <div class="field"><div class="label">${icon('gauge')} Pacing</div>
               <div class="slider-row"><input type="range" class="range" id="pacing" min="-2" max="2" step="1" value="${brief.pacing || 0}"><span class="value" id="pacing-v">${PACING[(brief.pacing || 0) + 2]}</span></div></div>
           </div>
+          <div class="field"><div class="label">${icon('clock')} Shot length <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">empty lets the showrunner choose; long shots take longer to render</span></div>
+            <div class="slider-row" style="justify-content:flex-start"><input class="input" id="shot-min" type="number" min="1" max="60" step="1" value="${brief.shot_min_s ?? ''}" placeholder="Auto" aria-label="Shortest video shot in seconds" title="The shortest video shot, in seconds" style="width:76px;flex:none;padding:6px 8px"><span class="muted">to</span>
+              <input class="input" id="shot-max" type="number" min="1" max="60" step="1" value="${brief.shot_max_s ?? ''}" placeholder="Auto" aria-label="Longest video shot in seconds" title="The longest video shot, in seconds" style="width:76px;flex:none;padding:6px 8px"><span class="muted">s</span></div></div>
           <div class="field"><div class="label">${icon('palette')} Style</div>
             <div class="styles">${STYLES.map(style => `<button class="chip clickable ${brief.style_tags.includes(style) ? 'on' : ''}" data-style="${style}">${style}</button>`).join('')}</div>
             <input class="input" id="style" style="margin-top:10px" placeholder="Anything else about the look: lighting, era, references, palette…" value="${esc(brief.style)}"></div>
@@ -75,12 +85,13 @@ export function mountBrief(container, doc) {
         <span class="hint" id="models-hint">Auto: the showrunner picks the best model for each shot</span><span class="fold">${icon(modelsOpen() ? 'chevronDown' : 'chevron')}</span></div>
         <div class="models" id="models" ${modelsOpen() ? '' : 'hidden'}><div class="muted">Loading the models…</div></div></section>
 
+      ${state.doc.deliverables.length ? `<div class="muted" style="font-size:12.5px;margin:4px 2px 0">This brief is where the production started: later changes live in the shots, the cast and the edit, and it is not rewritten. To keep going from where the production is, talk to the showrunner.</div>` : ''}
       <div class="cta-bar">
         <div class="grow"><b>${esc(kind.label)}</b> <span class="muted">· ${esc(brief.aspect)} · ${brief.resolution} · <span id="brief-duration">${formatDuration(brief.duration_s || analysis?.duration_s || 30)}</span> · ${doc.cast.length} cast · ${brief.references.length} ${brief.references.length === 1 ? 'reference' : 'references'}</span>
           ${state.directorInfo.available === false && state.directorInfo.reason ? `<div class="muted" style="font-size:12px;color:var(--amber)">${esc(state.directorInfo.reason)}</div>` : ''}</div>
         ${doc.shots.length ? `<button class="btn" id="to-board">${icon('grid')} Storyboard (${doc.shots.length})</button>` : ''}
         ${!(brief.text || '').trim() && !(brief.script || '').trim() && !brief.song ? '<span class="muted" style="font-size:12.5px">Write your idea first</span>' : ''}
-        <button class="btn primary lg" id="plan" ${actions.busy(doc) || state.live.running || !(brief.text || '').trim() && !(brief.script || '').trim() && !brief.song ? 'disabled' : ''}>${icon('wand')} ${actions.busy(doc) || state.live.running ? 'The showrunner is working…' : doc.shots.length ? 'Plan again' : 'Plan with the showrunner'}</button>
+        <button class="btn primary lg" id="plan" ${availability(actions.directorBlocked() || actions.planBlocked(doc))}>${icon('wand')} ${actions.busy(doc) || state.live.running ? 'The showrunner is working…' : doc.shots.length ? 'Plan again' : 'Plan with the showrunner'}</button>
       </div>`;
     bind();
     renderModels();
@@ -96,13 +107,16 @@ export function mountBrief(container, doc) {
     const ready = () => {  // the Plan button follows the idea as it is typed
       const filled = root.querySelector('#text').value.trim() || root.querySelector('#script')?.value.trim() || state.doc.brief.song;
       const button = root.querySelector('#plan');
-      button.disabled = !filled || actions.busy(state.doc) || state.live.running;
+      const blocked = actions.directorBlocked() || (filled ? '' : actions.planBlocked({ brief: {} }));
+      button.disabled = !!blocked;
+      button.title = blocked;
       button.previousElementSibling?.classList.contains('muted') && (button.previousElementSibling.style.display = filled ? 'none' : '');
     };
     root.querySelector('#text').oninput = event => { queue({ text: event.target.value }); ready(); };
     root.querySelector('#script')?.addEventListener('input', event => { queue({ script: event.target.value }); ready(); });
     root.querySelector('#style').oninput = event => queue({ style: event.target.value });
     root.querySelectorAll('[data-aspect]').forEach(button => button.onclick = () => actions.ops([{ op: 'brief', fields: { aspect: button.dataset.aspect } }]).then(render));
+    root.querySelector('#make-format')?.addEventListener('click', () => actions.makeFormat(state.doc.brief.aspect));
     root.querySelectorAll('[data-res]').forEach(button => button.onclick = () => actions.ops([{ op: 'brief', fields: { resolution: button.dataset.res } }]).then(render));
     root.querySelectorAll('[data-style]').forEach(button => button.onclick = () => {
       const tags = new Set(save.pending('brief')?.style_tags ?? state.doc.brief.style_tags);  // the chips clicked a moment ago count too
@@ -119,6 +133,11 @@ export function mountBrief(container, doc) {
     root.querySelector('#match-song')?.addEventListener('click', () => actions.ops([{ op: 'brief', fields: { duration_s: null } }]).then(render));
     const pacing = root.querySelector('#pacing');
     pacing.oninput = () => { root.querySelector('#pacing-v').textContent = PACING[+pacing.value + 2]; queue({ pacing: +pacing.value }); };
+    [['#shot-min', 'shot_min_s'], ['#shot-max', 'shot_max_s']].forEach(([selector, field]) => {
+      const input = root.querySelector(selector);
+      input.oninput = () => { if (input.value === '' || (+input.value >= 1 && +input.value <= 60)) queue({ [field]: +input.value || null }); };  // out of range: kept until the field is left
+      input.onchange = () => { if (input.value !== '') input.value = Math.min(60, Math.max(1, Math.round(+input.value))); queue({ [field]: +input.value || null }); };
+    });
     const budget = root.querySelector('#budget');
     budget.oninput = () => { root.querySelector('#budget-v').textContent = +budget.value ? `${budget.value} min` : 'Auto'; queue({ budget_minutes: +budget.value || null }); };
     root.querySelector('#plan-first').parentElement.onclick = () => actions.ops([{ op: 'brief', fields: { plan_first: !state.doc.brief.plan_first } }]).then(render);
@@ -177,7 +196,7 @@ export function mountBrief(container, doc) {
     zone.onclick = async () => {
       if (role === 'cast') {  // as on the Cast page: a person is named first; dropping photos adds people too
         const name = await promptDialog({ title: 'Who or what is it?', text: 'Describe them on the Cast page, or drop a photo here.', placeholder: 'Mia, the lead singer', ok: 'Add' });
-        if (name?.trim()) actions.ops([{ op: 'add_cast', fields: { name: name.trim() } }]).then(render);
+        if (name?.trim()) actions.ops([{ op: 'add_cast', fields: personFields(name) }]).then(render);
         return;
       }
       const files = await pickFiles(accept, role !== 'song');

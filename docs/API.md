@@ -503,6 +503,10 @@ Names are lowercase hyphenated slugs of at most 64 characters. Front matter must
 
 User skills are stored in `user_skills/<name>/SKILL.md` under the WanGP installation and persist across sessions and restarts. They are shared across its workspaces and external/Prime connections, and appear on the next resource browse without reconnecting. Existing pagination cursors continue their original snapshot; start a fresh browse to see changes. Shipped skills cannot be overwritten through this action. Refer to current model metadata and templates instead of copying a model catalogue, full settings, temporary media IDs or session-specific paths into a skill.
 
+#### Lip sync check
+
+External MCP and Deepy Prime expose `wangp_toolbox(action="check_lip_sync", arguments={...})`. Pass the video as `media_id`, optionally `start_s` and `duration_s` (one shot, at most 60 seconds), and `voice_id` for a separate recording of the voice (a vocal stem or the line that drove the shot) with `voice_start_s` for where the shot begins in it. The result gives `verdict` (`follows`, `may_not_follow` or `not_measurable`), `face_height_px`, `face_seen`, `voice_present`, `correlation_at_0`, `best_correlation` and `best_lag_s`, positive when the mouth comes after the voice. It compares when the mouth opens with when the voice is loud, not mouth shapes, and is less reliable on small faces: treat `may_not_follow` as a moment to watch.
+
 #### Audio inspection
 
 External MCP and Deepy Prime expose `wangp_toolbox(action="inspect_audio", arguments={...})`. Pass `media_id`, optionally a 1-based `audio_track_no`, `start_s` and `duration_s`. Measurements use CPU FFmpeg and streaming samples: sample rate/channels, per-channel peak and RMS, full-scale sample counts, EBU R128 integrated loudness/true peak and silence intervals. Coverage and thresholds are returned; at most 200 silence intervals are listed while aggregate counts/duration cover the whole analyzed range. `window_s` (0.1 to 600 seconds, at most 600 windows) adds an `envelope`: lists of RMS, peak and loudest momentary loudness per window (window i starts at `start_s + i * window_s`), to locate climaxes, gaps or a balance problem in one call.
@@ -885,7 +889,7 @@ print(result.generated_files)
 
 Postprocessing values use the registered postprocessor value strings:
 
-- `temporal_upsampling`: registered temporal upsamplers such as `rife*2` or `dlssg*4` for videos, or texturers such as `supratex` for meshes.
+- `temporal_upsampling`: registered temporal upsamplers such as `rife*2` or `dlssg*4` for videos, or texturers such as `supratex` and `pixal3d_texture` for meshes. For native Pixal3D, `postprocessing_reference_images` accepts one matching image or four views ordered front, right, back, left.
 - `spatial_upsampling`: registered decoded-media upsamplers such as `lanczos*2`, `flashvsr*2`, `coz*4`, or the no-scale visual refiner `h3facerefine`. VAE upsamplers are model-pipeline features and are not accepted for late postprocessing.
 - `spatial_postprocessing_parameters` / `temporal_postprocessing_parameters`: the options of the spatial and of the temporal processor, each a dictionary keyed by the parameter ids returned by postprocessing discovery. For example, H3 accepts `prompt`, `face_count` and `face_strength`; the texturers accept `texture_size` and `texture_max_faces`.
 - `postprocessing_reference_images`: the reference images shared by both processors: H3's face references, or the object image of Hi3D and the texturers (their `reference_images` parameter).

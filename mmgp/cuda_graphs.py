@@ -280,29 +280,50 @@ def _prepare_blas_stream(stream):
     # PyTorch owns these workspaces per handle/stream, beyond the life of a model's graphs. Initialize both cuBLAS and cuBLASLt
     # before warmup/capture can put them in graph scratch (which would also pin that entire pool after the model is released).
     from . import allocator
-    with allocator.normal_allocations(), torch.cuda.stream(stream), torch.inference_mode():
+    with allocator.normal_allocations(), allocator.long_lived_allocations(), torch.cuda.stream(stream), torch.inference_mode():
         key = (torch.cuda.current_blas_handle(), stream.cuda_stream)
         if key not in _blas_workspaces:
             matrix = torch.zeros((16, 16), dtype=torch.float16, device=stream.device)
             torch.addmm(matrix[0], matrix, matrix)
+            stream.synchronize()  # what this allocated on another stream's behalf is free with nothing in flight
             _blas_workspaces.add(key)
 
 
-def _capture_stream(device):
+def capture_stream(device, blas=True):
+    """The one stream of a device's graph captures, with what libraries allocate per stream on first use (which a capture cannot do) ready:
+    the cuBLAS workspaces for a capture that uses cuBLAS. Taking a new stream from PyTorch's pool for each capture would leave these
+    workspaces on all its streams."""
     stream = _capture_streams.get(device, None)
     if stream is None:
         stream = _capture_streams[device] = torch.cuda.Stream(device)
+    if blas:
+        _prepare_blas_stream(stream)
     for setup in _capture_setups:
         setup(stream)
     return stream
 
 
-_BLAS_OPS = {getattr(torch.ops.aten, name) for name in ("mm", "addmm", "bmm", "baddbmm", "addbmm", "mv", "addmv", "dot", "vdot", "_addmm_activation", "_int_mm",
-                                                         "_scaled_mm", "_scaled_mm_v2", "_grouped_mm") if hasattr(torch.ops.aten, name)}
+def release_blas_workspaces():
+    """Frees the cuBLAS workspaces of every thread and stream when a runtime that used them closes: PyTorch would keep them for the whole
+    process, each holding a chunk of VRAM. A graph keeps the address of the workspace it captured: with a graph alive, they all stay."""
+    from . import allocator
+    if not allocator.no_graphs():
+        return False
+    torch.cuda.synchronize()
+    torch._C._cuda_clearCublasWorkspaces()
+    _blas_workspaces.clear()
+    return True
+
+
+# With their composite operations, which reach a dispatch mode whole and call cuBLAS inside. An operation missing here costs a capture again, not
+# a wrong result: the workspace then appears during the capture, and the allocator's guard (_leave_shared_chunks) moves what shares its chunk.
+_BLAS_OPS = {getattr(torch.ops.aten, name) for name in ("mm", "addmm", "bmm", "baddbmm", "addbmm", "mv", "addmv", "dot", "vdot", "_addmm_activation", "_scaled_mm", "_scaled_mm_v2", "_grouped_mm",
+                                                         "linear", "bilinear", "matmul", "einsum", "tensordot", "inner", "cdist", "scaled_dot_product_attention", "linalg_multi_dot", "linalg_inv",
+                                                         "linalg_pinv", "linalg_matrix_power", "linalg_matrix_exp", "linalg_lstsq", "linalg_solve_triangular") if hasattr(torch.ops.aten, name)}
 
 
 class _BlasUse(TorchDispatchMode):
-    """The eager warmup of a graph: its first cuBLAS operation prepares the stream's cuBLAS workspaces outside the graph pool, and the capture
+    """An eager stage before captures: its first cuBLAS operation prepares the stream's cuBLAS workspaces outside the graph pool, and the capture
     stream gets them only then. A model computing without cuBLAS (e.g. with its own kernels) keeps no workspace for the capture stream."""
 
     def __init__(self):
@@ -644,7 +665,7 @@ class BlockGraphs:
                     plan = allocator.OutputPlan(self.pool)
                     try:
                         blas_key = (id(module), method, None if module.__dict__.get("_mm_graph_check_once", False) else signature)
-                        if blas_key in self.blas:  # decided at an earlier capture of the same call: its workspaces are kept
+                        if blas_key in self.blas:  # decided at an earlier capture of the same call
                             if self.blas[blas_key]:
                                 _prepare_blas_stream(torch.cuda.current_stream())
                             out, consumed = _execute_lifetimes(forward, args, kwargs, lifetimes, leaves)
@@ -668,11 +689,13 @@ class BlockGraphs:
                             del flat
                         # Returned views keep execution storage alive: capture them with the ordinary owner's version counter.
                         self._capture_lifetimes, self._capture_output_plan = consumed, plan
-                        entry = self._capture(module, forward, leaves, spec, signature, extras, extra_signature, out, static_key, buffers, not retained_output, self.blas[blas_key])
+                        shared = [leaves[index] for index in consumed if allocator.storage_shared(leaves[index])]
+                        entry = self._leave_shared_chunks(shared) if shared else self._capture(module, forward, leaves, spec, signature, extras, extra_signature, out, static_key, buffers, not retained_output, self.blas[blas_key])
                         if entry is None:  # a different allocation trace must not replay the proposed aliases
                             self._capture_output_plan = None
                             entry = self._capture(module, forward, leaves, spec, signature, extras, extra_signature, out, static_key, buffers, not retained_output, self.blas[blas_key])
-                        self.entries[key] = entry
+                        if entry:
+                            self.entries[key] = entry
                     finally:
                         self.__dict__.pop('_capture_lifetimes', None)
                         self.__dict__.pop('_capture_output_plan', None)
@@ -723,7 +746,7 @@ class BlockGraphs:
         if self.pool is None:  # a stage before the first captures: its temporaries give the pool its first memory, which they would keep from it
             self.pool = torch.cuda.graph_pool_handle()
         live = allocator.pool_live(self.pool)
-        with allocator.graph_warmup(self.pool):
+        with allocator.graph_warmup(self.pool), _BlasUse():
             out = fn(*args, **kwargs)
         holders = {}
         for leaf in _flatten(out)[0]:
@@ -892,8 +915,28 @@ class BlockGraphs:
             buffers.append(self.static[key])
         return keys, buffers
 
+    def _leave_shared_chunks(self, tensors):
+        """Memory allocated during this warmup or capture stayed (a library's cache): it lies on a chunk that one of these tensors had lent for
+        the call, and each would overwrite the other. The tensors move to memory of their own, with their content (a capture runs nothing,
+        and a consumed input has none left to lose). The graphs go, as they may use these buffers at their old addresses; this call's is
+        captured at its next one, and finds the cache already there."""
+        from . import allocator
+        if ("shared chunk", self.name) not in _reported:
+            _reported.add(("shared chunk", self.name))
+            tqdm.write(f"[MMGP] A library kept memory it allocated during a CUDA graph capture of '{self.name}': its graphs are captured again.")
+        self.clear()
+        moved = {}
+        for tensor in tensors:
+            storage = tensor.untyped_storage()
+            copy = moved.get(storage.data_ptr())
+            if copy is None:
+                with allocator.normal_allocations():
+                    copy = moved[storage.data_ptr()] = torch.UntypedStorage(storage.nbytes(), device=tensor.device)
+                copy.copy_(storage)
+            tensor.set_(copy, tensor.storage_offset(), tensor.shape, tensor.stride())
+        return False
+
     def _capture(self, module, forward, leaves, spec, signature, extras, extra_signature, warm_output, static_key, buffers, adopt_outputs, blas=False):
-        # blas: the call uses cuBLAS, whose workspaces the capture stream then needs before the capture (they cannot be made during it)
         from . import allocator
         entry = _Graph()
         self.captures += 1
@@ -946,9 +989,7 @@ class BlockGraphs:
         if not _autotune_guarded:
             _guard_triton_autotune()
         global _capturing
-        stream = _capture_stream(torch.cuda.current_device())
-        if blas:
-            _prepare_blas_stream(stream)
+        stream = capture_stream(torch.cuda.current_device(), blas)
         with torch.cuda.stream(stream):
             entry.graph.capture_begin(self.pool, capture_error_mode="thread_local")
             _capturing = True
@@ -990,6 +1031,10 @@ class BlockGraphs:
                 entry.graph.capture_end()
             except Exception as error:
                 raise RuntimeError(f"{failed}: {error}") from error
+        lent = [source for source in out_sources if source is not None] if plan is not None else []
+        shared = [tensor for tensor in (*lent, *(leaves[index] for index in entry.lifetimes)) if allocator.storage_shared(tensor)]
+        if shared:
+            return self._leave_shared_chunks(shared)
         if not plan_valid:
             return None
         if isinstance(check, _ReadCheck):

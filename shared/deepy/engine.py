@@ -76,6 +76,7 @@ from shared.prompt_enhancer.qwen35_assistant_runtime import (
     assistant_action_budget_tokens,
     extract_incomplete_tool_arguments,
     extract_incomplete_tool_name,
+    extract_incomplete_tool_parameters,
     extract_tool_calls,
     render_assistant_messages,
     render_assistant_text_suffix,
@@ -600,6 +601,7 @@ class AssistantSessionState:
     generation_speed_window: ActiveComputeSpeedWindow = field(default_factory=ActiveComputeSpeedWindow)
     runtime_max_model_len: int = 0
     chat_stats_signature: str = ""
+    chat_stats: dict[str, Any] | None = None
     chat_status: dict[str, Any] | None = None
     remote_usage_stats: dict[str, Any] | None = None
     file_access_policy: Any | None = None
@@ -724,6 +726,7 @@ def clear_assistant_session(session: AssistantSessionState) -> None:
     session.generation_speed_window.clear()
     session.runtime_max_model_len = 0
     session.chat_stats_signature = ""
+    session.chat_stats = None
     session.chat_status = None
     session.remote_usage_stats = None
     session.seen_video_gallery_paths = []
@@ -4856,6 +4859,7 @@ class DeepyZeroTools:
         return result
 
     @assistant_tool(
+        display_name="Inspect Audio",
         description="Inspect the selected audio stream's playable range on CPU: peak/RMS, clipping indicators, EBU R128 loudness and below-threshold silence intervals. Coverage excludes decoder tail padding when track duration is known; silence does not mean zero or missing audio. Optional playable preview (at most 30 seconds). Does not transcribe or judge musical quality.",
         parameters={
             "media_id": {"type": "string", "description": "Audio or video media ID or authorized file.", "required": True},
@@ -4890,6 +4894,34 @@ class DeepyZeroTools:
             result["media_id"] = record["media_id"] if record else ""
         self._set_status("Audio Inspection Complete", kind="tool")
         return result
+
+    @assistant_tool(
+        display_name="Check Lip Sync",
+        description="Measure whether the lips of the biggest face in a video follow its voice, comparing mouth opening per frame with the voice's loudness: one shot at a time, at most 60 seconds, a few seconds of work. verdict: follows; may_not_follow, a suspicion to check by eye (it compares timing, not mouth shapes, and is noisy on small faces); not_measurable, no clear face or too little voice. best_lag_s: where the match is best, positive when the mouth comes after the voice.",
+        parameters={
+            "media_id": {"type": "string", "description": "Video media ID or authorized file.", "required": True},
+            "start_s": {"type": "number", "description": "Start of the shot in seconds; default 0.", "required": False},
+            "duration_s": {"type": "number", "description": "Seconds to measure; omitted measures through the end.", "required": False},
+            "voice_id": {"type": "string", "description": "Optional audio of the voice alone (a vocal stem from remove_background, or the recording that drove the shot). Default: the video's own sound, where music under the voice weakens the measure.", "required": False},
+            "voice_start_s": {"type": "number", "description": "Where in voice_id the video's start_s falls; default start_s (0 for a recording of this shot alone).", "required": False},
+        },
+        pause_reason="light",
+    )
+    def check_lip_sync(self, media_id: str, start_s: float = 0.0, duration_s: float | None = None, voice_id: str | None = None, voice_start_s: float | None = None) -> dict[str, Any]:
+        from shared.deepy import lip_sync
+
+        source, error_result = self._resolve_video_media(media_id, "media_id")
+        if error_result is not None:
+            return error_result
+        voice = source
+        if voice_id:
+            voice, error_result = self._resolve_audio_or_video_media(voice_id, "voice_id")
+            if error_result is not None:
+                return error_result
+        self._set_status("Checking Lip Sync", kind="tool")
+        result = lip_sync.check(source["path"], start_s, duration_s, voice["path"], voice_start_s)
+        self._set_status("Lip Sync Checked", kind="tool")
+        return {"status": "done", "source_media_id": source["media_id"], **result}
 
     @assistant_tool(
         display_name="Extract Audio",
@@ -6668,6 +6700,9 @@ class DeepyZeroTools:
 check_zero_catalog({metadata["name"]: metadata for metadata in (getattr(value, "_assistant_tool", None) for value in vars(DeepyZeroTools).values()) if metadata is not None})
 
 
+_CONTEXT_BAR_TOKENS = 12000  # a conversation being rebuilt: Prime's system prompt alone takes about 8,000 tokens, and shows no bar
+
+
 class AssistantEngine:
     def __init__(self, session: AssistantSessionState, runtime_hooks: AssistantRuntimeHooks, tool_box: Any, send_cmd, debug_enabled: bool | None = None, thinking_enabled: bool = True, vram_mode: str = DEEPY_VRAM_MODE_UNLOAD, system_prompt: str = ASSISTANT_SYSTEM_PROMPT, custom_system_prompt_key: str = DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY):
         self.session = session
@@ -6706,6 +6741,7 @@ class AssistantEngine:
         self._compaction_thinking_enabled = False
         self._prefill_started_at: float | None = None
         self._live_prefill_tokens = 0
+        self._context_progress_at = 0.0
         self._segment_generated_tokens = 0
         self._segment_metrics_checkpoint_at: float | None = None
         self._segment_metrics_recorded_tokens = 0
@@ -6829,12 +6865,13 @@ class AssistantEngine:
             live_generation_seconds=live_generation_seconds,
         )
 
-    def _emit_stats(self, *, force: bool = False) -> None:
-        stats = self._chat_stats_payload()
+    def _emit_stats(self, *, force: bool = False, prefilling_tokens: int = 0) -> None:
+        stats = {**self._chat_stats_payload(), **({"prefilling_tokens": prefilling_tokens} if prefilling_tokens else {})}
         signature = _json_dumps(stats)
         if not force and signature == str(self.session.chat_stats_signature or ""):
             return
         self.session.chat_stats_signature = signature
+        self.session.chat_stats = stats
         self._emit_chat_event(assistant_chat.build_stats_event(stats))
 
     def _record_prefill_metrics(self, token_count: int, elapsed_seconds: float) -> None:
@@ -6870,11 +6907,19 @@ class AssistantEngine:
         self._segment_metrics_checkpoint_at = now
         self._segment_metrics_recorded_tokens = current_tokens
 
-    def _run_prefill_call(self, token_count: int, callback: Callable[[], Any], *, record_if: bool | Callable[[Any], bool] = True) -> Any:
+    def _run_prefill_call(self, token_count: int, callback: Callable[[], Any], *, record_if: bool | Callable[[Any], bool] = True, rebuilds_conversation: bool = False) -> Any:
         tokens = max(0, int(token_count or 0))
+        if tokens > 0:
+            self._emit_stats(force=True, prefilling_tokens=tokens)  # before the timer starts: the speeds stay those of the finished prefills
+        runtime = self.runtime
+        if runtime is not None:
+            runtime.prefill_setup_seconds = 0.0
         started_at = time.perf_counter()
         self._prefill_started_at = started_at if tokens > 0 else None
         self._live_prefill_tokens = tokens
+        long_call = rebuilds_conversation and tokens >= _CONTEXT_BAR_TOKENS and self.runtime is not None
+        if long_call:
+            self.runtime.context_progress = self._report_context_progress
         completed = False
         result = None
         try:
@@ -6882,13 +6927,31 @@ class AssistantEngine:
             completed = True
             return result
         finally:
-            elapsed_seconds = max(0.0, time.perf_counter() - started_at)
+            if long_call:
+                self.runtime.context_progress = None
+                self._close_context_progress()
+            elapsed_seconds = max(0.0, time.perf_counter() - started_at - (0.0 if runtime is None else runtime.prefill_setup_seconds))
             self._prefill_started_at = None
             self._live_prefill_tokens = 0
             should_record = record_if(result) if callable(record_if) else bool(record_if)
             if completed and should_record:
                 self._record_prefill_metrics(tokens, elapsed_seconds)
             self._emit_stats(force=True)
+
+    def _report_context_progress(self, done: int, total: int) -> None:
+        """A conversation being rebuilt moves the bar of the status line, three times a second at most."""
+        now = time.perf_counter()
+        if done < total and now - self._context_progress_at < 0.33:
+            return
+        self._context_progress_at = now
+        self._emit_chat_event(assistant_chat.build_status_event("Reloading Conversation", kind="loading", session=self.session, progress={"done": done, "total": total}))
+
+    def _close_context_progress(self) -> None:
+        """The status line goes back to what it said before the bar."""
+        if self._context_progress_at:
+            self._context_progress_at = 0.0
+            status = self._current_status_payload
+            self._set_status(status["text"], status["kind"]) if status else self._hide_status()
 
     def _finish_stream_pass(self, token_count: int | None = None) -> None:
         recorded_tokens = max(max(0, int(token_count or 0)), max(0, int(self._segment_generated_tokens or 0)))
@@ -8113,6 +8176,26 @@ class AssistantEngine:
             len(suffix_tokens),
             lambda: self.runtime.extend_context(target_tokens),
             record_if=lambda result: result in ("prefilled", "chunk_prefilled"),
+            rebuilds_conversation=True,
+        )
+
+    def _prefill_from_new_header(self, target_tokens: list[int]) -> str:
+        base_tokens = self._render_system_prompt_tokens(add_generation_prompt=False)
+        if not base_tokens or target_tokens[: len(base_tokens)] != base_tokens:
+            raise RuntimeError("Deepy context does not extend its rendered system/tools prefix.")
+        self._run_prefill_call(len(base_tokens), lambda: self.runtime.prime_context(base_tokens))
+        base_snapshot = self.runtime.snapshot_context()
+        if base_snapshot is None:
+            raise RuntimeError("Deepy context could not snapshot its system/tools prefix.")
+        self.session.reset_base_token_ids = list(base_tokens)
+        self.session.reset_base_snapshot = base_snapshot
+        self.session.reset_base_signature = self._current_reset_base_signature()
+        self.session.reset_base_context_window_tokens = self._get_context_window_tokens()
+        return self._run_prefill_call(
+            len(target_tokens) - len(base_tokens),
+            lambda: self.runtime.extend_context(target_tokens),
+            record_if=lambda result: result in ("prefilled", "chunk_prefilled"),
+            rebuilds_conversation=True,
         )
 
     def _restore_or_replay_session(self, context_label: str = "Session context") -> str:
@@ -8143,6 +8226,7 @@ class AssistantEngine:
             len(fallback_tokens),
             lambda: runtime.restore_or_replay(self.session.runtime_snapshot, fallback_tokens),
             record_if=lambda result: isinstance(result, tuple) and len(result) > 0 and result[0] == "prefilled",
+            rebuilds_conversation=True,  # moves only if it has to prefill: a restore from RAM reports nothing
         )
         pending_replay_reason = str(self.session.pending_replay_reason or "").strip()
         runtime_replay_reason = str(runtime_replay_reason or "").strip()
@@ -8583,9 +8667,8 @@ class AssistantEngine:
         base_tokens = target_tokens[:-len(current_turn_suffix)]
         if not base_tokens or len(base_tokens) >= context_window_tokens:
             raise RuntimeError("Compacted Deepy system-and-summary context does not fit in the configured context window.")
-        base_mode = self._extend_context_from_preserved_base(base_tokens)
-        if base_mode is None:
-            self._run_prefill_call(len(base_tokens), lambda: self.runtime.prime_context(base_tokens))
+        if self._extend_context_from_preserved_base(base_tokens) is None:
+            self._prefill_from_new_header(base_tokens)
         compacted_base_snapshot = self.runtime.snapshot_context()
         if compacted_base_snapshot is None:
             raise RuntimeError("Compacted Deepy base context could not be snapshotted.")
@@ -8975,7 +9058,11 @@ class AssistantEngine:
             reason = f"Context window changed from {self.session.rendered_context_window_tokens:,} to {context_window_tokens:,} tokens" if context_changed else "Deepy instructions/settings changed"
             self._log(f"{reason}; rebuilding conversation checkpoints.")
             prior_messages_len = self.session.current_turn["messages_len"]
+            turn_start = self.session.messages[prior_messages_len]
             invalidate_assistant_reset_base(self.session)
+            # A smaller window may not hold the conversation.
+            if self._fit_rendered_messages_to_window(add_generation_prompt=True, reserve_tokens=self._resolved_compaction_reserve_tokens(generation_reserve_tokens, context_window_tokens))[1]:
+                prior_messages_len = next((index for index, message in enumerate(self.session.messages) if message is turn_start), 0)
             self._commit_rewritten_history(self.session.messages[:prior_messages_len], self.session.messages[prior_messages_len:], generation_reserve_tokens)
             return
         if self._maybe_summarize_context(generation_reserve_tokens):
@@ -9071,8 +9158,10 @@ class AssistantEngine:
                 return
             if mode is None:
                 mode = self._extend_context_from_preserved_base(target_tokens)
-            if mode is None:
+            if mode is None and not trimmed_any:
                 raise RuntimeError("Generation context could not be synchronized from a live, header, or turn-start snapshot.")
+            if mode is None:  # trimmed history no longer extends the KV and no header is left to go on from
+                mode = self._prefill_from_new_header(target_tokens)
             self.session.rendered_token_ids = list(target_tokens)
             self.session.pending_replay_reason = ""
             self._remember_render_state()
@@ -9087,7 +9176,7 @@ class AssistantEngine:
             else:
                 self._log(f"Generation context {mode}.")
             return
-        self._run_prefill_call(len(target_tokens), lambda: runtime.prime_context(target_tokens))
+        self._run_prefill_call(len(target_tokens), lambda: runtime.prime_context(target_tokens), rebuilds_conversation=True)
         self.session.rendered_token_ids = list(target_tokens)
         self.session.runtime_snapshot = None
         self.session.pending_replay_reason = ""
@@ -9179,19 +9268,7 @@ class AssistantEngine:
             target_tokens, _trimmed = self._fit_rendered_messages_to_window(add_generation_prompt=False)
             mode = self._extend_context_from_preserved_base(target_tokens)
             if mode is None:
-                base_tokens = self._render_system_prompt_tokens(add_generation_prompt=False)
-                if not base_tokens or target_tokens[: len(base_tokens)] != base_tokens:
-                    raise RuntimeError("Restored Deepy context does not extend its rendered system/tools prefix.")
-                self._run_prefill_call(len(base_tokens), lambda: runtime.prime_context(base_tokens))
-                base_snapshot = runtime.snapshot_context()
-                if base_snapshot is None:
-                    raise RuntimeError("Restored Deepy context could not snapshot its system/tools prefix.")
-                self.session.reset_base_token_ids = list(base_tokens)
-                self.session.reset_base_snapshot = base_snapshot
-                self.session.reset_base_signature = self._current_reset_base_signature()
-                self.session.reset_base_context_window_tokens = self._get_context_window_tokens()
-                suffix_tokens = target_tokens[len(base_tokens) :]
-                mode = self._run_prefill_call(len(suffix_tokens), lambda: runtime.extend_context(target_tokens), record_if=lambda result: result in ("prefilled", "chunk_prefilled"))
+                mode = self._prefill_from_new_header(target_tokens)
             self.session.rendered_token_ids = list(target_tokens)
             self.session.runtime_snapshot = None
             self.session.pending_replay_reason = ""
@@ -9236,7 +9313,7 @@ class AssistantEngine:
         self.session.messages.append({"role": "assistant", "content": content})
         self._record_live_context("Rejected tool request retained in live context; only error feedback will be appended.")
         self._append_tool_message(payload)
-        tool_label = self.tool_box.get_tool_transcript_label(tool_name, {}) if tool_name else "Tool request"
+        tool_label = self.tool_box.get_tool_transcript_label(tool_name, extract_incomplete_tool_parameters(raw_text)) if tool_name else "Tool request"
         message_id, tool_id = self._start_tool_call_card(tool_name, {}, tool_label)
         self._emit_chat_event(assistant_chat.complete_tool_call(self.session, message_id, tool_id, {**payload, "rejected_request": rejected_request}))
         checkpoint_assistant_turn(self.session)
@@ -9477,7 +9554,7 @@ class AssistantEngine:
         if mode is None:
             mode = self._append_target_suffix_from_live_runtime(target_tokens)
         if mode is None:
-            raise RuntimeError("Interrupted-turn trimmed answer context could not be synchronized from the turn-start snapshot.")
+            mode = self._prefill_from_new_header(target_tokens)
         self.session.rendered_token_ids = list(target_tokens)
         self._remember_render_state()
         self.session.runtime_snapshot = None

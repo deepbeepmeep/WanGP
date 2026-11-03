@@ -1,8 +1,10 @@
 ############# WanGP Copyright DeepBeepMeep 2025-2026 #############
 import os, sys
+# A pipe or a file defaults to the ANSI code page with strict errors: any other character in a print would raise
+for _stream in (sys.stdout, sys.stderr): _stream.reconfigure(encoding="utf-8", errors="replace")
 from tqdm import tqdm
 
-WanGP_version = "19.02"
+WanGP_version = "19.13"
 _welcome_message = f" WanGP v{WanGP_version} - Copyright (c) 2024-2026 DeepBeepMeep "
 tqdm.write(f"\033[1m\033[93m{_welcome_message:*^100}\033[0m")
 
@@ -2738,6 +2740,7 @@ family_handlers.append("models.evoke.evoke_handler")
 family_handlers.append("models.hi3d.hi3d_handler")
 family_handlers.append("models.supratex.supratex_handler")
 family_handlers.append("models.TTS.nemotron_transcribe.nemotron_transcribe_handler")
+family_handlers.append("models.glb_coder.glb_coder_handler")
 DEFAULT_LORA_ROOT = "loras" #"models.cosmos3.cosmos3_handler",
 
 def get_lora_root():
@@ -2884,7 +2887,6 @@ if not Path(config_load_filename).is_file():
         "queue_color_scheme": "pastel",
         "process_queues_when_browser_unfocused": 1,
         "multi_prompts_gen_type": prompt_parser.DEFAULT_MULTI_PROMPTS_MODE,
-        "model_hierarchy_type": 1,
         upsampler_api.UPSAMPLER_CONFIG_KEY: upsampler_api.default_config_sections(),
         audio_processor_api.AUDIO_PROCESSOR_CONFIG_KEY: audio_processor_api.default_config_sections(),
         temporal_upsampler_api.TEMPORAL_UPSAMPLER_CONFIG_KEY: temporal_upsampler_api.default_config_sections(),
@@ -2933,7 +2935,6 @@ deepy_voice.install_gradio_routes(get_service=lambda: _deepy_hybrid, language=ar
 checkpoints_paths = server_config.get("checkpoints_paths", None)
 if checkpoints_paths is None: checkpoints_paths = server_config["checkpoints_paths"] = fl.default_checkpoints_paths
 fl.set_checkpoints_paths(checkpoints_paths)
-three_levels_hierarchy = server_config.get("model_hierarchy_type", 1) == 1
 
 if app is None:
     app = WAN2GPApplication()
@@ -11994,7 +11995,7 @@ def generate_media(
 
                 if mesh_outputs and splats is None and mesh_postprocessing.selected(spatial_upsampling, temporal_upsampling):
                     processed = [perform_mesh_postprocessing(asset, spatial_upsampling, temporal_upsampling, spatial_values=parameter_ui.runtime_values(spatial_postprocessing_parameters, postprocessing_reference_images), temporal_values=parameter_ui.runtime_values(temporal_postprocessing_parameters, postprocessing_reference_images),
-                                                             reference_image=original_image_refs[0] if original_image_refs else None,
+                                                             reference_image=original_image_refs,
                                                              seed=seed, abort_callback=lambda: media_abort_requested(gen), progress_callback=upsampler_progress) for asset in meshes]
                     if gen.get("abort", False):
                         abort = True
@@ -18232,7 +18233,6 @@ def _get_dropdown_deps():
         transformer_types=transformer_types,
         displayed_model_types=displayed_model_types,
         transformer_type=transformer_type,
-        three_levels_hierarchy=three_levels_hierarchy,
         families_infos=families_infos,
         server_config=server_config,
         transformer_quantization=transformer_quantization,
@@ -18245,7 +18245,6 @@ def _get_dropdown_deps():
         get_lora_dir=get_lora_dir,
         get_lora_local_path=get_lora_local_path,
         get_parent_model_type=get_parent_model_type,
-        get_base_model_type=get_base_model_type,
         get_model_family=get_model_family,
         get_model_name=get_model_name,
         get_transformer_dtype=get_transformer_dtype,
@@ -18258,7 +18257,6 @@ def _get_finetune_editor_deps():
         families_infos=families_infos,
         transformer_types=transformer_types,
         displayed_model_types=displayed_model_types,
-        three_levels_hierarchy=three_levels_hierarchy,
         get_model_def=get_model_def,
         get_model_name=get_model_name,
         get_base_model_type=get_base_model_type,
@@ -18284,8 +18282,8 @@ def create_models_hierarchy(rows):
 def create_models_selector_hierarchy(dropdown_types=None):
     return model_dropdowns.create_models_selector_hierarchy(_get_dropdown_deps(), dropdown_types)
 
-def get_sorted_dropdown(dropdown_types, current_model_family, current_model_type, three_levels = True):
-    return model_dropdowns.get_sorted_dropdown(_get_dropdown_deps(), dropdown_types, current_model_family, current_model_type, three_levels)
+def get_sorted_dropdown(dropdown_types, current_model_family, current_model_type):
+    return model_dropdowns.get_sorted_dropdown(_get_dropdown_deps(), dropdown_types, current_model_family, current_model_type)
 
 def generate_dropdown_model_list(current_model_type, state=None):
     return model_dropdowns.generate_dropdown_model_list(_get_dropdown_deps(), current_model_type, state)

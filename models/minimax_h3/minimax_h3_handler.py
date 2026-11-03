@@ -285,7 +285,7 @@ PIKA_INFOS = """
 
 ### Pika H3 Flex
 
-Apply **Pika H3 Flex FL2VA 6 Steps** or **Pika H3 Flex Ref2VA 6 Steps** from the accelerator profiles for the matching model. FL2VA generates video and stereo audio from text, a first frame, a last frame, or both. Ref2VA uses image/video references and optional audio references; it requires at least one image or video.
+Apply **Pika H3 Flex FL2VA 6 Steps** or **Pika H3 Flex Ref2VA 6 Steps** from the accelerator profiles for the matching model. FL2VA generates video and stereo audio from text, a first frame, a last frame, or both. Ref2VA can generate from text alone or with injected frames. Image, video and audio references are optional.
 
 The profile selects **Pika Re-noise (6 Steps)**, six steps, flow shift 12 and one generation phase. Keep **Steps Skipping** off and **Custom Sigmas** empty. The sampler requires the matching Pika adapter; selecting it alone does not accelerate the base model. Use **Vanilla Phase 1 (Reset)** to return to ordinary H3 generation.
 
@@ -295,7 +295,7 @@ Start with 480p or 768p and a 5–15 second clip. These are Pika's released loca
 PIKA_DEEPY_INFOS = (" Pika H3 Flex accelerator profiles select the matching FL2VA/Ref2VA rank-128 adapter at multiplier 1, "
                    "sample_solver=pika_renoise, num_inference_steps=6, flow_shift=12, guidance_phases=1, custom_sigmas='', "
                    "skip_steps_cache_type=''. Use the profile, not the sampler alone. Start at 480p/768p and 124–362 frames at 24 fps. "
-                   "Ref2VA requires at least one image/video; up to 9 images, 3 videos and 3 standalone audio references, 12 files total. "
+                   "Ref2VA supports text alone or injected frames without additional references. It accepts up to 9 reference images, 3 videos and 3 standalone audio clips, with 12 reference files total. "
                    "Video soundtracks selected with audio_prompt_type=K stay attached to their videos. H3 reference order is images, videos, "
                    "then standalone audios; use <Picture N>, <Video N>, <Audio N> labels. Pika has no released local high-resolution or audio-stem stage. "
                    "Vanilla Phase 1 (Reset) restores Euler and removes accelerators while retaining additional LoRAs.")
@@ -1207,8 +1207,6 @@ class family_handler:
             return "MiniMax H3 accepts at most 3 audio references"
         _notify_audio_reference_limit(audio_durations)
         visual_count = image_count + len(video_durations)
-        if pika and not visual_count:
-            return "Pika H3 Flex Ref2VA requires at least one image or video reference"
         if not pika and audio_count > visual_count:
             return f"MiniMax H3 requires at least as many reference images and videos as audio references (found {visual_count} visual and {audio_count} audio)"
         file_count = image_count + len(videos) + (0 if soundtrack_mode else audio_count)

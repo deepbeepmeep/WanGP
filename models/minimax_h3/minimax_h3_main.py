@@ -178,7 +178,7 @@ def _load_transformer(filename, dtype, qkv_splitting=True, qkv_layout="interleav
     filenames = list(filename) if isinstance(filename, (list, tuple)) else [filename]
     from .lora_tables import detect_checkpoint
 
-    lora_affine_package = detect_checkpoint(filenames[0])
+    lora_affine_package = detect_checkpoint(filenames[0], allow_native=hybrid_ref2va_blocks is None)
     if lora_affine_package is not None:
         tqdm.write(f"MiniMax H3: detected AdaLN map '{lora_affine_package.name}'.")
     ref2va_adaln_t_table = None

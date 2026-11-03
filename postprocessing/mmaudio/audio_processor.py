@@ -90,18 +90,27 @@ class MMAudioProcessor:
             return ""
         return "" if frames_count >= round(float(fps)) else "MMAudio can generate an Audio track only if the Video is at least 1s long"
 
-    def query_download_defs(self, enabled_only: bool = True) -> list[dict[str, Any]]:
-        from postprocessing.mmaudio import MMAUDIO_ALTERNATE, MMAUDIO_MODE_V2, MMAUDIO_STANDARD
+    def query_checkpoint_inventory(self):
+        from postprocessing.mmaudio import MMAUDIO_MODE_CHOICES
+        for label, mode in MMAUDIO_MODE_CHOICES:
+            yield {"name": "MMAudio", "variant": label, "download_defs": [self._download_def([mode])]}
 
-        enabled, mode, _, _, _ = self._settings()
-        if enabled_only and not enabled:
-            return []
-        model_files = [MMAUDIO_STANDARD if mode == MMAUDIO_MODE_V2 else MMAUDIO_ALTERNATE] if enabled_only else [MMAUDIO_STANDARD, MMAUDIO_ALTERNATE]
-        return [{
+    @staticmethod
+    def _download_def(modes):
+        from postprocessing.mmaudio import MMAUDIO_ALTERNATE, MMAUDIO_MODE_V2, MMAUDIO_STANDARD
+        model_files = [MMAUDIO_STANDARD if mode == MMAUDIO_MODE_V2 else MMAUDIO_ALTERNATE for mode in modes]
+        return {
             "repoId": "DeepBeepMeep/Wan2.1",
             "sourceFolderList": ["mmaudio", "DFN5B-CLIP-ViT-H-14-378", "bigvgan_v2_44khz_128band_512x"],
             "fileList": [["synchformer_state_dict.pth", "v1-44.pth", *model_files], ["open_clip_config.json", "open_clip_pytorch_model.bin"], ["config.json", "bigvgan_generator.pt"]],
-        }]
+        }
+
+    def query_download_defs(self, enabled_only: bool = True) -> list[dict[str, Any]]:
+        from postprocessing.mmaudio import MMAUDIO_MODE_CHOICES
+        if not enabled_only:
+            return [self._download_def([mode for _, mode in MMAUDIO_MODE_CHOICES])]
+        enabled, mode, _, _, _ = self._settings()
+        return [self._download_def([mode])] if enabled else []
 
     def download(self, method, process_files: Callable[..., Any], send_cmd=None, status_text=None, **_kwargs) -> bool:
         from shared.utils.download import process_files_def_if_needed

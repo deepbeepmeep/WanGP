@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from shared.utils.loras_mutipliers import preparse_loras_multipliers
+
 from . import assemble, media, production as model, templates, titles
 from .director import Director
 from .store import ProductionStore
@@ -83,10 +85,10 @@ class Showrunner:
         return {"path": relative, "role": role, "target": target, **facts}
 
     def add_take(self, production_id: str, shot_id: str, path: str | Path, *, by: str, settings: dict[str, Any] | None = None, media_id: str | None = None,
-                 note: str = "", gpu_s: float | None = None) -> dict[str, Any]:
+                 note: str = "", gpu_s: float | None = None, base_loras: list[Any] | None = None) -> dict[str, Any]:
         production = self.store.get(production_id)
         facts = self.take_facts(production, production.resolve(production.adopt(path)))  # a take from outside the production is copied in
-        take = {**facts, "media": media_id, "settings": production.rel_settings(settings or {}), "note": note, "gpu_s": None if gpu_s is None else round(gpu_s, 1)}
+        take = {**facts, "media": media_id, "settings": production.rel_settings(settings or {}), "note": note, "gpu_s": None if gpu_s is None else round(gpu_s, 1), "base_loras": base_loras}
         result = production.apply([{"op": "add_take", "shot": shot_id, "take": take}], by=by)
         return {**result[0], **facts}
 
@@ -179,6 +181,62 @@ class Showrunner:
     def choose_default_template(self, role: str, template: str | None) -> dict[str, Any]:
         self.host.save_default_templates(templates.pick(self.host.default_templates(), self.catalog(self._defaults()), role, template))
         return self.default_template_roles()
+
+    def frame_sizes(self, production_id: str) -> dict[str, Any]:
+        """What the shots of the edit come out at: their take's real size (shot true); not shot yet, what their model makes of the brief's format or of
+        their own resolution (size None: their first reference decides it)."""
+        doc = self.store.get(production_id).snapshot()
+        catalog, sizes = self.catalog(doc), {}
+        for shot in doc["shots"]:
+            take = model.chosen_take(shot)
+            if not shot["included"]:
+                continue
+            if take is not None and take.get("width") and take.get("height"):
+                sizes[shot["id"]] = {"size": f"{take['width']}x{take['height']}", "shot": True}
+                continue
+            entry = templates.resolve(catalog, shot["generation"].get("template"))
+            requested = shot["generation"].get("settings", {}).get("resolution") or model.resolution(doc["brief"])
+            size = None if entry is not None and entry.get("sized_by_ref") and entry["task"] != "edit_image" else self.host.frame_size(entry, requested) if entry is not None and entry.get("model_type") else requested
+            sizes[shot["id"]] = {"size": size, "shot": False}
+        return {"sizes": sizes}
+
+    # Cast LoRAs (Settings > LoRAs on cast cards; off by default) --------------------------------------------------------------------------
+    def cast_lora_choices(self, production_id: str) -> dict[str, Any]:
+        """What the cast cards offer: the installed LoRAs of each model family the production's shots use, and the family of each shot."""
+        doc = self.store.get(production_id).snapshot()
+        catalog = self.catalog(doc)
+        picks = templates.effective(doc, catalog)
+        names = [picks[role] for role in ("cast_shots", "cast_shots_lip_synced", "image_edits", "images", "shots_without_cast") if role in picks]
+        names += [shot["generation"].get("template") for shot in doc["shots"]]
+        families, folders = {}, {}
+        for name in dict.fromkeys(names):
+            entry = templates.resolve(catalog, name)
+            if entry is None or not entry.get("model_type"):
+                continue
+            folder = folders[name] = self.host.lora_folder(entry["model_type"])
+            if folder and folder not in families:
+                families[folder] = {"folder": folder, "label": entry["label"], "loras": self.host.list_loras(entry["model_type"])}
+        return {"families": list(families.values()), "shots": {shot["id"]: folders.get(shot["generation"].get("template")) for shot in doc["shots"] if shot["included"]}}
+
+    def with_cast_loras(self, doc: dict[str, Any], shot: dict[str, Any], entry: dict[str, Any] | None, settings: dict[str, Any]) -> tuple[dict[str, Any], list[Any] | None]:
+        """A shot's settings with the LoRAs of the cast members it shows, after the template's, when they fit the shot's model; a trigger word missing from
+        the prompt opens it. Also returns the LoRAs before them, which a new take starts from (None when none applies)."""
+        loras = [member["lora"] for member in doc["cast"] if member["id"] in shot["cast"] and member["lora"]]
+        if not loras or entry is None or not entry.get("model_type") or not self.host.settings()["cast_loras"]:
+            return settings, None
+        folder = self.host.lora_folder(entry["model_type"])
+        loras = [lora for lora in loras if lora["folder"] == folder]
+        if not loras:
+            return settings, None
+        before = (list(settings["activated_loras"]), settings.get("loras_multipliers") or "") if "activated_loras" in settings else self.host.template_loras(templates.entry_name(entry))
+        present = {Path(name).name for name in before[0]}
+        added = [lora for lora in loras if Path(lora["file"]).name not in present]
+        tokens = preparse_loras_multipliers(before[1])  # one per LoRA, 1 when missing, or the added ones would take another's place
+        kept = before[1] if len(tokens) == len(before[0]) else " ".join((tokens + ["1"] * len(before[0]))[:len(before[0])])
+        multipliers = "\n".join(filter(None, [kept, " ".join(f"{float(lora['multiplier']):g}" for lora in added)]))
+        prompt = str(settings.get("prompt") or "")
+        words = [lora["trigger"].strip() for lora in loras if lora["trigger"].strip() and lora["trigger"].strip().casefold() not in prompt.casefold()]
+        return {**settings, "activated_loras": [*before[0], *(lora["file"] for lora in added)], "loras_multipliers": multipliers, **({"prompt": ", ".join([*words, prompt])} if words else {})}, list(before)
 
     def create(self, title: str, kind: str, **brief: Any):
         """A new production, starting with the default templates."""
@@ -311,14 +369,18 @@ class Showrunner:
             raise ValueError("This shot has no take with saved settings yet: ask the showrunner to render it.")
         settings = production.resolve_settings(take["settings"])
         settings.update({key: value for key, value in shot["generation"].get("settings", {}).items() if key in ("prompt", "alt_prompt", "negative_prompt")})
+        if take.get("base_loras"):  # the cast cards say which LoRAs of the cast this take gets, as they are now
+            settings["activated_loras"], settings["loras_multipliers"] = take["base_loras"]
         template = shot["generation"].get("template")
+        entry = templates.resolve(self.catalog(doc), template or settings.get("template"))
         if template and settings.get("template") and template != settings["template"]:  # the user picked another model: the shot's content on it, not the old model's settings
             settings = {"template": template, **{key: value for key, value in settings.items() if key in CONTENT_SETTINGS}}
-            entry = templates.resolve(self.catalog(doc), template)
             if entry is not None and not entry["refs"]:
                 settings.pop("image_refs", None)
             if entry is not None and entry["soundtrack"] and not entry["audio"] and settings.get("audio_guide"):
                 settings["audio_prompt_type"] = "AS"  # as render: a reference template follows the driving audio as its soundtrack
+        settings.update(templates.planned_length(doc, shot, entry))  # the shot as it is now, not its last take's length
+        settings, base_loras = self.with_cast_loras(doc, shot, entry, settings)
         if new_seed:
             settings["seed"] = random.randint(0, 2 ** 31 - 1)
         key = (production_id, shot_id)
@@ -330,17 +392,17 @@ class Showrunner:
                 {"type": "render", "production": production_id, "shot": shot_id, "progress": getattr(update, "progress", None), "status": getattr(update, "status", "")}))
             self._renders[key] = job
         production.apply([{"op": "update_shot", "shot": shot_id, "fields": {"status": "rendering"}}], by="user", record=False)
-        threading.Thread(target=self._finish_rerun, args=(production_id, shot_id, job, settings), daemon=True).start()
+        threading.Thread(target=self._finish_rerun, args=(production_id, shot_id, job, settings, base_loras), daemon=True).start()
         return {"shot": shot_id, "status": "rendering"}
 
-    def _finish_rerun(self, production_id, shot_id, job, settings):
+    def _finish_rerun(self, production_id, shot_id, job, settings, base_loras=None):
         production = self.store.get(production_id)
         started = time.time()
         try:
             result = job.result()
             files = list(getattr(result, "generated_files", None) or [])
             if getattr(result, "success", False) and files:
-                self.add_take(production_id, shot_id, files[0], by="user", settings=settings, note="Rerun", gpu_s=time.time() - started)
+                self.add_take(production_id, shot_id, files[0], by="user", settings=settings, note="Rerun", gpu_s=time.time() - started, base_loras=base_loras)
                 production.apply([{"op": "budget", "gpu_seconds": time.time() - started}], by="system", record=False)
             else:
                 errors = list(getattr(result, "errors", None) or [])
@@ -361,6 +423,27 @@ class Showrunner:
             job.cancel()
 
     # Assembly -------------------------------------------------------------------------------------------------------------------------
+    def detach_sound(self, production_id: str, shot_id: str, *, by: str = "user") -> dict[str, Any]:
+        """A shot's sound as a track of its own at its place in the cut, the shot then playing silent. The track holds the whole take's sound (at the
+        shot's speed), so that it can be extended past the cut as well as shortened."""
+        production = self.store.get(production_id)
+        doc = production.snapshot()
+        shot = model.find(doc["shots"], shot_id, "shot")
+        take = model.chosen_take(shot)
+        if take is None or take.get("kind") != "video" or not take.get("has_audio"):
+            raise ValueError("This shot's take has no sound.")
+        if not shot["sound"]:
+            raise ValueError("This shot's sound is already detached.")
+        clip = assemble.placed_clip(doc, production.resolve, shot_id)
+        if clip is None:
+            raise ValueError("Include this shot in the edit first: its sound goes where it plays.")
+        speed = clip["speed"]
+        file = media.take_sound(production.resolve(take["path"]), speed, production.folder / "media" / "tracks", "" if speed == 1.0 else assemble._atempo(speed))
+        track = {"path": production.rel(file), "start_s": round(clip["offset"], 3), "gain_db": 0.0, "in_s": round(clip["start"] / speed, 3), "out_s": round(clip["end"] / speed, 3),
+                 "name": f"Sound of {shot['title'] or shot_id}", "shot": shot_id, "take": take["id"]}
+        production.apply([{"op": "edit", "fields": {"audio_tracks": [*doc["edit"]["audio_tracks"], track]}}, {"op": "update_shot", "shot": shot_id, "fields": {"sound": False}}], by=by)
+        return track
+
     def assemble(self, production_id: str, by: str = "user") -> dict[str, Any]:
         production = self.store.get(production_id)
         doc = production.snapshot()

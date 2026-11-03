@@ -38,6 +38,7 @@ ASSISTANT_ACTION_BUDGET_LARGE_CONTEXT_TOKENS = 64000
 ASSISTANT_ACTION_BUDGET_SMALL_TOKENS = 2048
 ASSISTANT_ACTION_BUDGET_MEDIUM_TOKENS = 6144
 ASSISTANT_ACTION_BUDGET_LARGE_TOKENS = 8192
+ASSISTANT_ACTION_MINIMUM_TOKENS = 1024
 DEEPY_TELEMETRY_ENV = "WAN2GP_DEEPY_TELEMETRY"
 _DEEPY_TELEMETRY_ENABLED = str(os.environ.get(DEEPY_TELEMETRY_ENV, "0")).strip().lower() in {"1", "true", "yes", "y", "on"}
 
@@ -371,10 +372,32 @@ def extract_incomplete_tool_name(raw_text: str) -> str:
     open_markers = [(start, end) for start, end, closing in _tool_call_markers(text) if not closing]
     candidate = text if len(open_markers) == 0 else text[open_markers[-1][1]:]
     json_name = re.search(r"[\"']name[\"']\s*:\s*[\"']([^\"']+)", candidate, flags=re.IGNORECASE)
-    if json_name is not None:
-        return _clean_tag_name(json_name.group(1))
     function_start = _FUNCTION_START_RE.search(candidate)
-    return "" if function_start is None else _clean_tag_name(function_start.group(1))
+    if json_name is None and function_start is None:
+        return ""
+    # Whichever comes first names the tool: a "name" after <function=...> belongs to the call's arguments, and a <function=...> after "name" to its text.
+    first = json_name if function_start is None or json_name is not None and json_name.start() < function_start.start() else function_start
+    return _clean_tag_name(first.group(1))
+
+
+def extract_incomplete_tool_parameters(raw_text: str) -> dict[str, Any]:
+    """The parameters an interrupted <function=...> call has written, enough to name it: the finished ones (JSON decoded) and {} for the one it stopped in."""
+    text = str(raw_text or "")
+    open_markers = [(start, end) for start, end, closing in _tool_call_markers(text) if not closing]
+    candidate = text if len(open_markers) == 0 else text[open_markers[-1][1]:]
+    function_start = _FUNCTION_START_RE.search(candidate)
+    if function_start is None:
+        return {}
+    parameters: dict[str, Any] = {}
+    for name, value, closing in re.findall(r"<parameter(?:=|\s+name=)([^\s>]+)[^>]*>(.*?)(</parameter>|$)", candidate[function_start.end():], flags=re.DOTALL | re.IGNORECASE):
+        value = value.strip()
+        if value[:1] in ("{", "["):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                value = {}
+        parameters[_clean_tag_name(name)] = value if closing else {}
+    return parameters
 
 
 def _decode_completed_object_members(source: str, open_brace_index: int) -> dict[str, Any]:
@@ -524,6 +547,8 @@ class Qwen35AssistantRuntime:
         if self.tokenizer is None:
             raise RuntimeError("Prompt enhancer tokenizer is missing for assistant runtime.")
         self.debug_enabled = bool(debug_enabled)
+        self.context_progress = None  # called with (done, total) while a conversation is prefilled
+        self.prefill_setup_seconds = 0.0  # of the prefill being timed: preparing the runtime (engine, graph capture), which is no measure of its speed
         self.telemetry_enabled = self.debug_enabled and _DEEPY_TELEMETRY_ENABLED
         self._runtime_extra_tokens = getattr(model, "_prompt_enhancer_thinking_extra_tokens", 0)
         self._assistant_presence_state = None
@@ -1086,7 +1111,9 @@ class Qwen35AssistantRuntime:
         normalized_token_ids = [int(token_id) for token_id in token_ids]
         if len(normalized_token_ids) == 0:
             raise ValueError("Cannot prefill assistant context with an empty token sequence.")
+        setup_started_at = time.perf_counter()
         _engine, llm = self._ensure_clean_runtime(max_context_tokens=len(normalized_token_ids), max_new_tokens=1, seed=seed)
+        self.prefill_setup_seconds += time.perf_counter() - setup_started_at
         speculative = bool(getattr(self.model, "_prompt_enhancer_speculative_decoding", False))
         # Without MTP, the first decode step processes the final context token,
         # so the scheduled prefill leaves it for the suffix path below.
@@ -1161,6 +1188,8 @@ class Qwen35AssistantRuntime:
                     f"with {len(chunk)} tokens in {time.perf_counter() - chunk_started_at:.3f}s (context={int(seq.num_tokens)})."
                 )
                 self._log_speculative_alignment(seq, f"after suffix chunk {chunk_index}/{total_chunks}")
+                if self.context_progress is not None:
+                    self.context_progress(chunk_index, total_chunks)
         finally:
             seq.logits_processor = original_processor
             seq.logits_processor_update_state = original_update
@@ -1428,7 +1457,11 @@ class Qwen35AssistantRuntime:
         llm = self._get_live_llm()
         available_tokens = max(0, int(llm.config.max_model_len) - int(seq.num_tokens))
         if available_tokens < generation_limit:
-            raise RuntimeError(f"Assistant {phase} action requires {generation_limit} reserved tokens but only {available_tokens} remain.")
+            # Just after a compaction with nothing older left to summarize, the context can sit a little above what a full action reserves.
+            # The action gets what is left, which it rarely uses all of, and the next one can compact.
+            if available_tokens < ASSISTANT_ACTION_MINIMUM_TOKENS:
+                raise RuntimeError(f"Assistant {phase} action requires {generation_limit} reserved tokens but only {available_tokens} remain.")
+            generation_limit = available_tokens - 16
         temp, normalized_top_p, normalized_top_k = qwen35_text._normalize_vllm_sampling(do_sample=bool(do_sample), temperature=temperature, top_p=top_p, top_k=qwen35_text._resolve_prompt_top_k(self.model, top_k))
         existing_completion_tokens = int(seq.num_completion_tokens) if continuing_response else 0
         if not continuing_response:

@@ -1211,6 +1211,57 @@ class RemoteLLMAdapterTests(unittest.TestCase):
         self.assertIs(session.remote_backends["codex"], backend)
         self.assertFalse(backend.closed)
 
+    def test_remote_turn_drains_a_render_before_restoring_the_conversation(self):
+        for failed in (False, True):
+            with self.subTest(failed=failed):
+                session = AssistantSessionState()
+                user_id, _ = assistant_chat.add_user_message(session, "Render two shots")
+                begin_assistant_turn(session, user_id, "Render two shots")
+                between_shots = threading.Event()
+                observed = []
+
+                def render(name, arguments):
+                    # A paused render needs both the stop signal and the session lock to exit.
+                    with session.turn_lock:
+                        session.pause_requested = True
+                        session.pause_resume_event.clear()
+                    between_shots.set()
+                    session.pause_resume_event.wait(3)
+                    with session.turn_lock:
+                        observed.append((session.interrupt_requested, session.current_turn is not None))
+                    return {"status": "interrupted", "tool": name}
+
+                def end_early(prompt, *, call_tool, **kwargs):
+                    worker = threading.Thread(target=call_tool, args=("wangp_generate", {}), daemon=True)
+                    worker.start()
+                    self.addCleanup(worker.join, 3)
+                    self.assertTrue(between_shots.wait(3))
+                    if failed:
+                        raise ConnectionError("provider disconnected")
+                    return ""
+
+                backend, toolbox = Mock(), _FakeToolbox()
+                backend.run_turn.side_effect = end_early
+                toolbox.call = Mock(side_effect=render)
+                session.remote_backends["opencode"] = backend
+                args = ({"llm_engines": {"deepy": "opencode"}}, session, "Render two shots", "system", toolbox, lambda *_: None)
+                if failed:
+                    with self.assertRaisesRegex(ConnectionError, "provider disconnected"):
+                        run_remote_deepy_turn(*args)
+                else:
+                    run_remote_deepy_turn(*args)
+                self.assertEqual(observed, [(True, True)])
+                self.assertIsNone(session.current_turn)
+                self.assertIn("ended its turn", session.interruption_notice)
+                backend.interrupt.assert_not_called()
+
+                # An old provider callback must stay closed after the next turn starts.
+                session.interrupt_requested = False
+                begin_assistant_turn(session, user_id, "Next turn")
+                late = backend.run_turn.call_args.kwargs["call_tool"]("wangp_generate", {})
+                self.assertTrue(late["cancelled"])
+                toolbox.call.assert_called_once()
+
     def test_remote_deepy_streams_reasoning_and_progress_status(self):
         session = AssistantSessionState()
         user_id, _event = assistant_chat.add_user_message(session, "compare products")

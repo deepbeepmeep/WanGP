@@ -6,7 +6,7 @@ import time
 import math
 import torch
 
-from mmgp import transfer
+from mmgp import cuda_graphs, transfer
 from ..config import Config
 from .sequence import Sequence
 from ..layers import kv_formats as kvf
@@ -2228,7 +2228,7 @@ class ModelRunner:
         self.graphs = {}
         self.graph_pool = self._graph_pool_seed
         # Kitchen's CUTLASS workspace is per stream and must exist before capture.
-        capture_stream = torch.cuda.Stream(device=model_device)
+        capture_stream = cuda_graphs.capture_stream(torch.cuda.current_device())
 
         choose_short_batch_kernels = None
         try:

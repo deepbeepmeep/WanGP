@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import os
+from concurrent.futures import ThreadPoolExecutor
 from fnmatch import fnmatchcase
 from types import MethodType
 
@@ -118,9 +119,13 @@ def _probe_wgpkernels():
         module = importlib.import_module("wgpkernels.int8")
         if module._lib is None:
             module.load_library()
-        # Every kernel once with fixed configurations, at selection time and outside graph capture.
-        with torch.inference_mode():
-            failure = module.selftest()
+        # Every kernel once with fixed configurations, at selection time and outside graph capture. Its reference uses cuBLAS, whose workspaces
+        # stay per thread and stream: on a thread of its own, the next thread inherits this one instead of allocating another.
+        def selftest():
+            with torch.inference_mode():
+                return module.selftest()
+        with ThreadPoolExecutor(1) as thread:
+            failure = thread.submit(selftest).result()
         return (None, failure) if failure else (module, "available")
     except Exception as exc:
         return None, str(exc)

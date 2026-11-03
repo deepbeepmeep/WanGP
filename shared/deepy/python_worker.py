@@ -600,6 +600,8 @@ def _build_wangp_module() -> types.ModuleType:
         """Report a loop's progress to the user: wangp.progress(i, len(items), name) as item i starts shows a progress bar from the first item, with the item
         running and the time left; wangp.progress(len(items), len(items)) after the loop completes it."""
         _check_stop()
+        if isinstance(done, str):  # a status alone: wangp.progress("Inspecting shot 3")
+            done, text = 0, done
         done, total = int(done), None if total is None else int(total)
         finished = total is not None and done >= total
         if finished or time.monotonic() - progress_state["sent"] >= 0.2:
@@ -663,7 +665,7 @@ def _format_error(exc: BaseException) -> tuple[str, list[str]]:
     name = getattr(exc, "name", None) if isinstance(exc, NameError) else None
     if name in _TOOL_NAMES:
         message += f". WanGP's tools are reached through the wangp module here: {_TOOL_NAMES[name]}"
-    elif name and (name.startswith("wangp_") or name in ("view_media", "render_3d_views", "transcribe_media", "inspect_audio", "extract_audio", "remux_media", "merge_videos", "resize_crop")):
+    elif name and (name.startswith("wangp_") or name in ("view_media", "render_3d_views", "transcribe_media", "inspect_audio", "check_lip_sync", "extract_audio", "remux_media", "merge_videos", "resize_crop")):
         message += f". WanGP's tools are reached through the wangp module here: wangp.toolbox({name.removeprefix('wangp_')!r}, ...) or wangp.call({name!r}, ...)"
     elif not isinstance(exc, PermissionError) and ("'@" in message or '"@' in message):  # open() knows @alias paths; libraries opening files in C do not
         message += ". Libraries that open files themselves (soundfile, cv2, librosa) need the local path: pass wangp.path('@...') instead of the @alias path"

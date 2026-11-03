@@ -12,6 +12,9 @@
         document.head.prepend(element);
     }
     let initialized = false, pending = null, fullscreenTarget = null, fullscreenPanel = null, scrollY = 0, message = '';
+    const headerButtons = new Map();  // an add-on's tab -> the button its page shows in its own header
+    const SVG = path => `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${path}"/></svg>`;
+    const EXPAND = SVG('M14 4h6v6M10 20H4v-6M20 4l-7 7M4 20l7-7'), EXIT = SVG('M10 4H5v16h5M14 8l4 4-4 4M18 12H9');
 
     function updateUrl(target, useFolder) {
         const url = new URL(location.href), link = linkFor(target);
@@ -41,7 +44,17 @@
             window.scrollTo({top: scrollY, behavior: 'instant'});
         }
         if (!target) fullscreenPanel = null;
+        [target, previous].forEach(paintHeaderButton);
         window.dispatchEvent(new Event('resize'));
+    }
+
+    function paintHeaderButton(target) {
+        const button = headerButtons.get(target);
+        if (!button) return;
+        const inside = fullscreenTarget === target;
+        button.title = inside ? 'Back to WanGP' : 'Open Full Screen';
+        button.setAttribute('aria-label', button.title);
+        button.innerHTML = inside ? EXIT : EXPAND;
     }
 
     // An embedded web app (an iframe with data-src in .wangp-addon-web-view) loads when its tab is first shown, then hears whether
@@ -88,6 +101,25 @@
     }
 
     window.WanGPAddonNavigation = {
+        // An add-on's page in an iframe calls this each time it draws its header: the header gets WanGP's Full Screen / Back to WanGP button, and the bar above the page goes away.
+        headerButton(frame, container, className = '') {
+            const tab = Array.from(root().querySelectorAll('button[role="tab"][aria-controls]')).find(button => root().querySelector(`#${CSS.escape(button.getAttribute('aria-controls'))}`)?.contains(frame));
+            const target = tab.dataset.tabId;
+            panelFor(target).classList.add('wangp-addon-own-controls');
+            if (linkFor(target).dataset.appFullscreen !== 'true') return;
+            const button = container.ownerDocument.createElement('button');
+            button.type = 'button';
+            button.className = className;
+            if (!className) button.style.cssText = 'display:inline-grid;place-items:center;width:34px;height:34px;border:0;border-radius:9px;background:transparent;color:inherit;cursor:pointer';
+            button.onclick = () => {
+                const fullscreen = fullscreenTarget !== target;
+                setFullscreen(fullscreen ? target : null);
+                updateUrl(target, fullscreen);
+            };
+            container.append(button);
+            headerButtons.set(target, button);
+            paintHeaderButton(target);
+        },
         beforeRoute(target) { if (pending?.target !== target) pending = null; },
         selected(target) {
             syncWebViews(target);

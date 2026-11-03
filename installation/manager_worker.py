@@ -10,6 +10,7 @@ import threading
 import uuid
 
 from .catalog import load_config
+from .checkpoints import remove_version
 from .conda import discover_conda_environments
 from . import conda_transactions
 from .environments import inspect_interpreter, installation_environments, interpreter_path, managed_record
@@ -20,7 +21,7 @@ from .manager_demo import create_demo
 from .plan import build_plan
 from .releases import create_release, load_release, source_path
 from .resolution import resolve_dependencies
-from .runtime import ensure_pip
+from .runtime import EnvironmentService, ensure_pip
 from .server_probe import require_free_port, wait_for_server
 from .sources import OFFICIAL_REPOSITORY, VERSION_FILE, cached_download_release, list_versions, remote_catalog, version_metadata
 from .state import InstallError, InstallationLock, atomic_json, inside, plain_path, read_json
@@ -30,7 +31,7 @@ from .version import local_version
 
 
 PROTOCOL = 1
-ACTIONS = {"hardware", "conda_environments", "detect_installation", "catalog", "sources", "register", "inspect", "preview", "apply", "recover", "versions", "launch", "demo", "manager_update"}
+ACTIONS = {"hardware", "conda_environments", "detect_installation", "catalog", "sources", "register", "inspect", "preview", "apply", "recover", "versions", "remove_version", "launch", "demo", "manager_update"}
 
 
 def application_root(root):
@@ -164,6 +165,11 @@ def run_action(action, args, data, runtime, cancelled, emit, request_id):
         if conda_transactions.read_record(args["root"]) or args.get("maintenance") in ("conda", "venv"):
             return conda_transactions.version_history(args["root"])
         return version_history(args["root"])
+    if action == "remove_version":
+        preferences = data / "preferences.json"
+        registrations = read_json(preferences)["installations"] if preferences.exists() else []
+        emit({"type": "progress", "title": "Removing Saved Version", "message": "Checking which versions and installations use its environment"})
+        return remove_version(args["root"], args["checkpoint"], registrations)
     if action == "demo":
         target = data / "test-workspaces" / request_id[:12]
         emit({"type": "progress", "title": "Preparing Test Installation"})
@@ -207,36 +213,22 @@ def run_action(action, args, data, runtime, cancelled, emit, request_id):
                     # Built-in plugins must use the target release's requirements.
                     target = release / "source" / requirements.relative_to(app_root)
                     plugins.append(target if target.is_file() else requirements)
-            resolved = resolve_dependencies(catalog, preview / "resolution", runtime, runner=runner, extra_requirements=plugins)
+            policy = args.get("environment", "auto")
+            service = EnvironmentService(runtime, runner, kind="conda" if existing and existing.get("maintenance") == "conda" else "uv")
+            installed = None
+            if existing and operation in ("update", "switch-version") and policy != "new":
+                info = existing.get("inspection") or inspect_interpreter(existing["python"])
+                if info.get("python") == catalog["python"]:
+                    installed = service.inventory(info["prefix"])["packages"]
+            resolve_dependencies(catalog, preview / "resolution", runtime, runner=runner, extra_requirements=plugins, installed=installed)
             runner.check_cancelled()
             emit({"type": "progress", "title": "Preparing Installation Plan", "message": "Comparing files and recording the changes for your review"})
             if is_conda:
                 repository = args.get("repository") or args.get("source")
                 commit = args.get("commit") or conda_transactions.git(plain_path(repository), runner, "rev-parse", "HEAD")
-                # Source-only updates keep the working packages. Changed recipes
-                # build/validate a candidate before switching either source or Python.
-                same_inputs = True
-                for filename in resolved["input_files"]:
-                    path = Path(filename)
-                    if not path.is_relative_to(release / "source"):
-                        continue
-                    previous = Path(existing["root"]) / path.relative_to(release / "source")
-                    if not previous.is_file() or previous.read_text(encoding="utf-8-sig").strip() != path.read_text(encoding="utf-8-sig").strip():
-                        same_inputs = False
-                        break
-                previous_record = conda_transactions.read_record(existing["root"])
-                previous_resolution = previous_record and previous_record["active"].get("resolution")
-                # An imported environment has no validated dependency recipe yet.
-                # Its first update builds a candidate, including plugin requirements.
-                same_recipe = False
-                if previous_resolution:
-                    from .resolution import load_resolution
-                    saved = load_resolution(previous_resolution, check_inputs=False)
-                    same_recipe = saved["dependency_fingerprint"] == resolved["dependency_fingerprint"]
-                reuse = args.get("environment", "auto") != "new" and same_inputs and same_recipe
-                plan = conda_engine.prepare(args["root"], python=existing["python"], release=release, resolution=preview / "resolution", repository=repository, commit=commit, operation=operation, reuse_environment=reuse)
+                plan = conda_engine.prepare(args["root"], python=existing["python"], release=release, resolution=preview / "resolution", repository=repository, commit=commit, operation=operation, environment_policy=policy)
             else:
-                plan = prepare_transaction(args["root"], release, preview / "resolution", operation=operation, environment_policy=args.get("environment", "auto"), emit=emit, check_cancelled=runner.check_cancelled)
+                plan = prepare_transaction(args["root"], release, preview / "resolution", operation=operation, environment_policy=policy, emit=emit, check_cancelled=runner.check_cancelled, environment_service=service)
         atomic_json(preview / "transaction.json", plan)
         return {"preview_id": request_id, "plan": plan}
     if action == "apply":

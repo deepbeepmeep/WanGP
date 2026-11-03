@@ -1,0 +1,24 @@
+{
+    "model": {
+        "name": "Qwen3.5 GLB 3D Coder 4B",
+        "architecture": "qwen35_glb_coder",
+        "description": "Create a low-poly game asset or a small 3D scene from a description, optionally guided by a reference image. This compact preview model can include animated parts, but complex requests may need another attempt.",
+        "URLs": ["https://huggingface.co/DeepBeepMeep/3D/resolve/main/Qwen3.5-4B-GLB-3D-Coder-Q4_K_M.gguf"],
+        "system_configs": {
+            "_name": "Model Weights",
+            "_default_label": "Q4_K_M (2.7 GB)",
+            "_infos": "Q4_K_M uses less memory. Choose Q8_0 to use the higher-precision release.",
+            "q8": {
+                "name": "Q8_0 (4.5 GB)",
+                "URLs": ["https://huggingface.co/DeepBeepMeep/3D/resolve/main/Qwen3.5-4B-GLB-3D-Coder-Q8_0.gguf"]
+            }
+        }
+    },
+    "prompt": "A low-poly treasure chest with dark oak panels, two brass bands and a large brass lock.",
+    "image_mode": 1,
+    "video_prompt_type": "",
+    "prompt_enhancer": "",
+    "custom_settings": {"kv_cache_layout": "int8", "kv_cache_size": 64000, "save_source": 0},
+    "batch_size": 1,
+    "seed": 42
+}

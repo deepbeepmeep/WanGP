@@ -102,12 +102,14 @@ def ready_record(root):
     return record
 
 
-def _prepare(root, release, resolution, operation, operation_id, checkpoint=None, environment_policy="auto", *, emit=None, check_cancelled=None):
+def _prepare(root, release, resolution, operation, operation_id, checkpoint=None, environment_policy="auto", *, emit=None, check_cancelled=None, environment_service=None):
     root = plain_path(root)
     assert_idle(root)
     if any((parent / ".manager/installation.json").exists() or (parent / ".manager/active_operation.json").exists() for parent in root.parents):
         raise InstallError("nested_installation", "A managed installation cannot be nested inside another managed installation")
     current = read_installation(root)
+    if current and current.get("removing_checkpoint"):
+        raise InstallError("cleanup_pending", "Finish removing the saved version before updating")
     if environment_policy not in ("auto", "current", "new"):
         raise InstallError("invalid_environment_policy", "Choose auto, current or new for the target environment")
     if operation in ("update", "switch-version") and current:
@@ -170,8 +172,15 @@ def _prepare(root, release, resolution, operation, operation_id, checkpoint=None
     reuse = False
     if target_active:
         environment, reuse = target_active["environment"], True
-    elif current and operation != "repair" and environment_policy != "new" and current["active"]["dependency_fingerprint"] == locked["dependency_fingerprint"]:
-        environment, reuse = current["active"]["environment"], True
+    elif current and operation != "repair" and environment_policy != "new":
+        if environment_service is None:
+            reuse = current["active"]["dependency_fingerprint"] == locked["dependency_fingerprint"]
+        else:
+            prefix = inside(root, current["active"]["environment"])
+            previous_dir = resolution_location(root, current["active"]["resolution"])
+            reuse = environment_service.satisfies(prefix, resolution, locked, environment_service.inventory(prefix), previous_dir)
+        if reuse:
+            environment = current["active"]["environment"]
     if environment_policy == "current" and (not current or not reuse or environment != current["active"]["environment"]):
         raise InstallError("incompatible_environment", "This version needs different dependencies. Choose auto or new to preserve the current environment and build a separate one")
     registry = inside(root, "app/envs.json")
@@ -187,15 +196,17 @@ def _prepare(root, release, resolution, operation, operation_id, checkpoint=None
         "rollback_checkpoint": checkpoint, "target_active": target_active,
         "trust": "explicit_local_release", "apply_supported": True,
     }
+    if environment_service is not None and operation in ("update", "switch-version"):
+        result["check_installed_packages"] = True
     result["plan_sha256"] = digest(result)
     return result
 
 
-def prepare_transaction(root, release=None, resolution=None, operation="install", checkpoint=None, environment_policy="auto", *, emit=None, check_cancelled=None):
+def prepare_transaction(root, release=None, resolution=None, operation="install", checkpoint=None, environment_policy="auto", *, emit=None, check_cancelled=None, environment_service=None):
     if operation not in ("install", "update", "repair", "rollback", "switch-version"):
         raise InstallError("invalid_operation", f"Unsupported transaction: {operation}")
     with InstallationLock(root):
-        return _prepare(root, release, resolution, operation, uuid.uuid4().hex, checkpoint, environment_policy, emit=emit, check_cancelled=check_cancelled)
+        return _prepare(root, release, resolution, operation, uuid.uuid4().hex, checkpoint, environment_policy, emit=emit, check_cancelled=check_cancelled, environment_service=environment_service)
 
 
 def _cache_resolution(source, destination):
@@ -252,7 +263,10 @@ class TransactionEngine:
             raise InstallError("changed_plan", "Transaction plan was modified")
         root = plain_path(plan["installation_root"])
         with InstallationLock(root):
-            expected = _prepare(root, plan["release_directory"], plan["resolution_directory"], plan["operation"], plan["operation_id"], plan["rollback_checkpoint"], plan["environment_policy"])
+            checker = None
+            if plan.get("check_installed_packages"):
+                checker = self.environment_service or EnvironmentService(self.runtime, ProcessRunner(events=self.events, cancelled=self.cancelled))
+            expected = _prepare(root, plan["release_directory"], plan["resolution_directory"], plan["operation"], plan["operation_id"], plan["rollback_checkpoint"], plan["environment_policy"], environment_service=checker)
             if expected != plan:
                 raise InstallError("stale_plan", "Installation state changed after preview; prepare a new plan")
             previous = read_installation(root)
@@ -451,7 +465,10 @@ def version_history(root):
             if saved["installation_id"] != current["installation_id"] or saved["root"] != current["root"]:
                 raise InstallError("invalid_checkpoint", "Version history contains a foreign checkpoint")
             records.append((checkpoint, saved))
-        return {"versions": [{"checkpoint": checkpoint, "current": checkpoint is None, "release_id": record["active"]["release_id"], "release_sha256": record["active"]["release"], "environment": record["active"]["environment"], "config_schema": record["config_schema"]} for checkpoint, record in records]}
+        versions = [{"checkpoint": checkpoint, "current": checkpoint is None, "release_id": record["active"]["release_id"], "release_sha256": record["active"]["release"], "environment": record["active"]["environment"], "config_schema": record["config_schema"]} for checkpoint, record in records]
+        if current.get("removing_checkpoint"):
+            versions.append({**current["removing_checkpoint"], "current": False, "removing": True})
+        return {"versions": versions}
 
 
 def cancel_operation(root, operation_id):

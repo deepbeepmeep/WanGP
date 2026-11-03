@@ -174,6 +174,10 @@ class H3FaceRefinerBridge(SimpleScaleSuffixMixin):
             return True
         return context.model_family == "minimax_h3"
 
+    def query_checkpoint_inventory(self):
+        from models.minimax_h3.minimax_h3_handler import REF_TURBO_LORA_KEY
+        return [{"model_types": [DEFAULT_MODEL_TYPE], "download_defs": self.query_download_defs(), "model_lora_keys": {DEFAULT_MODEL_TYPE: [REF_TURBO_LORA_KEY]}}]
+
     def query_download_defs(self) -> list[dict[str, Any]]:
         from models.minimax_h3.minimax_h3_handler import REF2VA_PRUNED_ARCHITECTURE, REPO_ID, family_handler
 

@@ -1,6 +1,7 @@
 {
   "decoders": {
     "taeltx_2": {
+      "model": "LTX",
       "filename": "taeltx_2.safetensors",
       "channels": 128,
       "patch": 4,
@@ -14,6 +15,7 @@
       "sha256": "6e4cc0469134213d0101a46877ea2bce1dc7cf06ff5f5aefb9e4076c03542f7b"
     },
     "taeltx2_3": {
+      "model": "LTX",
       "filename": "taeltx2_3.safetensors",
       "channels": 128,
       "patch": 4,
@@ -27,6 +29,7 @@
       "sha256": "f0773b4e3e57318e6aa4dd4a35e1d16213a5f160fbc0376163f06888bbcbe246"
     },
     "taef2": {
+      "model": "FLUX",
       "filename": "taef2_decoder.safetensors",
       "channels": 32,
       "patch": 1,
@@ -36,6 +39,7 @@
       "sha256": "83841c5ca153e4cae60f03e2bedc7a49cb8b157da17623e5f137cce2fa183624"
     },
     "taef1": {
+      "model": "FLUX",
       "filename": "taef1_decoder.safetensors",
       "channels": 16,
       "patch": 1,
@@ -45,6 +49,7 @@
       "sha256": "5283b341ac4358818690111b9c2e760ef1958888e32b03568c75f8006423c272"
     },
     "taew2_1": {
+      "model": "Wan",
       "filename": "taew2_1.safetensors",
       "channels": 16,
       "patch": 1,
@@ -58,6 +63,7 @@
       "sha256": "04766eac0221b5390b985ae3fdcca652cbb4b1e8b82b28ea7ff89dfad1b1a93f"
     },
     "taew2_2": {
+      "model": "Wan",
       "filename": "taew2_2.safetensors",
       "channels": 48,
       "patch": 2,
@@ -71,6 +77,7 @@
       "sha256": "b84609b2a133d48434bd9636bfcb44bf05168dc436e2d3cecf26256faa1f5325"
     },
     "taehv": {
+      "model": "HunyuanVideo",
       "filename": "taehv.safetensors",
       "channels": 16,
       "patch": 1,
@@ -84,6 +91,7 @@
       "sha256": "032ad4ddc689513287ce02fcc099b5278592526ed1eac0324a7fab94bb690ed9"
     },
     "taehv1_5": {
+      "model": "HunyuanVideo",
       "filename": "taehv1_5.safetensors",
       "channels": 32,
       "patch": 2,
@@ -97,6 +105,7 @@
       "sha256": "b52e245bb86c62e159f50338e2e8f422d4b6f98b467164939c1c031c7d61352e"
     },
     "taeh3": {
+      "model": "MiniMax H3",
       "filename": "taeh3.safetensors",
       "channels": 24,
       "patch": 1,

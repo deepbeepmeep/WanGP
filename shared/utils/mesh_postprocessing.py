@@ -65,14 +65,21 @@ def validate(model_def, inputs, spatial_upsampling, temporal_upsampling) -> str:
 def process_mesh(mesh, spatial_upsampling, temporal_upsampling, *, spatial_values=None, temporal_values=None, spatial_kwargs=None, temporal_kwargs=None, **common):
     """The mesh refined by the 3D refiner, then textured by the texturer (either may be absent). spatial_values / temporal_values: the
     slots' runtime values (parameter_ui.runtime_values); common: the arguments of both processors (reference_image: the object image, PIL
-    RGBA preferred, unless the parameters supply one;
+    RGBA preferred, or an ordered list for a processor declaring accepts_reference_list = True; explicit slot parameters take precedence;
     seed, abort_callback, progress_callback, main_offloadobj, loaded_model_context, process_files); spatial_kwargs / temporal_kwargs: those
     of one slot (init_pipe of its memory policy)."""
+    def slot_inputs(handler):
+        refs = common.get("reference_image")
+        if isinstance(refs, list) and not getattr(handler, "accepts_reference_list", False):
+            return {**common, "reference_image": refs[0] if refs else None}
+        return common
+
     if str(spatial_upsampling or "").strip():
         handler = upsampler_api.find_postprocessing_upsampler(spatial_upsampling)
-        mesh = upsampler_api.upscale_postprocessing(handler, mesh, spatial_upsampling, parameter_values=spatial_values, **common, **dict(spatial_kwargs or {}))
+        mesh = upsampler_api.upscale_postprocessing(handler, mesh, spatial_upsampling, parameter_values=spatial_values, **slot_inputs(handler), **dict(spatial_kwargs or {}))
     if str(temporal_upsampling or "").strip():
-        mesh = temporal_upsampler_api.texture_mesh(temporal_upsampling, mesh, parameter_values=temporal_values, **common, **dict(temporal_kwargs or {}))
+        handler = temporal_upsampler_api.find_temporal_upsampler(temporal_upsampling)
+        mesh = temporal_upsampler_api.texture_mesh(temporal_upsampling, mesh, parameter_values=temporal_values, **slot_inputs(handler), **dict(temporal_kwargs or {}))
     return mesh
 
 

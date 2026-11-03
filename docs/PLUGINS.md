@@ -14,7 +14,7 @@ Media Flow and Showrunner appear in the normal **Enabled Apps & Plugins** list, 
 
 Both apps have a **Full Screen** control. `/media-flow/` and `/showrunner/` on your WanGP address open the corresponding app directly in full screen. The address keeps that folder URL, which you can bookmark or share. **WanGP** returns to the same tab, preserving its form or editor. Expanding and returning reuse the existing page.
 
-**Models Manager** is always installed. Open **Configuration → General → Manage Models & Disk Space**, beside **Show "All" Model Filter**, or press **Alt+M** from anywhere in WanGP, to inspect model files, shared dependencies and recoverable disk space. When finished, its **Back to ...** link (or **Alt+M** again) returns to the screen you came from.
+**Models Manager** is always installed. Open **Configuration → General → Manage Models & Disk Space**, beside **Selectable Generative Models**, or press **Alt+M**. Once disk usage is ready, **Models** lists generative models and finetunes, and **System** lists local Deepy and prompt enhancer variants, preprocessors, postprocessors, preview decoders and checkpoints reported by loaded plugins. Expand a family and select an entry to see its files. A file used by multiple models or variants stays **Shared** at every level and counts once per total. **Total Used** and the drive totals cover both tabs. **Delete Exclusive** removes only files that no entry outside the selected branch uses. The compact **Back to ...** link (or **Alt+M** again) returns to the screen you came from.
 
 Apps and plugins use the same Plugin system described below. Developer APIs, Plugin identifiers and installation folders keep their existing names.
 
@@ -101,6 +101,19 @@ Example:
 ```
 
 ### Reference Plugins and Specialized APIs
+
+**Reporting checkpoints to Models Manager.** Implement `query_checkpoint_inventory()` on the plugin or its registered processor. It lists **all** supported downloads, even when the extension is turned off or another variant is selected. Return or yield one entry per distinct set of checkpoints. Iterate the choices your extension offers and reuse the same per-variant definitions as the downloader. The manager must be able to call this offline without mutating settings, loading weights, or downloading anything.
+
+```python
+def query_checkpoint_inventory(self):
+    for label, model in self.MODEL_CHOICES:
+        for precision in self.PRECISIONS:
+            yield {"name": label, "variant": precision, "download_defs": [self.model_download_def(model, precision)]}
+```
+
+A fixed-checkpoint extension can keep its existing `query_download_def()` or `query_download_defs()`. The manager calls it only if the inventory hook is absent or returns `None`; an empty inventory explicitly declares no checkpoints. Legacy queries receive `enabled_only=False` if supported. That flag does **not** enumerate other configuration values: an extension with variant-dependent downloads must implement the inventory hook. Processors registered by a plugin are discovered automatically; the plugin need not repeat their declarations.
+
+`name` defaults to the owner's name, and `family` defaults to the processor category or **Plugin Extensions**. Set `variant` to group entries as **family → model → variant**. Entries without a variant appear directly under their family. Use `files` for exact checkpoint-relative or absolute file paths, including the individual files of a folder snapshot without a file list. Use `model_types` for WanGP models the processor reuses and `model_lora_keys` to map a model ID to model-definition keys for required LoRAs. Report only model assets that the user may remove through Models Manager.
 
 Reference Plugins:
 *   [Stable Diffusion 1.4 Model Plugin](https://github.com/deepbeepmeep/wan2gp-stable-diffusion-1-4): compact model Plugin template that adds Stable Diffusion 1.4 using MMGP-managed UNet, text encoder, and VAE components.
@@ -413,13 +426,16 @@ with self.deepy.run("Make it 6 s", session_dir="D:/my_plugin/sessions/trailer-12
 | `queued` | `None`: the job waits for Deepy to be idle. |
 | `started` | `{"session_dir", "workspace_id"}`: Deepy now shows the job. |
 | `status` | `{"kind", "text"}`: Deepy's status line (starting, thinking, paused...). |
-| `text` | `{"text", "delta"}`: Deepy's reply so far, and what was added. |
+| `text` | `{"text", "delta", "last"}`: all Deepy said so far, what was added, and its last message alone. |
+| `thought` | `{"id", "text", "delta", "streaming"}` while Deepy thinks, when its model does: one `id` per thought, the thought so far, what was added, and whether it is still being written. Up to three updates per second. |
+| `stats` | The line Deepy's chat shows, as `{"text"}`, with the numbers behind it. With a local model: `avg_prefill_tokens_per_second`, `avg_generated_tokens_per_second`, `consumed_tokens`, `max_tokens`, and `prefilling_tokens` while it reads that many tokens before writing. Up to three updates per second. |
 | `tool` | `{"id", "name", "label", "status", "status_text"}` when a Deepy action starts or changes state (`running`, `done`, `error`, `interrupted`); a failed action adds `"error"`, its reason. |
 | `progress` | A `ProgressUpdate` (`phase`, `status`, `progress` in percent, `current_step`, `total_steps`, `unit`) for generations run by the job. |
 | `output` | `{"id", "path", "kind", "name", "label"}` for each media file Deepy writes. |
+| `chat` | When you set `job.chat_events = True` right after `run`: each update of Deepy's chat, for Deepy's window in your page (see below). |
 | `done`, `cancelled`, `error` | The `DeepyResult`; always the last event. |
 
-`job.result(timeout=None)` waits for the `DeepyResult`: `status` (`"done"`, `"cancelled"` or `"error"`), `text` (Deepy's reply), `outputs` (as in `output` events), `session_dir` and `error`. The job ends once the user's conversation has been brought back. `job.cancel()` stops a job that is waiting, or interrupts Deepy's work on it; a stop from the Deepy chat ends the job as `cancelled` too. `job.close()` (or leaving a `with` block) cancels a job still running and deletes its private files, temporary workspace included.
+`job.result(timeout=None)` waits for the `DeepyResult`: `status` (`"done"`, `"cancelled"` or `"error"`), `text` (all Deepy said during the job), `reply` (its last message alone), `outputs` (as in `output` events), `session_dir` and `error`. The job ends once the user's conversation has been brought back. `job.cancel()` stops a job that is waiting, or interrupts Deepy's work on it; a stop from the Deepy chat ends the job as `cancelled` too. `job.close()` (or leaving a `with` block) cancels a job still running and deletes its private files, temporary workspace included.
 
 **Steering a running job.** `job.steer(text)` sends Deepy a message while it works on the job; Deepy applies it at its next step, as a message typed in the Deepy chat while it works. The reply and media that follow belong to the job's result. It raises an error once the job has ended: send the message with a new `run()` on the same `session_dir`.
 
@@ -465,6 +481,36 @@ def create_web_app(self):
 ```
 
 `register_web_app(path, factory)` serves `factory()`, an ASGI application such as a FastAPI app, at `path` from the WanGP server, behind its authentication. The factory runs once when the server starts, after WanGP's globals have been injected. If `app_url` uses that same path, embed the web page with `<iframe src="./my_plugin/?embedded=1">`; the embedded request reaches the web page while the public URL opens its WanGP tab. API and asset subpaths continue to reach the web app. Use relative URLs in the page so that it works wherever it is mounted. Wrap a full-height iframe in `<div class="wangp-addon-web-view">` to fit it to the shared fullscreen view. The bundled Showrunner Plugin is an example; Media Flow uses ordinary Gradio components and needs only the JSON declarations. Web apps without these declarations retain their existing independent URLs.
+
+A web page in an iframe can carry the Full Screen control in its own header, which saves the bar above the page. Each time the page draws its header, it calls `window.parent.WanGPAddonNavigation?.headerButton(window.frameElement, header, className)`: the header gets a button that opens Full Screen from the tab and goes back to WanGP from full screen, with its tooltip, and the bar goes away. `className` is optional and styles the button as the page's own. Pages that do not call it keep the bar.
+
+#### Deepy's Window in Your Page
+
+Your web page can show Deepy's chat window, with Deepy's own look, streaming and scrolling (it follows the latest words unless the reader scrolled up), in an iframe:
+
+```html
+<iframe src="../deepy/window?contour=0&input=0&avatars=0&wide=1"></iframe>
+```
+
+| Option | Effect |
+| --- | --- |
+| `contour=0` | No border around the window. |
+| `input=0` | No text input: the window only shows the conversation. |
+| `stats=0` | No line of speeds under the conversation. |
+| `avatars=0` | No name beside the messages. |
+| `stop=0` | No Pause and Stop on the status line. |
+| `actions=0` | No buttons on the messages. |
+| `compact=0` | Every step shown, instead of grouped under each answer. |
+| `wide=1` | Messages use the whole width, for a narrow panel. |
+| `font=0.84` | Text size. |
+| `theme=dark` | Dark colors, also with `DeepyWindow.theme("dark")`. |
+
+Once the iframe has loaded, your page drives it through `frame.contentWindow.DeepyWindow`:
+
+- `replay(events)` shows a conversation at once, from `shared.deepy.session_store.read_ui_updates(session_dir, after=0)`, which returns `events`, a `next` position to pass as `after` next time, and `restart` when the conversation was rewound.
+- `update(data)` applies one `chat` event of a running job.
+- `reset()` empties the window, `rejoin()` comes before `update` again after your page skipped some, and `shown()` puts the reader back in place when the iframe returns from being hidden.
+- `onGap` is called when an update could not be placed: read the saved conversation again. `onSubmit(text)` receives what the user typed in its input.
 
 ## Examples
 

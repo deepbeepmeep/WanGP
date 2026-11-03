@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .environments import interpreter_path
 from .execute import ProcessRunner
+from .resolution import artifact_sources_match
 from .state import InstallError, digest, file_hash, plain_path
 
 
@@ -52,6 +53,21 @@ class EnvironmentService:
 
     def snapshot(self, environment):
         return {"inventory": self.inventory(environment)}
+
+    def satisfies(self, environment, directory, resolution, inventory, previous_directory=None):
+        if inventory["python"] != resolution["python"]:
+            return False
+        if previous_directory and not artifact_sources_match(previous_directory, directory, resolution, inventory["packages"]):
+            return False
+        python = interpreter_path(environment, self.kind)
+        lock = plain_path(directory) / "pylock.toml"
+        command = self.runtime.command("pip", "install", "--check", "--require-hashes", "--python", python, "-r", str(lock))
+        if resolution.get("no_index"):
+            command.append("--no-index")
+        result = self.runner.run(command, env=self.runtime.environment(python), check=False)
+        if result.returncode not in (0, 1):
+            raise InstallError("environment_check_failed", "Could not check the installed packages against the dependency lock. See the operation log.")
+        return result.returncode == 0
 
     def update_clone(self, source, destination, resolution_directory, resolution):
         # Build a relocatable environment at its final path; never copy venv scripts

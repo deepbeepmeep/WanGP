@@ -10,13 +10,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from shared.kernels import ops
+from shared.utils.lora_mapping import convert_lora_keys
 from shared.utils.phase_progress import check_abort
 from .layers import EmbedderMLP, FeedForward, SelfAttention, layer_norm
-
-
-def fused_split_map(channels):
-    """mmgp split map of the fused upstream self-attention projection."""
-    return {"qkv": {"mapped_modules": ["q", "k", "v"], "split_sizes": [channels] * 3}}
 
 
 class RePo3DRotaryEmbedding(nn.Module):
@@ -101,6 +97,7 @@ class TripoSplatFlow(nn.Module):
                  num_blocks, num_heads, mlp_ratio):
         super().__init__()
         self.q_token_length, self.in_channels, self.cam_channels, self.model_channels = q_token_length, in_channels, cam_channels, model_channels
+        self.split_linear_modules_map = {"qkv": {"mapped_modules": ["q", "k", "v"], "split_sizes": [model_channels] * 3}}
         head_dim = model_channels // num_heads
         self.t_embedder = EmbedderMLP(model_channels)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(model_channels, 6 * model_channels))
@@ -118,6 +115,9 @@ class TripoSplatFlow(nn.Module):
         self.shift_table = nn.Parameter(torch.zeros(1, 2, model_channels))
         self.out_layer = nn.Linear(model_channels, out_channels)
         self.cam_out_layer = nn.Linear(model_channels, cam_channels)
+
+    def preprocess_loras(self, model_type, state_dict):
+        return convert_lora_keys(state_dict, dict(self.named_modules()), split_linear_modules_map=self.split_linear_modules_map)
 
     def encode_context(self, feature1, feature2):
         """Image tokens after the context refiners (1, tokens, channels): DINOv3 features feature1 and FLUX.2 VAE latents feature2."""

@@ -565,7 +565,7 @@ class DeepyPrimeTools:
             f"Use properties defined in template settings files: {bool(settings['use_template_properties'])}.",
         ]
         if settings["use_template_properties"]:  # named as settings: "width" and "height" are not setting names
-            lines.append("When using a Deepy template, retain its resolution, video_length, duration_seconds and seed unless the user asks for an override.")
+            lines.append("When using a Deepy template, retain its resolution, video_length, duration_seconds and seed unless the user or the task states otherwise (a production brief's format, for instance).")
         else:
             lines.extend([
                 f"Default resolution: \"{int(settings['width'])}x{int(settings['height'])}\".",
@@ -699,6 +699,8 @@ class DeepyPrimeTools:
             from shared.mcp.plugin_toolbox import transcript_label
 
             return transcript_label(arguments, humanize)
+        if tool_name == "wangp_validate" and isinstance(arguments.get("settings"), list) and len(arguments["settings"]) > 1:
+            return f"Validate {len(arguments['settings'])} Tasks"
         if tool_name == "wangp_web_search":
             action = str(arguments.get("action", "") or "").strip()
             action_arguments = arguments.get("arguments")
@@ -837,6 +839,8 @@ class DeepyPrimeTools:
         inner = arguments.get("arguments")
         if toolbox and isinstance(inner, dict) and inner.get("action") == arguments.get("action") is not None and set(inner) == {"action", "arguments"} and isinstance(inner["arguments"], dict):
             arguments["arguments"] = inner = inner["arguments"]  # the whole call repeated inside arguments under the same action
+        if toolbox and arguments.get("action") is not None and isinstance(inner, dict) and "arguments" in inner and inner["arguments"] is None:
+            arguments["arguments"] = inner = None  # the action's contract, asked for with its null written one level too deep
         if toolbox and arguments.get("action") is None and isinstance(inner, dict):
             if set(arguments) == {"arguments"} and set(inner) & set(properties) - {"action", "arguments"} and set(inner) <= set(properties):
                 arguments.pop("arguments")  # the whole call nested in arguments with its other top-level parameters (wangp_plugins' plugin)

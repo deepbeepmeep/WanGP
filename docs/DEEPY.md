@@ -426,7 +426,10 @@ For Qwen3.8 27B:
 
 - **GGUF Q4** has the highest quality and memory use. **Recommended for:** quality-first work when it fits without forcing excessive unloading. Usually this will require a 24 GB VRAM GPU.
 - **GGUF IQ3_S** is the middle ground for quality and memory. **Recommended for:** most local Prime installations. You may run this version with a 16 GB VRAM GPU.
-- **GGUF Q2** has the lowest memory use and the largest quality loss. **Recommended for:** this version can be also used with a 16 GB VRAM GPU but the advantage over Q3 is that you will be able to expand the context window.
+- **GGUF Q2** has lower memory use and a larger quality loss. **Recommended for:** this version can be also used with a 16 GB VRAM GPU but the advantage over Q3 is that you will be able to expand the context window.
+- **Bonsai 2 PTQ1_0** has the lowest memory use. **Recommended for:** GPUs with less than 16 GB of VRAM. It needs the GGUF kernels 1.0.22 or newer; without them, a first launch below 16 GB stays on Qwen3.5 4B and WanGP suggests Q2 if you choose Qwen3.8.
+
+On first launch, WanGP sets up Deepy Prime on the Qwen3.8 version that suits your NVIDIA GPU, with nothing to configure, so that Showrunner works right away: Q4 from 24 GB of VRAM, IQ3_S from 16 GB, Bonsai below that, with a 64K context from 10 GB of VRAM and 32K below. Settings you have already saved are never changed. You can pick another version, but if it is less compressed than the one suited to your GPU, or if a Speculative Decoding you chose pushes the model out of VRAM, WanGP warns you that Deepy may perform poorly: in **Configuration > Prompt Enhancer / Deepy**, at the first request of a Deepy chat, and in Showrunner. The same places tell you when Speculative Decoding is Disabled although your version of Qwen3.8 fits in VRAM with MTP on your GPU, as Deepy could then run about twice as fast.
 
 Deepy keeps as much of its local model in VRAM as fits beside its context cache. When the whole model does not fit, it streams the remaining layers from RAM at each step: it keeps working, but it answers more slowly the more layers are streamed, and it frees VRAM by itself when an image is inspected or another component needs memory. Deepy always uses the fastest kernels that are installed; there is no decoder setting to choose.
 
@@ -446,7 +449,7 @@ Speculative decoding can generate Deepy's text faster by predicting several toke
 
 Choose a method and **Number of Tokens** on the row above **KV Cache Quantization**. Only compatible methods appear; switching to an incompatible model or quantization resets the method to **Auto**.
 
-- **Auto** enables MTP on supported models when it speeds Deepy up: when the model fits in VRAM with it, or when part of the model has to stream from RAM anyway (MTP then predicts several tokens for each pass over the streamed weights). It stays off when MTP would push a model that otherwise fits in VRAM partly out of it, and on GPUs with 8 GB or less. For GGUF models, WanGP reads the checkpoint, context size and KV Cache Quantization to decide; for other quantizations Auto needs at least 12 GB for Qwen3.5 9B. The token count is automatic, and the console reports the choice Auto made.
+- **Auto** enables MTP on supported models when it speeds Deepy up: when the model fits in VRAM with it, or when part of the model has to stream from RAM anyway (MTP then predicts several tokens for each pass over the streamed weights). It stays off when MTP would push a model that otherwise fits in VRAM partly out of it, and on GPUs with 8 GB or less. From 13 to 16 GB, it enables MTP only when the whole model fits in VRAM with it. On Qwen3.8 27B, it uses 4 draft tokens from 24 GB of VRAM, or from 12 GB with Bonsai, and 2 below. For GGUF models, WanGP reads the checkpoint, context size and KV Cache Quantization to decide; for other quantizations Auto needs at least 12 GB for Qwen3.5 9B. The token count is automatic, and the console reports the choice Auto made.
 - **Disabled** adds no draft-model VRAM and disables the token control. Use it when memory is tight or prediction is slower for your workload.
 - **MTP** supports 1–8 draft tokens on Qwen3.5 9B and Qwen3.8/Bonsai 27B. Start with 2.
 - **DSpark** supports 1–7 draft tokens on Qwen3.8/Bonsai 27B when Triton and FlashAttention 2 are installed.
@@ -502,7 +505,7 @@ The context window is how much recent conversation, tool output, and project sta
 
 The KV cache holds the active conversation context in GPU memory. Quantizing it reduces that memory cost without changing the model checkpoint.
 
-- **Auto** uses fast INT8 caching when compatible GGUF kernels are installed and otherwise uses BF16. **Recommended for:** most users.
+- **Auto** chooses for your installation: Q4 when the GGUF and Triton kernels are installed and the GPU is an RTX 30XX or newer, fast INT8 with the GGUF kernels alone, and BF16 otherwise. **Recommended for:** most users.
 - **Disabled (BF16)** uses more VRAM and avoids cache quantization. **Recommended for:** quality-sensitive troubleshooting, or systems where INT8 cache performance is worse.
 - **INT8** uses about half the KV-cache VRAM and makes larger context windows practical. **Recommended for:** long Prime sessions or tight VRAM, provided the installed kernels support it efficiently.
 - **Below INT8** (INT8 keys with Q4 values, Q6, Q6 keys with Q4 values, Q4.1, Q4) shrinks the cache further, by a quarter to almost a half of the INT8 size. The first page of the conversation and the most recent tokens always stay in INT8; only the older middle of the context uses the smaller format. Q6 and INT8 keys with Q4 values are practically indistinguishable from INT8 on long texts; Q4.1 and Q4 cost a little precision on the oldest part of the context. Decoding speed is unchanged; reading a long prompt is 5 to 12 percent slower. **Recommended for:** very long Prime sessions on cards where the cache, not the model, is what no longer fits.
@@ -510,6 +513,14 @@ The KV cache holds the active conversation context in GPU memory. Quantizing it 
 **Exact Sink and Recent Tokens** appears with a cache below INT8 and chooses which tokens keep the INT8 precision: the first page plus the last 1024 tokens (recommended), the first page plus the last 256 tokens, the last 1024 tokens alone, or none for a uniformly quantized cache.
 
 The context-window label displays an estimated cache size. Treat that estimate as VRAM reserved before image or video model requirements.
+
+### KV Caches Kept in RAM
+
+When you go back to a conversation you left (your chat after a Showrunner request, or a production you worked on last), Deepy continues from its saved cache instead of rebuilding its context, so it answers in seconds rather than up to a minute. Each conversation keeps one cache, restored when it next needs Deepy; the oldest makes way once the limit is reached, and that conversation simply rebuilds its context on its next request.
+
+- **2** (default) keeps your chat and your last production ready.
+- **More** keeps more productions ready, at the cost of RAM: 64K tokens of context take about 1.2 GB in Q4, 2.1 GB in INT8 and 4 GB in BF16.
+- **Disabled** frees that RAM, and every conversation you come back to rebuilds its context. **Recommended for:** low RAM.
 
 ### Compaction Type When Context is Full
 

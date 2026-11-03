@@ -95,16 +95,20 @@ class CondaTransactionEngine:
         cls = CondaEnvironmentService if kind == "conda" else EnvironmentService
         return self.service or cls(self.runtime, runner, inside(root, ".manager/cache/uv"))
 
-    def prepare(self, root, python=None, release=None, resolution=None, repository=None, commit=None, operation="update", checkpoint=None, reuse_environment=False):
+    def prepare(self, root, python=None, release=None, resolution=None, repository=None, commit=None, operation="update", checkpoint=None, environment_policy="auto"):
         root = plain_path(root)
         with InstallationLock(root):
             if active_operation(root):
                 raise InstallError("recovery_required", "Recover the interrupted update first")
             if operation not in ("update", "switch-version", "rollback"):
                 raise InstallError("invalid_operation", "Existing installations support updates, version switching and rollback")
+            if environment_policy not in ("auto", "current", "new"):
+                raise InstallError("invalid_environment_policy", "Choose auto, current or new for the target environment")
             runner = ProcessRunner(events=self.events, cancelled=self.cancelled)
             state = git_state(root, runner)
             current = read_record(root)
+            if current and current.get("removing_checkpoint"):
+                raise InstallError("cleanup_pending", "Finish removing the saved version before updating")
             if current:
                 if current["active"]["commit"] != state["commit"]:
                     raise InstallError("source_conflict", "The Git revision changed outside Manager. Restore the recorded revision before maintaining this installation")
@@ -123,6 +127,7 @@ class CondaTransactionEngine:
             operation_id = uuid.uuid4().hex
             previous = {**current, "active": {**current["active"], "snapshot": before}} if current else {"schema_version": 1, "ownership": kind, "root": str(root), "installation_id": operation_id, "generation": 0, "history": [], "active": {**state, "release_id": (local_version(root) or "Existing checkout") + "-" + state["commit"][:12], "environment": str(environment), "snapshot": before, "resolution": None}}
             target = None
+            reuse_environment = operation == "rollback"
             if operation == "rollback":
                 if current is None or checkpoint not in current["history"]:
                     raise InstallError("unknown_checkpoint", "Select a saved version")
@@ -136,8 +141,6 @@ class CondaTransactionEngine:
                 target_version = target["release_id"]
                 resolution = target["resolution"]
             else:
-                if kind == "conda" and not reuse_environment:
-                    conda_command(environment)
                 commit = revision(commit)
                 self.events({"type": "progress", "title": "Preparing Git Revision", "message": "Fetching the selected source revision without changing the checkout"})
                 git(root, runner, "fetch", "--no-tags", "--depth=1", "--", str(repository), commit)
@@ -145,6 +148,11 @@ class CondaTransactionEngine:
                     raise InstallError("changed_source", "Fetched source does not match the selected revision")
                 manifest = load_release(release)
                 locked = load_resolution(resolution)
+                reuse_environment = environment_policy != "new" and service.satisfies(environment, resolution, locked, before["inventory"], previous["active"]["resolution"])
+                if environment_policy == "current" and not reuse_environment:
+                    raise InstallError("incompatible_environment", "The current environment needs package changes. Choose Automatic or Create a new environment.")
+                if kind == "conda" and not reuse_environment:
+                    conda_command(environment)
                 # The resolved requirements must be the ones in the selected Git commit.
                 for filename, expected in locked["input_files"].items():
                     if filename in locked.get("extra_requirements", []) or not plain_path(filename).is_relative_to(plain_path(locked["source_root"])):
@@ -157,7 +165,6 @@ class CondaTransactionEngine:
                 target_version = manifest["release_id"]
                 resolution = str(plain_path(resolution))
             changes = target_changes(root, runner, state["commit"], commit)
-            reuse_environment = operation == "rollback" or reuse_environment
             plan = {"schema_version": 1, "backend": "conda", "environment_kind": kind, "operation": operation, "operation_id": operation_id, "installation_root": str(root), "previous_record": current, "previous": previous, "git_before": state, "environment_before": before, "target_commit": commit, "target_active": target, "resolution_directory": resolution, "resolution_sha256": load_resolution(resolution, check_inputs=False)["resolution_sha256"] if resolution else None, "registry_sha256": observation(root, "envs.json"), "config_sha256": observation(root, "wgp_config.json"), "previous_release_id": previous["active"]["release_id"], "target_release_id": target_version, "changes": changes, "reuse_environment": reuse_environment, "environment": target["environment"] if target else str(environment) if reuse_environment else str(inside(root, ".manager/conda-envs/" + operation_id[:12])), "apply_supported": True}
             plan["plan_sha256"] = digest(plan)
             return plan
@@ -209,7 +216,9 @@ class CondaTransactionEngine:
                     cached = inside(root, ".manager/conda-resolutions/" + resolution["resolution_sha256"])
                     _cache_resolution(Path(plan["resolution_directory"]), cached)
                     if plan["reuse_environment"]:
-                        validation = {"inventory": service.inventory(plan["environment"]), "health": {"packages": "retained", "compute": "unchanged"}}
+                        if not service.satisfies(plan["environment"], cached, resolution, plan["environment_before"]["inventory"], previous["active"]["resolution"]):
+                            raise InstallError("environment_changed", "The current environment no longer satisfies the selected dependencies")
+                        validation = service.validate(plan["environment"], resolution, plan["environment_before"]["inventory"])
                     else:
                         validation = service.update_clone(previous["active"]["environment"], plan["environment"], cached, resolution)
                     active = {"commit": plan["target_commit"], "branch": None, "release_id": plan["target_release_id"], "environment": plan["environment"], "snapshot": service.snapshot(plan["environment"]), "resolution": str(cached), "validation": validation}
@@ -310,4 +319,7 @@ def version_history(root):
         if current is None:
             return {"versions": []}
         records = [(None, current)] + [(key, read_json(inside(root, f".manager/conda-checkpoints/{identifier(key)}.json"))) for key in reversed(current["history"])]
-        return {"versions": [{"checkpoint": key, "current": key is None, "release_id": record["active"]["release_id"], "environment": record["active"]["environment"]} for key, record in records]}
+        versions = [{"checkpoint": key, "current": key is None, "release_id": record["active"]["release_id"], "environment": record["active"]["environment"]} for key, record in records]
+        if current.get("removing_checkpoint"):
+            versions.append({**current["removing_checkpoint"], "current": False, "removing": True})
+        return {"versions": versions}

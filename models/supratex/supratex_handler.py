@@ -6,6 +6,7 @@ from .prompts import (SHAPE_DEEPY_INFOS, SHAPE_INFOS, SHAPE_PROMPT_INFOS, TEXTUR
                       TEXTURE_PROMPT_INFOS)
 
 TEXTURE_ARCH, SHAPE_ARCH = "supratex_texture", "pixal3d"
+MV_SHAPE, NATIVE_TEXTURE = "pixal3d_mv_shape", "pixal3d_texture"
 # Pixal3D + SUPRA-Tex in one model type, merged into Pixal3D + the SUPRA-Tex Texturer (2026-10-29)
 RETIRED_ARCH = "supratex"
 TEXTURER = "supratex"  # the SUPRA-Tex Texturer's method in the temporal slot (postprocessing/supratex)
@@ -21,11 +22,15 @@ DINOV3_FILES = ["dinov3_vitl16_lvd1689m.safetensors", "LICENSE_DINOv3.md"]
 
 
 def _settings(base_model_type):
-    shape = base_model_type == SHAPE_ARCH
+    shape = base_model_type in (SHAPE_ARCH, MV_SHAPE)
     settings = [{"id": "max_faces", "name": "Max Faces", "label": "Max Faces (0 = keep all)", "type": "int", "min": 0, "max": 4000000, "inc": 50000,
                  "default": 500000 if shape else 0,
                  "info": "Reduces the generated mesh to this number of faces (quadric decimation)." if shape else
                          "Reduces the mesh to this number of faces before texturing (quadric decimation); 0 keeps every face."}]
+    if base_model_type == MV_SHAPE:
+        settings.append({"id": "shape_resolution", "name": "Shape Resolution", "label": "Shape Resolution", "type": "dropdown",
+                         "default": 1024, "choices": [("1024", 1024), ("1536", 1536)],
+                         "info": "1536 can preserve finer geometry and takes more time and memory."})
     if not shape:
         settings.append({"id": "texture_size", "name": "Texture Size", "label": "Texture Size", "type": "dropdown", "default": 2048,
                          "choices": [("1024", 1024), ("2048", 2048), ("4096", 4096)], "info": "Size of the PBR texture images."})
@@ -35,7 +40,7 @@ def _settings(base_model_type):
 class family_handler:
     @staticmethod
     def query_supported_types():
-        return [TEXTURE_ARCH, SHAPE_ARCH]
+        return [TEXTURE_ARCH, SHAPE_ARCH, MV_SHAPE, NATIVE_TEXTURE]
 
     @staticmethod
     def query_family_maps():
@@ -74,10 +79,7 @@ class family_handler:
 
     @staticmethod
     def query_model_def(base_model_type, model_def):
-        from models.qwen21.qwen21_handler import ENCODER, ENCODER_REPO
-        from shared.utils.hf import build_hf_url
-
-        textured = base_model_type == TEXTURE_ARCH
+        textured = base_model_type in (TEXTURE_ARCH, NATIVE_TEXTURE)
         definition = {
             "image_outputs": True,
             "mesh_outputs": True,
@@ -106,8 +108,6 @@ class family_handler:
         }
         if textured:
             definition.update({
-                "text_encoder_folder": ENCODER,
-                "text_encoder_URLs": [build_hf_url(ENCODER_REPO, ENCODER, ENCODER + suffix) for suffix in ("_bf16.safetensors", "_int8_convrot.safetensors")],
                 "custom_guide": {"id": "custom_guide", "name": "Mesh", "label": "Input Mesh (.glb/.obj/.ply/.stl)", "type": "file", "default": None, "required": True,
                                  "file_types": MESH_FILE_TYPES},
                 "infos": TEXTURE_INFOS, "prompt_infos": TEXTURE_PROMPT_INFOS, "deepy_infos": TEXTURE_DEEPY_INFOS,
@@ -122,12 +122,37 @@ class family_handler:
                 "specialities": [{"name": "image to 3D", "aliases": ["3D mesh", "GLB", "3D asset", "pixel-aligned 3D"],
                                   "description": "Turns one picture of an object into a 3D mesh aligned with the picture's viewpoint."}],
             })
+        if base_model_type == TEXTURE_ARCH:
+            from models.qwen21.qwen21_handler import ENCODER, ENCODER_REPO
+            from shared.utils.hf import build_hf_url
+
+            definition["text_encoder_folder"] = ENCODER
+            definition["text_encoder_URLs"] = [build_hf_url(ENCODER_REPO, ENCODER, ENCODER + suffix) for suffix in ("_bf16.safetensors", "_int8_convrot.safetensors")]
+        if base_model_type in (MV_SHAPE, NATIVE_TEXTURE):
+            shape = base_model_type == MV_SHAPE
+            help_text = ("Supply four matching eye-level views, 90 degrees apart, ordered front, right (+X), back, left. "
+                         "Upload four equally framed images or a horizontal strip of four square panels. Keep the same scale and centre in every view.")
+            if not shape:
+                help_text = ("Paint an existing mesh with native Pixal3D base colour, metallic and roughness maps in a new UV atlas. "
+                             "Supply one front or three-quarter object image, or a turnaround. " + help_text)
+            label = "Four Object Views" if shape else "Object Image or Four Views"
+            definition.update(image_ref_choices={"choices": [(label, "I")], "letters_filter": "I", "default": "I"},
+                              one_image_ref_needed=False, one_image_ref_only=False, no_lora=False, infos=help_text, prompt_infos=help_text, deepy_infos=help_text,
+                              profiles_dir=[base_model_type], preset_profiles_dir=[base_model_type + "_presets"],
+                              specialities=[{"name": "Multi-view mesh generation" if shape else "Pixel-aligned PBR texturing",
+                                             "description": help_text}])
         return definition
 
     @staticmethod
+    def validate_generative_settings(base_model_type, model_def, inputs):
+        if base_model_type in (MV_SHAPE, NATIVE_TEXTURE) and len(inputs.get("image_refs") or []) not in (1, 4):
+            return "Supply four object views or a single turnaround sheet." if base_model_type == MV_SHAPE else "Supply one object image, four views or a turnaround sheet."
+
+    @staticmethod
     def query_model_files(computeList, base_model_type, model_def=None):
-        if base_model_type == SHAPE_ARCH:
-            return [{"repoId": REPO, "sourceFolderList": [PROJECT, "trellis2", "dinov3_vitl16"], "fileList": [SHAPE_FILES, SHAPE_TRELLIS2_FILES, DINOV3_FILES]}]
+        if base_model_type in (SHAPE_ARCH, MV_SHAPE, NATIVE_TEXTURE):
+            components = [TEXTURE_TRELLIS2_FILES[0], TEXTURE_TRELLIS2_FILES[2]] if base_model_type == NATIVE_TEXTURE else SHAPE_TRELLIS2_FILES
+            return [{"repoId": REPO, "sourceFolderList": [PROJECT, "trellis2", "dinov3_vitl16"], "fileList": [SHAPE_FILES, components, DINOV3_FILES]}]
         from models.qwen21.qwen21_handler import family_handler as qwen21
 
         return [{"repoId": REPO, "sourceFolderList": [PROJECT, "trellis2"], "fileList": [TEXTURE_FILES, TEXTURE_TRELLIS2_FILES]},
@@ -138,6 +163,9 @@ class family_handler:
         from .supratex_main import model_factory
 
         model = model_factory(model_filename, model_type, base_model_type, text_encoder_filename=text_encoder_filename, save_quantized=save_quantized, **kwargs)
+        if base_model_type in (MV_SHAPE, NATIVE_TEXTURE):
+            extra_stages = ["texture_flow_mv"] if base_model_type == NATIVE_TEXTURE else ["shape_flow", "shape_flow2"]
+            return model, {"pipe": model.pipe(), "loras": extra_stages}
         if base_model_type == SHAPE_ARCH:
             return model, model.pipe()
         return model, {"pipe": model.pipe(), "loras": ["material_transformer"]}  # LoRA slots of the material adapter
@@ -152,5 +180,7 @@ class family_handler:
             "remove_background_images_ref": 1,
             "prompt_enhancer": "",
         })
-        if base_model_type == SHAPE_ARCH:
+        if base_model_type == NATIVE_TEXTURE:
+            ui_defaults["guidance_scale"] = 1.0
+        if base_model_type in (SHAPE_ARCH, MV_SHAPE):
             ui_defaults["guidance_scale"] = 7.5

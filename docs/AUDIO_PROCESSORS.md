@@ -49,6 +49,7 @@ class MyAudioProcessor:
     def validate_method(self, method, **kwargs): ...        # -> "" or error text
     def download(self, method, process_files, send_cmd=None, status_text=None, **kwargs): ...
     def query_download_defs(self, *, enabled_only=True): ... # -> list of process_files definitions
+    def query_checkpoint_inventory(self): ...               # all checkpoint variants, independent of the selected settings; see PLUGINS.md
     def enabled(self): ...                                  # optional UI gating
     @property
     def status(self): ...                                   # optional: "enabled" or "disabled"

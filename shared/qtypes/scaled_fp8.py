@@ -2,6 +2,7 @@
 import ast
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 from torch._subclasses.fake_tensor import is_fake
@@ -241,9 +242,14 @@ def _init_scaled_mm_support():
     _FP8_MM_PROBED = True
     if not torch.cuda.is_available():
         return
+    # On a thread of its own: cuBLAS workspaces stay per thread and stream, and the next thread inherits this one instead of allocating another.
+    with ThreadPoolExecutor(1) as thread:
+        _FP8_MM_SUPPORT.update(thread.submit(_probe_scaled_mm, torch.device("cuda", torch.cuda.current_device())).result())
+
+
+def _probe_scaled_mm(device):
     support = {torch.float8_e4m3fn: False, torch.float8_e5m2: False}
     try:
-        device = torch.device("cuda", torch.cuda.current_device())
         with torch.cuda.device(device):
             a = torch.randn(1, 16, device=device, dtype=torch.float16)
             b = torch.randn(16, 16, device=device, dtype=torch.float16)
@@ -258,7 +264,7 @@ def _init_scaled_mm_support():
                     support[fp8_dtype] = False
     except Exception:
         support = {torch.float8_e4m3fn: False, torch.float8_e5m2: False}
-    _FP8_MM_SUPPORT.update(support)
+    return support
 
 
 def _scaled_fp8_qfallback(callable, *args, **kwargs):
