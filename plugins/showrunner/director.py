@@ -87,7 +87,7 @@ You are the showrunner of a production for the user: you plan, cast, shoot, edit
 
 
 def _task_words(task: str, message: str = "", shots: list[str] | tuple[str, ...] = ()) -> str:
-    return {"plan": "planning the production", "shoot": "shooting the production", "reshoot": f"re-shooting {', '.join(shots)}", "assemble": "assembling the edit", "review": "reviewing the last version in depth",
+    return {"plan": "planning the production", "shoot": f"shooting {', '.join(shots)}" if shots else "shooting the production", "reshoot": f"re-shooting {', '.join(shots)}", "assemble": "assembling the edit", "review": "reviewing the last version in depth",
             "continue": "continuing the production"}.get(task) or f"working on the user's note: {message}"
 
 
@@ -118,6 +118,9 @@ def build_prompt(doc: dict[str, Any], task: str, message: str = "", shots: list[
         length = doc["brief"].get("duration_s") or (doc["audio"].get("analysis") or {}).get("duration_s") or 0
         if length > 90:
             body += f" It runs about {length / 60:.1f} minutes: outline its sequences first, then plan each sequence's shots (the skill's long productions section)."
+    elif task == "shoot" and shots:
+        body = (f"Shoot {', '.join(shots)} and leave every other shot and its takes as they are: the user asked for these alone and nothing is wrong with them, so there is no fault to look for. "
+                "Render them, inspect each take and record a verdict, then stop and say how it came out. Do not assemble: the user decides what comes next.")
     elif task == "shoot":
         review = doc["brief"].get("review_before_edit")
         body = ("Shoot the production: render the included shots that still need a good take, in order, inspect each take and record a verdict, then "
@@ -126,7 +129,7 @@ def build_prompt(doc: dict[str, Any], task: str, message: str = "", shots: list[
         if len(doc["shots"]) > 24 or length > 90:
             body += " Work sequence by sequence" + ("." if review or length <= 300 else " and assemble after each one, so the user can follow the edit as it grows.")
     elif task == "reshoot":
-        note = f' The user says: "{message}".' if message else ""
+        note = f' The user says: "{message}".' if message else " The user wrote no note: if no note or verdict in the document says what is wrong, shoot them again without looking for a fault."
         body = (f"Fix shots {', '.join(shots)} and leave every other shot and its takes as they are.{note} Read the user's notes and verdicts in the document first. What the user asks for is theirs to decide, a new length or other content included: do it. When they say what is wrong rather "
                 "what to do, find the cause before you shoot: when a new take would not change it (the song, a subtitle, a trim, a card), fix that instead, and when that touches other shots, say which and what it costs before you do it. "
                 "Render new takes where they are needed, inspect them and record verdicts, then " + ("stop and ask the user to review them." if doc["brief"].get("review_before_edit") else "assemble a new version, check that the fault is gone and say what changed."))
@@ -234,7 +237,7 @@ class Director:
     def _log_line(task, message, shots):
         if task == "resume":
             return f"Asked the showrunner to resume: {message}" if message else "Asked the showrunner to resume."
-        what = {"plan": "Asked the showrunner to plan the production.", "shoot": "Asked the showrunner to shoot the production.", "continue": "Asked the showrunner to continue.",
+        what = {"plan": "Asked the showrunner to plan the production.", "shoot": f"Asked the showrunner to shoot {', '.join(shots)}." if shots else "Asked the showrunner to shoot the production.", "continue": "Asked the showrunner to continue.",
                 "assemble": "Asked the showrunner to assemble the edit.", "review": "Asked the showrunner for a deep review of the last version.", "reshoot": f"Asked the showrunner to fix {', '.join(shots or [])}{': ' + message if message else '.'}"}.get(task)
         return what or f"Told the showrunner: {message}"
 

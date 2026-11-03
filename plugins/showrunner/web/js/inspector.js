@@ -187,7 +187,7 @@ export function mountInspector(root) {
       if (note !== null) actions.ops([{ op: 'verdict', shot: id, take: take.id, ok: false, note }]);
     });
     root.querySelector('#i-rerun')?.addEventListener('click', () => rerun(id));
-    root.querySelector('#i-shoot')?.addEventListener('click', () => actions.direct('reshoot', '', [id]));
+    root.querySelector('#i-shoot')?.addEventListener('click', () => actions.direct('shoot', '', [id]));
     root.querySelector('#i-fix')?.addEventListener('click', () => askForFix([id]));
     if (root.querySelector('#i-reshoot')) root.querySelector('#i-reshoot').onclick = () => askForFix([id]);
     if (root.querySelector('#i-ask')) root.querySelector('#i-ask').onclick = async () => {

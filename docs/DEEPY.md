@@ -426,7 +426,10 @@ For Qwen3.8 27B:
 
 - **GGUF Q4** has the highest quality and memory use. **Recommended for:** quality-first work when it fits without forcing excessive unloading. Usually this will require a 24 GB VRAM GPU.
 - **GGUF IQ3_S** is the middle ground for quality and memory. **Recommended for:** most local Prime installations. You may run this version with a 16 GB VRAM GPU.
-- **GGUF Q2** has the lowest memory use and the largest quality loss. **Recommended for:** this version can be also used with a 16 GB VRAM GPU but the advantage over Q3 is that you will be able to expand the context window.
+- **GGUF Q2** has lower memory use and a larger quality loss. **Recommended for:** this version can be also used with a 16 GB VRAM GPU but the advantage over Q3 is that you will be able to expand the context window.
+- **Bonsai 2 PTQ1_0** has the lowest memory use. **Recommended for:** GPUs with less than 16 GB of VRAM. It needs the GGUF kernels 1.0.22 or newer; without them, a first launch below 16 GB stays on Qwen3.5 4B and WanGP suggests Q2 if you choose Qwen3.8.
+
+On first launch, WanGP sets up Qwen3.8 in the version that suits your NVIDIA GPU, with nothing to configure: Q4 from 24 GB of VRAM, IQ3_S from 16 GB, Bonsai below that. Deepy Prime is selected from 16 GB. Settings you have already saved are never changed. You can pick another version, but if it is less compressed than the one suited to your GPU, **Configuration > Prompt Enhancer / Deepy** warns you that Deepy may perform poorly.
 
 Deepy keeps as much of its local model in VRAM as fits beside its context cache. When the whole model does not fit, it streams the remaining layers from RAM at each step: it keeps working, but it answers more slowly the more layers are streamed, and it frees VRAM by itself when an image is inspected or another component needs memory. Deepy always uses the fastest kernels that are installed; there is no decoder setting to choose.
 

@@ -843,6 +843,9 @@ user-select: text;
 .deepy-prime-recommendation .prose p {
     margin: 0 !important;
 }
+.deepy-prime-recommendation .prose p + p {
+    margin-top: calc(6px * var(--wangp-ui-scale)) !important;
+}
 
 .toast-wrap { max-width: min(920px, calc(100vw - 2rem)) !important; }
 .toast-wrap > div, .toast-wrap .toast-body, .gradio-container [role="alert"] { max-width: 100% !important; }

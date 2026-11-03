@@ -103,11 +103,12 @@ class ShowrunnerToolbox:
             raise ValueError(f"{error.args[0]} Known productions: {', '.join(self.store.ids()[:12]) or 'none'}.") from None
 
     def _fixing(self, ctx, target) -> list[str] | None:
-        """The shots of the fix the director is working on, none in a review, None in any other task."""
+        """The shots the user named for the director's fix or shoot, none in a review, None in any other task."""
         director = target.snapshot()["director"]
-        if self._own(ctx) is None or director.get("task") not in ("reshoot", "review") or director.get("state") not in ("queued", "running", "pausing"):
+        if self._own(ctx) is None or director.get("state") not in ("queued", "running", "pausing"):
             return None
-        return (director.get("shots") or []) if director["task"] == "reshoot" else []
+        named = director.get("shots") or []
+        return {"reshoot": named, "shoot": named or None, "review": []}.get(director.get("task"))
 
     def _only_the_fix(self, ctx, target, shots=(), what: str = "") -> None:
         """The user named shots to fix: in that task the director changes nothing else, because rounds that spread beyond what was asked made films worse than their first version. A global
@@ -119,7 +120,7 @@ class ShowrunnerToolbox:
         if outside and target.snapshot()["director"]["task"] == "review":
             raise ValueError("A review changes nothing: end your turn saying what you would change, and the user decides.")
         if outside:
-            raise ValueError(f"You are fixing {', '.join(allowed)} at the user's request and everything else stays as it is, so {outside} cannot change in this task. If the fault really needs it, "
+            raise ValueError(f"You are working on {', '.join(allowed)} at the user's request and everything else stays as it is, so {outside} cannot change in this task. If the fault really needs it, "
                              "end your turn saying what you would change and what it costs: the user's answer starts a task that can do it.")
 
     @staticmethod

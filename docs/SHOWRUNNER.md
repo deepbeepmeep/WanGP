@@ -129,7 +129,8 @@ is shot (hover to play it), its status and the showrunner's opinion of the take.
   undone.
 
 When the plan suits you, press **Shoot N shots**: the showrunner shoots the shots without a take and the ones marked for a redo, never
-the others. Once every shot has a take, the same button becomes **Assemble**.
+the others. Once every shot has a take, the same button becomes **Assemble**. **Shoot this shot** in the panel of a shot without a take shoots
+that shot alone and stops there, to see it before the rest.
 
 The line under **Storyboard** gives the picture size of the shots: the real size of their takes, and for a shot not shot yet what its model makes of the
 brief's resolution (a model works on a grid of pixels, so 1280×720 can come out at 1280×704). Change it in the brief. Point at it for the details.
