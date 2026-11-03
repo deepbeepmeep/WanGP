@@ -14,7 +14,7 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 | **Video** | **Wan 2.1/2.2** and derived models, **MiniMax H3**, **LTX-2/2.3/2.5**, **Hunyuan Video 1/1.5**, **LongCat**, **Kandinsky**, **LTXV**, **MagiHuman** |
 | **Image** | **Fibo 2.0**, **Flux 3 Klein** and **Flux 1/2**, **MOSS Image / Edit**, **Krea 2**, **Qwen Image**, **Z-Image**, **SenseNova**, **Ideogram 4**, **HiDream** |
 | **Audio / TTS** | **Fish Audio Drama 3**, **MOSS-TTS v1.5**, **Qwen3 TTS**, **MiniMax H3 Voice Clone**, **Ace Step 1/2/XL**, **Omnivoice**, **Index TTS2/2.5**, **KugelAudio**, **HeartMula**, **Chatterbox**, **Minimax Music**, **Stable Audio 3** |
-| **3D** | **Hunyuan3D 2.1**, **TRELLIS.2**, **TripoSG**, **TripoSplat**, **PartCrafter**, **WorldMirror 2.0**, **MapAnything**, **Depth Anything 3 Points**, **MoGe-2** |
+| **3D** | **Hunyuan3D 2.1**, **TRELLIS.2**, **TripoSG**, **TripoSplat** (including **Idol**), **PartCrafter**, **WorldMirror 2.0**, **MapAnything**, **Depth Anything 3 Points**, **MoGe-2** |
 | **Interactive worlds** | **Hy-Nomas 8B** from text; **EVOKE Turbo 14B** from an image. Walk, look around, introduce events and save your journey. |
 
 ### Create a World, Then Explore It
@@ -240,7 +240,7 @@ Deepy Prime, your built-in personal assistant, can now:
 - **Faster Startup on RTX 50xx, Happier SSD**: on Blackwell GPUs, the NVIDIA driver optimizes the GPU code again at every launch and keeps the result in a shared 1 GB cache, too small to hold it all: 10-15 s lost at each first generation, and a cache rewritten on your SSD every time. Tick *Config → Performance → WanGP Compute Cache* to give WanGP its own cache (up to 2 GB): the work is done once and for all.
 
 - **3D Gen Models**: WanGP enters the third dimension, with plenty of synergies with the other models: rotate a 3D asset in the new *3D Viewer*, snap a view at the resolution you want and use it as a start image, or turn your generated images and videos into 3D.
-  - *One picture to a 3D asset*: **Hunyuan3D 2.1** (mesh + PBR textures), **TRELLIS.2** (textured PBR mesh), **TripoSG** (detailed mesh), **TripoSplat** (Gaussian splats), **PartCrafter** (one mesh per part)
+  - *One picture to a 3D asset*: **Hunyuan3D 2.1** (mesh + PBR textures), **TRELLIS.2** (textured PBR mesh), **TripoSG** (detailed mesh), **TripoSplat** and **Idol** (Gaussian splats), **PartCrafter** (one mesh per part)
   - *Photos or video to a 3D scene*: **WorldMirror 2.0**, **MapAnything**, **Depth Anything 3 Points**, and **MoGe-2** from a single photo
   - *Mesh tools*: **GeoSAM2** splits a mesh into its parts, **AnimateAnyMesh** animates a mesh from a text description
 

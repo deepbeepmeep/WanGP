@@ -35,13 +35,13 @@ best; faces of people often come out blurred, and the hidden sides are inferred.
 """
 
 TRIPOSPLAT_PROMPT_INFOS = """
-# TripoSplat Asset Name
+# Asset Name
 
-TripoSplat builds the 3D Gaussian splat from the Object Image alone: the text is not a prompt. Write a short name of the asset, such
+The model builds the 3D Gaussian splat from the Object Image alone. Write a short name of the asset, such
 as `Ceramic teapot` or `Toy pirate ship`; it becomes the output file name and is stored with the settings.
 
 To create an asset from text, first generate the object with an image model (one centered object, whole in frame, plain background,
-three-quarter view, soft even light), then send that image to TripoSplat as its Object Image.
+three-quarter view, soft even light), then use that image as the Object Image.
 """
 
 TRIPOSPLAT_DEEPY_INFOS = ("Image to 3D Gaussian splat (PLY, Y up), not a mesh. Needs exactly one reference image (`image_refs`): one whole object "
@@ -52,6 +52,34 @@ TRIPOSPLAT_DEEPY_INFOS = ("Image to 3D Gaussian splat (PLY, Y up), not a mesh. N
 
 TRIPOSPLAT_DEEPY_PROMPT_INFOS = ("`prompt` (optional): a short asset name such as `Toy pirate ship`; it names the file and does not change the splat, which "
                                  "depends only on the reference image (one centred, uncropped object, plain background, three-quarter view).")
+
+IDOL_INFOS = """
+# Idol
+
+Idol by Speridlabs turns one picture of a whole object into a Gaussian splat PLY. The visible side guides the shape and colour.
+Idol infers the hidden surfaces, so details on the back may differ from the real object.
+
+## Object Image
+
+Choose **Render or Generated Image** for a tight crop around a synthetic object. Choose **Photograph** to leave more space
+around a photographed object. An image with transparency supplies its own cutout. The optional asset name labels the output.
+
+## Settings
+
+- **Gaussian Count** defaults to 256K. Use 32K for lighter files or up to 1M to capture fine detail. Higher counts take longer to decode.
+- **Inference Steps** defaults to 50. Lower it for a quicker preview.
+- **Guidance** defaults to 4 on WanGP's scale, equivalent to 3 in the Idol SDK. Set it to 1 for unguided sampling.
+- **Shift Scale** defaults to 3. Higher values spend more steps forming the coarse shape.
+
+Open the PLY in the 3D gallery or a Gaussian splat viewer. Mesh printing and rigging require a separate mesh reconstruction.
+
+[Idol model card and license](https://huggingface.co/speridlabs/idol)
+"""
+
+IDOL_DEEPY_INFOS = ("One object image (`image_refs`) to a Y-up Gaussian splat PLY. Set `model_mode` to `synthetic` for renders or "
+                    "`real` for a photograph with a wider crop. The image supplies the shape and colour, hidden surfaces are inferred, "
+                    "and `prompt` names the file. Defaults are 50 steps, guidance_scale 4, flow_shift 3. "
+                    "`custom_settings.num_gaussians` accepts 32768, 65536, 131072, 196608, 262144 (default), 524288 or 1048576.")
 
 ASSET_NAME_INSTRUCTIONS = """You name 3D assets. Look at the image and name the single main object it shows in 2 to 6 words, for example: Toy
 pirate ship, Ceramic teapot with blue flowers, Stone cottage. Keep the words of the user's text when it already names the object. Answer with

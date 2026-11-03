@@ -645,7 +645,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                     with gr.Row(visible=not deepy_remote_default and enhancer_enabled_value in QWEN_PROMPT_ENHANCER_IDS) as self.enhancer_speculative_row:
                         self.enhancer_speculative_decoding_choice = gr.Dropdown(
                             choices=speculative_choices, value=speculative_method, label="Speculative Decoding",
-                            info="Speculative decoding uses extra VRAM. For Bonsai PTQ1, Auto disables MTP at 10 GiB VRAM or less and uses 2 draft tokens above 10 GiB.",
+                            info="Speculative decoding uses extra VRAM. On GPUs up to 16 GB, Auto enables MTP only when the whole model fits in VRAM with it, and never at 8 GB or less (10 GB for Bonsai PTQ1).",
                             interactive=not self.args.lock_config,
                         )
                         self.enhancer_speculative_tokens_choice = gr.Dropdown(

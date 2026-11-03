@@ -10,6 +10,7 @@ PROMPT_ENHANCER_SPECULATIVE_DECODING_DEFAULT = PROMPT_ENHANCER_SPECULATIVE_DECOD
 PROMPT_ENHANCER_SPECULATIVE_DECODING_IDS = frozenset((4, 5, 6))
 PROMPT_ENHANCER_SPECULATIVE_DECODING_VRAM_GB = {4: 12, 5: 24, 6: 8}  # Auto when the model's fit in VRAM is unknown (resolve_..., fit)
 MTP_AUTO_SLACK = 512 << 20  # Auto: MTP still pays when it leaves this much of the model out of VRAM (with the model in VRAM it decodes about twice as fast)
+MTP_AUTO_NO_OFFLOAD_VRAM_GB = 16  # Auto on GPUs up to this size: MTP only when the whole model stays in VRAM with it
 PROMPT_ENHANCER_SPECULATIVE_DRAFT_COUNTS = (2, 3, 4)
 BLOCK_DRAFT_METHODS = ("dspark", "dflash2")
 SPECULATIVE_METHOD_LABELS = {"auto": "Auto", "disabled": "Disabled", "mtp": "MTP", "dspark": "DSpark", "dflash2": "DFlash2"}
@@ -132,7 +133,7 @@ def resolve_prompt_enhancer_speculative_decoding(enhancer_enabled: Any, value: A
     needs without MTP, VRAM MTP adds, VRAM available) in bytes, or None if unknown. Auto then takes MTP unless it would push a model that
     fits in VRAM without it out of VRAM: measured on Qwen3.8 27B IQ2_M, MTP decodes 2.1x faster when both fit (15 GiB) and 1.5-1.7x when
     the weights stream either way (an 11 GB RTX 2080 Ti, a VRAM-limited RTX 4090 after a video), but 20% slower when the model fits
-    only without it (11 GiB). Without fit, a fixed VRAM size per model decides."""
+    only without it (11 GiB). On GPUs up to MTP_AUTO_NO_OFFLOAD_VRAM_GB, it takes MTP only when nothing is offloaded with it. Without fit, a fixed VRAM size per model decides."""
     mode = validate_prompt_enhancer_speculative_decoding(enhancer_enabled, value)
     if speculative_decoding_runtime(mode)[0] != PROMPT_ENHANCER_SPECULATIVE_DECODING_AUTO:
         return mode, ""
@@ -150,19 +151,24 @@ def resolve_prompt_enhancer_speculative_decoding(enhancer_enabled: Any, value: A
             total_vram_gb = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / (1024 ** 3)
         except Exception:
             total_vram_gb = 0
-    if enhancer_no == 5 and qwen_backend == "gguf_ptq1":
-        detected_vram = max(0.0, float(total_vram_gb))
-        if detected_vram > 10:
-            return speculative_decoding_config("mtp", 2), f"Speculative Decoding enabled automatically for Bonsai PTQ1: {detected_vram:.2f} GiB VRAM detected (more than 10 GiB; 2 MTP tokens)."
-        return 0, f"Speculative Decoding disabled automatically for Bonsai PTQ1: {detected_vram:.2f} GiB VRAM detected (10 GiB or less)."
+    bonsai = enhancer_no == 5 and qwen_backend == "gguf_ptq1"
     detected_vram_gb = max(0, int(float(total_vram_gb) + 0.5))
-    model_label = {4: "Qwen3.5-9B", 6: "Qwen3.8-9B"}.get(enhancer_no, "Qwen3.8-27B")
-    if float(total_vram_gb) <= 8:  # 8 GB GPUs: the drafter, its caches and graphs would take room from the model's blocks
-        return 0, f"Speculative Decoding disabled automatically for {model_label}: {max(0.0, float(total_vram_gb)):.2f} GiB VRAM detected (8 GiB or less)."
+    model_label = "Bonsai PTQ1" if bonsai else {4: "Qwen3.5-9B", 6: "Qwen3.8-9B"}.get(enhancer_no, "Qwen3.8-27B")
+    minimum = 10 if bonsai else 8  # small GPUs: the drafter, its caches and graphs would take room from the model's blocks
+    if float(total_vram_gb) <= minimum:
+        return 0, f"Speculative Decoding disabled automatically for {model_label}: {max(0.0, float(total_vram_gb)):.2f} GiB VRAM detected ({minimum} GiB or less)."
+    enabled = speculative_decoding_config("mtp", 2) if bonsai else 1
     sizes = None if fit is None else fit()
     if sizes is not None:
         needed, extra, available = sizes
         gib = lambda nbytes: f"{nbytes / 2**30:.1f}"
+        if detected_vram_gb <= MTP_AUTO_NO_OFFLOAD_VRAM_GB:
+            if needed + extra <= available:
+                return enabled, f"Speculative Decoding enabled automatically for {model_label}: the whole model fits in VRAM with MTP (about {gib(needed + extra)} GiB needed, {gib(available)} GiB available)."
+            return 0, f"Speculative Decoding disabled automatically for {model_label}: with MTP part of the model would stay out of VRAM (about {gib(needed + extra)} GiB needed, {gib(available)} GiB available)."
+    if bonsai:
+        return enabled, f"Speculative Decoding enabled automatically for Bonsai PTQ1: {float(total_vram_gb):.2f} GiB VRAM detected (more than 10 GiB; 2 MTP tokens)."
+    if sizes is not None:
         if needed + extra - available <= MTP_AUTO_SLACK:
             return 1, f"Speculative Decoding enabled automatically for {model_label}: with MTP it needs about {gib(needed + extra)} GiB of VRAM, {gib(available)} GiB available."
         if needed - available <= MTP_AUTO_SLACK:

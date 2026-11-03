@@ -23,6 +23,8 @@ DEEPY_PRIME_Q3_MIN_VRAM_GB = 16
 DEEPY_PRIME_Q4_MIN_VRAM_GB = 24
 QWEN38_QUANTIZATIONS = {"gguf_ptq1": "Bonsai Q1", "gguf_q2": "Q2", "gguf_q3": "Q3", "gguf": "Q4"}  # the most compressed first
 BONSAI_MIN_GGUF_KERNELS_VERSION = "1.0.22"
+DEEPY_FULL_CONTEXT_TOKENS = 64000  # a production's conversation is long, and below this Deepy keeps condensing it
+DEEPY_FULL_CONTEXT_MIN_VRAM_GB = 10  # below, Bonsai no longer fits in VRAM with this context
 
 
 def detected_nvidia_vram_gb() -> float:
@@ -40,20 +42,21 @@ def reported_vram(vram_gb: float | None = None) -> int:
     return int((detected_nvidia_vram_gb() if vram_gb is None else vram_gb) + 0.5)
 
 
-def deepy_prime_hardware_profile(vram_gb: float | None = None) -> tuple[str, str, int] | None:
-    reported_vram_gb = reported_vram(vram_gb)
-    if reported_vram_gb >= DEEPY_PRIME_Q4_MIN_VRAM_GB:
-        return "Q4", "gguf", reported_vram_gb
-    if reported_vram_gb >= DEEPY_PRIME_Q3_MIN_VRAM_GB:
-        return "Q3", "gguf_q3", reported_vram_gb
-    return None
-
-
 def bonsai_kernels_installed() -> bool:
     try:
         return Version(get_gguf_kernels_version()) >= Version(BONSAI_MIN_GGUF_KERNELS_VERSION)
     except InvalidVersion:
         return False
+
+
+def deepy_prime_hardware_profile(vram_gb: float | None = None) -> tuple[str, str, int] | None:
+    """Deepy Prime on the Qwen3.8 27B version that suits this GPU: (label, quantization, VRAM). None without an NVIDIA GPU, or below 16 GB without Bonsai's kernels, as Q2 would not fit there."""
+    reported_vram_gb = reported_vram(vram_gb)
+    if reported_vram_gb >= DEEPY_PRIME_Q4_MIN_VRAM_GB:
+        return "Q4", "gguf", reported_vram_gb
+    if reported_vram_gb >= DEEPY_PRIME_Q3_MIN_VRAM_GB:
+        return "Q3", "gguf_q3", reported_vram_gb
+    return ("Bonsai Q1", "gguf_ptq1", reported_vram_gb) if reported_vram_gb > 0 and bonsai_kernels_installed() else None
 
 
 def qwen38_recommended_quantization(vram_gb: float | None = None) -> str | None:
@@ -62,26 +65,27 @@ def qwen38_recommended_quantization(vram_gb: float | None = None) -> str | None:
     if reported_vram_gb <= 0:
         return None
     profile = deepy_prime_hardware_profile(reported_vram_gb)
-    return profile[1] if profile else "gguf_ptq1" if bonsai_kernels_installed() else "gguf_q2"
+    return profile[1] if profile else "gguf_q2"
 
 
 def apply_first_launch_deepy_prime_defaults(server_config: dict[str, Any], vram_gb: float | None = None) -> str:
-    """The first launch starts on what Configuration recommends: Qwen3.8 27B in the version that suits this GPU, with Deepy Prime from 16 GB of VRAM. Nothing changes without an NVIDIA GPU, nor
-    below 16 GB without Bonsai's kernels: Q2 would not fit there."""
-    quantization = qwen38_recommended_quantization(vram_gb)
-    if quantization is None or quantization == "gguf_q2":
+    """The first launch starts on what Configuration recommends, with nothing to configure: Deepy Prime on the Qwen3.8 27B version that suits this GPU, so that Showrunner works at once."""
+    profile = deepy_prime_hardware_profile(vram_gb)
+    if profile is None:
         return ""
+    label, quantization, reported_vram_gb = profile
     llm_config = normalize_llm_config(server_config)
     llm_config["deepy"] = ENGINE_QWEN38_27B
-    server_config.update({"enhancer_enabled": local_enhancer_id(ENGINE_QWEN38_27B), "prompt_enhancer_quantization": quantization, LLM_CONFIG_KEY: llm_config})
-    if deepy_prime_hardware_profile(vram_gb) is not None:
-        server_config.update({
-            DEEPY_ENABLED_KEY: 1,
-            DEEPY_TYPE_KEY: DEEPY_TYPE_PRIME,
-            DEEPY_CONTEXT_TOKENS_KEY: DEEPY_COMPACTION_SUMMARIZE_MIN_TOKENS,
-            DEEPY_COMPACTION_TYPE_KEY: DEEPY_COMPACTION_TYPE_SUMMARIZE,
-        })
-    return QWEN38_QUANTIZATIONS[quantization]
+    server_config.update({
+        DEEPY_ENABLED_KEY: 1,
+        DEEPY_TYPE_KEY: DEEPY_TYPE_PRIME,
+        DEEPY_CONTEXT_TOKENS_KEY: DEEPY_FULL_CONTEXT_TOKENS if reported_vram_gb >= DEEPY_FULL_CONTEXT_MIN_VRAM_GB else DEEPY_COMPACTION_SUMMARIZE_MIN_TOKENS,
+        DEEPY_COMPACTION_TYPE_KEY: DEEPY_COMPACTION_TYPE_SUMMARIZE,
+        "enhancer_enabled": local_enhancer_id(ENGINE_QWEN38_27B),
+        "prompt_enhancer_quantization": quantization,
+        LLM_CONFIG_KEY: llm_config,
+    })
+    return label
 
 
 def qwen38_quantization_warning(server_config: dict[str, Any], vram_gb: float | None = None) -> str:
@@ -106,4 +110,5 @@ def deepy_prime_upgrade_message(server_config: dict[str, Any], vram_gb: float | 
     if profile is None or deepy_mode_from_config(server_config.get(DEEPY_ENABLED_KEY, 0), server_config.get(DEEPY_TYPE_KEY)) == DEEPY_TYPE_PRIME:
         return ""
     label, _quantization, reported_vram_gb = profile
-    return f"✨ **Switch to Deepy Prime {label}** — your NVIDIA GPU ({reported_vram_gb} GB VRAM) is eligible. Gain multi-step planning, image/video/audio tool chaining, and end-to-end handling of long creations. Select Deepy Prime below to switch."
+    select = "Deepy Prime" if normalize_llm_config(server_config)["deepy"] == ENGINE_QWEN38_27B else "the Qwen3.8 VL Uncensored 27B engine and Deepy Prime"
+    return f"✨ **Switch to Deepy Prime {label}** — your NVIDIA GPU ({reported_vram_gb} GB VRAM) is eligible. Gain Showrunner, multi-step planning, image/video/audio tool chaining, and end-to-end handling of long creations. Select {select} below to switch."

@@ -29,9 +29,10 @@ class _Progress:
 ADVISED_CONTEXT = 64000  # tokens: a production's conversation is long, and below this Deepy keeps condensing it
 
 
-def advice_for_deepy(context_tokens: int, kv_cache: str, lower_kv_cache: bool) -> str:
-    """One notice for what a local Deepy's settings cost a production: a short context, a KV cache that could leave room for a longer one. Empty when both are fine."""
-    short, large = context_tokens < ADVISED_CONTEXT, lower_kv_cache and kv_cache in ("", "int8")
+def advice_for_deepy(context_tokens: int, kv_cache: str, lower_kv_cache: bool, room_for_context: bool = True) -> str:
+    """One notice for what a local Deepy's settings cost a production: a short context, a KV cache that could leave room for a longer one. Empty when both are fine. room_for_context: this GPU holds
+    the model with the advised context; on a smaller one, following the advice would push the model out of VRAM."""
+    short, large = room_for_context and context_tokens < ADVISED_CONTEXT, lower_kv_cache and kv_cache in ("", "int8")
     context, cache = f"Context Window Tokens to at least 64K (it is {context_tokens // 1000}K)", f"KV Cache Quantization to Q4 or lower (it is {'INT8' if kv_cache else 'BF16'})"
     where = "In Configuration > Prompt Enhancer / Deepy."
     if short and large:
@@ -71,11 +72,12 @@ class WanGPHost:
 
     def deepy_advice(self) -> str:
         from shared.deepy.config import DEEPY_CONTEXT_TOKENS_DEFAULT, DEEPY_CONTEXT_TOKENS_KEY, DEEPY_KV_CACHE_QUANTIZATION_DEFAULT, DEEPY_KV_CACHE_QUANTIZATION_KEY, deepy_lower_kv_cache_supported, get_deepy_runtime_config, normalize_deepy_context_tokens, resolve_deepy_kv_cache_quantization
+        from shared.deepy.onboarding import DEEPY_FULL_CONTEXT_MIN_VRAM_GB, reported_vram
         from shared.remote_llm.config import is_remote_engine, resolve_role_engine
         config = get_deepy_runtime_config()
         if is_remote_engine(resolve_role_engine(config, "deepy")):  # a remote agent has its own context
             return ""
-        return advice_for_deepy(normalize_deepy_context_tokens(config.get(DEEPY_CONTEXT_TOKENS_KEY, DEEPY_CONTEXT_TOKENS_DEFAULT)), resolve_deepy_kv_cache_quantization(config.get(DEEPY_KV_CACHE_QUANTIZATION_KEY, DEEPY_KV_CACHE_QUANTIZATION_DEFAULT))[0], deepy_lower_kv_cache_supported())
+        return advice_for_deepy(normalize_deepy_context_tokens(config.get(DEEPY_CONTEXT_TOKENS_KEY, DEEPY_CONTEXT_TOKENS_DEFAULT)), resolve_deepy_kv_cache_quantization(config.get(DEEPY_KV_CACHE_QUANTIZATION_KEY, DEEPY_KV_CACHE_QUANTIZATION_DEFAULT))[0], deepy_lower_kv_cache_supported(), reported_vram() == 0 or reported_vram() >= DEEPY_FULL_CONTEXT_MIN_VRAM_GB)
 
     def production_workspace(self, title: str, folder: Path) -> str:
         return self._client().ensure_workspace(f"Showrunner - {title}"[:120], folder)

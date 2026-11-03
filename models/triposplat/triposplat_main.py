@@ -25,11 +25,10 @@ from shared.utils.phase_progress import PhaseProgress, check_abort, generation_p
 from shared.utils.text_encoder_cache import TextEncoderCache
 from .decoder import TripoSplatDecoder, fused_split_map as decoder_split_map
 from .dinov3 import DINOv3ViT
-from .flow import TripoSplatFlow, fused_split_map as flow_split_map
-from .settings import DEFAULT_CUSTOM_SETTINGS
+from .flow import TripoSplatFlow
+from .settings import DEFAULT_GAUSSIAN_COUNT
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "configs", "triposplat.json")
-DECODER_FILE = "triposplat/triposplat_vae_decoder_fp16.safetensors"
 IMAGE_ENCODER_FILE = "dinov3_vith16plus/dinov3_vith16plus_lvd1689m_bf16.safetensors"  # DINOv3 License (LICENSE_DINOv3.md beside it)
 VAE_FILE = "flux2_vae.safetensors"  # shared with FLUX.2: TripoSplat's copy has the same encoder weights and latent statistics
 IMAGE_MEAN, IMAGE_STD = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
@@ -108,24 +107,26 @@ def splats_to_gltf(splats):
 
 
 class model_factory:
-    def __init__(self, model_filename, model_type, base_model_type, save_quantized=False):
+    def __init__(self, model_filename, model_type, model_def, save_quantized=False):
         self.device = torch.device("cuda")
         self._interrupt = False
         with open(CONFIG_PATH, encoding="utf-8") as reader:
             self.config = json.load(reader)
         config = self.config
+        self.crop_margins = model_def.get("crop_margins", {})
         with init_empty_weights():
             flow = TripoSplatFlow(**config["flow"])
-        # FP16 checkpoint (INT8 linears compute in FP16); the fused q/k/v projections are split at load for the attention kit
-        self.transformer = _load(flow, model_filename[0], fp32_dtype=torch.float16, fused_split_map=flow_split_map(config["flow"]["model_channels"]))
+        dtype = torch.bfloat16 if model_def["dtype"] == "bf16" else torch.float16
+        self.transformer = _load(flow, model_filename[0], fp32_dtype=dtype, fused_split_map=flow.split_linear_modules_map)
         if save_quantized:
             from wgp import save_quantized_model
-            save_quantized_model(self.transformer, model_type, model_filename[0], torch.float16, None)
+            save_quantized_model(self.transformer, model_type, model_filename[0], dtype, None)
         with init_empty_weights():
             decoder = TripoSplatDecoder(config["octree"], config["gaussians"], config["octree_levels"])
             image_encoder = DINOv3ViT(**config["image_encoder"])
             vae = Flux2ImageEncoder(config["vae_bn_eps"])
-        self.decoder = _load(decoder, fl.locate_file(DECODER_FILE), fused_split_map=decoder_split_map(config["gaussians"]["model_channels"]))
+        self.decoder = _load(decoder, fl.locate_file(os.path.join("triposplat", model_def["splat_decoder"])),
+                             fused_split_map=decoder_split_map(config["gaussians"]["model_channels"]))
         self.image_encoder = _load(image_encoder, fl.locate_file(IMAGE_ENCODER_FILE))
         self.vae = _load(vae, fl.locate_file(VAE_FILE), preprocess_sd={"decoder": None})
         self.vae._convertWeightsFloatTo = torch.bfloat16  # FP32 checkpoint run in BF16, as upstream
@@ -134,10 +135,10 @@ class model_factory:
     def pipe(self):
         return {"transformer": self.transformer, "image_encoder": self.image_encoder, "vae": self.vae, "decoder": self.decoder}
 
-    def _encode_image(self, image):
+    def _encode_image(self, image, margin):
         """DINOv3 features and FLUX.2 VAE posterior of the prepared object image, cached on the CPU by source image content."""
         config = self.config
-        settings = (config["canvas_size"], config["crop_margin"], config["erode_radius"])
+        settings = (config["canvas_size"], margin, config["erode_radius"])
         digest = hashlib.sha1(image.tobytes() + repr((image.mode, image.size, settings)).encode()).hexdigest()
 
         def encode(_):
@@ -191,10 +192,11 @@ class model_factory:
     @generation_progress
     @torch.inference_mode()
     def generate(self, seed, sampling_steps, guide_scale, batch_size, shift, custom_settings, original_input_ref_images, callback=None,
-                 set_progress_status=None, **kwargs):
-        num_gaussians = int((DEFAULT_CUSTOM_SETTINGS | custom_settings)["num_gaussians"])
+                 set_progress_status=None, model_mode=None, **kwargs):
+        num_gaussians = int(custom_settings.get("num_gaussians", DEFAULT_GAUSSIAN_COUNT))
         per_point = self.config["gaussians"]["num_gaussians"]
-        encoded = self._encode_image(original_input_ref_images[0])
+        margin = self.crop_margins.get(model_mode, self.config["crop_margin"])
+        encoded = self._encode_image(original_input_ref_images[0], margin)
         flow = self.transformer
         uncond = flow.encode_context(torch.zeros_like(encoded["features"]), torch.zeros(1, encoded["features"].shape[1], flow.cond_embedder2.in_features,
                                      dtype=torch.float32, device=self.device)) if guide_scale > 1 else None
