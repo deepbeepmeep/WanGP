@@ -8176,6 +8176,25 @@ class AssistantEngine:
             rebuilds_conversation=True,
         )
 
+    def _prefill_from_new_header(self, target_tokens: list[int]) -> str:
+        base_tokens = self._render_system_prompt_tokens(add_generation_prompt=False)
+        if not base_tokens or target_tokens[: len(base_tokens)] != base_tokens:
+            raise RuntimeError("Deepy context does not extend its rendered system/tools prefix.")
+        self._run_prefill_call(len(base_tokens), lambda: self.runtime.prime_context(base_tokens))
+        base_snapshot = self.runtime.snapshot_context()
+        if base_snapshot is None:
+            raise RuntimeError("Deepy context could not snapshot its system/tools prefix.")
+        self.session.reset_base_token_ids = list(base_tokens)
+        self.session.reset_base_snapshot = base_snapshot
+        self.session.reset_base_signature = self._current_reset_base_signature()
+        self.session.reset_base_context_window_tokens = self._get_context_window_tokens()
+        return self._run_prefill_call(
+            len(target_tokens) - len(base_tokens),
+            lambda: self.runtime.extend_context(target_tokens),
+            record_if=lambda result: result in ("prefilled", "chunk_prefilled"),
+            rebuilds_conversation=True,
+        )
+
     def _restore_or_replay_session(self, context_label: str = "Session context") -> str:
         if self.runtime is None:
             raise RuntimeError("Assistant runtime is not available for restore.")
@@ -8645,9 +8664,8 @@ class AssistantEngine:
         base_tokens = target_tokens[:-len(current_turn_suffix)]
         if not base_tokens or len(base_tokens) >= context_window_tokens:
             raise RuntimeError("Compacted Deepy system-and-summary context does not fit in the configured context window.")
-        base_mode = self._extend_context_from_preserved_base(base_tokens)
-        if base_mode is None:
-            self._run_prefill_call(len(base_tokens), lambda: self.runtime.prime_context(base_tokens))
+        if self._extend_context_from_preserved_base(base_tokens) is None:
+            self._prefill_from_new_header(base_tokens)
         compacted_base_snapshot = self.runtime.snapshot_context()
         if compacted_base_snapshot is None:
             raise RuntimeError("Compacted Deepy base context could not be snapshotted.")
@@ -9037,7 +9055,11 @@ class AssistantEngine:
             reason = f"Context window changed from {self.session.rendered_context_window_tokens:,} to {context_window_tokens:,} tokens" if context_changed else "Deepy instructions/settings changed"
             self._log(f"{reason}; rebuilding conversation checkpoints.")
             prior_messages_len = self.session.current_turn["messages_len"]
+            turn_start = self.session.messages[prior_messages_len]
             invalidate_assistant_reset_base(self.session)
+            # A smaller window may not hold the conversation.
+            if self._fit_rendered_messages_to_window(add_generation_prompt=True, reserve_tokens=self._resolved_compaction_reserve_tokens(generation_reserve_tokens, context_window_tokens))[1]:
+                prior_messages_len = next((index for index, message in enumerate(self.session.messages) if message is turn_start), 0)
             self._commit_rewritten_history(self.session.messages[:prior_messages_len], self.session.messages[prior_messages_len:], generation_reserve_tokens)
             return
         if self._maybe_summarize_context(generation_reserve_tokens):
@@ -9133,8 +9155,10 @@ class AssistantEngine:
                 return
             if mode is None:
                 mode = self._extend_context_from_preserved_base(target_tokens)
-            if mode is None:
+            if mode is None and not trimmed_any:
                 raise RuntimeError("Generation context could not be synchronized from a live, header, or turn-start snapshot.")
+            if mode is None:  # trimmed history no longer extends the KV and no header is left to go on from
+                mode = self._prefill_from_new_header(target_tokens)
             self.session.rendered_token_ids = list(target_tokens)
             self.session.pending_replay_reason = ""
             self._remember_render_state()
@@ -9241,19 +9265,7 @@ class AssistantEngine:
             target_tokens, _trimmed = self._fit_rendered_messages_to_window(add_generation_prompt=False)
             mode = self._extend_context_from_preserved_base(target_tokens)
             if mode is None:
-                base_tokens = self._render_system_prompt_tokens(add_generation_prompt=False)
-                if not base_tokens or target_tokens[: len(base_tokens)] != base_tokens:
-                    raise RuntimeError("Restored Deepy context does not extend its rendered system/tools prefix.")
-                self._run_prefill_call(len(base_tokens), lambda: runtime.prime_context(base_tokens))
-                base_snapshot = runtime.snapshot_context()
-                if base_snapshot is None:
-                    raise RuntimeError("Restored Deepy context could not snapshot its system/tools prefix.")
-                self.session.reset_base_token_ids = list(base_tokens)
-                self.session.reset_base_snapshot = base_snapshot
-                self.session.reset_base_signature = self._current_reset_base_signature()
-                self.session.reset_base_context_window_tokens = self._get_context_window_tokens()
-                suffix_tokens = target_tokens[len(base_tokens) :]
-                mode = self._run_prefill_call(len(suffix_tokens), lambda: runtime.extend_context(target_tokens), record_if=lambda result: result in ("prefilled", "chunk_prefilled"))
+                mode = self._prefill_from_new_header(target_tokens)
             self.session.rendered_token_ids = list(target_tokens)
             self.session.runtime_snapshot = None
             self.session.pending_replay_reason = ""
@@ -9539,7 +9551,7 @@ class AssistantEngine:
         if mode is None:
             mode = self._append_target_suffix_from_live_runtime(target_tokens)
         if mode is None:
-            raise RuntimeError("Interrupted-turn trimmed answer context could not be synchronized from the turn-start snapshot.")
+            mode = self._prefill_from_new_header(target_tokens)
         self.session.rendered_token_ids = list(target_tokens)
         self._remember_render_state()
         self.session.runtime_snapshot = None
