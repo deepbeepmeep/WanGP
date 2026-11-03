@@ -7448,6 +7448,26 @@ def _is_h3_family(base_model_type, model_def):
     return str((model_def or {}).get("architecture") or "") in _H3_BASE_TYPES
 
 
+# The Magi Human family's base types (the models.magi_human handler's
+# supported types): the catalog keeps the distill arch as its own
+# architecture (the handler's family maps fold it into the base only for
+# the model swap), so both arches are listed — the sr1080 sub-models carry
+# one of these arches too.
+_MAGI_HUMAN_BASE_TYPES = ("magi_human", "magi_human_distill")
+
+
+def _is_magi_human_family(base_model_type, model_def):
+    """Whether the latent's model family is Magi Human (the models.magi_human
+    handler: the Turbo VAED video VAE — 48 channels, the 4/1 latent layout,
+    16x spatial — and one 64-channel audio latent per pixel frame at
+    44.1 kHz; the set mirrors magi_human_handler.family_handler).
+    """
+    base_model_type = str(base_model_type or "")
+    if base_model_type in _MAGI_HUMAN_BASE_TYPES:
+        return True
+    return str((model_def or {}).get("architecture") or "") in _MAGI_HUMAN_BASE_TYPES
+
+
 def _is_wan_family(base_model_type, model_def):
     """Whether the latent's model family is Wan (the models.wan handlers:
     the Wan 2.1 / 2.2 video VAEs, the 4/1 latent layout; the set mirrors
@@ -7487,11 +7507,13 @@ def _is_longcat_family(base_model_type, model_def):
 
 def _is_all_latent_family(base_model_type, model_def):
     """Whether the model family writes the all-latent sidecar (LTX2, Wan,
-    LongCat and MiniMax H3: the sidecar is the sole content source)."""
+    LongCat, MiniMax H3 and Magi Human: the sidecar is the sole content
+    source)."""
     return (_is_ltx2_family(base_model_type, model_def)
             or _is_wan_family(base_model_type, model_def)
             or _is_longcat_family(base_model_type, model_def)
-            or _is_h3_family(base_model_type, model_def))
+            or _is_h3_family(base_model_type, model_def)
+            or _is_magi_human_family(base_model_type, model_def))
 
 
 # The *Misc.* tab's *Save Latents* choice (per generation): it overrides
@@ -7886,6 +7908,12 @@ _BRANCH_PREFIX_LAYOUTS = {
     "minimax_h3_ref2va_pruned": (0, 0, 16, 24),
     "minimax_h3_tts_ref2va_pruned": (0, 0, 16, 24),
     "viggle_animate": (0, 0, 16, 24),
+    # Magi Human Phase 3: the Turbo VAED divides time by 4 (4/1) and space
+    # by 16, with a 48-channel latent - the same linear layout the
+    # Wan 2.2 5B class uses (the VAE identity check on top keeps the
+    # checkpoints apart).
+    "magi_human": (4, 1, 16, 48),
+    "magi_human_distill": (4, 1, 16, 48),
 }
 
 
@@ -8046,6 +8074,28 @@ def _longcat_video_vae_identity(model_def, base_model_type):
                 vae_sha = latent_io.sha256_file(str(path))
             except Exception:
                 vae_sha = ""
+    return vae_file, vae_sha
+
+
+def _magi_video_vae_identity(model_def, base_model_type):
+    """The job's Magi Human video VAE identity: (relative path, sha256).
+
+    Mirrors models/magi_human/magi_human_model.py's selection: the Turbo
+    VAED checkpoint is fixed by the model (there is no model-definition
+    VAE override), and the sidecar records its relative path (the
+    ``turbo_vae/`` subfolder included), so this returns the same relative
+    path for the fit check's filename comparison. The sha is empty when
+    the checkpoint cannot be located (the fit check then falls back to
+    the filename comparison).
+    """
+    vae_file = "turbo_vae/TurboV3-Wan22-TinyShallow_7_7.safetensors"
+    vae_sha = ""
+    path = fl.locate_file(vae_file, error_if_none=False)
+    if path is not None and os.path.isfile(str(path)):
+        try:
+            vae_sha = latent_io.sha256_file(str(path))
+        except Exception:
+            vae_sha = ""
     return vae_file, vae_sha
 
 
@@ -8226,11 +8276,17 @@ def _prepare_branch_prefix(entry, branch_point, carried, *, base_model_type, vid
     # Phase 3 (MiniMax H3): the same time-ratio splice on the flat
     # [64, t] block, carried as {"batched": [1, 32, 2, N] frozen prefix,
     # "flat": [64, N] condition rows}.
+    # Phase 3 (Magi Human): the same time-ratio splice on the flat
+    # [64, t] block (one 64-channel latent per pixel frame), carried in
+    # the sidecar's flat layout for the model to freeze at the head of
+    # the head window's audio tensor.
     prefix_audio = None
     if str(base_model_type or "").startswith("ltx2") and audio_entry is not None:
         prefix_audio = latent_io.branch_audio_prefix_latents(audio_entry, entry, branch_point)
     elif is_h3 and audio_entry is not None:
         prefix_audio = latent_io.h3_branch_audio_prefix_latents(audio_entry, entry, branch_point)
+    elif _is_magi_human_family(base_model_type, model_def) and audio_entry is not None:
+        prefix_audio = latent_io.magi_branch_audio_prefix_latents(audio_entry, entry, branch_point)
     # The all-latent sidecar (LTX2 / Wan / LongCat / H3) carries two
     # head-side values in the prefix, each named for what it is.
     # ``containing_window_head_trim`` is the containing window's own
@@ -9377,6 +9433,162 @@ def _edit_latent_job_h3(send_cmd, state, video_source, client_id, plugin_data, s
 
 
 
+def _edit_latent_job_magi(send_cmd, state, video_source, client_id, plugin_data, sidecar_obj, entry, model_def, window_specs,
+                          api_return_video_uint8, api_return_audio, api_suppress_metadata_images):
+    """Decode a saved Magi Human latent back to pixels.
+
+    Magi Human uses a different VAE stack than the Wan family (the Turbo
+    VAED video VAE — 48 channels, the 4/1 latent layout, 16x spatial — and
+    one 64-channel SA audio latent per pixel frame at 44.1 kHz), so the
+    decode job takes a family-specific path: load only the two VAEs, decode
+    each window the way the model's own decode does and hand the result to
+    ``_save_ltx2_decoded_video``.
+    """
+    gen = get_gen_info(state)
+    if gen.get("abort", False):
+        return
+    from models.magi_human.magi_human_model import SAAudioFeatureExtractor, get_turbo_vaed, resample_audio_sinc
+    from models.minimax_h3.pipeline import _video_to_uint8_cpu
+
+    fps = float(entry.get("fps") or 0) or float(model_def.get("fps") or 25)
+    decode_device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    audio_entry = latent_io.audio_latent_payload(sidecar_obj)
+    audio_windows = latent_io.audio_window_specs(audio_entry) if audio_entry is not None else []
+    needs_audio = len(audio_windows) > 0
+    sample_rate = int((audio_entry or {}).get("sample_rate") or 44100)
+
+    # The VAE names recorded in the sidecar take precedence (they produced
+    # this latent); the family defaults fall back. The Turbo VAED loads its
+    # architecture from the config JSON that sits next to the checkpoint.
+    turbo_default = "turbo_vae/TurboV3-Wan22-TinyShallow_7_7.safetensors"
+    turbo_vae_file = str(entry.get("vae_file") or "") or turbo_default
+    turbo_vae_pth = fl.locate_file(turbo_vae_file, error_if_none=False)
+    if not turbo_vae_pth or not os.path.isfile(str(turbo_vae_pth)):
+        send_cmd("error", gr.Error(f"The video VAE checkpoint required to decode this latent could not be located: {os.path.basename(str(turbo_vae_file))}"))
+        return
+    turbo_vae_json = os.path.splitext(str(turbo_vae_pth))[0] + ".json"
+    if not os.path.isfile(turbo_vae_json):
+        # A custom checkpoint without its config next to it: the default
+        # config is the family's, the only one the loader knows.
+        default_pth = fl.locate_file(turbo_default, error_if_none=False)
+        turbo_vae_json = os.path.splitext(str(default_pth))[0] + ".json" if default_pth is not None else ""
+        if not turbo_vae_json or not os.path.isfile(turbo_vae_json):
+            send_cmd("error", gr.Error(f"The video VAE config required to decode this latent could not be located next to {os.path.basename(str(turbo_vae_file))}."))
+            return
+
+    # The sidecar's recorded dtype is the one the VAE ran with at
+    # generation; decode with the same dtype (the server config is the
+    # fallback for sidecars that do not record it).
+    vae_dtype = _DTYPE_MAP.get(str(entry.get("vae_dtype") or ""))
+    if vae_dtype is None:
+        vae_dtype = torch.float16 if str(server_config.get("vae_precision", "16")) == "16" else torch.float
+    stored_vae_hash = str(entry.get("vae_sha256") or "")
+    if len(stored_vae_hash) > 0 and latent_io.sha256_file(str(turbo_vae_pth)) != stored_vae_hash:
+        print("Latent decode identity warning: the video VAE checkpoint on disk differs from the one used at save time.")
+
+    try:
+        # Same construction as the model (the VAE loads on the CPU and the
+        # decode moves the latents to the accelerator, the way the
+        # generation does).
+        turbo_vae = get_turbo_vaed(turbo_vae_json, str(turbo_vae_pth), device="cpu", weight_dtype=vae_dtype)
+    except Exception as exc:
+        send_cmd("error", gr.Error(f"The video VAE required to decode this latent could not be loaded ({exc})."))
+        return
+
+    audio_vae = None
+    if needs_audio:
+        # The extractor loads the whole model folder; the sidecar records
+        # the checkpoint inside it, so the folder is its parent path.
+        audio_vae_file = str((audio_entry or {}).get("audio_vae_file") or "stable-audio-open-1.0/model.safetensors")
+        audio_folder = audio_vae_file.rsplit("/", 1)[0] if "/" in audio_vae_file else "stable-audio-open-1.0"
+        audio_model_path = fl.locate_folder(audio_folder, error_if_none=False)
+        if audio_model_path is None:
+            send_cmd("error", gr.Error(f"The audio VAE model required to decode this latent could not be located: {audio_folder}"))
+            return
+        stored_audio_hash = str((audio_entry or {}).get("audio_vae_sha256") or "")
+        if len(stored_audio_hash) > 0:
+            audio_vae_pth = fl.locate_file(audio_vae_file, error_if_none=False)
+            if audio_vae_pth is not None and os.path.isfile(str(audio_vae_pth)) and latent_io.sha256_file(str(audio_vae_pth)) != stored_audio_hash:
+                print("Latent decode identity warning: the audio VAE checkpoint on disk differs from the one used at save time.")
+        try:
+            audio_vae = SAAudioFeatureExtractor(device="cpu", model_path=audio_model_path)
+        except Exception as exc:
+            send_cmd("error", gr.Error(f"The audio VAE required to decode this latent could not be loaded ({exc})."))
+            return
+
+    turbo_dtype = next(turbo_vae.parameters()).dtype
+    audio_dtype = next(audio_vae.vae_model.parameters()).dtype if audio_vae is not None else None
+    window_frames_list = []
+    audio_waveform_chunks = []
+    try:
+        for idx, spec in enumerate(window_specs):
+            if gen.get("abort", False):
+                return
+            window_no = int(spec["window_no"])
+            latents = spec["latents"].to(device=decode_device, dtype=turbo_dtype)
+            if latents.dim() == 4:
+                # The sidecar stores the unbatched [c, t, h, w] layout; the
+                # decoder takes the batched layout the generation feeds it.
+                latents = latents.unsqueeze(0)
+            sample_h = int(latents.shape[-2]) * 16
+            sample_w = int(latents.shape[-1]) * 16
+            # Tile only when the window's decoded canvas exceeds the tile
+            # threshold (spatial tiling is a memory measure and its overlap
+            # blending shifts the pixels, so it is used only when needed —
+            # the same heuristic the generic decode path applies, scaled to
+            # the Turbo VAED's 16x spatial compression).
+            tile_size = 256 if (sample_h > 256 or sample_w > 256) else 0
+            output_offload = tile_size > 0 or sample_h * sample_w > 832 * 480
+            decoded = turbo_vae.decode(latents, output_offload=output_offload, tile_size=tile_size, temporal_chunk_size=0)
+            latents = None
+            if decoded is None or decoded.numel() == 0:
+                if gen.get("abort", False):
+                    return
+                raise ValueError(f"window {window_no} could not be decoded")
+            frames = decoded[0].float().clamp(-1, 1)  # [3, D, h, w]
+            decoded = None
+            # Re-apply the exact pixel trims of the original assembly so the
+            # decoded windows re-assemble into the original video unchanged.
+            head_trim = int(spec["head_trim"])
+            tail_trim = int(spec["tail_trim"])
+            if head_trim > 0 or tail_trim > 0:
+                frames = frames[:, head_trim:max(head_trim, frames.shape[1] - tail_trim)]
+            window_frames_list.append(_video_to_uint8_cpu(frames))
+            frames = None
+            # The audio latent is one 64-channel frame per pixel frame, so
+            # the window's decoded span needs no frame-to-sample fitting:
+            # the 51.2 kHz output resamples to the recorded rate with the
+            # per-frame proportion kept exact, like the generation decode.
+            if idx < len(audio_windows) and audio_vae is not None:
+                a_latent = audio_windows[idx]["latents"]
+                if a_latent.dim() == 3:
+                    a_latent = a_latent[0]
+                a_decoded = audio_vae.decode(a_latent.T.to(dtype=audio_dtype))  # [1, 2, samples] @ 51.2 kHz
+                a_latent = None
+                if a_decoded is None or a_decoded.numel() == 0:
+                    raise ValueError(f"window {window_no} audio could not be decoded")
+                a_waveform = a_decoded.float().squeeze(0).T.detach().cpu().numpy()  # [samples, 2]
+                a_waveform = resample_audio_sinc(a_waveform, sample_rate / 51200)
+                audio_waveform_chunks.append(torch.from_numpy(np.ascontiguousarray(a_waveform.T)).float())
+    except Exception as exc:
+        send_cmd("error", gr.Error(f"The saved latent could not be decoded: {exc}"))
+        return
+    finally:
+        turbo_vae.to("cpu")
+        if audio_vae is not None:
+            audio_vae.vae_model.to("cpu")
+        del turbo_vae
+        if audio_vae is not None:
+            del audio_vae
+    if len(window_frames_list) == 0:
+        send_cmd("error", gr.Error("The saved latent does not contain any decodable window."))
+        return
+    frames = torch.cat(window_frames_list, dim=1) if len(window_frames_list) > 1 else window_frames_list[0]
+    _save_ltx2_decoded_video(send_cmd, state, video_source, client_id, plugin_data, frames, audio_waveform_chunks, sample_rate, entry, audio_entry, fps, False,
+                             api_return_video_uint8, api_return_audio, api_suppress_metadata_images)
+
+
 def edit_latent_job(send_cmd, state, video_source, client_id="", plugin_data=None):
     """Decode a saved pre-decode latent (Media Flow 'Latent Decode') back to pixels.
 
@@ -9443,6 +9655,10 @@ def edit_latent_job(send_cmd, state, video_source, client_id="", plugin_data=Non
         return
     if _is_ltx2_family(str(entry.get("base_model_type") or ""), model_def):
         _edit_latent_job_ltx2(send_cmd, state, video_source, client_id, plugin_data, sidecar_obj, entry, model_def, window_specs,
+                              api_return_video_uint8, api_return_audio, api_suppress_metadata_images)
+        return
+    if _is_magi_human_family(str(entry.get("base_model_type") or ""), model_def):
+        _edit_latent_job_magi(send_cmd, state, video_source, client_id, plugin_data, sidecar_obj, entry, model_def, window_specs,
                               api_return_video_uint8, api_return_audio, api_suppress_metadata_images)
         return
 
@@ -10192,6 +10408,8 @@ def generate_media(
                 _branch_vae_file, _branch_vae_sha = _longcat_video_vae_identity(_job_model_def, base_model_type)
             elif _is_h3_family(base_model_type, model_def):
                 _branch_vae_file, _branch_vae_sha = _h3_video_vae_identity(_job_model_def, base_model_type, vae_upsampling=new_model_vae_upsampling)
+            elif _is_magi_human_family(base_model_type, model_def):
+                _branch_vae_file, _branch_vae_sha = _magi_video_vae_identity(_job_model_def, base_model_type)
             # Step 2: the kept region is a fresh decode of the source
             # sidecar's kept windows, whenever the job's VAE can decode
             # them on the job's canvas (the fit check's VAE-identity and
@@ -12319,10 +12537,21 @@ def generate_media(
                         # are not in scope in this block (the post-processing paths
                         # rewrite them), so derive the canvas from the latent grid the
                         # entry carries and the family's spatial factor (8 for the
-                        # Wan-VAE families, 16 for the 5B Wan 2.2 VAE and MiniMax H3,
-                        # 32 for LTX2 — the _BRANCH_PREFIX_LAYOUTS table).
+                        # Wan-VAE families, 16 for the 5B Wan 2.2 VAE, MiniMax H3 and
+                        # Magi Human, 32 for LTX2 — the _BRANCH_PREFIX_LAYOUTS table,
+                        # with the factor the family predicate knows for the families
+                        # not in the table yet).
                         _latent_layout = _BRANCH_PREFIX_LAYOUTS.get(str(base_model_type or ""))
-                        _latent_canvas_factor = int(_latent_layout[2] if _latent_layout else 0)
+                        if _latent_layout is not None:
+                            _latent_canvas_factor = int(_latent_layout[2])
+                        elif _is_magi_human_family(str(base_model_type or ""), model_def):
+                            # The Turbo VAED's spatial compression (Magi is not
+                            # in the prefix table yet — the branch's frozen prefix
+                            # is not supported — but the canvas factor is known,
+                            # so the sidecar records the true canvas).
+                            _latent_canvas_factor = 16
+                        else:
+                            _latent_canvas_factor = 0
                         _latent_shape = [int(u) for u in (latent_entry.get("shape") or [])]
                         if len(_latent_shape) < 4:
                             _latent_shape = list(latent_io.payload_latents(latent_entry).shape)

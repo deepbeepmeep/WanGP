@@ -928,7 +928,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                     self.save_latents_choice = gr.Checkbox(
                         value=self.server_config.get("save_latents", False),
                         label="Save Latents",
-                        info="Writes the companion *_latent.pt file next to each generated video (the model's final pre-decode latent, one latent block per window for sliding-window jobs). Applies to the LTX2 / Wan / LongCat / MiniMax H3 families only. Used by the Media Flow 'Latent Decode' process and required for the 'From WanGP latent file' option.",
+                        info="Writes the companion *_latent.pt file next to each generated video (the model's final pre-decode latent, one latent block per window for sliding-window jobs). Applies to the LTX2 / Wan / LongCat / MiniMax H3 / Magi Human families only. Used by the Media Flow 'Latent Decode' process and required for the 'From WanGP latent file' option.",
                         interactive=True,
                     )
                     self.workspace_storage_choice = gr.Radio(choices=[('Shared Output Folders', 'shared'), ('Dedicated Folder per Workspace', 'dedicated')], value=self.server_config.get('workspace_storage_mode', 'shared'), label='Default Storage for New Workspaces', info='Existing workspaces keep their storage mode. Convert them in the workspace manager. Dedicated workspaces use the Workspaces Root instead of the shared output folders below.')

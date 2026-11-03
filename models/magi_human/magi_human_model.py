@@ -19,6 +19,7 @@ from transformers.models.t5gemma import T5GemmaEncoderModel
 from shared.utils import files_locator as fl
 from shared.utils.loras_mutipliers import update_loras_slists
 from shared.utils.text_encoder_cache import TextEncoderCache
+from shared.utils import latent_io
 from shared.utils.utils import calculate_new_dimensions
 from models.wan.modules.vae2_2 import Wan2_2_VAE
 
@@ -233,10 +234,12 @@ class MagiHumanModel:
 
         self.vae = Wan2_2_VAE(vae_pth=fl.locate_file("Wan2.2_VAE.safetensors"), dtype=VAE_dtype, device="cpu")
         self.vae.device = self.device
+        self.audio_vae_file = "stable-audio-open-1.0/model.safetensors"
         self.audio_vae = SAAudioFeatureExtractor(device="cpu", model_path=fl.locate_folder("stable-audio-open-1.0"))
+        self.turbo_vae_file = "turbo_vae/TurboV3-Wan22-TinyShallow_7_7.safetensors"
         self.turbo_vae = get_turbo_vaed(
             fl.locate_file("turbo_vae/TurboV3-Wan22-TinyShallow_7_7.json"),
-            fl.locate_file("turbo_vae/TurboV3-Wan22-TinyShallow_7_7.safetensors"),
+            fl.locate_file(self.turbo_vae_file),
             device="cpu",
             weight_dtype=VAE_dtype,
         )
@@ -473,6 +476,96 @@ class MagiHumanModel:
         audio_output = audio_output.float().squeeze(0).T.detach().cpu().numpy()
         return resample_audio_sinc(audio_output, 441 / 512)
 
+    def _vae_file_identity(self, relative_path: str):
+        """(relative path, sha256) for a model file: the recorded relative
+        path locates the checkpoint again (``locate_file`` accepts it), and
+        the empty sha degrades the identity checks to the filename
+        comparison when the file cannot be located."""
+        sha = ""
+        path = fl.locate_file(relative_path, error_if_none=False)
+        if path is not None and os.path.isfile(str(path)):
+            try:
+                sha = latent_io.sha256_file(str(path))
+            except Exception:
+                sha = ""
+        return relative_path, sha
+
+    def _build_latent_file_obj(self, video, audio, *, frame_num, fps, seed, prompt,
+                               sampling_steps, denoising_strength, window_no,
+                               window_start_frame_no, app_version, model_type,
+                               model_filename, loras, audio_samples):
+        """The companion latent payload ('Save Latents'): this window's final
+        pre-decode video latent ``[48, t, h, w]`` and audio latent
+        ``[64, t]`` (one 64-channel audio latent per pixel frame), tagged
+        with the VAE identities the decode and branch flows compare. The
+        window's sample span is recorded from the decoded waveform's actual
+        length (the 51.2 kHz -> 44.1 kHz resample keeps the per-frame
+        proportion exact), and its start is the window's first output frame
+        mapped onto that span.
+        """
+        video_latent = video.detach().to(dtype=torch.float32, device="cpu")
+        if video_latent.dim() == 5:
+            video_latent = video_latent[0]
+        audio_latent = audio.detach().to(dtype=torch.float32, device="cpu")
+        if audio_latent.dim() == 3:
+            audio_latent = audio_latent[0]
+        audio_flat = audio_latent.T.contiguous()  # [t, 64] -> [64, t]
+        lora_names = [os.path.basename(str(lora)) for lora in (loras or []) if str(lora).strip()]
+        video_vae_file, video_vae_sha = self._vae_file_identity(self.turbo_vae_file)
+        audio_vae_file, audio_vae_sha = self._vae_file_identity(self.audio_vae_file)
+        turbo_dtype = str(next(self.turbo_vae.parameters()).dtype).replace("torch.", "")
+        audio_dtype = str(next(self.audio_vae.vae_model.parameters()).dtype).replace("torch.", "")
+        samples = int(audio_samples)
+        start_sample = int(round(int(window_start_frame_no) / max(int(frame_num), 1) * samples))
+        video_payload = latent_io.build_latent_payload(
+            video_latent,
+            app_version=str(app_version or ""),
+            model_type=str(model_type or ""),
+            base_model_type=str(self.base_model_type or ""),
+            model_filename=str(model_filename or ""),
+            loras=lora_names,
+            vae_file=str(video_vae_file),
+            vae_sha256=str(video_vae_sha),
+            vae_z_dim=int(self.latent_channels),
+            vae_dtype=turbo_dtype,
+            frames=int(frame_num),
+            fps=float(fps),
+            seed=int(seed),
+            prompt=str(prompt)[:1000],
+            denoising_strength=float(denoising_strength),
+            steps=int(sampling_steps),
+            latent_stride=int(self.vae_stride[0]),
+            frame_offset=1,
+        )
+        audio_payload = latent_io.build_audio_latent_payload(
+            audio_flat,
+            [{
+                "window_no": int(window_no or 1),
+                "start_sample": start_sample,
+                "samples": samples,
+            }],
+            app_version=str(app_version or ""),
+            model_type=str(model_type or ""),
+            base_model_type=str(self.base_model_type or ""),
+            model_filename=str(model_filename or ""),
+            loras=lora_names,
+            audio_vae_file=str(audio_vae_file),
+            audio_vae_sha256=str(audio_vae_sha),
+            audio_vae_dtype=audio_dtype,
+            sample_rate=44100,
+            channels=2,
+            samples=samples,
+            seed=int(seed),
+            prompt=str(prompt)[:1000],
+            denoising_strength=float(denoising_strength),
+            steps=int(sampling_steps),
+            total_windows=1,
+        )
+        payload = dict(video_payload)
+        payload.update(audio_payload)
+        print(f"[WanGP][Magi] Latent companion payload built (video {tuple(video_latent.shape)}, audio {tuple(audio_flat.shape)}).")
+        return payload
+
     def _prepare_proxy_input(self, eval_input: _EvalInput, data_proxy: MagiDataProxy):
         packed = data_proxy.process_input(eval_input)
         return packed, dict(data_proxy._saved_data)
@@ -509,6 +602,8 @@ class MagiHumanModel:
         update_audio=True,
         use_sr_model=False,
         sr_cfg_scale=None,
+        frozen_video_prefix=None,
+        frozen_audio_prefix=None,
     ):
         video_scheduler = FlowUniPCMultistepScheduler()
         audio_scheduler = FlowUniPCMultistepScheduler()
@@ -532,7 +627,15 @@ class MagiHumanModel:
         for step_idx, t in enumerate(progress_bar):
             if self._interrupt:
                 return None, None
-            latent_video[:, :, :1] = image_latent[:, :, :1]
+            if frozen_video_prefix is not None:
+                # The branch's kept latents stay verbatim for the whole
+                # run (the frame-0 image freeze is replaced: the prefix
+                # owns the tensor head).
+                latent_video[:, :, : int(frozen_video_prefix.shape[2])] = frozen_video_prefix
+            else:
+                latent_video[:, :, :1] = image_latent[:, :, :1]
+            if frozen_audio_prefix is not None:
+                latent_audio[:, : int(frozen_audio_prefix.shape[1])] = frozen_audio_prefix
             eval_input = _EvalInput(
                 x_t=latent_video,
                 audio_x_t=latent_audio,
@@ -583,7 +686,12 @@ class MagiHumanModel:
                     latent_audio = audio_scheduler.step_ddim(pred_audio, step_idx, latent_audio)
             if callback is not None:
                 callback(step_idx, latent_video[0].detach(), pass_no=pass_no)
-        latent_video[:, :, :1] = image_latent[:, :, :1]
+        if frozen_video_prefix is not None:
+            latent_video[:, :, : int(frozen_video_prefix.shape[2])] = frozen_video_prefix
+        else:
+            latent_video[:, :, :1] = image_latent[:, :, :1]
+        if frozen_audio_prefix is not None:
+            latent_audio[:, : int(frozen_audio_prefix.shape[1])] = frozen_audio_prefix
         return latent_video, latent_audio
 
     @torch.inference_mode()
@@ -636,6 +744,18 @@ class MagiHumanModel:
         set_header_text=None,
         loras_slists=None,
         set_progress_status=None,
+        loras_selected=None,
+        save_latents=False,
+        app_version="",
+        latent_model_type="",
+        model_filename="",
+        window_no=1,
+        window_start_frame_no=0,
+        prefix_latents=None,
+        prefix_audio_latents=None,
+        prefix_kept_windows=None,
+        prefix_kept_frames=0,
+        prefix_is_i2v=False,
         **kwargs,
     ):
         self._interrupt = False
@@ -665,7 +785,14 @@ class MagiHumanModel:
             uncond_prompt_embeds, uncond_prompt_lens = self._get_uncond_prompt(n_prompt)
         else:
             uncond_prompt_embeds, uncond_prompt_lens = None, None
-        image_batch = input_video[:, -1].unsqueeze(0)
+        if input_video is None:
+            # A branch job without a companion video (the kept region
+            # comes from the sidecar, not from source pixels): the start
+            # frame is a placeholder - the frozen branch prefix overwrites
+            # the frame-0 freeze at every step when it is accepted.
+            image_batch = torch.full((1, 1, 3, int(height), int(width)), -1.0, device=self.device, dtype=torch.float32)
+        else:
+            image_batch = input_video[:, -1].unsqueeze(0)
         # image_batch = self._coerce_last_video_frame_batch(input_video, batch_size)
         # if image_batch is None:
         #     image_batch = self._coerce_last_video_frame_batch(prefix_video, batch_size)
@@ -691,7 +818,44 @@ class MagiHumanModel:
             device=self.device,
             dtype=torch.float32,
         )
-        latent_video[:, :, :1] = image_latent[:, :, :1]
+        # Latent branch (Phase 3): the kept latents of the sidecar's
+        # containing window, spliced verbatim at the tensor head instead
+        # of a fresh encode. The denoise loop re-freezes them at every
+        # step (the same way it re-freezes the frame-0 image latent),
+        # which keeps the kept portion bit-identical for the whole run;
+        # only the latents after the prefix get stepped. The SR model
+        # resolves the kept latents at its own (finer) grid, so the phase
+        # 1 freeze uses a spatially resolved-down copy there.
+        branch_video_prefix = None
+        branch_prefix_full_grid = None
+        if torch.is_tensor(prefix_latents):
+            if prefix_latents.dim() == 4:
+                prefix_latents = prefix_latents.unsqueeze(0)
+            if prefix_latents.dim() == 5:
+                branch_video_prefix = prefix_latents.to(device=self.device, dtype=torch.float32)
+        if branch_video_prefix is not None and (
+                int(branch_video_prefix.shape[2]) < 1
+                or int(branch_video_prefix.shape[2]) > latent_frames
+                or int(branch_video_prefix.shape[1]) != self.latent_channels):
+            print(
+                f"Latent branch: the prefix shape {tuple(branch_video_prefix.shape)} of the source latent file does not match the latent shape of this window "
+                f"({self.latent_channels}, {latent_frames}, {latent_h}, {latent_w}); the head window uses a fresh encode."
+            )
+            branch_video_prefix = None
+        if branch_video_prefix is not None and (
+                int(branch_video_prefix.shape[3]) != latent_h or int(branch_video_prefix.shape[4]) != latent_w):
+            # The sidecar's grid differs from this window's phase grid
+            # (the SR model saves at its full grid): resolve the prefix to
+            # the phase grid for the phase-1 conditioning (the SR pass
+            # re-freezes the original full-grid prefix, kept as-is).
+            branch_prefix_full_grid = branch_video_prefix
+            branch_video_prefix = F.interpolate(
+                branch_video_prefix, size=(int(branch_video_prefix.shape[2]), latent_h, latent_w),
+                mode="trilinear", align_corners=True)
+        if branch_video_prefix is not None:
+            latent_video[:, :, : int(branch_video_prefix.shape[2])] = branch_video_prefix
+        else:
+            latent_video[:, :, :1] = image_latent[:, :, :1]
 
         use_audio_guide = bool("A" in (audio_prompt_type or "") and (input_waveform is not None or audio_guide))
         if "A" in (audio_prompt_type or "") and input_waveform is not None:
@@ -700,6 +864,21 @@ class MagiHumanModel:
             latent_audio = self._load_audio_latent(audio_guide, frame_num, fps)
         else:
             latent_audio = torch.randn((batch_size, frame_num, self.audio_channels), generator=generator, device=self.device, dtype=torch.float32)
+        # The branch's kept audio (the sidecar's flat [64, t] prefix as
+        # the model's [1, t, 64] state), frozen at the head of the audio
+        # tensor the same way the video prefix is frozen.
+        branch_audio_prefix = None
+        if torch.is_tensor(prefix_audio_latents) and prefix_audio_latents.dim() == 2 \
+                and int(prefix_audio_latents.shape[0]) == self.audio_channels:
+            branch_audio_prefix = prefix_audio_latents.to(device=self.device, dtype=torch.float32).T.unsqueeze(0)
+        if branch_audio_prefix is not None and (
+                int(branch_audio_prefix.shape[1]) < 1 or int(branch_audio_prefix.shape[1]) > frame_num):
+            print(
+                f"Latent branch: the audio prefix spans {int(branch_audio_prefix.shape[1])} samples of a {frame_num}-frame window; the head window's audio uses a fresh encode."
+            )
+            branch_audio_prefix = None
+        if branch_audio_prefix is not None:
+            latent_audio[:, : int(branch_audio_prefix.shape[1])] = branch_audio_prefix
 
         if loras_slists is not None:
             update_loras_slists(self.transformer, loras_slists, int(sampling_steps), phase_switch_step=int(sampling_steps), phase_switch_step2=int(sampling_steps))
@@ -724,6 +903,8 @@ class MagiHumanModel:
             uncond_prompt_lens=uncond_prompt_lens,
             update_audio=True,
             use_sr_model=False,
+            frozen_video_prefix=branch_video_prefix,
+            frozen_audio_prefix=branch_audio_prefix,
         )
         if latent_video is None or latent_audio is None:
             return None
@@ -744,6 +925,15 @@ class MagiHumanModel:
                 sigma = self._sr_sigmas.to(sr_video_latent.device)[self.sr_noise_value]
                 sr_video_latent = sr_video_latent * sigma + torch.randn_like(sr_video_latent) * (1 - sigma**2).sqrt()
             sr_audio_latent = torch.randn_like(latent_audio) * self.sr_audio_noise_scale + latent_audio * (1 - self.sr_audio_noise_scale)
+            # The branch prefix survives the SR pass the way the frame-0
+            # image does: the pass re-freezes it from its clean form at
+            # the SR grid (the noise added at the pass start is wiped by
+            # the first re-freeze), so the saved latent keeps the kept
+            # latents' content at the SR grid. The audio prefix keeps its
+            # phase-1 form (the SR audio refine is a light noise-and-denoise
+            # of the same content).
+            sr_video_prefix = branch_prefix_full_grid if branch_prefix_full_grid is not None else branch_video_prefix
+            sr_audio_prefix = branch_audio_prefix
             if loras_slists is not None:
                 update_loras_slists(self.transformer2, loras_slists, self.sr_num_inference_steps, phase_switch_step=0, phase_switch_step2=self.sr_num_inference_steps)
             final_video_latent, _ = self._run_diffusion_phase(
@@ -767,10 +957,47 @@ class MagiHumanModel:
                 uncond_prompt_lens=uncond_prompt_lens,
                 update_audio=False,
                 use_sr_model=True,
+                frozen_video_prefix=sr_video_prefix,
+                frozen_audio_prefix=sr_audio_prefix,
             )
             if final_video_latent is None:
                 return None
 
         video = self._decode_video(final_video_latent, final_tile_size)
         audio = self._decode_audio(final_audio_latent[:1])
-        return {"x": video, "audio": audio, "audio_sampling_rate": 44100}
+        result = {"x": video, "audio": audio, "audio_sampling_rate": 44100}
+        # Latent branch (Phase 3, step 2): the kept region as a fresh
+        # decode of the source sidecar's kept windows (the same
+        # reconstruction the Latent Decode job performs: the per-window
+        # recorded trims, the family's grid), handed back as
+        # decoded_prefix so the job uses it as the output video's prefix
+        # instead of a re-extraction of the source video (source
+        # independence). Best effort: any failure keeps the source-pixel
+        # prefix the job extracted before the model call.
+        if prefix_kept_windows is not None and int(prefix_kept_frames or 0) > 0:
+            def _decode_kept_window(spec):
+                _lat = spec["latents"]
+                if _lat.dim() == 4:
+                    _lat = _lat.unsqueeze(0)
+                return self._decode_video(_lat.to(self.device), final_tile_size)
+            try:
+                decoded_prefix = latent_io.decode_kept_windows(
+                    _decode_kept_window, prefix_kept_windows, int(prefix_kept_frames),
+                    is_i2v=bool(prefix_is_i2v))
+                result["decoded_prefix"] = decoded_prefix
+            except Exception as exc:
+                print(f"Latent branch: the kept region could not be decoded ({exc}); the output keeps the source-pixel prefix.")
+        if bool(save_latents):
+            try:
+                result["latent_file_obj"] = self._build_latent_file_obj(
+                    final_video_latent, final_audio_latent,
+                    frame_num=frame_num, fps=fps, seed=int(seed),
+                    prompt=prompt, sampling_steps=int(sampling_steps),
+                    denoising_strength=float(denoising_strength),
+                    window_no=int(window_no or 1), window_start_frame_no=int(window_start_frame_no or 0),
+                    app_version=str(app_version or ""), model_type=str(latent_model_type or self.model_type),
+                    model_filename=str(model_filename or ""), loras=loras_selected,
+                    audio_samples=int(audio.shape[0]))
+            except Exception as exc:
+                print(f"Latent save: the Magi Human companion latent could not be built ({exc}); the latent file is not written.")
+        return result
