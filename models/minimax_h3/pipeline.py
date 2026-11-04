@@ -26,6 +26,7 @@ from .dialogue import H3_DIALOGUE_GENERATION, generate_dialogue, is_dialogue_pro
 from .excerpts import H3_AUDIO_EXCERPTS_SETTING, H3_VIDEO_EXCERPTS_SETTING, parse_excerpts, reference_video_frame_limit
 from .first_block_cache import MiniMaxH3FirstBlockCache
 from .interrupt import GenerationInterrupted
+from .p_h3_image import P_H3_IMAGE_SIGMAS, reference_size, size_at_area
 from .pdd import pdd_sampling_plans, pdd_sampling_plans_for_sigmas
 from .pika import PIKA_SOLVER, PIKA_STEPS, PIKA_VIDEO_SHIFT, noise as pika_noise, renoise_ as pika_renoise_, sigma_schedule as pika_sigma_schedule
 from .spectrum import MiniMaxH3Spectrum
@@ -373,7 +374,8 @@ def _pil_to_video(image):
 class MiniMaxH3Pipeline:
     refinement_api = "masked_video_sigma_v1"
 
-    def __init__(self, transformer, text_encoder, video_vae, audio_vae, latent_upscaler=None, reference_mode=False, audio_only=False, dtype=torch.bfloat16, fixed_prompt=None):
+    def __init__(self, transformer, text_encoder, video_vae, audio_vae, latent_upscaler=None, reference_mode=False, audio_only=False, dtype=torch.bfloat16, fixed_prompt=None, image_model=False):
+        self.image_model = bool(image_model)
         self.transformer = transformer
         self.text_encoder = text_encoder
         self.fixed_prompt = fixed_prompt
@@ -483,7 +485,8 @@ class MiniMaxH3Pipeline:
         if self.text_encoder is not None:
             self.text_encoder._interrupt = self._interrupt
         self.vae._interrupt = self._interrupt
-        self.audio_vae._interrupt = self._interrupt
+        if self.audio_vae is not None:
+            self.audio_vae._interrupt = self._interrupt
         if self.latent_upscaler is not None:
             self.latent_upscaler._interrupt = self._interrupt
         if self.dialogue_whisper is not None:
@@ -512,6 +515,8 @@ class MiniMaxH3Pipeline:
     def _encode_prompt(self, prompt, presentation):
         if self.fixed_prompt is not None:
             return self.fixed_prompt.prompt_embeds.to(device=self.device, dtype=self.dtype), self.fixed_prompt.text_token_tags
+        if self.image_model and presentation and not prompt.lstrip().startswith(("Edit <Picture 1>.", "subject_definitions:")):
+            prompt = f"Edit <Picture 1>. {prompt}"  # the edit form the image model was trained on
 
         def encode_fn(prompts):
             return [self.text_encoder.encode(prompts[0], presentation, self.device, self.dtype)]
@@ -615,9 +620,12 @@ class MiniMaxH3Pipeline:
         if image is None:
             return None
         image = _to_pil(image)
-        ratio = image.width / image.height
-        pixel_budget = target_width * target_height * image_refs_relative_size / 100
-        target_h, target_w = _resolve_canvas(*image.size, math.sqrt(pixel_budget / max(ratio, 1 / ratio)))
+        if self.image_model:
+            target_w, target_h = reference_size(*image.size)
+        else:
+            ratio = image.width / image.height
+            pixel_budget = target_width * target_height * image_refs_relative_size / 100
+            target_h, target_w = _resolve_canvas(*image.size, math.sqrt(pixel_budget / max(ratio, 1 / ratio)))
         if image.size != (target_w, target_h):
             image = image.resize((target_w, target_h), Image.Resampling.LANCZOS)
         return _pil_to_video(image)
@@ -628,6 +636,10 @@ class MiniMaxH3Pipeline:
             return
         latent = self._encode_video(video)
         if self.fixed_prompt is None:
+            if self.image_model:  # the text encoder sees about one megapixel of the image as supplied
+                source = _to_pil(image)
+                vision_size = size_at_area(*source.size)
+                video = _pil_to_video(source if source.size == vision_size else source.resize(vision_size, Image.Resampling.LANCZOS))
             presentation.append({"type": "image", "frames": _qwen_frames(video.clone())})
         visual_latents.append(latent)
         refs.append({"kind": "image", "latent_h": latent.shape[-2], "latent_w": latent.shape[-1]})
@@ -793,7 +805,7 @@ class MiniMaxH3Pipeline:
                 loras_slists=loras_slists, loras_selected=loras_selected, custom_settings=custom_settings,
                 set_progress_status=set_progress_status, verbose_level=verbose_level)
         self._use_shared_components()
-        phase_1_sigmas = custom_sigmas[0] if custom_sigmas else None
+        phase_1_sigmas = custom_sigmas[0] if custom_sigmas else P_H3_IMAGE_SIGMAS if self.image_model else None
         phase_2_sigmas = custom_sigmas[1] if custom_sigmas and len(custom_sigmas) > 1 else None
         if phase_1_sigmas is not None:
             sampling_steps = len(phase_1_sigmas)
@@ -1226,7 +1238,7 @@ class MiniMaxH3Pipeline:
             sigmas_video, sigmas_audio = pika_sigma_schedule(self.device)
         if phase_1_sigmas is not None:
             sigmas_video = torch.tensor([*phase_1_sigmas, 0.0], dtype=torch.float32, device=self.device)
-            sigmas_audio = _map_shifted_sigma(sigmas_video, float(shift), 3.0)
+            sigmas_audio = sigmas_video.clone() if self.image_model else _map_shifted_sigma(sigmas_video, float(shift), 3.0)  # the two audio latents of an image model share its grid
             video[:, :, target_video_condition_frames:].mul_(sigmas_video[0])
             audio[..., target_audio_condition_latents:].mul_(sigmas_audio[0])
         if sigmas_video.shape != sigmas_audio.shape:

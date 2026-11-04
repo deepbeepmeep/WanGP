@@ -177,6 +177,7 @@ dialog button { width: 100%; padding: 12px; background: #0c5376; color: white; b
 #media-viewer .mesh-viewer-fallback { width: 100%; height: 100%; }
 #media-viewer .mesh-viewer-actions { position: absolute; top: max(12px, env(safe-area-inset-top)); left: max(12px, env(safe-area-inset-left)); }
 #media-viewer .mesh-viewer-actions button { display: grid; place-items: center; width: 44px; height: 44px; padding: 10px; background: #183749; }
+#media-viewer .mesh-viewer-actions button[aria-pressed="true"] { background: #2f7da8; }
 #media-viewer .mesh-viewer-actions svg { width: 24px; height: 24px; fill: none; stroke: currentColor; stroke-width: 1.6; }
 #media-viewer #close-media-viewer, #media-viewer .wangp-image-zoom-controls button { display: flex; align-items: center; justify-content: center; width: 44px; height: 44px; padding: 9px; border: 1px solid #fff5; border-radius: 10px; background: #183749; color: white; }
 #media-viewer #close-media-viewer { position: absolute; z-index: 1; top: max(12px, env(safe-area-inset-top)); right: max(12px, env(safe-area-inset-right)); }

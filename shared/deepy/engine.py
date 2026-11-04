@@ -628,7 +628,7 @@ class AssistantSessionState:
     reset_to_base_callback: Callable[[], bool] | None = None
     prime_toolbox: Any | None = None
     remote_backends: dict[str, Any] = field(default_factory=dict)
-    remote_history_pending: set[str] = field(default_factory=set)
+    remote_history_seen: dict[str, int] = field(default_factory=dict)  # per remote engine, how many messages its provider conversation holds
 
     def __post_init__(self) -> None:
         self.pause_resume_event.set()
@@ -672,7 +672,7 @@ def clear_assistant_session(session: AssistantSessionState) -> None:
         if callable(close_backend):
             close_backend()
     session.remote_backends.clear()
-    session.remote_history_pending.clear()
+    session.remote_history_seen.clear()
     if session.file_list_pages is not None:
         session.file_list_pages.close()
         session.file_list_pages = None

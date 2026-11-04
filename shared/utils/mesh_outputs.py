@@ -9,6 +9,7 @@ The preview is the 3D gallery thumbnail and the image shown where a 3D asset can
 """
 import json
 import os
+from functools import lru_cache
 from pathlib import Path
 
 from shared.utils.media_imports import persist_gallery_import
@@ -45,6 +46,39 @@ def asset_summary(path):
     if animation and animation["frames"]:
         summary.update(frame_count=animation["frames"], fps=round(animation["fps"], 3) if animation["fps"] else None, duration_seconds=round(animation["duration"], 3))
     return summary
+
+
+def first_camera(path):
+    """Camera-to-world matrix (row-major 4x4, in the asset's axes) of the first view of a reconstructed scene, from the `_cameras.json`
+    saved beside it (a list of views, or a record holding them in "cameras"); None for an asset without one."""
+    cameras = Path(path).with_name(f"{Path(path).stem}_cameras.json")
+    if not cameras.is_file():
+        return None
+    views = json.loads(cameras.read_text(encoding="utf-8"))
+    return (views if isinstance(views, list) else views["cameras"])[0]["camera_to_world"]
+
+
+def splat_viewer_options(path):
+    """How the splat viewer opens a file (read once per version of the file): "navigation", the "mesh_navigation" of the model that made
+    it ("walk" for a scene to move through) or "orbit" for a model that declares none and for a file from elsewhere; "walk_start", the
+    first camera as JSON when it has one; "level", true for a file from elsewhere, whose axes nothing vouches for."""
+    version = os.stat(path).st_mtime_ns if os.path.isfile(path) else None
+    return _splat_viewer_options(str(path), version)
+
+
+@lru_cache(maxsize=256)
+def _splat_viewer_options(path, version):
+    from shared.extra_settings import model_def_of_settings
+    model_def = model_def_of_settings(read_mesh_metadata(path)) if version is not None else None
+    camera = first_camera(path)
+    return {"navigation": (model_def or {}).get("mesh_navigation", "orbit"), "walk_start": json.dumps(camera) if camera else None, "level": model_def is None and version is not None}
+
+
+def splat_viewer_attributes(path):
+    """The options of splat_viewer_options as the attributes of a viewer element."""
+    options = splat_viewer_options(path)
+    start = f' data-walk-start="{options["walk_start"]}"' if options["walk_start"] else ""
+    return f' data-navigation="{options["navigation"]}"{start}' + (' data-level="free"' if options["level"] else "")
 
 
 def animation_time(path, frame_no):

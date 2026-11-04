@@ -84,14 +84,16 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 ## 🔥 Latest Updates : 
 
 
-## 2nd of November 2026: WanGP v19.12 - The Show must Go On
+## 2nd of November 2026: WanGP v19.13 - The Show must Go On
 
-## Showrunner 0.2.0
+## Showrunner 0.2.1
   - **Places that stay the same**: a kitchen or a cockpit no longer changes from shot to shot. The showrunner makes a picture of each recurring place and shoots in it, or uses your own photo.
   - **Fix what is wrong, keep the rest**: pause on a problem or pick shots, say what should change or press **+** to insert a shot. Only that changes; compare with the previous version and go back in one click. Bigger changes (a new actor, a new song) stay one sentence away in the chat.
   - **Voices and songs that hold together**: each voice is checked against its cast card and each line against its voice, so a man does not sound like a woman and a voice does not change between lines. Lines that are not really sung are found before any shot depends on them, subtitles follow the singing, and a shot inserted in a music video keeps every later shot in sync with the song.
   - **Deep Review**: one click measures a finished version against its script (words, subtitles, voices, lips, sound and picture), then the showrunner looks at every shot. Each finding says where and what, and goes to the fix window in one click.
   - **Faster and clearer at every step**: a new request on the production you just worked on starts in seconds, the panel says what the showrunner is doing right now, silent shots play their whole video, and comparing versions has a bar to jump to any moment. Turn on **Show the Deepy tab** in **Settings** to follow Deepy's thoughts and every step.
+  - **Let the video model speak**: set **Voices** to **From the video model** in the Brief, or just ask the showrunner, and MiniMax H3 says the lines itself with its own sound, with nothing recorded first and no speech model needed. **Even voices** on the Timeline brings every shot to one level in the export. A voice can change from shot to shot and a take can change or add words, so listen to each one: this suits short pieces best.
+  - **Long takes and shots by hand**: give the Brief a **Shot length** range, such as 8 to 15 seconds, to leave the usual 5-second shots behind. **Render now** makes a shot from what you wrote, with no language model and no showrunner, so you can build a whole production by hand, even without Deepy Prime.
 
 ## 3D
 
@@ -99,6 +101,19 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 - **Pixal3D Multi-View Shape** builds a mesh from front, right, back and left views. Upload four images in that order or one horizontal turnaround sheet.
 - **Pixal3D Native Texture** paints PBR materials on a new or existing mesh from one image or four views. Both models are available in BF16 and INT8 ConvRot.
 - **Speridlabs Idol** brings new weights to TripoSplat. Turn a single photo or render of an object into a 3D Gaussian splat you can rotate in the gallery or export as a PLY. Select **Create → TripoSplat Image to Gaussian Splats → Speridlabs Idol**. Choose **Photograph** for a wider crop, and raise **Gaussian Count** from 256K to 1M for finer detail.
+
+## WanGP Manager 0.1.14
+
+- **Updates that reinstall less**: your Python environment is kept when it still fits the new version and your plugins.
+- **Free disk space**: remove old rollback versions under **Update WanGP → Saved versions and rollback**.
+- **More reliable start**: many plugins no longer make a start fail, and if one does fail, the console says why.
+- **Choose where downloads go**: **Open in App** now shows the Windows **Save As** window instead of saving straight to Downloads.
+
+## Other
+- **H3 Image**: [P-H3-Image](https://huggingface.co/PrunaAI/P-H3-Image) by Pruna AI turns MiniMax H3 into an image model: **8-megapixel stills in 8 steps** without guidance, from text or by editing with up to 8 input images. Select **MiniMax H3 → P-H3-Image 8-Step 20B**. It shares the H3 LoRA list, so FL2VA LoRAs apply to it.
+- **H3 Distilled Text Encoder**: choose **Distilled Qwen3-VL-4B** under **Text Encoder** on the H3 models for **about 5 GB instead of 27 GB** (INT8) and about half the encoding time. Results are close to the original encoder but not identical, and a prompt detail can occasionally be lost.
+
+[Download it](https://github.com/deepbeepmeep/WanGP/releases/latest/download/WanGPManager.exe) and choose **Update in place**.
 
 ## 30th of October 2026: WanGP v19.02 - More Treats Than You Can Handle
 

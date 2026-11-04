@@ -132,6 +132,7 @@ spatial_upsampler_handlers = [
     "postprocessing.seedvr2.wgp_bridge.SeedVR2Bridge",
     "postprocessing.pid.wgp_bridge.PiDBridge",
     "postprocessing.h3_face_refiner.wgp_bridge.H3FaceRefinerBridge",
+    "postprocessing.taomate_fvsr.wgp_bridge.TaoMateFVSRBridge",
     "postprocessing.chain_of_zoom.wgp_bridge.ChainOfZoomBridge",
     "postprocessing.ltx2_upsampler.wgp_bridge.LTXVideoUpsamplerBridge",
     "postprocessing.hi3d_refiner.wgp_bridge.Hi3DRefinerBridge",
@@ -444,6 +445,18 @@ def query_download_defs(enabled_only: bool = True) -> list[dict[str, Any]]:
         if result is not None:
             definitions.extend(result if isinstance(result, list) else [result])
     return definitions
+
+
+def download_defs_for_value(spatial_upsampling) -> list[dict[str, Any]]:
+    """The files of a selected value through its owner, without downloading them, for a processor that runs another one."""
+    import inspect
+
+    handler = find_upsampler(spatial_upsampling)
+    query = getattr(handler, "query_download_defs", None) or getattr(handler, "query_download_def", None)
+    if query is None:
+        return []
+    result = query(**({"spatial_upsampling": spatial_upsampling} if "spatial_upsampling" in inspect.signature(query).parameters else {}))
+    return [] if result is None else result if isinstance(result, list) else [result]
 
 
 def download_for_value(spatial_upsampling, process_files, **kwargs):

@@ -36,6 +36,10 @@ class Operations(BaseModel):
     base_revision: int | None = None
 
 
+class RenderRequest(BaseModel):
+    shots: list[str]
+
+
 class DirectorRequest(BaseModel):
     task: str
     message: str = ""
@@ -347,6 +351,11 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
     def rerun(production_id: str, shot_id: str):
         production(production_id)
         return showrunner.rerun(production_id, shot_id)
+
+    @app.post("/api/productions/{production_id}/render")
+    def render_now(production_id: str, request: RenderRequest):
+        production(production_id)
+        return showrunner.render_directly(production_id, request.shots)
 
     @app.post("/api/productions/{production_id}/shots/{shot_id}/cancel")
     def cancel(production_id: str, shot_id: str):

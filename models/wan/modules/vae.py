@@ -325,6 +325,38 @@ def _exact_tiled(net, chunks, segments, size, sink):
         inputs, size = store, out_size
 
 
+class ExactStream:
+    """_exact_tiled one temporal chunk at a time, with the same result: each tile keeps its causal caches between the calls, so that a video
+    processed by windows runs as one (net: Encoder3d / Decoder3d, fast path; size: frames at its input)."""
+
+    def __init__(self, net, segments, size):
+        self.net, self.work = net, []
+        for start, stop, tiles in segments:
+            stages = net._stages()[start:stop]
+            out_size = _sizes(stages, size)[-1]
+            work = [(tuple((0, s) for s in out_size), None, tuple((0, s) for s in size))] if tiles is None else [(region, *_plan(stages, size, region)) for region in tiles]
+            work = sorted(work, key=lambda item: -(item[2][0][1] - item[2][0][0]) * (item[2][1][1] - item[2][1][0]))  # largest first: the allocator reuses their blocks
+            self.work.append((start, stop, out_size, [(*item, [None] * sum(isinstance(m, nn.Conv3d) for m in net.modules())) for item in work]))
+            size = out_size
+
+    def run(self, x, first, sink):
+        """The next chunk x, delivered tile after tile to sink(region, output)."""
+        device = x.device
+        for number, (start, stop, out_size, tiles) in enumerate(self.work):
+            store = None
+            for region, plan, need, cache in tiles:
+                (a, b), (c, d) = need
+                y = self.net(x[..., a:b, c:d].to(device).contiguous(memory_format=torch.channels_last_3d), feat_cache=cache, feat_idx=[0], part=(start, stop, plan, need, first))
+                if number == len(self.work) - 1:
+                    sink(region, y)
+                else:
+                    if store is None:
+                        store = torch.empty((*y.shape[:3], *out_size), dtype=y.dtype, device="cpu", memory_format=torch.channels_last_3d)
+                    store[..., region[0][0]:region[0][1], region[1][0]:region[1][1]].copy_(y)
+                y = None
+            x = store
+
+
 def _exact_decode(model, z, segments, any_end_frame, sink):
     """Tiled decoding equal to the untiled one (fast path) of scaled latents z on the GPU, through _exact_tiled."""
     x = model.conv2(z)

@@ -269,7 +269,7 @@
     // Without the gallery viewer, images and videos open in a new tab.
     if (!['image', 'video', 'audio', '3d'].includes(kind) || (!WAC.galleryMediaViewer && ['image', 'video'].includes(kind))) return false;
     const thumbnail = link.querySelector('img')?.src || '';
-    openMedia({kind, format: link.dataset.mediaFormat, url: link.href, name: (link.querySelector('.chat__attachment-title') || link).textContent.trim(), thumbnail, poster: thumbnail});
+    openMedia({kind, format: link.dataset.mediaFormat, navigation: link.dataset.mediaNavigation, walk_start: link.dataset.mediaWalkStart, level: link.dataset.mediaLevel, url: link.href, name: (link.querySelector('.chat__attachment-title') || link).textContent.trim(), thumbnail, poster: thumbnail});
     return true;
   };
   let galleryItems = [];

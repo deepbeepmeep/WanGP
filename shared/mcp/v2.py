@@ -293,6 +293,7 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
     mcp._wangp_pages = pages
     mcp._wangp_jobs = jobs
     mcp._wangp_allow_async = allow_async
+    mcp._wangp_wait_interrupted = lambda: False
 
     if extended:
         @mcp.tool(description=RESOURCE_DESCRIPTION)
@@ -1257,7 +1258,7 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
             finished = any if action == "wait_jobs" and arguments.get("mode", "any") == "any" else all
             done = lambda: finished(isinstance(record, RecoveredJob) or record.done for record in records)  # recovered receipts have no live job
             deadline = time.monotonic() + arguments.get("wait_s", 60 if action == "wait_jobs" else 0)
-            while not done() and time.monotonic() < deadline:
+            while not done() and time.monotonic() < deadline and not mcp._wangp_wait_interrupted():
                 time.sleep(min(0.2, max(0, deadline - time.monotonic())))
             if action == "get_job":
                 return present_job(records[0].snapshot(event_limit=arguments.get("event_limit", 0)))

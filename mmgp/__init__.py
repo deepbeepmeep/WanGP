@@ -2,7 +2,7 @@
 import enum
 from tqdm import tqdm
 
-__version__ = "4.5.0"
+__version__ = "4.5.1"
 
 class profile_type(int, enum.Enum): 
     @staticmethod

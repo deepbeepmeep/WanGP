@@ -7,7 +7,11 @@ import threading
 from typing import Any, Callable, Sequence
 
 
+OMITTED = "__wangp_omitted__"  # FastMCP passes every declared parameter: this default tells one the model left out from an explicit null, which WanGP's tools read as a request for an action's contract
+
+
 def build_tool_proxy(tools: Sequence[dict[str, Any]], call_tool: Callable[[str, dict[str, Any]], dict[str, Any]]):
+    import anyio
     from mcp.server.fastmcp import FastMCP
 
     server = FastMCP("WanGP Deepy Prime")
@@ -20,12 +24,12 @@ def build_tool_proxy(tools: Sequence[dict[str, Any]], call_tool: Callable[[str, 
         properties = dict(schema.get("properties", {}) or {})
         required = set(schema.get("required", []) or [])
 
-        def proxy(tool_name=name, **kwargs):
-            return call_tool(tool_name, kwargs)
+        async def proxy(tool_name=name, **kwargs):  # on a thread: the server keeps answering its client during a long tool
+            return await anyio.to_thread.run_sync(call_tool, tool_name, {key: value for key, value in kwargs.items() if value != OMITTED})
 
         proxy.__name__ = name
         proxy.__signature__ = inspect.Signature([
-            inspect.Parameter(str(parameter_name), inspect.Parameter.KEYWORD_ONLY, default=inspect.Parameter.empty if parameter_name in required else None, annotation=Any)
+            inspect.Parameter(str(parameter_name), inspect.Parameter.KEYWORD_ONLY, default=inspect.Parameter.empty if parameter_name in required else OMITTED, annotation=Any)
             for parameter_name in properties
             if str(parameter_name).isidentifier()
         ])

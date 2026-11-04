@@ -393,10 +393,16 @@ def can_fuse_linear(module, x, dtypes=(torch.bfloat16,), act=None):
     Callers widen `dtypes` only for activation dtypes validated with their model; act is the input operation they want fused
     ('rms_norm', 'swiglu', or 'gelu', which only WGPKernels provide).
     WGPKernels fuse with the precision of their unfused linears (full precision or per-block activations, input operations in FP32,
-    one rounding), whatever the kernel precision setting; Comfy Kitchen's rowwise fusions need the fast (approximate) setting."""
+    one rounding), whatever the kernel precision setting; Comfy Kitchen's rowwise fusions need the fast (approximate) setting.
+    A layer with LoRAs keeps a fused residual with WGPKernels, its LoRAs added to the output by MMGP; an input operation stays out, since
+    their first factor reads the transformed input."""
     if (torch.compiler.is_compiling() or not torch.is_inference_mode_enabled() or triton._is_fake_tensor(x) or not x.is_cuda
-            or x.dtype not in dtypes or (getattr(module, '_mm_lora_old_forward', None) and getattr(module, '_mm_lora_data', None) != {})):
+            or x.dtype not in dtypes):
         return False
+    if getattr(module, '_mm_lora_old_forward', None) and getattr(module, '_mm_lora_data', None) != {}:
+        from mmgp import offload
+        if act is not None or _backend != "wgpkernels" or not offload.fusion_with_loras(module):
+            return False
     if _backend == "wgpkernels":
         group = getattr(module, '_convrot_group_size', 0)
         quanto = group == 0 and getattr(getattr(module, 'weight_qtype', None), 'name', None) == "qint8"  # plain INT8 (Quanto files)

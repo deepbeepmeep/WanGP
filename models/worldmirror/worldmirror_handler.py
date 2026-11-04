@@ -36,6 +36,7 @@ class family_handler:
             "group": goals_3d.RECONSTRUCTION,
             "image_outputs": True,
             "mesh_outputs": True,
+            "mesh_navigation": "walk",  # a scene to move through, not an object to turn around
             "device_explicit": True,
             "image_ref_choices": {"choices": [("Photos", "I"), ("No Photos", "")], "letters_filter": "I", "default": "I"},
             "no_background_removal": True,

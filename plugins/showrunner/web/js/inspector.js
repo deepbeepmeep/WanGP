@@ -15,6 +15,10 @@ export async function rerun(shotId) {
   try { await api.rerun(state.pid, shotId); toast('Rendering a new take…'); } catch (error) { toast(error.message, 'error', 7000); }
 }
 
+export async function renderNow(shotIds) {
+  try { await api.renderNow(state.pid, shotIds); toast(shotIds.length > 1 ? `Rendering ${shotIds.length} shots…` : 'Rendering…'); } catch (error) { toast(error.message, 'error', 7000); }
+}
+
 function loopOn() { try { return localStorage.getItem('sr.loop') === '1'; } catch { return false; } }  // off unless this viewer turned it on
 
 export function mountInspector(root) {
@@ -58,13 +62,15 @@ export function mountInspector(root) {
           ${doc.brief.review_before_edit ? `<button class="btn reject ${shot.status === 'rejected' && verdict?.by === 'user' ? 'active' : ''}" id="i-reject" title="Mark the take for a redo, with a note for the showrunner, and carry on reviewing">${icon('x')} Redo…</button>` : ''}
           ${take.settings && Object.keys(take.settings).length ? `<button class="btn" id="i-rerun" ${availability(rendering ? 'This shot is rendering: wait for its take.' : '', 'Another take now, from the same prompt and settings: nobody is told what was wrong. To say it, use Fix.')}>${icon('refresh')} Same again</button>` : ''}</div>
         ${[verdict, verdict?.by === 'user' && take.showrunner_verdict].filter(Boolean).map(item => `<div class="verdict-note ${item.ok ? 'ok' : 'bad'}">${icon(item.ok ? 'check' : 'alert')}<span><b>${item.by === 'user' ? 'You' : 'Showrunner'}:</b> ${shotRefs(item.note || (item.by === 'user' ? (item.ok ? 'Approved.' : 'Marked for a redo.') : item.ok ? 'Good take.' : 'Needs a retry.'), doc.shots, doc.cast)}</span></div>`).join('')}
-        ${checksHtml(take)}` : `<div class="verdict-row"><button class="btn primary" id="i-shoot" ${availability(rendering ? 'This shot is rendering: wait for its take.' : actions.directorBlocked())}>${icon('clapper')} ${rendering ? 'Rendering…' : 'Shoot this shot'}</button></div>`}
+        ${heardHtml(take, shot)}${checksHtml(take)}` : `<div class="verdict-row"><button class="btn primary" id="i-shoot" ${availability(rendering ? 'This shot is rendering: wait for its take.' : actions.directorBlocked())}>${icon('clapper')} ${rendering ? 'Rendering…' : 'Shoot this shot'}</button>
+          ${rendering ? '' : `<button class="btn" id="i-render" ${availability(actions.renderBlocked(), 'Renders it now from its prompt, without the showrunner: no language model, and nobody checks the take. Without a prompt, one is made from what you wrote on the shot.')}>${icon('bolt')} Render now</button>`}</div>`}
       <div class="field"><div class="label">${icon('sparkles')} What happens</div><textarea class="textarea" id="i-intent" rows="3" placeholder="${{ music_video: 'The singer turns to the camera as the chorus starts…', ad: 'The product in use, close up, the moment it pays off…', story: 'The fox finds the lantern at the edge of the wood…' }[doc.brief.kind] || 'She hears the radio crackle and turns to the window…'}">${esc(shot.intent)}</textarea></div>
-      <div class="field"><div class="label">${icon('chat')} Dialogue <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">words spoken or sung in this shot</span></div>
+      <div class="field"><div class="label">${icon('chat')} Dialogue <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">${doc.brief.voices_from_model && !['music_video', 'story'].includes(doc.brief.kind) ? 'the video model says these words: they join the prompt when the shot renders' : 'words spoken or sung in this shot'}</span></div>
         <div class="dialogue" id="i-dialogue">${(shot.dialogue || []).map(item => lineRow(item, doc)).join('')}</div>
-        <button class="btn small ghost" id="i-add-line" style="align-self:flex-start">${icon('plus')} Line</button></div>
-      <details class="details" id="i-prompt-box" ${promptOpen ? 'open' : ''}><summary>${icon('chevron')} Prompt <span class="muted" id="i-count" style="font-weight:500">written by the showrunner from what happens, the camera and the cast · ${(settings.prompt || '').length} chars</span></summary>
-        <textarea class="textarea" id="i-prompt" rows="6" style="margin-top:8px" placeholder="The showrunner writes the full generation prompt here.">${esc(settings.prompt || '')}</textarea></details>
+        <button class="btn small ghost" id="i-add-line" style="align-self:flex-start">${icon('plus')} Line</button>
+        ${doc.brief.voices_from_model && !['music_video', 'story'].includes(doc.brief.kind) && (shot.dialogue || []).length ? `<label class="row muted" style="font-size:12.5px;cursor:pointer;gap:10px" title="After each take, the shot starts just before its first line and ends just before any word the model adds after its last line. Turn it off for a shot that should run on."><span class="toggle ${shot.cut_extra_words !== false ? 'on' : ''}" id="i-cut-words"></span>Cut words that are not in these lines</label>` : ''}</div>
+      <details class="details" id="i-prompt-box" ${promptOpen ? 'open' : ''}><summary>${icon('chevron')} Prompt <span class="muted" id="i-count" style="font-weight:500">made from what happens, the camera and the cast · ${(settings.prompt || '').length} chars</span></summary>
+        <textarea class="textarea" id="i-prompt" rows="6" style="margin-top:8px" placeholder="The showrunner writes the full generation prompt here. Render now makes one from what you wrote above.">${esc(settings.prompt || '')}</textarea></details>
       <div class="insp-grid">
         <div class="field"><div class="label">${icon('clock')} Duration ${take?.duration_s ? `<span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500" title="What the edit plays of this shot's video">plays ${(segments(doc, actions.take).find(item => item.shot.id === shot.id)?.duration ?? 0).toFixed(1)} s of ${take.duration_s.toFixed(1)} s</span>` : ''}</div><input class="input" id="i-duration" type="number" min="0.5" max="60" step="0.1" value="${shot.duration_s ?? ''}"></div>
         <div class="field"><div class="label">${icon('layers')} Section</div><input class="input" id="i-section" list="i-sections" value="${esc(shot.section)}"><datalist id="i-sections">${sections.map(name => `<option value="${esc(name)}">`).join('')}</datalist></div>
@@ -110,6 +116,19 @@ export function mountInspector(root) {
         <button class="btn small" id="cmp-use" title="Use take B in the edit">${icon('check')} Use B</button><button class="btn small" id="cmp-done">${icon('x')} Done</button></div>`;
   }
 
+  // What was heard in a take whose model says the shot's lines
+  function heardHtml(take, shot) {
+    const heard = take.heard, said = heard?.text ? `Heard: “${esc(heard.text)}”` : 'No words were heard.';
+    if (!heard) return '';
+    const extra = [heard.before, heard.after].filter(Boolean).map(words => `“${esc(words)}”`).join(' and ');
+    const notes = [
+      ...heard.missing.map(line => [false, `<b>Not said as written:</b> “${esc(line)}”<br>${said}<br><b>Same again</b> tries another take.`]),
+      ...heard.between.map(words => [false, `<b>Words added between its lines:</b> “${esc(words)}”<br>They cannot be cut without a jump: <b>Same again</b> tries another take.`]),
+      ...heard.inexact.map(line => [true, `A word may differ in “${esc(line)}”<br>${said}`]),
+      ...(extra && shot.line_cut ? [[true, `<b>Cut, as not in its lines:</b> ${extra}`]] : extra && !heard.missing.length ? [[true, `<b>Not in its lines, left in the shot:</b> ${extra}`]] : [])];
+    return notes.map(([ok, text]) => `<div class="verdict-note ${ok ? 'ok' : 'bad'}">${icon(ok ? 'scissors' : 'alert')}<span>${text}</span></div>`).join('');
+  }
+
   function checksHtml(take) {
     const checks = take.checks || {};
     const chips = [];
@@ -133,7 +152,7 @@ export function mountInspector(root) {
     field('#i-duration', 'duration_s', value => Math.max(0.5, +value || 0.5));
     root.querySelector('#i-prompt-box').addEventListener('toggle', event => { promptOpen = event.target.open; });
     root.querySelector('#i-prompt').addEventListener('input', event => {
-      root.querySelector('#i-count').textContent = `written by the showrunner from what happens, the camera and the cast · ${event.target.value.length} chars`;
+      root.querySelector('#i-count').textContent = `made from what happens, the camera and the cast · ${event.target.value.length} chars`;
       saveShot(id, { generation: { settings: { prompt: event.target.value } } });
     });
     const saveDialogue = () => saveShot(id, { dialogue: [...root.querySelectorAll('#i-dialogue .line-row')].map(row => ({
@@ -168,6 +187,7 @@ export function mountInspector(root) {
     root.querySelector('#i-speed')?.addEventListener('change', event => setSpeed(event.target.value));
     root.querySelector('#i-detach')?.addEventListener('click', () => actions.detachSound(id));
     root.querySelector('#i-reattach')?.addEventListener('click', () => actions.reattachSound(id));
+    root.querySelector('#i-cut-words')?.parentElement.addEventListener('click', () => actions.ops([{ op: 'update_shot', shot: id, fields: { cut_extra_words: shot.cut_extra_words === false } }]));
     root.querySelector('#i-included')?.parentElement.addEventListener('click', () => actions.ops([{ op: 'update_shot', shot: id, fields: { included: !shot.included } }]));
     root.querySelectorAll('[data-take]').forEach(element => {
       element.onclick = () => actions.ops([{ op: 'update_shot', shot: id, fields: { chosen_take: element.dataset.take } }]);
@@ -188,6 +208,7 @@ export function mountInspector(root) {
     });
     root.querySelector('#i-rerun')?.addEventListener('click', () => rerun(id));
     root.querySelector('#i-shoot')?.addEventListener('click', () => actions.direct('shoot', '', [id]));
+    root.querySelector('#i-render')?.addEventListener('click', () => renderNow([id]));
     root.querySelector('#i-fix')?.addEventListener('click', () => askForFix([id]));
     if (root.querySelector('#i-reshoot')) root.querySelector('#i-reshoot').onclick = () => askForFix([id]);
     if (root.querySelector('#i-ask')) root.querySelector('#i-ask').onclick = async () => {
@@ -269,6 +290,7 @@ export function mountInspector(root) {
         <button class="btn" data-bulk="lock">${icon('lock')} Lock / unlock</button>
         <button class="btn" data-bulk="include">${icon('eye')} Include / exclude</button>
         <button class="btn" data-bulk="reshoot" ${availability(actions.directorBlocked())}>${icon('refresh')} Ask the showrunner to fix them…</button>
+        <button class="btn" data-bulk="render" ${availability(actions.renderBlocked() || (shots.some(shot => !shot.takes.length) ? '' : 'All of them have a take.'), 'Renders the ones without a take now, without the showrunner: no language model, and nobody checks the takes')}>${icon('bolt')} Render now</button>
         <div class="field"><div class="label">${icon('layers')} Move to section</div><input class="input" id="bulk-section" placeholder="The part of the video they belong to"></div>
         <div class="field"><div class="label">${icon('transition')} Transition</div><div class="seg" id="bulk-tr">${TRANSITIONS.map(([key, label]) => `<button data-tr="${key}">${label}</button>`).join('')}</div></div>
         <button class="btn danger" data-bulk="delete">${icon('trash')} Delete</button></div></div>`;
@@ -278,6 +300,7 @@ export function mountInspector(root) {
       if (kind === 'lock') actions.ops(shots.map(shot => ({ op: 'update_shot', shot: shot.id, fields: { locked: !shots.every(item => item.locked) } })));
       if (kind === 'include') actions.ops(shots.map(shot => ({ op: 'update_shot', shot: shot.id, fields: { included: !shots.every(item => item.included) } })));
       if (kind === 'reshoot') askForFix(shots.map(shot => shot.id));
+      if (kind === 'render') renderNow(shots.filter(shot => !shot.takes.length).map(shot => shot.id));
       if (kind === 'delete') shotMenu(button, shots.map(shot => shot.id));
     });
     root.querySelector('#bulk-section').addEventListener('change', event => actions.ops(shots.map(shot => ({ op: 'update_shot', shot: shot.id, fields: { section: event.target.value } }))));

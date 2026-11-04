@@ -22,11 +22,11 @@ from shared.utils.utils import get_default_workers, process_images_multithread
 
 def sample_to_frames(sample: torch.Tensor) -> tuple[torch.Tensor, str]:
     if sample.ndim != 4 or sample.shape[0] != 3:
-        raise ValueError(f"H3 Face Refiner expects a CTHW video tensor, got {tuple(sample.shape)}")
+        raise ValueError(f"Face Refiner expects a CTHW video tensor, got {tuple(sample.shape)}")
     if sample.dtype == torch.uint8:
         return sample.permute(1, 2, 3, 0).cpu().contiguous(), "uint8"
     if not torch.is_floating_point(sample):
-        raise ValueError(f"H3 Face Refiner expects uint8 or floating-point video, got {sample.dtype}")
+        raise ValueError(f"Face Refiner expects uint8 or floating-point video, got {sample.dtype}")
     frames = torch.empty((sample.shape[1], sample.shape[2], sample.shape[3], 3), dtype=torch.uint8, device="cpu")
     for index in range(sample.shape[1]):
         frame = sample[:, index].to(dtype=torch.float32, device="cpu", copy=True).clamp_(-1.0, 1.0).add_(1.0).mul_(127.5).round_().byte().permute(1, 2, 0)
@@ -261,7 +261,7 @@ def select_reference_frame(frames, face_boxes, max_candidates=120, insightface_m
             observations.append({"index": index, "height": box[3] - box[1], "yaw": yaw, "roll": roll,
                                  "mouth": mouth_open, "sharpness": sharpness, "confidence": float(matched.det_score)})
     except Exception as error:
-        print(f"[H3FaceRefine] frontal reference selection unavailable ({error}); using largest detected face")
+        print(f"[FaceRefine] frontal reference selection unavailable ({error}); using largest detected face")
     finally:
         released = _release_insightface(app)
         app = None
@@ -269,7 +269,7 @@ def select_reference_frame(frames, face_boxes, max_candidates=120, insightface_m
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         if released:
-            print("[H3FaceRefine] Unloaded InsightFace ONNX sessions before H3 decoding")
+            print("[FaceRefine] Unloaded InsightFace ONNX sessions before decoding")
 
     if not observations:
         return largest_index
@@ -282,7 +282,7 @@ def select_reference_frame(frames, face_boxes, max_candidates=120, insightface_m
                          * math.exp(-0.5 * (item["mouth"] / 0.20) ** 2)
                          * (0.9 + 0.1 * sharp_score) * item["confidence"])
     best = max(observations, key=lambda item: item["score"])
-    print(f"[H3FaceRefine] frontal reference frame {best['index'] + 1}: face={best['height']:.0f}px yaw-proxy={best['yaw']:.3f} mouth={best['mouth']:.3f}")
+    print(f"[FaceRefine] frontal reference frame {best['index'] + 1}: face={best['height']:.0f}px yaw-proxy={best['yaw']:.3f} mouth={best['mouth']:.3f}")
     return int(best["index"])
 
 
@@ -384,13 +384,13 @@ def _select_track(frames, detections, identity_track=True, identity_threshold=0.
                 candidates = _embeddings(app, identity_reference)
                 if candidates:
                     anchor = max(candidates, key=lambda item: item[0][3] - item[0][1])[1]
-                    print("[H3FaceRefine] identity anchor from the supplied reference")
+                    print("[FaceRefine] identity anchor from the supplied reference")
             if anchor is None:
                 anchor, anchor_frames = _clip_anchor(app, frames, detections)
                 if anchor is not None:
-                    print(f"[H3FaceRefine] identity anchor built from the clip itself ({anchor_frames} unambiguous frames)")
+                    print(f"[FaceRefine] identity anchor built from the clip itself ({anchor_frames} unambiguous frames)")
         except Exception as error:
-            print(f"[H3FaceRefine] identity matching unavailable ({error})")
+            print(f"[FaceRefine] identity matching unavailable ({error})")
             anchor = None
 
     selected, previous = [], None
@@ -443,7 +443,7 @@ def _select_track(frames, detections, identity_track=True, identity_threshold=0.
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         if released:
-            print("[H3FaceRefine] Unloaded InsightFace ONNX sessions before H3 refinement")
+            print("[FaceRefine] Unloaded InsightFace ONNX sessions before refinement")
     return selected, identity_matches, continuity_matches, conflicts
 
 
@@ -689,7 +689,7 @@ def _select_tracks(frames, detections, face_count=1, identity_threshold=0.28, re
     app = None
     shot_boundaries = _shot_boundaries(frames)
     if shot_boundaries:
-        print(f"[H3FaceRefine] detected {len(shot_boundaries)} shot boundary/boundaries; resetting spatial track continuity")
+        print(f"[FaceRefine] detected {len(shot_boundaries)} shot boundary/boundaries; resetting spatial track continuity")
     frame_embeddings = [[None] * len(boxes) for boxes in detections]
     references = list(reference_images or [])
     try:
@@ -707,7 +707,7 @@ def _select_tracks(frames, detections, face_count=1, identity_threshold=0.28, re
             candidates = _embeddings(app, reference)
             reference_embeddings.append(None if not candidates else max(candidates, key=lambda item: item[0][3] - item[0][1])[1])
     except Exception as error:
-        print(f"[H3FaceRefine] multi-face identity matching unavailable ({error}); using geometric tracks")
+        print(f"[FaceRefine] multi-face identity matching unavailable ({error}); using geometric tracks")
         tracks = _associate_tracks(detections, frame_embeddings, identity_threshold, shot_boundaries, progress_callback)
         reference_embeddings = [None] * len(references)
     finally:
@@ -717,12 +717,12 @@ def _select_tracks(frames, detections, face_count=1, identity_threshold=0.28, re
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         if released:
-            print("[H3FaceRefine] Unloaded InsightFace ONNX sessions before H3 refinement")
+            print("[FaceRefine] Unloaded InsightFace ONNX sessions before refinement")
 
     matches = []
     for reference_index, embedding in enumerate(reference_embeddings):
         if embedding is None:
-            print(f"[H3FaceRefine] reference image {reference_index + 1} has no recognizable face and will be ignored")
+            print(f"[FaceRefine] reference image {reference_index + 1} has no recognizable face and will be ignored")
             continue
         for track_index, track in enumerate(tracks):
             if track["anchor"] is not None:
@@ -737,10 +737,10 @@ def _select_tracks(frames, detections, face_count=1, identity_threshold=0.28, re
         tracks[track_index]["reference_similarity"] = similarity
         assigned_references.add(reference_index)
         assigned_tracks.add(track_index)
-        print(f"[H3FaceRefine] matched reference image {reference_index + 1} to face track {track_index + 1} (similarity {similarity:.3f})")
+        print(f"[FaceRefine] matched reference image {reference_index + 1} to face track {track_index + 1} (similarity {similarity:.3f})")
     for reference_index in range(len(references)):
         if reference_index not in assigned_references and reference_embeddings[reference_index] is not None:
-            print(f"[H3FaceRefine] reference image {reference_index + 1} did not match a detected identity and will be ignored")
+            print(f"[FaceRefine] reference image {reference_index + 1} did not match a detected identity and will be ignored")
 
     rank_key = lambda index: (tracks[index]["anchor"] is not None, tracks[index]["rank"])
     ranked = sorted(range(len(tracks)), key=rank_key, reverse=True)
@@ -750,10 +750,10 @@ def _select_tracks(frames, detections, face_count=1, identity_threshold=0.28, re
         selected_indices = (prioritized + [index for index in relevant if index not in assigned_tracks])[:5]
         too_small = sum(track["max_height"] < float(auto_min_face_height) for track in tracks)
         too_brief = sum(track["presence"] < float(auto_min_presence) for track in tracks)
-        print(f"[H3FaceRefine] Auto face selection: {len(relevant)}/{len(tracks)} relevant track(s), thresholds max face height >= {float(auto_min_face_height):g}px and presence >= {float(auto_min_presence):.0%}; rejected {too_small} too small and {too_brief} too brief")
+        print(f"[FaceRefine] Auto face selection: {len(relevant)}/{len(tracks)} relevant track(s), thresholds max face height >= {float(auto_min_face_height):g}px and presence >= {float(auto_min_presence):.0%}; rejected {too_small} too small and {too_brief} too brief")
     else:
         selected_indices = (prioritized + [index for index in ranked if index not in assigned_tracks])[:int(face_count)]
-    print(f"[H3FaceRefine] detected {len(tracks)} distinct face track(s); refining {len(selected_indices)}")
+    print(f"[FaceRefine] detected {len(tracks)} distinct face track(s); refining {len(selected_indices)}")
     return [tracks[index] for index in selected_indices]
 
 
@@ -776,7 +776,7 @@ def _body_fallback(frames, missing, fallback_path, confidence, abort_callback=No
     return found
 
 
-def _affine_crop(frame: torch.Tensor, box, width: int, height: int) -> torch.Tensor:
+def _affine_crop(frame: torch.Tensor, box, width: int, height: int, reduce_large=False) -> torch.Tensor:
     x, y, box_width, box_height = box
     source_h, source_w = frame.shape[:2]
     source = frame[..., :3].movedim(-1, 0).unsqueeze(0).float()
@@ -784,8 +784,10 @@ def _affine_crop(frame: torch.Tensor, box, width: int, height: int) -> torch.Ten
         source.div_(255.0)
     theta = source.new_tensor([[[box_width / source_w, 0.0, (2.0 * x + box_width) / source_w - 1.0],
                                 [0.0, box_height / source_h, (2.0 * y + box_height) / source_h - 1.0]]])
-    grid = F.affine_grid(theta, (1, 3, height, width), align_corners=False)
-    return F.grid_sample(source, grid, mode="bilinear", padding_mode="border", align_corners=False)[0]
+    oversampling = max(1, math.ceil(box_height / height)) if reduce_large else 1  # a box larger than the canvas: read at its resolution, then averaged
+    grid = F.affine_grid(theta, (1, 3, height * oversampling, width * oversampling), align_corners=False)
+    crop = F.grid_sample(source, grid, mode="bilinear", padding_mode="border", align_corners=False)
+    return (F.avg_pool2d(crop, oversampling) if oversampling > 1 else crop)[0]
 
 
 def crop_face_track(frames, transform, start=0, stop=None, *, uint8_storage=False):
@@ -795,7 +797,7 @@ def crop_face_track(frames, transform, start=0, stop=None, *, uint8_storage=Fals
     dtype = torch.uint8 if uint8_storage else torch.float32
     crops = torch.empty((3, stop - start, canvas_height, canvas_width), dtype=dtype, device="cpu")
     for target, index in enumerate(range(start, stop)):
-        crop = _affine_crop(frames[index], transform["boxes"][index], canvas_width, canvas_height)
+        crop = _affine_crop(frames[index], transform["boxes"][index], canvas_width, canvas_height, reduce_large=transform.get("reduce_large", False))
         if uint8_storage:
             crop = crop.mul_(255.0).round_().byte()
         else:
@@ -804,8 +806,26 @@ def crop_face_track(frames, transform, start=0, stop=None, *, uint8_storage=Fals
     return crops
 
 
+def best_reference_crop(frames, transform, insightface_model_dir=None):
+    """The track's best face as its stabilized crop: (frame index, uint8 (3, height, width)), chosen by select_reference_frame (large, frontal, mouth closed, sharp)."""
+    frame = select_reference_frame(frames, transform["raw_face_boxes"], insightface_model_dir=insightface_model_dir)
+    return frame, crop_face_track(frames, transform, frame, frame + 1, uint8_storage=True)[:, 0]
+
+
+def reference_image_crop(image, detector_path, crop_factor, size, confidence=0.25):
+    """A supplied picture framed like the crops of a track: (uint8 (3, size, size), the crop's side in the picture), or None without a detected face."""
+    frame = torch.from_numpy(np.array(image.convert("RGB"), copy=True))
+    boxes = _detect(frame.unsqueeze(0), detector_path, confidence)[0]
+    if not boxes:
+        return None
+    left, top, right, bottom = max(boxes, key=lambda box: box[3] - box[1])
+    side = (bottom - top) * float(crop_factor)
+    crop = _affine_crop(frame, ((left + right - side) / 2.0, (top + bottom - side) / 2.0, side, side), size, size, reduce_large=True)
+    return crop.mul_(255.0).round_().byte(), side
+
+
 def _crop_track(frames, selected, *, confidence=0.35, crop_factor=2.5, canvas_width=512, canvas_height=512,
-                canvas_mode="manual", smooth_window=21, size_smooth_window=51, smooth_method="gaussian",
+                canvas_mode="manual", canvas_tiers=None, smooth_window=21, size_smooth_window=51, smooth_method="gaussian",
                 size_mode="per_frame", fallback_detector_path=None, fallback_head_frac=0.5, strength_small_face=0.85,
                 strength_large_face=0.85, scale_mode="absolute_px", face_px_small=30.0, face_px_large=120.0,
                 strength_gamma=1.0, strength_smooth_frames=9, abort_callback=None, progress_callback=None, track_label="face",
@@ -852,6 +872,8 @@ def _crop_track(frames, selected, *, confidence=0.35, crop_factor=2.5, canvas_wi
         canvas_width = canvas_height = max(128, min(1344, auto_size))
         if canvas_mode == "auto_capped_768":
             canvas_width = canvas_height = min(canvas_width, 768)
+        if canvas_tiers:  # a model with fixed working sizes: the smallest that keeps the face's resolution, or the largest
+            canvas_width = canvas_height = next((tier for tier in canvas_tiers if tier >= needed), canvas_tiers[-1])
     canvas_width = max(128, min(1344, round(int(canvas_width) / 32) * 32))
     canvas_height = max(128, min(1344, round(int(canvas_height) / 32) * 32))
     aspect = canvas_width / float(canvas_height)
@@ -886,13 +908,13 @@ def _crop_track(frames, selected, *, confidence=0.35, crop_factor=2.5, canvas_wi
     transform = {"boxes": boxes, "face_rect": face_rects, "raw_face_boxes": detected_boxes, "canvas": (canvas_width, canvas_height),
                  "src_size": (source_w, source_h), "frames": frame_count, "weights": weights.tolist(),
                  "detected": valid.tolist(), "active": active.tolist(), "segments": segments,
-                 "crop_factor": float(crop_factor), "largest_face_frame": largest_face_frame}
+                 "crop_factor": float(crop_factor), "largest_face_frame": largest_face_frame, "reduce_large": bool(canvas_tiers)}
     magnifications = [canvas_height / max(box[3], 1e-6) for box in boxes]
     padded = sum(x < 0.0 or y < 0.0 or x + width > source_w or y + height > source_h for x, y, width, height in boxes)
-    print(f"[H3FaceRefine] {track_label}: frames={frame_count} detected={int(valid.sum())} ({valid.mean() * 100:.0f}%) optical-flow={int(via_flow.sum())} body-fallback={int(via_body.sum())} short-gap={int(active.sum() - known.sum())} inactive={int((~active).sum())} discontinuities={discontinuities}")
-    print(f"[H3FaceRefine] kept face centered with border padding in {padded}/{frame_count} edge frames")
-    print(f"[H3FaceRefine] face height min={face_h.min():.0f}px mean={face_h.mean():.0f}px max={face_h.max():.0f}px; magnification into {canvas_width}x{canvas_height}: min={min(magnifications):.2f}x mean={np.mean(magnifications):.2f}x max={max(magnifications):.2f}x")
-    print(f"[H3FaceRefine] per-frame denoise strength {strengths.max():.2f} (smallest) .. {strengths.min():.2f} (largest), mean={strengths.mean():.2f}")
+    print(f"[FaceRefine] {track_label}: frames={frame_count} detected={int(valid.sum())} ({valid.mean() * 100:.0f}%) optical-flow={int(via_flow.sum())} body-fallback={int(via_body.sum())} short-gap={int(active.sum() - known.sum())} inactive={int((~active).sum())} discontinuities={discontinuities}")
+    print(f"[FaceRefine] kept face centered with border padding in {padded}/{frame_count} edge frames")
+    print(f"[FaceRefine] face height min={face_h.min():.0f}px mean={face_h.mean():.0f}px max={face_h.max():.0f}px; magnification into {canvas_width}x{canvas_height}: min={min(magnifications):.2f}x mean={np.mean(magnifications):.2f}x max={max(magnifications):.2f}x")
+    print(f"[FaceRefine] per-frame denoise strength {strengths.max():.2f} (smallest) .. {strengths.min():.2f} (largest), mean={strengths.mean():.2f}")
     strengths = torch.from_numpy(strengths).float()
     return (crop_face_track(frames, transform), transform, strengths) if include_crops else (transform, strengths)
 
@@ -907,7 +929,7 @@ def track_and_crop(frames, detector_path, *, confidence=0.35, crop_factor=2.5, c
     if detections is None:
         return None
     selected, identity_matches, continuity_matches, conflicts = _select_track(frames, detections, identity_track, identity_threshold, identity_reference, select, insightface_model_dir)
-    print(f"[H3FaceRefine] tracking: {continuity_matches} by continuity, {conflicts} ambiguous ({identity_matches} resolved by face identity)")
+    print(f"[FaceRefine] tracking: {continuity_matches} by continuity, {conflicts} ambiguous ({identity_matches} resolved by face identity)")
     return _crop_track(frames, selected, confidence=confidence, crop_factor=crop_factor, canvas_width=canvas_width, canvas_height=canvas_height,
                        canvas_mode=canvas_mode, smooth_window=smooth_window, size_smooth_window=size_smooth_window, smooth_method=smooth_method,
                        size_mode=size_mode, fallback_detector_path=fallback_detector_path, fallback_head_frac=fallback_head_frac,
@@ -917,7 +939,7 @@ def track_and_crop(frames, detector_path, *, confidence=0.35, crop_factor=2.5, c
 
 
 def track_faces(frames, detector_path, *, face_count=1, reference_images=None, confidence=0.35, crop_factor=2.5,
-                canvas_width=512, canvas_height=512, canvas_mode="manual", smooth_window=21, size_smooth_window=51,
+                canvas_width=512, canvas_height=512, canvas_mode="manual", canvas_tiers=None, smooth_window=21, size_smooth_window=51,
                 smooth_method="gaussian", size_mode="per_frame", identity_threshold=0.28, fallback_detector_path=None,
                 auto_min_face_height=32, auto_min_presence=0.2, fallback_head_frac=0.5, strength_small_face=0.85, strength_large_face=0.85, scale_mode="absolute_px",
                 face_px_small=30.0, face_px_large=120.0, strength_gamma=1.0, strength_smooth_frames=9,
@@ -936,7 +958,7 @@ def track_faces(frames, detector_path, *, face_count=1, reference_images=None, c
     output = []
     for track_index, track in enumerate(tracks):
         prepared = _crop_track(frames, track["boxes"], confidence=confidence, crop_factor=crop_factor, canvas_width=canvas_width,
-                               canvas_height=canvas_height, canvas_mode=canvas_mode, smooth_window=smooth_window,
+                               canvas_height=canvas_height, canvas_mode=canvas_mode, canvas_tiers=canvas_tiers, smooth_window=smooth_window,
                                size_smooth_window=size_smooth_window, smooth_method=smooth_method, size_mode=size_mode,
                                fallback_detector_path=fallback_detector_path if len(tracks) == 1 else None,
                                fallback_head_frac=fallback_head_frac, strength_small_face=strength_small_face,
@@ -1000,7 +1022,7 @@ def _feather_mask(height, width, feather, device):
     return mask
 
 
-def stitch(frames, refined, transform, *, paste_region="face_only", mask_dilation=16, feather=6,
+def stitch(frames, refined, transform, *, paste_region="face_only", mask_dilation=16, feather=6, feather_fraction=None,
            colour_match=1.0, blend=1.0, undetected_frames="fade_out", feather_scales_with_crop=False,
            abort_callback=None, progress_callback=None):
     device = torch.device("cuda" if torch.cuda.is_available() else frames.device)
@@ -1022,7 +1044,10 @@ def stitch(frames, refined, transform, *, paste_region="face_only", mask_dilatio
         stop = min(start + chunk_size, len(boxes))
         count = stop - start
         middle_box_h = boxes[(start + stop - 1) // 2][3]
-        canvas_feather = int(feather) if feather_scales_with_crop else max(1, min(round(feather * canvas_h / max(middle_box_h, 1.0)), canvas_h // 3))
+        if feather_fraction is not None:
+            canvas_feather = round(feather_fraction * canvas_h)
+        else:
+            canvas_feather = int(feather) if feather_scales_with_crop else max(1, min(round(feather * canvas_h / max(middle_box_h, 1.0)), canvas_h // 3))
         if paste_region == "full_crop":
             mask = _feather_mask(canvas_h, canvas_w, canvas_feather, device)
             masks = mask.view(1, 1, canvas_h, canvas_w).expand(count, 1, canvas_h, canvas_w)
@@ -1074,4 +1099,4 @@ def stitch(frames, refined, transform, *, paste_region="face_only", mask_dilatio
     return output
 
 
-__all__ = ["crop_face_track", "frames_to_sample", "sample_to_frames", "select_reference_frame", "stitch", "track_and_crop", "track_and_crop_faces", "track_faces"]
+__all__ = ["best_reference_crop", "crop_face_track", "frames_to_sample", "reference_image_crop", "sample_to_frames", "select_reference_frame", "stitch", "track_and_crop", "track_and_crop_faces", "track_faces"]

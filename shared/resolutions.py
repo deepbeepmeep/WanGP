@@ -368,8 +368,11 @@ def resolve_resolution_choices(current_resolution_choice, model_def, enable_4k_r
         if not locked and not exceeds_limits:
             current_resolution_choice = align_resolution_value(current_resolution_choice, model_def.get("vae_block_size", 16) if block_size is None else block_size)
         if not any(current_resolution_choice == resolution[1] for resolution in resolution_choices):
+            budgets = available_resolution_budgets(model_def)
             if locked or exceeds_limits:
                 current_resolution_choice = None
+            elif model_def.get("resolution_budget") is not None and not enable_4k_resolutions and budgets and resolution_choices and math.prod(parse_resolution(current_resolution_choice)) > max(budgets.values()):
+                current_resolution_choice = closest_resolution(current_resolution_choice, resolution_choices)  # a remembered or saved size above the budget the model declares is not offered
             else:
                 resolution_choices.append((f"{current_resolution_choice} (Current)", current_resolution_choice))
     elif resolution_choices:

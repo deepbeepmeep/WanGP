@@ -67,6 +67,10 @@ def modulation_segments(batch: int, seq_len: int, noisy: tuple[int, int] | None=
             segments.append((base + stop, base + seq_len, batch + b))
     return segments
 
+def _ffn_width(dim):
+    return dim * 8 // 3 // 64 * 64
+
+
 class FeedForward(nn.Module):
 
     def __init__(self, dim: int, hidden_dim: int):
@@ -180,7 +184,7 @@ class BriaFibo2TransformerBlock(nn.Module):
     def __init__(self, dim: int, n_heads: int, norm_eps: float, cross_attention_dim: int | None=None):
         super().__init__()
         self.attention = BriaFibo2Attention(dim, n_heads, dim // n_heads, eps=norm_eps)
-        self.feed_forward = FeedForward(dim=dim, hidden_dim=dim * 8 // 3 // 64 * 64)
+        self.feed_forward = FeedForward(dim=dim, hidden_dim=_ffn_width(dim))
         self.attention_norm1 = RMSNorm(dim, eps=norm_eps)
         self.ffn_norm1 = RMSNorm(dim, eps=norm_eps)
         self.attention_norm2 = RMSNorm(dim, eps=norm_eps)
@@ -231,7 +235,7 @@ class BriaFibo2PerceiverLayer(nn.Module):
         self.self_attn_norm = RMSNorm(dim, eps=norm_eps)
         self.self_attention = BriaFibo2Attention(dim, n_heads, dim // n_heads, eps=norm_eps)
         self.ffn_norm = RMSNorm(dim, eps=norm_eps)
-        self.ffn = FeedForward(dim=dim, hidden_dim=dim * 8 // 3 // 64 * 64)
+        self.ffn = FeedForward(dim=dim, hidden_dim=_ffn_width(dim))
 
     def forward(self, latents: torch.Tensor, encoder_hidden_states: torch.Tensor, encoder_attention_mask: torch.Tensor | None=None, attention_mask: torch.Tensor | None=None) -> torch.Tensor:
         latents = latents + self.cross_attention(self.cross_attn_norm(latents), encoder_hidden_states=encoder_hidden_states, attention_mask=encoder_attention_mask)
@@ -267,6 +271,13 @@ class BriaFibo2Transformer2DModel(nn.Module):
     def __init__(self, in_channels: int=32, patch_size: int=2, dim: int=3584, n_layers: int=44, n_refiner_layers: int=2, n_heads: int=28, norm_eps: float=1e-05, cap_feat_dim: int=7680, injection_layer_ids: tuple[int, ...]=(6, 14, 22, 30, 38), perceiver_num_layers: int=2, min_num_gist_tokens: int=256, max_num_gist_tokens: int=512, gist_step: int=64, gist_min_text_len: int=256, gist_max_text_len: int=2048, rope_theta: float=256.0, t_scale: float=1000.0, axes_dims: tuple[int, ...]=(32, 48, 48), axes_lens: tuple[int, ...]=(2048, 512, 512)):
         super().__init__()
         self.config = SimpleNamespace(**{k: v for k, v in locals().items() if k not in ('self', '__class__')})
+        self.split_linear_modules_map = {
+            "qkv": {"mapped_modules": ["to_q", "to_k", "to_v"], "split_sizes": [dim] * 3},
+            "to_kv": {"mapped_modules": ["to_k", "to_v"], "split_sizes": [dim] * 2},
+            "out": {"mapped_modules": ["to_out.0"], "split_sizes": [dim]},
+            "to_out": {"mapped_modules": ["to_out.0"], "split_sizes": [dim]},
+            "w13": {"mapped_modules": ["w1", "w3"], "split_sizes": [_ffn_width(dim)] * 2},
+        }
         self._interrupt = False
         self.x_embedder = nn.Linear(patch_size * patch_size * in_channels, dim, bias=True)
         self.t_embedder = TimestepEmbedder(min(dim, ADALN_EMBED_DIM), mid_size=1024)
@@ -277,7 +288,22 @@ class BriaFibo2Transformer2DModel(nn.Module):
         self.final_layer = FinalLayer(dim, patch_size * patch_size * in_channels)
 
     def preprocess_loras(self, model_type, state_dict):
-        return convert_lora_keys(state_dict, [name for name, _ in self.named_modules()])
+        state_dict = convert_lora_keys(state_dict, dict(self.named_modules()), split_linear_modules_map=self.split_linear_modules_map)
+        width = _ffn_width(self.config.dim)
+        padded = (width + 255) // 256 * 256  # ComfyUI pads each SwiGLU projection separately.
+        if width != padded:
+            for key, value in state_dict.items():
+                if getattr(value, "ndim", None) != 2:
+                    continue
+                if key.endswith(".w13.lora_B.weight") and value.shape[0] == 2 * padded:
+                    gate, up = value.split(padded)
+                    if gate[width:].any() or up[width:].any():
+                        raise ValueError(f"Fibo 2 LoRA {key} has nonzero rows in the padded FFN channels")
+                    state_dict[key] = torch.cat((gate[:width], up[:width]))
+                elif key.endswith(".w2.lora_A.weight") and value.shape[1] == padded:
+                    # These columns multiply zeros because the padded gate and up rows are zero.
+                    state_dict[key] = value[:, :width].contiguous()
+        return state_dict
 
     @staticmethod
     def create_coordinate_grid(size, start=None, device=None):

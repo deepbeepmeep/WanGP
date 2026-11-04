@@ -180,6 +180,23 @@ SeedVC voice replacement, also used by Scenema Audio for reference voices, is di
 
 Late postprocessing is useful when you want to improve existing media without regenerating the original scene.
 
+### Face Refinement
+
+Face refiners find and follow up to five faces, restore each one and paste it back: the rest of the picture and the video's resolution do not change. Set *Faces to Refine* to `0` to let WanGP pick the relevant faces.
+
+- **H3 Face Refiner** restores faces with the H3 model, a text description and the soundtrack, which the model hears as it does when generating. Mouths stay closer to the source's, and it reuses H3 when H3 is already loaded.
+- **TaoMate-FVSR Face Refiner** restores speaking and singing faces from the soundtrack: lips and teeth come out sharp and follow the audio, with more skin and eye detail. It takes no prompt and pushes the mouth toward the audio much harder than H3 Face Refiner, so it is the one to try when a mouth looks wrong, and the mouth can differ more from the source.
+
+TaoMate-FVSR choices:
+
+- **Faces Following the Soundtrack:** a face following the soundtrack mouths its words even if that person is only listening. *Largest Face* (the default) suits one speaker with others around; use *All Faces* when everyone sings or speaks together, and *No Face* to restore detail from the picture alone. A video without audio is always restored from the picture alone.
+- **Face Refinement Strength** blends the result over the source. Below 1 the original mouth can show through the new one, so keep it at 1 unless you see a change you dislike.
+- **Optional Face Reference Images** (Late Post Processing) work as for H3 Face Refiner: each picture is matched to the person it shows, and gives the model the clean detail of that face. Without one, the images the video was generated from are used when its file holds them. A person left without a picture uses the best frame of their own track: the largest, sharpest and most frontal. If that frame is damaged too, some of the damage can remain: supply a clean picture of that person.
+- **Reference Restorer** (in *Configuration / Extensions*) restores that frame, or a small supplied picture, before the model uses it. SeedVR2 is the default and downloads with the refiner; with *None* faces stay softer.
+- **Working Size** (in *Configuration / Extensions*): *Auto* works at 512 and moves to 1024 for faces large in the frame. 1024 takes several times longer and more VRAM.
+
+Limitations: new facial detail is an estimate, not the person's true appearance, and the mouth may differ from the source because it follows the audio. Video frame rates near 25 fps match its training best, and clear speech gives the most reliable lips; music and very fast cuts are less predictable.
+
 ### Detail Refinement Up To 8K
 
 **LTX 2.5 Detail Refiner** rebuilds fine texture, edges and natural grain in videos that look soft: compressed web video, clips upscaled with a basic resizer, or generated videos that lost detail in the VAE. Framing, motion, exposure and color stay those of the source.

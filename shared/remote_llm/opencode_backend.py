@@ -8,6 +8,7 @@ import mimetypes
 import queue
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -24,6 +25,10 @@ from shared.mcp.bridge import MCPHttpBridge, build_tool_proxy
 
 
 OPENCODE_PROGRESS_INSTRUCTIONS = """For work with multiple meaningful steps, send concise user-facing progress updates as short text messages before and between tool calls. Keep progress updates separate from the final answer, and do not reveal hidden reasoning."""
+OPENCODE_MCP_SERVER = "wangp"  # OpenCode declares MCP tools as <server>_<tool>
+OPENCODE_TOOL_NAMES_INSTRUCTIONS = f"""Tools that these instructions name without the {OPENCODE_MCP_SERVER}_ prefix are declared with it: call mcp_resource as {OPENCODE_MCP_SERVER}_mcp_resource."""
+OPENCODE_RETRY_LIMIT_S = 300  # a provider retry further away than this (a usage limit) ends the turn with its message
+OPENCODE_TOOL_TIMEOUT_MS = 24 * 3600 * 1000  # OpenCode fails an MCP call after 60 s by default; WanGP bounds job waits itself and scripts and plugin actions can take hours
 
 
 def _resolve_opencode_executable(configured: str) -> str:
@@ -48,6 +53,21 @@ def _opencode_launch_command(executable: str, port: int) -> list[str]:
     return args
 
 
+def _opencode_tools(tools: Sequence[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """The tools under the names to register: OpenCode's server prefix then gives back the names that prompts and tool results use. Also returns the name WanGP knows each one by."""
+    prefix = f"{OPENCODE_MCP_SERVER}_"
+    names = {str(dict(definition.get("function", {}) or {}).get("name", "") or "").strip() for definition in tools}
+    renamed, originals = [], {}
+    for definition in tools:
+        function = dict(definition.get("function", {}) or {})
+        name = str(function.get("name", "") or "").strip()
+        if name:
+            exposed = f"plugin_{name}" if prefix + name in names else name.removeprefix(prefix)  # a plugin's tool named like one of WanGP's would be declared under its name
+            originals[exposed] = name
+            renamed.append({**definition, "function": {**function, "name": exposed}})
+    return renamed, originals
+
+
 class OpenCodeBackend:
     engine = "opencode"
 
@@ -61,6 +81,7 @@ class OpenCodeBackend:
         self._bridge: MCPHttpBridge | None = None
         self._call_tool: ToolCallback | None = None
         self._model_catalog = list(self.profile.get("model_catalog", []) or [])
+        self._temp_dir = tempfile.TemporaryDirectory(prefix="wangp-opencode-", ignore_cleanup_errors=True)
 
     @staticmethod
     def _auth():
@@ -107,7 +128,7 @@ class OpenCodeBackend:
         if config := str(self.profile.get("config", "") or "").strip():
             child_env["OPENCODE_CONFIG_CONTENT"] = config
         try:
-            self._process = subprocess.Popen(_opencode_launch_command(executable, parsed.port or 4096), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=child_env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0)
+            self._process = subprocess.Popen(_opencode_launch_command(executable, parsed.port or 4096), cwd=self._temp_dir.name, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=child_env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0)
         except (FileNotFoundError, PermissionError, OSError) as exc:
             raise RuntimeError(f"OpenCode is not reachable and could not be started with '{configured} serve'. Install/configure OpenCode or correct its executable and server URL. {exc}") from exc
         for _ in range(50):
@@ -163,11 +184,12 @@ class OpenCodeBackend:
         if not self._session_id:
             raise RuntimeError("OpenCode did not return a session id.")
         if self.toolbox is not None:
-            proxy = build_tool_proxy(tools, lambda name, arguments: self._call_tool(name, arguments) if self._call_tool is not None else {"status": "error", "tool": name, "error": "WanGP tool bridge is not active."})
+            exposed, originals = _opencode_tools(tools)
+            proxy = build_tool_proxy(exposed, lambda name, arguments: self._call_tool(originals[name], arguments) if self._call_tool is not None else {"status": "error", "tool": originals[name], "error": "WanGP tool bridge is not active."})
             self._bridge = MCPHttpBridge(proxy)
             url = self._bridge.start()
             try:
-                self._request("POST", "/mcp", json={"name": "wangp", "config": {"type": "remote", "url": url, "oauth": False, "codemode": False}}, timeout=15)
+                self._request("POST", "/mcp", json={"name": OPENCODE_MCP_SERVER, "config": {"type": "remote", "url": url, "oauth": False, "codemode": False, "timeout": OPENCODE_TOOL_TIMEOUT_MS}}, timeout=15)
             except Exception:
                 self._bridge.close()
                 self._bridge = None
@@ -217,8 +239,8 @@ class OpenCodeBackend:
         self._abort = False
         body: dict[str, Any] = {
             "parts": [{"type": "text", "text": str(text or "")}],
-            "system": "\n\n".join(part for part in (str(system_prompt or "").strip(), OPENCODE_PROGRESS_INSTRUCTIONS) if part),
-            "tools": {name: False for name in ("bash", "shell", "read", "write", "edit", "patch", "glob", "grep", "list", "webfetch", "websearch", "task")},
+            "system": "\n\n".join(part for part in (str(system_prompt or "").strip(), OPENCODE_TOOL_NAMES_INSTRUCTIONS if tools else "", OPENCODE_PROGRESS_INSTRUCTIONS) if part),
+            "tools": {"*": False, f"{OPENCODE_MCP_SERVER}_*": True},  # OpenCode's own tools stay off, including the ones later versions add
         }
         if llm_io_enabled():
             log_llm_io("OUT", self.engine, "turn-context", {"system_prompt": system_prompt, "user_text": str(text or ""), "images": [media_descriptor(path) for path in images], "tools": list(tools), "model": self._model() or "Automatic"})
@@ -261,7 +283,7 @@ class OpenCodeBackend:
 
         def request_turn():
             try:
-                result_box.update(self._request("POST", f"/session/{self._session_id}/message", json=body, timeout=3600))
+                result_box.update(self._request("POST", f"/session/{self._session_id}/message", json=body, timeout=(10, None)))  # the answer arrives when the whole turn ends
             except BaseException as exc:
                 error_box.append(exc)
 
@@ -276,6 +298,7 @@ class OpenCodeBackend:
         snapshots: dict[str, str] = {}
         pending: dict[str, list[str]] = {}
         last_usage: dict[str, Any] = {}
+        provider_error = ""
 
         def emit_usage(response: dict[str, Any]) -> None:
             nonlocal last_usage
@@ -291,6 +314,7 @@ class OpenCodeBackend:
             on_event(BackendEvent(kind, delta, {"item_id": part_id, "summary_index": 0} if kind == "reasoning_delta" else {"item_id": part_id}))
 
         def consume(event: dict[str, Any]) -> None:
+            nonlocal provider_error
             event_type = str(event.get("type", "") or "")
             properties = dict(event.get("properties", {}) or {})
             part = dict(properties.get("part", {}) or {})
@@ -343,6 +367,14 @@ class OpenCodeBackend:
                 event_session_id = str(properties.get("sessionID", "") or "")
                 if not event_session_id or event_session_id == self._session_id:
                     on_event(BackendEvent("compaction", data={"provider": "opencode"}))
+            elif event_type == "session.status":
+                status = dict(properties.get("status", {}) or {})
+                if status.get("type") == "retry":
+                    message = str(status.get("message", "") or "The provider did not answer.")
+                    on_event(BackendEvent("provider_retry", message))
+                    if float(status.get("next", 0) or 0) / 1000 - time.time() > OPENCODE_RETRY_LIMIT_S:
+                        provider_error = message
+                        self.interrupt()
 
         while worker.is_alive():
             try:
@@ -361,6 +393,9 @@ class OpenCodeBackend:
         if stream_response:
             stream_response[0].close()
         event_worker.join(timeout=2)
+        if provider_error:
+            self._call_tool = None
+            raise RuntimeError(f"OpenCode provider: {provider_error}")
         if error_box and not self._abort:
             self._call_tool = None
             raise error_box[0]
@@ -395,4 +430,7 @@ class OpenCodeBackend:
             self._bridge = None
         process, self._process = self._process, None
         if process is not None and process.poll() is None:
-            process.terminate()
+            if os.name == "nt":  # a .cmd launcher owns OpenCode: terminating cmd.exe alone leaves the server running
+                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+            else:
+                process.terminate()

@@ -6,7 +6,7 @@ import { renderHome } from './home.js';
 import { openDefaultModels } from './models.js';
 import { openSettings } from './settings.js';
 import { mountBrief } from './brief.js';
-import { mountStoryboard, toShoot } from './storyboard.js';
+import { mountStoryboard, toShoot, visible as onBoard } from './storyboard.js';
 import { mountTimeline } from './timeline.js';
 import { mountCast } from './cast.js';
 import { mountDeliver } from './deliver.js';
@@ -29,6 +29,10 @@ const UNDONE = { add_take: 'a new take', update_shot: 'a shot edit', verdict: 'a
   outline: 'the outline', deliverable: 'an export', bin_add: 'a bin import', bin_remove: 'a bin removal', bin_to_take: 'a take from the bin', stage: 'a stage change' };
 const GUIDE_PAGES = { home: 'Quick Start', brief: 'Starting a Production', storyboard: 'Reviewing and Changing the Plan', timeline: 'The Timeline', cast: 'The Cast', deliver: 'Delivering' };
 const STAGES = [['brief', 'Brief'], ['planning', 'Plan'], ['review', 'Review'], ['shooting', 'Shoot'], ['editing', 'Edit'], ['delivered', 'Deliver']];
+// What each stage's button opens: its view, on the Board the shots of that step, and its tooltip
+const STAGE_VIEWS = { brief: ['brief', null, 'opens the Brief'], planning: ['storyboard', 'all', 'shows all the shots on the Board'], review: ['storyboard', 'review', 'shows the takes to review on the Board'],
+  shooting: ['storyboard', 'todo', 'shows the shots still to shoot on the Board'], editing: ['timeline', null, 'opens the Timeline'], delivered: ['deliver', null, 'opens Deliver'] };
+const openStage = () => STAGES.find(([key]) => STAGE_VIEWS[key][0] === state.view && (!STAGE_VIEWS[key][1] || STAGE_VIEWS[key][1] === state.filter))?.[0];
 const app = document.getElementById('app');
 let stopEvents = null, mounted = null, inspector = null, director = null, conversation = null, bin = null, catalogStop = null;
 
@@ -63,6 +67,7 @@ export const actions = {
     await actions.ops([{ op: 'brief', fields: { aspect } }]);
     actions.direct('message', `Make a ${aspect} version of the current cut: the same shots, words, cast, narrator and music, every shot made again in ${aspect}, and the cards in the same colours, typefaces and layout at the new format. The current version stays as it is.`);
   },
+  refreshTopbar() { renderTopbar(); },
   refreshDirector() { director?.update(state.doc); renderTopbar(); },  // what it says about the user's turn changed without a new document
   select(shotId, { additive = false, range = false, open = true, keep = false } = {}) {
     const ids = mounted?.visibleIds?.() || state.doc?.shots.map(shot => shot.id) || [];  // a range covers the shots on screen only
@@ -112,9 +117,10 @@ export const actions = {
   busy: doc => !['idle', 'paused'].includes(doc.director.state),  // a paused director waits for the user: nothing runs
   // Why the buttons that give the showrunner a task are greyed out now ('': they are not).
   directorBlocked() {
-    if (state.live.running || actions.busy(state.doc)) return 'The showrunner is working: this comes back when it finishes, or after Pause or Stop.';
-    return state.directorInfo.available === false && state.directorInfo.reason || '';
+    return actions.renderBlocked() || state.directorInfo.available === false && state.directorInfo.reason || '';
   },
+  // Why Render now cannot run now ('': it can): it needs no showrunner, but does not run beside one.
+  renderBlocked: () => state.live.running || actions.busy(state.doc) ? 'The showrunner is working: this comes back when it finishes, or after Pause or Stop.' : '',
   // Why the edit cannot be assembled now ('': it can).
   assembleBlocked: doc => doc.shots.some(shot => shot.included && shot.takes.length) ? '' : 'Nothing to assemble yet: shoot at least one shot, the edit is made of their takes.',
   planBlocked: doc => ['text', 'script', 'song'].some(key => String(doc.brief[key] || '').trim()) ? '' : 'Write your idea in the brief first, or drop a song or a script: the showrunner plans from it.',
@@ -361,7 +367,7 @@ function renderTopbar() {
   const html = `${brand()}
     <span class="sep"></span>
     <input class="input bare crumb-title" id="title" value="${esc(doc.title)}" aria-label="Production title" spellcheck="false">
-    <div class="stages">${STAGES.map(([key, label], index) => `${index ? icon('chevron', 'stage-arrow') : ''}<button class="stage ${index < stageIndex ? 'done' : index === stageIndex ? 'current' : ''}" data-stage="${key}" title="${label}: the production's stage · click to open its view"><span class="dot">${index < stageIndex ? icon('check') : index + 1}</span><span>${label}</span></button>`).join('')}</div>
+    <div class="stages">${STAGES.map(([key, label], index) => `${index ? icon('chevron', 'stage-arrow') : ''}<button class="stage ${index < stageIndex ? 'done' : index === stageIndex ? 'current' : ''} ${key === openStage() ? 'open' : ''}" data-stage="${key}" title="${label}: ${STAGE_VIEWS[key][2]}"><span class="dot">${index < stageIndex ? icon('check') : index + 1}</span><span>${label}</span></button>`).join('')}</div>
     <button class="btn ghost icon" id="undo" title="Undo (Ctrl+Z)">${icon('undo')}</button>
     <button class="btn ghost icon" id="redo" title="Redo (Ctrl+Shift+Z)">${icon('redo')}</button>
     <button class="director-pill ${working ? 'working' : ''} ${next ? 'turn' : ''}" id="pill" title="${esc(next ? `Your turn: ${next.text}` : 'Showrunner')}"><span class="avatar">${icon('director')}</span>${next ? `<span class="state">Your turn: ${esc(next.label)}</span>` : `<span>Showrunner</span><span class="state">${esc(directorLabel(doc))}</span>`}</button>
@@ -378,7 +384,15 @@ function renderTopbar() {
   bar.querySelector('#undo').onclick = () => actions.undo();
   bar.querySelector('#redo').onclick = () => actions.redo();
   bar.querySelector('#pill').onclick = () => actions.toggleSide('director');
-  bar.querySelectorAll('[data-stage]').forEach(button => button.onclick = () => actions.go({ brief: 'brief', planning: 'storyboard', review: 'storyboard', shooting: 'storyboard', editing: 'timeline', delivered: 'deliver' }[button.dataset.stage]));
+  bar.querySelectorAll('[data-stage]').forEach(button => button.onclick = () => {
+    const [view, filter] = STAGE_VIEWS[button.dataset.stage];
+    if (filter && state.view === view) return mounted.showFilter(filter);
+    if (filter) {
+      state.filter = filter;
+      state.selection = new Set([...state.selection].filter(id => onBoard(actions.shot(id))));  // a selection never hides behind the filter
+    }
+    actions.go(view);
+  });
 }
 
 // The next step in full, above the media bin: its button does it and closes it; when there is nothing to press, an x closes it.
