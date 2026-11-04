@@ -4312,7 +4312,7 @@ dependencies = [
 
 [[package]]
 name = "wangp-manager"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "serde",
  "serde_json",
@@ -4323,6 +4323,8 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-single-instance",
  "uuid",
+ "webview2-com",
+ "windows-core",
  "windows-sys 0.61.2",
 ]
 

@@ -28,12 +28,16 @@
     container.className = 'mesh-viewer'; container.dataset.preview = item.thumbnail;
     const viewer = document.createElement(item.format === 'ply' ? 'wangp-splat-viewer' : 'model-viewer');
     viewer.setAttribute('src', item.url); viewer.setAttribute('aria-label', item.name);
+    if (item.navigation) viewer.dataset.navigation = item.navigation;
+    if (item.walk_start) viewer.dataset.walkStart = item.walk_start;
+    if (item.level) viewer.dataset.level = 'free';
     if (item.format !== 'ply') {
       viewer.setAttribute('alt', item.name);
       for (const [key, value] of Object.entries({'camera-controls': '', 'touch-action': 'pan-y', 'interaction-prompt': 'none', 'shadow-intensity': '0.6', 'environment-image': 'neutral', exposure: '1', 'tone-mapping': 'neutral'})) viewer.setAttribute(key, value);
     }
     const actions = document.createElement('div'); actions.className = 'mesh-viewer-actions';
-    actions.innerHTML = '<button type="button" data-mesh-action="play" title="Play the Animation" aria-label="Play the Animation" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg></button>';
+    actions.innerHTML = '<button type="button" data-mesh-action="play" title="Play the Animation" aria-label="Play the Animation" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg></button>'
+      + (item.format === 'ply' ? '<button type="button" data-mesh-action="walk" title="Walk Through the Scene" aria-label="Walk Through the Scene" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="13" cy="4.5" r="1.8"/><path d="M10 21l2.5-6.5-2.5-3 1.5-4 3 2.5 3 1M11.5 7.5 8 9.5l-1.5 4M12.5 14.5l3 2.5 1 4"/></svg></button>' : '');
     container.append(viewer, actions);
     return container;
   }

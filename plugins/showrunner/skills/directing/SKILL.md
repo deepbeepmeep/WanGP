@@ -32,7 +32,7 @@ merges, this document and its actions replace them:
 
 ## 2. Plan
 
-- The brief is the user's: no action writes it, and a rewritten line lives in the shot's `dialogue`. Only the user approves a take: yours passes your check, say so in those words.
+- The brief is the user's: no action writes it, apart from `edit(voices_from_model=...)` when the user asks for it, and a rewritten line lives in the shot's `dialogue`. Only the user approves a take: yours passes your check, say so in those words.
 - `plan` writes outline, cast, style and shots in one call. Shots the user locked, edited or already shot are kept; the others are
   replaced. Write the prompts in the call itself, never in files: for many shots, `plan` the outline, cast, style and first shots, then
   `add_shots` the others in batches.
@@ -132,6 +132,8 @@ The production's edit replaces the merge and remux steps of the film and product
 - Never write the spoken or sung words in a video prompt (no `<d>…</d>` dialogue, even when a template's example prompt shows one):
   the model would voice them itself, in a new voice every shot. Speak every line with `speak` first; the prompt only says who speaks,
   "speaking with natural lip movements synchronized".
+- Unless the advice has `spoken_lines`: the user chose that the video model says the lines (the brief's Voices), knowing that a voice can change from shot to shot, so do not argue for recordings. Write the lines in `dialogue` as usual, exactly as the script has them, and do not `speak` them or lay them on the edit: `render` writes each shot's lines into its prompt, as its model reads them, with the speaker's `voice_description`. Keep their words and "natural lip movements" out of your prompt: that wording is for a recording. Quote nobody there (the model says whatever a prompt quotes, a catchphrase on a cast card too), and call each speaker by their cast name, as the lines do; `render` adds the card of a speaker on screen whom you do not name. These shots last their planned length, not their line's: about 0.4 s a word plus a second, no more, as the model fills time left with words of its own. `render` listens to each of these takes and answers under `heard`: it cuts words before the first line and after the last one, and you need another take when `missing` or `between` is not empty (a line it did not say, words added between two lines). A shot that should run on after its line gets `cut_extra_words: false`. The shots can differ a lot in level; `edit(level_voices=true)` evens them out in the export, when the user asks. A shot of a template that cannot say its lines, or that follows a song or its own audio, works as below.
+- When the user asks in words for the video model's own voices, with nothing recorded first ("use H3's audio", "do not pre-render the voices"), call `edit(voices_from_model=true)`, then tell them what it answers under `tell_the_user` and fix its `warnings`; `false` goes back to recordings. Never switch it on your own, and never answer that it cannot be done.
 - Speaking shots: use the lip-sync template of the advice, `video_length` at least as long as the shot's lines. `render` drives the shot
   with its lines (it speaks the ones not spoken yet, one after the other when there are several), pads them with silence to the shot's
   length and trims the shot 0.35 s after them: the model fills the padding with invented words.

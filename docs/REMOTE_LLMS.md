@@ -110,6 +110,20 @@ opencode serve --hostname 127.0.0.1 --port 4096
 
 Stop a manually started server with `Ctrl+C` in the same terminal.
 
+## Long generations
+
+With a remote engine, Deepy can start generations in the background and keep working while they run, for example queueing several images and following them together, or preparing the next step while a video renders.
+
+- Like any Deepy request, its generations run after the current task and ahead of the tasks you queued yourself. Several of them run in the order it requested them.
+- A generation that takes more than ten minutes does not fail: Deepy gets control back while it keeps running, follows it to the end and does not submit it twice.
+- `Stop Deepy` also cancels the generations it started in the background and that are still running or waiting, unless **Auto-abort** is off.
+
+## Resuming saved sessions
+
+A remote engine continues a saved session with what was said and done in it: when you resume the session, even after restarting WanGP, it receives the earlier messages and tool results. The same applies when you change engine during a session and later come back to the first one: it receives what it missed.
+
+The words of the conversation and the most recent results are always sent whole. In a very long session, the oldest tool results are shortened, and the complete record is kept in the session's documents as `conversation_history.json`, where the engine can look up a detail when it needs one.
+
 ## Prompt Enhancer and visual inspection
 
 Prompt Enhancer uses the same selected engine. Choose the normal on-demand prompt-enhancement action; no second remote-engine configuration is required.
@@ -133,6 +147,10 @@ Select an explicit `OpenCode provider` before choosing an explicit model. With b
 ### Claude SDK dependency conflicts
 
 Install exactly the pinned bridge version shown above in WanGP's environment. Do not add or upgrade WanGP's general requirements merely to obtain a newer Claude SDK.
+
+### A turn ends with an OpenCode provider message
+
+When a provider reports a limit that would keep OpenCode waiting for a long time, such as `Free usage exceeded`, Deepy ends the turn and shows that message instead of waiting. Shorter retries appear in the status line while OpenCode tries again. Choose another model or provider in `Configuration`, or send the request again once the limit has reset.
 
 ### Authentication or provider changes are not visible
 

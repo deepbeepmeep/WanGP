@@ -15,8 +15,9 @@ from shared.utils import files_locator as fl
 from .audio_vae import MiniMaxH3AudioVAE
 from .convrot_layout import get_convrot_layout
 from .latent_upscaler import MiniMaxH3LatentUpscaler
+from .p_h3_image import P_H3_IMAGE_TEXT_ENCODER_FOLDER, P_H3_IMAGE_VAE_FILE, P_H3_IMAGE_VAE_INT8_FILE
 from .pipeline import MiniMaxH3Pipeline
-from .text_encoder import MiniMaxH3TextEncoder, load_h3_qwen_config
+from .text_encoder import MiniMaxH3DistilledTextEncoder, MiniMaxH3TextEncoder, load_h3_qwen_config
 from .transformer import MiniMaxH3Model, get_linear_split_map
 from .video_vae import MiniMaxH3VideoVAE, get_video_vae_linear_split_map, group_qkv_rows
 from .viggle import load_fixed_prompt
@@ -231,11 +232,15 @@ def _load_transformer(filename, dtype, qkv_splitting=True, qkv_layout="interleav
     return transformer
 
 
-def _load_text_encoder(filename, dtype):
-    config_path = fl.locate_file(os.path.join(TEXT_ENCODER_FOLDER, "config.json"))
-    config = load_h3_qwen_config(config_path)
+def _load_text_encoder(filename, dtype, distilled=False):
+    config_path = fl.locate_file(os.path.join(P_H3_IMAGE_TEXT_ENCODER_FOLDER if distilled else TEXT_ENCODER_FOLDER, "config.json"))
+    config = load_h3_qwen_config(config_path, None if distilled else 50)
     with init_empty_weights(include_buffers=True):
-        text_encoder = MiniMaxH3TextEncoder(config)
+        text_encoder = (MiniMaxH3DistilledTextEncoder if distilled else MiniMaxH3TextEncoder)(config)
+    if distilled:
+        text_encoder.text_connector._convertWeightsFloatTo = None
+        for module in text_encoder.text_connector.modules():
+            module._lock_dtype = torch.float32
     text_encoder.visual.rotary_pos_emb.reset_inv_freq()
     text_encoder.language_model.rotary_emb.reset_inv_freq()
     text_encoder.requires_grad_(False)
@@ -247,14 +252,14 @@ def _load_text_encoder(filename, dtype):
     return text_encoder
 
 
-def _load_video_vae(filename, qkv_splitting=True, upsampling=False):
+def _load_video_vae(filename, qkv_splitting=True, upsampling=False, single_frame=False):
     lightvae = filename in (VIDEO_VAE_LIGHT_FILE, VIDEO_VAE_LIGHT_INT8_FILE)
     filename = fl.locate_file(filename)
     dtype = quant_router.load_metadata_state_dict(filename)[0]["encoder.conv_in.weight"].dtype
     dtype = torch.float16 if dtype == torch.float32 else dtype  # checkpoint-native FP16/BF16; FP32 wastes VRAM for little precision
     print(f"Loading MiniMax H3 Video VAE '{filename}'...")
     with init_empty_weights(include_buffers=False):
-        vae = MiniMaxH3VideoVAE(upsampling=upsampling, decoder_num_layers=12 if lightvae else 36)
+        vae = MiniMaxH3VideoVAE(upsampling=upsampling, decoder_num_layers=12 if lightvae else 36, single_frame=single_frame)
     split_map = get_video_vae_linear_split_map() if qkv_splitting else None
     if split_map is not None:
         offload.split_linear_modules(vae, split_map)
@@ -320,22 +325,22 @@ def model_factory(model_filename, text_encoder_filename, qkv_splitting, dtype=to
                   model_type="minimax_h3_fl2va", reference_mode=False, video_vae_filename=VIDEO_VAE_FILE,
                   audio_vae_filename=AUDIO_VAE_FILE, latent_upscaler_filename=os.path.join(LATENT_UPSCALER_FOLDER, LATENT_UPSCALER_FILE),
                   shared_h3_pipeline=None, qkv_layout="interleaved", pdd=False, pdd_num_steps=None, pdd_block_size=None, vdn=False, audio_only=False,
-                  fixed_prompt_filename=None, veda=False, vsa=False):
+                  fixed_prompt_filename=None, veda=False, vsa=False, image_model=False, distilled_text_encoder=False):
     transformer = _load_transformer(model_filename, dtype, qkv_splitting, qkv_layout, pdd, pdd_num_steps, pdd_block_size, vdn, veda, vsa)
     if shared_h3_pipeline is None:
-        text_encoder = _load_text_encoder(text_encoder_filename, dtype) if fixed_prompt_filename is None else None
-        video_vae_qkv_splitting = qkv_splitting and video_vae_filename in (VIDEO_VAE_FILE, VIDEO_VAE_LIGHT_FILE, X2_VAE_FILE) + (
-            (VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_INT8_FILE, X2_VAE_INT8_FILE) if VIDEO_VAE_SPLIT_INT8 else ())
-        video_vae = _load_video_vae(video_vae_filename, video_vae_qkv_splitting, upsampling=video_vae_filename in (X2_VAE_FILE, X2_VAE_INT8_FILE))
-        audio_vae = _load_audio_vae(audio_vae_filename)
-        latent_upscaler = _load_latent_upscaler(latent_upscaler_filename) if fixed_prompt_filename is None else None
+        text_encoder = _load_text_encoder(text_encoder_filename, dtype, distilled_text_encoder) if fixed_prompt_filename is None else None
+        video_vae_qkv_splitting = qkv_splitting and video_vae_filename in (VIDEO_VAE_FILE, VIDEO_VAE_LIGHT_FILE, X2_VAE_FILE, P_H3_IMAGE_VAE_FILE) + (
+            (VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_INT8_FILE, X2_VAE_INT8_FILE, P_H3_IMAGE_VAE_INT8_FILE) if VIDEO_VAE_SPLIT_INT8 else ())
+        video_vae = _load_video_vae(video_vae_filename, video_vae_qkv_splitting, upsampling=video_vae_filename in (X2_VAE_FILE, X2_VAE_INT8_FILE), single_frame=image_model)
+        audio_vae = None if image_model else _load_audio_vae(audio_vae_filename)
+        latent_upscaler = _load_latent_upscaler(latent_upscaler_filename) if fixed_prompt_filename is None and not image_model else None
     else:
         text_encoder = shared_h3_pipeline.text_encoder
         video_vae = shared_h3_pipeline.vae
         audio_vae = shared_h3_pipeline.audio_vae
         latent_upscaler = shared_h3_pipeline.latent_upscaler
     fixed_prompt = load_fixed_prompt(fixed_prompt_filename) if fixed_prompt_filename is not None else None
-    pipeline = MiniMaxH3Pipeline(transformer, text_encoder, video_vae, audio_vae, latent_upscaler=latent_upscaler, reference_mode=reference_mode, audio_only=audio_only, dtype=dtype, fixed_prompt=fixed_prompt)
+    pipeline = MiniMaxH3Pipeline(transformer, text_encoder, video_vae, audio_vae, latent_upscaler=latent_upscaler, reference_mode=reference_mode, audio_only=audio_only, dtype=dtype, fixed_prompt=fixed_prompt, image_model=image_model)
     if save_quantized:
         from wgp import save_quantized_model
         save_quantized_model(transformer, model_type, model_filename[0], dtype, None,

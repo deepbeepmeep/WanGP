@@ -133,7 +133,6 @@ from shared.remote_llm.config import (
     ENGINE_CODEX,
     ENGINE_OPENCODE,
     ENGINE_QWEN35_4B,
-    ENGINE_QWEN38_9B,
     LLM_CONFIG_KEY,
     is_remote_engine,
     local_enhancer_id,
@@ -580,7 +579,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                     deepy_remote_default = is_remote_engine(resolve_role_engine(llm_config_view, "deepy"))
                     deepy_type_default = deepy_mode_from_config(self.server_config.get(DEEPY_ENABLED_KEY, 0), self.server_config.get(DEEPY_TYPE_KEY, DEEPY_TYPE_DEFAULT))
                     with gr.Group(elem_classes=["wangp-transparent-group"]):
-                        self.deepy_llm_engine_choice = gr.Dropdown(choices=[choice for choice in DEEPY_ENGINE_CHOICES if choice[1] != ENGINE_QWEN38_9B or llm_config["deepy"] == ENGINE_QWEN38_9B], value=llm_config["deepy"], label="Prompt Enhancer / Deepy LLM Engine")  # Qwen3.8 9B hidden until it works reliably
+                        self.deepy_llm_engine_choice = gr.Dropdown(choices=DEEPY_ENGINE_CHOICES, value=llm_config["deepy"], label="Prompt Enhancer / Deepy LLM Engine")
                         self.remote_llm_warning_md = gr.Markdown(value=privacy_warning(self.server_config))
                         self.remote_llm_auth_md = gr.Markdown("Authentication is managed by each external engine. WanGP does not request or store passwords, API keys, access tokens, or refresh tokens.", visible=deepy_remote_default)
                         self.codex_config_ui = create_codex_config_ui(gr, llm_config["profiles"][ENGINE_CODEX], visible=ENGINE_CODEX in active_llm_engines, lock_config=self.args.lock_config)

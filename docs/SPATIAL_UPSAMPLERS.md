@@ -1,6 +1,6 @@
 # Spatial Upsampler / Visual Refiner Plugin API
 
-Spatial upsamplers and visual refiners (Lanczos, FlashVSR, PiD, H3 Face Refiner,
+Spatial upsamplers and visual refiners (Lanczos, FlashVSR, PiD, H3 Face Refiner, TaoMate-FVSR Face Refiner,
 Chain-of-Zoom, VAE upscalers, ...) are
 registered in `postprocessing/spatial_upsamplers.py`. Each upsampler declares itself and its
 capabilities through a handler object; the registry owns dropdown state, value
@@ -310,6 +310,15 @@ the VAE's `8n+1` frame cadence; window size ranges from 9 to 481 frames, with 81
 as the default. The values are read at the start of every native or Media Flow
 upscale. Audio remains under the existing WGP and Media Flow preservation paths;
 the LTX spatial upsampler itself only returns video frames.
+
+**Face refiners** share `postprocessing/face_refiner`: `face.py` (detection, identity tracks, crops, the choice of
+a reference, paste-back) and `bridge.py`, a `FaceRefinerBridge` to subclass, with `PrivateRuntime` and
+`model_step_callback` for refiners running a model of their own. A new refiner declares its method, parameters and
+files, and its `open_engine(job)` returns an object with `prepare(tracked_faces)`, `window_count(frames)`,
+`refine_segment(segment)` (restored crops, uint8) and `close()`.
+`canvas_tiers` in its configuration restricts the crops to the square sizes a model works at. A processor running
+another one lists that one's files with `download_defs_for_value`. H3 Face Refiner (`h3facerefine`) and TaoMate-FVSR
+Face Refiner (`taomatefvsr`) are the two examples.
 
 The same handler also exposes **LTX 2.5 Detail Refiner** (`ltx25_refine`, x1,
 x1.5 or x2) with the Refine Details IC-LoRA on the LTX 2.5 distilled checkpoint.

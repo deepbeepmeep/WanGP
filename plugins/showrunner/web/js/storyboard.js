@@ -72,6 +72,16 @@ function speakerName(speaker, doc) {
   return doc.cast.find(member => member.id === speaker)?.name || (speaker === 'NARRATOR' ? 'Narrator' : speaker || '?');
 }
 
+export function visible(shot) {  // on the Board, with its filter
+  switch (state.filter) {
+    case 'todo': return shot.included && ['planned', 'failed', 'rejected', 'queued', 'rendering'].includes(shot.status);
+    case 'review': return shot.status === 'rendered';
+    case 'approved': return shot.status === 'approved';
+    case 'excluded': return !shot.included;
+    default: return true;
+  }
+}
+
 export function mountStoryboard(container, doc) {
   container.innerHTML = `<div class="toolbar sb-toolbar" id="sb-tools"></div><div class="storyboard" id="board"></div>`;
   const tools = container.querySelector('#sb-tools');
@@ -79,14 +89,11 @@ export function mountStoryboard(container, doc) {
   const cards = new Map();
   let dragIds = null, dropTarget = null;
 
-  function visible(shot) {
-    switch (state.filter) {
-      case 'todo': return shot.included && ['planned', 'failed', 'rejected', 'queued', 'rendering'].includes(shot.status);
-      case 'review': return shot.status === 'rendered';
-      case 'approved': return shot.status === 'approved';
-      case 'excluded': return !shot.included;
-      default: return true;
-    }
+  function showFilter(filter) {
+    state.filter = filter;
+    const shown = new Set(visibleIds());
+    state.selection = new Set([...state.selection].filter(id => shown.has(id)));  // a selection never hides behind the filter
+    renderTools(); renderBoard(); actions.refreshTopbar(); actions.select(state.focus && shown.has(state.focus) ? state.focus : [...state.selection][0] || null, { additive: false, open: false, keep: true });
   }
 
   function renderTools() {
@@ -94,12 +101,12 @@ export function mountStoryboard(container, doc) {
     const total = Math.max(0, ...segments(doc, actions.take).map(item => item.start + item.duration));  // where the cut ends: transitions overlap
     const counts = status => doc.shots.filter(shot => shot.status === status).length;
     const selected = [...state.selection];
-    const shooting = toShoot(doc), todo = shooting.length;
+    const shooting = toShoot(doc), todo = shooting.length, alone = state.directorInfo.available === false;  // alone: no showrunner to shoot them
     const estimate = todo ? shootTime(doc, shooting, renderTools) : '';
     const review = doc.brief.review_before_edit, approved = shot => actions.take(shot)?.verdict?.by === 'user' && actions.take(shot).verdict.ok;
     const waiting = review && !todo ? doc.shots.filter(shot => shot.included && !approved(shot)).length : 0;  // the showrunner waits for them before the edit
     tools.innerHTML = `<div class="col" style="gap:0;min-width:0"><h2>Storyboard</h2><span class="stat" style="white-space:nowrap">${doc.shots.length} shots · ${formatDuration(total)} · ${doc.shots.length ? frameSizes(doc, renderTools) : ''}${review ? `<span style="color:var(--green)">${counts('approved')} approved</span> · <span style="color:var(--amber)">${counts('rendered')} to review</span>` : ''}</span></div>
-      <span class="sep"></span><div class="filters">${FILTERS.filter(([key]) => review || key !== 'review').map(([key, label]) => `<button class="chip clickable ${state.filter === key ? 'on' : ''}" data-filter="${key}">${label}</button>`).join('')}</div>
+      <span class="sep"></span><div class="filters">${FILTERS.filter(([key]) => review || key !== 'review' || state.filter === 'review').map(([key, label]) => `<button class="chip clickable ${state.filter === key ? 'on' : ''}" data-filter="${key}">${label}</button>`).join('')}</div>
       <div class="row" style="margin-left:auto;flex-wrap:nowrap">
       <input type="range" class="range" id="density" min="180" max="420" step="10" value="${state.cardWidth}" style="width:96px" title="Card size">
       ${selected.length > 1 ? `<span class="chip on">${selected.length} selected</span>` : ''}
@@ -107,21 +114,16 @@ export function mountStoryboard(container, doc) {
       <button class="btn small" id="add">${icon('plus')} Shot</button>
       ${estimate ? `<span class="stat" style="white-space:nowrap" title="Roughly how long generating the ${count(todo, 'shot')} to shoot takes, measured on earlier takes of the same models (this production's first, then your other productions' at the same picture size). Checks and retakes add to it.">${icon('clock')} ${esc(estimate)}</span>` : ''}
       ${waiting ? `<button class="chip clickable" id="review-wait" title="The showrunner waits for your review before the edit: approve each take, or mark it for a redo. Assemble still makes a cut now.">${icon('clock')}Waiting for your review: ${count(waiting, 'shot')}</button>` : ''}
-      ${doc.shots.length ? `<button class="btn primary small" id="shoot" ${availability(actions.directorBlocked() || (todo ? '' : actions.assembleBlocked(doc)), todo ? `The showrunner shoots the shots without a take and the ones marked for a redo, then ${review ? 'waits for your review before the edit' : 'assembles the edit'}` : 'Every shot has a take: assemble the edit now (texts, sound, subtitles); the showrunner panel can also assemble and check it')}>${icon(todo ? 'clapper' : 'film')} ${todo ? `Shoot ${count(todo, 'shot')}` : 'Assemble'}</button>`
+      ${doc.shots.length ? `<button class="btn primary small" id="shoot" ${availability((alone ? actions.renderBlocked() : actions.directorBlocked()) || (todo ? '' : actions.assembleBlocked(doc)), todo && alone ? 'Renders them now, one after the other, from what they say: nobody checks the takes' : todo ? `The showrunner shoots the shots without a take and the ones marked for a redo, then ${review ? 'waits for your review before the edit' : 'assembles the edit'}` : 'Every shot has a take: assemble the edit now (texts, sound, subtitles); the showrunner panel can also assemble and check it')}>${icon(todo ? 'clapper' : 'film')} ${todo ? `${alone ? 'Render' : 'Shoot'} ${count(todo, 'shot')}` : 'Assemble'}</button>`
         : `<button class="btn primary small" id="plan" ${availability(actions.directorBlocked() || actions.planBlocked(doc))}>${icon('wand')} Plan with the showrunner</button>`}</div>`;
-    tools.querySelectorAll('[data-filter]').forEach(button => button.onclick = () => {
-      state.filter = button.dataset.filter;
-      const shown = new Set(visibleIds());
-      state.selection = new Set([...state.selection].filter(id => shown.has(id)));  // a selection never hides behind the filter
-      renderTools(); renderBoard(); actions.select(state.focus && shown.has(state.focus) ? state.focus : [...state.selection][0] || null, { additive: false, open: false, keep: true });
-    });
+    tools.querySelectorAll('[data-filter]').forEach(button => button.onclick = () => showFilter(button.dataset.filter));
     tools.querySelector('#density').oninput = event => { state.cardWidth = +event.target.value; localStorage.setItem('sr.card', state.cardWidth); board.style.setProperty('--card-w', `${state.cardWidth}px`); };
     tools.querySelector('#add').onclick = () => {
       const selected = state.doc.shots.map((shot, index) => state.selection.has(shot.id) ? index : -1).filter(index => index >= 0);
       addShot(selected.length ? selected.at(-1) + 1 : null);
     };
     tools.querySelector('#plan')?.addEventListener('click', () => actions.direct('plan'));
-    tools.querySelector('#shoot')?.addEventListener('click', () => todo ? actions.direct('shoot') : actions.assemble());  // as the timeline's Assemble: at once, by you
+    tools.querySelector('#shoot')?.addEventListener('click', () => !todo ? actions.assemble() : alone ? import('./inspector.js').then(({ renderNow }) => renderNow(shooting.map(shot => shot.id))) : actions.direct('shoot'));  // as the timeline's Assemble: at once, by you
     tools.querySelector('#reshoot')?.addEventListener('click', () => askForFix(selected));
     tools.querySelector('#review-wait')?.addEventListener('click', () => tools.querySelector('[data-filter="review"]').click());
   }
@@ -334,6 +336,7 @@ export function mountStoryboard(container, doc) {
   renderBoard();
   return {
     update() { renderTools(); renderBoard(); },
+    showFilter,
     selection() { renderTools(); renderBoard(); },
     progress() { renderBoard(); },
     key(event) { boardKeys(event, addShot, visibleIds()); },
@@ -357,6 +360,7 @@ export function shotMenu(anchor, ids) {
     '-',
     ...(one && take?.kind === 'video' && take.has_audio ? [one.sound !== false ? { label: 'Detach Sound', icon: 'scissors', action: () => actions.detachSound(one.id) } : { label: 'Reattach Sound', icon: 'undo', action: () => actions.reattachSound(one.id) }] : []),
     ...(one && take?.settings && Object.keys(take.settings).length ? [{ label: 'Render a new take', icon: 'refresh', unavailable: rendering(one) ? 'This shot is rendering: wait for its take.' : '', action: () => import('./inspector.js').then(module => module.rerun(one.id)) }] : []),
+    ...(shots.some(shot => !shot.takes.length) ? [{ label: 'Render now', icon: 'bolt', unavailable: actions.renderBlocked(), action: () => import('./inspector.js').then(({ renderNow }) => renderNow(shots.filter(shot => !shot.takes.length).map(shot => shot.id))) }] : []),
     ...(one ? [{ label: 'Insert a shot after it…', icon: 'plus', unavailable: actions.directorBlocked(), action: () => askForFix([], null, one.id) }] : []),
     { label: `Ask the showrunner to fix ${shots.length > 1 ? `${shots.length} shots` : 'it'}…`, icon: 'director', unavailable: actions.directorBlocked(), action: () => askForFix(shots.map(shot => shot.id)) },
     { label: 'Tell the showrunner about it…', icon: 'chat', action: async () => { const text = await promptDialog({ title: 'Note for the showrunner', placeholder: 'Make it a slow push-in, keep her red coat…', multiline: true, ok: 'Send' }); if (text?.trim()) actions.steer(`${shots.map(shot => shot.id).join(', ')}: ${text.trim()}`); } },

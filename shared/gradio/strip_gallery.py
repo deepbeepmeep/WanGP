@@ -524,6 +524,7 @@ for (const id of __STRIP_GALLERY_IDS__) SG.whenElement('#' + id + '_gallery_html
             }}
             .mesh-viewer-actions > *:hover {{ opacity: 1; border-color: var(--studio-accent); }}
             .mesh-viewer-actions > [hidden] {{ display: none; }}
+            .mesh-viewer-actions > [aria-pressed="true"] {{ opacity: 1; border-color: var(--studio-accent); color: var(--studio-accent); }}
             .mesh-viewer-actions button:disabled {{ cursor: progress; opacity: 0.5; }}
             .mesh-snapshot-popup {{
                 position: absolute; top: 48px; right: 8px; z-index: 5; display: flex; flex-direction: column; gap: 8px; padding: 10px 12px;
@@ -861,20 +862,24 @@ class MeshGallery(StripGallery):
         url, name = html.escape(url), html.escape(Path(path).name)
         preview = cls.preview_path(path)
         preview_url = html.escape(gradio_file_url(preview)) if os.path.isfile(preview) else ""
-        if Path(path).suffix.lower() == ".ply":
-            viewer, kind = f'<wangp-splat-viewer src="{url}" style="display:block;width:100%;height:100%"></wangp-splat-viewer>', "Gaussian Splats (PLY)"
+        is_splat = Path(path).suffix.lower() == ".ply"
+        if is_splat:
+            from shared.utils.mesh_outputs import splat_viewer_attributes
+            viewer, kind = f'<wangp-splat-viewer src="{url}"{splat_viewer_attributes(path)} style="display:block;width:100%;height:100%"></wangp-splat-viewer>', "Gaussian Splats (PLY)"
         else:
             viewer, kind = f'<model-viewer src="{url}" alt="{name}" camera-controls touch-action="pan-y" interaction-prompt="none" shadow-intensity="0.6" environment-image="neutral" exposure="1" tone-mapping="neutral" style="width:100%;height:100%;background:transparent"></model-viewer>', "GLB"
         snapshot_icon = '<path d="M4 8h3l2-3h6l2 3h3v11H4V8Z"/><circle cx="12" cy="13" r="3.5"/>'
         download_icon = '<path d="M12 4v11m-4.5-4.5L12 15l4.5-4.5M5 19h14"/>'
         fullscreen_icon = '<path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5"/>'
         play_icon = '<path d="M8 5v14l11-7z"/>'
+        walk_icon = '<circle cx="13" cy="4.5" r="1.8"/><path d="M10 21l2.5-6.5-2.5-3 1.5-4 3 2.5 3 1M11.5 7.5 8 9.5l-1.5 4M12.5 14.5l3 2.5 1 4"/>'
         icon = lambda drawing: f'<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{drawing}</svg>'
+        walk_button = f'<button type="button" data-mesh-action="walk" title="Walk Through the Scene" aria-label="Walk Through the Scene" aria-pressed="false">{icon(walk_icon)}</button>\n' if is_splat else ""
         return f"""<wangp-mesh-viewer class="mesh-viewer" data-path="{html.escape(path)}" data-preview="{preview_url}" style="height:{cls.viewer_height}px">
 {viewer}
 <div class="mesh-viewer-actions" role="group" aria-label="3D Asset Actions">
 <button type="button" data-mesh-action="play" title="Play the Animation" aria-label="Play the Animation" hidden>{icon(play_icon)}</button>
-<button type="button" data-mesh-action="snapshot" title="Add a Snapshot of the Current View to the Image Gallery" aria-label="Add Snapshot to Image Gallery">{icon(snapshot_icon)}</button>
+{walk_button}<button type="button" data-mesh-action="snapshot" title="Add a Snapshot of the Current View to the Image Gallery" aria-label="Add Snapshot to Image Gallery">{icon(snapshot_icon)}</button>
 <a href="{url}" download="{name}" title="Download the 3D Asset ({kind})" aria-label="Download {name}">{icon(download_icon)}</a>
 <button type="button" data-mesh-action="fullscreen" title="Full Screen (Esc to leave)" aria-label="Full Screen">{icon(fullscreen_icon)}</button>
 </div>
@@ -939,11 +944,20 @@ window.__meshGalleryNS = window.__meshGalleryNS || {};
       MG.loading = null; MG.moduleAttempt = (MG.moduleAttempt || 0) + 1; throw error;
     });
   };
+  // Walk mode of the splat viewer: keys by position (the same physical keys on every layout), as in the Worlds explorer, with a level view.
+  const WALK_MOVES = {KeyW: [0, 0, -1], KeyS: [0, 0, 1], KeyA: [-1, 0, 0], KeyD: [1, 0, 0], KeyR: [0, 1, 0], KeyF: [0, -1, 0]};
+  const WALK_TURNS = {ArrowLeft: [1, 0], ArrowRight: [-1, 0], ArrowUp: [0, 1], ArrowDown: [0, -1]};
+  const WALK_ROLLS = {KeyQ: 1, KeyE: -1};  // files from elsewhere have axes of their own (an upright world in a tilted frame): these level the scene
+  const WALK_FOV = 70, ORBIT_FOV = 40, WALK_SPEED = 0.2, WALK_TURN_SPEED = 1.2, WALK_ROLL_SPEED = 0.6, WALK_LOOK_PER_PIXEL = 0.003, WALK_FAST = 4, WALK_MAX_PITCH = 1.55;
+  const walkLabels = {};  // key code -> label of this keyboard, kept from one walk to the next
+  const walkLabel = code => walkLabels[code] || code.slice(3);
+  const levelKey = viewer => 'wangp-splat-level:' + (viewer.parentElement.dataset.path || viewer.getAttribute('src').split('?')[0]);
   // Gaussian splats: one WebGL context while the asset is shown, released when the viewer shows another asset.
   class SplatViewer extends HTMLElement {
     async load() {
       const token = this.token = {};
       this.ready = this.inView = false;
+      const host = this.parentElement;
       const download = this.download = new AbortController();
       const bytes = fetch(this.getAttribute('src'), {signal: download.signal}).then(response => {
         if (!response.ok) throw new Error('Unable to Load the Splat Asset');
@@ -963,16 +977,18 @@ window.__meshGalleryNS = window.__meshGalleryNS || {};
       // Redraw for interaction and Spark's asynchronous sorting, then leave static views idle.
       const requestRender = () => {
         if (this.renderFrame || this.token !== token || !this.ready || !this.inView || document.hidden) return;
-        this.renderFrame = requestAnimationFrame(() => {
+        this.renderFrame = requestAnimationFrame(now => {
           this.renderFrame = 0;
           if (this.token !== token || !this.inView || document.hidden || !this.clientWidth || !this.clientHeight) return;
+          this.walkStep(now);
           renderer.render(scene, camera);
+          if (this.state.walk?.keys.size) requestRender();
         });
       };
       const splat = new SplatMesh({fileBytes: new Uint8Array(fileBytes), fileName: 'asset.ply'});
       const spark = new SparkRenderer({renderer, onDirty: requestRender});
       scene.add(spark, splat);
-      this.state = {renderer, scene, camera, controls, splat, spark, requestRender};
+      this.state = {THREE, host, renderer, scene, camera, controls, splat, spark, requestRender};
       controls.addEventListener('change', requestRender);
       const resize = () => {
         const width = this.clientWidth, height = this.clientHeight;
@@ -985,16 +1001,176 @@ window.__meshGalleryNS = window.__meshGalleryNS || {};
       this.state.resize = resize;
       await splat.initialized;
       if (this.token !== token) {splat.dispose(); return;}
-      // Same 3/4 framing as the preview: the whole asset in view, seen from the front right and slightly above.
-      const box = splat.getBoundingBox(true), center = box.getCenter(new THREE.Vector3()), radius = Math.max(box.getSize(new THREE.Vector3()).length() / 2, 1e-3);
+      if (this.dataset.level) {
+        try {
+          const level = JSON.parse(localStorage.getItem(levelKey(this)));
+          if (level) {splat.position.fromArray(level.position); splat.quaternion.fromArray(level.quaternion);}
+        } catch {}  // only a convenience: the scene as it is stored
+        splat.updateMatrixWorld();
+      }
+      // Same 3/4 framing as the preview: the bulk of the splats in view (2-98 % of their positions on each axis: floaters or a far sky must
+      // not make the scene a dot), seen from the front right and slightly above. The far plane still holds them all.
+      const positions = [[], [], []], step = Math.ceil(splat.numSplats / 65536), low = new THREE.Vector3(), high = new THREE.Vector3();
+      splat.forEachSplat((index, point) => {if (index % step === 0) point.toArray().forEach((value, axis) => positions[axis].push(value));});
+      positions.forEach((values, axis) => {
+        values.sort((a, b) => a - b);
+        low.setComponent(axis, values[Math.floor(values.length * 0.02)]);
+        high.setComponent(axis, values[Math.floor(values.length * 0.98)]);
+      });
+      const center = splat.localToWorld(low.clone().add(high).multiplyScalar(0.5)), radius = Math.max(high.distanceTo(low) / 2, 1e-3);
       camera.position.copy(center).addScaledVector(new THREE.Vector3(0.55, 0.35, 0.75).normalize(), radius / Math.sin(THREE.MathUtils.degToRad(20)));
       camera.near = radius / 100;
-      camera.far = radius * 100;
+      camera.far = Math.max(radius, splat.getBoundingBox(true).getSize(new THREE.Vector3()).length() / 2) * 100;
       camera.updateProjectionMatrix();
       controls.target.copy(center);
       controls.update();
+      Object.assign(this.state, {center, radius});
       this.ready = true;
       this.refresh();
+      // The navigation its model expects, or as the viewer was left when released (hidden, another window): a walk goes on where it was.
+      if (host.walkView !== false && (host.walkView || this.dataset.navigation === 'walk')) this.startWalk(host.walkView);
+    }
+    // The first walk of a scene starts at its first camera (data-walk-start), otherwise from the current view. The median distance from
+    // there to the splats sets the speed: about five seconds to reach what is typically around, whatever the scene's scale.
+    startWalk(saved) {
+      const state = this.state, {THREE, host, renderer, camera, controls, splat, radius, requestRender} = state, canvas = renderer.domElement;
+      controls.enabled = false;
+      if (saved) {
+        camera.position.fromArray(saved.position);
+        state.walkDistance = saved.distance;
+      } else if (!state.walkDistance) {
+        const first = this.getAttribute('data-walk-start');
+        if (first) new THREE.Matrix4().fromArray(JSON.parse(first).flat()).transpose().decompose(camera.position, camera.quaternion, new THREE.Vector3());
+        const distances = [], step = Math.ceil(splat.numSplats / 4096), from = splat.worldToLocal(camera.position.clone());
+        splat.forEachSplat((index, center) => {if (index % step === 0) distances.push(center.distanceTo(from));});
+        state.walkDistance = distances.sort((a, b) => a - b)[distances.length >> 1] || radius;
+      }
+      camera.fov = WALK_FOV; camera.near = state.walkDistance / 500;  // the box of a scene can be far larger than where one walks (floaters, sky)
+      camera.updateProjectionMatrix();
+      const view = new THREE.Euler().setFromQuaternion(camera.quaternion, 'YXZ'), events = new AbortController(), {signal} = events;
+      const walk = state.walk = {keys: new Set(), yaw: saved?.yaw ?? view.y, pitch: saved?.pitch ?? Math.max(-WALK_MAX_PITCH, Math.min(WALK_MAX_PITCH, view.x)), boost: saved?.boost ?? 1, fast: false, last: 0, events};
+      const aim = () => camera.rotation.set(walk.pitch, walk.yaw, 0, 'YXZ');
+      aim();
+      const hint = walk.hint = host.appendChild(document.createElement('div'));
+      hint.className = 'mesh-walk-hint';
+      hint.style.cssText = 'position:absolute;left:8px;bottom:8px;max-width:calc(100% - 16px);box-sizing:border-box;padding:4px 8px;border-radius:6px;background:rgba(0,0,0,.6);color:#fff;font-size:12px;line-height:1.4;pointer-events:none';
+      const levels = !!this.dataset.level, lettered = code => WALK_MOVES[code] || (levels && WALK_ROLLS[code]);
+      const showHint = () => {
+        const [w, a, s, d, r, f, q, e] = ['KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyR', 'KeyF', 'KeyQ', 'KeyE'].map(walkLabel);
+        const hints = matchMedia('(hover: none)').matches ? 'Drag: Look · Pinch: Forward / Back · Two Fingers: Aside / Up' : `${w} ${a} ${s} ${d}: Move · ${r} ${f}: Up / Down · Arrows or Drag: Look · Shift: Fast · Wheel: Speed`;
+        hint.textContent = hints + (walk.boost === 1 ? '' : ` (x${walk.boost.toFixed(1)})`) + (levels ? ` · ${q} ${e}: Level` : '');
+      };
+      showHint();
+      navigator.keyboard?.getLayoutMap?.().then(map => {
+        for (const code of Object.keys({...WALK_MOVES, ...WALK_ROLLS})) if (map.get(code)) walkLabels[code] = map.get(code).toUpperCase();
+        showHint();
+      }).catch(() => {});
+      const onKey = event => {
+        if (event.type === 'keyup') {
+          walk.keys.delete(event.code);
+          if (levels && WALK_ROLLS[event.code]) {
+            try { localStorage.setItem(levelKey(this), JSON.stringify({position: splat.position.toArray(), quaternion: splat.quaternion.toArray()})); } catch {}
+          }
+        }
+        if (event.target.closest('.mesh-snapshot-popup') || event.ctrlKey || event.metaKey || event.altKey) return;
+        walk.fast = event.shiftKey;
+        if (!lettered(event.code) && !WALK_TURNS[event.code]) return;
+        event.preventDefault(); event.stopPropagation();
+        if (event.type !== 'keydown') return;
+        if (lettered(event.code) && event.key.length === 1 && walkLabel(event.code) !== event.key.toUpperCase()) {  // browsers without a layout map
+          walkLabels[event.code] = event.key.toUpperCase();
+          showHint();
+        }
+        walk.keys.add(event.code);
+        requestRender();
+      };
+      host.addEventListener('keydown', onKey, {signal});
+      host.addEventListener('keyup', onKey, {signal});
+      host.addEventListener('focusout', event => {if (!host.contains(event.relatedTarget)) walk.keys.clear();}, {signal});
+      const pointers = new Map();
+      const gesture = () => {
+        const [a, b] = pointers.values();
+        return {x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, gap: Math.hypot(a.x - b.x, a.y - b.y)};
+      };
+      canvas.addEventListener('pointerdown', event => {
+        canvas.focus({preventScroll: true});
+        if (event.button) return;
+        pointers.set(event.pointerId, {x: event.clientX, y: event.clientY});
+        canvas.setPointerCapture(event.pointerId);
+      }, {signal});
+      canvas.addEventListener('pointermove', event => {
+        const pointer = pointers.get(event.pointerId);
+        if (!pointer) return;
+        if (pointers.size === 1) {  // one finger or the mouse: look
+          walk.yaw -= (event.clientX - pointer.x) * WALK_LOOK_PER_PIXEL;
+          walk.pitch = Math.max(-WALK_MAX_PITCH, Math.min(WALK_MAX_PITCH, walk.pitch - (event.clientY - pointer.y) * WALK_LOOK_PER_PIXEL));
+          pointer.x = event.clientX; pointer.y = event.clientY;
+          aim();
+        } else {  // two fingers: spread to go forward, slide to drag the scene; the height of the view is worth the typical distance
+          const before = gesture();
+          pointer.x = event.clientX; pointer.y = event.clientY;
+          const after = gesture(), unit = state.walkDistance * walk.boost / canvas.clientHeight;
+          camera.position.add(new THREE.Vector3(before.x - after.x, 0, before.gap - after.gap).multiplyScalar(unit).applyQuaternion(camera.quaternion));
+          camera.position.y += (after.y - before.y) * unit;
+        }
+        requestRender();
+      }, {signal});
+      for (const type of ['pointerup', 'pointercancel']) canvas.addEventListener(type, event => pointers.delete(event.pointerId), {signal});
+      canvas.addEventListener('wheel', event => {
+        event.preventDefault();
+        walk.boost = Math.max(1 / 32, Math.min(32, walk.boost * (event.deltaY < 0 ? 1.25 : 0.8)));
+        showHint();
+      }, {signal, passive: false});
+      host.walkView = null;
+      this.setWalkButton(true);
+      canvas.tabIndex = -1; canvas.style.outline = 'none';
+      if (document.activeElement === document.body) canvas.focus({preventScroll: true});  // never taken from a field being typed in
+      requestRender();
+    }
+    walkStep(now) {
+      const {THREE, camera, splat, walk, walkDistance} = this.state;
+      if (!walk) return;
+      if (!walk.keys.size) {walk.last = 0; return;}
+      const seconds = Math.min((now - (walk.last || now - 16)) / 1000, 0.1), move = new THREE.Vector3();
+      walk.last = now;
+      for (const code of walk.keys) {
+        if (WALK_MOVES[code]) move.add(new THREE.Vector3(...WALK_MOVES[code]));
+        if (WALK_ROLLS[code]) {  // the scene turns around the line of sight: what is ahead stays ahead
+          const axis = camera.getWorldDirection(new THREE.Vector3()), angle = WALK_ROLLS[code] * WALK_ROLL_SPEED * seconds;
+          splat.position.sub(camera.position).applyAxisAngle(axis, angle).add(camera.position);
+          splat.rotateOnWorldAxis(axis, angle);
+        }
+        if (WALK_TURNS[code]) {
+          walk.yaw += WALK_TURNS[code][0] * WALK_TURN_SPEED * seconds;
+          walk.pitch = Math.max(-WALK_MAX_PITCH, Math.min(WALK_MAX_PITCH, walk.pitch + WALK_TURNS[code][1] * WALK_TURN_SPEED * seconds));
+        }
+      }
+      camera.rotation.set(walk.pitch, walk.yaw, 0, 'YXZ');
+      const rise = move.y;  // up and down along the world's vertical, the others along the view
+      move.y = 0;
+      move.applyQuaternion(camera.quaternion).setY(move.y + rise);
+      if (move.lengthSq()) camera.position.addScaledVector(move.normalize(), WALK_SPEED * walkDistance * walk.boost * (walk.fast ? WALK_FAST : 1) * seconds);
+    }
+    // Back to orbiting: around what is typically ahead, so that the view stays where the walk ended.
+    stopWalk() {
+      const {THREE, host, camera, controls, walk, walkDistance} = this.state;
+      walk.events.abort();
+      walk.hint.remove();
+      this.state.walk = null;
+      host.walkView = false;  // orbiting was chosen: it stays so if the viewer is released, even for a scene
+      camera.fov = ORBIT_FOV;
+      camera.updateProjectionMatrix();
+      controls.target.copy(camera.position).addScaledVector(camera.getWorldDirection(new THREE.Vector3()), walkDistance);
+      controls.enabled = true;
+      controls.update();
+      this.setWalkButton(false);
+      this.state.requestRender();
+    }
+    setWalkButton(walking) {
+      const button = this.state.host.querySelector('[data-mesh-action="walk"]');
+      if (!button) return;
+      button.setAttribute('aria-pressed', walking);
+      button.title = button.ariaLabel = walking ? 'Back to the Orbit View' : 'Walk Through the Scene';
     }
     refresh() {
       this.inView = MG.visible(this);
@@ -1011,6 +1187,12 @@ window.__meshGalleryNS = window.__meshGalleryNS || {};
       const state = this.state;
       if (!state) return;
       this.state = null;
+      if (state.walk) {
+        const {walk, camera, host, walkDistance} = state;
+        host.walkView = {position: camera.position.toArray(), yaw: walk.yaw, pitch: walk.pitch, boost: walk.boost, distance: walkDistance};
+        walk.events.abort();
+        walk.hint.remove();
+      }
       state.controls.removeEventListener('change', state.requestRender);
       state.controls.dispose();
       state.splat.dispose();
@@ -1055,8 +1237,9 @@ window.__meshGalleryNS = window.__meshGalleryNS || {};
       this.events = new AbortController();
       const viewer = this.viewer = this.querySelector('model-viewer, wangp-splat-viewer');
       this.playing = false;
-      const snapshot = this.querySelector('[data-mesh-action="snapshot"]');
+      const snapshot = this.querySelector('[data-mesh-action="snapshot"]'), walk = this.querySelector('[data-mesh-action="walk"]');
       if (snapshot) snapshot.disabled = true;
+      if (walk) walk.disabled = true;
       const status = this.status ||= this.appendChild(document.createElement('div'));
       status.className = 'mesh-viewer-status'; status.setAttribute('role', 'status');
       status.hidden = false; status.textContent = 'Loading 3D Asset…';
@@ -1071,6 +1254,7 @@ window.__meshGalleryNS = window.__meshGalleryNS || {};
         this.viewer = null;
         this.querySelector('[data-mesh-action="play"]').hidden = true;
         if (snapshot) snapshot.disabled = true;
+        if (walk) walk.disabled = true;
         status.hidden = false; status.textContent = message;
         const retry = document.createElement('button'); retry.type = 'button'; retry.textContent = 'Retry 3D';
         retry.onclick = () => {preview.replaceWith(replacement); this.start();};
@@ -1080,6 +1264,7 @@ window.__meshGalleryNS = window.__meshGalleryNS || {};
         if (!this.isConnected || this.viewer !== viewer) return;
         status.hidden = true;
         if (snapshot) snapshot.disabled = false;
+        if (walk) walk.disabled = false;
         const play = this.querySelector('[data-mesh-action="play"]');
         play.hidden = !viewer.availableAnimations?.length;
         setPlayButton(play, false);
@@ -1149,6 +1334,14 @@ window.__meshGalleryNS = window.__meshGalleryNS || {};
     container.playing = !container.playing;
     container.refresh();
     setPlayButton(button, container.playing);
+  });
+  document.addEventListener('click', event => {
+    const button = event.target.closest('.mesh-viewer [data-mesh-action="walk"]');
+    if (!button) return;
+    const viewer = button.closest('.mesh-viewer').querySelector('wangp-splat-viewer');
+    if (!viewer?.ready) return;  // not shown yet: this click shows it
+    if (viewer.state.walk) viewer.stopWalk();
+    else viewer.startWalk();
   });
   // Full screen: the viewer of the selected asset (both viewers follow their container's size)
   document.addEventListener('click', event => {

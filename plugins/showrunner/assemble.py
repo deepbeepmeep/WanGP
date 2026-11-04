@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import statistics
 import subprocess
 import tempfile
 import time
@@ -15,6 +16,8 @@ XFADE = {"crossfade": "fade", "fade_black": "fadeblack", "fade_white": "fadewhit
 CEILING_DB = -2.0  # the limiter's ceiling, at 4x oversampling (inter-sample peaks included): AAC adds up to ~1 dB, the delivery stays under about -1 dBTP
 DELIVERY_PEAK_DB = -1.0  # the true peak the delivered file keeps, measured after the audio codec
 MAX_GAIN_DB = 20.0  # a nearly silent mix is raised this much at most: its noise floor must not become hiss
+WORD_CUT_FADE_S = 0.1  # the sound where words outside a shot's lines were cut: a word or a breath must not stop dead
+VOICE_GAIN_DB = 15.0  # how far Even Voices moves a shot at most: past it, what the viewer hears is the shot's noise floor
 DEFAULT_VIDEO_ARGS = ["-c:v", "libx264", "-crf", "16", "-preset", "medium", "-pix_fmt", "yuv420p"]
 DEFAULT_AUDIO_ARGS = ["-c:a", "aac", "-b:a", "192k"]
 
@@ -37,7 +40,7 @@ def plan(doc: dict[str, Any], resolve) -> dict[str, Any]:
         end = float(end) if end is not None else model.out_point(shot, length)
         clips.append({"shot": shot["id"], "take": take["id"], "path": path, "kind": take.get("kind", "video"), "start": start, "end": max(start + 0.04, end), "speed": model.speed_of(shot, take),
                       "transition": shot.get("transition") or {"type": "cut"}, "has_audio": take.get("has_audio"), "sound": shot.get("sound", True), "codec": take.get("codec"),
-                      "width": take.get("width"), "height": take.get("height"), "fps": take.get("fps"), "sung": bool(shot.get("audio_slice")), "dialogue": shot.get("dialogue") or [],
+                      "width": take.get("width"), "height": take.get("height"), "fps": take.get("fps"), "sung": bool(shot.get("audio_slice")), "dialogue": shot.get("dialogue") or [], "line_cut": shot.get("line_cut") if shot.get("line_cut") == shot.get("trim") else None,
                       "line": (shot.get("generation") or {}).get("settings", {}).get("audio_guide"), "length": float(length),
                       "trimmed": start > 0.0 or end < float(length) - 0.01})
     edit = doc["edit"]
@@ -75,6 +78,7 @@ def render(doc: dict[str, Any], resolve, out: str | Path, *, video_args: list[st
         method = "stream copy"
     else:
         length = sum((clip["end"] - clip["start"]) / clip["speed"] for clip in clips)
+        _level_voices(doc, clips)
         measure = _encode_command(doc, clips, resolve, out, video_args or DEFAULT_VIDEO_ARGS, audio_args or DEFAULT_AUDIO_ARGS, measure=True)
         gain = _gain(-14.0 if doc["edit"].get("audio_mode") == "song" and not doc["edit"].get("audio_tracks") else -16.0, _loudness(measure, timeout=max(120.0, 5.0 * length))) if measure else 0.0
         command = _encode_command(doc, clips, resolve, out, video_args or DEFAULT_VIDEO_ARGS, audio_args or DEFAULT_AUDIO_ARGS, gain_db=gain)
@@ -159,6 +163,20 @@ def _loudness(command: list[str], **kwargs) -> float | None:
     result = (_run_graph if "-filter_complex" in command else media._run)([command[0], "-hide_banner", "-nostats", "-v", "info", *command[1:]], **kwargs)
     found = re.findall(r"I:\s+(-?[\d.]+) LUFS", result.stderr.decode("utf-8", "replace") if isinstance(result.stderr, bytes) else result.stderr)
     return float(found[-1]) if found and float(found[-1]) > -70.0 else None
+
+
+def _level_voices(doc: dict[str, Any], clips: list[dict[str, Any]]) -> None:
+    """The edit's level_voices: a video model says each shot's lines at a level of its own, and the mix's one gain would leave the jumps. Each shot with lines moves to their median,
+    measured on what the cut plays of it."""
+    if not doc["edit"].get("level_voices") or not doc["brief"].get("voices_from_model"):
+        return
+    voiced = [clip for clip in clips if clip["kind"] == "video" and clip["has_audio"] and clip["sound"] and clip["dialogue"] and not clip["sung"]]
+    measured = [(clip, _loudness([media.ffmpeg(), "-ss", f"{clip['start']:.3f}", "-to", f"{clip['end']:.3f}", "-i", str(clip["path"]), "-vn", "-af", MEASURE, "-f", "null", "-"])) for clip in voiced]
+    measured = [(clip, loudness) for clip, loudness in measured if loudness is not None]
+    if len(measured) > 1:
+        middle = statistics.median(loudness for _, loudness in measured)
+        for clip, loudness in measured:
+            clip["voice_gain_db"] = max(-VOICE_GAIN_DB, min(VOICE_GAIN_DB, middle - loudness))
 
 
 def _gain(target: float, loudness: float | None) -> float:
@@ -392,8 +410,11 @@ def _audio_chain(doc, clips, resolve, inputs, filters, offsets, total, gain_db) 
             if clip["kind"] == "video" and clip["has_audio"] and clip["sound"] and not (mode == "mix" and clip["sung"] and doc["brief"].get("song")):  # the song already sings it
                 tempo = "" if clip["speed"] == 1.0 else _atempo(clip["speed"]) + ","
                 played = (clip["end"] - clip["start"]) / clip["speed"]
-                fades = f"afade=t=in:d=0.015,afade=t=out:st={played - 0.03:.3f}:d=0.03," if played > 0.1 else ""  # no click where the sound of one clip stops and the next starts
-                filters.append(f"[{position}:a]atrim=start={clip['start']:.3f}:end={clip['end']:.3f},asetpts=PTS-STARTPTS,{tempo}aresample=48000,{fades}adelay={delay}|{delay}[a{position}]")
+                cut = clip.get("line_cut") or [0.0, None]
+                fade_in, fade_out = WORD_CUT_FADE_S if cut[0] else 0.015, WORD_CUT_FADE_S if cut[1] is not None else 0.03
+                fades = f"afade=t=in:d={fade_in},afade=t=out:st={played - fade_out:.3f}:d={fade_out}," if played > 0.1 else ""  # no click where the sound of one clip stops and the next starts
+                voice = f"volume={clip['voice_gain_db']:.2f}dB," if clip.get("voice_gain_db") else ""
+                filters.append(f"[{position}:a]atrim=start={clip['start']:.3f}:end={clip['end']:.3f},asetpts=PTS-STARTPTS,{tempo}aresample=48000,{voice}{fades}adelay={delay}|{delay}[a{position}]")
                 parts.append((f"a{position}", 1.0))
     song = doc["brief"].get("song")
     if mode in ("song", "mix") and song and resolve(song).is_file():

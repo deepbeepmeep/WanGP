@@ -55,7 +55,7 @@ def normalize(doc: dict[str, Any]) -> dict[str, Any]:
     brief = doc.setdefault("brief", {})
     for key, value in {"kind": "free", "text": "", "song": None, "script": "", "references": [], "duration_s": None, "aspect": "16:9", "resolution": "720p",
                        "style_tags": [], "style": "", "pacing": 0, "language": "en", "plan_first": True, "budget_minutes": None, "templates": {},
-                       "read_other_productions": True, "review_before_edit": False, "shot_min_s": None, "shot_max_s": None}.items():
+                       "read_other_productions": True, "review_before_edit": False, "shot_min_s": None, "shot_max_s": None, "voices_from_model": False}.items():
         brief.setdefault(key, copy.deepcopy(value))
     if brief["kind"] not in KINDS:
         brief["kind"] = "free"
@@ -80,7 +80,7 @@ def normalize(doc: dict[str, Any]) -> dict[str, Any]:
         normalize_shot(shot)
         shot["cast"] = cast_ids(doc, shot["cast"])
     edit = doc.setdefault("edit", {})
-    for key, value in {"audio_mode": "song" if brief["kind"] == "music_video" else "clips", "audio_tracks": [], "subtitles": [], "overlays": [], "fps": None}.items():
+    for key, value in {"audio_mode": "song" if brief["kind"] == "music_video" else "clips", "audio_tracks": [], "subtitles": [], "overlays": [], "fps": None, "level_voices": False}.items():
         edit.setdefault(key, copy.deepcopy(value))
     for overlay in edit["overlays"]:
         for key, value in {"text": "", "subtitle": "", "style": "", "design": "", "start_s": 0.0, "end_s": 3.0, "fade_s": 0.5, "by": "user"}.items():
@@ -100,7 +100,7 @@ def normalize(doc: dict[str, Any]) -> dict[str, Any]:
 def normalize_shot(shot: dict[str, Any]) -> dict[str, Any]:
     for key, value in {"title": "", "section": "", "intent": "", "camera": "", "cast": [], "dialogue": [], "duration_s": 5.0, "audio_slice": None, "generation": {},
                        "status": "planned", "locked": False, "included": True, "takes": [], "chosen_take": None, "trim": [0.0, None], "speed": 1.0, "sound": True,
-                       "transition": {"type": "cut", "duration_s": 0.0}, "notes": "", "updated_by": "", "updated_rev": 0}.items():
+                       "transition": {"type": "cut", "duration_s": 0.0}, "notes": "", "updated_by": "", "updated_rev": 0, "cut_extra_words": True, "line_cut": None}.items():
         shot.setdefault(key, copy.deepcopy(value))
     generation = shot["generation"]
     generation.setdefault("template", "gen_video")
@@ -132,6 +132,29 @@ def find(items: list[dict[str, Any]], item_id: str, label: str) -> dict[str, Any
 
 def shot_prompt(shot: dict[str, Any]) -> str:
     return str(shot["generation"].get("settings", {}).get("prompt", "") or "")
+
+
+_QUOTED_CLAUSE = re.compile(r"""[^.;!?]*(?<!\w)['"\u201c\u2018\u00ab][^'"\u201d\u2019\u00bb\n]{2,}?['"\u201d\u2019\u00bb](?!\w)[^.;!?]*[.;!?]?""")
+
+
+def without_quoted_words(text: str) -> str:
+    """A text without the clauses that quote someone's words: a model that voices its prompt says them, whoever they were written for."""
+    return _QUOTED_CLAUSE.sub("", text).strip(" ;,")
+
+
+def compiled_prompt(doc: dict[str, Any], shot: dict[str, Any], lip_sync: bool = True) -> str:
+    """A shot's prompt from what the user wrote on its card and in the brief, for a shot rendered without the showrunner: no language model rewrites it. Empty until the shot says what happens.
+    lip_sync: its speakers follow a recording, and the prompt asks for it. Off, its model says what the prompt quotes, so the cast's quoted words stay out."""
+    if not str(shot.get("intent") or "").strip():
+        return ""
+    members = {member["id"]: member for member in doc["cast"]}
+    shown = [members[cast_id] for cast_id in shot.get("cast") or [] if cast_id in members]
+    speakers = {line.get("speaker") for line in shot.get("dialogue") or []}
+    look = ", ".join(str(item).strip() for item in [*(doc["brief"].get("style_tags") or []), doc["brief"].get("style")] if str(item or "").strip())
+    described = lambda member: member["description"] if lip_sync else without_quoted_words(member["description"])
+    parts = [shot["intent"], shot.get("camera"), *(f"{member['name']}: {described(member)}" for member in shown if member.get("description") and described(member)),
+             *(f"{member['name']} is speaking with natural lip movements synchronized" for member in shown if lip_sync and member["id"] in speakers), look]
+    return " ".join(f"{part.strip().rstrip('.')}." for part in parts if str(part or "").strip())
 
 
 def chosen_take(shot: dict[str, Any]) -> dict[str, Any] | None:
@@ -247,6 +270,51 @@ def lyric_lines(doc: dict[str, Any]) -> list[str]:
     return [line.strip() for line in str(doc["brief"].get("script") or "").splitlines() if line.strip() and not line.strip().startswith("[")]
 
 
+_SCRIPT_LABEL = re.compile(r"^[*_\s]*([^\W\d_][^:()\d]{0,38}?)[*_\s]*(?:\([^)]*\))?[*_\s]*:[*_\s]*(\S.*)$")
+_SCRIPT_HEADINGS = {"scene", "act", "shot", "chapter", "part", "sequence", "title", "note", "notes", "setting", "location", "action", "description", "int", "ext", "fade", "cut"}
+
+
+def script_speech(doc: dict[str, Any]) -> list[str]:
+    """What the brief's script has spoken, line by line: after a speaker's label (NARRATOR: ..., MIA (whispering): ...) or under a speaker's name in capitals. Text without a speaker may be anything, and says nothing."""
+    spoken, speaking = [], False
+    for text in (line.strip() for line in str(doc["brief"].get("script") or "").splitlines()):
+        label = _SCRIPT_LABEL.match(text)
+        if not text:
+            speaking = False
+        elif text.startswith(("[", "#")):
+            continue
+        elif label and len(label[1].split()) <= 3 and label[1].split()[0].casefold().rstrip(".") not in _SCRIPT_HEADINGS:
+            spoken.append(label[2])
+            speaking = False
+        elif text.isupper() and len(text.split()) <= 3 and not text.endswith((".", ":")) and text.split()[0].rstrip(".") not in ("INT", "EXT"):
+            speaking = True
+        elif speaking:
+            spoken.append(text)
+    return spoken
+
+
+def _script_words(text: str) -> list[str]:
+    return re.findall(r"[^\W_]+(?:'[^\W_]+)*", re.sub(r"\([^)]*\)|\[[^\]]*\]", " ", text).casefold().replace("\u2019", "'"))
+
+
+def says(text: str, line: str) -> bool:
+    """Whether a text has a line word for word: capitals, punctuation and directions do not count."""
+    run = lambda words: f" {' '.join(words)} "
+    return run(_script_words(line)) in run(_script_words(text))
+
+
+def script_differences(doc: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """The script's spoken lines that no shot in the edit says word for word, and the lines of shots (other than those the user edited) that the script does not have.
+    Capitals and punctuation do not count, and a line can run over several shots."""
+    run = lambda lines: f" {' '.join(word for line in lines for word in _script_words(line))} "
+    written = [line for line in script_speech(doc) if _script_words(line)]
+    shots = [shot for shot in doc["shots"] if shot.get("included", True)]
+    said, script = run(line["line"] for shot in shots for line in shot.get("dialogue") or []), run(written)
+    missing = [line for line in written if run([line]) not in said]
+    added = [f"{shot['id']}: {line['line']}" for shot in shots if written and shot.get("updated_by") != "user" for line in shot.get("dialogue") or [] if _script_words(line["line"]) and run([line["line"]]) not in script]
+    return missing, added
+
+
 def _lyric_words(text: str) -> list[str]:
     return re.findall(r"[a-z0-9']+", text.lower().replace("\u2019", "'"))
 
@@ -295,6 +363,53 @@ def sung_lines(lines: list[str], words: list[tuple[str, float, float]]) -> list[
             item.update(sung=True, start_s=round(start, 2), end_s=round(floor, 2))
         result.append(item)
     return result
+
+
+WORD_CUT_MARGIN_S = 0.1  # a cut before a word heard: its start is known to about this much
+
+
+def _heard_tokens(text: str) -> list[str]:
+    """A text's words, in any alphabet; each character of the scripts written without spaces."""
+    return re.findall(r"[\u3040-\u30ff\u3400-\u9fff]|[^\W_\u3040-\u30ff\u3400-\u9fff]+(?:'[^\W_]+)*", text.casefold().replace("\u2019", "'"))
+
+
+def heard_lines(lines: list[str], words: list[tuple[str, float, float]]) -> dict[str, Any]:
+    """A take against the lines its model was asked to say, from the words heard in it [(word, start, end)]: the lines it does not say, those it says with a word heard differently, the words
+    it adds before, between and after them, and where to cut. A line is found where most of its words come close together, not where half of them are scattered: a model that gets a line wrong
+    still says some of its words. Nothing is cut around a line it did not find, nor between two lines: that would jump."""
+    heard = [(token, start, end) for word, start, end in words for token in _heard_tokens(word)]
+    said, spans, missing, inexact, offset = [token for token, _, _ in heard], [], [], [], 0
+    for line in lines:
+        wanted, best = _heard_tokens(line), None
+        for start in range(offset, len(said)):
+            pairs = _aligned(wanted, said[start:start + len(wanted) + 2])
+            if pairs and (best is None or len(pairs) > len(best[1])):
+                best = (start, pairs)
+        if best is None or len(best[1]) * 5 < len(wanted) * 4:
+            missing.append(line)
+            continue
+        spans.append((best[0] + best[1][0][1], best[0] + best[1][-1][1]))
+        offset = spans[-1][1] + 1
+        if len(best[1]) < len(wanted):
+            inexact.append(line)
+    before = said[:spans[0][0]] if spans else []
+    after = said[spans[-1][1] + 1:] if spans else []
+    result = {"text": " ".join(word.strip() for word, _, _ in words), "missing": missing, "inexact": inexact, "before": " ".join(before), "after": " ".join(after),
+              "between": [" ".join(said[left[1] + 1:right[0]]) for left, right in zip(spans, spans[1:]) if right[0] > left[1] + 1], "cut": None}
+    if spans and not missing and (before or after):
+        first, last = spans[0][0], spans[-1][1]
+        start = heard[first][1] - min(WORD_CUT_MARGIN_S, max(0.0, heard[first][1] - heard[first - 1][2]) / 2) if before else 0.0
+        end = heard[last + 1][1] - min(WORD_CUT_MARGIN_S, max(0.0, heard[last + 1][1] - heard[last][2]) / 2) if after else None
+        result["cut"] = [round(start, 2), None if end is None else round(end, 2)]
+    return result
+
+
+def follow_line_cut(shot: dict[str, Any]) -> None:
+    """A trim made around a take's own lines follows the take in use and the shot's switch; any other trim was set on purpose, and stays."""
+    if (shot.get("trim") or [0.0, None]) != (shot.get("line_cut") or [0.0, None]):
+        return
+    cut = ((chosen_take(shot) or {}).get("heard") or {}).get("cut") if shot.get("cut_extra_words", True) else None
+    shot["line_cut"], shot["trim"] = copy.deepcopy(cut), copy.deepcopy(cut) if cut else [0.0, None]
 
 
 def checked_lyrics(doc: dict[str, Any]) -> list[dict[str, Any]] | None:
@@ -395,7 +510,7 @@ def timeline(doc: dict[str, Any]) -> list[dict[str, Any]]:
     for shot in included:
         take = chosen_take(shot)
         start_trim, end_trim = (list(shot.get("trim") or [0.0, None]) + [None, None])[:2]
-        length = (take or {}).get("duration_s") or (shot.get("duration_s") if song_driven else planned_length(shot)) or 0.0
+        length = (take or {}).get("duration_s") or (shot.get("duration_s") if song_driven or doc["brief"].get("voices_from_model") else planned_length(shot)) or 0.0
         end = end_trim if end_trim is not None else length if take is None else out_point(shot, length)
         duration = round(max(0.0, float(end) - float(start_trim or 0.0)) / speed_of(shot, take) * fps) / fps
         transition = shot.get("transition") or {}
@@ -539,6 +654,8 @@ def edit_key(doc: dict[str, Any]) -> str:
            for shot, take in sequence(doc)]  # listed only when set: older exports stay up to date
     edit = {key: doc["edit"].get(key) for key in ("audio_mode", "song_start_s", "audio_tracks", "subtitles", "fps")}
     edit["overlays"] = [{key: item.get(key) for key in ("path", "start_s", "end_s", "fade_s")} for item in doc["edit"].get("overlays", [])]
+    if doc["edit"].get("level_voices") and doc["brief"].get("voices_from_model"):  # listed only when set: older exports stay up to date
+        edit["level_voices"] = True
     return hashlib.sha1(json.dumps([cut, edit, doc["brief"].get("song")], sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
 
 
@@ -556,7 +673,7 @@ def summary(doc: dict[str, Any], sequence: str | None = None) -> dict[str, Any]:
         "style": doc["style"], "shot_counts": counts, "total_s": cut_length(doc),
         "shots": [{"id": shot["id"], "title": shot["title"], "section": shot["section"], "duration_s": shot["duration_s"], "status": shot["status"], "locked": shot["locked"],
                    "included": shot["included"], "cast": shot["cast"], "prompt": shot_prompt(shot)[:prompt_chars], "takes": len(shot["takes"]), "chosen_take": shot["chosen_take"],
-                   **({"dialogue": shot["dialogue"]} if shot.get("dialogue") else {}), **({"speed": shot["speed"]} if shot["speed"] != 1.0 else {}), **({"sound": False} if not shot["sound"] else {}),
+                   **({"dialogue": shot["dialogue"]} if shot.get("dialogue") else {}), **({"speed": shot["speed"]} if shot["speed"] != 1.0 else {}), **({"sound": False} if not shot["sound"] else {}), **({"cut_extra_words": False} if not shot.get("cut_extra_words", True) else {}),
                    "verdict": (chosen_take(shot) or {}).get("verdict"), "take_path": (chosen_take(shot) or {}).get("path"), "notes": shot["notes"],
                    **({"changed_by_user": True} if shot.get("updated_by") == "user" else {})}
                   for shot in shots],
@@ -572,7 +689,7 @@ def summary(doc: dict[str, Any], sequence: str | None = None) -> dict[str, Any]:
 # Operations ---------------------------------------------------------------------------------------------------------------------------
 
 BRIEF_FIELDS = {"kind", "title", "text", "song", "script", "references", "duration_s", "aspect", "resolution", "style_tags", "style", "pacing", "language", "plan_first", "budget_minutes",
-                "templates", "read_other_productions", "review_before_edit", "shot_min_s", "shot_max_s"}
+                "templates", "read_other_productions", "review_before_edit", "shot_min_s", "shot_max_s", "voices_from_model"}
 DEFAULT_LENGTH_S = 30.0  # what the Brief shows and plans for until the user sets a length
 
 
@@ -587,7 +704,7 @@ def shot_range_words(doc: dict[str, Any]) -> str:
     return f"{low:g} to {high:g} s" if low and high else f"at least {low:g} s" if low else f"at most {high:g} s" if high else ""
 GENERATION_SHORTHAND = {"prompt", "negative_prompt", "audio_guide", "image_refs", "image_start", "video_length", "seed", "template", "settings"}
 SHOT_FIELDS = {"title", "section", "intent", "camera", "cast", "dialogue", "duration_s", "audio_slice", "generation", "status", "locked", "included", "chosen_take", "trim", "speed", "sound",
-               "transition", "notes"}
+               "transition", "notes", "cut_extra_words"}
 SPEEDS = (0.25, 4.0)  # what a browser plays with its sound and the export's filters handle
 CAST_FIELDS = {"name", "role", "description", "images", "master", "voice", "voice_description", "voice_text", "lora", "locked", "looks"}
 MEDIA_SETTINGS = {"image_refs", "image_start", "image_end", "image_guide", "image_mask", "video_guide", "video_mask", "video_source", "audio_guide", "audio_guide2",
@@ -665,6 +782,8 @@ def _set_shot_fields(shot: dict[str, Any], fields: dict[str, Any], by: str, revi
         else:
             shot[key] = copy.deepcopy(value)
         changed.append(key)
+    if {"chosen_take", "cut_extra_words"} & set(fields):
+        follow_line_cut(shot)
     if by == "user" and set(fields) - {"status"}:  # the user's last change of the shot: it protects it from the director's stale writes and replans
         shot["updated_by"], shot["updated_rev"] = by, revision
     return changed
@@ -746,6 +865,7 @@ def _add_take(shot: dict[str, Any], take: dict[str, Any], by: str) -> dict[str, 
     shot["chosen_take"] = record["id"]
     if shot["status"] in ("planned", "queued", "rendering", "failed", "rejected"):
         shot["status"] = "rendered"
+    follow_line_cut(shot)
     return record
 
 
@@ -956,6 +1076,13 @@ def _op_verdict(doc, op, by, revision, base_revision):
         shot["status"] = "rendered" if op.get("ok") else "rejected"
 
 
+def _op_heard(doc, op, by, revision, base_revision):
+    """What was heard in a take whose model says the shot's lines (see heard_lines)."""
+    shot = find(doc["shots"], op.get("shot"), "shot")
+    find(shot["takes"], op.get("take"), "take")["heard"] = copy.deepcopy(op.get("heard"))
+    follow_line_cut(shot)
+
+
 def _op_remove_take(doc, op, by, revision, base_revision):
     shot = find(doc["shots"], op.get("shot"), "shot")
     take = find(shot["takes"], op.get("take"), "take")
@@ -964,6 +1091,7 @@ def _op_remove_take(doc, op, by, revision, base_revision):
     shot["takes"].remove(take)
     if shot["chosen_take"] == take["id"]:
         shot["chosen_take"] = shot["takes"][-1]["id"] if shot["takes"] else None
+        follow_line_cut(shot)
     if not shot["takes"]:
         shot["status"] = "planned"
 
@@ -1129,6 +1257,8 @@ def version_changes(old: dict[str, Any], new: dict[str, Any], limit: int = 40, l
     lines += [f"Text «{key[1]}» moved" for key, when in timing(new).items() if key in timing(old) and timing(old)[key] != when]
     if old["edit"].get("audio_mode") != new["edit"].get("audio_mode"):
         lines.append(f"Soundtrack: {old['edit'].get('audio_mode')} → {new['edit'].get('audio_mode')}")
+    if bool(old["edit"].get("level_voices")) != bool(new["edit"].get("level_voices")):
+        lines.append("Voices evened out" if new["edit"].get("level_voices") else "Voices as the model made them")
     cuts = lambda doc: [[track.get(key) for key in ("in_s", "out_s", "fade_in_s", "fade_out_s")] for track in doc["edit"].get("audio_tracks", [])]
     if [track.get("path") for track in old["edit"].get("audio_tracks", [])] != [track.get("path") for track in new["edit"].get("audio_tracks", [])]:
         counts = len(old["edit"].get("audio_tracks", [])), len(new["edit"].get("audio_tracks", []))
@@ -1284,7 +1414,7 @@ def _op_bin_to_take(doc, op, by, revision, base_revision):
     return result
 
 
-_OPS = {"brief": _op_brief, "style": _op_style, "stage": _op_stage, "add_cast": _op_add_cast, "update_cast": _op_update_cast, "remove_cast": _op_remove_cast,
+_OPS = {"heard": _op_heard, "brief": _op_brief, "style": _op_style, "stage": _op_stage, "add_cast": _op_add_cast, "update_cast": _op_update_cast, "remove_cast": _op_remove_cast,
         "add_shots": _op_add_shots, "replace_plan": _op_replace_plan, "update_shot": _op_update_shot, "remove_shot": _op_remove_shot, "move_shots": _op_move_shots,
         "reorder": _op_reorder, "add_take": _op_add_take, "verdict": _op_verdict, "remove_take": _op_remove_take, "edit": _op_edit, "log": _op_log,
         "director": _op_director, "line_audio": _op_line_audio, "bring_back": _op_bring_back, "restore_version": _op_restore_version, "outline": _op_outline, "add_overlay": _op_add_overlay, "update_overlay": _op_update_overlay,

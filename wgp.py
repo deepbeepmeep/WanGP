@@ -4,7 +4,7 @@ import os, sys
 for _stream in (sys.stdout, sys.stderr): _stream.reconfigure(encoding="utf-8", errors="replace")
 from tqdm import tqdm
 
-WanGP_version = "19.13"
+WanGP_version = "19.14"
 _welcome_message = f" WanGP v{WanGP_version} - Copyright (c) 2024-2026 DeepBeepMeep "
 tqdm.write(f"\033[1m\033[93m{_welcome_message:*^100}\033[0m")
 
@@ -2318,7 +2318,18 @@ def _pop_runtime_task_priority(task):
     raw_value = params.pop("priority", None) if isinstance(params, dict) else None
     if raw_value is None:
         raw_value = task.pop("priority", None)
-    return _normalize_inline_queue_priority(raw_value)
+    priority = _normalize_inline_queue_priority(raw_value)
+    if priority:
+        task["queue_priority"] = True
+    return priority
+
+
+def _admit_priority_tasks(queue, tasks):
+    """After the running task and the priority tasks already waiting: they keep their order, ahead of the tasks added by hand."""
+    position = 1
+    while position < len(queue) and queue[position].get("queue_priority"):
+        position += 1
+    queue[position:position] = tasks
 
 
 def load_queue_action(filepath, state, evt:gr.EventData):
@@ -2414,7 +2425,7 @@ def load_queue_action(filepath, state, evt:gr.EventData):
             task_id = max_existing_id + len(newly_loaded_queue) + 1
             with lock:
                 if priority_tasks:
-                    original_queue[1:1] = priority_tasks
+                    _admit_priority_tasks(original_queue, priority_tasks)
                 if regular_tasks:
                     original_queue.extend(regular_tasks)
                 gen["queue"] = original_queue
@@ -4602,7 +4613,7 @@ else:
         transformer = get_transformer_model(wan_model)
         if hasattr(wan_model, "get_trans_lora"):
             transformer, _ = wan_model.get_trans_lora()
-        setup_loras(transformer_type, transformer,  get_lora_dir(transformer_type), "", None)
+        setup_loras(transformer_type, transformer, get_lora_dir(transformer_type), "", getattr(transformer, "split_linear_modules_map", None))
         exit()
 
 gen_in_progress = False

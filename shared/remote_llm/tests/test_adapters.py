@@ -28,7 +28,7 @@ from shared.remote_llm.images import temporary_image_paths
 from shared.mcp.bridge import build_tool_proxy
 from shared.remote_llm.opencode_backend import OpenCodeBackend
 from shared.remote_llm.base import BackendEvent
-from shared.remote_llm.deepy_runner import _visual_query, run_remote_deepy_turn
+from shared.remote_llm.deepy_runner import REMOTE_HISTORY_MAX_CHARS, _restored_history, _visual_query, run_remote_deepy_turn
 from shared.remote_llm.usage import build_remote_usage_stats, claude_context_window
 from shared.prompt_enhancer.qwen35_assistant_runtime import extract_tool_calls
 
@@ -1165,6 +1165,12 @@ class RemoteLLMAdapterTests(unittest.TestCase):
         result = asyncio.run(server._tool_manager.call_tool("wangp_generate", {"prompt": "sunset", "steps": 8}))
         self.assertEqual(result, {"status": "done"})
         self.assertEqual(calls, [("wangp_generate", {"prompt": "sunset", "steps": 8})])
+        calls.clear()
+        asyncio.run(server._tool_manager.call_tool("wangp_generate", {"prompt": "sunset"}))
+        self.assertEqual(calls, [("wangp_generate", {"prompt": "sunset"})])  # a parameter left out does not reach WanGP as null
+        calls.clear()
+        asyncio.run(server._tool_manager.call_tool("wangp_generate", {"prompt": "sunset", "steps": None}))
+        self.assertEqual(calls, [("wangp_generate", {"prompt": "sunset", "steps": None})])  # an explicit null does
 
     def test_temporary_image_paths_are_removed(self):
         with temporary_image_paths([Image.new("RGB", (4, 4), "red")]) as paths:
@@ -1200,6 +1206,59 @@ class RemoteLLMAdapterTests(unittest.TestCase):
         self.assertEqual([block["text"] for block in assistant_record["blocks"] if block["type"] == "markdown"], ["I will generate.", "Done."])
         status_events = [json.loads(payload)["event"].get("status") for command, payload in sent if command == "chat_output" and json.loads(payload)["event"]["type"] == "status"]
         self.assertIn({"visible": True, "kind": "tool", "text": "Generate - sunset..."}, status_events)
+
+    def test_remote_engine_receives_the_turns_it_has_not_seen(self):
+        class Recording(_ClosableBackend):
+            def __init__(self):
+                super().__init__()
+                self.prompts = []
+
+            def run_turn(self, text, **_kwargs):
+                self.prompts.append(text)
+                return "answer"
+
+            def interrupt(self):
+                pass
+
+        session = AssistantSessionState()
+        codex, claude = Recording(), Recording()
+
+        def turn(engine, text):
+            user_id, _event = assistant_chat.add_user_message(session, text)
+            begin_assistant_turn(session, user_id, text)
+            run_remote_deepy_turn({"llm_engines": {"deepy": engine}}, session, text, "system", _FakeToolbox(), lambda *_args: None)
+
+        with patch("shared.remote_llm.deepy_runner.create_backend", side_effect=[codex, claude]):
+            turn("codex", "first")
+            turn("codex", "second")
+            turn("claude", "third")
+            turn("codex", "fourth")
+        self.assertNotIn("wangp_conversation_history", codex.prompts[0])
+        self.assertNotIn("wangp_conversation_history", codex.prompts[1])
+        history = claude.prompts[0].split("</wangp_conversation_history>")[0]
+        self.assertIn("first", history)
+        self.assertIn("second", history)
+        history = codex.prompts[2].split("</wangp_conversation_history>")[0]
+        self.assertIn("third", history)  # what the other engine did, and nothing it already holds
+        self.assertNotIn("second", history)
+
+    def test_restored_history_keeps_the_latest_messages_whole(self):
+        results = [{"role": "tool", "tool_call_id": str(number), "content": f"result {number} " + "x" * 100_000} for number in range(10)]
+        messages = [{"role": "user", "content": "first words"}, *results, {"role": "assistant", "content": "latest words"}]
+        history, cut = _restored_history(messages)
+        self.assertTrue(cut)
+        self.assertLessEqual(len(json.dumps(history, ensure_ascii=False)), REMOTE_HISTORY_MAX_CHARS)
+        self.assertEqual(history[0]["content"], "first words")
+        self.assertEqual(history[-1]["content"], "latest words")
+        self.assertIn("characters shortened", history[1]["content"])
+        self.assertTrue(history[1]["content"].startswith("result 0"))
+        self.assertEqual(history[-2]["content"], results[-1]["content"])
+        self.assertEqual(_restored_history(messages[:2]), ([{"role": "user", "content": "first words"}, {"role": "tool", "tool_call_id": "0", "content": results[0]["content"]}], False))
+        words = [{"role": "user", "content": f"{number} " + "y" * 100_000} for number in range(10)]  # nothing left to shorten: the oldest go
+        history, cut = _restored_history(words)
+        self.assertTrue(cut)
+        self.assertLessEqual(len(json.dumps(history, ensure_ascii=False)), REMOTE_HISTORY_MAX_CHARS)
+        self.assertEqual(history[-1]["content"], words[-1]["content"])
 
     def test_remote_deepy_keeps_codex_alive_while_browser_login_completes(self):
         session = AssistantSessionState()

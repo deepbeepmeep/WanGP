@@ -309,7 +309,7 @@ function soundPanel(doc) {
   const tracks = edit.audio_tracks.length ? count(edit.audio_tracks.length, 'track') + ' over the edit' : 'no track over the edit';
   return `<div class="panel"><div class="panel-head"><h3>Sound and subtitles</h3><span class="hint">What the export plays and shows, besides the picture</span></div>
     <div class="col" style="gap:14px">
-      <div class="row" style="flex-wrap:wrap"><span class="label" style="margin:0">${icon('music')} Sound</span><span>${soundtrack} · ${tracks}</span><span class="grow"></span>
+      <div class="row" style="flex-wrap:wrap"><span class="label" style="margin:0">${icon('music')} Sound</span><span>${soundtrack}${edit.level_voices && doc.brief.voices_from_model && edit.audio_mode !== 'song' ? ', voices evened out' : ''} · ${tracks}</span><span class="grow"></span>
         <button class="btn small" id="edit-sound" title="The soundtrack and the tracks (narration, score, effects) are placed on the Timeline">${icon('timeline')} Edit on the Timeline</button></div>
       <div><div class="label">${icon('note')} Subtitles <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">a track the viewer turns on, never burnt into the picture</span></div>
         ${edit.subtitles.length ? edit.subtitles.map((item, index) => `<div class="row" style="font-size:13px"><b>${esc(name(item.path))}</b><span class="chip">${esc(item.language || 'eng')}</span><span class="grow"></span>

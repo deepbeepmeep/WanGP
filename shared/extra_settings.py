@@ -108,6 +108,11 @@ def _resolve_model_def(configs: dict[str, Any] | None, model_def: dict[str, Any]
     return _MODEL_DEF_PROVIDER(model_type) if len(model_type) > 0 else None
 
 
+def model_def_of_settings(configs: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The model def of the model named in saved settings; None when they name none or that model is gone."""
+    return _resolve_model_def(configs)
+
+
 def _with_data_context(data: dict[str, Any] | None, **context: Any) -> dict[str, Any]:
     merged = dict(context)
     if isinstance(data, dict):

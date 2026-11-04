@@ -10,7 +10,7 @@ import torch.cuda.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from .vae import _blend_h_edge_, _blend_v_edge_, _vae_float_to_cpu_uint8, _kernels, _use_fast, _causal_input, _residual_fast, _resample_fast, _run_part, _exact_segments, _exact_calls, _exact_decode, _exact_encode, _attention_fast
+from .vae import _blend_h_edge_, _blend_v_edge_, _vae_float_to_cpu_uint8, _kernels, _use_fast, _causal_input, _residual_fast, _resample_fast, _run_part, _exact_segments, _exact_calls, _exact_decode, _exact_encode, _attention_fast, ExactStream
 
 __all__ = [
     "Wan2_2_VAE",
@@ -811,8 +811,26 @@ def count_conv3d(model):
     return count
 
 
+class VAEStream:
+    """A video encoded or decoded chunk after chunk over several calls (windows of a long video): the causal state between the calls, with
+    tiles equal to the untiled result where the fast path can tile them. encode/decode chunks are those of WanVAE_.encode/decode."""
+
+    def __init__(self, net, exact=None):
+        self.cache = [None] * count_conv3d(net)
+        self.exact = exact
+        self.first = isinstance(net, Decoder3d)
+
+    def run(self, net, x):
+        first, self.first = self.first, False
+        if self.exact is not None:
+            out = []
+            self.exact.run(x, first, lambda region, y: out.append((region, y)))
+            return out
+        return net(x, feat_cache=self.cache, feat_idx=[0], first_chunk=first) if isinstance(net, Decoder3d) else net(x, feat_cache=self.cache, feat_idx=[0])
+
+
 class WanVAE_(nn.Module):
-    _offload_hooks = ['encode', 'decode']
+    _offload_hooks = ['encode', 'decode', 'stream_encode', 'stream_decode']
     def __init__(
         self,
         dim=160,
@@ -936,10 +954,35 @@ class WanVAE_(nn.Module):
                     feat_idx=self._conv_idx))
         self.clear_cache()
         out = torch.cat(out_list, 2)
-        out = unpatchify(out, patch_size=2)        
+        out = unpatchify(out, patch_size=2)
         return out
 
-   
+    def stream_encode(self, x, stream, scale):
+        """The latent of the next chunk of a stream (the first frame, then 4 frames at a time, with the first call's frames counted as WanVAE_.encode)."""
+        x = patchify(x, patch_size=2)
+        out = stream.run(self.encoder, x)
+        if stream.exact is not None:
+            parts, out = out, None
+            for region, y in parts:
+                if out is None:
+                    out = y.new_empty((*y.shape[:3], x.shape[-2] // 8, x.shape[-1] // 8))
+                out[..., region[0][0]:region[0][1], region[1][0]:region[1][1]] = y
+        mu = self.conv1(out).chunk(2, dim=1)[0]
+        return (mu - scale[0].view(1, self.z_dim, 1, 1, 1)) * scale[1].view(1, self.z_dim, 1, 1, 1)
+
+    def stream_decode(self, z, stream, scale):
+        """The frames of the next latent frame z (batch, channels, 1, height, width) of a stream, as WanVAE_.decode gives them for the whole video."""
+        out = stream.run(self.decoder, self.conv2(z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(1, self.z_dim, 1, 1, 1)))
+        if stream.exact is None:
+            return unpatchify(out, patch_size=2)
+        frames = None
+        for region, y in out:
+            y = unpatchify(y.contiguous(), patch_size=2)
+            if frames is None:
+                frames = y.new_empty((*y.shape[:3], z.shape[-2] * 16, z.shape[-1] * 16))
+            frames[..., region[0][0] * 2:region[0][1] * 2, region[1][0] * 2:region[1][1] * 2] = y
+        return frames
+
     def blend_v(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
         blend_extent = min(a.shape[-2], b.shape[-2], blend_extent)
         for y in range(blend_extent):
@@ -1393,6 +1436,32 @@ class Wan2_2_VAE:
             return [ self.model.spatial_tiled_decode(u.to(self.dtype).unsqueeze(0), scale, tile_size, any_end_frame=any_end_frame).clamp_(-1, 1).float().squeeze(0) for u in zs ]
         else:
             return [ self.model.decode(u.to(self.dtype).unsqueeze(0), scale, any_end_frame=any_end_frame).clamp_(-1, 1).float().squeeze(0) for u in zs ]
+
+    def _exact_stream(self, net, decoder, frame_size, tile_size):
+        """Exact tiles for a stream of frames of frame_size in pixels, where encode and decode would tile them (Low VRAM level, or a frame large for the GPU when encoding)."""
+        size = tuple(s // 16 for s in frame_size) if decoder else tuple(s // 2 for s in frame_size)
+        if not (tile_size > 0 and mmgp_vram_allocator() and _use_fast(torch.empty(0, dtype=self.dtype, device=self.device))):
+            return None
+        memory = torch.cuda.get_device_properties(self.device).total_memory
+        if not decoder and tile_size > 256 and (memory >= 12e9 and frame_size[0] * frame_size[1] <= 1280 * 720 or memory >= 24e9 and frame_size[0] * frame_size[1] <= 1920 * 1088):
+            return None
+        return ExactStream(net, _exact_segments(net, size, tile_size // 2, decoder), size)
+
+    def encode_stream(self, frame_size, tile_size=0):
+        """A stream of frames of frame_size (height, width): pass stream_encode the first frame, then 4 frames at a time."""
+        return VAEStream(self.model.encoder, exact=self._exact_stream(self.model.encoder, False, frame_size, tile_size))
+
+    def decode_stream(self, frame_size, tile_size=0):
+        """A stream of latent frames of frames of frame_size (height, width), for stream_decode."""
+        return VAEStream(self.model.decoder, exact=self._exact_stream(self.model.decoder, True, frame_size, tile_size))
+
+    def stream_encode(self, frames, stream):
+        """frames (3, T, H, W) in [-1, 1] on the GPU: the next chunk's latent (channels, 1, height, width), float32."""
+        return self.model.stream_encode(frames.to(device=self.device, dtype=self.dtype).unsqueeze(0), stream, [u.to(device=self.device) for u in self.scale]).float().squeeze(0)
+
+    def stream_decode(self, latent, stream):
+        """latent (channels, 1, height, width): the next frames (3, T, H, W) in [-1, 1] on the GPU, in the VAE's dtype."""
+        return self.model.stream_decode(latent.to(device=self.device, dtype=self.dtype).unsqueeze(0), stream, [u.to(device=self.device) for u in self.scale]).clamp_(-1, 1).squeeze(0)
 
     def decode_to_cpu_uint8(self, zs, tile_size=256, target_frames=None, target_height=None, target_width=None, any_end_frame=False):
         scale = [u.to(device=self.device) for u in self.scale]

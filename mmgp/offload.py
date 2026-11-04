@@ -651,14 +651,15 @@ def _subtensors_nbytes(sub_tensors):
     return sum(torch.numel(t) * t.element_size() for _, t in sub_tensors)
 
 def _get_tensor_ref(p):
+    # the address that tied tensors share. A tensor without elements has none (data_ptr() is 0, even on a view of a buffer): it shares nothing
     sub_tensors = _get_quantized_subtensors(p)
     if sub_tensors:
         for _, t in sub_tensors:
             ref = t.data_ptr()
             del sub_tensors
-            return ref
+            return ref or id(p)
         del sub_tensors
-    return p.data_ptr()
+    return p.data_ptr() or id(p)
 
 BIG_TENSOR_MAX_SIZE = 2**28 # 256 MB
 BLOCK_ALIGN = 512 # alignment of the tensors packed in pinned memory and in the VRAM buffer of a block: that of the CUDA caching allocator
@@ -1257,7 +1258,7 @@ DROP_UNREFERENCED_PAGES = True # comparison switch: once the models are profiled
 
 if os.name == "nt":
     class _MemoryInformation(ctypes.Structure):
-        _fields_ = [("BaseAddress", ctypes.c_void_p), ("AllocationBase", ctypes.c_void_p), ("AllocationProtect", ctypes.c_ulong), ("PartitionId", ctypes.c_ushort),
+        _fields_ = [("BaseAddress", ctypes.c_size_t), ("AllocationBase", ctypes.c_void_p), ("AllocationProtect", ctypes.c_ulong), ("PartitionId", ctypes.c_ushort),
                     ("RegionSize", ctypes.c_size_t), ("State", ctypes.c_ulong), ("Protect", ctypes.c_ulong), ("Type", ctypes.c_ulong)]
     _virtual_query = ctypes.WinDLL("kernel32", use_last_error=True).VirtualQuery
     _virtual_query.argtypes = (ctypes.c_void_p, ctypes.POINTER(_MemoryInformation), ctypes.c_size_t)
@@ -1787,38 +1788,57 @@ def _pin_sd_to_memory(sd, sd_name, tied_weights = None, gig_tensor_size = BIG_TE
   
     big_tensors_sizes.append(current_big_tensor_size)
 
-    big_tensors = []
+    big_tensors, owners = [], []
     last_big_tensor = 0
-    total = 0  
+    total = 0
+    planned = 0 # page-rounded bytes of the blocks, locked only once they are filled
     incomplete_pinning = False
     cap = _get_max_reservable_memory(_get_perc_reserved_mem_max())
     for size in big_tensors_sizes:
-        current_big_tensor = pinned.empty(size, "lora", cap)
+        rounded = -(-size // pinned.PAGE) * pinned.PAGE
+        try:
+            current_big_tensor, owner = pinned.block(rounded) if pinned.fits(planned + rounded, cap) else (None, None)
+        except (MemoryError, RuntimeError):
+            pinned.refused(planned + rounded)
+            current_big_tensor = None
         if current_big_tensor is None:
             incomplete_pinning = True
             print(f"Unable to pin more tensors for '{sd_name}' as the maximum reservable memory has been reached ({total/ONE_MB:.2f} MB). Transfer speed from RAM to VRAM may be slower.")
             break
-        big_tensors.append(current_big_tensor)
+        big_tensors.append(current_big_tensor[:size])
+        owners.append(owner)
         last_big_tensor += 1
         total += size
+        planned += rounded
 
-    tensor_no = 0
-    tied = {} if tied_weights is None else tied_weights
-    for n, p  in sd.items():
-        if n not in tied:
-            big_tensor_no, offset, length = tensor_map_indexes[tensor_no]
-            if big_tensor_no>=0 and big_tensor_no < last_big_tensor:
-                current_big_tensor = big_tensors[big_tensor_no]
-                length = torch.numel(p.data) * p.data.element_size()
-                q = _move_to_pinned_tensor(p.data, current_big_tensor, offset, length)
-                torch.utils.swap_tensors(p, q)
-                del q
-            tensor_no += 1
-        del p
+    # as for models (_pin_to_memory): copied by threads, which read what a drive must read ahead, fault the new pages and release the sources
+    # (locking the pages first would commit them one by one in the driver); then locked in place, which takes about 1 ms per 256 MB
+    copier = _ReadAheadPinningCopier()
+    copier.start_block(0)
+    try:
+        tensor_no = 0
+        tied = {} if tied_weights is None else tied_weights
+        for n, p  in sd.items():
+            if n not in tied:
+                big_tensor_no, offset, length = tensor_map_indexes[tensor_no]
+                if big_tensor_no>=0 and big_tensor_no < last_big_tensor:
+                    current_big_tensor = big_tensors[big_tensor_no]
+                    length = torch.numel(p.data) * p.data.element_size()
+                    q = _move_to_pinned_tensor(p.data, current_big_tensor, offset, length, copier)
+                    torch.utils.swap_tensors(p, q)
+                    del q
+                tensor_no += 1
+            del p
+    finally:
+        copier.close()
+    for current_big_tensor, owner, size in zip(big_tensors, owners, big_tensors_sizes):
+        if owner is not None: # refused: its tensors stay in normal RAM
+            owner.registration = pinned.lock(owner.base, current_big_tensor.data_ptr(), -(-size // pinned.PAGE) * pinned.PAGE, "lora")
+            if owner.registration is None:
+                pinned.refused(size)
+                incomplete_pinning = True
     for n, q_name in tied.items(): # once their targets are pinned (or, beyond the budget, left where they were), wherever they come in sd
         sd[n].data = sd[q_name].data
-    gc.collect()
-    torch.cuda.empty_cache()
 
 
     if verboseLevel >=1:
@@ -1868,8 +1888,9 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
             include = False
 
         if include:
-            params_dict.update( { k + '.' + n : (p,  False) for n, p in sub_module.named_parameters(recurse=False) if (ranks is None or id(p) in ranks) and not _is_mapped(p) }  )
-            params_dict.update( { k + '.' + n : (b,  True) for n, b in sub_module.named_buffers(recurse=False) if ranks is None or id(b) in ranks }  )
+            # tensors without elements have no bytes to pin (alone in a buffer, the driver would refuse to lock it)
+            params_dict.update( { k + '.' + n : (p,  False) for n, p in sub_module.named_parameters(recurse=False) if (ranks is None or id(p) in ranks) and not _is_mapped(p) and p.numel() }  )
+            params_dict.update( { k + '.' + n : (b,  True) for n, b in sub_module.named_buffers(recurse=False) if (ranks is None or id(b) in ranks) and b.numel() }  )
     origins = {}
     if ranks is not None:
         # blocks of their own (a rank is an entry): those copied from a checkpoint mapping first, then those made at load, in buffers apart
@@ -3927,11 +3948,12 @@ def linear_rows_supported(modules, x):
 
 def prepare_linear_input(x_list, modules):
     """Prepares x, handed off in x_list, for modules computed by ranges of rows (check linear_rows_supported first): the activation of
-    each weight format once, x @ A once per LoRA adapter. x itself is kept only for plain weights and diff adapters."""
+    each weight format once, x @ A once per LoRA factor (q, k and v of a LoRA on a fused projection share one A). x itself is kept only for
+    plain weights and diff adapters."""
     x = x_list[0]
     x_list.clear()
     shape, x = x.shape[:-1], x.reshape(-1, x.shape[-1])
-    prepared, providers, lora, keep_x = {}, {}, {}, False
+    prepared, providers, lora, keep_x, products = {}, {}, {}, False, {}
     for module in modules:
         provider = providers[module] = _row_projection(module, x)
         key = provider.key(module)
@@ -3943,8 +3965,33 @@ def prepare_linear_input(x_list, modules):
             if data[5].get("type", "lora") == "diff":
                 keep_x = True
             elif data[0] is not None:
-                lora[(module, adapter)] = x @ data[0].to(x.dtype).T
+                product = products.get(id(data[0]))
+                if product is None:
+                    product = products[id(data[0])] = x @ data[0].to(x.dtype).T
+                lora[(module, adapter)] = product
     return LinearInput(shape, x if keep_x else None, prepared, providers, lora)
+
+
+def fusion_with_loras(module):
+    """Whether a fused kernel can compute module's base output, its LoRAs then added to that output (_lora_linear_forward): its own forward
+    takes the fused operands, and each active adapter has a low-rank or diff form."""
+    return getattr(module, "_mm_requires_native_linear_forward", False) and _row_lora_adapters(module) is not None
+
+
+class _AliasedLoraSlots:
+    """The LoRA slots (data, index) of one tensor, as one holder of a graph's extra inputs: one static copy, and the graph sees one tensor."""
+    __slots__ = ("slots",)
+
+    def __init__(self, slots):
+        self.slots = slots
+
+    def __getitem__(self, _):
+        data, index = self.slots[0]
+        return data[index]
+
+    def __setitem__(self, _, value):
+        for data, index in self.slots:
+            data[index] = value
 
 
 def linear_rows(module, linear_input, start, stop):
@@ -4373,7 +4420,8 @@ class offload:
             items, all_pinned = [], not _pool.involved(self, entry_name) # a block of the pinned pool keeps the layout of its pageable tensors
             for i, (_, _, p, _, tied_param) in enumerate(self.blocks_of_modules[entry_name]):
                 t = p.data if type(p) is torch.nn.Parameter else p
-                leaves = _staging_leaves(t) if tied_param is None and self.stager.checked_classes.get(type(t), None) is not False else None
+                # a tensor without elements stays out of the block's buffer: no bytes, no address (data_ptr() is 0, even on a view), never pinned on its own
+                leaves = _staging_leaves(t) if tied_param is None and t.numel() and self.stager.checked_classes.get(type(t), None) is not False else None
                 if leaves:
                     items.append((i, t))
                     all_pinned = all_pinned and builtins.all(leaf.is_pinned() for leaf in leaves)
@@ -4788,8 +4836,14 @@ class offload:
     def _graph_lora_inputs(self, model, module):
         """The LoRA copies that a block reads, as (list, index): its graphs read them from buffers filled before each replay, so that they come
         and go with their block as without CUDA graphs."""
-        return [(data, index) for holder, name in self._graph_state(model, module)[2] for data in (holder.get(name, None),) if data is not None
-                for index in range(min(4, len(data))) if torch.is_tensor(data[index])]
+        slots = {}
+        for holder, name in self._graph_state(model, module)[2]:
+            data = holder.get(name, None)
+            if data is not None:
+                for index in range(min(4, len(data))):
+                    if torch.is_tensor(data[index]):
+                        slots.setdefault(id(data[index]), []).append((data, index))
+        return [entries[0] if len(entries) == 1 else (_AliasedLoraSlots(entries), 0) for entries in slots.values()]
 
     def _ensure_loras(self, model_id, entry_name):
         # A prefetched block got the LoRA copies of the step and adapters current when it was transferred: the last block of a forward
@@ -5457,6 +5511,10 @@ class offload:
                     x = x.to(compute_dtype)
                 x_2d = x if x.dim() == 2 else x.reshape(-1, x.shape[-1])
                 result_2d = result if result.dim() == 2 else result.reshape(-1, result.shape[-1])
+                # A fused kernel (shared.kernels fusion operands) wrote residual + gate * base: the LoRA's output takes the same gate, in its
+                # output factor (no full width output for one addition). can_fuse_linear admits no fused input operation here.
+                fusion = submodule.__dict__.get("_wangp_linear_fusion", None)
+                gate = None if fusion is None or fusion[4] is None else fusion[4].to(result.dtype).unsqueeze(1)
 
                 for active_adapter in active_adapters:
                     data = loras_data.get(active_adapter + '_GPU', None)
@@ -5496,6 +5554,9 @@ class offload:
                             result_2d.add_(diff_b, alpha=scaling)
                         del y
                         continue
+                    if gate is not None:
+                        lora_B = None if lora_B is None else lora_B * gate
+                        diff_b = None if diff_b is None else diff_b * gate.squeeze(1)
                     if adapter_type == "diff":
                         result_2d.addmm_(x_2d, lora_B.T, beta=1, alpha=scaling)
                         if diff_b is not None:

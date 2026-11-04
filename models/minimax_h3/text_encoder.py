@@ -25,9 +25,9 @@ class _RawHiddenState(nn.Module):
         return hidden_states[0] if isinstance(hidden_states, list) else hidden_states
 
 
-def load_h3_qwen_config(config_path):
+def load_h3_qwen_config(config_path, num_hidden_layers=50):
     config = Qwen3VLConfig.from_json_file(config_path)
-    config.text_config.num_hidden_layers = 50
+    config.text_config.num_hidden_layers = num_hidden_layers or config.text_config.num_hidden_layers
     config.text_config.use_cache = False
     config.vision_config.out_hidden_size = config.text_config.hidden_size
     return config
@@ -92,12 +92,17 @@ def _mrope_positions(visuals, seq_len, device):
 class MiniMaxH3TextEncoder(nn.Module):
     """Qwen3-VL-32B truncated after language layer 50, without final RMSNorm."""
 
+    truncated = True
+    mid_result_layers = None
+    tokenizer_options = {}
+
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.visual = Qwen3VLVisionModel(config.vision_config)
         self.language_model = Qwen3VLTextModel(config.text_config)
-        self.language_model.norm = _RawHiddenState()
+        if self.truncated:
+            self.language_model.norm = _RawHiddenState()
         self.tokenizer = None
         self._interrupt = False
 
@@ -114,7 +119,7 @@ class MiniMaxH3TextEncoder(nn.Module):
             self.language_model._interrupt = self._abort
 
     def set_tokenizer(self, tokenizer_path):
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=False)
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=False, **self.tokenizer_options)
 
     def _token_ids(self, text):
         if self.tokenizer is None:
@@ -153,6 +158,9 @@ class MiniMaxH3TextEncoder(nn.Module):
                 raise ValueError(f"Unsupported H3 presentation item: {kind}")
         add_text(prompt)
         return entries or [TEXT_PAD]
+
+    def _conditioning(self, output, dtype):
+        return output.last_hidden_state.to(dtype)
 
     def encode(self, prompt, items, device, dtype):
         entries = self._presentation(prompt, items)
@@ -209,10 +217,47 @@ class MiniMaxH3TextEncoder(nn.Module):
         self.language_model._interrupt = self._interrupt
         with text_encoding_progress(self.language_model.layers):
             output = self.language_model(inputs_embeds=embeds, position_ids=positions, visual_pos_masks=visual_mask if visuals else None,
-                                         deepstack_visual_embeds=deepstack, use_cache=False)
+                                         deepstack_visual_embeds=deepstack, use_cache=False, return_mid_results_layers=self.mid_result_layers)
         if output.last_hidden_state is None:
             raise GenerationInterrupted
-        return output.last_hidden_state.to(dtype), tags
+        return self._conditioning(output, dtype), tags
 
 
-__all__ = ["MiniMaxH3TextEncoder", "load_h3_qwen_config"]
+class MiniMaxH3TextConnector(nn.Module):
+    """Concatenated, standardized hidden states projected to the conditioning H3 reads; the first token, an attention sink, gets a fixed embedding.
+    Follows PH3ImageTextConnector in diffusers (Copyright 2026 The HuggingFace Team, Apache License 2.0)."""
+
+    def __init__(self, in_channels=12800, out_channels=5120):
+        super().__init__()
+        self.input_mean = nn.Parameter(torch.zeros(in_channels))
+        self.input_std = nn.Parameter(torch.ones(in_channels))
+        self.proj = nn.Linear(in_channels, out_channels, bias=False)
+        self.output_mean = nn.Parameter(torch.zeros(out_channels))
+        self.output_std = nn.Parameter(torch.ones(out_channels))
+        self.sink_embedding = nn.Parameter(torch.zeros(out_channels))
+
+    def forward(self, hidden_states):
+        states = torch.cat(hidden_states, dim=-1).to(self.input_mean)
+        hidden_states.clear()
+        states = self.proj((states - self.input_mean) / self.input_std) * self.output_std + self.output_mean
+        return torch.cat((self.sink_embedding.expand(states.shape[0], 1, -1), states[:, 1:]), dim=1)
+
+
+class MiniMaxH3DistilledTextEncoder(MiniMaxH3TextEncoder):
+    """Pruna's Qwen3-VL-4B, distilled to produce the signal of the 32B encoder: hidden states 13, 19, 25, 31 and the final normed one, through the connector."""
+
+    truncated = False
+    mid_result_layers = [12, 18, 24, 30]
+    tokenizer_options = {"extra_special_tokens": {}}
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.text_connector = MiniMaxH3TextConnector()
+
+    def _conditioning(self, output, dtype):
+        states = [*output.mid_results, output.last_hidden_state]
+        output.mid_results = output.last_hidden_state = None
+        return self.text_connector(states).to(dtype)
+
+
+__all__ = ["MiniMaxH3DistilledTextEncoder", "MiniMaxH3TextEncoder", "load_h3_qwen_config"]

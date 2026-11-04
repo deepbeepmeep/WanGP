@@ -15,10 +15,54 @@ from shared.utils.loras_mutipliers import preparse_loras_multipliers
 from . import assemble, media, production as model, templates, titles
 from .director import Director
 from .store import ProductionStore
+from .toolbox import ShowrunnerToolbox
 
 
 # What a take's settings say about the shot itself, kept when the shot moves to another template (the rest belongs to the old model).
 CONTENT_SETTINGS = ("prompt", "negative_prompt", "alt_prompt", "image_refs", "image_start", "image_end", "audio_guide", "video_length", "duration_seconds", "resolution", "seed")
+
+
+class _DirectContext:
+    """What the render action asks of its caller, for shots the user renders without the showrunner: generations go straight to WanGP's queue, no language model takes part, and files keep their real paths."""
+
+    def __init__(self, showrunner, production):
+        self.showrunner, self.production = showrunner, production
+        self.shot, self.job, self.stopped = None, None, False
+
+    @property
+    def outputs_dir(self) -> Path:
+        return self.production.folder / "media"
+
+    def virtualize(self, path) -> str:
+        return str(path)
+
+    def resolve(self, path) -> Path:
+        return Path(path)
+
+    def cancelled(self) -> bool:
+        return self.stopped
+
+    def cancel(self) -> None:
+        self.stopped = True
+        if self.job is not None:
+            self.job.cancel()
+
+    def progress(self, done=None, total=None, text="", *, force=False) -> None:
+        pass
+
+    def call(self, tool, arguments) -> dict[str, Any]:
+        settings = arguments["settings"]
+        if settings.get("seed") == -1:  # the take keeps the seed it really had, for Same again
+            settings = {**settings, "seed": random.randint(0, 2 ** 31 - 1)}
+        host, production_id = self.showrunner.host, self.production.id
+        self.job = host.submit_generation(settings, host.production_workspace(self.production.snapshot()["title"], self.outputs_dir), on_progress=lambda update: self.showrunner.store.publish(
+            {"type": "render", "production": production_id, "shot": self.shot, "progress": getattr(update, "progress", None), "status": getattr(update, "status", "")}))
+        result = self.job.result()
+        files = list(getattr(result, "generated_files", None) or [])
+        if getattr(result, "success", False) and files:
+            return {"outputs": [{"path": str(files[0]), "media_id": f"file:{Path(files[0]).name}", "settings": settings}]}
+        errors = list(getattr(result, "errors", None) or [])
+        return {"errors": errors, "result": {"errors": errors}}
 
 
 class Showrunner:
@@ -91,6 +135,28 @@ class Showrunner:
         take = {**facts, "media": media_id, "settings": production.rel_settings(settings or {}), "note": note, "gpu_s": None if gpu_s is None else round(gpu_s, 1), "base_loras": base_loras}
         result = production.apply([{"op": "add_take", "shot": shot_id, "take": take}], by=by)
         return {**result[0], **facts}
+
+    def hear_take(self, production, shot_id: str, take_id: str, listening=None) -> dict[str, Any] | None:
+        """Listens to a new take whose model said the shot's lines: the take keeps what was heard, the shot is cut around its lines as its switch says, and a line not said as written goes to the log.
+        A transcript that fails leaves the take whole, and says so. listening: called just before it starts."""
+        doc = production.snapshot()
+        shot = model.find(doc["shots"], shot_id, "shot")
+        take = model.find(shot["takes"], take_id, "take")
+        lines = [line["line"] for line in shot.get("dialogue") or [] if str(line.get("line") or "").strip()]
+        if not lines or take.get("kind") != "video" or not take.get("has_audio") or (take.get("settings") or {}).get("audio_guide") \
+                or not templates.model_speaks(doc, shot, templates.resolve(self.catalog(doc), shot["generation"].get("template"))):
+            return None
+        if listening:
+            listening()
+        try:
+            heard = model.heard_lines(lines, self.host.song_words(production.resolve(take["path"]), str(doc["brief"].get("language") or "") or None))
+        except Exception as error:  # the take exists: the words are only checked
+            production.apply([{"op": "log", "text": f"{shot_id} could not be checked against its lines ({error}): listen to it yourself.", "shot": shot_id}], by="system", record=False)
+            return None
+        wrong = [f"it does not say: {' / '.join(heard['missing'])}"] if heard["missing"] else []
+        wrong += [f"it adds between its lines: {' / '.join(heard['between'])}"] if heard["between"] else []
+        production.apply([{"op": "heard", "shot": shot_id, "take": take_id, "heard": heard}, *([{"op": "log", "text": f"{shot_id}: {'; '.join(wrong)}. Heard: {heard['text'] or 'no words'}.", "shot": shot_id}] if wrong else [])], by="system", record=False)
+        return heard
 
     def shoot_rates(self, production_id: str) -> dict[str, Any]:
         """How long each template takes to generate at this production's frame size, measured on takes (see model.shoot_rates): the page
@@ -366,7 +432,7 @@ class Showrunner:
         shot = model.find(doc["shots"], shot_id, "shot")
         take = model.chosen_take(shot)
         if take is None or not take.get("settings"):
-            raise ValueError("This shot has no take with saved settings yet: ask the showrunner to render it.")
+            raise ValueError("This shot has no take with saved settings yet: use Render now.")
         settings = production.resolve_settings(take["settings"])
         settings.update({key: value for key, value in shot["generation"].get("settings", {}).items() if key in ("prompt", "alt_prompt", "negative_prompt")})
         if take.get("base_loras"):  # the cast cards say which LoRAs of the cast this take gets, as they are now
@@ -380,6 +446,8 @@ class Showrunner:
             if entry is not None and entry["soundtrack"] and not entry["audio"] and settings.get("audio_guide"):
                 settings["audio_prompt_type"] = "AS"  # as render: a reference template follows the driving audio as its soundtrack
         settings.update(templates.planned_length(doc, shot, entry))  # the shot as it is now, not its last take's length
+        if not settings.get("audio_guide") and templates.model_speaks(doc, shot, entry) and settings.get("prompt"):
+            settings["prompt"] = templates.with_spoken_lines(doc, shot, entry, settings["prompt"])  # the shot's prompt does not hold its lines
         settings, base_loras = self.with_cast_loras(doc, shot, entry, settings)
         if new_seed:
             settings["seed"] = random.randint(0, 2 ** 31 - 1)
@@ -402,8 +470,9 @@ class Showrunner:
             result = job.result()
             files = list(getattr(result, "generated_files", None) or [])
             if getattr(result, "success", False) and files:
-                self.add_take(production_id, shot_id, files[0], by="user", settings=settings, note="Rerun", gpu_s=time.time() - started, base_loras=base_loras)
+                taken = self.add_take(production_id, shot_id, files[0], by="user", settings=settings, note="Rerun", gpu_s=time.time() - started, base_loras=base_loras)
                 production.apply([{"op": "budget", "gpu_seconds": time.time() - started}], by="system", record=False)
+                self.hear_take(production, shot_id, taken["take"])
             else:
                 errors = list(getattr(result, "errors", None) or [])
                 status = "planned" if getattr(result, "cancelled", False) else "failed"
@@ -415,6 +484,54 @@ class Showrunner:
             with self._render_lock:
                 self._renders.pop((production_id, shot_id), None)
             self.store.publish({"type": "render", "production": production_id, "shot": shot_id, "done": True})
+
+    def render_directly(self, production_id: str, shot_ids: list[str]) -> dict[str, Any]:
+        """Render shots now, one after the other, without the showrunner: the render action's own work (the cast's pictures, spoken lines, lengths) with no language model and no verdict.
+        A shot nobody chose a model for gets the brief's for what it shows, a shot without a prompt one made from what it says, kept on the shot, where it can be edited."""
+        production = self.store.get(production_id)
+        if self.director.status(production_id)["running"]:
+            raise RuntimeError("The showrunner is working on this production: this comes back when it finishes, or after Pause or Stop.")
+        doc = production.snapshot()
+        catalog, ops, statuses = self.catalog(doc), [], {}
+        for shot_id in shot_ids:
+            shot = model.find(doc["shots"], shot_id, "shot")
+            statuses[shot_id], generation = shot["status"], {}
+            if shot["generation"].get("template") == "gen_video" and (template := templates.template_for(doc, shot, catalog)):  # every shot's default: nobody chose its model
+                generation["template"] = template
+            if not model.shot_prompt(shot).strip():
+                entry = templates.resolve(catalog, generation.get("template") or shot["generation"].get("template"))
+                if not (prompt := model.compiled_prompt(doc, shot, lip_sync=not templates.model_speaks(doc, shot, entry))):
+                    raise ValueError(f"{shot['title'] or shot_id} has nothing to render yet: write what happens in it, or its prompt.")
+                generation["settings"] = {"prompt": prompt}
+            ops.append({"op": "update_shot", "shot": shot_id, "fields": {"status": "rendering", **({"generation": generation} if generation else {})}})
+        context = _DirectContext(self, production)
+        with self._render_lock:
+            if busy := [shot_id for shot_id in shot_ids if (production_id, shot_id) in self._renders]:
+                raise RuntimeError(f"Already rendering: {', '.join(busy)}.")
+            self._renders.update({(production_id, shot_id): context for shot_id in shot_ids})
+        production.apply(ops, by="user", record=False)
+        threading.Thread(target=self._render_directly, args=(production, shot_ids, statuses, context), daemon=True).start()
+        return {"shots": shot_ids, "status": "rendering"}
+
+    def _render_directly(self, production, shot_ids, statuses, context):
+        toolbox = ShowrunnerToolbox(self)
+        for shot_id in shot_ids:
+            context.shot = shot_id
+            try:
+                try:
+                    error = None if context.stopped else toolbox.render_shot(context, production, shot_id, new_seed=True, by="user").get("error")
+                except Exception as failure:
+                    error = str(failure)
+                if context.stopped:  # as it was: a shot marked for a redo stays marked
+                    production.apply([{"op": "update_shot", "shot": shot_id, "fields": {"status": statuses[shot_id]}}], by="system", record=False)
+                elif error:
+                    production.apply([{"op": "update_shot", "shot": shot_id, "fields": {"status": "failed"}}, {"op": "log", "text": f"Render of {shot_id} failed: {error}"}], by="system", record=False)
+            except model.OperationError:  # deleted while it waited: the next shots still render
+                pass
+            finally:
+                with self._render_lock:
+                    self._renders.pop((production.id, shot_id), None)
+                self.store.publish({"type": "render", "production": production.id, "shot": shot_id, "done": True})
 
     def cancel_rerun(self, production_id: str, shot_id: str) -> None:
         with self._render_lock:

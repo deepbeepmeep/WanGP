@@ -53,6 +53,8 @@ def _brief_text(doc: dict[str, Any]) -> str:
         lines.append("Pacing: " + ("faster cuts than usual." if pacing > 0 else "longer, calmer shots than usual."))
     if model.shot_range_words(doc):
         lines.append(f"Shot length, the user's choice: video shots of {model.shot_range_words(doc)}.")
+    if brief.get("voices_from_model"):
+        lines.append("Voices, the user's choice: the video model says the lines, in every shot that follows no song or audio of its own: template_advice says how, and this replaces `speak` for those shots.")
     if brief.get("budget_minutes"):
         lines.append(f"GPU budget: about {brief['budget_minutes']:g} minutes of generation in total.")
     if brief.get("review_before_edit"):
@@ -82,7 +84,7 @@ You are the showrunner of a production for the user: you plan, cast, shoot, edit
 - A shot's generation names its template and gives only what the shot changes (prompt, media): the template brings the model, LoRAs and steps, the brief the resolution and its duration_s the length. `plan` and `add_shots` validate the shots and return what they will render at (`renders`): quote those numbers when you tell the user a size or a length.
 - Words meant to be read (titles, taglines, names, captions) are edit overlays or drawn cards, never part of a video prompt: video models misspell them.
 - Spoken and sung words get subtitles unless the brief says otherwise: write them in their shots' dialogue.
-- Each speaker keeps one voice for the whole production: give every speaker (the narrator too, as a cast member with role narrator) a voice_description and make their lines with `speak`. A voice described again for each line comes out different every time.
+- Each speaker keeps one voice for the whole production: give every speaker (the narrator too, as a cast member with role narrator) a voice_description and make their lines with `speak`. A voice described again for each line comes out different every time. If the user asks for the video model's own voices instead of recordings, call edit(voices_from_model=true).
 - Choose a text design that suits the production (style.text_design) and vary cards with it; a chapter card over a dimmed still of the scene it opens beats a plain page.
 - Inspect every take before you judge it, and log one short line for each decision the user should know about.
 - Your replies and log lines are for the user, a filmmaker: short and in plain words. Name a shot by its id (s7: the page shows its number) or its title, never "shot 7", people by their names and an export by its version number (assemble returns it: "version 3"); leave out file paths, revisions, settings keys, model, template and tool names (shot ids are fine: the page shows them as shot numbers)."""

@@ -7,7 +7,7 @@ you follow, review and change anything on a storyboard and a timeline.
 Showrunner comes enabled with WanGP. Open **Showrunner** in the app bar; on first use, choose **Keep It** in its introduction. If you removed it, restore it from **Available Locally** in **Apps & PlugIn Manager**. **Full Screen** at the top of the tab expands the editor in place; **WanGP** returns to the Showrunner tab with your production and view preserved. Open `/showrunner/` on the WanGP address to go directly to the fullscreen editor. Full screen keeps this folder URL, which you can bookmark or share. In the tab as in full screen, the address also names the production and the page you have open: a reload or a copied link opens them again.
 
 Showrunner needs **Deepy Prime**, with a local model or a remote agent (Configuration > Prompt Enhancer / Deepy): running a production takes a planner that
-can follow a long plan. On first launch, WanGP sets it up on the Qwen3.8 version that suits your NVIDIA GPU, with nothing to configure. Everything you do yourself (reviewing, editing, re-rendering a take, assembling) works without Deepy.
+can follow a long plan. On first launch, WanGP sets it up on the Qwen3.8 version that suits your NVIDIA GPU, with nothing to configure. Everything you do yourself (writing shots, rendering them, reviewing, editing, assembling) works without Deepy: see Working Without the Showrunner.
 
 With a local model, Showrunner tells you when Deepy's settings hold a production back:
 
@@ -40,7 +40,7 @@ On the home page, pick a format and name the production (you can rename it later
 format changes how the showrunner plans and cuts:
 
 - **Music video**: shots follow the song's sections and bars, with the singer lip-synced to the part of the song each shot covers.
-- **Short film** and **Trailer**: scenes with recurring characters, dialogue and narration; a script you supply keeps its exact words.
+- **Short film** and **Trailer**: scenes with recurring characters, dialogue and narration; a script you supply keeps its exact words. The plan is checked against the spoken lines of the script, written as `MIA: the words` or with the name in capitals on the line above.
 - **Ad**: a short product spot with a clear message and a closing card.
 - **Illustrated story**: picture-book pages, each a still picture held while the narrator reads it, with the same characters throughout;
   the edit moves slowly over each page and dissolves to the next.
@@ -59,7 +59,10 @@ The production opens on its **Brief**, which saves itself as you type:
   sounds (or drop a recording of their voice) so that they sound the same in every line (see **The Cast**).
 - **Look and format**: aspect ratio, resolution, total duration from 5 seconds to ten minutes (drag the slider, or type the seconds in
   the field next to it; or **Match the song**), pacing from calm to frenetic, **Shot length** and style tags. Leave **Shot length** empty and the showrunner
-  chooses, with most shots lasting about 4 to 7 seconds. Give a range to set it yourself, such as 8 to 15 seconds for long takes (or only one end of it): long shots take longer to render.
+  chooses, with most shots lasting about 4 to 7 seconds. Give a range to set it yourself, such as 8 to 15 seconds for long takes (or only one end of it): long shots take longer to render, and a shot lasts at most what its model makes in one go (about 15 seconds with MiniMax H3).
+- **Voices** (not for music videos and illustrated stories): how the lines get their sound.
+  - **Recorded first** (the default) records each line in its speaker's voice, and the video follows the recording. A speaker keeps one voice for the whole production, which is what long dialogue needs.
+  - **From the video model** lets the model say the lines itself, with its own sound: nothing is recorded, and no speech model is needed. Choose the language of the lines beside it, or simply ask the showrunner in the chat ("use the video model's own voices"): it switches this choice and tells you. It suits short pieces and single speakers: a speaker's voice and level can change from shot to shot (**Even voices** on the Timeline evens out the level in the export), and a line's subtitle stays up for its whole shot. Give a shot about 0.4 seconds a word plus a second, no more: with time left, the model tends to add words of its own. Each take is then listened to. Words before the first line and after the last one are cut, with the sound fading out, while a shot that adds nothing plays to its end; turn off **Cut words that are not in these lines**, under the shot's dialogue, for a shot that should run on, and a trim you set yourself always stays. A line the take got wrong, or words added between two lines, are shown on the shot: **Same again** tries another take. This only reads words, so a mumble or a laugh stays, and a cut can leave a sliver of a word. The MiniMax H3 video models can do this. When none of your templates can, lines are recorded first, and the Brief says so.
 - **Review the plan before shooting** (on by default): the showrunner stops after planning so that you can edit the storyboard before any
   video is generated. Turn it off to let it plan and shoot in one go.
 - **Review the takes before the edit** (off by default): the showrunner shoots and checks the shots, then waits for you instead of
@@ -118,6 +121,8 @@ person, plans each sequence's shots, and shoots sequence by sequence, assembling
 
 ## Reviewing and Changing the Plan
 
+The steps at the top of the page show how far the production has got, and each one opens what it is about: **Brief**, **Edit** (the Timeline) and **Deliver** their pages, and on the Board, **Plan** all the shots, **Review** the takes to review and **Shoot** the shots still to shoot. The step you are looking at has a colored outline.
+
 The **Board** (storyboard) shows every shot as a card, grouped by the parts of the song or the film. Cards show the shot's picture once it
 is shot (hover to play it), its status and the showrunner's opinion of the take.
 
@@ -141,7 +146,7 @@ is shot (hover to play it), its status and the showrunner's opinion of the take.
 
 When the plan suits you, press **Shoot N shots**: the showrunner shoots the shots without a take and the ones marked for a redo, never
 the others. Once every shot has a take, the same button becomes **Assemble**. **Shoot this shot** in the panel of a shot without a take shoots
-that shot alone and stops there, to see it before the rest.
+that shot alone and stops there, to see it before the rest. **Render now**, beside it, renders the shot without the showrunner (see Working Without the Showrunner).
 
 The line under **Storyboard** gives the picture size of the shots: the real size of their takes, and for a shot not shot yet what its model makes of the
 brief's resolution (a model works on a grid of pixels, so 1280×720 can come out at 1280×704). Change it in the brief. Point at it for the details.
@@ -170,6 +175,17 @@ Only you approve a shot, and you need to only when takes wait for your review be
 - **+ Shot** adds a shot after the selected one, in its part (at the end when none is selected); drag its card to move it.
 - After changing someone on the **Cast** page, **Re-shoot N** on their card shoots again the shots showing them, with their new look and voice.
 
+## Working Without the Showrunner
+
+You can make a production by hand, with no language model at all: to keep every decision yourself, or when your computer cannot run Deepy Prime.
+
+1. In the **Brief**, choose the format and the **Models**. On the **Cast** page, drop a photo of each person and describe their voice.
+2. On the **Board**, press **+ Shot** for each shot, then write **What happens**, its camera and duration, who is in it and its dialogue.
+3. Press **Render now** in the shot's panel, or right-click it, or select several shots and press it in the panel. Without Deepy Prime, the Board's main button renders every shot still to shoot.
+4. Check each take yourself, use **Same again** for another try, then press **Assemble**.
+
+A shot without a prompt gets one made from what you wrote (what happens, the camera, who is in it, the brief's look), word for word: open **Prompt** in the shot's panel to change it. A shot without a chosen model takes the brief's for what it shows. Lines of dialogue are recorded first in their speakers' voices, as when the showrunner shoots, unless **Voices** in the Brief is on **From the video model**: then they join the prompt when the shot renders, and a shot without a chosen model takes one that can say them. Nobody checks these takes, and nothing is retried or assembled by itself.
+
 ## The Timeline
 
 The **Timeline** plays the edit in the browser, at once, with no rendering: the chosen takes back to back with their trims and transitions,
@@ -182,7 +198,7 @@ over the song. Shots that are not shot yet appear as cards in their place, so th
   the edit, **Escape** closes it). Tracks play in the preview as they will in the export, whichever soundtrack is chosen. Texts and tracks
   follow the shots they start on when shots are added, removed, moved or retimed.
 - The soundtrack of the preview and of the export is chosen above the lanes: **Song**, **Shot sound** (dialogue, effects) or **Mix**.
-  In a mix, the song plays at half its level. **+ Audio**, next to **+ Text**, adds your own audio track (it starts at 0 s: drag it into place). The **Edit** card beside the
+  In a mix, the song plays at half its level. When **Voices** in the Brief is on **From the video model**, **Even voices** brings every shot with lines to one level in the export, as some come out much quieter than others: turn it on, then **Assemble**. A very quiet shot gets louder along with its background noise, and the preview still plays the shots as they were made. **+ Audio**, next to **+ Text**, adds your own audio track (it starts at 0 s: drag it into place). The **Edit** card beside the
   monitor sets where the song starts; in a narrow window it is hidden, and the card beside the monitor only appears while a track is
   selected.
 - Click a shot to see it in the monitor; double-click it to open it in the shot panel. Drag a shot to move it; drag its edges to trim it
