@@ -160,7 +160,10 @@ def resolve_prompt_enhancer_speculative_decoding(enhancer_enabled: Any, value: A
         return 0, f"Speculative Decoding disabled automatically for {model_label}: {max(0.0, float(total_vram_gb)):.2f} GiB VRAM detected (8 GiB or less)."
     drafts = 4 if enhancer_no == 5 and detected_vram_gb >= (MTP_AUTO_FOUR_DRAFTS_BONSAI_VRAM_GB if bonsai else MTP_AUTO_FOUR_DRAFTS_VRAM_GB) else 2
     enabled, enabled_for = speculative_decoding_config("mtp", drafts), f"Speculative Decoding enabled automatically for {model_label} ({drafts} draft tokens)"
-    sizes = None if fit is None else fit()
+    try:
+        sizes = None if fit is None else fit()
+    except Exception:  # the fit is a hint about the model's fit in VRAM: a probe that cannot read the checkpoints falls back to the model's VRAM size, it is never a reason to fail the prompt enhancer
+        sizes = None
     if sizes is None and bonsai:
         if float(total_vram_gb) > 10:
             return enabled, f"{enabled_for}: {float(total_vram_gb):.2f} GiB VRAM detected (more than 10 GiB)."
