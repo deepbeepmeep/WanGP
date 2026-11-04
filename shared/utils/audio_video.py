@@ -58,6 +58,17 @@ def _prepare_audio_array(audio_data):
 
 def write_wav_file(path, audio_data, sample_rate):
     audio_array = _prepare_audio_array(audio_data)
+    if audio_array.ndim == 2 and audio_array.shape[1] == 0 and audio_array.shape[0] > 0:
+        # A channel-first zero-frame array (e.g. (2, 0)) slips through the
+        # orientation heuristic above (it only flips when shape[1] > shape[0]),
+        # so libsndfile reads it as frames=2, channels=0 and refuses to create
+        # the file: "Format not recognised" (reproduced on libsndfile 1.2.2 /
+        # soundfile 0.14.0, so this is not an old-library quirk a newer
+        # libsndfile fixes: a WAV with no channel is invalid by definition).
+        # The frame-first zero-frame form (0, channels) is the header-only WAV
+        # form it accepts, and ffmpeg/ffprobe read it (pcm_s16le, 0 frames):
+        # saving then yields an empty audio track instead of raising.
+        audio_array = audio_array.T
     sf.write(path, audio_array, int(sample_rate))
     return path
 
