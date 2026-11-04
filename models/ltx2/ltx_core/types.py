@@ -168,6 +168,9 @@ class LatentStateRuntimeCache:
     rope_caches: dict[tuple, object] = field(default_factory=dict)
     base_timestep: torch.Tensor | None = None
     prompt_base_timestep: torch.Tensor | None = None
+    # Count of the leading conditioning tokens of the window, -1 when they are not one leading run (see sol_attention):
+    # read from the denoise mask once per window, so that CUDA graph captures never synchronize on it.
+    sol_sink_tokens: int | None = None
 
 
 @dataclass(frozen=True)

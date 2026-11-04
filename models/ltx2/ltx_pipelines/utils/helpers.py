@@ -31,6 +31,7 @@ from ...ltx_core.guidance.perturbations import (
 )
 from ...ltx_core.components.guiders import MultiModalGuider
 from ...ltx_core.model.transformer import Modality, X0Model
+from ...ltx_core.model.transformer.sol_attention import sink_tokens_from_mask
 from ...ltx_core.model.video_vae import VideoEncoder, TilingConfig, encode_video as vae_encode_video
 from ...ltx_core.text_encoders.gemma import GemmaTextEncoderModelBase
 from ...ltx_core.tools import AudioLatentTools, LatentTools, VideoLatentTools
@@ -1110,6 +1111,10 @@ def modality_from_latent_state(
     runtime_cache = state.runtime_cache
     if runtime_cache.timestep_plan is None:
         runtime_cache.timestep_plan = build_timestep_compression_plan(state.denoise_mask, state.positions)
+    if runtime_cache.sol_sink_tokens is None:  # once per window: the answer is a number, and CUDA graphs record it
+        sink = sink_tokens_from_mask(state.denoise_mask)
+        runtime_cache.sol_sink_tokens = -1 if sink is None else sink
+    sol_sink_tokens = None if runtime_cache.sol_sink_tokens < 0 else runtime_cache.sol_sink_tokens
     timesteps, frame_indices = timesteps_from_mask(state.denoise_mask, sigma, plan=runtime_cache.timestep_plan)
     sigma_tensor = sigma if torch.is_tensor(sigma) else torch.tensor(sigma, device=state.latent.device)
     sigma_tensor = sigma_tensor.to(device=state.latent.device, dtype=state.latent.dtype)
@@ -1138,6 +1143,7 @@ def modality_from_latent_state(
         runtime_cache=runtime_cache,
         step_index=step_index,
         sigma_schedule=sigma_schedule,
+        sol_sink_tokens=sol_sink_tokens,
     )
 
 

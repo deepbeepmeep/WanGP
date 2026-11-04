@@ -40,3 +40,6 @@ class Modality:
     runtime_cache: LatentStateRuntimeCache | None = None
     step_index: int | None = None
     sigma_schedule: torch.Tensor | None = None
+    # Leading tokens that carry conditioning (a reference video, a keyframe, a start image, a Multiple Subject Reference) and
+    # so are kept in the exact set under Sol-Attn; None when the conditioned tokens are not one leading run.
+    sol_sink_tokens: int | None = None

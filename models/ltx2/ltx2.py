@@ -10,6 +10,7 @@ from typing import Callable, Iterator
 
 import torch
 import torchaudio
+from mmgp import offload
 from accelerate import init_empty_weights
 from safetensors.torch import load_file
 from shared.utils import files_locator as fl
@@ -30,6 +31,7 @@ from .ltx_core.model.transformer import (
     LTXModelConfigurator,
     X0Model,
 )
+from .ltx_core.model.transformer.sol_attention import SOL_ATTN_TAU_START_KEY
 from .ltx_core.model.upsampler import LatentUpsamplerConfigurator
 from .ltx_core.model.video_vae import VideoDecoderConfigurator, VideoEncoderConfigurator
 from .ltx_core.model.video_vae.diffusion_video_decoder import DiffusionVideoDecoder
@@ -1433,6 +1435,15 @@ class LTX2:
     ):
         if self._interrupt:
             return None
+        # Hand the "Start Tau" (Attention Sparsity) setting to the Sol-Attn policy.
+        attention_sparsity = kwargs.get("attention_sparsity")
+        if attention_sparsity not in (None, ""):
+            try:
+                offload.shared_state[SOL_ATTN_TAU_START_KEY] = float(attention_sparsity)
+            except (TypeError, ValueError):
+                offload.shared_state.pop(SOL_ATTN_TAU_START_KEY, None)
+        else:
+            offload.shared_state.pop(SOL_ATTN_TAU_START_KEY, None)
         joyai_context = None
         joyai_memory_bank = None
         joyai_store_mem_selectors = []
