@@ -11,6 +11,7 @@ from diffusers import FlowMatchEulerDiscreteScheduler
 from .ovi.utils.fm_solvers import (FlowDPMSolverMultistepScheduler,
                                get_sampling_sigmas, retrieve_timesteps)
 from shared.utils import files_locator as fl
+from shared.utils import latent_io
 from .modules.vae2_2 import Wan2_2_VAE
 from .modules.t5 import T5EncoderModel
 from .ovi.modules.mmaudio.features_utils import FeaturesUtils
@@ -94,6 +95,11 @@ class OviFusionEngine:
         vae_model_audio = init_mmaudio_vae()
         vae_model_audio.requires_grad_(False).eval()
         self.audio_vae = vae_model_audio.bfloat16()
+        # The mmaudio VAE's encoder checkpoint, for the latent companion's
+        # audio entry (the BigVGAN vocoder travels with it in the same
+        # folder).
+        self.audio_vae_file = "v1-16.pth"
+        self.audio_vae_pth = fl.locate_file(os.path.join("mmaudio", self.audio_vae_file), error_if_none=False)
         # Load T5 text model
         text_encoder_folder = model_def.get("text_encoder_folder")
         if text_encoder_folder:
@@ -152,6 +158,12 @@ class OviFusionEngine:
                     block_size = 0,                    
                     VAE_tile_size = 0,
                     joint_pass = False,
+                    save_latents=False,
+                    prefix_latents=None,
+                    prefix_audio_latents=None,
+                    prefix_kept_windows=None,
+                    prefix_kept_frames=0,
+                    prefix_is_i2v=False,
                     **bbkwargs,
                 ):
 
@@ -224,6 +236,38 @@ class OviFusionEngine:
             video_latent_length = 61
             audio_latent_length = 314
 
+        # Latent Branch (Phase 1): the head window's frozen prefixes are
+        # the sidecar's kept latents (the video prefix verbatim, the audio
+        # prefix the flat [20, t] block sliced by time ratio), so the
+        # branch does not re-encode the part it keeps; they are re-frozen
+        # at every denoise step and captured into the companion file with
+        # the rest of the window. Best effort: a prefix that does not
+        # match this window's latent grid is refused with a notice and the
+        # head window runs without it.
+        branch_video_prefix = None
+        branch_audio_prefix = None
+        if prefix_latents is not None:
+            _prefix = torch.as_tensor(prefix_latents)
+            if _prefix.dim() == 5:
+                _prefix = _prefix[0]
+            _prefix_shape = tuple(int(u) for u in _prefix.shape)
+            if _prefix.dim() == 4 and int(_prefix.shape[0]) == self.video_latent_channel \
+                    and tuple(int(u) for u in _prefix.shape[2:]) == (video_latent_h, video_latent_w) \
+                    and 0 < int(_prefix.shape[1]) <= video_latent_length \
+                    and (int(_prefix.shape[1]) - 1) % 4 == 0:
+                branch_video_prefix = _prefix.detach().to(dtype=self.target_dtype, device=self.device)
+            else:
+                print(f"[WanGP][Ovi] The branch prefix {_prefix_shape} does not match this window's video latent grid ([{self.video_latent_channel}, <{video_latent_length}>, {video_latent_h}, {video_latent_w}]); the branch prefix is not used for this run.")
+        if prefix_audio_latents is not None:
+            _audio_prefix = torch.as_tensor(prefix_audio_latents)
+            _audio_prefix_shape = tuple(int(u) for u in _audio_prefix.shape)
+            if _audio_prefix.dim() == 2 and int(_audio_prefix.shape[0]) == self.audio_latent_channel \
+                    and 0 < int(_audio_prefix.shape[1]) <= audio_latent_length:
+                # The sidecar stores [c, t]; the window's audio state is [t, c].
+                branch_audio_prefix = _audio_prefix.detach().t().to(dtype=self.target_dtype, device=self.device)
+            else:
+                print(f"[WanGP][Ovi] The branch audio prefix {_audio_prefix_shape} does not match this window's audio latent grid ([{self.audio_latent_channel}, <{audio_latent_length}>]); the branch audio prefix is not used for this run.")
+
 
 		
         from .modules.posemb_layers import get_rotary_pos_embed, get_nd_rotary_pos_embed
@@ -264,6 +308,10 @@ class OviFusionEngine:
                 offload.set_step_no_for_lora(self.model.video_model, i)
                 if is_i2v:
                     video_noise[:, :1] = latents_images
+                if branch_video_prefix is not None:
+                    video_noise[:, :branch_video_prefix.shape[1]] = branch_video_prefix
+                if branch_audio_prefix is not None:
+                    audio_noise[:branch_audio_prefix.shape[0], :] = branch_audio_prefix
                 computed_perturbation_layers = perturbation_layers if int(perturbation_start * sampling_steps) <= i < int(perturbation_end * sampling_steps) else None
                 any_guidance = not (guide_scale == 1 and audio_cfg_scalecale ==1)
 
@@ -320,6 +368,36 @@ class OviFusionEngine:
 
             if is_i2v:
                 video_noise[:, :1] = latents_images
+            if branch_video_prefix is not None:
+                video_noise[:, :branch_video_prefix.shape[1]] = branch_video_prefix
+            if branch_audio_prefix is not None:
+                audio_noise[:branch_audio_prefix.shape[0], :] = branch_audio_prefix
+
+            # Capture the final pre-decode latents for the optional latent
+            # companion file ('Save Latents'): the video latent is the
+            # final denoised [48, t, h, w] state and the audio latent the
+            # final [20, t] state; both are captured right before their
+            # VAE decodes.
+            latent_file_obj = None
+            if save_latents:
+                try:
+                    latent_file_obj = self._build_latent_file_obj(
+                        video=video_noise,
+                        audio=audio_noise,
+                        frame_num=frame_num,
+                        fps=float(bbkwargs.get("fps") or self.fps or 24),
+                        seed=int(seed),
+                        input_prompt=input_prompt,
+                        sampling_steps=int(sampling_steps),
+                        denoising_strength=float(bbkwargs.get("denoising_strength") or 1.0),
+                        window_no=int(bbkwargs.get("window_no") or 1),
+                        window_start_frame_no=int(bbkwargs.get("window_start_frame_no") or 0),
+                        loras_slists=loras_slists,
+                        kwargs=bbkwargs)
+                    print(f"Latent companion payload built (video {tuple(int(u) for u in video_noise.shape)}, audio {tuple(int(u) for u in audio_noise.shape)}).")
+                except Exception as exc:
+                    print(f"Warning: the latent companion file was not saved: {exc}")
+                    latent_file_obj = None
 
             # Decode audio
             audio_latents_for_vae = audio_noise.unsqueeze(0).transpose(1, 2)  # 1, c, l
@@ -331,10 +409,128 @@ class OviFusionEngine:
 
         # self.last_audio = audio
         output = {"x": generated_video, "audio": generated_audio}
+        if latent_file_obj is not None:
+            # Hand the payload to the caller instead of the side-files dict: the
+            # caller owns the companion file (it must accumulate the windows of
+            # a sliding-window job) and the raw bytes are never echoed to API
+            # responses.
+            output["latent_file_obj"] = latent_file_obj
+        if prefix_kept_windows is not None and int(prefix_kept_frames or 0) > 0:
+            # The branch job's kept region is a fresh decode of the source
+            # sidecar's kept windows (the same reconstruction the Latent
+            # Decode job performs), handed back as decoded_prefix so the job
+            # uses it as the output video's prefix instead of a
+            # re-extraction of the source video. Best effort: a decode that
+            # fails keeps the source-pixel prefix the job set up before the
+            # model call.
+            _vae_dtype = getattr(self.vae, "dtype", None) or torch.float32
+            def _decode_kept_window(spec):
+                _lat = spec["latents"].to(device=self.device, dtype=_vae_dtype)
+                _videos = self.vae.decode_to_cpu_uint8([_lat], VAE_tile_size)
+                if not _videos or _videos[0] is None:
+                    return None
+                return _videos[0].to("cpu")
+            try:
+                decoded_prefix = latent_io.decode_kept_windows(
+                    _decode_kept_window, prefix_kept_windows, int(prefix_kept_frames),
+                    is_i2v=bool(prefix_is_i2v))
+                if decoded_prefix is not None:
+                    output["decoded_prefix"] = decoded_prefix
+            except Exception as exc:
+                print(f"Latent branch: the kept region could not be decoded ({exc}); the output keeps the source-pixel prefix.")
         return output
 
 
                 
+    def _build_latent_file_obj(self, *, video, audio, frame_num, fps, seed, input_prompt, sampling_steps,
+                               denoising_strength, window_no, window_start_frame_no, loras_slists, kwargs):
+        """Build the ``*_latent.pt`` companion payload from the final
+        pre-decode latents.
+
+        Called right before the video/audio VAE decodes (see ``generate``)
+        so the latent can later be re-decoded without the diffusion model
+        (Media Flow Latent Decode). The video entry is a standard
+        ``wgp_latent/1`` entry carrying the [48, t, h, w] latent of the
+        Wan 2.2 5B-class VAE (the linear 4/1 layout the Wan family
+        records); the audio entry carries the [20, t] latent of the
+        mmaudio VAE, decoded to 16 kHz mono.
+        The file itself is written by the caller (the all-latent sidecar:
+        the job's windows stacked on one time dimension, the sidecar the
+        sole content source of the video).
+        """
+        def vae_sha(path_or_name):
+            """SHA-256 of a VAE file on disk. The engine keeps the resolved
+            path of its video VAE, so a name that is not a path on its own
+            is resolved through the app's files locator (the ckpts/
+            folder) before hashing; an unlocatable file contributes no
+            hash (the readers treat an empty hash as unrecorded)."""
+            if not path_or_name:
+                return ""
+            path = path_or_name if os.path.isabs(str(path_or_name)) else fl.locate_file(str(path_or_name), error_if_none=False)
+            if not path or not os.path.isfile(str(path)):
+                return ""
+            return latent_io.sha256_file(str(path))
+
+        video_latent = video.detach().to(dtype=torch.float32, device="cpu")
+        if video_latent.dim() == 5:
+            video_latent = video_latent[0]
+        lora_names = []
+        if loras_slists:
+            for lora_entry in loras_slists:
+                name = lora_entry if isinstance(lora_entry, str) else (lora_entry[0] if isinstance(lora_entry, (list, tuple)) and len(lora_entry) > 0 else "")
+                if len(str(name).strip()) > 0:
+                    lora_names.append(str(name))
+        video_vae_pth = getattr(self.vae, "vae_pth", None)
+        video_payload = latent_io.build_latent_payload(
+            video_latent,
+            app_version=str(kwargs.get("app_version") or ""),
+            model_type=str(kwargs.get("latent_model_type") or ""),
+            base_model_type="ovi",
+            model_filename=str(kwargs.get("model_filename") or ""),
+            loras=lora_names,
+            vae_file=os.path.basename(str(video_vae_pth)) if video_vae_pth else "",
+            vae_sha256=vae_sha(str(video_vae_pth)) if video_vae_pth else "",
+            vae_z_dim=int(video_latent.shape[0]),
+            vae_dtype=str(getattr(self.vae, "dtype", "torch.float32")).replace("torch.", ""),
+            frames=int(frame_num),
+            fps=float(fps),
+            seed=int(seed),
+            prompt=str(input_prompt)[:1000],
+            denoising_strength=float(denoising_strength),
+            steps=int(sampling_steps),
+        )
+        payload = dict(video_payload)
+        audio_latent = audio.detach().to(dtype=torch.float32, device="cpu")
+        if audio_latent.dim() == 3:
+            audio_latent = audio_latent[0]
+        audio_samples = int(round(frame_num / fps * self.sr)) if fps > 0 else int(audio_latent.shape[-1])
+        audio_payload = latent_io.build_audio_latent_payload(
+            audio_latent,
+            [{
+                "window_no": int(window_no or 1),
+                "start_sample": int(round(window_start_frame_no / fps * self.sr)) if fps > 0 else 0,
+                "samples": audio_samples,
+            }],
+            app_version=str(kwargs.get("app_version") or ""),
+            model_type=str(kwargs.get("latent_model_type") or ""),
+            base_model_type="ovi",
+            model_filename=str(kwargs.get("model_filename") or ""),
+            loras=lora_names,
+            audio_vae_file=self.audio_vae_file,
+            audio_vae_sha256=vae_sha(os.path.join("mmaudio", self.audio_vae_file)),
+            audio_vae_dtype="bfloat16",
+            sample_rate=self.sr,
+            channels=1,
+            samples=audio_samples,
+            seed=int(seed),
+            prompt=str(input_prompt)[:1000],
+            denoising_strength=float(denoising_strength),
+            steps=int(sampling_steps),
+            total_windows=1,
+        )
+        payload.update(audio_payload)
+        return payload
+
     def get_scheduler_time_steps(self, sampling_steps, solver_name='unipc', device=0, shift=5.0):
         torch.manual_seed(4)
 

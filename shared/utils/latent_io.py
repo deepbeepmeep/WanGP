@@ -1877,9 +1877,10 @@ def _branch_audio_prefix_slice(audio_entry, video_entry, branch_point):
 
     The layout follows the video spec: the mel families store the block as
     ``[c, t * mel]`` (the mel bins recorded at save time) and the slice
-    keeps a whole number of mel frames; MiniMax H3 stores it flat (``[64,
-    t]``, one column per latent time step) and the slice keeps a whole
-    number of columns.
+    keeps a whole number of mel frames; the flat families — MiniMax H3's
+    ``[64, t]``, Magi Human's ``[64, t]``, Ovi's ``[20, t]`` — store one
+    column per latent time step and the slice keeps a whole number of
+    columns.
 
     ``audio_entry``/``video_entry`` are the sidecar's
     ``wgp_latent/audio/1`` and ``wgp_latent/1|2`` entries;
@@ -1887,10 +1888,11 @@ def _branch_audio_prefix_slice(audio_entry, video_entry, branch_point):
     for the video entry. Returns a dict with ``flat`` (the 2D slice),
     ``count`` (the slice's latent time steps), ``t_k`` (the block's full
     step count), ``tail`` (whether the slice is the committed tail),
-    ``layout`` (``"h3"`` / ``"mel"``) and ``block`` (the containing
-    window's raw audio block), or ``None`` when the sidecar carries no
-    usable audio for the branch point (no audio entry, no window block,
-    missing mel/sample-rate/fps bookkeeping, or a degenerate slice).
+    ``layout`` (``"h3"`` / ``"magi"`` / ``"ovi"`` / ``"mel"``) and
+    ``block`` (the containing window's raw audio block), or ``None`` when
+    the sidecar carries no usable audio for the branch point (no audio
+    entry, no window block, missing mel/sample-rate/fps bookkeeping, or a
+    degenerate slice).
     """
     if not isinstance(branch_point, dict) or not isinstance(audio_entry, dict) or not isinstance(video_entry, dict):
         return None
@@ -1913,6 +1915,7 @@ def _branch_audio_prefix_slice(audio_entry, video_entry, branch_point):
     block = audio_spec["latents"]
     is_h3 = _is_h3_spec(video_spec)
     is_mag = _is_magi_human_entry(video_entry)
+    is_ovi = str(video_entry.get("base_model_type") or "") == "ovi"
     if is_h3:
         if block.dim() != 2 or block.shape[0] < 2 or block.shape[0] % 2 != 0:
             return None
@@ -1938,11 +1941,12 @@ def _branch_audio_prefix_slice(audio_entry, video_entry, branch_point):
     else:
         mel = int(audio_entry.get("mel_bins") or 0)
         raw_len = int(block.shape[1])
-        if is_mag:
+        if is_mag or is_ovi:
             # Magi Human records the block flat ([64, t], one 64-channel
-            # latent per pixel frame): the slice keeps a whole number of
-            # columns, as for the H3 layout, while the kept length follows
-            # the linear 4/1 arithmetic.
+            # latent per pixel frame) and Ovi records it flat as well
+            # ([20, t], the mmaudio VAE's 20-channel latent): the slice
+            # keeps a whole number of columns, as for the H3 layout, while
+            # the kept length follows the linear 4/1 arithmetic.
             if block.dim() != 2:
                 return None
             t_k = raw_len
@@ -1984,7 +1988,7 @@ def _branch_audio_prefix_slice(audio_entry, video_entry, branch_point):
     else:
         count = int(round(t_k * float(length) / natural_window))
     count = max(1, min(count, t_k))
-    if is_h3 or is_mag:
+    if is_h3 or is_mag or is_ovi:
         flat = block[:, (t_k - count):] if tail else block[:, :count]
     else:
         flat = block[:, (t_k - count) * mel:] if tail else block[:, :count * mel]
@@ -1993,7 +1997,7 @@ def _branch_audio_prefix_slice(audio_entry, video_entry, branch_point):
         "count": int(count),
         "t_k": int(t_k),
         "tail": bool(tail),
-        "layout": "h3" if is_h3 else ("magi" if is_mag else "mel"),
+        "layout": "h3" if is_h3 else ("magi" if is_mag else ("ovi" if is_ovi else "mel")),
         "block": audio_block,
     }
 
@@ -2108,6 +2112,40 @@ def magi_branch_audio_prefix_latents(audio_entry, video_entry, branch_point):
         return None
     slice_info = _branch_audio_prefix_slice(audio_entry, video_entry, branch_point)
     if slice_info is None or slice_info["layout"] != "magi":
+        return None
+    return slice_info["flat"]
+
+
+def ovi_branch_audio_prefix_latents(audio_entry, video_entry, branch_point):
+    """The sidecar's kept Ovi audio latent run, as the branch job's frozen
+    audio prefix.
+
+    Ovi stores its audio latent flat (``[20, t]``, the mmaudio VAE's
+    20-channel 16 kHz mono latent), so this is the flat-layout companion of
+    :func:`magi_branch_audio_prefix_latents` over the same shared
+    time-ratio splice (:func:`_branch_audio_prefix_slice`): the kept
+    length follows the resolved cut (with the cut inside the window the
+    prefix is the head of the block, with the cut at the window's
+    committed end it is the block's committed tail), measured with the
+    sidecar's recorded duration (the block's ``samples`` at the entry's
+    ``sample_rate`` against ``length / fps``).
+
+    ``audio_entry``/``video_entry`` are the sidecar's
+    ``wgp_latent/audio/1`` and ``wgp_latent/1`` entries; ``branch_point``
+    is the dict returned by :func:`branch_point_for_frame` for the video
+    entry. Returns the prefix as the sidecar's flat ``[20, N]`` tensor
+    (the model transposes it to its ``[N, 20]`` audio state and freezes
+    it at the head of the head window's audio tensor), or ``None`` when
+    the sidecar carries no usable audio for the branch point (no audio
+    entry, no window block, a malformed block shape, or a degenerate
+    slice).
+    """
+    if not isinstance(branch_point, dict) or not isinstance(audio_entry, dict) or not isinstance(video_entry, dict):
+        return None
+    if not is_all_latent_entry(video_entry):
+        return None
+    slice_info = _branch_audio_prefix_slice(audio_entry, video_entry, branch_point)
+    if slice_info is None or slice_info["layout"] != "ovi":
         return None
     return slice_info["flat"]
 

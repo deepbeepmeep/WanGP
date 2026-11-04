@@ -7479,6 +7479,19 @@ def _is_magi_human_family(base_model_type, model_def):
     return str((model_def or {}).get("architecture") or "") in _MAGI_HUMAN_BASE_TYPES
 
 
+def _is_ovi_family(base_model_type, model_def):
+    """Whether the latent's model family is Ovi (the models.wan ovi_handler:
+    the Wan 2.2 5B-class VAE for the video — 48 channels, the 4/1 latent
+    layout, 16x spatial — and the 16 kHz mmaudio/BigVGAN VAE for the
+    soundtrack; the type mirrors ovi_handler.family_handler's supported
+    types).
+    """
+    base_model_type = str(base_model_type or "")
+    if base_model_type == "ovi":
+        return True
+    return str((model_def or {}).get("architecture") or "") == "ovi"
+
+
 def _is_wan_family(base_model_type, model_def):
     """Whether the latent's model family is Wan (the models.wan handlers:
     the Wan 2.1 / 2.2 video VAEs, the 4/1 latent layout; the set mirrors
@@ -7489,7 +7502,7 @@ def _is_wan_family(base_model_type, model_def):
     if base_model_type in _WAN_BASE_TYPES:
         return True
     handler = model_types_handlers.get(base_model_type)
-    if handler is not None and str(getattr(handler, "__name__", "")).startswith("models.wan"):
+    if handler is not None and str(getattr(handler, "__module__", "")).startswith("models.wan"):
         return True
     architecture = str((model_def or {}).get("architecture") or "")
     return architecture in _WAN_BASE_TYPES or architecture == "wan"
@@ -7925,6 +7938,10 @@ _BRANCH_PREFIX_LAYOUTS = {
     # checkpoints apart).
     "magi_human": (4, 1, 16, 48),
     "magi_human_distill": (4, 1, 16, 48),
+    # Ovi (the Wan 2.2 5B-class audio-video model): the same 5B VAE the
+    # ti2v_2_2 class uses (4/1, 16x spatial, 48-channel latent); the
+    # 16 kHz mono soundtrack rides the sidecar's audio entry.
+    "ovi": (4, 1, 16, 48),
 }
 
 
@@ -8044,6 +8061,27 @@ def _wan_video_vae_identity(model_def, base_model_type):
     else:
         vae_file = "Wan2.1_VAE.safetensors"
     vae_file = os.path.basename(str(vae_file or ""))
+    vae_sha = ""
+    path = fl.locate_file(vae_file, error_if_none=False)
+    if path is not None and os.path.isfile(str(path)):
+        try:
+            vae_sha = latent_io.sha256_file(str(path))
+        except Exception:
+            vae_sha = ""
+    return vae_file, vae_sha
+
+
+def _ovi_video_vae_identity(model_def, base_model_type):
+    """The job's Ovi video VAE identity: (checkpoint filename, sha256).
+
+    Mirrors models/wan/ovi_fusion_engine.py's fixed selection: the Ovi
+    engine always loads the Wan 2.2 5B-class VAE from its single fixed
+    checkpoint (there is no model-definition override), so this returns
+    that filename for the branch fit check's identity comparison. The sha
+    is empty when the checkpoint cannot be located (the fit check then
+    falls back to the filename comparison).
+    """
+    vae_file = "Wan2.2_VAE.safetensors"
     vae_sha = ""
     path = fl.locate_file(vae_file, error_if_none=False)
     if path is not None and os.path.isfile(str(path)):
@@ -8291,6 +8329,10 @@ def _prepare_branch_prefix(entry, branch_point, carried, *, base_model_type, vid
     # [64, t] block (one 64-channel latent per pixel frame), carried in
     # the sidecar's flat layout for the model to freeze at the head of
     # the head window's audio tensor.
+    # Ovi: the same time-ratio splice on the flat [20, t] block (the
+    # mmaudio VAE's 20-channel 16 kHz mono latent), carried in the
+    # sidecar's flat layout for the model to freeze at the head of the
+    # head window's audio tensor.
     prefix_audio = None
     if str(base_model_type or "").startswith("ltx2") and audio_entry is not None:
         prefix_audio = latent_io.branch_audio_prefix_latents(audio_entry, entry, branch_point)
@@ -8298,6 +8340,8 @@ def _prepare_branch_prefix(entry, branch_point, carried, *, base_model_type, vid
         prefix_audio = latent_io.h3_branch_audio_prefix_latents(audio_entry, entry, branch_point)
     elif _is_magi_human_family(base_model_type, model_def) and audio_entry is not None:
         prefix_audio = latent_io.magi_branch_audio_prefix_latents(audio_entry, entry, branch_point)
+    elif _is_ovi_family(base_model_type, model_def) and audio_entry is not None:
+        prefix_audio = latent_io.ovi_branch_audio_prefix_latents(audio_entry, entry, branch_point)
     # The all-latent sidecar (LTX2 / Wan / LongCat / H3) carries two
     # head-side values in the prefix, each named for what it is.
     # ``containing_window_head_trim`` is the containing window's own
@@ -9600,6 +9644,146 @@ def _edit_latent_job_magi(send_cmd, state, video_source, client_id, plugin_data,
                              api_return_video_uint8, api_return_audio, api_suppress_metadata_images)
 
 
+def _edit_latent_job_ovi(send_cmd, state, video_source, client_id, plugin_data, sidecar_obj, entry, model_def, window_specs,
+                         api_return_video_uint8, api_return_audio, api_suppress_metadata_images):
+    """Decode a saved Ovi latent back to pixels and its soundtrack.
+
+    Ovi decodes through two independent VAEs (the video's Wan 2.2
+    5B-class VAE — 48 channels, the 4/1 latent layout, 16x spatial — and
+    the 16 kHz mmaudio/BigVGAN audio VAE — a 20-channel latent per audio
+    step), so the job takes a family-specific path: load only the VAE
+    components (no diffusion transformer), decode every window the way
+    the model's own decode does, and hand the result to
+    ``_save_ltx2_decoded_video`` (the decoded mono waveforms are
+    assembled with the generation's per-window trims and muxed back into
+    the video; a window whose audio latent runs short leaves silence at
+    the tail instead of shifting the track). A sidecar without an audio
+    entry decodes the video only, like the other families.
+    """
+    gen = get_gen_info(state)
+    if gen.get("abort", False):
+        return
+    from models.wan.modules.vae2_2 import Wan2_2_VAE
+    from models.wan.ovi_fusion_engine import init_mmaudio_vae
+
+    fps = float(entry.get("fps") or 0) or float(model_def.get("fps") or 24)
+    decode_device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    audio_entry = latent_io.audio_latent_payload(sidecar_obj)
+    audio_windows = latent_io.audio_window_specs(audio_entry) if audio_entry is not None else []
+    needs_audio = len(audio_windows) > 0
+    sample_rate = int((audio_entry or {}).get("sample_rate") or 16000)
+
+    # The VAE name recorded in the sidecar takes precedence (it produced
+    # this latent); the family default is the fallback.
+    vae_file = str(entry.get("vae_file") or "") or "Wan2.2_VAE.safetensors"
+    vae_pth = fl.locate_file(vae_file, error_if_none=False)
+    if not vae_pth or not os.path.isfile(str(vae_pth)):
+        send_cmd("error", gr.Error(f"The VAE checkpoint required to decode this latent could not be located: {os.path.basename(str(vae_file))}"))
+        return
+
+    # The sidecar's recorded dtype is the one the VAE ran with at
+    # generation; decode with the same dtype (the server config is the
+    # fallback for sidecars that do not record it).
+    vae_dtype = _DTYPE_MAP.get(str(entry.get("vae_dtype") or ""))
+    if vae_dtype is None:
+        vae_dtype = torch.float16 if str(server_config.get("vae_precision", "16")) == "16" else torch.float
+    stored_vae_hash = str(entry.get("vae_sha256") or "")
+    if len(stored_vae_hash) > 0 and latent_io.sha256_file(str(vae_pth)) != stored_vae_hash:
+        print("Latent decode identity warning: the video VAE checkpoint on disk differs from the one used at save time.")
+
+    try:
+        # Same construction as the model (the VAE loads on the CPU and the
+        # decode moves the latents to the accelerator, the way the
+        # generation does).
+        vae = Wan2_2_VAE(vae_pth=str(vae_pth), dtype=vae_dtype, device="cpu")
+        vae.device = decode_device
+        vae.model.to(decode_device)
+    except Exception as exc:
+        send_cmd("error", gr.Error(f"The video VAE required to decode this latent could not be loaded ({exc})."))
+        return
+
+    audio_vae = None
+    if needs_audio:
+        # The mmaudio VAE loads its two checkpoints (the encoder weights
+        # and the BigVGAN vocoder) from the mmaudio/ folder; the sidecar
+        # records the encoder's file name, and the vocoder travels with
+        # it.
+        audio_vae_file = str((audio_entry or {}).get("audio_vae_file") or "v1-16.pth")
+        try:
+            audio_vae = init_mmaudio_vae().to(decode_device).bfloat16()
+        except Exception as exc:
+            send_cmd("error", gr.Error(f"The audio VAE required to decode this latent's soundtrack could not be loaded ({exc})."))
+            return
+        stored_audio_hash = str((audio_entry or {}).get("audio_vae_sha256") or "")
+        if len(stored_audio_hash) > 0:
+            audio_vae_pth = fl.locate_file(os.path.join("mmaudio", audio_vae_file), error_if_none=False)
+            if audio_vae_pth and os.path.isfile(str(audio_vae_pth)) and latent_io.sha256_file(str(audio_vae_pth)) != stored_audio_hash:
+                print("Latent decode identity warning: the audio VAE checkpoint on disk differs from the one used at save time.")
+
+    # Defensive: Ovi latents are SDR today, but if a sidecar ever records
+    # an HDR sample, decode it in VAE range (float) and save it as tagged
+    # HDR10 instead of clamping to 8 bits.
+    entry_is_hdr = bool(entry.get("is_hdr"))
+    window_frames_list = []
+    audio_waveform_chunks = []
+    try:
+        for idx, spec in enumerate(window_specs):
+            if gen.get("abort", False):
+                return
+            window_no = int(spec["window_no"])
+            latents = spec["latents"].to(device=decode_device, dtype=vae_dtype)
+            # Tile only when the window's decoded canvas exceeds the tile
+            # threshold (spatial tiling is a memory measure and its overlap
+            # blending shifts the pixels, so it is used only when needed —
+            # the same heuristic the generic decode path applies, scaled to
+            # the 5B VAE's 16x spatial compression).
+            tile_size = 256 if (latents.shape[-1] * 16 > 256 or latents.shape[-2] * 16 > 256) else 0
+            videos = vae.decode([latents], tile_size) if entry_is_hdr else vae.decode_to_cpu_uint8([latents], tile_size)
+            latents = None
+            if len(videos) == 0 or videos[0] is None:
+                raise ValueError(f"window {window_no} could not be decoded")
+            frames = videos[0]
+            videos = None
+            # Re-apply the exact pixel trims of the original assembly so the
+            # decoded windows re-assemble into the original video unchanged.
+            head_trim = int(spec["head_trim"])
+            tail_trim = int(spec["tail_trim"])
+            if head_trim > 0 or tail_trim > 0:
+                frames = frames[:, head_trim:max(head_trim, frames.shape[1] - tail_trim)]
+            window_frames_list.append(frames)
+            # The audio latent is a 20-channel step per audio position; the
+            # vocoder decodes it straight to the entry's 16 kHz mono rate,
+            # so the waveform needs no resampling (the generation decode is
+            # the same call).
+            if needs_audio and idx < len(audio_windows) and audio_vae is not None:
+                a_latent = audio_windows[idx]["latents"]
+                if a_latent.dim() == 3:
+                    a_latent = a_latent[0]
+                a_decoded = audio_vae.wrapped_decode(a_latent.to(device=decode_device, dtype=torch.bfloat16).unsqueeze(0))
+                a_latent = None
+                if a_decoded is None or a_decoded.numel() == 0:
+                    raise ValueError(f"window {window_no} audio could not be decoded")
+                audio_waveform_chunks.append(a_decoded.reshape(-1).float().cpu())
+                a_decoded = None
+    except Exception as exc:
+        send_cmd("error", gr.Error(f"The saved latent could not be decoded: {exc}"))
+        return
+    finally:
+        vae.model.to("cpu")
+        if audio_vae is not None:
+            audio_vae.to("cpu")
+        del vae
+        if audio_vae is not None:
+            del audio_vae
+    if len(window_frames_list) == 0:
+        send_cmd("error", gr.Error("The saved latent does not contain any decodable window."))
+        return
+    frames = torch.cat(window_frames_list, dim=1) if len(window_frames_list) > 1 else window_frames_list[0]
+    _save_ltx2_decoded_video(send_cmd, state, video_source, client_id, plugin_data, frames, audio_waveform_chunks, sample_rate, entry, audio_entry, fps, entry_is_hdr,
+                             api_return_video_uint8, api_return_audio, api_suppress_metadata_images)
+
+
 def edit_latent_job(send_cmd, state, video_source, client_id="", plugin_data=None):
     """Decode a saved pre-decode latent (Media Flow 'Latent Decode') back to pixels.
 
@@ -9671,6 +9855,10 @@ def edit_latent_job(send_cmd, state, video_source, client_id="", plugin_data=Non
     if _is_magi_human_family(str(entry.get("base_model_type") or ""), model_def):
         _edit_latent_job_magi(send_cmd, state, video_source, client_id, plugin_data, sidecar_obj, entry, model_def, window_specs,
                               api_return_video_uint8, api_return_audio, api_suppress_metadata_images)
+        return
+    if _is_ovi_family(str(entry.get("base_model_type") or ""), model_def):
+        _edit_latent_job_ovi(send_cmd, state, video_source, client_id, plugin_data, sidecar_obj, entry, model_def, window_specs,
+                             api_return_video_uint8, api_return_audio, api_suppress_metadata_images)
         return
 
     # Resolve the VAE the same way the model loader does (the stored VAE name
@@ -10413,6 +10601,8 @@ def generate_media(
             _job_model_def = _runtime_model_def(model_type, model_def, config)
             if str(base_model_type or "").startswith("ltx2"):
                 _branch_vae_file, _branch_vae_sha = _ltx2_video_vae_identity(_job_model_def, base_model_type)
+            elif _is_ovi_family(base_model_type, model_def):
+                _branch_vae_file, _branch_vae_sha = _ovi_video_vae_identity(_job_model_def, base_model_type)
             elif _is_wan_family(base_model_type, model_def):
                 _branch_vae_file, _branch_vae_sha = _wan_video_vae_identity(_job_model_def, base_model_type)
             elif _is_longcat_family(base_model_type, model_def):
