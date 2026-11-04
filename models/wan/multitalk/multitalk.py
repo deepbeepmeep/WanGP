@@ -16,6 +16,7 @@ import numpy as np
 from einops import rearrange
 import math
 from shared.utils import files_locator as fl 
+from shared.utils.subprocess_stdin import child_kwargs
 
 def custom_init(device, wav2vec):    
     from mmgp import offload
@@ -82,7 +83,7 @@ def extract_audio_from_video(filename, sample_rate):
         "2",
         str(raw_audio_path),
     ]
-    subprocess.run(ffmpeg_command, check=True)
+    subprocess.run(ffmpeg_command, check=True, **child_kwargs())
     human_speech_array, sr = librosa.load(raw_audio_path, sr=sample_rate)
     human_speech_array = loudness_norm(human_speech_array, sr)
     os.remove(raw_audio_path)

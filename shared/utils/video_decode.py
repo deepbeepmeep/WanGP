@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from .virtual_media import clamp_virtual_frame_range, get_virtual_media_entry, parse_virtual_media_path, strip_virtual_media_suffix
+from shared.utils.subprocess_stdin import child_kwargs
 
 _ZSCALE_TRANSFER_MAP = {"smpte2084": "smpte2084", "arib-std-b67": "arib-std-b67", "bt709": "bt709", "bt2020-10": "2020_10", "bt2020-12": "2020_12"}
 _ZSCALE_PRIMARIES_MAP = {"bt2020": "2020", "bt709": "709", "smpte170m": "170m", "bt470bg": "470bg"}
@@ -185,7 +186,7 @@ def _probe_mkv_sparse_frame_count(source_path, ffprobe_path, duration, start_tim
     tail_frames = 64
     tail_start = max(0.0, start_time + max(0, candidate - tail_frames) / fps_float)
     probe_cmd = [ffprobe_path, "-v", "error", "-select_streams", "v:0", "-read_intervals", f"{tail_start:.6f}%+#96", "-show_entries", "frame=best_effort_timestamp_time,pts_time,pkt_pts_time", "-of", "json", source_path]
-    probe = subprocess.run(probe_cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False)
+    probe = subprocess.run(probe_cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False, **child_kwargs())
     if probe.returncode != 0:
         return candidate
     try:
@@ -208,7 +209,7 @@ def probe_video_stream_metadata(video_path, *, file_version=None):
     if ffprobe_path is None:
         return None
     probe_cmd = [ffprobe_path, "-v", "error", "-select_streams", "v:0", "-show_streams", "-show_format", "-of", "json", source_path]
-    probe = subprocess.run(probe_cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False)
+    probe = subprocess.run(probe_cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False, **child_kwargs())
     if probe.returncode != 0:
         return None
     try:
@@ -461,7 +462,7 @@ def _decode_contiguous_video_frames_ffmpeg(video_path, start_frame, max_frames, 
         cmd += ["-vf", video_filter]
     out_pix_fmt = "gbrpf32le" if hdr_linear else "rgb24"
     cmd += ["-fps_mode", "passthrough", "-frames:v", str(requested_frames), "-f", "rawvideo", "-pix_fmt", out_pix_fmt, "pipe:1"]
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**7)
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**7, **child_kwargs())
     frame_bytes = metadata["display_width"] * metadata["display_height"] * 3 * (4 if hdr_linear else 1)
     frame_dtype = np.float32 if hdr_linear else np.uint8
     frames_shape = (requested_frames, 3, metadata["display_height"], metadata["display_width"]) if hdr_linear else (requested_frames, metadata["display_height"], metadata["display_width"], 3)
@@ -544,7 +545,7 @@ def decode_video_frame_indices_ffmpeg(video_path, frame_indices, bridge="torch",
     cmd += ["-i", decode_path, "-an", "-sn", "-vf", video_filter]
     out_pix_fmt = "gbrpf32le" if hdr_linear else "rgb24"
     cmd += ["-fps_mode", "passthrough", "-frames:v", str(len(unique_indices)), "-f", "rawvideo", "-pix_fmt", out_pix_fmt, "pipe:1"]
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**7)
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**7, **child_kwargs())
     frame_bytes = metadata["display_width"] * metadata["display_height"] * 3 * (4 if hdr_linear else 1)
     frame_dtype = np.float32 if hdr_linear else np.uint8
     frames_shape = (len(unique_indices), 3, metadata["display_height"], metadata["display_width"]) if hdr_linear else (len(unique_indices), metadata["display_height"], metadata["display_width"], 3)

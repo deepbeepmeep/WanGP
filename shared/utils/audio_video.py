@@ -25,6 +25,7 @@ from .hdr import hdr10_x265_params, hdr10_zscale_filter, iter_hdr_gbrpf32_frames
 from .video_decode import probe_video_stream_metadata, resolve_media_binary
 from .video_codecs import SUPPORTED_VIDEO_CONTAINERS, get_imageio_codec_params, get_video_encode_args, validate_video_output_settings
 from .virtual_media import get_virtual_media_entry, parse_virtual_media_path, strip_virtual_media_suffix
+from shared.utils.subprocess_stdin import child_kwargs
 
 def _ffmpeg_binary():
     return resolve_media_binary("ffmpeg") or "ffmpeg"
@@ -418,7 +419,7 @@ def _run_ffmpeg_encode(input_path, output_path, codec, bitrate=None, sample_rate
     if sample_rate:
         cmd += ["-ar", str(int(sample_rate))]
     cmd.append(output_path)
-    subprocess.run(cmd, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    subprocess.run(cmd, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace", **child_kwargs())
 
 
 def save_audio_file(path, audio_data, sample_rate, codec_key="wav"):
@@ -666,7 +667,7 @@ def combine_and_concatenate_video_with_audio_tracks(
     if verbose:
         print(f"ffmpeg command: {cmd}")
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        subprocess.run(cmd, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace", **child_kwargs())
     except subprocess.CalledProcessError as e:
         raise Exception(f"FFmpeg error: {e.stderr}")
 
@@ -722,7 +723,7 @@ def combine_video_with_audio_tracks(target_video, audio_tracks, output_video,
         cmd += ['-b:a', audio_settings["bitrate"]]
     cmd += ['-t', str(dur), output_video]
 
-    result = subprocess.run(cmd, capture_output=not verbose, text=True, encoding="utf-8", errors="replace")
+    result = subprocess.run(cmd, capture_output=not verbose, text=True, encoding="utf-8", errors="replace", **child_kwargs())
     if result.returncode != 0:
         raise Exception(f"FFmpeg error:\n{result.stderr}")
     if verbose:

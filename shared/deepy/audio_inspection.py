@@ -11,6 +11,7 @@ import ffmpeg
 import numpy as np
 
 from shared.deepy.video_tools import _get_ffmpeg_path
+from shared.utils.subprocess_stdin import child_kwargs
 
 
 MAX_ENVELOPE_WINDOWS = 600
@@ -63,7 +64,7 @@ def inspect_audio(path, *, audio_track_no=1, start_time=0.0, duration=None, sile
     # Trim before metering: an output -t alone can let the filter inspect later frames.
     filters = ([f"atrim=end_sample={round(duration * rate)}"] if duration is not None else []) + [f"ebur128=peak=true:framelog={'info' if window_s is not None else 'verbose'}"]  # info logs the 100 ms frames
     with tempfile.TemporaryFile() as log:
-        process = subprocess.Popen(command + ["-af", ",".join(filters), "-f", "f32le", "-acodec", "pcm_f32le", "pipe:1"], stdout=subprocess.PIPE, stderr=log)
+        process = subprocess.Popen(command + ["-af", ",".join(filters), "-f", "f32le", "-acodec", "pcm_f32le", "pipe:1"], stdout=subprocess.PIPE, stderr=log, **child_kwargs())
         try:
             while data := process.stdout.read(window * channels * 4):
                 samples = np.frombuffer(data, dtype="<f4").reshape(-1, channels).astype(np.float64)
@@ -124,7 +125,7 @@ def inspect_audio(path, *, audio_track_no=1, start_time=0.0, duration=None, sile
         preview = command.copy()
         if duration is not None:
             preview = preview[:-2]
-        completed = subprocess.run(preview + ["-t", str(seconds), "-ac", "2", "-ar", "24000", "-c:a", "pcm_s16le", "-y", str(preview_path)], capture_output=True)
+        completed = subprocess.run(preview + ["-t", str(seconds), "-ac", "2", "-ar", "24000", "-c:a", "pcm_s16le", "-y", str(preview_path)], capture_output=True, **child_kwargs())
         if completed.returncode:
             Path(preview_path).unlink(missing_ok=True)
             raise ValueError(completed.stderr.decode(errors="replace")[-1500:])
@@ -155,7 +156,7 @@ def speech_intervals(path, *, start_time=0.0, duration=None, isolated=None, marg
     -60 dBFS) is treated as isolated. Energy below -55 dBFS never counts."""
     command = [_get_ffmpeg_path(), "-nostdin", "-hide_banner", "-loglevel", "error", "-ss", str(start_time), "-i", str(path), *(["-t", str(duration)] if duration else []),
                "-vn", "-af", "highpass=f=200,lowpass=f=4000", "-ac", "1", "-ar", str(SPEECH_RATE), "-f", "f32le", "pipe:1"]
-    completed = subprocess.run(command, capture_output=True)
+    completed = subprocess.run(command, capture_output=True, **child_kwargs())
     if completed.returncode:
         raise ValueError(f"Audio decoding failed: {completed.stderr.decode(errors='replace')[-1500:]}")
     samples = np.frombuffer(completed.stdout, dtype="<f4")
@@ -188,7 +189,7 @@ def voice_pitch(path, *, start_time=0.0, duration=None):
     male ones below. Meaningless on a full mix, whose instruments dominate the autocorrelation."""
     command = [_get_ffmpeg_path(), "-nostdin", "-hide_banner", "-loglevel", "error", "-ss", str(start_time), "-i", str(path), *(["-t", str(duration)] if duration else []),
                "-vn", "-af", "lowpass=f=1200", "-ac", "1", "-ar", str(SPEECH_RATE), "-f", "f32le", "pipe:1"]
-    completed = subprocess.run(command, capture_output=True)
+    completed = subprocess.run(command, capture_output=True, **child_kwargs())
     if completed.returncode:
         raise ValueError(f"Audio decoding failed: {completed.stderr.decode(errors='replace')[-1500:]}")
     size = 1024
