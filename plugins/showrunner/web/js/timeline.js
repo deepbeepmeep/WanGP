@@ -88,6 +88,7 @@ export function mountTimeline(container, doc) {
       <span class="time" id="time"></span>
       <span class="sep"></span>
       <div class="seg" id="mode" title="Soundtrack of the preview and of the assembled edit">${[['song', 'Song'], ['clips', 'Shot sound'], ['mix', 'Mix']].map(([key, label]) => `<button class="${doc.edit.audio_mode === key ? 'on' : ''}" data-mode="${key}">${label}</button>`).join('')}</div>
+      ${doc.brief.voices_from_model && !['music_video', 'story'].includes(doc.brief.kind) && doc.edit.audio_mode !== 'song' ? `<button class="btn small ${doc.edit.level_voices ? 'active' : ''}" id="level-voices" title="In the export, brings every shot with lines to one level: the video model makes some voices much quieter than others. The preview plays them as made.">${icon('gauge')} Even voices</button>` : ''}
       <button class="btn small ${snap ? 'active' : ''}" id="snap" title="Snap trims to beats and bars">${icon('magnet')} Snap</button>
       <div class="grow"></div>
       <button class="btn ghost small icon" id="zoom-out" title="Zoom out">${icon('zoomOut')}</button>
@@ -104,6 +105,7 @@ export function mountTimeline(container, doc) {
     $('#zoom-out').onclick = () => zoom(1 / 1.4);
     $('#zoom-fit').onclick = () => { fit(); render(); };
     container.querySelectorAll('[data-mode]').forEach(button => button.onclick = () => actions.ops([{ op: 'edit', fields: { audio_mode: button.dataset.mode } }]));
+    $('#level-voices')?.addEventListener('click', () => actions.ops([{ op: 'edit', fields: { level_voices: !doc.edit.level_voices } }]));
     $('#assemble').onclick = assemble;
     $('#add-text').onclick = () => editText(null);
     $('#add-track').onclick = async () => { const files = await pickFiles(AUDIO_ACCEPT, false); if (files.length) actions.upload(files, 'track'); };

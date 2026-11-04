@@ -1,0 +1,15 @@
+{
+  "_class_name": "WanModel",
+  "_diffusers_version": "0.33.0",
+  "dim": 3072,
+  "eps": 1e-06,
+  "ffn_dim": 14336,
+  "freq_dim": 256,
+  "in_dim": 48,
+  "model_type": "ti2v2_2",
+  "num_heads": 24,
+  "num_layers": 30,
+  "out_dim": 48,
+  "text_len": 512,
+  "taomate": true
+}

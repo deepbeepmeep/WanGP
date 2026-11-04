@@ -10,7 +10,7 @@ import shutil
 import threading
 import time
 from concurrent.futures import Future
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, suppress
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable
@@ -20,13 +20,13 @@ from anyio.from_thread import start_blocking_portal
 
 from shared.api import WanGPSession
 from shared.deepy import media_registry
-from shared.deepy.config import DEEPY_CONTEXT_TOKENS_DEFAULT, DEEPY_CONTEXT_TOKENS_KEY, DEEPY_MCP_AUTO_DISCOVER_PATHS_DEFAULT, DEEPY_MCP_AUTO_DISCOVER_PATHS_KEY, DEEPY_PRIME_MCP_SERVERS_KEY, get_deepy_config_value, get_deepy_runtime_config, normalize_deepy_context_tokens, normalize_deepy_mcp_auto_discover_paths, normalize_deepy_prime_mcp_servers
+from shared.deepy.config import DEEPY_AUTO_CANCEL_QUEUE_TASKS_DEFAULT, DEEPY_AUTO_CANCEL_QUEUE_TASKS_KEY, DEEPY_CONTEXT_TOKENS_DEFAULT, DEEPY_CONTEXT_TOKENS_KEY, DEEPY_MCP_AUTO_DISCOVER_PATHS_DEFAULT, DEEPY_MCP_AUTO_DISCOVER_PATHS_KEY, DEEPY_PRIME_MCP_SERVERS_KEY, get_deepy_config_value, get_deepy_runtime_config, normalize_deepy_auto_cancel_queue_tasks, normalize_deepy_context_tokens, normalize_deepy_mcp_auto_discover_paths, normalize_deepy_prime_mcp_servers
 from shared.gradio import assistant_chat
 from shared.mcp.server import _compact_job_snapshot, build_inprocess_server, resolve_gallery_media_path
 from shared.mcp.resources import RESOURCE_ALIASES, RESOURCE_DESCRIPTION, query_resources, resource_record, _extract_markdown_sections, _select_markdown_sections, _search_markdown_sections, _resource_read_blocks
 
 
-PRIME_ASYNC_ENABLED = False
+REMOTE_JOB_WAIT_S = 600  # a remote engine's generation or post-processing call returns by then, its job still running
 
 
 def _resolve_external_stdio_command(value: str, allow_changed_path_search: bool = False) -> str:
@@ -78,8 +78,11 @@ def _mcp_connection_error_message(error: BaseException) -> str:
 class DeepyPrimeTools:
     _POLL_INTERVAL_SECONDS = 0.2
     _plugin_tools_by_name = {}
+    allow_async = False  # remote engines start jobs in the background (wait=false) and wait for them in bounded calls
+    _queue_on_server = False  # their jobs join the queue whether or not a turn is still running to forward them
 
-    def __init__(self, state: dict[str, Any], send_cmd: Callable[..., None], assistant_session, zero_tools=None) -> None:
+    def __init__(self, state: dict[str, Any], send_cmd: Callable[..., None], assistant_session, zero_tools=None, allow_async: bool = False) -> None:
+        self.allow_async = allow_async
         self.state = state
         self.send_cmd = send_cmd
         self.assistant_session = assistant_session
@@ -89,12 +92,15 @@ class DeepyPrimeTools:
         from shared.deepy import session_store
 
         base_policy = build_file_access_policy(zero_tools._server_config() if zero_tools is not None else get_deepy_runtime_config())
-        self._api_session = WanGPSession(webui_state=state, console_output=False, console_isatty=False)
+        self._api_session = WanGPSession(webui_state=state, console_output=False, console_isatty=False, webui_concurrent=allow_async)
         from shared.utils.workspace_storage import host_for_gen
         host = host_for_gen(state['gen'])
         if host is not None:
             self._api_session._workspace_id = host.deepy_workspace_id()
-        self._api_session._gradio_webui_context = {"defer_load_queue_trigger": True}
+        from shared.deepy.hybrid import service_for
+        service = service_for(state) if allow_async else None
+        self._queue_on_server = service is not None
+        self._api_session._gradio_webui_context = {"load_queue": service.load_inline_queue} if service is not None else {"defer_load_queue_trigger": True}
 
         workspace = session_store.session_workspace(assistant_session)
         if workspace is None:
@@ -108,7 +114,8 @@ class DeepyPrimeTools:
 
         self._plugin_tools_by_name = {definition.name: definition for definition in get_deepy_prime_plugin_tools() if not definition.requires_file_system or base_policy.read_enabled}
         self._tool_progress_callback: Callable[..., None] | None = None
-        self._server = build_inprocess_server(self._api_session, toolbox=zero_tools, default_job_event_limit=0, file_access_policy=self.file_access_policy, api_version="2.1", allow_async=PRIME_ASYNC_ENABLED)
+        self._server = build_inprocess_server(self._api_session, toolbox=zero_tools, default_job_event_limit=0, file_access_policy=self.file_access_policy, api_version="2.1", allow_async=allow_async)
+        self._server._wangp_wait_interrupted = self._is_interrupted  # the chat Stop button ends a wait for jobs
         if self._server._wangp_python_sandbox is not None:
             sandbox = self._server._wangp_python_sandbox
             sandbox.interrupted = self._is_interrupted  # the chat Stop button kills a running script
@@ -169,7 +176,8 @@ class DeepyPrimeTools:
             self._active_job_id = ""
             self._active_session_job = None
         for job in list(self._background_jobs.values()):
-            job.cancel()
+            with suppress(ValueError):  # a toolbox job that cannot be cancelled runs to completion
+                job.cancel()
         if self._server._wangp_python_sandbox is not None:
             self._server._wangp_python_sandbox.close()
         self._server._wangp_pages.close()
@@ -180,8 +188,15 @@ class DeepyPrimeTools:
 
     def cancel_active_job(self) -> str:
         job_id = str(self._active_job_id or "").strip()
+        background_id = ""
+        auto_abort = normalize_deepy_auto_cancel_queue_tasks(get_deepy_config_value(DEEPY_AUTO_CANCEL_QUEUE_TASKS_KEY, DEEPY_AUTO_CANCEL_QUEUE_TASKS_DEFAULT))
+        for running_id, job in list(self._background_jobs.items()) if auto_abort else ():
+            if not job.done and not job.cancel_requested:
+                with suppress(ValueError):  # a toolbox job that cannot be cancelled runs to completion
+                    job.cancel()
+                    background_id = running_id
         if not job_id or self._active_job_cancel_requested:
-            return ""
+            return background_id
         self._active_job_cancel_requested = True
         try:
             if self._active_session_job is not None:
@@ -341,7 +356,7 @@ class DeepyPrimeTools:
                 payload = content_text
         if isinstance(payload, dict):
             normalized = dict(payload)
-            normalized.setdefault("status", "done")
+            normalized.setdefault("status", "running" if normalized.get("done") is False else "done")
         else:
             normalized = {"status": "done", "content": payload}
         normalized = self._enforce_output_budget(tool_name, self.file_access_policy.virtualize_result(normalized))
@@ -495,7 +510,7 @@ class DeepyPrimeTools:
             return initial
         self._active_job_id = job_id
         self._active_job_cancel_requested = False
-        queue_triggered = False
+        queue_triggered = self._queue_on_server
         cancel_requested = False
         snapshot = initial
         deadline = None if timeout_s is None else time.monotonic() + timeout_s
@@ -541,9 +556,9 @@ class DeepyPrimeTools:
         return str(self._server_instructions or "").strip()
 
     def get_remote_execution_instructions(self) -> str:
-        if PRIME_ASYNC_ENABLED:
-            return ""
-        return "WanGP waits for generation and post-processing internally and returns their results; do not poll jobs."
+        return (f"wangp_generate and wangp_postprocess wait for their job for up to {REMOTE_JOB_WAIT_S} seconds, or timeout_s when shorter. A job still running then returns status timeout with its job_id and keeps running: "
+                "follow it with wangp_session wait_jobs or get_job, and never submit it again. With wait=false they return the job_id at once, so you can start several jobs and keep working; wangp_toolbox and wangp_plugins accept wait=false too. "
+                "Before your final answer, wait for the jobs whose results you still need and report the rest as running.")
 
     def get_runtime_context(self) -> str:
         from shared.deepy.ui_settings import normalize_assistant_tool_ui_settings
@@ -857,7 +872,7 @@ class DeepyPrimeTools:
             for name in unknown:  # action parameters written beside action and arguments, checked there by the action's schema (a flat call stays refused)
                 arguments["arguments"][name] = arguments.pop(name)
             unknown = set()
-        if not PRIME_ASYNC_ENABLED and tool_name in {"wangp_generate", "wangp_postprocess"}:
+        if not self.allow_async and tool_name in {"wangp_generate", "wangp_postprocess"}:
             unknown -= {"wait", "timeout_s", "event_limit"}
         unknown = sorted(unknown)
         if unknown and (toolbox or parameters.get("additionalProperties") is False):
@@ -924,7 +939,7 @@ class DeepyPrimeTools:
 
         def finish():
             try:
-                if record.job.wait_for_webui_submission_or_completion() and trigger_queue and not record.job.done and not record.job.cancel_requested:
+                if record.job.wait_for_webui_submission_or_completion() and trigger_queue and not self._queue_on_server and not record.job.done and not record.job.cancel_requested:
                     self.send_cmd("load_queue_trigger", {"job_id": job_id, "token": record.job.webui_load_queue_token})
                 record.wait()
                 self._remember_generated_media(record.snapshot(event_limit=0))
@@ -987,7 +1002,7 @@ class DeepyPrimeTools:
 
     def _call(self, tool_name: str, arguments: dict[str, Any], route: tuple[str, str] | None = None) -> dict[str, Any]:
         ignored = []
-        if not PRIME_ASYNC_ENABLED and tool_name in {"wangp_generate", "wangp_postprocess"}:
+        if not self.allow_async and tool_name in {"wangp_generate", "wangp_postprocess"}:
             arguments = dict(arguments)
             if isinstance(arguments.get("arguments"), dict):
                 arguments["arguments"] = dict(arguments["arguments"])
@@ -1012,12 +1027,24 @@ class DeepyPrimeTools:
             # job controls sit at the top level; post-processing calls may still carry them inside arguments
             action_arguments = arguments if tool_name == "wangp_generate" else {**{key: value for key, value in arguments["arguments"].items() if key in JOB_CONTROLS}, **{key: arguments[key] for key in JOB_CONTROLS if key in arguments}}
             if action_arguments.get("wait", True):
-                result = self._wait_for_generation(result, action_arguments.get("timeout_s"), action_arguments.get("event_limit", 0))
+                timeout_s = action_arguments.get("timeout_s")
+                if self.allow_async and route is None:  # scripts and plugin actions wait for their own calls to end
+                    timeout_s = REMOTE_JOB_WAIT_S if timeout_s is None else min(timeout_s, REMOTE_JOB_WAIT_S)
+                result = self._wait_for_generation(result, timeout_s, action_arguments.get("event_limit", 0))
+                if result.get("waiting_timed_out"):
+                    result["info"] = "The job keeps running: follow it with wangp_session wait_jobs. Do not submit it again."
             else:
                 self._watch_background_job(result["job_id"])
+        elif tool_name in {"wangp_toolbox", "wangp_plugins"} and isinstance(result, dict) and result.get("job_id") and not result.get("done"):  # stops with the chat Stop button
+            self._background_jobs = {job_id: job for job_id, job in self._background_jobs.items() if not job.done}
+            self._background_jobs[result["job_id"]] = self._server._wangp_jobs.get(result["job_id"]).job
         if ignored:
             result["info"] = f"Ignored {', '.join(ignored)}: WanGP manages waiting for generation and post-processing."
         self._remember_generated_media(result)
+        if self.allow_async and tool_name in {"wangp_generate", "wangp_postprocess", "wangp_session"}:  # the browser-queue handshake of running jobs is not for the model
+            for job in (result, *result.get("jobs", [])):
+                job.pop("webui_submission_ready", None)
+                job.pop("webui_load_queue_token", None)
         if tool_name in {"wangp_generate", "wangp_postprocess"}:
             from shared.mcp.v2 import public_media_result
             result = public_media_result(result)

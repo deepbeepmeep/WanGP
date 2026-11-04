@@ -21,7 +21,6 @@ PROMPT_ENHANCER_CHOICES = [
     ("Qwen3.5VL Abliterated 4B (recommended, captioning + uncensored text enhancement, vllm accelerated if available)", 3),
     ("Qwen3.5VL Abliterated 9B (captioning + uncensored high end text enhancement, vllm accelerated if available)", 4),
     ("Qwen3.8VL Uncensored 27B by Jonathan Coletti (highest quality, choose GGUF Q2, Q3 or Q4 below)", 5),
-    ("Qwen3.8VL Uncensored 9B (distilled from Qwen3.8, Deepy Prime in about 6.5 GB VRAM, choose GGUF Q4 or Q8 below)", 6),
 ]
 
 SEEDVC_DEFAULT_MODE = 2

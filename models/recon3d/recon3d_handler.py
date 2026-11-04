@@ -44,6 +44,7 @@ class family_handler:
         extra_model_def = {
             "image_outputs": True,
             "mesh_outputs": True,
+            "mesh_navigation": "walk",  # a scene to move through, not an object to turn around
             "mesh_postprocessing": False,  # reconstructed scenes, point clouds and splats
             "device_explicit": True,
             "no_model_swap": True,  # one managed model: kept loaded between samples and queued tasks of the same model

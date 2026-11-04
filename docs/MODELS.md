@@ -66,6 +66,8 @@ Acceleration choices have different trade-offs. **PDD** variants use a fixed eig
 
 **[Viggle Animate](modeltype:viggle_animate) is an H3-derived character-replacement model.** Supply the original control video and one frame from it in which an image editor has replaced the character. Preserve that frame's pose, background, framing and dimensions. Viggle follows the original motion in a fixed three-step workflow, using sliding windows for longer footage. Its text generation prompt is ignored: express the change in the edited frame. Large pose changes, interacting characters and cuts are more challenging.
 
+**[P-H3-Image](modeltype:minimax_h3_image) is an H3-derived image model**, listed with H3 although it makes no video or audio. It generates a single image from text, or edits an image with up to eight input images, in a fixed eight-step workflow. It works best at 8 megapixels and is strongest at photorealism, film and editorial looks and graphic styles with short quoted text. It renders full, specific prompts much better than short requests, so write them out or use the optional **Write** button.
+
 The family also provides an audio-only **[H3 Voice Clone](modeltype:minimax_h3_tts_ref2va_pruned)** preset and **H3 Face Refiner** for finishing video; these are related H3 workflows, not separate model families.
 
 <a id="ltx-2-and-ltx-23"></a>
@@ -296,7 +298,7 @@ Combining them gives a shape, its fine relief and its textures in one generation
 
 ### Reuse 3D assets
 
-Open results in the **3D gallery** to rotate, zoom and inspect them. Save a view at your chosen resolution, then use that image as a reference or the start of a video. Compatible mesh results can also become inputs for texturing, refinement, segmentation or animation: select one in the 3D gallery and press **To Input Mesh**, shown for models that take a mesh (those under Texture, Refine, Split and Animate). [Deepy](DEEPY.md) can inspect 3D assets from different angles and help turn a character into a turnaround sheet.
+Open results in the **3D gallery** to rotate, zoom and inspect them. Gaussian splats can also be walked through: W A S D to move, R and F to rise and sink, the arrows or a drag to look, Shift to go faster and the wheel to change the speed. On a touch screen, drag to look, pinch to go forward or back and slide two fingers to step aside or rise. Scenes reconstructed from photos or video open this way, at their first camera; other splats open for turning around, and the **Walk** button switches between the two. Splats made elsewhere can arrive tilted: while walking, Q and E turn the scene around your line of sight to level it, and your browser remembers the result. Save a view at your chosen resolution, then use that image as a reference or the start of a video. Compatible mesh results can also become inputs for texturing, refinement, segmentation or animation: select one in the 3D gallery and press **To Input Mesh**, shown for models that take a mesh (those under Texture, Refine, Split and Animate). [Deepy](DEEPY.md) can inspect 3D assets from different angles and help turn a character into a turnaround sheet.
 
 ## Upscaling and finishing
 
@@ -305,7 +307,7 @@ Generation models and finishing tools are separate choices. Select a processor i
 - **Spatial upscaling and detail**: SeedVR2, FlashVSR and LTX-based upscaling offer different appearance and memory trade-offs. LTX 2.5 Detail Refiner can restore texture in soft or compressed video. Lanczos provides conventional resizing; latent/VAE upsamplers apply only to compatible generation workflows.
 - **Smoother motion**: RIFE supports x2/x3/x4 interpolation. Optional DLSS Frame Generation offers hardware-dependent multipliers on compatible RTX GPUs.
 - **Neural refinement**: optional DLSS 5 can refine lighting, material appearance and detail at native or enlarged resolution, on supported hardware. See the [DLSS 5 guide](DLSS5.md) for setup and limits.
-- **Faces**: H3 Face Refiner can refine up to five detected, tracked faces in a video.
+- **Faces**: H3 Face Refiner and TaoMate-FVSR Face Refiner refine up to five detected, tracked faces in a video, both using the soundtrack; TaoMate-FVSR pushes the mouth toward it much harder. See [Processing](PROCESSING.md#face-refinement).
 - **Audio**: remove vocals, replace voices with SeedVC, add a soundtrack with MMAudio or PrismAudio, or remux existing tracks. Deepy Prime can also mix audio and package selectable audio/subtitle tracks.
 
 See [Processing](PROCESSING.md) for input preparation, masks, control media and finishing workflows.

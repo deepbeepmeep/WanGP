@@ -44,6 +44,7 @@ export const api = {
   pause: (id, now = false) => call('POST', `productions/${id}/director/pause${now ? '?now=true' : ''}`),
   resume: (id, message = '') => call('POST', `productions/${id}/director/resume`, { message }),
   rerun: (id, shot) => call('POST', `productions/${id}/shots/${shot}/rerun`),
+  renderNow: (id, shots) => call('POST', `productions/${id}/render`, { shots }),
   detachSound: (id, shot) => call('POST', `productions/${id}/shots/${shot}/detach-sound`),
   cancelRender: (id, shot) => call('POST', `productions/${id}/shots/${shot}/cancel`),
   assemble: id => call('POST', `productions/${id}/assemble`),

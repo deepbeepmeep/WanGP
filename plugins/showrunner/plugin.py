@@ -59,7 +59,7 @@ class WanGPHost:
         if client.unavailable_reason:
             return client.unavailable_reason
         if client.deepy_type != "prime":
-            return "Showrunner needs Deepy Prime (local or with a remote agent): Deepy Zero cannot plan long productions. Choose Prime in Configuration > Deepy."
+            return "Showrunner needs Deepy Prime (local or with a remote agent): Deepy Zero cannot plan long productions. Choose Prime in Configuration > Prompt Enhancer / Deepy, or make the shots yourself: + Shot, then Render now."
         return ""
 
     def director_info(self) -> dict:
@@ -166,10 +166,11 @@ class WanGPHost:
                 catalog.append({"task": task, "category": tool_settings.TOOL_DISPLAY_NAMES[task], "name": variant, "label": label, "default": variant == default,
                                 "model_type": preset.get("model_type"), "refs": "I" in refs, "audio": "A" in str(video.get("audio_prompt_type") or ""),
                                 "soundtrack": "AS" in (sources.get("selection") or []),  # its model can follow an audio_guide kept as the soundtrack
+                                "spoken_line": model_def.get("spoken_line_prompt"),  # how its model takes a line to voice, written in its prompt
                                 "sized_by_ref": "K" in refs,  # its output takes the first reference's size, not the production's format
                                 "shortest_s": math.floor(model_def.get("frames_minimum", 0) / model_def.get("fps", 16) * 1000) / 1000,  # the shortest take its model makes
                                 "take_frames": [model_def.get("frames_minimum", 0), model_def.get("frames_steps", 1), model_def.get("fps", 16)],  # its first length and the steps after it
-                                "longest_frames": (model_def.get("sliding_window_defaults") or {}).get("window_max")})  # its longest window, when it has windows
+                                "longest_frames": video.get("sliding_window_size") or (model_def.get("sliding_window_defaults") or {}).get("window_default")})  # the longest take of one window: past it, WanGP generates a second one
         return catalog
 
     def default_templates(self) -> dict:
@@ -229,7 +230,7 @@ class ShowrunnerPlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "0.2.0"
+        self.version = "0.2.1"
         self.description = "Productions directed by Deepy: music videos, films, ads and stories, defined and reviewed shot by shot."
         self._showrunner = None
         self._lock = threading.Lock()

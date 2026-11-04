@@ -588,6 +588,7 @@ class WanGPSession:
         console_isatty: bool = True,
         webui_state: dict[str, Any] | None = None,
         webui_append: bool = False,
+        webui_concurrent: bool = False,
     ) -> None:
         self._root = Path(root or Path(__file__).resolve().parents[1]).resolve()
         self._config_path = Path(config_path).resolve() if config_path is not None else (self._root / "wgp_config.json").resolve()
@@ -599,6 +600,8 @@ class WanGPSession:
         self._use_webui_queue = isinstance(webui_state, dict)
         # Like the UI's Add to Queue: jobs append in order and several may wait, instead of one priority job.
         self._webui_append = self._use_webui_queue and webui_append
+        # Several priority jobs may wait too (a remote Deepy engine's background jobs): the queue keeps them in order.
+        self._webui_concurrent = self._webui_append or (self._use_webui_queue and webui_concurrent)
         self._state = webui_state if isinstance(webui_state, dict) else self._create_headless_state()
         self._active_job: SessionJob | None = None
         self._job_lock = threading.Lock()
@@ -986,7 +989,7 @@ class WanGPSession:
 
     def _submit_tasks(self, tasks: list[dict[str, Any]], callbacks: object | None = None) -> SessionJob:
         with self._job_lock:
-            if not self._webui_append and self._active_job is not None and not self._active_job.done:
+            if not self._webui_concurrent and self._active_job is not None and not self._active_job.done:
                 raise RuntimeError("WanGP session already has a generation in progress")
             job = SessionJob(self)
             self._bind_callbacks_to_job(job, callbacks)

@@ -95,8 +95,9 @@ Already have WanGP? In Manager, choose **Install / Add → Use existing installa
         gr.Markdown("- <B>FlashVSR</B>: high quality video super-resolution (https://github.com/OpenImagingLab/FlashVSR)")
         gr.Markdown("- <B>NVIDIA PiD</B>\\*: diffusion-based image super-resolution (https://github.com/nv-tlabs/PiD)")
         gr.Markdown("- <B>Carasibana</B>: the MIT-licensed ComfyUI H3 FaceRefine workflow adapted by WanGP (https://github.com/Carasibana/ComfyUI-H3-FaceRefine)")
-        gr.Markdown("- <B>Ultralytics YOLO\\* and Bingsu's ADetailer</B>: face and person detection used by H3 Face Refiner (https://github.com/ultralytics/ultralytics, https://github.com/Bing-su/adetailer)")
-        gr.Markdown("- <B>InsightFace</B>\\*: face detection, landmarks, and identity embeddings used by H3 Face Refiner (https://github.com/deepinsight/insightface)")
+        gr.Markdown("- <B>TaoLive AIGC</B>: TaoMate-FVSR, audio-guided facial video restoration (https://github.com/TaoLiveAIGC/TaoMate-FVSR, https://arxiv.org/abs/2611.03393)")
+        gr.Markdown("- <B>Ultralytics YOLO\\* and Bingsu's ADetailer</B>: face and person detection used by the face refiners (https://github.com/ultralytics/ultralytics, https://github.com/Bing-su/adetailer)")
+        gr.Markdown("- <B>InsightFace</B>\\*: face detection, landmarks, and identity embeddings used by the face refiners (https://github.com/deepinsight/insightface)")
         gr.Markdown("- <B>Merserk</B> and <B>DLSS5-Feeder</B>: foundations for the DLSS 5 video-processing integration (https://github.com/Merserk/dlss5-visual-enhancer, https://github.com/jlrouzies-fr/DLSS5-Feeder)")
 
         gr.Markdown("<BR>Special thanks to the following people for their Contributions & Support:")

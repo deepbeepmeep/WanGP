@@ -417,7 +417,11 @@ class PluginJobSupport:
             for workspace_id in self.workspaces.records:
                 if self.workspaces.media_dir(workspace_id) == folder:
                     return workspace_id
-            workspace_id = self.workspaces.create(name, folder=folder)
+            taken, unique, number = {record['name'].casefold() for record in self.workspaces.records.values()}, name, 1
+            while unique.casefold() in taken:  # another folder of the same name, such as two productions with one title
+                number += 1
+                unique = f'{name[:112]} ({number})'
+            workspace_id = self.workspaces.create(unique, folder=folder)
             self.workspaces.protect(workspace_id, True)  # a plugin's own folder is not archived for inactivity
         self.publish_workspaces()
         return workspace_id

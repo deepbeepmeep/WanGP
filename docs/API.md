@@ -890,8 +890,8 @@ print(result.generated_files)
 Postprocessing values use the registered postprocessor value strings:
 
 - `temporal_upsampling`: registered temporal upsamplers such as `rife*2` or `dlssg*4` for videos, or texturers such as `supratex` and `pixal3d_texture` for meshes. For native Pixal3D, `postprocessing_reference_images` accepts one matching image or four views ordered front, right, back, left.
-- `spatial_upsampling`: registered decoded-media upsamplers such as `lanczos*2`, `flashvsr*2`, `coz*4`, or the no-scale visual refiner `h3facerefine`. VAE upsamplers are model-pipeline features and are not accepted for late postprocessing.
-- `spatial_postprocessing_parameters` / `temporal_postprocessing_parameters`: the options of the spatial and of the temporal processor, each a dictionary keyed by the parameter ids returned by postprocessing discovery. For example, H3 accepts `prompt`, `face_count` and `face_strength`; the texturers accept `texture_size` and `texture_max_faces`.
+- `spatial_upsampling`: registered decoded-media upsamplers such as `lanczos*2`, `flashvsr*2`, `coz*4`, or the no-scale visual refiners `h3facerefine` and `taomatefvsr`. VAE upsamplers are model-pipeline features and are not accepted for late postprocessing.
+- `spatial_postprocessing_parameters` / `temporal_postprocessing_parameters`: the options of the spatial and of the temporal processor, each a dictionary keyed by the parameter ids returned by postprocessing discovery. For example, H3 accepts `prompt`, `face_count` and `face_strength`, TaoMate-FVSR `face_count`, `face_strength` and `follow_audio`, both taking `postprocessing_reference_images` as face references; the texturers accept `texture_size` and `texture_max_faces`.
 - `postprocessing_reference_images`: the reference images shared by both processors: H3's face references, or the object image of Hi3D and the texturers (their `reference_images` parameter).
 - `film_grain_intensity` / `film_grain_saturation`: late film grain settings. Film grain is active when intensity is greater than `0`.
 

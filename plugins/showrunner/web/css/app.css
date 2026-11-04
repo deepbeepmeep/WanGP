@@ -122,6 +122,8 @@ a { color: inherit; }
 .seg button { height: 28px; padding: 0 12px; border-radius: 8px; border: 0; background: transparent; color: var(--text-2); cursor: pointer; display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; }
 .seg button svg { width: 14px; height: 14px; }
 .seg button:hover { color: var(--text); }
+.transport:has(#level-voices) { flex-wrap: wrap; }
+.transport:has(#level-voices) #mode button { white-space: nowrap; }
 .seg button.on { background: var(--surface); color: var(--text); box-shadow: 0 1px 4px rgba(0, 0, 0, .25); }
 .toggle { position: relative; width: 38px; height: 22px; border-radius: 99px; background: var(--surface-3); border: 1px solid var(--line-strong); cursor: pointer; flex: none; transition: background .2s; }
 .toggle::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: var(--text-2); transition: transform .2s var(--ease), background .2s; }
@@ -147,6 +149,7 @@ input[type=range].range::-webkit-slider-thumb { -webkit-appearance: none; width:
 .stage.done .dot { background: rgba(61, 220, 151, .18); color: var(--green); }
 .stage.current { color: var(--text); background: var(--surface); box-shadow: 0 1px 6px rgba(0, 0, 0, .25); }
 .stage.current .dot { background: var(--grad); color: #fff; }
+.stage.open { color: var(--text); outline: 1.5px solid var(--accent); outline-offset: -1.5px; }  /* what the page shows now; current is how far the production has got */
 .stage svg { width: 11px; height: 11px; }
 .stage-arrow { color: var(--line-strong); width: 12px; height: 12px; }
 .director-pill { display: flex; align-items: center; gap: 8px; height: 34px; padding: 0 12px 0 6px; border-radius: 99px; border: 1px solid var(--line-strong); background: var(--surface-2); cursor: pointer; font-size: 12.5px; white-space: nowrap; }

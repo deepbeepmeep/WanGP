@@ -69,7 +69,6 @@ LLM_ENGINE_CHOICES = [
     ("Florence 2 + Llama Joy 8B (local)", ENGINE_LOCAL_2),
     ("Qwen3.5 VL Abliterated 4B (local)", ENGINE_QWEN35_4B),
     ("Qwen3.5 VL Abliterated 9B (local)", ENGINE_QWEN35_9B),
-    ("Qwen3.8 VL Uncensored 9B (local)", ENGINE_QWEN38_9B),
     ("Qwen3.8 VL Uncensored 27B (local)", ENGINE_QWEN38_27B),
     ("Codex (external)", ENGINE_CODEX),
     ("Claude Code (external)", ENGINE_CLAUDE),

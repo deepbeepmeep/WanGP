@@ -388,6 +388,16 @@ def _flatten(tree):
             _register_dataclass(cls)
 
 
+def _spec_hashable():
+    try:
+        return hash(pytree.tree_flatten(((), {}))[1]) is not None
+    except TypeError:  # PyTorch 2.7: the hash generated for TreeSpec fails on its lists; a graph's key then holds its repr, the same structure
+        return False
+
+
+_SPEC_HASHABLE = _spec_hashable()
+
+
 def _signature(leaves, holders=frozenset()):
     signature = []
     for leaf in leaves:
@@ -634,7 +644,7 @@ class BlockGraphs:
             raise ValueError(f"CUDA graph block call of '{self.name}' ({type(module).__name__}): argument {name} is a view whose elements share memory "
                              f"(shape {tuple(leaf.shape)}, stride {leaf.stride()}, e.g. from expand), which a graph's static buffer cannot hold. Pass the "
                              f"unexpanded tensor and expand it inside the block's forward (no cost), or make it contiguous before the call.") from None
-        key = (id(module), spec, signature, extra_signature, self.weights_key(module), tuple(provider() for provider in _key_providers), tuple(static_key), method)
+        key = (id(module), spec if _SPEC_HASHABLE else repr(spec), signature, extra_signature, self.weights_key(module), tuple(provider() for provider in _key_providers), tuple(static_key), method)
         keys = self.keys.setdefault(id(module), {})
         entry = self.entries.get(key, None)
         lifetimes = None

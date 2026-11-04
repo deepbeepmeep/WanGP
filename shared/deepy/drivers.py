@@ -11,6 +11,7 @@ from shared.deepy.gallery import Gallery
 from shared.deepy.media_registry import _label_from_settings
 from shared.utils.gallery_sources import GALLERY_SOURCES, gallery_source
 from shared.utils.media_settings import peek_settings
+from shared.utils.mesh_outputs import splat_viewer_options
 
 
 def gradio_chat_updates(commands, refresh_id):
@@ -83,6 +84,8 @@ class AppGallery(Gallery):
                     item['thumbnail'] = base + '/thumbnail' + version
                 if kind == '3d':
                     item['format'] = Path(path).suffix.lower().lstrip('.')
+                    if item['format'] == 'ply':
+                        item.update(splat_viewer_options(path))
                 cached = peek_settings(settings, index)
                 item['name'] = _label_from_settings(cached, path) or labels.get(os.path.normcase(os.path.abspath(path)), item['name'])
                 if cached:

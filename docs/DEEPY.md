@@ -207,6 +207,8 @@ The chat and generation progress bars show what Deepy and WanGP are doing.
 
 You can send a new instruction while Deepy is working. Use this to steer the current task, or queue the instruction for afterward when the interface offers that choice.
 
+Deepy's generations run after the current task and ahead of the tasks you added to the queue yourself, so a request to Deepy does not wait behind a long queue. Several of them run in the order Deepy requested them.
+
 **Compacted View of Thoughts and Actions** keeps long turns readable. A collapsed turn shows its latest useful statement, generated media, and final answer; expand it to review individual thoughts and actions. The preference is shared between Gradio and Web.
 
 ## Tool templates and defaults

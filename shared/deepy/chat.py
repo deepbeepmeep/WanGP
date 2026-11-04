@@ -21,6 +21,7 @@ from shared.utils.downloads import registered_download_path
 from shared.utils.gallery_media import gallery_media_ids
 from shared.utils.gallery_sources import APP_EXTENSIONS, MESH_EXTENSIONS
 from shared.utils.markdown import EscapeHtmlExtension
+from shared.utils.mesh_outputs import splat_viewer_options
 from shared.deepy.config import DEEPY_TYPE_PRIME, normalize_deepy_type
 
 
@@ -1272,12 +1273,20 @@ def _autolink_bare_urls(text: str) -> str:
 _MEDIA_LINK_RE = re.compile(r'<a href="(/wangp_api/(?:gallery/media/[^"]+|download/[a-f0-9]+))"[^>]*>')
 
 
+def _splat_link_attributes(path: str) -> str:
+    """How the viewer opens a splat file linked from a chat, for the media view of the Web app."""
+    if os.path.splitext(path)[1].lower() != ".ply":
+        return ""
+    options = splat_viewer_options(path)
+    return f" data-media-navigation='{options['navigation']}'" + (f" data-media-walk-start='{options['walk_start']}'" if options["walk_start"] else "") + (" data-media-level='free'" if options["level"] else "")
+
+
 def _media_link(match: re.Match) -> str:
     href = match[1]
     path = registered_download_path(html.unescape(href)) or ""
     kind = _attachment_kind(path)
     if kind in {"image", "video", "audio", "3d"}:
-        media_format = f' data-media-format="{html.escape(os.path.splitext(path)[1][1:].lower())}"' if kind == "3d" else ""
+        media_format = f' data-media-format="{html.escape(os.path.splitext(path)[1][1:].lower())}"{_splat_link_attributes(path)}' if kind == "3d" else ""
         return f'<a href="{href}" target="_blank" rel="noopener" data-media-kind="{kind}"{media_format}>'
     return f'<a href="{href}" download>' if href.startswith("/wangp_api/download/") else f'<a href="{href}" target="_blank" rel="noopener noreferrer">'
 
@@ -2158,7 +2167,7 @@ def _render_attachments(attachments: list[dict[str, Any]]) -> str:
         media_format = os.path.splitext(str(attachment.get('path') or download_name))[1].lower()
         # Reclassify retained attachments too: older conversations stored meshes as generic files.
         kind = '3d' if media_format in MESH_EXTENSIONS else str(attachment.get('kind', 'file'))
-        format_attribute = f" data-media-format='{html.escape(media_format[1:])}'" if kind == '3d' else ''
+        format_attribute = f" data-media-format='{html.escape(media_format[1:])}'{_splat_link_attributes(str(attachment.get('path') or download_name))}" if kind == '3d' else ''
         thumb_url = str(attachment.get("thumb_url", "")).strip()
         subtitle_html = f"<span class='chat__attachment-subtitle'>{subtitle}</span>" if len(subtitle) > 0 else ""
         thumb_html = (  # the typed icon waits beside a preview, which chat.js swaps for it when the preview cannot be made (an unreadable video)

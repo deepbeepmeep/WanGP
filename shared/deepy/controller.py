@@ -749,6 +749,10 @@ class DeepyController:
         if self.get_deepy_type() == DEEPY_TYPE_PRIME:
             from shared.deepy.prime_tools import DeepyPrimeTools
 
+            allow_async = is_remote_engine(resolve_role_engine(self._server_config(), "deepy"))
+            if active_session.prime_toolbox is not None and active_session.prime_toolbox.allow_async != allow_async:  # the tools' job options follow the engine
+                active_session.prime_toolbox.close()
+                active_session.prime_toolbox = None
             if active_session.prime_toolbox is not None and self.workspace_host is not None:
                 from shared.deepy.filesystem import build_file_access_policy
                 workspace_id = self.workspace_host.deepy_workspace_id()
@@ -762,7 +766,7 @@ class DeepyController:
             if active_session.prime_toolbox is None:
                 gen = self._deps.get_gen_info(state)
                 zero_tools = DeepyZeroTools(gen, self._deps.get_processed_queue, send_cmd, session=active_session, get_output_filepath=self._deps.get_output_filepath, record_file_metadata=self._deps.record_file_metadata, get_server_config=self._server_config)
-                active_session.prime_toolbox = DeepyPrimeTools(state, send_cmd, active_session, zero_tools=zero_tools)
+                active_session.prime_toolbox = DeepyPrimeTools(state, send_cmd, active_session, zero_tools=zero_tools, allow_async=allow_async)
             else:
                 active_session.prime_toolbox.bind_turn(state, send_cmd)
             return active_session.prime_toolbox

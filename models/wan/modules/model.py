@@ -25,6 +25,7 @@ from ..steadydancer.small_archs import FactorConv3d, PoseRefNetNoBNV3
 from ..steadydancer.mobilenetv2_dcd import DYModule
 from ..shotplan import inject_shotplan_tokens
 from ..animate2 import animate2_attention_block, animate2_cached_attention_block, load_cached as animate2_load_cached, store_kv as animate2_store_kv
+from ..taomate import audio_attention as taomate_audio_attention
 
 __all__ = ['WanModel']
 
@@ -660,6 +661,7 @@ class WanAttentionBlock(nn.Module):
         sub_x_no =0,         
         animate2_generation = None,
         animate2_cached = False,
+        taomate_audio = None,
     ):
         r"""
         Args:
@@ -722,6 +724,9 @@ class WanAttentionBlock(nn.Module):
             ylist= [y]
             del y
             x += self.cross_attn(ylist, context, grid_sizes, audio_proj = audio_proj, audio_scale = audio_scale, audio_context_lens = audio_context_lens, lynx_ip_embeds=lynx_ip_embeds, lynx_ip_scale=lynx_ip_scale).to(dtype)
+
+        if taomate_audio is not None:
+            x = taomate_audio_attention(self, x, taomate_audio, attention_dtype)
 
         if multitalk_audio != None:
             # cross attn of multitalk audio
@@ -919,6 +924,8 @@ class MLPProj(torch.nn.Module):
         return clip_extra_context_tokens
 
 class WanModel(ModelMixin, ConfigMixin):
+    _offload_hooks = ["project_audio"]
+
     def setup_chipmunk(self):
         # from chipmunk.util import LayerCounter
         # from chipmunk.modules import SparseDiffMlp, SparseDiffAttn
@@ -1119,11 +1126,13 @@ class WanModel(ModelMixin, ConfigMixin):
                  in_dim_control_adapter = 24,
                  downscale_factor_control_adapter = 8,
                  uni3c_controlnet = None,
+                 taomate = False,
                  ):
 
         super().__init__()
 
         self.model_type = model_type
+        self.taomate = taomate
 
         self.patch_size = patch_size
         self.text_len = text_len
@@ -1252,6 +1261,10 @@ class WanModel(ModelMixin, ConfigMixin):
             from ..vista4d.runtime import add_vista4d_modules
             add_vista4d_modules(self)
 
+        if taomate:
+            from ..taomate import add_modules as add_taomate_modules
+            add_taomate_modules(self)
+
         if add_control_adapter: # Wan Fun Control-Camera
             from ..camera_control.fun_camera import SimpleAdapter
             self.control_adapter = SimpleAdapter(in_dim_control_adapter, dim, kernel_size=patch_size[1:], stride=patch_size[1:], downscale_factor=downscale_factor_control_adapter)
@@ -1330,6 +1343,10 @@ class WanModel(ModelMixin, ConfigMixin):
                                                     hidden_dim=128,
                                                     num_heads=8)
 
+    def project_audio(self, features):
+        """TaoMate-FVSR: audio tokens (frames, window, dim) of hidden-state windows (frames, window, features). A hooked entry point of its own: they stay the same for the whole window."""
+        return self.audio_embedding(features.to(self.audio_embedding.proj_in.bias.dtype))
+
     def adapt_modulation(self, block_name ='blocks'):
         def move(v, param_name = "modulation"):
             module = torch.nn.Module()
@@ -1385,11 +1402,14 @@ class WanModel(ModelMixin, ConfigMixin):
             layer_list += [self.mask_patch_embedding]
         target_dype= dtype
         
-        layer_list2 = [ self.time_embedding, self.time_embedding[0], self.time_embedding[2], 
+        layer_list2 = [ self.time_embedding, self.time_embedding[0], self.time_embedding[2],
                     self.time_projection, self.time_projection[1]] #, self.text_embedding, self.text_embedding[0], self.text_embedding[2] ]
 
         for block in self.blocks:
-            layer_list2 += [block.norm3]
+            layer_list2 += [block.norm4 if self.taomate else block.norm3]
+
+        if self.taomate:
+            layer_list += [self.spark_ref_proj]
 
         if hasattr(self, "audio_proj"):
             for block in self.blocks:
@@ -1595,6 +1615,8 @@ class WanModel(ModelMixin, ConfigMixin):
         animate2_kv_cache = "Disabled",  # GPU (exact), INT8 (K/V on the GPU), RAM (INT8 K/V in RAM) (animate2.py)
         camera_adapter_features = None,
         uni3c_condition = None,
+        taomate_reference = None,  # per branch: the reference canvas, one tensor shared by the branches using it, or None for the all-zero canvas
+        taomate_audio = None,  # per branch: project_audio's tokens
     ):
         # patch_dtype =  self.patch_embedding.weight.dtype
         modulation_dtype = self.time_projection[1].weight.dtype
@@ -1768,6 +1790,13 @@ class WanModel(ModelMixin, ConfigMixin):
             output_grid_sizes = grid_sizes
             source_latents = source_masks = point_latents = point_masks = vista_source_tokens = vista_point_tokens = None
 
+        if taomate_reference is not None:
+            reference_tokens = self.spark_ref_proj(next(reference for reference in taomate_reference if reference is not None)).to(modulation_dtype)
+            for i, reference in enumerate(taomate_reference):
+                if reference is not None:
+                    x_list[i] += reference_tokens
+            reference_tokens = None
+
         motion_vec_list = []
         pose_tokens = None
         scail2_pose_tokens = None
@@ -1791,6 +1820,8 @@ class WanModel(ModelMixin, ConfigMixin):
                     x = voxel_chunk_no_padding(x, voxel_shape).squeeze(-1).transpose(1, 2)
                 else:
                     x = x.flatten(2).transpose(1, 2)
+                    if self.taomate:
+                        x = x.contiguous()  # the rows in order: the fused INT8 kernels write into them
 
                 if vista_condition_tokens is not None:
                     x = torch.cat((x, vista_condition_tokens), dim=1)
@@ -1914,9 +1945,9 @@ class WanModel(ModelMixin, ConfigMixin):
             else:
                 e0 = e0 + self.fps_projection(fps_emb).unflatten(1, (6, self.dim))
 
-        if not (self.any_kiwi_source or self.any_kiwi_ref):
+        if not (self.any_kiwi_source or self.any_kiwi_ref or self.taomate):
             context = [self.text_embedding(u) for u in context]
-        
+
         if clip_fea is not None:
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
             if steadydancer_clip_fea_c is not None:
@@ -2102,6 +2133,8 @@ class WanModel(ModelMixin, ConfigMixin):
                             if bernini_enabled:
                                 block_kwargs = dict(kwargs)
                                 block_kwargs["freqs"] = bernini_freqs_list[i]
+                            elif taomate_audio is not None:
+                                block_kwargs = dict(kwargs, taomate_audio=taomate_audio[i])
                             x_list[i] = block(x, context = context, hints= hints, audio_scale= audio_scale, multitalk_audio = multitalk_audio, multitalk_masks =multitalk_masks, e= e0,  motion_vec = motion_vec, lynx_ip_embeds= lynx_ip_embeds, lynx_ref_buffer = lynx_ref_buffer, sub_x_no =i,  **block_kwargs)
                             del x
                     context = hints = None

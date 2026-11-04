@@ -19,6 +19,8 @@ from .constants import (H3_AUDIO_REFINEMENT_SETTING, H3_CONTROL_LATENT_CONTINUAT
 from .dialogue import H3_DIALOGUE_GENERATION, H3_DIALOGUE_MAX_TOTAL_SECONDS, H3_DIALOGUE_PROMPT_INFOS, load_dialogue_whisper
 from .minimax_h3_main import (AUDIO_VAE_FILE, LATENT_UPSCALER_FILE, LATENT_UPSCALER_FOLDER, TEXT_ENCODER_FOLDER,
                               VIDEO_VAE_FILE, VIDEO_VAE_FP8MIX_FILE, VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_FILE, VIDEO_VAE_LIGHT_INT8_FILE)
+from .p_h3_image import (P_H3_IMAGE_ARCHITECTURE, P_H3_IMAGE_FOLDER, P_H3_IMAGE_MAX_IMAGES, P_H3_IMAGE_REPO_ID, P_H3_IMAGE_STEPS, P_H3_IMAGE_TEXT_ENCODER_BF16, P_H3_IMAGE_TEXT_ENCODER_FOLDER,
+                         P_H3_IMAGE_TEXT_ENCODER_INT8, P_H3_IMAGE_VAE_FILE, P_H3_IMAGE_VAE_INT8_FILE, query_p_h3_image_def)
 from .pdd import PDD_BLOCK_SIZE, PDD_NUM_STEPS
 from .pika import PIKA_SOLVER, PIKA_STEPS, PIKA_VIDEO_SHIFT
 from .ptd import PTD_FOLDER, PTD_HEAD_FILE, PTD_INFOS, PTD_DEEPY_INFOS
@@ -44,6 +46,11 @@ TEXT_ENCODER_VARIANTS = {
     "gguf_q2_k": [TEXT_ENCODER_GGUF_Q2],
     "gguf_q4_k_m": [TEXT_ENCODER_GGUF_Q4],
     "nvfp4_awq": [TEXT_ENCODER_NVFP4],
+}
+DISTILLED_TEXT_ENCODER_CONFIG = {
+    "name": "Distilled Qwen3-VL-4B",
+    "text_encoder_folder": P_H3_IMAGE_TEXT_ENCODER_FOLDER,
+    "text_encoder_URLs": [build_hf_url(P_H3_IMAGE_REPO_ID, P_H3_IMAGE_TEXT_ENCODER_FOLDER, filename) for filename in (P_H3_IMAGE_TEXT_ENCODER_BF16, P_H3_IMAGE_TEXT_ENCODER_INT8)],
 }
 FL2VA_ARCHITECTURE = "minimax_h3_fl2va"
 FL2VA_PRUNED_ARCHITECTURE = "minimax_h3_fl2va_pruned"
@@ -321,6 +328,7 @@ H3_TEXT_ENCODER_INFOS = """Choose how much system RAM to use for interpreting pr
 - **Qwen3-VL Quanto INT8:** a balanced lower-memory choice.
 - **Qwen3-VL NVFP4 AWQ** and **Qwen3-VL GGUF Q4_K_M:** reduce memory further.
 - **Qwen3-VL GGUF Q2_K:** the most aggressive memory reduction.
+- **Distilled Qwen3-VL-4B:** a much smaller encoder trained to imitate the large one, for the least memory and the fastest prompts. It follows Text Encoder Quantization. It was made for still images: in video, spoken lines still work, but it can miss details of the prompt and may follow reference images and videos less closely. Prefer another choice when those matter.
 
 More aggressive quantization can slightly affect prompt interpretation.
 """
@@ -524,6 +532,7 @@ def _get_audio_generator_model_def(model_def):
             "nvfp4_awq": {"name": "Qwen3-VL NVFP4 AWQ", "text_encoder_URLs": [build_hf_url(REPO_ID, TEXT_ENCODER_FOLDER, TEXT_ENCODER_NVFP4)]},
             "gguf_q4_k_m": {"name": "Qwen3-VL GGUF Q4_K_M", "text_encoder_URLs": [build_hf_url(REPO_ID, TEXT_ENCODER_FOLDER, TEXT_ENCODER_GGUF_Q4)]},
             "gguf_q2_k": {"name": "Qwen3-VL GGUF Q2_K", "text_encoder_URLs": [build_hf_url(REPO_ID, TEXT_ENCODER_FOLDER, TEXT_ENCODER_GGUF_Q2)]},
+            "distilled_4b": DISTILLED_TEXT_ENCODER_CONFIG,
         },
         "system_configs2": {
             "_name": "DiT Denoising Priority",
@@ -538,7 +547,7 @@ class family_handler:
     @staticmethod
     def query_supported_types():
         return [FL2VA_ARCHITECTURE, FL2VA_PRUNED_ARCHITECTURE, CONTROL_ARCHITECTURE, CONTROL_PRUNED_ARCHITECTURE,
-                REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE, TTS_REF2VA_PRUNED_ARCHITECTURE, VIGGLE_ARCHITECTURE]
+                REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE, TTS_REF2VA_PRUNED_ARCHITECTURE, VIGGLE_ARCHITECTURE, P_H3_IMAGE_ARCHITECTURE]
 
     @staticmethod
     def query_family_maps():
@@ -578,11 +587,14 @@ class family_handler:
 
     @staticmethod
     def query_model_def(base_model_type, model_def):
+        if base_model_type == P_H3_IMAGE_ARCHITECTURE:
+            return query_p_h3_image_def(H3_DENOISING_PRIORITY_INFOS)
         if base_model_type == VIGGLE_ARCHITECTURE:
             result = family_handler.query_model_def(REF2VA_PRUNED_ARCHITECTURE, model_def)
             result.pop("resolution_budget_tiled", None)
             result.update({
                 "profiles_dir": [VIGGLE_ARCHITECTURE],
+                "spoken_line_prompt": None,  # its prompt is fixed
                 "device_explicit": True,
                 "specialities": [{"name": "character replacement"}, {"name": "motion transfer"}],
                 "infos": VIGGLE_INFOS,
@@ -746,6 +758,7 @@ class family_handler:
             "sample_solvers": [("Euler", "euler")] if fixed_schedule else [("Euler", "euler"), ("RES Multistep", "res_multistep"), ("Ralston 2S (~2x slower)", "ralston_2s")] + ([("Pika Re-noise (6 Steps)", PIKA_SOLVER)] if pika_supported else []),
             "no_negative_prompt": True,
             "returns_audio": True,
+            "spoken_line_prompt": {"line": "{speaker}{note} says ({id}) <d>[{language}] {line}</d>", "before": "overall_soundscape:"},  # a line for H3 to voice, and the section of a structured prompt it goes before
             "audio_window_alignment": True,
             "audio_overlap_repair_ms": 25,  # sources without an audio tail: one audio latent, plus the measured waveform shortfall
             "audio_tail_ms": 100,  # generate() returns audio running past the last frame (H3_AUDIO_TAIL_LATENTS)
@@ -797,6 +810,7 @@ class family_handler:
                 "nvfp4_awq": {"name": "Qwen3-VL NVFP4 AWQ", "text_encoder_URLs": [build_hf_url(REPO_ID, TEXT_ENCODER_FOLDER, TEXT_ENCODER_NVFP4)]},
                 "gguf_q4_k_m": {"name": "Qwen3-VL GGUF Q4_K_M", "text_encoder_URLs": [build_hf_url(REPO_ID, TEXT_ENCODER_FOLDER, TEXT_ENCODER_GGUF_Q4)]},
                 "gguf_q2_k": {"name": "Qwen3-VL GGUF Q2_K", "text_encoder_URLs": [build_hf_url(REPO_ID, TEXT_ENCODER_FOLDER, TEXT_ENCODER_GGUF_Q2)]},
+                "distilled_4b": DISTILLED_TEXT_ENCODER_CONFIG,
             },
             "system_configs2": {
                 "_name": "Video VAE",
@@ -983,6 +997,13 @@ class family_handler:
 
     @staticmethod
     def validate_generative_settings(base_model_type, model_def, inputs):
+        if base_model_type == P_H3_IMAGE_ARCHITECTURE:
+            if len(inputs["image_refs"] or []) > P_H3_IMAGE_MAX_IMAGES:
+                return f"P-H3-Image edits with at most {P_H3_IMAGE_MAX_IMAGES} images"
+            if inputs["sample_solver"] != "euler":
+                return "P-H3-Image requires the Euler sampler"
+            inputs["num_inference_steps"] = P_H3_IMAGE_STEPS
+            return None
         pika = inputs["sample_solver"] == PIKA_SOLVER
         if pika:
             if base_model_type not in (FL2VA_ARCHITECTURE, FL2VA_PRUNED_ARCHITECTURE, REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE) or any(model_def.get(flag, False) for flag in ("pdd", "ptd", "vdn", "veda", "fasth3")):
@@ -1217,13 +1238,19 @@ class family_handler:
     @staticmethod
     def resolve_runtime_model_def(model_def, runtime_context):
         """Resolve Auto once for both asset downloads and model loading."""
-        if "video_vae_file" in model_def or model_def.get("system_configs2", {}).get("_name") != "Video VAE":
+        if "video_vae_file" in model_def or model_def.get("system_configs2", {}).get("_name") not in ("Video VAE", "VAE"):
             return model_def
+        if model_def["system_configs2"]["_name"] == "VAE":  # P-H3-Image
+            return {**model_def, "video_vae_file": P_H3_IMAGE_VAE_INT8_FILE if runtime_context["transformer_quantization"] == "int8" else P_H3_IMAGE_VAE_FILE}
         filename = {"int8": VIDEO_VAE_INT8_FILE, "fp8": VIDEO_VAE_FP8MIX_FILE}.get(runtime_context["transformer_quantization"], VIDEO_VAE_FILE)
         return {**model_def, "video_vae_file": filename, "x2_vae_file": X2_VAE_INT8_FILE if filename == VIDEO_VAE_INT8_FILE else X2_VAE_FILE}
 
     @staticmethod
     def query_model_files(computeList, base_model_type, model_def=None):
+        if base_model_type == P_H3_IMAGE_ARCHITECTURE:
+            vae_file = model_def.get("video_vae_file", P_H3_IMAGE_VAE_FILE)
+            return [{"repoId": P_H3_IMAGE_REPO_ID, "sourceFolderList": [P_H3_IMAGE_FOLDER, P_H3_IMAGE_TEXT_ENCODER_FOLDER],
+                     "fileList": [[vae_file.rsplit("/", 1)[-1]], ["config.json", "tokenizer.json", "tokenizer_config.json"]]}]
         source_folders = []
         file_lists = []
         if model_def.get("ptd", False):
@@ -1241,9 +1268,11 @@ class family_handler:
         if vae_files:
             source_folders.append("")
             file_lists.append(vae_files)
+        distilled_text_encoder = model_def.get("text_encoder_folder") == P_H3_IMAGE_TEXT_ENCODER_FOLDER
         if base_model_type != VIGGLE_ARCHITECTURE:
-            source_folders.append(TEXT_ENCODER_FOLDER)
-            file_lists.append(["config.json", "tokenizer.json", "tokenizer_config.json", "preprocessor_config.json", "vocab.json"])
+            if not distilled_text_encoder:
+                source_folders.append(TEXT_ENCODER_FOLDER)
+                file_lists.append(["config.json", "tokenizer.json", "tokenizer_config.json", "preprocessor_config.json", "vocab.json"])
             source_folders.append(LATENT_UPSCALER_FOLDER)
             file_lists.append([LATENT_UPSCALER_FILE])
         downloads = [{
@@ -1251,6 +1280,8 @@ class family_handler:
             "sourceFolderList": source_folders,
             "fileList": file_lists,
         }]
+        if distilled_text_encoder:
+            downloads.append({"repoId": P_H3_IMAGE_REPO_ID, "sourceFolderList": [P_H3_IMAGE_TEXT_ENCODER_FOLDER], "fileList": [["config.json", "tokenizer.json", "tokenizer_config.json"]]})
         if video_vae_file in (X2_VAE_FILE, X2_VAE_INT8_FILE):
             downloads.append(query_x2_vae_files(video_vae_file))
         if base_model_type == VIGGLE_ARCHITECTURE:
@@ -1271,15 +1302,17 @@ class family_handler:
 
         pdd = model_def.get("pdd", False)
         viggle = base_model_type == VIGGLE_ARCHITECTURE
+        image_model = base_model_type == P_H3_IMAGE_ARCHITECTURE
+        distilled_text_encoder = model_def.get("text_encoder_folder") == P_H3_IMAGE_TEXT_ENCODER_FOLDER
         if model_def.get("ptd", False):
             model_filename = list(model_filename) if isinstance(model_filename, (list, tuple)) else [model_filename]
             model_filename.append(fl.locate_file(os.path.join(PTD_FOLDER, PTD_HEAD_FILE)))
-        video_vae_file = model_def.get("video_vae_file", VIDEO_VAE_FILE)
+        video_vae_file = model_def.get("video_vae_file", P_H3_IMAGE_VAE_FILE if image_model else VIDEO_VAE_FILE)
         if VAE_upsampling == X2_VAE_VALUE:  # the X2 decoder of the selected Video VAE replaces it; downloaded once both choices are known
             video_vae_file = model_def.get("x2_vae_file", X2_VAE_FILE)
             process_files_def_if_needed(query_x2_vae_files(video_vae_file), status_text="Downloading MiniMax H3 X2 VAE")
         pipeline = model_factory(model_filename, text_encoder_filename, dtype=dtype,
-                                 reference_mode=base_model_type in (REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE, TTS_REF2VA_PRUNED_ARCHITECTURE, VIGGLE_ARCHITECTURE),
+                                 reference_mode=base_model_type in (REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE, TTS_REF2VA_PRUNED_ARCHITECTURE, VIGGLE_ARCHITECTURE, P_H3_IMAGE_ARCHITECTURE),
                                  save_quantized=save_quantized, model_type=model_type,
                                  qkv_splitting=model_def["qkv_splitting"],
                                  qkv_layout=model_def["qkv_layout"],
@@ -1288,9 +1321,14 @@ class family_handler:
                                  pdd=pdd, pdd_num_steps=PDD_NUM_STEPS if pdd else None, pdd_block_size=PDD_BLOCK_SIZE if pdd else None,
                                  vdn=model_def.get("vdn", False), veda=model_def.get("veda", False), vsa=model_def.get("fasth3", False),
                                  audio_only=base_model_type == TTS_REF2VA_PRUNED_ARCHITECTURE,
-                                 fixed_prompt_filename=os.path.join(VIGGLE_ASSET_FOLDER, VIGGLE_PROMPT_FILE) if viggle else None)
+                                 fixed_prompt_filename=os.path.join(VIGGLE_ASSET_FOLDER, VIGGLE_PROMPT_FILE) if viggle else None,
+                                 image_model=image_model, distilled_text_encoder=distilled_text_encoder)
         pipeline.ptd = model_def.get("ptd", False)
         pipe = {"transformer": pipeline.transformer}
+        if image_model:
+            pipe.update({"vae": pipeline.video_decoder, "video_encoder": pipeline.video_encoder, "text_encoder": pipeline.text_encoder.language_model,
+                         "vision_encoder": pipeline.text_encoder.visual, "text_connector": pipeline.text_encoder.text_connector})
+            return pipeline, {"pipe": pipe, "pinnedMemory": False} if disable_pinning else pipe
         if base_model_type == TTS_REF2VA_PRUNED_ARCHITECTURE and H3_DIALOGUE_GENERATION:
             pipeline.dialogue_whisper = load_dialogue_whisper()
             pipe["dialogue_whisper"] = pipeline.dialogue_whisper
@@ -1303,11 +1341,15 @@ class family_handler:
             if not viggle:
                 pipe.update({"text_encoder": pipeline.text_encoder.language_model, "vision_encoder": pipeline.text_encoder.visual,
                              "latent_upscaler": pipeline.latent_upscaler})
+                if distilled_text_encoder:
+                    pipe["text_connector"] = pipeline.text_encoder.text_connector
         else:
             class BorrowingPipe(dict):
                 pass
 
             borrowed_names = ("text_encoder", "vision_encoder", "vae", "video_encoder", "audio_vae", "latent_upscaler")
+            if "text_connector" in shared_h3_offloadobj.models:
+                borrowed_names += ("text_connector",)
             pipe = BorrowingPipe(pipe)
             pipe.update({name: shared_h3_offloadobj.models[name] for name in borrowed_names})
             pipe._mmgp_ignore_models = borrowed_names
@@ -1324,7 +1366,7 @@ class family_handler:
             ui_defaults["overrides"] = set_override(ui_defaults.get("overrides", ""), "attention_mode", "vsa")
         elif get_override(ui_defaults.get("overrides", ""), "attention_mode") == "vsa":
             ui_defaults["overrides"] = set_override(ui_defaults["overrides"], "attention_mode", "")
-        if base_model_type == TTS_REF2VA_PRUNED_ARCHITECTURE:
+        if base_model_type in (TTS_REF2VA_PRUNED_ARCHITECTURE, P_H3_IMAGE_ARCHITECTURE):
             return
         if base_model_type in CONTROL_ARCHITECTURES:
             # The former VU/UV outpainting choice is now V plus the existing spatial-outpainting settings.
@@ -1372,6 +1414,10 @@ class family_handler:
     @staticmethod
     def update_default_settings(base_model_type, model_def, ui_defaults):
         ui_defaults.pop("input_video_strength", None)
+        if base_model_type == P_H3_IMAGE_ARCHITECTURE:
+            ui_defaults.update({"image_mode": 1, "resolution": "2912x2912", "num_inference_steps": P_H3_IMAGE_STEPS, "guidance_phases": 1, "guidance_scale": 1.0,
+                                "sample_solver": "euler", "flow_shift": 12.0, "video_prompt_type": "", "audio_prompt_type": "", "prompt_enhancer": "", "batch_size": 1})
+            return
         if base_model_type == VIGGLE_ARCHITECTURE:
             family_handler.update_default_settings(REF2VA_PRUNED_ARCHITECTURE, model_def, ui_defaults)
             ui_defaults.update({"num_inference_steps": 3, "flow_shift": 3.0, "video_prompt_type": "IVU",

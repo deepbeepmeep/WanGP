@@ -9,6 +9,7 @@ import { modelRows, openDefaultModels } from './models.js';
 const STYLES = ['Cinematic', 'Anime', 'Documentary', 'Noir', 'Neon', 'Pastel', 'Claymation', 'Watercolor', 'Vintage film', 'VHS', 'Epic', 'Minimal', 'Dreamy', 'Gritty', 'Surreal', 'Cyberpunk'];
 const ASPECT_FRAMES = { '16:9': [44, 25], '9:16': [20, 34], '1:1': [30, 30], '4:3': [38, 28], '2.39:1': [50, 21] };
 const PACING = ['Very calm', 'Calm', 'Balanced', 'Energetic', 'Frenetic'];
+const LANGUAGES = [['en', 'English'], ['fr', 'French'], ['es', 'Spanish'], ['de', 'German'], ['it', 'Italian'], ['pt', 'Portuguese'], ['nl', 'Dutch'], ['pl', 'Polish'], ['ru', 'Russian'], ['tr', 'Turkish'], ['ar', 'Arabic'], ['hi', 'Hindi'], ['zh', 'Chinese'], ['ja', 'Japanese'], ['ko', 'Korean']];
 
 // A format chosen after shooting changes nothing by itself: the note says so, with the button that does it.
 function formatNote(doc) {
@@ -79,6 +80,10 @@ export function mountBrief(container, doc) {
           <label class="row" style="gap:12px;cursor:pointer"><span class="toggle ${brief.review_before_edit ? 'on' : ''}" id="review-edit"></span><span><b>Review the takes before the edit</b><br><span class="muted">The showrunner shoots and checks the shots, then waits for you: it assembles the edit only once you have approved every take. Assemble on the Board, the Timeline or the showrunner's panel works at any time.</span></span></label>
           <label class="row" style="gap:12px;cursor:pointer"><span class="toggle ${brief.read_other_productions ? 'on' : ''}" id="read-others"></span><span><b>Let the showrunner look at my other productions</b><br><span class="muted">When you ask for it ("make it like my other film", "the same characters as in Lanterns"), it reads them and copies the files it needs (pictures, voices) into this production; it never changes them. Off, it only knows this production.</span></span></label>
           <div class="field"><div class="label">${icon('bolt')} GPU budget</div><div class="slider-row"><input type="range" class="range" id="budget" min="0" max="240" step="5" value="${brief.budget_minutes || 0}"><span class="value" id="budget-v">${brief.budget_minutes ? `${brief.budget_minutes} min` : 'Auto'}</span></div></div>
+          ${['music_video', 'story'].includes(brief.kind) ? '' : `<div class="field" style="grid-column:1/-1"><div class="label">${icon('chat')} Voices</div>
+            <div class="row" style="gap:10px;flex-wrap:wrap"><div class="seg" id="voices"><button class="${brief.voices_from_model ? '' : 'on'}" data-voices="">Recorded first</button><button class="${brief.voices_from_model ? 'on' : ''}" data-voices="1">From the video model</button></div>
+              ${brief.voices_from_model ? `<select class="select" id="spoken-language" aria-label="Language of the lines" title="The language of the lines" style="width:auto">${LANGUAGES.map(([code, name]) => `<option value="${code}" ${brief.language === code ? 'selected' : ''}>${name}</option>`).join('')}</select>` : ''}</div>
+            <div class="muted" style="font-size:12.5px;margin-top:6px">${brief.voices_from_model ? 'The video model says the lines itself, with its own sound. Nothing is recorded first, but a speaker\'s voice can change from shot to shot.' : 'Each line is recorded first in its speaker\'s voice, and the video follows it: a speaker keeps one voice for the whole production.'} <span id="voices-models" style="color:var(--amber)"></span></div></div>`}
         </div></section>
 
       <section class="panel"><div class="panel-head clickable" id="models-head" title="Show or hide the models"><span class="num">8</span><h3>Models</h3>
@@ -140,6 +145,8 @@ export function mountBrief(container, doc) {
     });
     const budget = root.querySelector('#budget');
     budget.oninput = () => { root.querySelector('#budget-v').textContent = +budget.value ? `${budget.value} min` : 'Auto'; queue({ budget_minutes: +budget.value || null }); };
+    root.querySelectorAll('[data-voices]').forEach(button => button.onclick = () => actions.ops([{ op: 'brief', fields: { voices_from_model: !!button.dataset.voices } }]).then(render));
+    root.querySelector('#spoken-language')?.addEventListener('change', event => actions.ops([{ op: 'brief', fields: { language: event.target.value } }]).then(render));
     root.querySelector('#plan-first').parentElement.onclick = () => actions.ops([{ op: 'brief', fields: { plan_first: !state.doc.brief.plan_first } }]).then(render);
     root.querySelector('#read-others').parentElement.onclick = () => actions.ops([{ op: 'brief', fields: { read_other_productions: !state.doc.brief.read_other_productions } }]).then(render);
     root.querySelector('#review-edit').parentElement.onclick = () => actions.ops([{ op: 'brief', fields: { review_before_edit: !state.doc.brief.review_before_edit } }]).then(render);
@@ -173,6 +180,7 @@ export function mountBrief(container, doc) {
     let roles;
     try { roles = await actions.templateRoles(); } catch (error) { box.innerHTML = `<div class="muted">${esc(error.message)}</div>`; return; }
     if (!root.contains(box)) return;
+    voicesModels(roles);
     const kind = state.doc.brief.kind, picked = roles.filter(role => role.value).length;
     const hint = root.querySelector('#models-hint');
     if (hint) hint.textContent = picked ? `${picked} picked by you · the others on Auto` : "Auto: the templates selected in Deepy's settings";
@@ -183,10 +191,20 @@ export function mountBrief(container, doc) {
     box.querySelectorAll('[data-role]').forEach(select => select.onchange = async () => {
       try {
         await api.chooseTemplate(state.doc.id, select.dataset.role, select.value || null);
-        await actions.templateRoles(true);
+        voicesModels(await actions.templateRoles(true));
         toast(select.value ? `${select.selectedOptions[0].textContent} for ${roles.find(role => role.id === select.dataset.role).label.toLowerCase()}` : 'Back to the showrunner\'s choice');
       } catch (error) { toast(error.message, 'error'); renderModels(); }
     });
+  }
+
+  // What the Voices choice does with the models of this brief
+  function voicesModels(roles) {
+    const note = root.querySelector('#voices-models');
+    if (!note || !state.doc.brief.voices_from_model) return;
+    const choices = roles.flatMap(role => role.choices), able = choices.find(choice => choice.speaks);
+    const current = roles.filter(role => ['cast_shots', 'shots_without_cast'].includes(role.id)).map(role => role.value || role.auto);
+    note.textContent = !able ? 'None of your video templates can do this: lines are recorded first.'
+      : current.every(value => choices.find(choice => choice.value === value)?.speaks) ? '' : `The model picked for some shots cannot speak: shots with lines use ${able.label} or another model that can.`;
   }
 
   function modelsOpen() { try { return localStorage.getItem('sr.models') === '1'; } catch { return false; } }
