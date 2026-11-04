@@ -538,6 +538,11 @@ class family_handler:
         extra_model_def = {
             "device_explicit": True,
             "cuda_graphs": ["transformer", "transformer2"],
+            "compile": False,  # PyTorch compilation is a net loss for LTX-2: the attention and the
+            # fused kernels of the blocks are torch.compiler.disable()d, so each of the 48 blocks
+            # breaks the graph half a dozen times, and a compiled tower is excluded from the automatic
+            # preloading of the weights in the GPU (mmgp), which stalls the low VRAM profiles on disk
+            # reads. CUDA graphs are the supported acceleration path of this model.
             "uint8_guides": ltx2_uint8_guides,
             "ltx2_22B_class": base_model_type in LTX2_22B_CLASS or ltx25,
             "ltx2_edit_anything": editanything_ref,
