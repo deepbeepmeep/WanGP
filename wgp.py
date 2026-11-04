@@ -12023,6 +12023,12 @@ def generate_media(
                         elif input_fills_window:
                             output_new_audio_filepath = None
                     post_decode_pre_trim = samples.get("post_decode_pre_trim", 0) 
+                    # Step 2: the branch job's kept region (a fresh decode of
+                    # the source sidecar's kept windows — the same
+                    # reconstruction the Latent Decode job performs) is
+                    # returned by the pipeline so the job uses it as the
+                    # output video's prefix (source independence).
+                    branch_decoded_prefix = samples.get("decoded_prefix", None)
                     meshes = samples.get("meshes", None)
                     splats = samples.get("splats", None)
                     video_file = samples.get("video_file", None)  # a finished video made by the model (a temporary file it hands over), saved instead of "x"
@@ -12422,6 +12428,12 @@ def generate_media(
                         # dropped (the file ends on the video's last frame).
                         pad_audio_to_video=(audio_window_alignment and full_generated_audio is not None) or branch_prefix is not None,
                         verbose=verbose_level >= 2,
+                        # A branch job's generated audio can end a frame or
+                        # two short of its video (the window-boundary audio
+                        # accounting rounds down); padding it instead lets
+                        # -shortest end on the video, so no written frame is
+                        # dropped (the file ends on the video's last frame).
+                        pad_new_audio=branch_prefix is not None,
                         audio_tail_seconds=saved_audio_tail_seconds,
                     )
                     os.remove(save_path_tmp)

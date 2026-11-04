@@ -577,8 +577,9 @@ def combine_and_concatenate_video_with_audio_tracks(
     new_audio_from_start=False,
     source_audio_metadata=None,
     audio_codec_key="aac_128",
-    verbose = False,
+    pad_new_audio=False,
     pad_audio_to_video=False,
+    verbose = False,
     audio_tail_seconds=0.0,
 ):
     """audio_tail_seconds keeps that much audio past the last video frame (instead of cutting at the video end), so the end of the
@@ -642,7 +643,13 @@ def combine_and_concatenate_video_with_audio_tracks(
                 filters.append(
                     f'[{idx}:a]aresample={audio_sampling_rate},aformat=channel_layouts={channel_layout},'
                     f'atrim=start={start},asetpts=PTS-STARTPTS[n{i}]')
-                padding = ',apad=pad_dur=100' if pad_audio_to_video else ''
+                # A branch job's generated audio can end a frame or two short
+                # of its video (the window-boundary audio accounting rounds
+                # down); padding the track instead lets -shortest end on the
+                # video, so no written frame is dropped (the file ends on the
+                # video's last frame). Audio aligned to the video's length
+                # needs the same apad.
+                padding = ',apad=pad_dur=100' if (pad_new_audio or pad_audio_to_video) else ''
                 filters.append(f'[s{i}][n{i}]concat=n=2:v=0:a=1{padding}[aout{i}]')
                 idx += 1
             else:
