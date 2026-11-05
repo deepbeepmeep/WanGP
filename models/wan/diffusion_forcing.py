@@ -411,8 +411,14 @@ class DTT2V:
                             return None
                     noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
                     del noise_pred_cond, noise_pred_uncond
+            preview_latents = latents.clone() if getattr(callback, "tiny_vae", False) else None
             for idx in range(valid_interval_start, valid_interval_end):
                 if update_mask_i[idx].item():
+                    if preview_latents is not None:
+                        preview_step_index = sample_schedulers[idx].step_index
+                        if preview_step_index is None:
+                            preview_step_index = sample_schedulers[idx].index_for_timestep(timestep_i[idx])
+                        preview_latents[:, :, idx] = latents[:, :, idx] - sample_schedulers[idx].sigmas[preview_step_index] * noise_pred[:, :, idx - valid_interval_start]
                     latents[:, :, idx] = sample_schedulers[idx].step(
                         noise_pred[:, :, idx - valid_interval_start],
                         timestep_i[idx],
@@ -422,10 +428,10 @@ class DTT2V:
                     )[0]
                     sample_schedulers_counter[idx] += 1
             if callback is not None:
-                latents_preview = latents
+                latents_preview = preview_latents if preview_latents is not None else latents
                 if len(latents_preview) > 1: latents_preview = latents_preview.transpose(0,2)
                 callback(i, latents_preview[0], False)
-                latents_preview = None
+                latents_preview = preview_latents = None
 
         x0 =latents.unbind(dim=0)
 

@@ -100,12 +100,15 @@ class Flux3Pipeline:
                         raise GenerationAborted
                     predictions = self.transformer(latents, texts, reference, frequencies, schedule_device[step], schedule_device[step + 1] if self.transformer.flow_map else None)
                     velocity = predictions[0] + guide_scale * (predictions[1] - predictions[0]) if use_cfg else predictions[0]
+                    preview_x0 = latents - schedule[step].item() * velocity if callback is not None and getattr(callback, "tiny_vae", False) else None
                     latents = latents + (schedule[step + 1] - schedule[step]).item() * velocity
                     if callback is not None:
-                        preview = latents.reshape(h, w, 128).permute(2, 0, 1).unsqueeze(0)
+                        preview = (preview_x0 if preview_x0 is not None else latents).reshape(h, w, 128).permute(2, 0, 1).unsqueeze(0)
                         preview = preview * self.preview_std.to(preview) + self.preview_mean.to(preview)
                         preview = preview.reshape(1, 32, 2, 2, h, w).permute(0, 1, 4, 2, 5, 3).reshape(1, 32, h * 2, w * 2).transpose(0, 1)
                         callback(step, preview, False)
+                        del preview
+                    del preview_x0
             z = latents.reshape(h, w, 128).permute(2, 0, 1).unsqueeze(0)
             set_phase_status('VAE Decoding')
             with torch.autocast('cuda', dtype=torch.bfloat16):

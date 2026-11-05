@@ -189,10 +189,16 @@ class FiboPipeline:
                     unconditional = self.transformer(model_input, timestep, negative, context_latents=contexts)[0].float()
                     velocity = unconditional + guide_scale * (velocity - unconditional)
                     del unconditional
+                preview_x0 = None
+                if callback is not None and getattr(callback, "tiny_vae", False):
+                    if scheduler.step_index is None:
+                        scheduler._init_step_index(t)
+                    preview_x0 = latents.float() - scheduler.sigmas[scheduler.step_index].to(latents.device) * velocity
                 latents = scheduler.step(velocity, t, latents, return_dict=False)[0]
                 del velocity, model_input
                 if callback is not None:
-                    callback(step, self.preview(latents), False)
+                    callback(step, self.preview(preview_x0 if preview_x0 is not None else latents), False)
+                del preview_x0
         del positive, negative, base, contexts, embedding
         set_phase_status("VAE Decoding")
         with torch.autocast("cuda", dtype=torch.float16):

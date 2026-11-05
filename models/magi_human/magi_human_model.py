@@ -541,6 +541,7 @@ class MagiHumanModel:
                 txt_feat_len=prompt_lens,
             )
             packed_inputs, packed_state = self._prepare_proxy_input(eval_input, data_proxy)
+            preview_latents = None
             if cfg_number == 2:
                 uncond_eval_input = _EvalInput(
                     x_t=latent_video,
@@ -578,11 +579,17 @@ class MagiHumanModel:
                 if use_sr_model:
                     latent_video = video_scheduler.step(pred_video, t, latent_video, return_dict=False)[0]
                 else:
+                    if callback is not None and getattr(callback, "tiny_vae", False):
+                        # DDIM uses full-precision sigmas, not the integer model timestep.
+                        preview_latents = latent_video - video_scheduler.sigmas[step_idx] * pred_video
                     latent_video = video_scheduler.step_ddim(pred_video, step_idx, latent_video)
                 if update_audio and not use_audio_guide:
                     latent_audio = audio_scheduler.step_ddim(pred_audio, step_idx, latent_audio)
             if callback is not None:
-                callback(step_idx, latent_video[0].detach(), pass_no=pass_no)
+                if getattr(callback, "tiny_vae", False) and (cfg_number == 2 or use_sr_model):
+                    preview_latents = video_scheduler.model_outputs[-1]
+                callback(step_idx, (preview_latents if preview_latents is not None else latent_video)[0].detach(), pass_no=pass_no)
+            del preview_latents
         latent_video[:, :, :1] = image_latent[:, :, :1]
         return latent_video, latent_audio
 

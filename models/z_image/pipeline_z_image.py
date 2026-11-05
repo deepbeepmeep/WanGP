@@ -944,17 +944,24 @@ class ZImagePipeline(DiffusionPipeline, FromSingleFileMixin):
                     noise_pred = noise_pred.squeeze(2)
                     noise_pred = -noise_pred
 
+                    preview_x0 = None
+                    if callback is not None and getattr(callback, "tiny_vae", False):
+                        if self.scheduler.step_index is None:
+                            self.scheduler._init_step_index(t)
+                        preview_x0 = latents - self.scheduler.sigmas[self.scheduler.step_index].to(latents.device) * noise_pred.float()
                     latents = self.scheduler.step(noise_pred.to(torch.float32), t, latents, return_dict=False)[0]
                     assert latents.dtype == torch.float32
 
                     if self._interrupt:
+                        del preview_x0
                         break
                     if callback is not None:
-                        latents_preview = latents.unsqueeze(2)
+                        latents_preview = (preview_x0 if preview_x0 is not None else latents).unsqueeze(2)
                         if len(latents_preview) > 1:
                             latents_preview = latents_preview.transpose(0, 2)
                         callback(i, latents_preview[0], False)
                         latents_preview = None
+                    del preview_x0
 
 
         if self._interrupt:

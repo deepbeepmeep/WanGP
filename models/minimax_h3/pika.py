@@ -29,11 +29,13 @@ def noise(shape, generator, audio=False):
                        device=generator.device).permute(0, 2, 1, 3, 4).contiguous()
 
 
-def renoise_(sample, velocity_list, sigma, sigma_next, generator, final=False, audio=False):
+def renoise_(sample, velocity_list, sigma, sigma_next, generator, final=False, audio=False, return_denoised=False):
     """Consume the velocity, predict clean latents and add independent fresh noise."""
     prediction = velocity_list.pop().float().mul_(sigma).add_(sample)
+    denoised = prediction.clone() if return_denoised else None
     if final:
         sample.copy_(prediction)
     else:
         fresh = noise(sample.shape, generator, audio=audio).mul_(sigma_next)
         sample.copy_(prediction.mul_(1.0 - sigma_next).add_(fresh))
+    return denoised

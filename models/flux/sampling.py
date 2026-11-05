@@ -758,6 +758,7 @@ def denoise(
         pred, neg_pred = run_model(img, true_cfg_scale)
         if pred == None: return None
 
+        preview_x0 = None
         if is_piflow and isinstance(pred, dict):
             if true_cfg_scale > 1:
                 pred = {k: neg_pred[k] + true_cfg_scale * (pred[k] - neg_pred[k]) for k in pred}
@@ -778,6 +779,10 @@ def denoise(
                 and piflow_gm_temperature < 1.0
             ):
                 policy.temperature_(piflow_gm_temperature)
+            if callback is not None and getattr(callback, "tiny_vae", False):
+                preview_x0 = (policy.denoising_output_x_0["logweights"].softmax(dim=1) * policy.denoising_output_x_0["means"]).sum(dim=1)
+                preview_x0 = _pack_latent_piflux2(preview_x0, patch_size=patch_size)
+                preview_x0 = rearrange(preview_x0, "b c h w -> b (h w) c").to(img.dtype)
             img_unpacked = _policy_rollout(
                 img_unpacked,
                 sigma_t_src,
@@ -786,6 +791,7 @@ def denoise(
                 policy=policy,
                 shift=3.2,
             )
+            del policy
 
             sigma_t_to = piflow_sigmas[i + 1]
             m = piflow_m_vals[i]
@@ -805,6 +811,8 @@ def denoise(
             if true_cfg_scale > 1:
                 pred = cfg_predictions(pred, neg_pred, true_cfg_scale, t_vec)
 
+            if callback is not None and getattr(callback, "tiny_vae", False):
+                preview_x0 = img - t_curr * pred
             step_size = t_prev - t_curr
             if final_step_size_scale is not None and i == len(timesteps) - 2:
                 step_size = step_size * final_step_size_scale
@@ -816,10 +824,14 @@ def denoise(
             noisy_image  = original_image_latents  * (1.0 - latent_noise_factor) + randn * latent_noise_factor 
             img  =  noisy_image * (1-img_msk_latents)  + img_msk_latents * img
             noisy_image = None
+            if preview_x0 is not None:
+                preview_x0 = original_image_latents * (1-img_msk_latents) + img_msk_latents * preview_x0
 
         if callback is not None:
-            preview = unpack_latent(img).transpose(0,1)
+            preview = unpack_latent(preview_x0 if preview_x0 is not None else img).transpose(0,1)
             callback(i, preview, False, preview_meta=preview_meta)
+            del preview
+        del preview_x0
 
 
     return img

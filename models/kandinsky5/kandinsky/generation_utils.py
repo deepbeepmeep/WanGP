@@ -216,19 +216,26 @@ def generate(
         )
         if pred_velocity is None:
             return None
+        preview_img = None
+        if callback is not None and getattr(callback, "tiny_vae", False):
+            preview_img = img[..., :pred_velocity.shape[-1]] - timestep * pred_velocity
         img[..., :pred_velocity.shape[-1]] += timestep_diff * pred_velocity
         if callback is not None:
+            if preview_img is None:
+                preview_img = img
             latents_preview = None
             if visual_rope_pos is not None and len(visual_rope_pos) > 0:
                 duration = int(visual_rope_pos[0].numel())
                 if duration > 0 and img.shape[0] % duration == 0:
                     batch = img.shape[0] // duration
                     latents_preview = (
-                        img.reshape(batch, duration, img.shape[1], img.shape[2], img.shape[3])
+                        preview_img.reshape(batch, duration, *preview_img.shape[1:])
                         .permute(0, 4, 1, 2, 3)
                         .detach()
                     )[0]
             callback(step_idx, latents_preview, False)
+            del latents_preview
+        del preview_img
         # NOTE: remove extra channels that can be added in Image Editing (I2I)
     return img[..., :pred_velocity.shape[-1]]
 

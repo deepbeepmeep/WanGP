@@ -1254,6 +1254,7 @@ class HunyuanVideoAudioPipeline(DiffusionPipeline):
                     dtype=latents_all.dtype,
                 ).to(device=latents_all.device)
 
+                preview_latents = torch.zeros_like(pred_latents) if getattr(callback, "tiny_vae", False) else None
                 cache_slot_no = 0
                 for index_start in range(0, infer_length, frames_per_batch):
                     self.scheduler._step_index = None
@@ -1384,6 +1385,14 @@ class HunyuanVideoAudioPipeline(DiffusionPipeline):
                         noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=self.guidance_rescale)
                     noise_pred_text, noise_pred_uncond = None, None
                     # compute the previous noisy sample x_t -> x_t-1
+                    preview_chunk = None
+                    if preview_latents is not None:
+                        preview_step_index = self.scheduler.step_index
+                        if preview_step_index is None:
+                            preview_step_index = self.scheduler.begin_index
+                        if preview_step_index is None:
+                            preview_step_index = self.scheduler.index_for_timestep(t)
+                        preview_chunk = latents.float() - self.scheduler.sigmas[preview_step_index] * noise_pred.float()
                     latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
                     noise_pred = None
 
@@ -1392,6 +1401,9 @@ class HunyuanVideoAudioPipeline(DiffusionPipeline):
                         p = (index_start + iii) % pred_latents.shape[2]
                         pred_latents[:, :, p] += latents[:, :, iii]
                         counter[:, :, p] += 1
+                        if preview_chunk is not None:
+                            preview_latents[:, :, p] += preview_chunk[:, :, iii]
+                    preview_chunk = None
 
                     if cache_type == "tea" and cache_size > 1:
                         for l in range(latent_items):
@@ -1417,7 +1429,8 @@ class HunyuanVideoAudioPipeline(DiffusionPipeline):
                 latents_all = pred_latents     
 
                 if callback is not None:
-                    callback(i, latents_all[0, :, :video_length], False)
+                    callback(i, (preview_latents / counter if preview_latents is not None else latents_all)[0, :, :video_length], False)
+                    preview_latents = None
 
         latents = latents_all.float()[:, :, :video_length] 
 
