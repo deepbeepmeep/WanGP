@@ -43,3 +43,13 @@ def Decoder(latent_channels: int = 4, use_midblock_gn: bool = False) -> nn.Seque
         Block(64, 64), Block(64, 64), Block(64, 64), nn.Upsample(scale_factor=2), conv(64, 64, bias=False),
         Block(64, 64), conv(64, 3),
     )
+
+
+def F16Decoder() -> nn.Sequential:
+    return nn.Sequential(
+        Clamp(), conv(64, 256), nn.ReLU(),
+        Block(256, 256), Block(256, 256), Block(256, 256), nn.Upsample(scale_factor=2), conv(256, 128, bias=False),
+        Block(128, 128), Block(128, 128), Block(128, 128), nn.Upsample(scale_factor=2), conv(128, 64, bias=False),
+        Block(64, 64), Block(64, 64), Block(64, 64), nn.Upsample(scale_factor=2), conv(64, 64, bias=False),
+        Block(64, 64), conv(64, 16), nn.PixelShuffle(2),
+    )
