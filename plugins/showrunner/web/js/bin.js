@@ -18,7 +18,7 @@ function loadZoom() {
 }
 
 // A bin item in full: a video or a sound plays at once; a picture zooms with the wheel or the buttons and moves when held, as in the gallery.
-function showItem(item) {
+export function showItem(item) {
   const src = actions.file(item.path), name = readable(item.name || item.path.split('/').pop()), picture = item.kind === 'image';
   actions.pausePlayback();
   const media = item.kind === 'audio' ? `<audio src="${src}" controls autoplay></audio>`

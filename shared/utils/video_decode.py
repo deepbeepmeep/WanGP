@@ -9,7 +9,7 @@ from functools import lru_cache
 import numpy as np
 import torch
 
-from .virtual_media import clamp_virtual_frame_range, get_virtual_media_entry, parse_virtual_media_path, strip_virtual_media_suffix
+from .virtual_media import bounced_frame, clamp_virtual_frame_range, get_virtual_media_entry, parse_virtual_media_path, strip_virtual_media_suffix
 
 _ZSCALE_TRANSFER_MAP = {"smpte2084": "smpte2084", "arib-std-b67": "arib-std-b67", "bt709": "bt709", "bt2020-10": "2020_10", "bt2020-12": "2020_12"}
 _ZSCALE_PRIMARIES_MAP = {"bt2020": "2020", "bt709": "709", "smpte170m": "170m", "bt470bg": "470bg"}
@@ -114,7 +114,8 @@ def _augment_virtual_metadata(video_path, metadata):
     virtual_metadata["virtual_end_frame"] = end_frame
     if end_frame is None:
         return virtual_metadata
-    virtual_frame_count = max(0, end_frame - start_frame + 1)
+    virtual_metadata["virtual_own_frames"] = max(0, end_frame - start_frame + 1)
+    virtual_frame_count = virtual_metadata["virtual_own_frames"] + spec.pad_frames  # a padded view is that long to its readers
     virtual_metadata["frame_count"] = virtual_frame_count
     fps_float = float(virtual_metadata.get("fps_float") or 0.0)
     fps = int(virtual_metadata.get("fps") or 0)
@@ -584,6 +585,23 @@ def decode_video_frame_indices_ffmpeg(video_path, frame_indices, bridge="torch",
     return frames if bridge == "torch" else frames.numpy()
 
 
+def _read_rate(metadata, target_fps):
+    """The rate a video's frames are counted at when read at target_fps. Read at its own rate, rounded or real, it keeps every frame: 23.976 at 24 or at 23.976."""
+    return float(target_fps) if abs(float(metadata["fps_float"] or 0) - float(target_fps)) < 0.1 else metadata["fps"] if metadata["fps"] > 0 else max(1, int(round(metadata["fps_float"] or 0)))
+
+
+def virtual_own_frames(video_path, target_fps=None):
+    """How many frames of a file a virtual video names, without its padding, or how many they give at target_fps; None for a real file or one held in memory."""
+    if not isinstance(video_path, str) or parse_virtual_media_path(video_path) is None or get_virtual_media_entry(video_path) is not None:
+        return None
+    metadata = probe_video_stream_metadata(video_path)
+    own_frames = None if metadata is None else metadata.get("virtual_own_frames")
+    if own_frames is None or target_fps is None:
+        return own_frames
+    rate = _read_rate(metadata, target_fps)
+    return len(_resample_frame_indices(rate, own_frames, int(own_frames * float(target_fps) / rate) + 2, float(target_fps), 0))
+
+
 def decode_video_frames_ffmpeg(video_path, start_frame, max_frames, target_fps=None, bridge="torch", hdr_linear=False):
     metadata = probe_video_stream_metadata(video_path)
     if metadata is None:
@@ -595,16 +613,22 @@ def decode_video_frames_ffmpeg(video_path, start_frame, max_frames, target_fps=N
         empty_dtype = np.float32 if hdr_linear else np.uint8
         empty = np.empty((0, metadata["display_height"], metadata["display_width"], 3), dtype=empty_dtype)
         return torch.from_numpy(empty) if bridge == "torch" else empty
-    if target_fps is None or float(target_fps) <= 0:
+    own_frames = metadata.get("virtual_own_frames")
+    padded = own_frames is not None and metadata["frame_count"] > own_frames
+    if (target_fps is None or float(target_fps) <= 0) and not padded:
         return _decode_contiguous_video_frames_ffmpeg(video_path, start_frame, max_frames, bridge, hdr_linear=hdr_linear)
-    source_fps = metadata["fps"] if metadata["fps"] > 0 else max(1, int(round(metadata["fps_float"] or 0)))
-    frame_nos = _resample_frame_indices(source_fps, metadata["frame_count"], int(max_frames), float(target_fps), int(start_frame))
+    if target_fps is None or float(target_fps) <= 0:
+        frame_nos = list(range(start_frame, min(start_frame + int(max_frames), metadata["frame_count"])))
+    else:
+        frame_nos = _resample_frame_indices(_read_rate(metadata, target_fps), metadata["frame_count"], int(max_frames), float(target_fps), int(start_frame))
+    if padded:
+        frame_nos = [bounced_frame(frame_no, own_frames) for frame_no in frame_nos]
     if len(frame_nos) == 0:
         empty_dtype = np.float32 if hdr_linear else np.uint8
         empty = np.empty((0, metadata["display_height"], metadata["display_width"], 3), dtype=empty_dtype)
         return torch.from_numpy(empty) if bridge == "torch" else empty
-    decode_start = frame_nos[0]
-    decoded = _decode_contiguous_video_frames_ffmpeg(video_path, decode_start, frame_nos[-1] - decode_start + 1, bridge, hdr_linear=hdr_linear)
+    decode_start = min(frame_nos)
+    decoded = _decode_contiguous_video_frames_ffmpeg(video_path, decode_start, max(frame_nos) - decode_start + 1, bridge, hdr_linear=hdr_linear)
     index_list = [frame_no - decode_start for frame_no in frame_nos if frame_no - decode_start < decoded.shape[0]]
     if bridge == "torch":
         return decoded[index_list]

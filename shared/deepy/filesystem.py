@@ -20,7 +20,9 @@ from PIL import Image
 
 from shared.deepy.image_channels import image_color_details, upright_size
 from shared.deepy.media_registry import detect_media_type
+from shared.utils.utils import get_video_info
 from shared.utils.video_decode import resolve_media_binary
+from shared.utils.virtual_media import read_view
 
 
 TEXT_MAX_CHARS = 16000
@@ -414,6 +416,10 @@ def file_info(path: str, policy: FileAccessPolicy | None = None) -> dict[str, An
     if target.is_dir():
         stat = target.stat()
         return {"status": "done", "path": str(target), "filename": target.name, "file_type": "directory", "size_bytes": None, "modified": stat.st_mtime, "error": ""}
+    if (view := read_view(target)) is not None:  # a part of a video: the source's streams, its own length, and where it comes from
+        fps, _width, _height, frames = get_video_info(str(target))
+        return {**_probe_media(Path(view["source"]), "video"), "path": str(target), "filename": target.name, "view": {"source": view["source"], "start_frame": view["start_frame"], "end_frame": view["end_frame"]},
+                "frame_count": frames, "duration": round(frames / fps, 3) if fps else None, "duration_seconds": round(frames / fps, 3) if fps else None, "modified": target.stat().st_mtime}
     try:
         media_type = detect_media_type(str(target))
         if media_type == "3d":

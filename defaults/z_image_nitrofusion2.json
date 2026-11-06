@@ -1,0 +1,25 @@
+{
+    "model": {
+        "accelerated": "native",
+        "name": "NitroFusion2 Z-Image Turbo 6B",
+        "architecture": "z_image",
+        "description": "NitroFusion2 creates images from a text prompt in 1 to 4 steps, 2 by default, instead of the 8 steps of Z-Image Turbo, with sharp details and legible text. It is an adversarially distilled Z-Image Turbo finetune with the same memory needs and no guidance.",
+        "flow_shift": true,
+        "uniform_sigmas": true,
+        "profiles_dir": ["z_image_nitrofusion2"],
+        "URLs": [
+            "https://huggingface.co/DeepBeepMeep/Z-Image/resolve/main/NitroFusion2_bf16.safetensors",
+            "https://huggingface.co/DeepBeepMeep/Z-Image/resolve/main/NitroFusion2_int8_convrot.safetensors"
+        ]
+    },
+    "prompt": "A rainy night market street in Taipei, a glowing shop sign that reads \"NITRO NOODLES\" in bold red letters, steam rising from a bowl on the counter, reflections on the wet pavement, cinematic photograph.",
+    "resolution": "1024x1024",
+    "batch_size": 1,
+    "num_inference_steps": 2,
+    "guidance_scale": 0,
+    "flow_shift": 6.0,
+    "activated_loras": [
+        "https://huggingface.co/DeepBeepMeep/Z-Image/resolve/main/loras_accelerators/NitroFusion2_dedistill_lora_bf16.safetensors"
+    ],
+    "loras_multipliers": "0.5,0|"
+}

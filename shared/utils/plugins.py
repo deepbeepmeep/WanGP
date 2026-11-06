@@ -85,6 +85,7 @@ class PluginDeepyAction:
     routing: str  # when to choose this action, added to the agents' instructions
     instead_of: str  # a WanGP tool this action competes with: its discovery mentions the action
     scripts: bool  # callable from Deepy Python scripts
+    listed: bool = True  # False: not in the toolbox's list of actions, for a workflow whose own skill names it
 
 
 @dataclass
@@ -107,6 +108,7 @@ class PluginDeepySkill:
     description: str
     plugin_id: str
     routing: str = ""
+    listed: bool = True  # False: named only where it applies, not in its toolbox's discovery
 
     @property
     def uri(self) -> str:
@@ -603,7 +605,7 @@ class WAN2GPPlugin:
         self._deepy_toolbox = PluginDeepyToolbox(str(toolbox_id or ""), str(display_name or ""), " ".join(str(summary).split()), str(guide or "").strip(), {})
 
     def register_deepy_action(self, function: callable, *, name: str | None = None, summary: str | None = None, description: str | None = None, parameters: Dict[str, Dict[str, Any]] | None = None, example: Dict[str, Any] | None = None,
-                              uses_gpu: bool = True, paths: Dict[str, str] | None = None, routing: str = "", instead_of: str = "", scripts: bool = True) -> callable:
+                              uses_gpu: bool = True, paths: Dict[str, str] | None = None, routing: str = "", instead_of: str = "", scripts: bool = True, listed: bool = True) -> callable:
         """Add an action to this plugin's Deepy toolbox. function(ctx, **arguments) is synchronous; its arguments' schema comes from the type hints,
         parameters overrides per-argument schema entries (description, enum, ...). uses_gpu=False only for actions that never run GPU work:
         Deepy unloads before every other call so that the generations the action submits can run."""
@@ -629,7 +631,7 @@ class WAN2GPPlugin:
             raise ValueError(f"Deepy toolbox action '{action_name}' needs a summary or a docstring.")
         action_description = re.sub(r"(?<!\n)\n(?!\n)", " ", action_description)  # a docstring's wrapped lines form one paragraph
         self._deepy_toolbox.actions[action_name] = PluginDeepyAction(action_name, function, action_summary, action_description or action_summary, {key: dict(value) for key, value in dict(parameters or {}).items()},
-                                                                     dict(example) if example else None, bool(uses_gpu), roles, " ".join(str(routing or "").split()), str(instead_of or "").strip(), bool(scripts))
+                                                                     dict(example) if example else None, bool(uses_gpu), roles, " ".join(str(routing or "").split()), str(instead_of or "").strip(), bool(scripts), bool(listed))
         return function
 
     @property
@@ -1693,10 +1695,11 @@ class PluginManager:
             with open(path, encoding="utf-8") as reader:
                 text = reader.read()
             description = skill_metadata(text, name)["description"]
-            routing = yaml.safe_load(text.split("---", 2)[1]).get("routing") or ""
+            front_matter = yaml.safe_load(text.split("---", 2)[1])
+            routing = front_matter.get("routing") or ""
             if not isinstance(routing, str):
                 raise ValueError(f"The routing of Deepy skill '{name}' in plugin '{plugin_id}' must be one line of text.")
-            skill = PluginDeepySkill(name, path, description, plugin_id, " ".join(routing.split()))
+            skill = PluginDeepySkill(name, path, description, plugin_id, " ".join(routing.split()), bool(front_matter.get("listed", True)))
             if not skill.routing and (plugin_id == "user" or not re.fullmatch(r"[A-Za-z0-9._-]+", plugin_id)):
                 raise ValueError(f"Plugin folder '{plugin_id}' cannot hold toolbox skills: rename it with letters, digits, '.', '_' or '-' (not 'user').")
             existing = _ACTIVE_DEEPY_SKILLS.get(skill.uri)

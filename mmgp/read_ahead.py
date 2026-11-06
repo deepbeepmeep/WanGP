@@ -119,6 +119,23 @@ def cold_ranges(ranges):
         return []
 
 
+def ram_short():
+    """Whether the pages of mapped weights should leave the working set: the available RAM is under the floor of the pinned pool. Elsewhere than on Windows the available RAM already counts them."""
+    if sys.platform != "win32":
+        return False
+    import psutil
+    from . import offload
+    return psutil.virtual_memory().available < offload.POOL_RAM_FLOOR
+
+
+def drop_behind(ranges):
+    """Mapped weights (address, byte count) just copied elsewhere and not read again soon, when RAM is short: their pages go from the working set to the standby list, available to the system and to the next read without
+    the drive. Without this they stay, counted as used, until Windows trims the working set, recent pages included. About 75 ms per GiB, on the thread that copied them."""
+    if ram_short():
+        from . import offload
+        offload._drop_mapped_pages(offload._mapped_pages(ranges))
+
+
 def prefetch_ranges(ranges):
     """Reads ranges ([start, end] address pairs) into RAM with large requests."""
     hints = _hints()

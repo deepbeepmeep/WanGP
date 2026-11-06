@@ -17,9 +17,17 @@
   WAC.submitRequest = submit;
   WAC.queueBusyRequest = submit;
   WAC.steerRequest = submit;
+  // A picture, video or sound of the conversation opens over the page showing the window, when that page shows media: in a new tab otherwise.
+  WAC.openAttachment = link => {
+    const kind = link.dataset.mediaKind;
+    if (link.hasAttribute('download') || !['image', 'video', 'audio'].includes(kind) || !window.DeepyWindow.onMedia) return false;
+    window.DeepyWindow.onMedia({kind, url: link.href, name: (link.querySelector('.chat__attachment-title') || link).textContent.trim()});
+    return true;
+  };
   window.DeepyWindow = {
     onSubmit: null,
     onGap: null,
+    onMedia: null,  // ({kind, url, name}): the page shows that media
     replay(updates) { WAC.consumePayload({batch: updates, replay: true}); },  // a conversation at once, the window at its end
     update(update) { WAC.consumePayload(update); },  // one update as Deepy publishes it: the window follows it when it is at its end
     rejoin() { WAC.chatSequence = -1; },  // before updates again after some were skipped

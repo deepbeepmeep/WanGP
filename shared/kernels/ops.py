@@ -9,6 +9,7 @@ Whole-head normalization and compact rotary layouts remain model supplied.
 """
 import torch
 import torch.nn.functional as F
+from mmgp import offload
 from . import int8_backend, kernel_policy, native_ops
 from .dispatch import choose, cuda_inference, device_supported, packed_fma, take
 
@@ -31,6 +32,12 @@ try:
 except (ImportError, OSError):
     _adaln_triton = None
 
+try:  # a LoRA's output pass, alone or with the SwiGLU that reads its output
+    from . import lora_triton as _lora_triton
+except (ImportError, OSError, RuntimeError):
+    _lora_triton = None
+_LORA_DTYPES = (torch.bfloat16, torch.float16)
+
 try:
     from comfy_kitchen import rms_rope_split_half_ as _kitchen_rms_rope
 except (ImportError, OSError, RuntimeError):
@@ -51,6 +58,17 @@ def linear(layer, x_list, **fusion):
     if not fusion:
         return layer(take(x_list))
     return int8_backend.linear_with_fusion(layer, take(x_list), **fusion)
+
+
+def _lora_output(out, y, factor, scale, rank_first):
+    if not (_lora_triton is not None and cuda_inference(out, dtypes=_LORA_DTYPES) and _lora_triton.supported(out, y, factor, rank_first)
+            and choose("LoRA Output", owned_triton=True)):
+        return False
+    _lora_triton.add_(out, y, factor, scale, rank_first)
+    return True
+
+
+offload.register_lora_output(_lora_output)
 
 
 def project_many(modules, x_list):
@@ -183,11 +201,28 @@ def swiglu(x_list, *, packed=True, in_place=True):
     are consumed. No approximate kernel is promoted to a new model contract.
     """
     if packed:
-        gate, value = take(x_list).chunk(2, -1)
+        x = take(x_list)
+        if in_place and _lora_triton is not None and x.ndim == 2 and x.stride(1) == 1 and cuda_inference(x, dtypes=_LORA_DTYPES) and choose("SwiGLU", owned_triton=True):
+            return _lora_triton.swiglu_(x)
+        gate, value = x.chunk(2, -1)
     else:
         gate, value = x_list
         x_list.clear()
     return F.silu(gate, inplace=in_place).mul_(value)
+
+
+def _swiglu_of_linear(layer, x):
+    """silu(gate) * value of layer(x), its LoRA added in the same pass over the rows; None when the layer has no such LoRA."""
+    if _lora_triton is None or not cuda_inference(x, dtypes=_LORA_DTYPES) or not choose("LoRA Output", owned_triton=True):
+        return None
+    split = offload.linear_output_and_lora(layer, x)
+    if split is None:
+        return None
+    out, (y, factor, scale, rank_first) = split
+    if _lora_triton.supported(out, y, factor, rank_first):
+        return _lora_triton.swiglu_(out, y, factor, scale, rank_first)
+    out.addmm_(y, factor if rank_first else factor.T, beta=1, alpha=scale)
+    return swiglu([out])
 
 
 def gated_mlp(x_list, gate_proj, up_proj, down_proj, activation):
@@ -331,9 +366,12 @@ def mlp(x_list, fc1, fc2, act, *, up=None, prefix=None, residual=None, gate=None
         scale = None if scale is None else scale.reshape(-1).to(out.dtype)
         for first in range(start, stop, rows):
             last = min(first + rows, stop)
-            h = fc1(x[first:last])
-            fused = fusable if fusable and can_linear(fc2, h, act=fusable) else None
-            if fused is None:
+            # an activation that fc2's kernel cannot take (fc2 has a LoRA, whose product needs it) can still share fc1's pass over its rows
+            h = _swiglu_of_linear(fc1, x[first:last]) if fusable == "swiglu" and not can_linear(fc2, x, act=fusable) else None
+            activated = h is not None
+            h = h if activated else fc1(x[first:last])
+            fused = fusable if not activated and fusable and can_linear(fc2, h, act=fusable) else None
+            if fused is None and not activated:
                 h = (situ([h, up(x[first:last])], packed=False) if act == "situ" and up is not None else situ([h]) if act == "situ"
                      else swiglu([h, up(x[first:last])], packed=False) if up is not None else swiglu([h]) if act == "swiglu"
                      else torch.ops.aten.silu_(h) if act == "silu" else torch.ops.aten.gelu_(h, approximate="tanh" if act == "gelu" else "none"))

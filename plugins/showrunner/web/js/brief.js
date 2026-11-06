@@ -9,6 +9,7 @@ import { modelRows, openDefaultModels } from './models.js';
 const STYLES = ['Cinematic', 'Anime', 'Documentary', 'Noir', 'Neon', 'Pastel', 'Claymation', 'Watercolor', 'Vintage film', 'VHS', 'Epic', 'Minimal', 'Dreamy', 'Gritty', 'Surreal', 'Cyberpunk'];
 const ASPECT_FRAMES = { '16:9': [44, 25], '9:16': [20, 34], '1:1': [30, 30], '4:3': [38, 28], '2.39:1': [50, 21] };
 const PACING = ['Very calm', 'Calm', 'Balanced', 'Energetic', 'Frenetic'];
+const RESOLUTION_CHOICES = ['480p', '720p', '1080p'];
 const LANGUAGES = [['en', 'English'], ['fr', 'French'], ['es', 'Spanish'], ['de', 'German'], ['it', 'Italian'], ['pt', 'Portuguese'], ['nl', 'Dutch'], ['pl', 'Polish'], ['ru', 'Russian'], ['tr', 'Turkish'], ['ar', 'Arabic'], ['hi', 'Hindi'], ['zh', 'Chinese'], ['ja', 'Japanese'], ['ko', 'Korean']];
 
 // A format chosen after shooting changes nothing by itself: the note says so, with the button that does it.
@@ -42,8 +43,11 @@ export function mountBrief(container, doc) {
             <textarea class="textarea mono" id="script" rows="9" placeholder="${lyrics ? '[Verse 1]\nThe sun climbs up over the old town square…' : 'NARRATOR: Once, at the edge of the sea…\nMIA: Did you hear that?'}">${esc(brief.script)}</textarea></div>` : ''}
         </div></section>
 
-      <section class="panel"><div class="panel-head"><span class="num">3</span><h3>${brief.kind === 'music_video' ? 'The song' : 'Soundtrack'}</h3><span class="hint">${brief.kind === 'music_video' ? 'Drives timing, cuts and lip sync' : 'Optional: music the edit follows'}</span></div>
-        <div id="song">${brief.song ? songCard(doc, analysis) : dropzone('song', AUDIO_ACCEPT + ',video/*', 'Drop the song here', `or click to choose a file · WAV, MP3, FLAC, M4A, or a video to take its audio${brief.kind === 'music_video' ? '. No song yet? Leave this empty: the showrunner composes one from your idea and lyrics.' : ''}`)}</div></section>
+      ${brief.kind === 'remake' ? `<section class="panel"><div class="panel-head"><span class="num">3</span><h3>The source video</h3><span class="hint">Its motion, camera, timing and sound stay</span></div><div id="source">${brief.source ? `<div class="row" style="gap:10px"><video src="${actions.file(brief.source)}" controls preload="metadata" style="max-width:320px;border-radius:8px"></video><button class="btn small" id="remove-source">${icon('trash')} Remove</button></div>` : dropzone('source', 'video/*', 'Drop the video here', 'or click to choose a file. Change only footage you have the rights to, and never put a real person into a video without their agreement.')}</div>
+        <div class="field" style="margin-top:12px"><div class="label">${icon('clock')} Shots rendered together <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">short shots render with their neighbours: alone, the lips barely follow the speech</span></div>
+          <div class="slider-row" style="justify-content:flex-start"><span class="muted">at least</span><input class="input" id="render-min" type="number" min="0" max="15" step="1" value="${brief.render_min_s ?? 0}" aria-label="Shortest render in seconds" title="Consecutive shots join until a render lasts this long; 0 renders every shot alone" style="width:76px;flex:none;padding:6px 8px"><span class="muted">to</span>
+            <input class="input" id="render-max" type="number" min="1" max="15" step="1" value="${brief.render_max_s ?? ''}" placeholder="Auto" aria-label="Longest render in seconds" title="The longest render of shots together; Auto is the model's window" style="width:76px;flex:none;padding:6px 8px"><span class="muted">s</span></div></div></section>` : `<section class="panel"><div class="panel-head"><span class="num">3</span><h3>${brief.kind === 'music_video' ? 'The song' : 'Soundtrack'}</h3><span class="hint">${brief.kind === 'music_video' ? 'Drives timing, cuts and lip sync' : 'Optional: music the edit follows'}</span></div>
+        <div id="song">${brief.song ? songCard(doc, analysis) : dropzone('song', AUDIO_ACCEPT + ',video/*', 'Drop the song here', `or click to choose a file · WAV, MP3, FLAC, M4A, or a video to take its audio${brief.kind === 'music_video' ? '. No song yet? Leave this empty: the showrunner composes one from your idea and lyrics.' : ''}`)}</div></section>`}
 
       <section class="panel"><div class="panel-head"><span class="num">4</span><h3>References</h3><span class="hint">Looks, places, moods, motion: images or videos</span></div>
         <div class="refs">${brief.references.map((path, index) => reference(path, index)).join('')}
@@ -59,7 +63,8 @@ export function mountBrief(container, doc) {
           <div class="field"><div class="label">${icon('ratio')} Aspect ratio</div><div class="aspects">${Object.entries(ASPECT_FRAMES).map(([aspect, [width, height]]) =>
             `<button class="aspect ${brief.aspect === aspect ? 'on' : ''}" data-aspect="${aspect}"><i style="width:${width}px;height:${height}px"></i>${aspect}<span class="muted" style="font-size:10.5px">${{ '16:9': 'Widescreen', '9:16': 'Vertical', '1:1': 'Square', '4:3': 'Classic', '2.39:1': 'Scope' }[aspect]}</span></button>`).join('')}</div>${formatNote(state.doc)}</div>
           <div class="three">
-            <div class="field"><div class="label">${icon('image')} Resolution</div><div class="seg" id="res">${['480p', '720p', '1080p'].map(value => `<button class="${brief.resolution === value ? 'on' : ''}" data-res="${value}">${value}</button>`).join('')}</div></div>
+            <div class="field"><div class="label">${icon('image')} Target resolution</div><div class="seg" id="res" title="What the final shots and every picture are made at">${RESOLUTION_CHOICES.map(value => `<button class="${brief.resolution === value ? 'on' : ''}" data-res="${value}">${value}</button>`).join('')}</div></div>
+            <div class="field"><div class="label">${icon('clock')} Draft resolution</div><div class="seg" id="draft-res" title="Try shots at this size first, then Shoot set to Final renders the ones you like at the target resolution. The pictures stay the same">${['', ...RESOLUTION_CHOICES.slice(0, RESOLUTION_CHOICES.indexOf(brief.resolution))].map(value => `<button class="${(brief.draft_resolution || '') === value ? 'on' : ''}" data-draft="${value}">${value || 'None'}</button>`).join('')}</div></div>
             <div class="field"><div class="label">${icon('clock')} Duration ${brief.song && analysis ? `<button class="chip clickable ${!brief.duration_s ? 'on' : ''}" id="match-song" style="height:20px;margin-left:4px">${icon('music')}Match the song</button>` : ''}</div>
               <div class="slider-row"><input type="range" class="range" id="duration" min="5" max="600" step="5" value="${brief.duration_s || analysis?.duration_s || 30}" aria-label="Duration">
                 <input class="input" id="duration-n" type="number" min="5" max="600" step="1" value="${Math.round(brief.duration_s || analysis?.duration_s || 30)}" aria-label="Duration in seconds" title="Seconds, from 5 to 600" style="width:76px;flex:none;padding:6px 8px"><span class="muted">s</span></div></div>
@@ -92,11 +97,11 @@ export function mountBrief(container, doc) {
 
       ${state.doc.deliverables.length ? `<div class="muted" style="font-size:12.5px;margin:4px 2px 0">This brief is where the production started: later changes live in the shots, the cast and the edit, and it is not rewritten. To keep going from where the production is, talk to the showrunner.</div>` : ''}
       <div class="cta-bar">
-        <div class="grow"><b>${esc(kind.label)}</b> <span class="muted">· ${esc(brief.aspect)} · ${brief.resolution} · <span id="brief-duration">${formatDuration(brief.duration_s || analysis?.duration_s || 30)}</span> · ${doc.cast.length} cast · ${brief.references.length} ${brief.references.length === 1 ? 'reference' : 'references'}</span>
+        <div class="grow"><b>${esc(kind.label)}</b> <span class="muted">· ${esc(brief.aspect)} · ${brief.draft_resolution ? `${brief.draft_resolution} draft, ` : ''}${brief.resolution} · <span id="brief-duration">${formatDuration(brief.duration_s || analysis?.duration_s || 30)}</span> · ${doc.cast.length} cast · ${brief.references.length} ${brief.references.length === 1 ? 'reference' : 'references'}</span>
           ${state.directorInfo.available === false && state.directorInfo.reason ? `<div class="muted" style="font-size:12px;color:var(--amber)">${esc(state.directorInfo.reason)}</div>` : ''}</div>
         ${doc.shots.length ? `<button class="btn" id="to-board">${icon('grid')} Storyboard (${doc.shots.length})</button>` : ''}
         ${!(brief.text || '').trim() && !(brief.script || '').trim() && !brief.song ? '<span class="muted" style="font-size:12.5px">Write your idea first</span>' : ''}
-        <button class="btn primary lg" id="plan" ${availability(actions.directorBlocked() || actions.planBlocked(doc))}>${icon('wand')} ${actions.busy(doc) || state.live.running ? 'The showrunner is working…' : doc.shots.length ? 'Plan again' : 'Plan with the showrunner'}</button>
+        <button class="btn primary lg" id="plan" ${availability(actions.directorBlocked() || actions.planBlocked(doc))}>${icon('wand')} ${actions.busy(doc) || state.live.running ? 'The showrunner is working…' : (doc.shots.length ? 'Plan again' : 'Plan with the showrunner') + (doc.brief.plan_first ? '' : ' and shoot')}</button>
       </div>`;
     bind();
     renderModels();
@@ -122,7 +127,11 @@ export function mountBrief(container, doc) {
     root.querySelector('#style').oninput = event => queue({ style: event.target.value });
     root.querySelectorAll('[data-aspect]').forEach(button => button.onclick = () => actions.ops([{ op: 'brief', fields: { aspect: button.dataset.aspect } }]).then(render));
     root.querySelector('#make-format')?.addEventListener('click', () => actions.makeFormat(state.doc.brief.aspect));
-    root.querySelectorAll('[data-res]').forEach(button => button.onclick = () => actions.ops([{ op: 'brief', fields: { resolution: button.dataset.res } }]).then(render));
+    root.querySelectorAll('[data-res]').forEach(button => button.onclick = () => {
+      const lower = RESOLUTION_CHOICES.indexOf(state.doc.brief.draft_resolution) < RESOLUTION_CHOICES.indexOf(button.dataset.res);
+      actions.ops([{ op: 'brief', fields: { resolution: button.dataset.res, ...(lower ? {} : { draft_resolution: null }) } }]).then(render);
+    });
+    root.querySelectorAll('[data-draft]').forEach(button => button.onclick = () => actions.ops([{ op: 'brief', fields: { draft_resolution: button.dataset.draft || null } }]).then(render));
     root.querySelectorAll('[data-style]').forEach(button => button.onclick = () => {
       const tags = new Set(save.pending('brief')?.style_tags ?? state.doc.brief.style_tags);  // the chips clicked a moment ago count too
       tags.has(button.dataset.style) ? tags.delete(button.dataset.style) : tags.add(button.dataset.style);
@@ -138,6 +147,10 @@ export function mountBrief(container, doc) {
     root.querySelector('#match-song')?.addEventListener('click', () => actions.ops([{ op: 'brief', fields: { duration_s: null } }]).then(render));
     const pacing = root.querySelector('#pacing');
     pacing.oninput = () => { root.querySelector('#pacing-v').textContent = PACING[+pacing.value + 2]; queue({ pacing: +pacing.value }); };
+    [['#render-min', 'render_min_s', 0], ['#render-max', 'render_max_s', null]].forEach(([selector, field, empty]) => {  // a remake's shots rendered together
+      const input = root.querySelector(selector);
+      if (input) input.onchange = () => queue({ [field]: input.value === '' ? empty : Math.min(15, Math.max(0, +input.value)) || empty });
+    });
     [['#shot-min', 'shot_min_s'], ['#shot-max', 'shot_max_s']].forEach(([selector, field]) => {
       const input = root.querySelector(selector);
       input.oninput = () => { if (input.value === '' || (+input.value >= 1 && +input.value <= 60)) queue({ [field]: +input.value || null }); };  // out of range: kept until the field is left
@@ -160,6 +173,8 @@ export function mountBrief(container, doc) {
       if (await actions.direct('plan')) actions.go('storyboard');
     };
     root.querySelectorAll('[data-drop]').forEach(zone => dropTarget(zone, zone.dataset.drop));
+    const removeSource = root.querySelector('#remove-source');
+    if (removeSource) removeSource.onclick = () => actions.ops([{ op: 'brief', fields: { source: null } }]).then(render);
     root.querySelectorAll('[data-remove-ref]').forEach(button => button.onclick = () => {
       const references = state.doc.brief.references.filter((_, index) => index !== +button.dataset.removeRef);
       actions.ops([{ op: 'brief', fields: { references } }]).then(render);
@@ -184,8 +199,9 @@ export function mountBrief(container, doc) {
     const kind = state.doc.brief.kind, picked = roles.filter(role => role.value).length;
     const hint = root.querySelector('#models-hint');
     if (hint) hint.textContent = picked ? `${picked} picked by you · the others on Auto` : "Auto: the templates selected in Deepy's settings";
-    const used = role => !(kind === 'music_video' && ['voices', 'cloned_voices'].includes(role.id)) && !(role.id === 'music' && state.doc.brief.song);  // kinds this production makes
-    box.innerHTML = modelRows(roles.filter(role => used(role) || role.value))
+    const editing = ['people_edits', 'scene_edits'], used = role => kind === 'remake' ? role.id === 'image_edits' : !editing.includes(role.id)
+      && !(kind === 'music_video' && ['voices', 'cloned_voices'].includes(role.id)) && !(role.id === 'music' && state.doc.brief.song);  // kinds this production makes
+    box.innerHTML = modelRows(roles.filter(role => used(role) || role.value))  // a remake's shots are Viggle Remake's: their templates show only when picked before, to be reset
       + '<div class="muted" style="grid-column:1/-1;font-size:12px">Auto is the template selected in Deepy\'s settings for the category; add your own templates there (Ask Deepy &gt; Settings). A pick applies to the shots of its category that still use the previous template; the shot panel changes one shot. <button class="link" id="models-defaults">Default models</button> sets what new productions start with.</div>';
     box.querySelector('#models-defaults').onclick = () => openDefaultModels();
     box.querySelectorAll('[data-role]').forEach(select => select.onchange = async () => {
@@ -210,14 +226,14 @@ export function mountBrief(container, doc) {
   function modelsOpen() { try { return localStorage.getItem('sr.models') === '1'; } catch { return false; } }
 
   function dropTarget(zone, role) {
-    const accept = role === 'song' ? AUDIO_ACCEPT + ',video/*' : 'image/*,video/*';
+    const accept = role === 'song' ? AUDIO_ACCEPT + ',video/*' : role === 'source' ? 'video/*' : 'image/*,video/*';
     zone.onclick = async () => {
       if (role === 'cast') {  // as on the Cast page: a person is named first; dropping photos adds people too
         const name = await promptDialog({ title: 'Who or what is it?', text: 'Describe them on the Cast page, or drop a photo here.', placeholder: 'Mia, the lead singer', ok: 'Add' });
         if (name?.trim()) actions.ops([{ op: 'add_cast', fields: personFields(name) }]).then(render);
         return;
       }
-      const files = await pickFiles(accept, role !== 'song');
+      const files = await pickFiles(accept, role !== 'song' && role !== 'source');
       if (files.length) upload(files, role);
     };
     zone.ondragover = event => { event.preventDefault(); zone.classList.add('over'); };
@@ -227,7 +243,7 @@ export function mountBrief(container, doc) {
 
   async function upload(files, role) {
     if (role === 'song') analysisRequested = true;
-    const results = await actions.upload(role === 'song' ? [...files].slice(0, 1) : files, role);
+    const results = await actions.upload(role === 'song' || role === 'source' ? [...files].slice(0, 1) : files, role);
     if (role === 'cast') for (const result of results) {
       const name = await promptDialog({ title: 'Who is it?', text: 'The showrunner uses this name in the plan and the dialogue.', value: state.doc.cast.find(member => member.id === result.target)?.name || '', ok: 'Save' });
       if (name?.trim()) await actions.ops([{ op: 'update_cast', cast: result.target, fields: { name: name.trim() } }]);
@@ -276,6 +292,7 @@ function placeholder(kind) {
     ad: 'A 30-second spot for a reusable bottle that keeps drinks cold for 24 hours: hikers, a desert, a cold sip at sunset…',
     trailer: 'A one-minute trailer for a heist film set in a floating city…',
     story: 'A shy fox who collects lost sounds and returns them to their owners…',
+    remake: 'What should change: who replaces whom, or what is removed, added or restyled. Everything else stays as in the video…',
     free: 'Describe what you want to make…',
   }[kind] || '';
 }

@@ -39,6 +39,7 @@ from .assets import (
     QWEN35_VISION_FILENAME,
     QWEN38_VARIANT_27B,
     QWEN38_VARIANT_9B,
+    QWEN38_VARIANT_FLASH_NEXT,
 )
 from .qwen3_5 import load_qwen35_model_class
 from .progress import EnhancementProgress
@@ -74,6 +75,7 @@ QWEN35_VARIANT_ALIASES = {
     "qwen3.8-27b uncensored": QWEN38_VARIANT_27B,
     "qwen3.8-9b": QWEN38_VARIANT_9B,
     "qwen3.8-9b uncensored": QWEN38_VARIANT_9B,
+    "qwen3.8 flash-next": QWEN38_VARIANT_FLASH_NEXT,
 }
 
 
@@ -89,7 +91,7 @@ def get_qwen35_assets_dir_name(variant: str | None = None) -> str:
 
 
 def get_qwen35_prompt_enhancer_variant(model_no) -> str:
-    return {3: QWEN35_VARIANT_4B, 4: QWEN35_VARIANT_9B, 5: QWEN38_VARIANT_27B, 6: QWEN38_VARIANT_9B}[int(model_no)]
+    return {3: QWEN35_VARIANT_4B, 4: QWEN35_VARIANT_9B, 5: QWEN38_VARIANT_27B, 6: QWEN38_VARIANT_9B, 7: QWEN38_VARIANT_FLASH_NEXT}[int(model_no)]
 
 
 def get_qwen35_quantization(backend: str, variant: str | None = None) -> str:
@@ -1084,7 +1086,15 @@ def load_qwen35_vl_prompt_enhancer(
         raise FileNotFoundError(f"Qwen3.5VL checkpoint not found: {model_path}")
 
     model_class = load_qwen35_model_class(modeling_path, class_name="Qwen3_5ForConditionalGeneration")
-    config = AutoConfig.from_pretrained(assets_dir, trust_remote_code=True)
+    if get_qwen35_variant_spec(variant).get("architecture") == "qwen4_exp":
+        # the vision tower of Qwen3.5 under the name of this architecture; the text model is the shared one below
+        with open(config_path, "r", encoding="utf-8") as reader:
+            config_values = json.load(reader)
+        for values in (config_values, config_values["text_config"], config_values["vision_config"]):
+            values["model_type"] = values["model_type"].replace("qwen4_exp", "qwen3_5")
+        config = AutoConfig.for_model(**config_values)
+    else:
+        config = AutoConfig.from_pretrained(assets_dir, trust_remote_code=True)
     config._prompt_enhancer_safe_legacy = legacy_safe_mode
     config._attn_implementation = attn_implementation
     if hasattr(config, "text_config") and config.text_config is not None:

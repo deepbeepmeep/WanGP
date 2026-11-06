@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import json
 import shutil
 import subprocess
@@ -130,6 +131,104 @@ def subtitle_cues(path: str | Path) -> list[tuple[float, float, str]]:
             start, end = lines[timing].split(" --> ")
             cues.append((seconds(start.strip()), seconds(end.split()[0]), " ".join(lines[timing + 1:]).strip()))
     return cues
+
+
+NEAR_RATE = 0.1  # frames per second: 23.976 for 24, 29.97 for 30
+OWN_RATES = (23.5, 30.5)  # keep their frames at their rate: a real render at 25 and at 30 matches its render at 24 (43 and 41 dB). Twice that would cost twice the frames for the same seconds
+
+
+def _rates(path: str | Path) -> list[float]:
+    found = _run([ffprobe(), "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=avg_frame_rate,r_frame_rate", "-of", "csv=p=0", str(path)]).stdout.decode("ascii", "replace").strip().split("\n")[0].split(",")
+    return [float(numerator) / float(denominator or 1) if numerator and float(denominator or 1) else 0.0 for numerator, _, denominator in (rate.partition("/") for rate in found)]
+
+
+def frame_rate(path: str | Path) -> float:
+    """A video's real frame rate, 23.976023976 and not a rounded 24."""
+    return _rates(path)[-1]
+
+
+def _steady_rate(path: str | Path) -> bool:
+    rates = _rates(path)
+    return max(rates) - min(rates) < 0.01
+
+
+def normalized_video(path: str | Path, fps: float, out_folder: str | Path) -> Path:
+    """A remake's source, whose frames are the numbers the plan speaks in. A video at a steady rate near the model's is used as it is, frame for frame, at its real rate: WanGP reads, renders, times its audio
+    and records at that rate (force_fps). Another (a higher rate, a variable one) is converted to the model's rate once and reused."""
+    if (abs(frame_rate(path) - fps) < NEAR_RATE or OWN_RATES[0] <= frame_rate(path) <= OWN_RATES[1]) and _steady_rate(path):
+        return Path(path)
+    out = Path(out_folder) / f"{cache_key(path, fps)}.mp4"
+    if not out.is_file():
+        out.parent.mkdir(parents=True, exist_ok=True)
+        _run([ffmpeg(), "-y", "-v", "error", "-i", str(path), "-vf", f"fps={fps:g}", "-c:v", "libx264", "-crf", "12", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "256k", str(out)])
+    return out
+
+
+def video_subtitles(path: str | Path, out_folder: str | Path) -> list[dict[str, Any]]:
+    """The text subtitle tracks of a video as SRT files with their languages, converted once and reused. Subtitles drawn as pictures are left out."""
+    streams = json.loads(_run([ffprobe(), "-v", "error", "-select_streams", "s", "-show_entries", "stream=codec_name:stream_tags=language", "-of", "json", str(path)]).stdout or b"{}").get("streams", [])
+    tracks = []
+    for number, stream in enumerate(streams):
+        if stream.get("codec_name") in ("mov_text", "subrip", "srt", "ass", "ssa", "webvtt", "text"):
+            out = Path(out_folder) / f"{Path(path).stem}-subtitles-{number}.srt"
+            if not out.is_file():
+                out.parent.mkdir(parents=True, exist_ok=True)
+                _run([ffmpeg(), "-y", "-v", "error", "-i", str(path), "-map", f"0:s:{number}", "-f", "srt", str(out)])
+            tracks.append({"path": out, "language": (stream.get("tags") or {}).get("language") or "und"})
+    return tracks
+
+
+def video_window(path: str | Path, start: int, frames: int, fps: float, out_folder: str | Path, size: str | None = None) -> Path:
+    """Exactly `frames` frames of a video from frame `start`, with their sound, cut once and reused, for the page's players: nothing delivered reads it. size: "WIDTHxHEIGHT" to scale them to."""
+    out = Path(out_folder) / f"{Path(path).stem}-{start}-{frames}{f'-{size}' if size else ''}.mp4"
+    if not out.is_file():
+        out.parent.mkdir(parents=True, exist_ok=True)
+        scale = f",scale={size.replace('x', ':')}" if size else ""
+        # inputs that end with the part: nothing before it is decoded, and half a frame early lands the seek on its first frame
+        inputs = ["-ss", f"{max(0.0, start - 0.5) / fps:.6f}", "-t", f"{(frames + 2) / fps * 1.01:.6f}", "-i", str(path), "-ss", f"{start / fps:.6f}", "-t", f"{frames / fps:.6f}", "-i", str(path)]
+        making = out.with_name(f"{out.stem}.{uuid.uuid4().hex[:8]}.mp4")  # another request for this file, a mouse over a card and its player, must not read it half written
+        _run([ffmpeg(), "-y", "-v", "error", *inputs, "-filter_complex", f"[0:v]trim=end_frame={frames},setpts=PTS-STARTPTS{scale}[picture]", "-map", "[picture]", "-map", "1:a?", "-frames:v", str(frames),
+              "-c:v", "libx264", "-crf", "12", "-pix_fmt", "yuv420p", "-r", f"{fps:.6f}", "-c:a", "aac", "-b:a", "256k", str(making)])
+        os.replace(making, out)
+    return out
+
+
+def changed_share(before: str | Path, after: str | Path) -> float:
+    """The share of a picture that really differs from another, past the small shifts and tones of a redraw: colours at 64x48, more than 30 of 255 apart."""
+    from PIL import Image
+
+    pictures = [np.asarray(Image.open(path).convert("RGB").resize((64, 48), Image.BOX), dtype=np.float32) for path in (before, after)]
+    return float((np.abs(pictures[0] - pictures[1]).max(axis=2) > 30).mean())
+
+
+def fitted_canvas(path: str | Path, resolution: str, pixels: int | None = None) -> str:
+    """The size a video's shape takes at a resolution of the brief, on the 32-pixel grid: a wider video keeps its shape below the model's largest size (pixels)."""
+    facts = probe(path)
+    short = {"480p": 480, "720p": 736}.get(resolution, 736)
+    wide, tall = (facts["width"], facts["height"]) if facts["width"] >= facts["height"] else (facts["height"], facts["width"])
+    long = round(short * wide / tall / 32) * 32
+    while pixels and short * long > pixels:
+        short -= 32
+        long = round(short * wide / tall / 32) * 32
+    return f"{long}x{short}" if facts["width"] >= facts["height"] else f"{short}x{long}"
+
+
+def generation_seed(path: str | Path) -> int | None:
+    """The seed a generated video was made with, from the settings WanGP keeps in its file."""
+    found = _run([ffprobe(), "-v", "error", "-show_entries", "format_tags=comment", "-of", "default=nw=1:nk=1", str(path)]).stdout.decode("utf-8", "replace").strip()
+    try:
+        return int(json.loads(found)["seed"])
+    except (ValueError, KeyError, TypeError):  # a file from elsewhere, dropped on the shot
+        return None
+
+
+def video_frame(path: str | Path, frame: int, out_folder: str | Path) -> Path:
+    """One frame of a video as a PNG, cut once and reused."""
+    out = Path(out_folder) / f"{Path(path).stem}-frame{frame}.png"
+    if not out.is_file():
+        out.parent.mkdir(parents=True, exist_ok=True)
+        _run([ffmpeg(), "-y", "-v", "error", "-i", str(path), "-vf", f"select=eq(n\\,{frame})", "-frames:v", "1", "-vsync", "0", str(out)])
+    return out
 
 
 def audio_slice(path: str | Path, start_s: float, end_s: float, out_folder: str | Path) -> Path:

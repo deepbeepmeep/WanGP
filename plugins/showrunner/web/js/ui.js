@@ -237,6 +237,17 @@ export function confirmDialog({ title, text, ok = 'Confirm', danger = false }) {
   });
 }
 
+// A picture, video or sound shown over the page (the showrunner's conversation opens its media here): Esc or a click beside it closes it.
+export function mediaPopup({ kind, url, name = '' }) {
+  const media = kind === 'image' ? `<img src="${esc(url)}" alt="${esc(name)}">` : `<${kind} src="${esc(url)}" controls autoplay></${kind}>`;
+  const back = h(`<div class="modal-back"><div class="media-popup" role="dialog" aria-modal="true" aria-label="${esc(name)}">${media}${name ? `<div class="media-popup-name">${esc(name)}</div>` : ''}</div></div>`);
+  const close = () => { back.remove(); document.removeEventListener('keydown', keys); };
+  const keys = event => { if (event.key === 'Escape') { event.stopPropagation(); close(); } };
+  back.addEventListener('click', event => { if (event.target === back) close(); });
+  document.addEventListener('keydown', keys);
+  document.getElementById('overlay-root').append(back);
+}
+
 export function promptDialog({ title, text = '', value = '', placeholder = '', ok = 'Save', multiline = false }) {
   return new Promise(resolve => {
     const field = multiline ? `<textarea class="textarea" rows="4" placeholder="${esc(placeholder)}">${esc(value)}</textarea>` : `<input class="input" value="${esc(value)}" placeholder="${esc(placeholder)}">`;
@@ -361,6 +372,14 @@ function mergeFields(base, extra) {
   const merged = { ...base };
   for (const [key, value] of Object.entries(extra)) merged[key] = plain(value) && plain(base[key]) ? mergeFields(base[key], value) : value;
   return merged;
+}
+
+// At most one call per wait: the first at once, the last one asked for when the wait ends (live events come many times a second).
+export function throttle(fn, wait = 100) {
+  let timer = null, asked = false;
+  const run = () => { timer = null; if (asked) call(); };
+  const call = () => { asked = false; fn(); timer = setTimeout(run, wait); };
+  return () => { if (timer) asked = true; else call(); };
 }
 
 export function debounce(fn, wait = 250) {

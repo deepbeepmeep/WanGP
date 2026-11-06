@@ -311,13 +311,14 @@ class PythonSandbox:
     code runs (the chat Stop button)."""
 
     def __init__(self, root: Path, *, resolve_path: Callable[[str], str], publish_media: Callable[[str, str], dict | None], publish_frames: Callable[[list[str], float, str, str], dict | None], virtualize: Callable[[str], str] = str, memory_mb: int = MEMORY_MB,
-                 call_tool: Callable[[str, dict], dict] | None = None, list_dir: Callable[[str], Path] | None = None, apps=None):
+                 call_tool: Callable[[str, dict], dict] | None = None, list_dir: Callable[[str], Path] | None = None, apps=None, resolve_part: Callable[[str], dict] | None = None):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "out").mkdir(exist_ok=True)
         (self.root / "scratch").mkdir(exist_ok=True)  # the work folder the rules name in their examples
         self._low_integrity = sys.platform == "win32" and _label_low_integrity(self.root)
         self._resolve_path, self._publish_media, self._publish_frames, self._virtualize = resolve_path, publish_media, publish_frames, virtualize
+        self._resolve_part = resolve_part or (lambda reference: {"path": resolve_path(reference), "start_frame": 0, "end_frame": None})  # what wangp.video_frames reads, a view being a part of its source
         self.call_tool, self._list_dir = call_tool, list_dir  # call_tool(name, arguments) runs a WanGP tool for a script (Prime installs its own); list_dir(ref) resolves an authorized folder
         self.apps = apps  # shared.apps.dev.AppWorkshop when App Development is on: the app_* actions and wangp.app helpers
         self.progress: Callable[[str, dict], None] = lambda status_text, summary: None  # live status of a running script: a short status line and a summary dict for the transcript entry
@@ -466,6 +467,8 @@ class PythonSandbox:
                             raise FileNotFoundError(f"No such file: {reference}") from None
                         raise IsADirectoryError(f"{reference} is a folder: wangp.path is for files. List it with wangp.listdir({reference!r}); the sandbox's own files are relative paths here (scratch/a.png) and @documents/sandbox/scratch/a.png for other tools.") from None
                     raise
+            if request.get("op") == "part":
+                return {"value": self._resolve_part(str(request.get("ref", "")))}
             if request.get("op") == "video":
                 frames = [str(Path(frame).resolve()) for frame in request.get("frames", [])]
                 outside = [frame for frame in frames if not Path(frame).is_relative_to(self.root)]

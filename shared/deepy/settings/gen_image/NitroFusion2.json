@@ -1,0 +1,12 @@
+{
+    "settings_version": 2.55,
+    "model_type": "z_image_nitrofusion2",
+    "prompt_enhancer": "T",
+    "prompt": "",
+    "image_mode": 1,
+    "resolution": "1280x720",
+    "num_inference_steps": 2,
+    "flow_shift": 6.0,
+    "type": "NitroFusion2",
+    "batch_size": 1
+}

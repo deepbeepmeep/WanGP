@@ -25,11 +25,12 @@
 #define CPU_LINEAR_API extern "C" __declspec(dllexport)
 #else
 #include <cpuid.h>
+#include <sched.h>
 #define CPU_LINEAR_API extern "C" __attribute__((visibility("default")))
 #endif
 
 enum Format { FORMAT_GGUF = 0, FORMAT_INT8_ROWS = 1, FORMAT_FP8_ROWS = 2, FORMAT_NVFP4 = 3 };
-enum { GGML_Q8_0 = 8, GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14, GGML_IQ3_S = 21, GGML_IQ2_S = 22, PRISM_PTQ1_0 = 143 };
+enum { GGML_Q8_0 = 8, GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14, GGML_IQ3_XXS = 18, GGML_IQ4_NL = 20, GGML_IQ3_S = 21, GGML_IQ2_S = 22, GGML_IQ4_XS = 23, GGML_Q2_0 = 42, PRISM_PTQ1_0 = 143 };
 enum { FP8_E4M3 = 0, FP8_E5M2 = 1 };
 enum { NVFP4_LEGACY = 0, NVFP4_TENSORCORE = 1 };
 enum { ROWS_E5M2 = 12 };  // internal: FP8 e5m2 rows (FORMAT_FP8_ROWS rows are e4m3)
@@ -222,6 +223,31 @@ static void row_any(const Weight & w, int64_t j, const float * x, int64_t k, int
     }
 }
 
+// ---- Q2_0 (ggml's format; its CPU backend has only the scalar product) ------------------------------------------------------------------
+// 64 two-bit codes per block, value (code - 1) * d, against two Q8_0 blocks of activations: integer dots by groups of 32, as the scalar product
+static void vec_dot_q2_0_q8_0(int n, float * s, size_t, const void * vx, size_t, const void * vy, size_t, int) {
+    const block_q2_0 * x = (const block_q2_0 *)vx;
+    const block_q8_0 * y = (const block_q8_0 *)vy;
+    const int nb = n / QK2_0;
+    const __m256i repeat = _mm256_setr_epi8(0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7);
+    const __m256i low = _mm256_set1_epi32(0x40100401), high = _mm256_set1_epi32((int)0x80200802), one = _mm256_set1_epi8(1), pairs = _mm256_set1_epi16(1);
+    __m256 sum = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+        for (int k = 0; k < 2; ++k) {
+            const block_q8_0 & b = y[i * 2 + k];
+            const __m128i codes = _mm_loadl_epi64((const __m128i *)(x[i].qs + k * 8));
+            const __m256i spread = _mm256_shuffle_epi8(_mm256_set_m128i(codes, codes), repeat);  // each byte 4 times; the high half reads bytes 4..7 of its lane
+            const __m256i b0 = _mm256_cmpeq_epi8(_mm256_and_si256(spread, low), low), b1 = _mm256_cmpeq_epi8(_mm256_and_si256(spread, high), high);
+            const __m256i value = _mm256_sub_epi8(_mm256_sub_epi8(_mm256_setzero_si256(), _mm256_add_epi8(b0, _mm256_add_epi8(b1, b1))), one);  // code - 1 in {-1, 0, 1, 2}
+            const __m256i q = _mm256_loadu_si256((const __m256i *)b.qs);
+            const __m256i dots = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_sign_epi8(value, value), _mm256_sign_epi8(q, value)), pairs);
+            sum = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dots), _mm256_set1_ps(d0 * GGML_CPU_FP16_TO_FP32(b.d)), sum);
+        }
+    }
+    *s = hsum8f(sum);
+}
+
 // ---- dispatch ---------------------------------------------------------------------------------------------------------------------------
 typedef void (*vec_dot_t)(int, float *, size_t, const void *, size_t, const void *, size_t, int);
 
@@ -238,6 +264,10 @@ static const GgufType gguf_types[] = {
     {GGML_Q6_K, 256, 210, false, ggml_vec_dot_q6_K_q8_K},
     {GGML_IQ3_S, 256, 110, false, ggml_vec_dot_iq3_s_q8_K},
     {GGML_IQ2_S, 256, 82, false, ggml_vec_dot_iq2_s_q8_K},
+    {GGML_IQ3_XXS, 256, 98, false, ggml_vec_dot_iq3_xxs_q8_K},
+    {GGML_IQ4_XS, 256, 136, false, ggml_vec_dot_iq4_xs_q8_K},
+    {GGML_IQ4_NL, 32, 18, true, ggml_vec_dot_iq4_nl_q8_0},
+    {GGML_Q2_0, 64, 18, true, vec_dot_q2_0_q8_0},
     {PRISM_PTQ1_0, 128, 28, false, nullptr},
 };
 
@@ -333,6 +363,9 @@ static Pool & workers(int threads) {
     return *pool;
 }
 
+static std::atomic<uint64_t> pool_wakes{0};  // calls that found sleeping workers
+CPU_LINEAR_API uint64_t host_trace_wakes() { return pool_wakes.load(); }
+
 // runs job(context, worker) on every worker of the pool and the caller (worker 0), returns once all are done
 static void run_workers(Pool & pool, void (*job)(void *, int), void * context) {
     pool.job = job;
@@ -340,6 +373,7 @@ static void run_workers(Pool & pool, void (*job)(void *, int), void * context) {
     pool.running.store(pool.size - 1, std::memory_order_relaxed);
     pool.generation.fetch_add(1);
     if (pool.sleeping.load()) {
+        pool_wakes.fetch_add(1, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lock(pool.mutex);
         pool.wake.notify_all();
     }
@@ -467,3 +501,66 @@ CPU_LINEAR_API int cpu_linear(const float * x, int64_t rows, int64_t k, int coun
     run_workers(pool, run_call, &c);
     return 0;
 }
+
+// ---- a diagnostic timeline of the host jobs -----------------------------------------------------------------------------------------------
+// host_trace_start(buffer, capacity) fills caller's records until host_trace_stop(), which returns their count; nothing is recorded otherwise (one relaxed load per job).
+struct HostStamp { int64_t start, end; int32_t kind, pairs; uint32_t thread, cpu; };  // ns of host_trace_now; kind: 0 routed experts, 1 table rows
+static std::atomic<HostStamp *> host_stamps{nullptr};
+static std::atomic<uint64_t> host_stamp_next{0};
+static uint64_t host_stamp_capacity = 0;
+
+static inline int64_t host_trace_clock() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
+CPU_LINEAR_API int64_t host_trace_now() { return host_trace_clock(); }
+
+CPU_LINEAR_API void host_trace_start(void * buffer, uint64_t capacity) {
+    host_stamp_capacity = capacity;
+    host_stamp_next.store(0);
+    host_stamps.store((HostStamp *)buffer);
+}
+
+CPU_LINEAR_API uint64_t host_trace_stop() {
+    host_stamps.store(nullptr);
+    return std::min(host_stamp_next.load(), host_stamp_capacity);
+}
+
+static inline void host_trace(int kind, int64_t start, int64_t pairs) {
+    HostStamp * stamps = host_stamps.load(std::memory_order_relaxed);
+    if (stamps == nullptr) return;
+    const uint64_t at = host_stamp_next.fetch_add(1);
+    if (at >= host_stamp_capacity) return;
+#ifdef _WIN32
+    stamps[at] = {start, host_trace_clock(), kind, (int32_t)pairs, (uint32_t)GetCurrentThreadId(), (uint32_t)GetCurrentProcessorNumber()};
+#else
+    stamps[at] = {start, host_trace_clock(), kind, (int32_t)pairs, 0, (uint32_t)sched_getcpu()};
+#endif
+}
+
+// A CUDA host function that spins for *(int64_t *)data nanoseconds: what a host job costs its graph, whatever it computes.
+CPU_LINEAR_API void host_job_spin(void * data) {
+    const int64_t until = host_trace_clock() + *(const int64_t *)data;
+    while (host_trace_clock() < until) cpu_relax();
+}
+
+#include "host_server.inc"
+
+// One linear as a job of the host server (ctypes structure of __init__.py): the same kernels as cpu_linear(), between a GPU kernel writing x to mapped RAM and another reading the result from it.
+struct LinearJob {
+    const float * x;
+    int64_t rows, k;
+    Weight weight;
+    int32_t threads, status;
+};
+
+CPU_LINEAR_API int cpu_linear_server_job(void * data) {
+    LinearJob & job = *(LinearJob *)data;
+    const int64_t traced = host_stamps.load(std::memory_order_relaxed) == nullptr ? 0 : host_trace_clock();
+    job.status = cpu_linear(job.x, job.rows, job.k, 1, &job.weight, job.threads);
+    if (traced) host_trace(2, traced, job.rows);
+    return 1;
+}
+
+#include "experts_gguf.inc"
+
+static const int8_t kvalues_iq4nl_port[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};  // ggml's kvalues_iq4nl
+#include "rows.inc"

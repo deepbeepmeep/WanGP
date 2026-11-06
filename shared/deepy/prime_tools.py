@@ -881,6 +881,9 @@ class DeepyPrimeTools:
                 hint = ' Put every generation setting inside settings: {"settings": {"model_type": "...", "prompt": "...", ...}}.'
             if tool_name == "wangp_toolbox" and arguments.get("action") == "inspect_media" and "media" in unknown:
                 hint = ' Put media_id (one visual) or media_ids (a list) inside arguments alongside question. Read the contract with {"action":"inspect_media","arguments":null}.'
+            named = arguments.get("tool")
+            if "tool" in unknown and isinstance(named, str) and named != tool_name and named in self._tool_defs_by_name:  # the tool it meant, written as a parameter of this one
+                hint = f' {named} is a tool of its own: call {named} with {{"action": "{arguments.get("action") or "<action>"}", "arguments": {{...}}}}, not {tool_name}.'
             return f"Unexpected top-level parameters: {', '.join(unknown)}. Nothing was executed." + hint
         for name, parameter in parameters.get("properties", {}).items():
             value = arguments.get(name)

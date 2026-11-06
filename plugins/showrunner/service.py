@@ -106,6 +106,10 @@ class Showrunner:
         if role == "song":
             production.apply([{"op": "brief", "fields": {"song": relative}}])
             self.analysis(production_id, refresh=True)
+        elif role == "source":
+            if facts["kind"] != "video":
+                raise ValueError("A remake's source is a video.")
+            production.apply([{"op": "brief", "fields": {"source": relative}}])
         elif role == "reference":
             references = production.snapshot()["brief"]["references"] + [relative]
             production.apply([{"op": "brief", "fields": {"references": references}}])
@@ -129,11 +133,11 @@ class Showrunner:
         return {"path": relative, "role": role, "target": target, **facts}
 
     def add_take(self, production_id: str, shot_id: str, path: str | Path, *, by: str, settings: dict[str, Any] | None = None, media_id: str | None = None,
-                 note: str = "", gpu_s: float | None = None, base_loras: list[Any] | None = None) -> dict[str, Any]:
+                 note: str = "", gpu_s: float | None = None, base_loras: list[Any] | None = None, tier: str | None = None, kept_source: bool = False, choose: bool = True) -> dict[str, Any]:
         production = self.store.get(production_id)
         facts = self.take_facts(production, production.resolve(production.adopt(path)))  # a take from outside the production is copied in
-        take = {**facts, "media": media_id, "settings": production.rel_settings(settings or {}), "note": note, "gpu_s": None if gpu_s is None else round(gpu_s, 1), "base_loras": base_loras}
-        result = production.apply([{"op": "add_take", "shot": shot_id, "take": take}], by=by)
+        take = {**facts, "media": media_id, "settings": production.rel_settings(settings or {}), "note": note, "gpu_s": None if gpu_s is None else round(gpu_s, 1), "base_loras": base_loras, "tier": tier, "kept_source": kept_source}
+        result = production.apply([{"op": "add_take", "shot": shot_id, "take": take, "choose": choose}], by=by)
         return {**result[0], **facts}
 
     def hear_take(self, production, shot_id: str, take_id: str, listening=None) -> dict[str, Any] | None:
@@ -194,6 +198,37 @@ class Showrunner:
                 cache.write_text(json.dumps(analysis), encoding="utf-8")
         production.apply([{"op": "audio", "analysis": analysis}], by="system", record=False)
         return analysis
+
+    @staticmethod
+    def _delivered(shot: dict[str, Any], fps: float) -> tuple[int, int]:
+        """The frames of a remake's shot that the edit keeps, from the start of what it renders: its first and how many."""
+        keep_from, keep_to = (list(shot.get("trim") or []) + [0.0, None])[:2]
+        first, last = round(float(keep_from or 0.0) * fps), shot["source_range"][1] - shot["source_range"][0] if keep_to is None else round(float(keep_to) * fps)
+        return first, last - first
+
+    def shot_size(self, production, doc: dict[str, Any], shot: dict[str, Any], *, final: bool = False) -> str:
+        """The size a video shot renders at, final or as a draft. A shot made from a video keeps that video's shape, below its model's largest size."""
+        name = model.tier_name(doc["brief"], final)
+        if not shot.get("source_range"):
+            return model.RESOLUTIONS[doc["brief"]["aspect"]][name]
+        entry = templates.resolve(self.catalog(doc), shot["generation"].get("template"))
+        return media.fitted_canvas(production.resolve(doc["remake"]["path"]), name, (entry or {}).get("pixels"))
+
+    def source_part(self, production_id: str, shot_id: str) -> Path:
+        """What a remake's shot delivers, as a video of its own for the page's player: cut once, the first time it is looked at."""
+        production = self.store.get(production_id)
+        doc = production.snapshot()
+        shot, fps = model.find(doc["shots"], shot_id, "shot"), doc["remake"]["fps"]
+        first, frames = self._delivered(shot, fps)
+        return media.video_window(production.resolve(doc["remake"]["path"]), shot["source_range"][0] + first, frames, fps, production.folder / "media" / "source")
+
+    def take_part(self, production_id: str, shot_id: str, take_id: str) -> Path:
+        """The same of a take: a render runs on past its shot's cut, and those frames, never in the edit, show the next camera shot as it was."""
+        production = self.store.get(production_id)
+        doc = production.snapshot()
+        shot, fps = model.find(doc["shots"], shot_id, "shot"), doc["remake"]["fps"]
+        first, frames = self._delivered(shot, fps)
+        return media.video_window(production.resolve(model.find(shot["takes"], take_id, "take")["path"]), first, frames, fps, production.folder / "media" / "parts")
 
     def waveform(self, production_id: str, path: str) -> dict[str, Any]:
         production = self.store.get(production_id)
@@ -261,7 +296,7 @@ class Showrunner:
                 sizes[shot["id"]] = {"size": f"{take['width']}x{take['height']}", "shot": True}
                 continue
             entry = templates.resolve(catalog, shot["generation"].get("template"))
-            requested = shot["generation"].get("settings", {}).get("resolution") or model.resolution(doc["brief"])
+            requested = shot["generation"].get("settings", {}).get("resolution") or self.shot_size(self.store.get(production_id), doc, shot)
             size = None if entry is not None and entry.get("sized_by_ref") and entry["task"] != "edit_image" else self.host.frame_size(entry, requested) if entry is not None and entry.get("model_type") else requested
             sizes[shot["id"]] = {"size": size, "shot": False}
         return {"sizes": sizes}
@@ -411,9 +446,9 @@ class Showrunner:
         production = self.store.get(production_id)
         with self._render_lock:
             busy = {shot for key, shot in self._renders if key == production_id}
-        stale = [shot for shot in production.snapshot()["shots"] if shot["status"] in ("rendering", "queued") and shot["id"] not in busy]
+        stale = [shot for shot in production.snapshot()["shots"] if shot["status"] in ("rendering", "queued") and shot["id"] not in busy and shot.get("rendering_with") not in busy]  # a remake's shot rendering with another is as busy as it
         if stale:
-            production.apply([{"op": "update_shot", "shot": shot["id"], "fields": {"status": "rendered" if shot["takes"] else "planned"}} for shot in stale], by="system", record=False)
+            production.apply([{"op": "update_shot", "shot": shot["id"], "fields": {"status": "rendered" if shot["takes"] else "planned", "rendering_with": None}} for shot in stale], by="system", record=False)
         return [shot["id"] for shot in stale]
 
     def undo(self, production_id: str, redo: bool = False) -> dict[str, Any]:
@@ -430,9 +465,13 @@ class Showrunner:
         production = self.store.get(production_id)
         doc = production.snapshot()
         shot = model.find(doc["shots"], shot_id, "shot")
+        if shot.get("source_range") and shot["takes"]:  # a remake's shot renders from its own settings, with the neighbours it renders together with
+            self.render_directly(production_id, [shot_id])
+            return {"shot": shot_id, "status": "rendering"}
         take = model.chosen_take(shot)
         if take is None or not take.get("settings"):
             raise ValueError("This shot has no take with saved settings yet: use Render now.")
+        tier = take.get("tier")
         settings = production.resolve_settings(take["settings"])
         settings.update({key: value for key, value in shot["generation"].get("settings", {}).items() if key in ("prompt", "alt_prompt", "negative_prompt")})
         if take.get("base_loras"):  # the cast cards say which LoRAs of the cast this take gets, as they are now
@@ -451,33 +490,37 @@ class Showrunner:
         settings, base_loras = self.with_cast_loras(doc, shot, entry, settings)
         if new_seed:
             settings["seed"] = random.randint(0, 2 ** 31 - 1)
-        key = (production_id, shot_id)
+        key, context = (production_id, shot_id), _DirectContext(self, production)  # cancels it while it waits for its turn as while it renders
         with self._render_lock:
             if key in self._renders:
                 raise RuntimeError("This shot is already rendering.")
-            workspace = self.host.production_workspace(doc["title"], production.folder / "media")
-            job = self.host.submit_generation(settings, workspace, on_progress=lambda update: self.store.publish(
-                {"type": "render", "production": production_id, "shot": shot_id, "progress": getattr(update, "progress", None), "status": getattr(update, "status", "")}))
-            self._renders[key] = job
+            self._renders[key] = context
+        workspace = self.host.production_workspace(doc["title"], production.folder / "media")
         production.apply([{"op": "update_shot", "shot": shot_id, "fields": {"status": "rendering"}}], by="user", record=False)
-        threading.Thread(target=self._finish_rerun, args=(production_id, shot_id, job, settings, base_loras), daemon=True).start()
+        threading.Thread(target=self._finish_rerun, args=(production_id, shot_id, context, workspace, settings, base_loras, tier), daemon=True).start()
         return {"shot": shot_id, "status": "rendering"}
 
-    def _finish_rerun(self, production_id, shot_id, job, settings, base_loras=None):
+    def _finish_rerun(self, production_id, shot_id, context, workspace, settings, base_loras=None, tier=None):
         production = self.store.get(production_id)
-        started = time.time()
         try:
-            result = job.result()
-            files = list(getattr(result, "generated_files", None) or [])
-            if getattr(result, "success", False) and files:
-                taken = self.add_take(production_id, shot_id, files[0], by="user", settings=settings, note="Rerun", gpu_s=time.time() - started, base_loras=base_loras)
-                production.apply([{"op": "budget", "gpu_seconds": time.time() - started}], by="system", record=False)
-                self.hear_take(production, shot_id, taken["take"])
-            else:
-                errors = list(getattr(result, "errors", None) or [])
-                status = "planned" if getattr(result, "cancelled", False) else "failed"
-                production.apply([{"op": "update_shot", "shot": shot_id, "fields": {"status": status}}, *([{"op": "log", "text": f"Rerun of {shot_id} failed: {errors[0]}"}] if errors else [])],
-                                 by="system", record=False)
+            with self.host.gpu_turn(context.cancelled):  # after the showrunners at work in other productions, never beside a language model
+                if context.stopped:
+                    production.apply([{"op": "update_shot", "shot": shot_id, "fields": {"status": "planned"}}], by="system", record=False)
+                    return
+                started = time.time()
+                context.job = self.host.submit_generation(settings, workspace, on_progress=lambda update: self.store.publish(
+                    {"type": "render", "production": production_id, "shot": shot_id, "progress": getattr(update, "progress", None), "status": getattr(update, "status", "")}))
+                result = context.job.result()
+                files = list(getattr(result, "generated_files", None) or [])
+                if getattr(result, "success", False) and files:
+                    taken = self.add_take(production_id, shot_id, files[0], by="user", settings=settings, note="Rerun", gpu_s=time.time() - started, base_loras=base_loras, tier=tier)
+                    production.apply([{"op": "budget", "gpu_seconds": time.time() - started}], by="system", record=False)
+                    self.hear_take(production, shot_id, taken["take"])
+                else:
+                    errors = list(getattr(result, "errors", None) or [])
+                    status = "planned" if getattr(result, "cancelled", False) else "failed"
+                    production.apply([{"op": "update_shot", "shot": shot_id, "fields": {"status": status}}, *([{"op": "log", "text": f"Rerun of {shot_id} failed: {errors[0]}"}] if errors else [])],
+                                     by="system", record=False)
         except Exception as error:
             production.apply([{"op": "update_shot", "shot": shot_id, "fields": {"status": "failed"}}, {"op": "log", "text": f"Rerun of {shot_id} failed: {error}"}], by="system", record=False)
         finally:
@@ -485,9 +528,17 @@ class Showrunner:
                 self._renders.pop((production_id, shot_id), None)
             self.store.publish({"type": "render", "production": production_id, "shot": shot_id, "done": True})
 
-    def render_directly(self, production_id: str, shot_ids: list[str]) -> dict[str, Any]:
+    def render_groups(self, production_id: str, shots: list[str] | None = None) -> list[list[str]]:
+        """The renders of a remake's shots asked for (all by default), one list of ids each (remake_groups); nothing for another kind of production."""
+        doc = self.store.get(production_id).snapshot()
+        catalog = self.catalog(doc)
+        entry = templates.resolve(catalog, templates.effective(doc, catalog).get("people_edits"))
+        return [[shot["id"] for shot in group] for group in ShowrunnerToolbox._render_groups(doc, entry, shots)] if doc.get("remake") and entry is not None else []
+
+    def render_directly(self, production_id: str, shot_ids: list[str], final: bool = False, new_seed: bool | None = None) -> dict[str, Any]:
         """Render shots now, one after the other, without the showrunner: the render action's own work (the cast's pictures, spoken lines, lengths) with no language model and no verdict.
-        A shot nobody chose a model for gets the brief's for what it shows, a shot without a prompt one made from what it says, kept on the shot, where it can be edited."""
+        A shot nobody chose a model for gets the brief's for what it shows, a shot without a prompt one made from what it says, kept on the shot, where it can be edited.
+        new_seed: None draws a new seed for a draft and keeps the take's for a final (its draft at the target size); True, a new one either way (Reshoot)."""
         production = self.store.get(production_id)
         if self.director.status(production_id)["running"]:
             raise RuntimeError("The showrunner is working on this production: this comes back when it finishes, or after Pause or Stop.")
@@ -510,16 +561,22 @@ class Showrunner:
                 raise RuntimeError(f"Already rendering: {', '.join(busy)}.")
             self._renders.update({(production_id, shot_id): context for shot_id in shot_ids})
         production.apply(ops, by="user", record=False)
-        threading.Thread(target=self._render_directly, args=(production, shot_ids, statuses, context), daemon=True).start()
+        threading.Thread(target=self._render_directly, args=(production, shot_ids, statuses, context, final, not final if new_seed is None else new_seed), daemon=True).start()
         return {"shots": shot_ids, "status": "rendering"}
 
-    def _render_directly(self, production, shot_ids, statuses, context):
-        toolbox = ShowrunnerToolbox(self)
+    def _render_directly(self, production, shot_ids, statuses, context, final=False, new_seed=True):
+        with self.host.gpu_turn(context.cancelled):  # after the showrunners at work in other productions, never beside a language model
+            self._render_shots(production, shot_ids, statuses, context, final, new_seed)
+
+    def _render_shots(self, production, shot_ids, statuses, context, final, new_seed=True):
+        toolbox, covered = ShowrunnerToolbox(self), set()  # covered: shots a render of this run already gave a take (remake shots rendered together)
         for shot_id in shot_ids:
             context.shot = shot_id
             try:
                 try:
-                    error = None if context.stopped else toolbox.render_shot(context, production, shot_id, new_seed=True, by="user").get("error")
+                    render = {} if context.stopped or shot_id in covered else toolbox.render_shot(context, production, shot_id, new_seed=new_seed, by="user", final=final, requested=shot_ids)
+                    covered.update(item["shot"] for item in render.get("rendered_with") or [])
+                    error = render.get("error")
                 except Exception as failure:
                     error = str(failure)
                 if context.stopped:  # as it was: a shot marked for a redo stays marked

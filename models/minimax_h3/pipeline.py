@@ -32,6 +32,7 @@ from .pika import PIKA_SOLVER, PIKA_STEPS, PIKA_VIDEO_SHIFT, noise as pika_noise
 from .spectrum import MiniMaxH3Spectrum
 from .transformer import VISUAL_COND_TIMESTEP, pack_audio, patchify_video, unpack_audio
 from .video_vae import LATENTS_MEAN, LATENTS_STD
+from .viggle import VIGGLE_REMAKE_KEYFRAME_UNTIL, VIGGLE_REMAKE_SIGMAS
 from .veda.attention import generation_context as veda_generation_context
 
 
@@ -274,6 +275,26 @@ def _masking_step_mask(editable_mask, step, denoising_start_step, mask_end_step)
     return editable_mask if editable_mask is not None and denoising_start_step <= step < mask_end_step else None
 
 
+def _keep_source_outside_mask(video, source, masks, to_uint8, margin_fraction=0.015, chunk=16):
+    """Restore the source's pixels outside a slightly grown, feathered mask, frame by frame: the rest of the picture stays exact."""
+    height, width = video.shape[-2:]
+    margin = max(1, round(min(height, width) * margin_fraction))
+    source = _as_video(source)
+    for start in range(0, video.shape[1], chunk):
+        stop = start + chunk
+        mask = guide_mask_to_float(masks[:1, start:stop]).float()
+        if mask.shape[-2:] != (height, width):
+            mask = F.interpolate(mask, size=(height, width), mode="bilinear", align_corners=False)
+        mask = F.max_pool2d(mask, 2 * margin + 1, stride=1, padding=margin)
+        for _ in range(2):  # a soft edge of about one margin
+            mask = F.avg_pool2d(F.pad(mask, (margin, margin, margin, margin), mode="replicate"), 2 * margin + 1, stride=1)
+        original = _resize_video(guide_to_float(source[:, start:stop]).float(), height, width)
+        if video.dtype == torch.uint8:
+            original = to_uint8(original)
+        target = video[:, start:stop]
+        target.copy_(torch.lerp(original.to(target).float(), target.float(), mask.to(target.device)).round_().to(target) if video.dtype == torch.uint8 else torch.lerp(original.to(target), target, mask.to(target)))
+
+
 def _er_sde_step(x, denoised, sigma, sigma_next, previous_sigma, previous_previous_sigma,
                  previous_denoised, previous_denoised_d, noise, stage_used):
     active = sigma > 0
@@ -374,11 +395,13 @@ def _pil_to_video(image):
 class MiniMaxH3Pipeline:
     refinement_api = "masked_video_sigma_v1"
 
-    def __init__(self, transformer, text_encoder, video_vae, audio_vae, latent_upscaler=None, reference_mode=False, audio_only=False, dtype=torch.bfloat16, fixed_prompt=None, image_model=False):
+    def __init__(self, transformer, text_encoder, video_vae, audio_vae, latent_upscaler=None, reference_mode=False, audio_only=False, dtype=torch.bfloat16, fixed_prompt=None, image_model=False, remake_mode=None):
         self.image_model = bool(image_model)
         self.transformer = transformer
         self.text_encoder = text_encoder
         self.fixed_prompt = fixed_prompt
+        self.remake_mode = remake_mode  # Viggle Remake: "swap" or "edit"
+        self.source_edit = fixed_prompt is not None or remake_mode is not None  # the Viggle layout: the source video as the first reference, then the edited frames
         self.vae = video_vae
         if video_vae.upsampling:
             # Masked refiners require a decoder that preserves the input dimensions.
@@ -597,7 +620,8 @@ class MiniMaxH3Pipeline:
             return
         video = video[:, :1]
         latent = self._encode_video(video)
-        presentation.append({"type": "image", "frames": _qwen_frames(video.clone())})
+        if not self.remake_mode:  # Remake's pinned frames are presented once, as references
+            presentation.append({"type": "image", "frames": _qwen_frames(video.clone())})
         visual_latents.append(latent)
         keyframe = {"anchor": anchor or ("first" if frame_index == 0 else "last"), "latent_frame_count": latent.shape[2]}
         if anchor == "frame":
@@ -635,7 +659,9 @@ class MiniMaxH3Pipeline:
         if video is None:
             return
         latent = self._encode_video(video)
-        if self.fixed_prompt is None:
+        if self.remake_mode:
+            presentation.append({"type": "image"})
+        elif self.fixed_prompt is None:
             if self.image_model:  # the text encoder sees about one megapixel of the image as supplied
                 source = _to_pil(image)
                 vision_size = size_at_area(*source.size)
@@ -676,8 +702,8 @@ class MiniMaxH3Pipeline:
                 if not sample_indices or round(cursor) > sample_indices[-1]:
                     sample_indices.append(round(cursor))
                 cursor += fps / 2
-            presentation.append({"type": "video", "frames": _qwen_frames(video[:, sample_indices].clone()),
-                                 "timestamps": [index / fps for index in sample_indices]})
+            presentation.append({"type": "video", "timestamps": [index / fps for index in sample_indices],
+                                 **({} if self.remake_mode else {"frames": _qwen_frames(video[:, sample_indices].clone())})})
         visual_latents.append(latent)
         refs.append({"kind": "video_audio" if audio_latent is not None else "video", "latent_t": latent.shape[2],
                      "latent_h": latent.shape[-2], "latent_w": latent.shape[-1],
@@ -805,7 +831,7 @@ class MiniMaxH3Pipeline:
                 loras_slists=loras_slists, loras_selected=loras_selected, custom_settings=custom_settings,
                 set_progress_status=set_progress_status, verbose_level=verbose_level)
         self._use_shared_components()
-        phase_1_sigmas = custom_sigmas[0] if custom_sigmas else P_H3_IMAGE_SIGMAS if self.image_model else None
+        phase_1_sigmas = custom_sigmas[0] if custom_sigmas else P_H3_IMAGE_SIGMAS if self.image_model else VIGGLE_REMAKE_SIGMAS[self.remake_mode] if self.remake_mode else None
         phase_2_sigmas = custom_sigmas[1] if custom_sigmas and len(custom_sigmas) > 1 else None
         if phase_1_sigmas is not None:
             sampling_steps = len(phase_1_sigmas)
@@ -853,7 +879,7 @@ class MiniMaxH3Pipeline:
         audio_from_control_video = not image_outputs and not self.reference_mode and "2" in (audio_prompt_type or "")
         # The disabled experiment aligns target overlap with the previous VAE grid (5 + 17n).
         # Retain support for legacy 1 + 17n prefixes when encoding an external continuation.
-        overlap_offset = 5 if H3_CONTROL_LATENT_CONTINUATION and self.transformer.control_layers and int(prefix_frames_count or 0) % 17 == 5 else 1
+        overlap_offset = 0 if self.remake_mode else 5 if H3_CONTROL_LATENT_CONTINUATION and self.transformer.control_layers and int(prefix_frames_count or 0) % 17 == 5 else 1
         prefix_frames_count, overlap_error = normalize_overlap(int(prefix_frames_count or 0), 17, overlap_offset)
         if overlap_error:
             raise ValueError(overlap_error)
@@ -865,7 +891,7 @@ class MiniMaxH3Pipeline:
         # and as visible pixels in its inpainting input. Native H3 history alone loses that appearance constraint.
         control_target_anchors = bool(self.transformer.control_layers) and not audio_from_control_video and not refinement_mode
         control_known_frames = None
-        if control_target_anchors and continuation_count:
+        if (control_target_anchors or self.remake_mode) and continuation_count:
             control_known_frames, continuation_count = continuation[:, -continuation_count:], 0
         frozen_control_video = (_build_frozen_control_video(input_frames, continuation, frame_num, continuation_count)
                                 if audio_from_control_video else None)
@@ -959,10 +985,11 @@ class MiniMaxH3Pipeline:
             raise ValueError("MiniMax H3 ControlNet-Union supports one-phase generation only")
         video_references = "V" in (video_prompt_type or "") and "G" not in (video_prompt_type or "") and not fun_control  # Ref2VA reference videos, or an in-context control video (VU) on any H3 model
         aligned_control = (_as_video(input_frames)[:, history_count:history_count + aligned_target_frames]
-                           if H3_ALIGNED_CONTROL_VIDEO and video_references and "-" not in (video_prompt_type or "") and self.fixed_prompt is None else None)
+                           if H3_ALIGNED_CONTROL_VIDEO and video_references and "-" not in (video_prompt_type or "") and not self.source_edit else None)
         # Injected frames on the window's first or end frame act as its start / end image (same prompt order as the enhancer's labels);
         # frames inside the overlap or on a frame already owned by the start / continuation frame are dropped
         injected_frames = [(image, int(position) - history_count) for image, position in zip(frames_to_inject or (), frames_relative_positions_list or ())]
+        remake_pinned_images = [image for image, index in injected_frames if 0 <= index < target_frames] if self.remake_mode else []  # a pinned frame is also a reference
         # Below full strength, end images and injected frames become noised conditions that the video eases into instead of jumping to them
         soft_anchor_timestep = float(input_video_strength) if float(input_video_strength) < VISUAL_COND_TIMESTEP else None
         has_start_frame = control_known_frames is not None or continuation_count > 0 or image_start is not None and not audio_from_control_video
@@ -1049,7 +1076,7 @@ class MiniMaxH3Pipeline:
         if frozen_target_video is not None:
             with control_video_encoding(audio_from_control_video):
                 target_video_condition = self._encode_video(_resize_video(frozen_target_video, height, width), keep_all_latents=True)
-        if self.reference_mode and self.fixed_prompt is None:
+        if self.reference_mode and not self.source_edit:
             if image_outputs and video_references:
                 input_ref_images = [*(input_ref_images or []), guide_to_float(input_frames)]
                 video_references = False
@@ -1064,9 +1091,9 @@ class MiniMaxH3Pipeline:
             if "*" in (video_prompt_type or ""):
                 video_sources.append(input_frames3)
         video_sources = [_as_video(source) for source in video_sources]
-        if self.reference_mode and self.fixed_prompt is None and "1" in (video_prompt_type or ""):  # excerpts replace the whole reference video
+        if self.reference_mode and not self.source_edit and "1" in (video_prompt_type or ""):  # excerpts replace the whole reference video
             video_sources = self._load_video_excerpts(video_guide, custom_settings[H3_VIDEO_EXCERPTS_SETTING], fps, height, width)
-        if self.fixed_prompt is not None:
+        if self.source_edit:
             if any(source is None for source in video_sources):
                 print("Viggle: no control video frames available for this window; continuing without control-video motion guidance.")
                 video_sources = [source for source in video_sources if source is not None]
@@ -1079,21 +1106,23 @@ class MiniMaxH3Pipeline:
             raise ValueError(f"MiniMax H3 reference videos must total at most {reference_video_frame_limit(1, fps)} frames (found {sum(video.shape[1] for video in video_sources)})")
         soundtrack = "S" in (audio_prompt_type or "")  # the audio is the soundtrack: condition on it rather than reference it
         soundtrack_excerpts = "1" in (audio_prompt_type or "")  # K1: soundtrack excerpts become independent audio references
-        soundtrack_sources = (audio_guide, audio_guide2, audio_guide3) if self.fixed_prompt is None and "K" in (audio_prompt_type or "") and not soundtrack and not soundtrack_excerpts else (None, None, None)
+        soundtrack_sources = (audio_guide, audio_guide2, audio_guide3) if not self.source_edit and "K" in (audio_prompt_type or "") and not soundtrack and not soundtrack_excerpts else (None, None, None)
         soundtracks = [self._load_audio_reference(soundtrack_sources[index]) if soundtrack_sources[index] is not None else None for index in range(len(video_sources))]
         soundtracks = [None if track is None else track[..., :round(video.shape[1] / fps * AUDIO_SAMPLE_RATE)] for track, video in zip(soundtracks, video_sources)]  # each soundtrack matches its video
         for index, source in enumerate(video_sources):
             self._add_video_reference(_resize_video(source, height, width), soundtracks[index], fps, presentation, visual_latents, audio_latents, refs)
         if self.fixed_prompt is not None:
             self._add_image_reference(input_ref_images[0], width, height, 100, presentation, visual_latents, refs)
+        for image in [*remake_pinned_images, *(input_ref_images or [])] if self.remake_mode else ():
+            self._add_image_reference(image, width, height, 100, presentation, visual_latents, refs)
         reference_sources = []
-        if self.reference_mode and self.fixed_prompt is None and not refinement_mode and "A" in (audio_prompt_type or "") and not soundtrack:
+        if self.reference_mode and not self.source_edit and not refinement_mode and "A" in (audio_prompt_type or "") and not soundtrack:
             reference_sources.append(audio_guide if audio_guide is not None else waveform)
-        if self.reference_mode and self.fixed_prompt is None and not refinement_mode and "B" in (audio_prompt_type or ""):
+        if self.reference_mode and not self.source_edit and not refinement_mode and "B" in (audio_prompt_type or ""):
             reference_sources.append(audio_guide2)
-        if self.reference_mode and self.fixed_prompt is None and not refinement_mode and "D" in (audio_prompt_type or ""):
+        if self.reference_mode and not self.source_edit and not refinement_mode and "D" in (audio_prompt_type or ""):
             reference_sources.append(audio_guide3)
-        if self.reference_mode and self.fixed_prompt is None and not refinement_mode and "K" in (audio_prompt_type or "") and soundtrack_excerpts:
+        if self.reference_mode and not self.source_edit and not refinement_mode and "K" in (audio_prompt_type or "") and soundtrack_excerpts:
             import soundfile as sf
             from shared.utils.utils import get_video_info
 
@@ -1104,7 +1133,10 @@ class MiniMaxH3Pipeline:
                 reference_sources.append(self._waveform(audio, sample_rate))
         for reference_audio in self._prepare_audio_references(reference_sources):
             self._add_audio_reference(reference_audio, presentation, audio_latents, refs)
-        if (refinement_mode or soundtrack or not self.reference_mode or self.fixed_prompt is not None) and any(flag in (audio_prompt_type or "") for flag in "AK") and waveform is not None:
+        if self.remake_mode:  # the soundtrack is clean for the whole denoise: silence where the source has none, one frame longer so that its latents cover the window
+            remake_samples = round((target_frames + 1) / fps * AUDIO_SAMPLE_RATE)
+            target_audio_condition = self._encode_audio(_fit_audio_samples(torch.zeros((1, 2, remake_samples), dtype=torch.float32) if waveform is None or not any(flag in (audio_prompt_type or "") for flag in "AK") else waveform, remake_samples))
+        elif (refinement_mode or soundtrack or not self.reference_mode or self.fixed_prompt is not None) and any(flag in (audio_prompt_type or "") for flag in "AK") and waveform is not None:
             condition_start = round(audio_start_seconds * AUDIO_SAMPLE_RATE)
             condition_samples = round((target_frames / fps - audio_time_offset / AUDIO_LATENT_FPS) * AUDIO_SAMPLE_RATE)
             condition_waveform = waveform[..., condition_start:condition_start + condition_samples]
@@ -1151,7 +1183,12 @@ class MiniMaxH3Pipeline:
                     raise ValueError("H3 ControlNet latent continuation requires overlaps of 5 + 17n frames")
                 latent_offset = offset // self.vae.config.clip_length * (1 + (self.vae.config.clip_length - 1) // self.vae.temporal_compression_ratio)
                 prefix_latents = overlapped_latents["latents"][:, :, latent_offset:]
-            control_anchor_indices, control_anchor_latents = self._prepare_control_anchors(control_frame_anchors, aligned_target_frames, height, width, prefix_latents)
+            if self.remake_mode:  # 17m frames of the previous take: the first 5m latents of the window, encoded as whole VAE clips
+                with control_video_encoding():
+                    control_anchor_latents = self._encode_video(_resize_video(control_known_frames.float(), height, width), keep_all_latents=True)
+                control_anchor_indices = torch.arange(control_anchor_latents.shape[2], dtype=torch.long, device="cpu")
+            else:
+                control_anchor_indices, control_anchor_latents = self._prepare_control_anchors(control_frame_anchors, aligned_target_frames, height, width, prefix_latents)
             control_anchor_frames = tuple(control_anchor_indices.tolist())
             prefix_latents = None
         overlapped_latents = None
@@ -1179,11 +1216,12 @@ class MiniMaxH3Pipeline:
 
         latent_t = video_latent_frames(aligned_target_frames)
         latent_h, latent_w = math.ceil(height / 16), math.ceil(width / 16)
-        audio_tail_latents = 0 if pika or self.audio_only or image_outputs else H3_AUDIO_TAIL_LATENTS
+        audio_tail_latents = 0 if pika or self.audio_only or image_outputs or self.remake_mode else H3_AUDIO_TAIL_LATENTS
         audio_t = round(aligned_target_frames / fps * AUDIO_LATENT_FPS - audio_time_offset) + audio_tail_latents
         generator = torch.Generator(device=self.device if pika else "cpu").manual_seed(int(seed))
         condition_generator = torch.Generator(device=self.device).manual_seed(int(seed) + 7919) if pika else generator
         cond_video_rows, cond_audio_rows = self._prepare_condition_rows(visual_latents, audio_latents, condition_generator, keyframes, pika=pika)
+        remake_keyframe_rows = sum(keyframe["latent_frame_count"] for keyframe in keyframes) * (latent_h // self.transformer.patch_size[1]) * (latent_w // self.transformer.patch_size[2]) if self.remake_mode else 0
         target_video_condition_frames = 0 if target_video_condition is None else target_video_condition.shape[2]
         video = ((pika_noise((1, 24, latent_t, latent_h, latent_w), generator) if pika else
                   torch.randn((1, 24, latent_t, latent_h, latent_w), generator=generator, dtype=torch.float32, device="cpu"))
@@ -1311,7 +1349,7 @@ class MiniMaxH3Pipeline:
                 return frame_sigmas
 
             def denoise_pass(pass_description, pass_extra):
-                nonlocal video, audio
+                nonlocal video, audio, remake_keyframe_rows
                 old_video_denoised = old_audio_denoised = None
                 old_video_denoised_d = old_audio_denoised_d = None
                 er_generator = torch.Generator(device=video.device).manual_seed(int(seed)) if stage_solver == "er_sde" else None
@@ -1335,6 +1373,11 @@ class MiniMaxH3Pipeline:
                     sigma_video_next = effective_sigmas_video[step + 1] if effective_sigmas_video is not None else stage_sigmas_video[step + 1]
                     previous_sigma_video = (effective_sigmas_video[step - 1] if effective_sigmas_video is not None else stage_sigmas_video[step - 1]) if step else None
                     previous_previous_sigma_video = (effective_sigmas_video[step - 2] if effective_sigmas_video is not None else stage_sigmas_video[step - 2]) if step > 1 else None
+                    if remake_keyframe_rows and float(sigma_video) < VIGGLE_REMAKE_KEYFRAME_UNTIL:  # the pinned frames leave the sequence, their references stay
+                        payload.update(keyframes=None, cond_video_rows=payload["cond_video_rows"][remake_keyframe_rows:])
+                        remake_keyframe_rows = 0
+                        for key in ("layout_signature", "layout", "rope"):
+                            payload.pop(key, None)
                     step_editable_mask = _masking_step_mask(editable_mask, step, denoising_start_step, mask_end_step)
                     payload["target_video_mask_active"] = grouped_masking and step_editable_mask is not None
                     if payload["target_video_mask_active"] and effective_sigmas_video is None:
@@ -1821,6 +1864,8 @@ class MiniMaxH3Pipeline:
         for frame_index, known in control_frame_anchors:  # restore exact supplied pixels after the VAE round trip
             known = _resize_video(known.float(), *decoded_video.shape[-2:])
             decoded_video[:, frame_index:frame_index + known.shape[1]] = (to_uint8(known) if decoded_video.dtype == torch.uint8 else known).to(decoded_video)
+        if self.remake_mode and "A" in (video_prompt_type or "") and "U" not in video_prompt_type:  # with U, WanGP drops the mask and passes an empty one
+            _keep_source_outside_mask(decoded_video, input_frames, input_masks, to_uint8)
         if image_outputs:
             audio = None
             self._check_abort()

@@ -272,6 +272,17 @@ def clear_qwen35_runtime_caches(device: torch.device | None = None) -> None:
         _MROPE_FREQ_CACHE.pop(cache_key, None)
 
 
+def _rotate_in_place(tensor: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> None:
+    rotary_dim = cos.shape[-1]
+    half = rotary_dim // 2
+    first = tensor[..., :half]
+    second = tensor[..., half:rotary_dim]
+    scratch = torch.empty_like(first)
+    scratch.copy_(first)
+    first.mul_(cos[..., :half]).sub_(second * sin[..., :half])
+    second.mul_(cos[..., half:]).add_(scratch * sin[..., half:])
+
+
 def apply_rotary_pos_emb(
     qk_list: list[torch.Tensor],
     cos: torch.Tensor,
@@ -279,18 +290,10 @@ def apply_rotary_pos_emb(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     q, k = qk_list
     qk_list.clear()
-    rotary_dim = cos.shape[-1]
     cos = cos.unsqueeze(2)
     sin = sin.unsqueeze(2)
-    half = rotary_dim // 2
-    for tensor in (q, k):
-        first = tensor[..., :half]
-        second = tensor[..., half:rotary_dim]
-        scratch = torch.empty_like(first)
-        scratch.copy_(first)
-        first.mul_(cos[..., :half]).sub_(second * sin[..., :half])
-        second.mul_(cos[..., half:]).add_(scratch * sin[..., half:])
-        scratch = None
+    _rotate_in_place(q, cos, sin)
+    _rotate_in_place(k, cos, sin)
     return q, k
 
 
@@ -509,9 +512,18 @@ class Qwen3_5StaticCache(Qwen3_5DynamicCache):
         key_cache, value_cache = self.key_cache[layer_idx], self.value_cache[layer_idx]
         key_cache.index_copy_(1, positions, key)
         value_cache.index_copy_(1, positions, value)
+        return self.attend_written(query, self.cache_seqlens, layer_idx, scaling)
+
+    def attends_in_place(self, query: torch.Tensor, layer_idx: int) -> bool:
+        return self.triton_kernels and _static_cache_attention is not None and _static_cache_attention.usable(query, self.key_cache[layer_idx])
+
+    def attend_written(self, query: torch.Tensor, seqlens: torch.Tensor, layer_idx: int, scaling: float) -> torch.Tensor:
+        """Attention of query rows at positions seqlens, seqlens + 1, ... whose keys and values are already written."""
+        positions = seqlens + self.cache_positions[:query.shape[1]]
+        key_cache, value_cache = self.key_cache[layer_idx], self.value_cache[layer_idx]
         if self.triton_kernels and _static_cache_attention is not None and choose("Static Cache Attention", owned_triton=_static_cache_attention.usable(query, key_cache)):
             # reads each row's keys up to its own position only, in FP32: no copy of the cache, no score matrix
-            return _static_cache_attention.attention(query.contiguous(), key_cache, value_cache, self.cache_seqlens, scaling)
+            return _static_cache_attention.attention(query.contiguous(), key_cache, value_cache, seqlens, scaling)
         # the slots past the written ones are zeros (finite), which the mask hides
         key, value = key_cache.transpose(1, 2), value_cache.transpose(1, 2)
         repeats = query.shape[2] // key.shape[1]
@@ -866,12 +878,15 @@ class Qwen3_5Block(nn.Module):
             self._gdn_recurrent_raw = None
             self._gdn_replay_verification = False
             self._gdn_replay_probe = None
+            self._gdn_fused = None
+            self._gdn_state_dtype = None  # the dtype of its recurrent and convolution states, when it is not the model's
 
     def prepare_sequence_state(self, max_batch_size: int, device: torch.device, dtype: torch.dtype):
         if self.layer_type != "linear_attention":
             return
         conv_shape = (int(max_batch_size), self.key_dim * 2 + self.value_dim, self.conv_kernel_size)
         recurrent_shape = (int(max_batch_size), self.num_v_heads, self.head_k_dim, self.head_v_dim)
+        dtype = self._gdn_state_dtype or dtype
         with torch.inference_mode():
             if (
                 self.conv_state_buffer.numel() == 0
@@ -926,7 +941,11 @@ class Qwen3_5Block(nn.Module):
             from shared.kernels.qwen_gdn import RecurrentReplay
             state = self.recurrent_state_buffer
             if self.speculative_replay is None or not self.speculative_replay.fits(state, int(max_verify_tokens), state.dtype, state.dtype):
-                self.speculative_replay = RecurrentReplay(state, self.num_k_heads, self.head_k_dim, int(max_verify_tokens), state.dtype, state.dtype)
+                if self._gdn_fused is not None:
+                    from shared.kernels.gdn_fused import FusedReplay
+                    self.speculative_replay = FusedReplay(state, self.key_dim * 2 + self.value_dim, int(max_verify_tokens))
+                else:
+                    self.speculative_replay = RecurrentReplay(state, self.num_k_heads, self.head_k_dim, int(max_verify_tokens), state.dtype, state.dtype)
                 # the commit replays run in the engine's own graphs, which must not read weights that MMGP may stream: copies of the two
                 # small per-head parameters stay with the replay buffers
                 self._replay_ssm_parameters = tuple(t.detach().to(device=state.device, copy=True) for t in self._recurrence_ssm_parameters(getattr(self, "_gdn_direct_layout", True)))
@@ -947,6 +966,11 @@ class Qwen3_5Block(nn.Module):
 
     def replay_speculative_state(self, processed_tokens: int) -> None:
         # The recurrent state the last verification held after its first processed tokens, with the same kernel and arithmetic.
+        if self._gdn_fused is not None:
+            from shared.kernels.gdn_fused import step_replay
+            replay = self.speculative_replay
+            step_replay(replay.h, replay.gate, replay.beta, self.recurrent_state_buffer, replay.pre, int(processed_tokens))
+            return
         from shared.kernels.qwen_gdn import recurrent_raw_replay
         direct_recurrent_layout = getattr(self, "_gdn_direct_layout", True)
         ssm_a, ssm_dt = self._replay_ssm_parameters
@@ -995,7 +1019,7 @@ class Qwen3_5Block(nn.Module):
             self.conv_state_buffer.numel() == 0
             or self.conv_state_buffer.shape[0] < int(batch_size)
             or self.conv_state_buffer.device != hidden_states.device
-            or self.conv_state_buffer.dtype != hidden_states.dtype
+            or self.conv_state_buffer.dtype != (self._gdn_state_dtype or hidden_states.dtype)
         ):
             self.prepare_sequence_state(batch_size, hidden_states.device, hidden_states.dtype)
         return self.conv_state_buffer[:batch_size]
@@ -1005,10 +1029,38 @@ class Qwen3_5Block(nn.Module):
             self.recurrent_state_buffer.numel() == 0
             or self.recurrent_state_buffer.shape[0] < int(batch_size)
             or self.recurrent_state_buffer.device != hidden_states.device
-            or self.recurrent_state_buffer.dtype != hidden_states.dtype
+            or self.recurrent_state_buffer.dtype != (self._gdn_state_dtype or hidden_states.dtype)
         ):
             self.prepare_sequence_state(batch_size, hidden_states.device, hidden_states.dtype)
         return self.recurrent_state_buffer[:batch_size]
+
+    def _fused_qkv(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.attn_qkv_full(hidden_states).split([self.num_heads * self.head_dim * 2, self.num_kv_heads * self.head_dim, self.num_kv_heads * self.head_dim], dim=-1)
+
+    def _keys_values(self, hidden_states: torch.Tensor, fused_key: torch.Tensor | None, fused_value: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, seq_len, _ = hidden_states.shape
+        if fused_key is not None:
+            key_states = fused_key.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+            value_states = fused_value.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        elif self.attn_kv is None:
+            key_states = self.attn_k(hidden_states).view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+            value_states = self.attn_v(hidden_states).view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        else:
+            key_value_states = self.attn_kv(hidden_states).view(batch_size, seq_len, self.num_kv_heads, self.head_dim * 2)
+            key_states, value_states = torch.chunk(key_value_states, 2, dim=-1)
+            key_states = key_states.contiguous()
+            value_states = value_states.contiguous()
+        return self.attn_k_norm(key_states), value_states
+
+    def _store_keys_values(self, hidden_states: torch.Tensor, position_embeddings: tuple[torch.Tensor, torch.Tensor], layer_idx: int, past_key_values: Qwen3_5DynamicCache) -> None:
+        """Tokens whose output nothing reads (those of a prompt in the MTP layer): later passes only read their K/V, which the attention does not change."""
+        fused_key = fused_value = None
+        if self.attn_qkv_full is not None:
+            _, fused_key, fused_value = self._fused_qkv(hidden_states)
+        key_states, value_states = self._keys_values(hidden_states, fused_key, fused_value)
+        cos, sin = position_embeddings
+        _rotate_in_place(key_states, cos.unsqueeze(2), sin.unsqueeze(2))
+        past_key_values.update(key_states.transpose(1, 2), value_states.transpose(1, 2), layer_idx)
 
     def _forward_full_attention(
         self,
@@ -1025,26 +1077,13 @@ class Qwen3_5Block(nn.Module):
             q_and_gate = self.attn_q(hidden_states)
             fused_key = fused_value = None
         else:
-            q_and_gate, fused_key, fused_value = self.attn_qkv_full(hidden_states).split(
-                [self.num_heads * self.head_dim * 2, self.num_kv_heads * self.head_dim, self.num_kv_heads * self.head_dim], dim=-1
-            )
+            q_and_gate, fused_key, fused_value = self._fused_qkv(hidden_states)
         q_and_gate = q_and_gate.reshape(batch_size, seq_len, self.num_heads, self.head_dim * 2)
         query_states, gate = torch.chunk(q_and_gate, 2, dim=-1)
         gate = gate.reshape(batch_size, seq_len, -1)
 
         query_states = self.attn_q_norm(query_states)
-        if fused_key is not None:
-            key_states = fused_key.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-            value_states = fused_value.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-        elif self.attn_kv is None:
-            key_states = self.attn_k(hidden_states).view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-            value_states = self.attn_v(hidden_states).view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-        else:
-            key_value_states = self.attn_kv(hidden_states).view(batch_size, seq_len, self.num_kv_heads, self.head_dim * 2)
-            key_states, value_states = torch.chunk(key_value_states, 2, dim=-1)
-            key_states = key_states.contiguous()
-            value_states = value_states.contiguous()
-        key_states = self.attn_k_norm(key_states)
+        key_states, value_states = self._keys_values(hidden_states, fused_key, fused_value)
         hidden_states = None
 
         cos, sin = position_embeddings
@@ -1071,8 +1110,12 @@ class Qwen3_5Block(nn.Module):
                 softmax_scale=self.scaling,
                 causal=True,
             ).reshape(batch_size, seq_len, -1)
-        elif isinstance(past_key_values, Qwen3_5StaticCache) and cache_prepared:
+        elif isinstance(past_key_values, Qwen3_5StaticCache) and (cache_prepared or past_key_values.attends_in_place(query_states, layer_idx)):
+            if not cache_prepared:
+                past_key_values.prepare_append()
             attn_output = past_key_values.graph_attention(query_states, key_states, value_states, layer_idx, self.scaling).reshape(batch_size, seq_len, -1)
+            if not cache_prepared:
+                past_key_values.advance(seq_len)
         elif past_key_values is not None:
             key_states, value_states = past_key_values.update(
                 key_states.transpose(1, 2),
@@ -1141,6 +1184,8 @@ class Qwen3_5Block(nn.Module):
             recurrent_capacity = self.speculative_replay.tokens - 1 if self.speculative_replay is not None else self.speculative_recurrent_state_buffer.shape[0]
             if self.speculative_conv_state_buffer.shape[0] < seq_len - 1 or recurrent_capacity < seq_len - 1:
                 raise RuntimeError(f"Predictive state buffers do not cover a {seq_len}-token verification pass.")
+        if self._gdn_fused is not None and is_cuda and cache_params is None and (use_precomputed_states or speculative_verify):
+            return self._gdn_fused(self, hidden_states, conv_state, recurrent_state, speculative_verify)
 
         if self.attn_qkv_gate is not None:
             mixed_qkv_input, z = self.attn_qkv_gate(hidden_states).split([self.key_dim * 2 + self.value_dim, self.value_dim], dim=-1)
@@ -1208,6 +1253,8 @@ class Qwen3_5Block(nn.Module):
             last_conv_state = conv_state
         elif use_short_convolution:
             short_conv_cache = conv_state if has_previous_state and conv_state is not None else None
+            if self._gdn_state_dtype is not None and short_conv_cache is not None:  # FLA's kernels take the history in the dtype of their input
+                short_conv_cache = short_conv_cache.to(mixed_qkv_input.dtype)
             mixed_qkv, last_conv_state = self.ssm_conv1d(
                 mixed_qkv_input,
                 cache=short_conv_cache,
@@ -1436,6 +1483,7 @@ class Qwen3_5Block(nn.Module):
         attention_mask: torch.Tensor | None = None,
         past_key_values: Qwen3_5DynamicCache | None = None,
         cache_prepared: bool = False,
+        store_only: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states, residual = x_list
         x_list.clear()
@@ -1447,6 +1495,9 @@ class Qwen3_5Block(nn.Module):
             hidden_states = residual = None
             hidden_states, residual = self.attn_norm.forward_list(norm_state_list)
 
+        if store_only:
+            self._store_keys_values(hidden_states, position_embeddings, layer_idx, past_key_values)
+            return None, None
         if self.layer_type == "full_attention":
             x_list = [hidden_states]
             hidden_states = None
@@ -1688,6 +1739,11 @@ class Qwen3_5MTP(nn.Module):
         position_embeddings = self.rotary_emb(hidden_states, positions)
         if self._cache is None:
             self._cache = Qwen3_5DynamicCache(self._cache_config)
+        if not compute_logits:  # the tokens of a prompt: the drafts read their K/V, nothing else of this layer
+            x_list = [hidden_states, None]
+            hidden_states = None
+            self.block(x_list, position_embeddings, layer_idx=0, past_key_values=self._cache, store_only=True)
+            return None, None
         static_flash_cache = isinstance(self._cache, Qwen3_5StaticCache) and self.block.attn.flash_attn_with_kvcache is not None and hidden_states.is_cuda
         if static_flash_cache and not cache_prepared:
             self._cache.prepare_append()

@@ -325,7 +325,7 @@ def model_factory(model_filename, text_encoder_filename, qkv_splitting, dtype=to
                   model_type="minimax_h3_fl2va", reference_mode=False, video_vae_filename=VIDEO_VAE_FILE,
                   audio_vae_filename=AUDIO_VAE_FILE, latent_upscaler_filename=os.path.join(LATENT_UPSCALER_FOLDER, LATENT_UPSCALER_FILE),
                   shared_h3_pipeline=None, qkv_layout="interleaved", pdd=False, pdd_num_steps=None, pdd_block_size=None, vdn=False, audio_only=False,
-                  fixed_prompt_filename=None, veda=False, vsa=False, image_model=False, distilled_text_encoder=False):
+                  fixed_prompt_filename=None, veda=False, vsa=False, image_model=False, distilled_text_encoder=False, remake_mode=None):
     transformer = _load_transformer(model_filename, dtype, qkv_splitting, qkv_layout, pdd, pdd_num_steps, pdd_block_size, vdn, veda, vsa)
     if shared_h3_pipeline is None:
         text_encoder = _load_text_encoder(text_encoder_filename, dtype, distilled_text_encoder) if fixed_prompt_filename is None else None
@@ -333,14 +333,14 @@ def model_factory(model_filename, text_encoder_filename, qkv_splitting, dtype=to
             (VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_INT8_FILE, X2_VAE_INT8_FILE, P_H3_IMAGE_VAE_INT8_FILE) if VIDEO_VAE_SPLIT_INT8 else ())
         video_vae = _load_video_vae(video_vae_filename, video_vae_qkv_splitting, upsampling=video_vae_filename in (X2_VAE_FILE, X2_VAE_INT8_FILE), single_frame=image_model)
         audio_vae = None if image_model else _load_audio_vae(audio_vae_filename)
-        latent_upscaler = _load_latent_upscaler(latent_upscaler_filename) if fixed_prompt_filename is None and not image_model else None
+        latent_upscaler = _load_latent_upscaler(latent_upscaler_filename) if fixed_prompt_filename is None and not image_model and remake_mode is None else None
     else:
         text_encoder = shared_h3_pipeline.text_encoder
         video_vae = shared_h3_pipeline.vae
         audio_vae = shared_h3_pipeline.audio_vae
         latent_upscaler = shared_h3_pipeline.latent_upscaler
     fixed_prompt = load_fixed_prompt(fixed_prompt_filename) if fixed_prompt_filename is not None else None
-    pipeline = MiniMaxH3Pipeline(transformer, text_encoder, video_vae, audio_vae, latent_upscaler=latent_upscaler, reference_mode=reference_mode, audio_only=audio_only, dtype=dtype, fixed_prompt=fixed_prompt, image_model=image_model)
+    pipeline = MiniMaxH3Pipeline(transformer, text_encoder, video_vae, audio_vae, latent_upscaler=latent_upscaler, reference_mode=reference_mode, audio_only=audio_only, dtype=dtype, fixed_prompt=fixed_prompt, image_model=image_model, remake_mode=remake_mode)
     if save_quantized:
         from wgp import save_quantized_model
         save_quantized_model(transformer, model_type, model_filename[0], dtype, None,

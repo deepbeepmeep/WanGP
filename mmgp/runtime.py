@@ -1,7 +1,7 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 """Model-facing execution services, independent of MMGP's offload/compilation hooks."""
 import weakref
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 
 import torch
@@ -253,6 +253,49 @@ def place_experts(module):
     manager, model_id = owner
     residency = manager.expert_residency.get(model_id)
     return residency is None or residency.place()
+
+
+def adapt_experts(module):
+    """To be called at each decoding pass of a model replayed by graphs, outside their recording: lets its GPU expert copies follow the routing (Residency.adapt)."""
+    owner = _owner(module)
+    if owner is not None:
+        residency = owner[0].expert_residency.get(owner[1])
+        if residency is not None:
+            residency.adapt()
+
+
+def plan_experts(module):
+    """To be called while the host waits for a decoding pass: the numbers of a round of its GPU expert copies (Residency.plan_round), which the GPU then does not wait for."""
+    owner = _owner(module)
+    if owner is not None:
+        residency = owner[0].expert_residency.get(owner[1])
+        if residency is not None and residency.elastic:
+            residency.plan_round()
+
+
+def free_vram():
+    """VRAM free now on the current GPU, in bytes: what an allocation can still take without pressure on anyone."""
+    from . import allocator
+    if allocator.active == "vmm":
+        state = allocator.stats()
+        return allocator.room() + state["reserved"] - state["allocated"]
+    return torch.cuda.mem_get_info()[0]
+
+
+def lendable_experts(module):
+    """VRAM of the GPU expert copies that a prompt pass may take over for its duration, in bytes: those of a placement that follows the routing, which gives them back in place while decoding."""
+    owner = _owner(module)
+    residency = None if owner is None else owner[0].expert_residency.get(owner[1])
+    return residency.nbytes if residency is not None and residency.elastic else 0
+
+
+def stream_experts(module, banks, tokens, nbytes=0):
+    from . import expert_stream
+    """A context for a pass of tokens over banks of experts (in their order of use) of a managed model: those out of VRAM stream ahead of their use through a ring instead of being uploaded by each bank (mmgp.expert_stream). nbytes: the VRAM the pass will allocate
+    beside its ring, which a placement following the routing lends if it is not free. A plain context for models without a residency."""
+    owner = _owner(module)
+    residency = None if owner is None else owner[0].expert_residency.get(owner[1])
+    return nullcontext() if residency is None or not expert_stream.ENABLED else residency.streaming(banks, tokens, nbytes)
 
 
 def dynamic_preload(module):

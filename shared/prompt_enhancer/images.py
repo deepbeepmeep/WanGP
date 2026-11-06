@@ -19,7 +19,7 @@ class ImageContext:
 
 
 def enabled(server_config, mode):
-    return MULTI_IMAGE_PROMPT_ENHANCEMENT and "I" in mode and server_config.get("enhancer_enabled", 0) in (3, 4, 5, 6) and not is_remote_engine(resolve_role_engine(server_config, "prompt_enhancer"))
+    return MULTI_IMAGE_PROMPT_ENHANCEMENT and "I" in mode and server_config.get("enhancer_enabled", 0) in (3, 4, 5, 6, 7) and not is_remote_engine(resolve_role_engine(server_config, "prompt_enhancer"))
 
 
 def image_list(images):

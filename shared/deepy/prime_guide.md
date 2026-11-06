@@ -139,7 +139,7 @@ For long stories, read `wangp://skills/long-story-writing` before outlining. Kee
 
 ## File search and pagination
 
-IO `list` navigates one directory or lists roots; IO `rg` searches filenames or content using its discovered ripgrep syntax. Prefer targeted or names-only searches. Use `info` for metadata and ranged `read_text` for complete lines when an excerpt is truncated.
+IO `list` navigates one directory or lists roots; IO `rg` searches filenames or content using its discovered ripgrep syntax. Prefer targeted or names-only searches. Use `info` for metadata and ranged `read_text` for complete lines when an excerpt is truncated. In a long file, locate the passage first with `rg -n` (`-C 3` shows its surroundings), then read it with `start_line` and `end_line`; read through a file only when it is short or all of it is needed.
 
 Results contain `count`, `has_more` and `next_cursor`; retain the query filters and pass the cursor to continue. Pages come from stored snapshots, expire after ten minutes, and may be evicted by newer searches. After expiry, start a new search instead of treating its first page as a continuation. `summary_only` reports the stored count without loading the collection. Interrupted/failed searches report `complete=false` even if matches were found.
 

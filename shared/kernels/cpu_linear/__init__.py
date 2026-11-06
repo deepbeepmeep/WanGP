@@ -1,25 +1,32 @@
 # Copyright (c) 2026 DeepBeepMeep - WanGP Community License 2.0 (see LICENSE.txt)
 """CPU products of quantized linear weights (linear.cpp): the linears of the blocks that MMGP leaves on the CPU (cpuCompute) compute in the
-weights' own storage (mmap or pinned), with GGUF (Q4_K, Q5_K, Q6_K, Q8_0, IQ2_S, IQ3_S, Prism PTQ1_0), INT8 (Quanto qint8, INT8 ConvRot),
-scaled FP8 (e4m3, e5m2) and NVFP4 weights. The modules apply their own input transforms first (ConvRot and Prism rotations, NVFP4
-pre-quantization scale). Activations cross pinned buffers that GPU kernels read and write in place. Importing or using this module never
+weights' own storage (mmap or pinned), with GGUF (Q4_K, Q5_K, Q6_K, Q8_0, IQ2_S, IQ3_S, IQ3_XXS, IQ4_XS, IQ4_NL, Q2_0, Prism PTQ1_0), INT8
+(Quanto qint8, INT8 ConvRot), scaled FP8 (e4m3, e5m2) and NVFP4 weights. The modules apply their own input transforms first (ConvRot and Prism
+rotations, NVFP4 pre-quantization scale). Activations cross pinned buffers that GPU kernels read and write in place. The library also holds the
+routed experts in GGUF storage (experts_gguf.inc) and the reader of table rows from a file (rows.inc). Importing or using this module never
 invokes a compiler: python -m shared.kernels.cpu_linear.build rebuilds the libraries."""
 import ctypes
 import os
 import platform
+import weakref
 from pathlib import Path
 
 import torch
 
+from mmgp import cuda_graphs, mapped
 from mmgp.expert_compute import cpu_threads
 
 FORMAT_GGUF, FORMAT_INT8_ROWS, FORMAT_FP8_ROWS, FORMAT_NVFP4 = 0, 1, 2, 3  # linear.cpp formats
 FP8_E4M3, FP8_E5M2 = 0, 1
 NVFP4_LEGACY, NVFP4_TENSORCORE = 0, 1
 
+CPU_DOORBELL = "cpu_doorbell" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # CPU blocks replayed in CUDA graphs, proven: the switch goes with the others at the end
 _library = None
 _attempted = False
 _buffers = {}
+_job_buffers = {}  # bytes -> (host view, CUDA view) of mapped RAM shared by the jobs of linears, which run one at a time
+JOB_BUFFER_BYTES = 1 << 20
+_jobs_supported = {}
 
 
 class Weight(ctypes.Structure):
@@ -44,8 +51,61 @@ def library():
             lib.cpu_linear_supported.restype = ctypes.c_int
             lib.cpu_linear.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64, ctypes.c_int, ctypes.POINTER(Weight), ctypes.c_int]
             lib.cpu_linear.restype = ctypes.c_int
+            lib.gguf_moe_forward.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int] * 3 + [ctypes.c_void_p] * 5 + [ctypes.c_int64] * 5 + [ctypes.c_int] * 2
+            lib.gguf_moe_forward.restype = ctypes.c_int64
+            lib.gguf_moe_host_job.argtypes = [ctypes.c_void_p]
+            lib.gguf_moe_host_job.restype = None
+            lib.row_table_open.argtypes = [ctypes.c_char_p, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_void_p]
+            lib.row_table_open.restype = ctypes.c_void_p
+            lib.row_table_fill.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64]
+            lib.row_table_fill.restype = ctypes.c_int
+            lib.row_table_filled.argtypes = [ctypes.c_void_p]
+            lib.row_table_filled.restype = ctypes.c_uint64
+            lib.row_table_close.argtypes = [ctypes.c_void_p]
+            lib.row_table_close.restype = None
+            lib.row_table_stats.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64)]
+            lib.row_table_stats.restype = None
+            lib.row_table_read.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p]
+            lib.row_table_read.restype = ctypes.c_int
+            lib.ngram_rows_forward.argtypes = [ctypes.c_void_p]
+            lib.ngram_rows_forward.restype = ctypes.c_int
+            lib.ngram_rows_host_job.argtypes = [ctypes.c_void_p]
+            lib.ngram_rows_host_job.restype = None
+            lib.ngram_rows_prefetch.argtypes = [ctypes.c_void_p]
+            lib.ngram_rows_prefetch.restype = None
             _library = lib
     return _library
+
+
+def moe_stats():
+    """What the host jobs of routed calls in GGUF storage have done so far."""
+    out = (ctypes.c_uint64 * 3)()
+    library().gguf_moe_stats(out)
+    return dict(zip(("jobs", "pairs", "microseconds"), out))
+
+
+class MoeJob(ctypes.Structure):
+    """One routed call in GGUF storage, run by a CUDA host function (experts_gguf.inc MoeJob): the addresses stay fixed while graphs replay it."""
+    _fields_ = [(name, ctypes.c_void_p) for name in ("gate", "up", "down", "payload", "resident", "usage", "out")] + \
+               [(name, ctypes.c_int32) for name in ("gate_type", "up_type", "down_type", "tokens", "h", "i", "experts", "topk", "threads", "tail_rank", "status")]
+
+
+def moe_host_function():
+    return ctypes.cast(library().gguf_moe_host_job, ctypes.c_void_p).value
+
+
+def moe_server_function():
+    """The job function of the host server (host_server.inc, shared.kernels.host_doorbell): returns whether it wrote a result."""
+    return ctypes.cast(library().gguf_moe_server_job, ctypes.c_void_p).value
+
+
+def moe_forward(gate, up, down, types, x, ids, probabilities, resident, out, tokens, h, i, experts, topk, threads):
+    """Addresses of contiguous CPU buffers: the bank's rows, float32 x/probabilities/out, int32 ids and a uint8 resident flag per expert (or 0).
+    Returns how many pairs were computed (out is left unwritten when there are none)."""
+    count = library().gguf_moe_forward(gate, up, down, *types, x, probabilities, ids, resident, out, tokens, h, i, experts, topk, max(1, threads), 0)
+    if count < 0:
+        raise RuntimeError(f"CPU GGUF expert kernel failed ({count}), types {types}")
+    return count
 
 
 def _float_rows(scale, n):
@@ -122,12 +182,76 @@ def _buffer(name, numel, device):
     return current
 
 
+class LinearJob(ctypes.Structure):
+    """One linear as a job of the host server (linear.cpp LinearJob)."""
+    _fields_ = [("x", ctypes.c_void_p), ("rows", ctypes.c_int64), ("k", ctypes.c_int64), ("weight", Weight), ("threads", ctypes.c_int32), ("status", ctypes.c_int32)]
+
+
+def jobs_supported(device):
+    """Whether blocks computing on the CPU may be captured in CUDA graphs on this device: their linears are then jobs that kernels ask for (shared.kernels.host_doorbell)."""
+    index = device if isinstance(device, int) else device.index or 0
+    if index not in _jobs_supported:
+        from shared.kernels import host_doorbell
+        _jobs_supported[index] = CPU_DOORBELL and host_doorbell.supported(torch.device("cuda", index))
+    return _jobs_supported[index]
+
+
+def _job_buffer(nbytes, device):
+    size = max(JOB_BUFFER_BYTES, nbytes)
+    current = _job_buffers.get(size)
+    if current is None:
+        current = _job_buffers[size] = mapped.empty(size, device, "host jobs")
+    return current[0], current[1]
+
+
+def _release_tickets(tickets):
+    from shared.kernels import host_doorbell
+    for ticket in tickets:
+        host_doorbell.release(ticket)
+
+
+def _linear_job(weight, spec, rows, k, device):
+    """(job, its number, CUDA views of its mapped input and result) of this weight at this row count, kept with the weight. The views are made here: nothing is computed from them during a graph capture."""
+    jobs = weight.__dict__.get("_cpu_linear_jobs")
+    if jobs is None:
+        jobs = weight._cpu_linear_jobs = {}
+        tickets = weight._cpu_linear_tickets = []
+        weakref.finalize(weight, _release_tickets, tickets).atexit = False
+    entry = jobs.get(rows)
+    if entry is None:
+        from shared.kernels import host_doorbell
+        format, type, data, scales, scale, n = spec
+        input_host, input_gpu = _job_buffer(rows * k * 4, device)
+        output_host, output_gpu = _job_buffer(max(rows * n * 4, JOB_BUFFER_BYTES) + 4096, device)  # another buffer than the input's
+        call = Weight(data.data_ptr(), None if scales is None else scales.data_ptr(), output_host.data_ptr(), n, format, type, scale, 0)
+        job = LinearJob(input_host.data_ptr(), rows, k, call, cpu_threads(), 0)
+        ticket = host_doorbell.register(device, ctypes.cast(library().cpu_linear_server_job, ctypes.c_void_p).value, None, job)
+        weight._cpu_linear_tickets.append(ticket)
+        entry = jobs[rows] = job, ticket, input_gpu[:rows * k * 4].view(torch.float32), output_gpu[:rows * n * 4].view(torch.float32)
+    return entry
+
+
+def _queued_linear(weight, spec, x, bias, dtype, shape, rows, k, device):
+    """linear() inside a CUDA graph, or during the eager call that precedes its capture: no synchronization, the CPU's result joins the stream."""
+    from shared.kernels import host_doorbell
+    n = spec[5]
+    _, ticket, inputs, result = _linear_job(weight, spec, rows, k, device)
+    flat = x.reshape(rows * k).contiguous()
+    host_doorbell.ask_floats(flat if host_doorbell.parts_supported(flat) else flat.float(), inputs, ticket)
+    output = torch.empty(rows * n, dtype=torch.float32, device=device)
+    host_doorbell.wait(ticket, result, output, False)
+    y = output.view(*shape[:-1], n).to(dtype)
+    return y if bias is None else y.add_(bias.to(device=device, dtype=dtype))
+
+
 def linear(weight, x, bias, dtype):
     """x [..., k] on the GPU (already transformed by the module), weight on the CPU (supported). Returns x . W^T (+ bias) on x's device in
-    dtype. The host waits for x: the CPU computes between a GPU kernel writing x to pinned memory and one reading the result from it."""
+    dtype. The host waits for x: the CPU computes between a GPU kernel writing x to pinned memory and one reading the result from it. While a CUDA graph is prepared or captured: a job of the host server."""
     format, type, data, scales, scale, n = _spec(weight)
     shape, k, device = x.shape, x.shape[-1], x.device
     rows = x.numel() // k
+    if CPU_DOORBELL and cuda_graphs.recording() and jobs_supported(device):
+        return _queued_linear(weight, (format, type, data, scales, scale, n), x, bias, dtype, shape, rows, k, device)
     (host_in, mapped_in), (host_out, mapped_out) = _buffer("x", rows * k, device), _buffer("y", rows * n, device)
     mapped_in[:rows * k].view(rows, k).copy_(x.reshape(rows, k))
     x = None
@@ -137,3 +261,7 @@ def linear(weight, x, bias, dtype):
         raise RuntimeError(f"CPU linear: unsupported weight (format {format}, type {type}, {n}x{k})")
     y = mapped_out[:rows * n].view(*shape[:-1], n).to(dtype, copy=True)
     return y if bias is None else y.add_(bias.to(device=device, dtype=dtype))
+
+
+if CPU_DOORBELL:
+    cuda_graphs.register_cpu_jobs(jobs_supported)

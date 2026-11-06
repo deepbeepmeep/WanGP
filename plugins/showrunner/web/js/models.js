@@ -30,7 +30,7 @@ export async function openDefaultModels() {
   try { roles = (await api.defaultTemplates()).roles; } catch (error) { toast(error.message, 'error'); return; }
   const back = h(`<div class="modal-back"><div class="modal default-models" role="dialog" aria-modal="true" aria-label="Default models"><h3>Default models</h3>
     <p>New productions start with these templates; a production's brief can change them for that production. Each list holds the category's templates from Deepy's settings, and <b>Auto</b> is the one selected there. To add your own, select your saved WanGP settings in the generator, then press + next to the category in <b>Ask Deepy &gt; Settings</b>.</p>
-    <div class="models">${modelRows(roles)}</div><div class="actions"><button class="btn primary" data-close>Done</button></div></div></div>`);
+    <div class="models">${modelRows(roles.filter(role => !['people_edits', 'scene_edits'].includes(role.id) || role.value))}</div><div class="actions"><button class="btn primary" data-close>Done</button></div></div></div>`);
   const close = () => { back.remove(); document.removeEventListener('keydown', keys); };
   const keys = event => { if (event.key === 'Escape') { event.stopPropagation(); close(); } };
   back.addEventListener('click', event => { if (event.target === back || event.target.closest('[data-close]')) close(); });

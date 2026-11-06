@@ -867,13 +867,16 @@ class ZImagePipeline(DiffusionPipeline, FromSingleFileMixin):
 
             latents = final_x_hat
         else:
-            callback(-1, None, True, len(timesteps))
+            # a last step already at sigma 0 has dt = 0 and would leave the latents unchanged: it is not run. Step-based LoRA
+            # multipliers keep their spread over the requested steps
+            num_passes = len(timesteps) - int(self.scheduler.sigmas[len(timesteps) - 1].item() == 0)
+            callback(-1, None, True, override_num_inference_steps=num_passes)
 
             if hasattr(self.transformer, 'loras_slists') and self.transformer.loras_slists is not None:
                 update_loras_slists(self.transformer, self.transformer.loras_slists, len(timesteps))
 
-            with self.progress_bar(total=num_inference_steps) as progress_bar:
-                for i, t in enumerate(timesteps):
+            with self.progress_bar(total=num_passes) as progress_bar:
+                for i, t in enumerate(timesteps[:num_passes]):
                     offload.set_step_no_for_lora(self.transformer, i)
                     if self.interrupt:
                         break
@@ -949,6 +952,7 @@ class ZImagePipeline(DiffusionPipeline, FromSingleFileMixin):
 
                     if self._interrupt:
                         break
+                    progress_bar.update()
                     if callback is not None:
                         latents_preview = latents.unsqueeze(2)
                         if len(latents_preview) > 1:

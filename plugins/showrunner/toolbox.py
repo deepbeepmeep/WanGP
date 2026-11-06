@@ -13,11 +13,15 @@ from typing import Any, Literal
 
 from tqdm import tqdm
 
-from . import assemble, media, production as model, review, templates
+from shared.utils.virtual_media import write_view
+
+from . import assemble, media, production as model, remake_groups, review, templates
 from .director import media_entries
 
 MEDIA_SETTINGS = model.MEDIA_SETTINGS
 _REFERENCE = re.compile(r"^(@|[a-z]+:[0-9a-f]{6,}$)")  # an @alias path or a Gallery media id
+CUT_FAULTS = {"dropped": "The source cuts to another camera setup at this frame of the take, and the take does not: everything after that cut in the source is missing, however few frames the number suggests.",
+              "moved": "The take makes this cut of the source late or early.", "added": "The take cuts here and the source does not."}
 
 # The words of a voice sample made from a description: neutral, about ten seconds, so that every line spoken from it keeps its voice.
 CASTING_LINE = ("Some stories begin quietly, on an ordinary morning. Listen closely, and you will hear how this one goes, from the very first word "
@@ -45,6 +49,29 @@ def mistyped_words(doc: dict[str, Any], texts: list[str]) -> list[str]:
             if close:
                 found.append(f'"{word}" in "{text}": the user wrote "{close[0]}"')
     return found
+
+
+# A character sheet follows the Viggle Remake MCP server (Copyright Viggle AI, Apache License 2.0): a portrait and three whole views give the painter a person's looks, and no framing or expression to copy.
+SHEET_LAYOUT = ("Left third: a large head-and-shoulders portrait facing the camera. Right two thirds: the same character three times full body, head to shoes visible, standing upright with arms relaxed - front view, three-quarter "
+                "view, back view. Identical in every view. No text.")
+SHEET_FROM_WORDS = "Character reference sheet, {style} on a plain light-grey background, soft even lighting. The character: {description}. " + SHEET_LAYOUT
+SHEET_FROM_PHOTO = ("Character reference sheet of the person in the photo, {style} on a plain light-grey background, soft even lighting. Exactly the same real face, hairstyle, skin tone, age and body build as the photo. "
+                    "The outfit: {description}. " + SHEET_LAYOUT)
+SHEET_SIZE = "1216x832"
+# The visual inspector on one picture, source or painted, in the same words: told it compares two, it says sizes match that do not. It is never told the brief.
+FRAME_PEOPLE = ("This is one frame of a video. List every person or character visible, even if only partly, from behind or out of focus, one line each, with no names and nothing you cannot see: where they are in the picture (left, "
+                "centre or right; foreground or background); which part of them shows; how tall their head is as a percentage of the picture's height, and whether the picture's edge cuts it; their hair or what covers their head, and "
+                "their clothes; which way the head faces; the eyes, brows and mouth (open or closed, smiling or not); sharp or blurred. Then one line for the camera (extreme close-up, close-up, medium shot or wide) and one for the background.")
+# The same without hair and clothes, for the painter's directions: told a replaced person's hair and clothes, it keeps them (s7 of the A24 teaser: Batman in 3 of 3 draws without those words, 1 of 3 with them).
+FRAME_POSES = ("This is one frame of a video. List every person or character visible, even if only partly, from behind or out of focus, one line each, with no names and nothing you cannot see: where they are in the picture (left, "
+               "centre or right; foreground or background); which part of them shows; how tall their head is as a percentage of the picture's height, and whether the picture's edge cuts it; which way the head faces; the eyes, brows "
+               "and mouth (open or closed, smiling or not); sharp or blurred. Then one line for the camera (extreme close-up, close-up, medium shot or wide) and one for the background.")
+PAINT_DRAWS = 3  # a draw that leaves the picture as it was is drawn again: the painter often does
+LARGE_HEAD = 30  # percent of the picture's height: below it a real change can touch too little of the picture to measure
+SAME_PICTURE = 0.15  # media.changed_share of a draw that changed nobody (0 to 0.13 on the teaser; 0.16 and up for a person replaced)
+PAINT_VERIFY = ("Verify this picture before going on: read `before` and `after`, person by person. It fails when a replaced person's old hair, face or clothes are still there; a head is much larger or smaller, or elsewhere; someone "
+                "seen from behind now shows a face, or someone new appears; eyes, brows or mouth differ from `before`; the camera or background changed; the outfit is not the one on the character's sheet. On a failure call paint_frame "
+                "again with the same people: each try draws differently. After 3 tries keep the closest (pass its `picture` back) and say in your report who is wrong and how.")
 
 
 class ShowrunnerToolbox:
@@ -77,6 +104,11 @@ class ShowrunnerToolbox:
         plugin.register_deepy_action(self.check_song, summary="Listen to the production's song: which lines of the lyrics it really sings, and when (the subtitles follow it).")
         plugin.register_deepy_action(self.deep_review, summary="Measure the last version against its script: words, subtitles, voices, lips, sound and picture, with the findings recorded on the version.")
         plugin.register_deepy_action(self.assemble, uses_gpu=False, summary="Render the edit (chosen takes in order, trims, transitions, soundtrack) as the production's deliverable.")
+        plugin.register_deepy_action(self.ingest_source, uses_gpu=False, listed=False, summary="A remake: read its source video, find the cuts and make one shot per camera shot, each with its part of the source.")
+        plugin.register_deepy_action(self.make_sheet, listed=False, summary="A remake: make a cast member's character sheet, a portrait and three whole views, as their picture for the painter.")
+        plugin.register_deepy_action(self.look_at_frame, uses_gpu=False, listed=False, summary="A remake: what the visual inspector sees in one frame of a shot's source, person by person: where, how large, what shows, expression, focus.")
+        plugin.register_deepy_action(self.paint_frame, paths={"picture": "read", "references": "read"}, listed=False, summary="A remake: paint one frame of a shot's source with the image editor from what happens to each person in it, or attach your own picture, as that shot's painted frame, and describe the result to verify it.")
+        plugin.register_deepy_action(self.check_take, uses_gpu=False, listed=False, summary="A remake: measure a take against its source: cuts moved, dropped or added, black bands at its edges.")
         plugin.register_deepy_action(self.log, uses_gpu=False, summary="Add a short line to the director's log the user reads.")
         plugin.register_deepy_action(self.status, uses_gpu=False, summary="Shots by status, takes waiting for a verdict, the latest deliverable (nothing renders in the background: render returns when done).")
 
@@ -163,6 +195,7 @@ class ShowrunnerToolbox:
         resolve = lambda path: ctx.virtualize(str(production.resolve(path))) if path else path
         brief = doc["brief"]
         brief["song"] = resolve(brief.get("song"))
+        brief["source"] = resolve(brief.get("source"))
         brief["references"] = [resolve(path) for path in brief.get("references", [])]
         voices = {member["id"]: member.get("voice") for member in doc.get("cast", [])}  # as the document keeps them, before they are renamed below
         for member in doc.get("cast", []):
@@ -172,7 +205,10 @@ class ShowrunnerToolbox:
             for key in MEDIA_SETTINGS & set(settings):
                 settings[key] = [resolve(item) for item in settings[key]] if isinstance(settings[key], list) else resolve(settings[key])
         for shot in doc.get("shots", []):
+            shot.pop("source_poster", None)
             media((shot.get("generation") or {}).get("settings") or {})
+            for painted in shot.get("painted_frames") or []:
+                painted.update(path=resolve(painted["path"]), source=resolve(painted["source"]))
             for line in shot.get("dialogue") or []:  # a line's audio while it is in its speaker's current voice
                 if line.get("audio") and line.get("voice") == voices.get((model.speaker(doc, line.get("speaker")) or {}).get("id")):
                     line["audio"] = resolve(line["audio"])
@@ -190,14 +226,17 @@ class ShowrunnerToolbox:
             item["path"] = resolve(item.get("path"))
         return doc
 
-    def _generation(self, ctx, target, shot: dict[str, Any]) -> dict[str, Any]:
-        """A shot's settings as render sends them: the brief's format, media named the caller's way, the cast's pictures as references."""
-        settings = {"template": shot["generation"].get("template", "gen_video"), "resolution": model.resolution(target.snapshot()["brief"]),
+    def _generation(self, ctx, target, shot: dict[str, Any], final: bool = False) -> dict[str, Any]:
+        """A shot's settings as render sends them: the brief's format as a draft or final, media named the caller's way, the cast's pictures as references."""
+        size = self.showrunner.shot_size(target, target.snapshot(), shot, final=final)
+        settings = {"template": shot["generation"].get("template", "gen_video"), "resolution": size,
                     **self._resolve_settings(ctx, target, shot["generation"].get("settings", {}))}  # the brief's format unless the shot sets its own
+        if shot.get("source_range"):  # a shot made from a video follows its video's shape, whatever an older plan wrote
+            settings["resolution"] = size
         entry = templates.resolve(self._catalog(target.snapshot()), settings["template"])
         settings.update(templates.planned_length(target.snapshot(), shot, entry))
         pictures = self._cast_pictures(target.snapshot(), shot)
-        if entry is not None and entry["refs"] and pictures and not settings.get("image_refs"):  # the cast's identity in every shot that shows them
+        if entry is not None and entry["refs"] and pictures and not settings.get("image_refs") and entry["task"] not in templates.EDIT_TASKS:  # the cast's identity in every shot that shows them; a remake's shot takes its painted frames instead
             settings["image_refs"] = [ctx.virtualize(str(target.resolve(path))) for path in pictures]
         if entry is not None and entry["task"] == "edit_image" and entry.get("sized_by_ref") and settings.get("image_refs") and "video_prompt_type" not in settings:
             settings["video_prompt_type"] = "I"  # an illustrated page keeps the production's format: its references bring the cast, not their picture's size
@@ -212,6 +251,8 @@ class ShowrunnerToolbox:
             settings["audio_guide"] = ctx.virtualize(str(target.resolve(song)))
         if entry is not None and entry["soundtrack"] and not entry["audio"] and settings.get("audio_guide") and not settings.get("audio_prompt_type"):
             settings["audio_prompt_type"] = "AS"  # the driving audio as a kept soundtrack the picture follows, not a voice reference
+        if entry is not None and entry.get("video_edit") and settings.get("video_mask"):
+            settings["video_prompt_type"] = settings.get("video_prompt_type", "IVU").replace("U", "A")  # WanGP ignores a mask beside U
         return settings
 
     @staticmethod
@@ -224,9 +265,9 @@ class ShowrunnerToolbox:
         shown = [line for line in lines if line.get("speaker") in shot.get("cast", [])]
         return shown if entry["soundtrack"] and not entry["audio"] else shown or lines if entry["audio"] else []
 
-    def _generation_with_loras(self, ctx, target, shot: dict[str, Any]) -> tuple[dict[str, Any], list[Any] | None]:
+    def _generation_with_loras(self, ctx, target, shot: dict[str, Any], final: bool = False) -> tuple[dict[str, Any], list[Any] | None]:
         """A shot's settings with the LoRAs of its cast (Settings > LoRAs on cast cards), and the LoRAs before them."""
-        settings, doc = self._generation(ctx, target, shot), target.snapshot()
+        settings, doc = self._generation(ctx, target, shot, final), target.snapshot()
         return self.showrunner.with_cast_loras(doc, shot, templates.resolve(self._catalog(doc), settings["template"]), settings)
 
     def _validate(self, ctx, target, shot_ids: list[str]) -> tuple[list[str], dict[str, dict[str, float | None]]]:
@@ -289,7 +330,8 @@ class ShowrunnerToolbox:
             result["references"] = doc["brief"]["references"]
             result["note"] = 'Prompts are cut short here: production(section="shot", shot=id) gives a shot\'s whole prompt and settings.'
             result["song"] = doc["brief"]["song"]
-            result["format"] = f"{model.resolution(doc['brief'])}: the brief's, what shots render at (fitted to their model's grid) unless one sets its own resolution"
+            result["format"] = (f"{model.resolution(doc['brief'])}: the brief's, what shots render at (fitted to their model's grid) unless one sets its own resolution" if not doc["brief"].get("draft_resolution")
+                                else f"{model.resolution(doc['brief'])}: the brief's target, which every picture is made at. Video shots render at {doc['brief']['draft_resolution']} (a draft, fitted to their model's grid) until the user shoots them final")
             result["cast"] = [{**member, "images": full["images"], "voice": full["voice"], **({"voice_description": full["voice_description"]} if full["voice_description"] else {})}
                               for member, full in zip(result["cast"], doc["cast"])]
             catalog = self._catalog(doc)
@@ -372,6 +414,12 @@ class ShowrunnerToolbox:
         files += [{"file": name(item["path"]), "what": "export", "duration_s": item.get("duration_s")} for item in doc["deliverables"][-2:]]
         return files
 
+    @staticmethod
+    def _source_decides_shots(target) -> None:
+        """A remake's shots are its source's camera shots, with their ranges and painted frames: a plan written over them loses both, and with them what they render from."""
+        if target.snapshot().get("remake"):
+            raise ValueError("A remake's shots come from its source and stay as ingest_source made them: write each shot's prompt and cast with update_shot. Nothing was changed.")
+
     def plan(self, ctx, production: str, shots: list[dict[str, Any]] | None = None, cast: list[dict[str, Any]] | None = None, style: dict[str, Any] | None = None,
              outline: list[dict[str, Any]] | None = None, validate: bool = True) -> dict[str, Any]:
         """Write the plan. shots: [{id?, title, section, intent, camera, cast: [cast ids], dialogue: [{speaker, line, note}], duration_s, audio_slice: [start_s, end_s],
@@ -383,6 +431,7 @@ class ShowrunnerToolbox:
         target = self._production(ctx, production)
         if shots:
             self._only_the_fix(ctx, target, what="the plan of the shots (update_shot changes a shot you are fixing)")
+            self._source_decides_shots(target)
         ops = [{"op": "outline", "outline": outline}] if outline is not None else []
         if style:
             ops.append({"op": "style", "fields": style})
@@ -433,6 +482,7 @@ class ShowrunnerToolbox:
     def add_shots(self, ctx, production: str, shots: list[dict[str, Any]], position: int | None = None) -> dict[str, Any]:
         """Insert shots (same fields as plan) at a zero-based position, or at the end."""
         target = self._production(ctx, production)
+        self._source_decides_shots(target)
         result = self._apply(target, [{"op": "add_shots", "shots": self._portable_shots(ctx, target, shots), "position": position}])
         fixing = self._fixing(ctx, target)
         if fixing is not None:  # a shot inserted in a fix is part of it; the shots around it keep their takes
@@ -443,12 +493,14 @@ class ShowrunnerToolbox:
 
     def remove_shot(self, ctx, production: str, shot: str, revision: int | None = None) -> dict[str, Any]:
         target = self._production(ctx, production)
+        self._source_decides_shots(target)
         self._only_the_fix(ctx, target, [shot])
         result = self._apply(target, [{"op": "remove_shot", "shot": shot, "revision": revision}], revision)
         return {"revision": target.doc["revision"], "removed": shot, **result[0]}
 
     def move_shots(self, ctx, production: str, shots: list[str], before: str | None = None) -> dict[str, Any]:
         target = self._production(ctx, production)
+        self._source_decides_shots(target)
         self._only_the_fix(ctx, target, shots)
         self._apply(target, [{"op": "move_shots", "shots": shots, "before": before}])
         return {"revision": target.doc["revision"], "order": [item["id"] for item in target.doc["shots"]]}
@@ -486,31 +538,43 @@ class ShowrunnerToolbox:
             self._apply(target, [{"op": "update_cast", "cast": cast_id, "fields": fields}])
         return {"revision": target.doc["revision"], "cast": cast_id}
 
-    def render(self, ctx, production: str, shots: list[str], new_seed: bool | int = False) -> dict[str, Any]:
+    def render(self, ctx, production: str, shots: list[str], new_seed: bool | int = False, final: bool = False) -> dict[str, Any]:
         """Generate one take per listed shot, in order, from the shot's generation (template + settings), and record it. Returns each take's media id
-        to inspect; record a verdict afterwards. new_seed: true draws a new seed instead of the settings' one; a number is the seed to use."""
+        to inspect; record a verdict afterwards. new_seed: true draws a new seed instead of the settings' one; a number is the seed to use.
+        final: at the brief's target resolution when it has a draft one, with the seed of the shot's take; only when the user asks for it."""
         target = self._production(ctx, production)
         self._only_the_fix(ctx, target, shots)
-        renders = []
+        if target.doc["stage"] in ("planning", "review"):  # a plan the user chose not to review goes on to its shoot
+            target.apply([{"op": "stage", "stage": "shooting"}], by="system", record=False)
+        renders, covered = [], {}  # covered: shots another shot's render already gave a take in this call
         for index, shot_id in enumerate(shots):
             if ctx.cancelled():
                 break
+            if shot_id in covered:
+                renders.append({"shot": shot_id, "rendered_with": covered[shot_id], "note": f"rendered together with {covered[shot_id]}: its take is in that render's result"})
+                continue
             if self.showrunner.director.pausing(production):
                 renders.append({"paused": True, "not_rendered": shots[index:], "note": "the user paused you: stop here, they will resume the task later"})
                 break
             if self.showrunner.director.note_waiting(production) and index:
                 renders.append({"stopped": True, "not_rendered": shots[index:], "note": "the user just wrote to you: read it, then decide what to render"})
                 break
-            render = self.render_shot(ctx, target, shot_id, new_seed, index, len(shots))
+            render = self.render_shot(ctx, target, shot_id, new_seed, index, len(shots), final=final, requested=shots)
+            covered.update({item["shot"]: shot_id for item in render.get("rendered_with") or []})
             if render.get("paused"):
                 renders.append({"paused": True, "not_rendered": shots[index:], "note": "the user paused you: stop here, they will resume the task later"})
                 break
+            if render.get("error"):  # what the user's Render now writes too: the Board shows it under the shot
+                target.apply([{"op": "log", "text": f"Render of {shot_id} failed: {render['error']}"}], by="system", record=False)
             renders.append(render)
         ctx.progress(done=len(renders), total=len(shots), text="Rendered", force=True)
         return {"revision": target.doc["revision"], "renders": renders}
 
-    def render_shot(self, ctx, target, shot_id: str, new_seed: bool | int = False, index: int = 0, total: int = 1, by: str = "deepy") -> dict[str, Any]:
-        """One take of a shot, from its generation: its lines spoken first when they are not yet. What happened, for its report. by "user": the user's Render now, which no showrunner directs."""
+    def render_shot(self, ctx, target, shot_id: str, new_seed: bool | int = False, index: int = 0, total: int = 1, by: str = "deepy", final: bool = False,
+                    requested: list[str] | tuple[str, ...] = ()) -> dict[str, Any]:
+        """One take of a shot, from its generation: its lines spoken first when they are not yet. What happened, for its report. by "user": the user's Render now, which no showrunner directs.
+        final: at the target resolution, with the seed of the take it follows. A remake's shot rendered with its neighbours (remake_groups) gives them a take too: as their
+        chosen one when they are in `requested` or have none, else beside the one they use."""
         shot = model.find(target.snapshot()["shots"], shot_id, "shot")
         if shot["locked"] and by == "deepy":
             return {"shot": shot_id, "error": "locked by the user"}
@@ -519,6 +583,10 @@ class ShowrunnerToolbox:
         doc = target.snapshot()
         catalog = self._catalog(doc)
         entry = templates.resolve(catalog, shot["generation"].get("template", "gen_video"))
+        if shot.get("source_range") and ((entry or {}).get("video_edit") or {}).get("input") == "painted_frames" and not shot["cast"] and all(item["path"] == item["source"] for item in shot.get("painted_frames") or []):
+            return self._keep_source(ctx, target, shot, doc, by)
+        if shot.get("source_range") and (entry or {}).get("video_edit") and len(group := remake_groups.group_of(self._render_groups(doc, entry, requested or [shot_id]), shot_id)) > 1:
+            return self._render_group(ctx, target, group, shot_id, new_seed, index, total, by, final, requested, entry)
         if templates.model_speaks(doc, shot, entry) and (shot.get("trim") or [0.0, None])[1] is not None and shot.get("updated_by") != "user":  # a trim made for a recorded line would cut what the model says
             target.apply([{"op": "update_shot", "shot": shot_id, "fields": {"trim": [0.0, None]}}], by="system", record=False)
             shot = model.find(target.snapshot()["shots"], shot_id, "shot")
@@ -532,7 +600,11 @@ class ShowrunnerToolbox:
             if errors := [f"line {item['line']}: {item['error']}" for item in said if item.get("error")]:
                 return {"shot": shot_id, "error": "its lines could not be spoken (" + "; ".join(errors) + "): fix the speakers' voices, then render it"}
             shot = model.find(target.snapshot()["shots"], shot_id, "shot")
-        settings, base_loras = self._generation_with_loras(ctx, target, shot)
+        settings, base_loras = self._generation_with_loras(ctx, target, shot, final)
+        tier = "draft" if doc["brief"].get("draft_resolution") and not final else "final"
+        follows = model.chosen_take(shot) if final and not new_seed else None
+        if follows is not None and follows.get("kind", "video") == "video" and (seed := media.generation_seed(target.resolve(follows["path"]))) is not None:
+            settings["seed"] = seed  # the take you approved at its draft size
         song = target.resolve(target.snapshot()["brief"].get("song"))
         if shot.get("audio_slice") and song is not None and settings.get("audio_guide") == ctx.virtualize(str(song)):
             start_s, end_s = shot["audio_slice"]  # the song drives the shot: its own slice, not the song from the start
@@ -570,20 +642,111 @@ class ShowrunnerToolbox:
         if not entries:
             target.apply([{"op": "update_shot", "shot": shot_id, "fields": {"status": "failed"}}], by=by, record=False)
             result = (response.get("result") or {}) if isinstance(response, dict) else {}
-            reasons = [str(item) for item in [response.get("error") if isinstance(response, dict) else None, *(result.get("errors") or [])] if item]
+            reasons = [str(item["message"] if isinstance(item, dict) else item) for item in [response.get("error") if isinstance(response, dict) else None, *(result.get("errors") or [])] if item]  # WanGP's errors are {message, task_index, stage...}
             return {"shot": shot_id, "error": "the generation returned no media" + (f": {'; '.join(reasons)}" if reasons else "")}
         entry = entries[0]
         try:
             path = ctx.resolve(entry["path"])  # tool results name files as the caller does
             used = entry.get("settings") if isinstance(entry.get("settings"), dict) else settings
-            take = self.showrunner.add_take(target.id, shot_id, path, by=by, settings=self._real_paths(ctx, used), media_id=entry.get("media_id") if by == "deepy" else None, gpu_s=generated, base_loras=base_loras)
+            take = self.showrunner.add_take(target.id, shot_id, path, by=by, settings=self._real_paths(ctx, used), media_id=entry.get("media_id") if by == "deepy" else None, gpu_s=generated, base_loras=base_loras, tier=tier)
         except Exception as error:  # the media exists: report it with the shot and render the next shots
             target.apply([{"op": "update_shot", "shot": shot_id, "fields": {"status": "failed"}}], by=by, record=False)
             return {"shot": shot_id, "media_id": entry.get("media_id"), "error": f"the take could not be recorded ({error}): record it with record_take"}
         target.apply([{"op": "budget", "gpu_seconds": time.time() - started}], by="system", record=False)
         heard = self.showrunner.hear_take(target, shot_id, take["take"], listening=lambda: ctx.progress(done=index, total=total, text=f"Listening to {shot_id} ({index + 1}/{total})", force=True))
-        return {"shot": shot_id, "take": take["take"], "media_id": entry.get("media_id"), "path": ctx.virtualize(path), "duration_s": take.get("duration_s"), "size": f"{take.get('width')}x{take.get('height')}", **({"heard": heard} if heard else {}),
+        measured = {key: value for key, value in self.check_take(ctx, target.id, shot_id, take["take"]).items() if key in ("ok", "cut_faults", "edge_bands")} if shot.get("source_range") else None  # a remake's take against its source
+        return {"shot": shot_id, "take": take["take"], "media_id": entry.get("media_id"), "path": ctx.virtualize(path), "duration_s": take.get("duration_s"), "size": f"{take.get('width')}x{take.get('height')}", **({"heard": heard} if heard else {}), **({"check": measured} if measured else {}),
                         **{key: response[key] for key in ("cut_times_seconds", "canvas") if isinstance(response, dict) and key in response}}
+
+    def _keep_source(self, ctx, target, shot: dict[str, Any], doc: dict[str, Any], by: str) -> dict[str, Any]:
+        """A remake's shot nothing changes in: its take is its part of the source. The model could only make it worse, at the cost of a render."""
+        note = "Nothing changes in this shot: its take is its part of the source, without the model."
+        if (kept := model.chosen_take(shot)) and kept.get("kept_source"):  # the edit reads it from the source at whatever size it is made
+            target.apply([{"op": "update_shot", "shot": shot["id"], "fields": {"status": "rendered"}}], by="system", record=False)
+            return {"shot": shot["id"], "take": kept["id"], "kept_source": True, "note": note}
+        start, stop = shot["source_range"]
+        clip = media.video_window(target.resolve(doc["remake"]["path"]), start, stop - start, doc["remake"]["fps"], target.folder / "media" / "source", size=self.showrunner.shot_size(target, doc, shot))  # what the page plays
+        take = self.showrunner.add_take(target.id, shot["id"], clip, by=by, note=note, gpu_s=0.0, kept_source=True)
+        target.apply([{"op": "verdict", "shot": shot["id"], "ok": True, "note": note}], by="system", record=False)
+        return {"shot": shot["id"], "take": take["take"], "kept_source": True, "note": note, "path": ctx.virtualize(clip), "duration_s": take.get("duration_s"), "size": f"{take.get('width')}x{take.get('height')}"}
+
+    @staticmethod
+    def _render_groups(doc: dict[str, Any], entry: dict[str, Any], wanted: list[str] | tuple[str, ...] | None = None) -> list[list[dict[str, Any]]]:
+        """The renders of a remake's shots asked for (remake_groups.plan): the brief's lengths in frames, up to the model's largest window (Auto: all of it)."""
+        fps, brief = doc["remake"]["fps"], doc["brief"]
+        minimum = round(float(brief["render_min_s"] or 0.0) * fps) if brief["group_renders"] else 0  # Group rendering off on the Board: every shot alone
+        largest = entry["window_max"] or entry["longest_frames"]
+        return remake_groups.plan(doc, minimum, min(round(float(brief["render_max_s"]) * fps), largest) if brief["render_max_s"] else largest, wanted)
+
+    def _render_group(self, ctx, target, group: list[dict[str, Any]], shot_id: str, new_seed: bool | int, index: int, total: int, by: str, final: bool, requested,
+                      entry: dict[str, Any]) -> dict[str, Any]:
+        """A remake's shot and its neighbours in one request (remake_groups): one view over their part of the source, every painted frame pinned at its own frame, their
+        prompts joined. Each changed shot gets its own part of the render as a take; the shots left as they are only give the window its length."""
+        doc = target.snapshot()
+        fps, changed = doc["remake"]["fps"], [shot for shot in group if not remake_groups.kept(shot)]
+        others = [shot["id"] for shot in changed if shot["id"] != shot_id]
+        together = ", ".join(shot["id"] for shot in group if shot["id"] != shot_id)
+        if missing := [shot["id"] for shot in changed if not shot.get("painted_frames")]:
+            return {"shot": shot_id, "error": f"{shot_id} renders together with {together}: paint a frame of {', '.join(missing)} first"}
+        try:
+            prompt = remake_groups.joined_prompt(group, fps)
+        except ValueError as error:
+            return {"shot": shot_id, "error": f"{shot_id} renders together with {together}: {error}"}
+        lead = model.find(doc["shots"], shot_id, "shot")
+        settings, base_loras = self._generation_with_loras(ctx, target, lead, final)
+        start, stop = group[0]["source_range"][0], group[-1]["source_range"][1]
+        source = target.resolve(doc["remake"]["path"])
+        view = write_view(target.folder / "media" / "views" / f"{source.stem}-{start}-{stop - start}{source.suffix}", source, start, stop - 1)
+        painted = [item for shot in group for item in shot.get("painted_frames") or []]
+        pinned = any("F" in str((shot["generation"].get("settings") or {}).get("video_prompt_type") or "") for shot in changed)
+        settings.update(video_guide=ctx.virtualize(view), video_length=stop - start, prompt=prompt, image_refs=[ctx.virtualize(str(target.resolve(item["path"]))) for item in painted],
+                        video_prompt_type="FIVU" if pinned else "IVU", frames_positions=" ".join(str(item["frame"] - start + 1) for item in painted) if pinned else "")
+        first, step, _ = entry["take_frames"]  # one window holds the whole render: WanGP would otherwise cut it into sliding windows, a seam inside a shot
+        settings["sliding_window_size"] = max(int(settings.get("sliding_window_size") or entry["longest_frames"] or 0), first + -(-max(0, stop - start - first) // step) * step)
+        follows = model.chosen_take(lead) if final and not new_seed else None
+        if follows is not None and (seed := (follows.get("settings") or {}).get("seed")) not in (None, -1):
+            settings["seed"] = seed  # the take you approved at its draft size: its part was cut from a render with this seed
+        if new_seed:
+            settings["seed"] = -1 if new_seed is True else int(new_seed)
+        tier = "draft" if doc["brief"].get("draft_resolution") and not final else "final"
+        ctx.progress(done=index, total=total, text=f"Rendering {shot_id} with {together} ({index + 1}/{total})", force=True)
+        before = {shot["id"]: shot["status"] for shot in changed}  # every shot of the render shows as rendering, the ones you did not ask for too
+        target.apply([{"op": "update_shot", "shot": shot["id"], "fields": {"status": "rendering", "rendering_with": None if shot["id"] == shot_id else shot_id}} for shot in changed], by=by, record=False)
+        started = time.time()
+        try:
+            response = ctx.call("wangp_generate", {"settings": settings})
+        except Exception as error:
+            response = {"error": str(error)}
+        generated, entries = time.time() - started, media_entries(response)
+        if not entries:
+            target.apply([{"op": "update_shot", "shot": shot["id"], "fields": {"status": "failed" if not shot["takes"] or shot["id"] == shot_id else before[shot["id"]], "rendering_with": None}} for shot in changed], by=by, record=False)
+            result = (response.get("result") or {}) if isinstance(response, dict) else {}
+            reasons = [str(item["message"] if isinstance(item, dict) else item) for item in [response.get("error") if isinstance(response, dict) else None, *(result.get("errors") or [])] if item]
+            return {"shot": shot_id, "error": f"the generation of {shot_id} with {together} returned no media" + (f": {'; '.join(reasons)}" if reasons else "")}
+        path = ctx.resolve(entries[0]["path"])
+        used = entries[0].get("settings") if isinstance(entries[0].get("settings"), dict) else settings
+        seed = media.generation_seed(path)
+        used = self._real_paths(ctx, {**used, **({"seed": seed} if seed is not None else {})})
+        target.apply([{"op": "budget", "gpu_seconds": generated}], by="system", record=False)
+        takes = {}
+        for shot in changed:  # each shot's own frames, with their sound, as a take of its own: the edit, the checks and the players read them as any take
+            own = shot["source_range"][1] - shot["source_range"][0]
+            part = media.video_window(path, shot["source_range"][0] - start, own, fps, target.folder / "media" / "parts")
+            choose = shot["id"] in (shot_id, *requested) or not shot["takes"]
+            mates = ", ".join(item["id"] for item in group if item["id"] != shot["id"])
+            added = self.showrunner.add_take(target.id, shot["id"], part, by=by, settings=used, note=f"Rendered together with {mates}", gpu_s=generated * own / (stop - start),
+                                             base_loras=base_loras, tier=tier, choose=choose)
+            target.apply([{"op": "update_shot", "shot": shot["id"], "fields": {"rendering_with": None, **({} if choose else {"status": before[shot["id"]]})}}], by="system", record=False)  # a take beside the one it uses: as it was
+            checked = {key: value for key, value in self.check_take(ctx, target.id, shot["id"], added["take"]).items() if key in ("ok", "cut_faults", "edge_bands")}
+            takes[shot["id"]] = {"shot": shot["id"], "take": added["take"], "chosen": choose, "path": ctx.virtualize(part), "check": checked}
+        extra = [item for shot, item in takes.items() if shot != shot_id]
+        if extra:
+            target.apply([{"op": "log", "text": f"{shot_id} rendered together with {together}: " + "; ".join(f"{item['shot']} got take {item['take']}" + ("" if item["chosen"] else ", beside the take it uses")
+                                                                                                         for item in extra) + ".", "shot": shot_id}], by="system", record=False)
+        mine = takes[shot_id]
+        return {**mine, "media_id": entries[0].get("media_id"), "duration_s": round((lead["source_range"][1] - lead["source_range"][0]) / fps, 3), "rendered_with": extra,
+                **({"note": f"{shot_id} rendered in one request with {together}, which gives the model a window long enough to follow speech and singing; " + ", ".join(item["shot"] for item in extra)
+                    + " got a take too: judge them as well."} if extra else {"note": f"{shot_id} rendered in one request with {together} (left as they are), for a longer window."})}
 
     def speak(self, ctx, production: str, shot: str | list[str], lines: list[int] | None = None, new_take: bool = False) -> dict[str, Any]:
         """Speak the dialogue lines of a shot, or of several shots in one call (shot: a list of ids), and record each line's audio on it;
@@ -697,13 +860,17 @@ class ShowrunnerToolbox:
         return str(ctx.resolve(entries[0]["path"])), entries[0].get("media_id")
 
     @staticmethod
-    def _cast_pictures(doc: dict[str, Any], shot: dict[str, Any]) -> list[str]:
-        """One picture per cast member the shot shows: the look worn in the shot's sequence, else the master, else the first picture."""
+    def _pictured_cast(doc: dict[str, Any], shot: dict[str, Any]) -> list[tuple[dict[str, Any], str]]:
+        """Each cast member the shot shows with one picture of them: the look worn in the shot's sequence, else the master, else the first picture."""
         members = {member["id"]: member for member in doc["cast"]}
         def picture(member):
             look = model.look_for(member, shot)
             return look["master"] if look else member.get("master") or (member.get("images") or [None])[0]
-        return [path for cast_id in shot.get("cast") or [] if cast_id in members and (path := picture(members[cast_id]))]
+        return [(members[cast_id], path) for cast_id in shot.get("cast") or [] if cast_id in members and (path := picture(members[cast_id]))]
+
+    @classmethod
+    def _cast_pictures(cls, doc: dict[str, Any], shot: dict[str, Any]) -> list[str]:
+        return [path for _, path in cls._pictured_cast(doc, shot)]
 
     @staticmethod
     def _portable(ctx, target, settings: dict[str, Any]) -> dict[str, Any]:
@@ -789,7 +956,9 @@ class ShowrunnerToolbox:
 
     @staticmethod
     def _length_warning(doc: dict[str, Any]) -> list[str]:
-        """A plan far longer than the brief asks, or a finished cut short of it (a shorter plan may still be growing, sequence by sequence)."""
+        """A plan far longer than the brief asks, or a finished cut short of it (a shorter plan may still be growing, sequence by sequence). A remake lasts as long as its source."""
+        if doc["brief"].get("kind") == "remake":
+            return []
         wanted, cut = doc["brief"].get("duration_s") or (0.0 if doc["brief"].get("song") else model.DEFAULT_LENGTH_S), model.cut_length(doc)
         if wanted and cut < wanted * 0.85 and all(shot["takes"] for shot in doc["shots"] if shot.get("included", True)):
             return [f"The cut lasts {cut:.0f} s and the brief asks for about {wanted:.0f} s. Bring it close (more room on the shots that need it, another shot); if you keep it, say plainly in your report how far it falls short."]
@@ -1012,6 +1181,300 @@ class ShowrunnerToolbox:
                 "shots": len(cut), "left_out": [shot["id"] for shot in doc["shots"] if shot["included"] and not shot["takes"]], "sound": doc["edit"]["audio_mode"],
                 "tracks": len(doc["edit"]["audio_tracks"]), "text_overlays": len(doc["edit"]["overlays"]), "subtitles": subtitles,
                 "delivered": delivered, "targets": "-16 LUFS for a mix, -14 for a song alone; true peak under -1 dBTP"}  # measured: no need to parse the file
+
+    def ingest_source(self, ctx, production: str, change: Literal["people", "scene"], cuts: list[int] | None = None, max_frames: int | None = None) -> dict[str, Any]:
+        """A remake's first step: bring the brief's source video to the template's frame rate, find its cuts and write one shot per camera shot. A shot too long for one window becomes a chain its
+        template continues by itself. change, from what the brief asks, picks the template of the shots: people (people_edits) or scene (scene_edits); give another shot the other one with
+        update_shot. cuts: your corrections, as first frames of the new shots, when the returned ones are wrong: call again before anything is rendered. Returns the shots with their source
+        ranges and `seen`, what Inspect Video finds in each, and what the template needs prepared: painted frames, references, a mask, or only the prompt."""
+        from shared.deepy import video_edit
+
+        target = self._production(ctx, production)
+        doc = target.snapshot()
+        if doc["brief"].get("kind") != "remake" or not doc["brief"].get("source"):
+            raise ValueError("ingest_source needs a remake with a source video in its brief.")
+        if any(shot["takes"] for shot in doc["shots"]):
+            raise ValueError("This remake's shots already have takes: its windows stay as they are.")
+        catalog = self._catalog(doc)
+        template = templates.effective(doc, catalog)["people_edits" if change == "people" else "scene_edits"]
+        entry = templates.resolve(catalog, template)
+        minimum, step, fps = entry["take_frames"]
+        offset, maximum = minimum % step, int(max_frames or entry["longest_frames"] or video_edit.DEFAULT_MAX_FRAMES)
+        hop = (entry.get("video_edit") or {}).get("continuation_overlap") or step + offset
+        ctx.progress(done=0, total=1, text="Reading the source video", force=True)
+        folder = target.folder / "media" / "source"
+        source = media.normalized_video(target.resolve(doc["brief"]["source"]), fps, folder)
+        rate = media.frame_rate(source)  # one clock, the source's real rate: its frames are the takes' one to one, and the sound of every window is counted on it
+        detected = video_edit.detect_cuts(str(source), rate, own_frames=True)
+        chosen = detected["cuts"] if cuts is None else sorted(int(cut) for cut in cuts)
+        groups = video_edit.plan_camera_shots(chosen, detected["frames"], max_frames=maximum, min_frames=minimum, hop=hop, step=step, offset=offset)
+        canvas = media.fitted_canvas(source, doc["brief"]["resolution"], entry.get("pixels"))
+        shots = []
+        for group in groups:
+            start, stop = group["own"]
+            poster = media.poster(source, folder / f"{source.stem}-{start}-{stop - start}-poster.jpg", at_s=(start + stop) / 2 / rate)  # what the Board shows until the shot has a take
+            # the shot's part of the source, read as it is: WanGP fits a virtual control video to the lengths its model renders, and delivers exactly its frames
+            guide = target.rel(write_view(target.folder / "media" / "views" / f"{source.stem}-{start}-{stop - start}{source.suffix}", source, start, stop - 1))
+            settings = {"video_guide": guide, "video_length": stop - start, **({"force_fps": str(rate)} if abs(rate - fps) >= media.NEAR_RATE else {})}
+            if group["windows"] > 1:
+                settings.update(sliding_window_size=maximum, sliding_window_overlap=hop, multi_prompts_gen_type="PW")
+            shots.append({"title": f"{start / rate:.1f} to {stop / rate:.1f} s", "duration_s": round((stop - start) / rate, 3), "source_range": [start, stop], "source_poster": target.rel(poster),
+                          "trim": [0.0, round((stop - start) / rate, 3)], "generation": {"template": template, "settings": settings}})
+        subtitles = [{"path": target.rel(track["path"]), "language": track["language"]} for track in media.video_subtitles(target.resolve(doc["brief"]["source"]), folder)]  # its timing stays: so do the words shown over it
+        results = self._apply(target, [{"op": "remake", "source": {"path": target.rel(source), "fps": rate, "frames": detected["frames"], "cuts": chosen}},
+                                       {"op": "replace_plan", "shots": shots}, {"op": "brief", "fields": {"duration_s": round(detected["frames"] / rate, 3)}}, {"op": "edit", "fields": {"fps": rate, **({"subtitles": subtitles} if subtitles else {})}}])
+        target.apply([{"op": "stage", "stage": "planning"}], by="system", record=False)
+        created = next(result["shots"] for result in results if "shots" in result)
+        edit = entry.get("video_edit") or {}
+        source_name = ctx.virtualize(str(source))
+        seen = self._look_at_shots(ctx, target, source_name, created, [group["own"] for group in groups], rate)
+        return {"revision": target.doc["revision"], "source": source_name, "fps": rate, "frames": detected["frames"], "cuts": chosen, "canvas": canvas, "template": template,
+                "needs": {"painted_frames": edit.get("input") == "painted_frames", "references": entry["refs"], "mask": entry["needs_mask"], "max_images": edit.get("max_images")},
+                "shots": [{"shot": shot_id, "source_range": item["source_range"], "windows": group["windows"], "seen": seen.get(shot_id)} for shot_id, item, group in zip(created, shots, groups)]}
+
+    def _look_at_shots(self, ctx, target, source: str, shots: list[str], owns: list[list[int]], fps: float) -> dict[str, str]:
+        """Inspect Video on each camera shot, for what the plan decides from: is anything the brief changes in this shot, and how many painted frames does it take. A director that looks by itself takes a
+        frame or two per shot, all shots in one question. It is not told the brief: told of a figure to replace, it finds that figure even where there is none. Its range stays 3 frames from each cut: it
+        samples up to the range's last frame, and a range ending on the cut would show the next camera shot."""
+        seen = {}
+        for index, (shot, (own_start, own_end)) in enumerate(zip(shots, owns)):
+            if ctx.cancelled():
+                break
+            ctx.progress(done=index, total=len(shots), text=f"Looking at Shot {index + 1}/{len(shots)}", force=True)
+            start_s, end_s = (own_start + 3) / fps, (own_end - 4) / fps
+            question = (f"These pictures are evenly spaced frames of one camera shot of a video, in order, from {start_s:.1f} s to {end_s:.1f} s of the video. Say who and what is in the shot: every person, animal, robot or character, "
+                        "or nobody. Say how each one's face shows over the shot: frontal, in profile, from behind, hidden or too small to see. Say what changes and at about which second of the video: someone entering or leaving, "
+                        "a face turning, the framing, the place (a change of place is a cut). At most five short sentences.")
+            try:
+                result = ctx.call("wangp_toolbox", {"action": "inspect_video", "arguments": {"media_id": source, "start_s": start_s, "end_s": end_s, "question": question, "mid_res_sampling": True}})
+            except Exception as error:  # the shots are written: the director looks by itself
+                print(f"[Showrunner] Could not look at {shot}: {error}", flush=True)
+                continue
+            result = result.get("result") or result
+            if answer := result.get("answer"):
+                measured = [f"Measured: the picture cuts at frame {round(time * fps)}." for time in result.get("cut_times_seconds") or []] + [f"Measured: black from {begin:g} to {stop:g} s." for begin, stop in result.get("black_ranges_seconds") or []]
+                seen[shot] = " ".join([answer, *measured])
+                target.apply([{"op": "update_shot", "shot": shot, "fields": {"seen": seen[shot]}}], by="system", record=False)
+        return seen
+
+    @staticmethod
+    def _from_behind(person: dict[str, Any]) -> bool:
+        return re.search(r"\bback of\b|from behind", str(person.get("where") or ""), re.IGNORECASE) is not None
+
+    @classmethod
+    def _swap_prompt(cls, people: list[dict[str, Any]], names: dict[str, str], note: str | None = None) -> str:
+        """What the painter reads to replace people, each in the inspector's words for how they stand in this frame, those seen from behind last. Few other words: the frame must stay the frame, and long rules did not hold it. Told of someone
+        seen from behind without more, it draws them a face."""
+        changed = sorted((person for person in people if person.get("becomes")), key=cls._from_behind)
+        name = lambda person: names[str(person["becomes"]).casefold()]  # noqa: E731
+        sheets = {name(person): number for number, person in enumerate({name(person): person for person in changed}.values(), 2)}
+        where = lambda person: f" ({person['where']})" if str(person.get("where") or "").strip() else ""  # noqa: E731
+        lines = [f"Picture 1 is a frame of a video.", *(f"Picture {number} is the character sheet of {member}." for member, number in sheets.items())]
+        for person in changed:
+            member = name(person)
+            lines.append(f"Change {person['who']} in Picture 1{where(person)} into {member} seen from behind, as in the back view of Picture {sheets[member]}: only the back of the head and shoulders, no face, the same size and place, as blurred as in Picture 1." if cls._from_behind(person)
+                         else f"Replace {person['who']} in Picture 1{where(person)} with {member} from Picture {sheets[member]}: face, hair, skin and clothes all become {member}'s, in the same size and place, with the same head angle, gaze and mouth.")
+        stays = "; ".join(f"{person['who']}{where(person)}" for person in people if not person.get("becomes"))
+        return " ".join(filter(None, [*lines, f"Leave unchanged: {stays}." if stays else "", str(note or "").strip(), "The background, light and framing stay exactly as in Picture 1."]))
+
+    def _paint_people(self, ctx, target, template: str, frame_path: Path, people: list[dict[str, Any]], named: dict[str, tuple[dict[str, Any], str]], note: str | None, size: str) -> Path | None:
+        """The frame with everyone replaced in one draw. A draw that leaves a large person as they were is drawn again. Returns the picture, or None when nothing changed."""
+        changed = list({str(person["becomes"]).casefold(): named[str(person["becomes"]).casefold()] for person in sorted((person for person in people if person.get("becomes")), key=self._from_behind)}.values())
+        settings = {"template": template, "prompt": self._swap_prompt(people, {key: member["name"] for key, (member, _) in named.items()}, note), "resolution": size,  # a picture is made once, at the target: a draft and its final use the same one
+                    "image_refs": [ctx.virtualize(str(path)) for path in (frame_path, *(target.resolve(sheet) for _, sheet in changed))]}
+        heads = [int(value) for person in people for match in re.findall(r"(\d{1,3})(?:\s*-\s*(\d{1,3}))?\s*%", str(person.get("where") or "")) for value in match if value]
+        for draw in range(PAINT_DRAWS):
+            ctx.progress(done=draw, total=PAINT_DRAWS, text="Painting the Frame", force=True)
+            entries = media_entries(ctx.call("wangp_generate", {"settings": settings}))
+            drawn = ctx.resolve(entries[0]["path"]) if entries else None
+            if drawn is not None and (max(heads, default=0) < LARGE_HEAD or media.changed_share(frame_path, drawn) >= SAME_PICTURE):
+                return drawn
+        return None
+
+    @staticmethod
+    def _shot_frame(doc: dict[str, Any], shot: str, frame: int) -> dict[str, Any]:
+        item = model.find(doc["shots"], shot, "shot")
+        if not item.get("source_range") or not doc.get("remake"):
+            raise ValueError("This is for a remake's shots: run ingest_source first.")
+        start, stop = item["source_range"]
+        if not start <= int(frame) < stop:
+            raise ValueError(f"Frame {frame} is outside this shot's source range {start} to {stop - 1}.")
+        return item
+
+    @staticmethod
+    def _people_in(ctx, picture: str, question: str = FRAME_PEOPLE) -> str | None:
+        """The visual inspector on one picture. None for a caller without an inspector, who looks with its own eyes."""
+        try:
+            result = ctx.call("wangp_toolbox", {"action": "inspect_media", "arguments": {"media_inputs": [{"media_id": picture}], "question": question}})
+        except Exception as error:
+            print(f"[Showrunner] The inspector did not look at {picture}: {error}", flush=True)
+            return None
+        return (result.get("result") or result).get("answer") or None
+
+    @staticmethod
+    def _painted_faults(before: str | None, after: str | None) -> list[str]:
+        """What can be told from the inspector's numbers and words alone, the two pictures described apart. Its head sizes are rough: only a large loss counts."""
+        if not before or not after:
+            return []
+        faults = []
+        heads = [max((int(value) for match in re.findall(r"(\d{1,3})(?:\s*-\s*(\d{1,3}))?\s*%", text) for value in match if value), default=0) for text in (before, after)]
+        if heads[0] and heads[1] and heads[1] < 0.6 * heads[0]:
+            faults.append(f"The largest head went from about {heads[0]} % of the picture's height to about {heads[1]} %: the framing is lost.")
+
+        def camera(text):
+            found = re.search(r"camera[^\n]*(?:\n[^\n]*)?", text, re.IGNORECASE)
+            return next((rank for word, rank in (("extreme", 0), ("medium", 2), ("wide", 3), ("close", 1)) if found and word in found.group(0).lower()), None)
+        ranks = camera(before), camera(after)
+        if None not in ranks and ranks[1] > ranks[0]:
+            faults.append("The camera is wider than in the source.")
+        return faults
+
+    def make_sheet(self, ctx, production: str, member: str, style: str = "as a photorealistic studio photograph") -> dict[str, Any]:
+        """A remake: a cast member's character sheet, which becomes their picture: a large portrait beside their whole body from the front, the side and the back, on plain grey. From their `description` (their looks and complete
+        outfit, nothing about whom they replace), or from their photo when they have `images`. style: how it is drawn, for instance "as a stylized 3D animated character". The painter takes their looks from it and, unlike from a
+        posed picture, no framing or expression."""
+        target = self._production(ctx, production)
+        doc = target.snapshot()
+        found = next((item for item in doc["cast"] if member == item["id"] or member.casefold() == item["name"].casefold()), None)
+        if found is None:
+            raise ValueError(f"{member} is not in the cast. Add them with cast first.")
+        description = str(found.get("description") or "").strip().rstrip(".")
+        if not description:
+            raise ValueError(f"{found['name']} has no description: give their looks and complete outfit with cast first.")
+        picks = templates.effective(doc, self._catalog(doc))
+        photo = (found.get("images") or [None])[0]
+        settings = {"template": picks.get("image_edits"), "prompt": SHEET_FROM_PHOTO.format(style=style, description=description), "image_refs": [ctx.virtualize(str(target.resolve(photo)))], "video_prompt_type": "I", "resolution": SHEET_SIZE} if photo else \
+            {"template": picks.get("images"), "prompt": SHEET_FROM_WORDS.format(style=style, description=description), "resolution": SHEET_SIZE}
+        ctx.progress(done=0, total=1, text=f"Drawing the Character Sheet of {found['name']}", force=True)
+        entries = media_entries(ctx.call("wangp_generate", {"settings": settings}))
+        if not entries:
+            return {"member": found["name"], "error": "the image model returned no picture"}
+        sheet = target.adopt(ctx.resolve(entries[0]["path"]))
+        self._apply(target, [{"op": "update_cast", "cast": found["id"], "fields": {"master": sheet}}])
+        return {"revision": target.doc["revision"], "member": found["name"], "sheet": ctx.virtualize(str(target.resolve(sheet))), "note": "A sheet keeps this size whatever the production's format: do not crop or resize it, its views would be cut."}
+
+    def look_at_frame(self, ctx, production: str, shot: str, frame: int) -> dict[str, Any]:
+        """A remake: what the visual inspector sees in a frame of the shot's source, numbered as in the source, person by person: where they are, how large, what shows of them, their expression, sharp or blurred. Call it before
+        paint_frame: you direct the painter from these words, for this frame, and it is what the painted picture is verified against."""
+        target = self._production(ctx, production)
+        doc = target.snapshot()
+        item = self._shot_frame(doc, shot, frame)
+        source_frame = media.video_frame(target.resolve(doc["remake"]["path"]), int(frame), target.folder / "media" / "painted")
+        name = ctx.virtualize(str(source_frame))
+        seen = self._people_in(ctx, name, FRAME_POSES)
+        if not seen:
+            raise ValueError(f"The inspector could not look at frame {frame}: look at {name} with your own eyes, and paint it with your instruction and references.")
+        target.apply([{"op": "update_shot", "shot": shot, "fields": {"looked": {**(item.get("looked") or {}), str(int(frame)): {"poses": seen, "before": self._people_in(ctx, name)}}}}], by="system", record=False)
+        return {"shot": shot, "frame": int(frame), "source_frame": name, "people": seen,
+                "next": "paint_frame with `people`: one entry per person listed here, with who (the woman), where (the inspector's words for them, unchanged) and becomes (a cast member's name, or null for someone who stays as they are)."}
+
+    def paint_frame(self, ctx, production: str, shot: str, frame: int, people: list[dict[str, Any]] | None = None, instruction: str | None = None, picture: str | None = None, references: list[str] | None = None, pin: bool = True, unchanged: bool = False) -> dict[str, Any]:
+        """A remake: a frame of the shot's source, numbered as in the source, changed by the image editor. When people are replaced: look_at_frame first, then `people`, one entry per person it listed: who (the woman), where (the
+        inspector's words for them), becomes (a cast member's name, or null for someone who stays as they are); `instruction` then adds what is special in this frame. For any other change: `instruction`, with `references`. Or
+        your own finished `picture`, or the source frame as it is (`unchanged`, for a camera setup the change does not touch, to hold it in the shot). It becomes one of the shot's painted frames, in source order; painting the same
+        frame again replaces it, and each try draws differently. pin: the take passes through that picture at that moment (all frames of a shot are pinned or none); keep it on when people are replaced. Returns the source frame and the picture; when people are
+        replaced `before` and `after`, what the inspector sees in each, `faults` measured from them, and `verify`; otherwise `comparison`: read them before you go on."""
+        target = self._production(ctx, production)
+        doc = target.snapshot()
+        item = self._shot_frame(doc, shot, frame)
+        start = item["source_range"][0]
+        catalog = self._catalog(doc)
+        entry = templates.resolve(catalog, item["generation"].get("template"))
+        limit = ((entry or {}).get("video_edit") or {}).get("max_images") or 4
+        kept = [painted for painted in item.get("painted_frames") or [] if painted["frame"] != int(frame)]
+        if len(kept) >= limit:
+            raise ValueError(f"This shot's template takes {limit} painted frames: paint one of those again, or give the shot fewer.")
+        tries = next((painted.get("tries", 1) for painted in item.get("painted_frames") or [] if painted["frame"] == int(frame)), 0) + 1
+        swap = ((entry or {}).get("video_edit") or {}).get("kind") == "swap"
+        looked = (item.get("looked") or {}).get(str(int(frame)))
+        before = (looked or {}).get("before")
+        folder = target.folder / "media" / "painted"
+        source_frame = media.video_frame(target.resolve(doc["remake"]["path"]), int(frame), folder)
+        if unchanged:
+            painted_path = source_frame
+        elif picture:
+            painted_path = ctx.resolve(picture)
+        else:
+            directed = swap and references is None
+            pictured = [] if references is not None else self._pictured_cast(doc, item)
+            if not pictured and references is None and (swap or templates.cast_with_pictures(doc)):
+                raise ValueError(f"Shot {shot} has no cast with a picture, so the painter would draw from words alone and the same person would look different in every frame. Give the shot its cast with update_shot first, "
+                                 "or pass references=[] when nobody of the cast is in this frame. Nothing was painted.")
+            template = templates.effective(doc, catalog).get("image_edits")
+            size = self.showrunner.shot_size(target, doc, item, final=True)
+            if directed:
+                if not looked:
+                    raise ValueError(f"Look at frame {frame} first with look_at_frame: you direct the painter from what this frame shows. Nothing was painted.")
+                if not people or not all(str(person.get("who") or "").strip() for person in people) or not any(person.get("becomes") for person in people):
+                    raise ValueError("Say in `people` what happens to everyone look_at_frame listed: who, where (its words for them) and becomes (a cast member's name, or null to stay as they are). Nothing was painted.")
+                named = {member["name"].casefold(): (member, path) for member, path in pictured}
+                if missing := list(dict.fromkeys(str(person["becomes"]) for person in people if person.get("becomes") and str(person["becomes"]).casefold() not in named)):
+                    raise ValueError(f"{', '.join(missing)} is not in this shot's cast with a picture: give the shot its cast with update_shot first. Nothing was painted.")
+                painted_path = self._paint_people(ctx, target, template, source_frame, people, named, instruction, size)
+                if painted_path is None:
+                    return {"shot": shot, "frame": int(frame), "error": f"The painter changed nobody in {PAINT_DRAWS} draws, so nothing was recorded. Call paint_frame again with the same people, or try another frame of this shot."}
+            else:
+                if not str(instruction or "").strip():
+                    raise ValueError("Give an instruction for the image editor, your own picture, or unchanged.")
+                pictures = [ctx.resolve(path) for path in references] if references is not None else [target.resolve(path) for _, path in pictured]
+                settings = {"template": template, "prompt": instruction, "image_refs": [ctx.virtualize(str(path)) for path in (source_frame, *pictures)], "resolution": size}  # a picture is made once, at the target: a draft and its final use the same one
+                ctx.progress(done=0, total=1, text=f"Painting a frame of {shot}", force=True)
+                entries = media_entries(ctx.call("wangp_generate", {"settings": settings}))
+                if not entries:
+                    return {"shot": shot, "frame": int(frame), "error": "the image editor returned no picture"}
+                painted_path = ctx.resolve(entries[0]["path"])
+            item = model.find(target.snapshot()["shots"], shot, "shot")  # frames painted side by side: what another call recorded while this one painted stays
+            kept = [painted for painted in item.get("painted_frames") or [] if painted["frame"] != int(frame)]
+            if len(kept) >= limit:
+                raise ValueError(f"This shot's template takes {limit} painted frames: paint one of those again, or give the shot fewer.")
+        painted = sorted([*kept, {"frame": int(frame), "path": target.adopt(painted_path), "source": target.rel(source_frame), "tries": tries}], key=lambda value: value["frame"])
+        settings = {**item["generation"]["settings"], "image_refs": [value["path"] for value in painted], "video_prompt_type": "FIVU" if pin else "IVU",
+                    "frames_positions": " ".join(str(value["frame"] - start + 1) for value in painted) if pin else ""}  # WanGP counts positions from 1
+        self._apply(target, [{"op": "update_shot", "shot": shot, "fields": {"painted_frames": painted, "generation": {**item["generation"], "settings": settings}}}])
+        source_name, picture_name = ctx.virtualize(str(source_frame)), ctx.virtualize(str(target.resolve(painted[[value["frame"] for value in painted].index(int(frame))]["path"])))
+        result = {"revision": target.doc["revision"], "shot": shot, "frame": int(frame), "source_frame": source_name, "picture": picture_name, "painted_frames": [value["frame"] for value in painted], "pinned": pin}
+        if unchanged:
+            return {**result, "comparison": None}
+        if not swap:
+            return {**result, "comparison": self._compare_painted(ctx, source_name, picture_name)}
+        ctx.progress(done=0, total=1, text=f"Checking the Painted Frame of {shot}", force=True)
+        before = before or self._people_in(ctx, source_name)
+        after = self._people_in(ctx, picture_name)
+        return {**result, "before": before, "after": after, "faults": self._painted_faults(before, after), "tries": tries, "verify": PAINT_VERIFY}
+
+    @staticmethod
+    def _compare_painted(ctx, source_frame: str, picture: str) -> str | None:
+        """The visual inspector on both pictures: who is in each and what differs. A wrong frame pulls its whole render toward it, and a director that keeps its plan in its head misses it. It is not told
+        what was asked: told of a figure to replace, it finds that figure in the source even where there is none. None for a caller without an inspector, who looks with its own eyes."""
+        question = ("The first picture is a frame of a video, the second the same frame after an edit. Say who is in each picture and where they stand, counting them; say so when a picture has nobody in it. Then say in one or two short "
+                    "sentences what differs: a person, animal or object added, removed or swapped, a pose, the framing, the background.")
+        try:
+            result = ctx.call("wangp_toolbox", {"action": "inspect_media", "arguments": {"media_inputs": [{"media_id": source_frame}, {"media_id": picture}], "question": question}})
+        except Exception as error:  # the frame is painted and recorded: only its check is missing
+            print(f"[Showrunner] No comparison of the painted frame: {error}", flush=True)
+            return None
+        return (result.get("result") or result).get("answer") or None
+
+    def check_take(self, ctx, production: str, shot: str, take: str | None = None) -> dict[str, Any]:
+        """A remake: measure a shot's take (by default its last) against the source clip it was rendered from: source cuts moved by 8 frames or more or dropped, cuts added, black bands growing at an
+        edge. A band comes from a painted frame carrying it: repaint that frame. It measures timing and borders, not identity: still look at the take. Give the result to verdict as checks."""
+        from shared.deepy import video_edit
+
+        target = self._production(ctx, production, read=True)
+        doc = target.snapshot()
+        item = model.find(doc["shots"], shot, "shot")
+        if not item.get("source_range") or not doc.get("remake"):
+            raise ValueError("check_take is for a remake's shots.")
+        recorded = model.find(item["takes"], take, "take") if take else (item["takes"] or [None])[-1]
+        if recorded is None:
+            raise ValueError(f"Shot {shot} has no take yet.")
+        fps, start = doc["remake"]["fps"], item["source_range"][0]
+        known = tuple(cut - start for cut in doc["remake"]["cuts"] if start < cut < item["source_range"][1])
+        trim = (list(item.get("trim") or []) + [0.0, None])[:2]
+        result = video_edit.check_take(str(target.resolve(doc["remake"]["path"])), str(target.resolve(recorded["path"])), source_start=start, own_start=round(float(trim[0] or 0.0) * fps),
+                                       own_end=None if trim[1] is None else round(float(trim[1]) * fps), known_cuts=known, fps=None)
+        result["cut_faults"] = [{**fault, "means": CUT_FAULTS[fault["fault"]]} for fault in result["cut_faults"]]
+        return {"shot": shot, "take": recorded["id"], **result}
 
     def log(self, ctx, production: str, text: str, shot: str | None = None) -> dict[str, Any]:
         target = self._production(ctx, production)

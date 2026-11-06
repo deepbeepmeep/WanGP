@@ -71,12 +71,13 @@ def install_gdn_decode(model):
     capability = torch.cuda.get_device_capability(0)
     if capability[0] < 8:
         return _install_turing_recurrence(model, capability)
+    from shared.kernels import gdn_fused
     validated_launches = capability == (12, 0)
     count = 0
     for block in model.blk:
         # The 27B hidden-width reduction benefits from more threads for a
         # single decode row. Other widths/batches retain defaults.
-        for norm in (block.attn_norm, block.post_attention_norm):
+        for norm in (block.attn_norm, block.post_attention_norm) if hasattr(block, "attn_norm") else ():  # models with hyper-connections have no layer norms
             if validated_launches and norm.weight.numel() == 5120:
                 norm._small_batch_num_warps = 16
         if block.layer_type != "linear_attention":
@@ -93,6 +94,9 @@ def install_gdn_decode(model):
             # instead of storing a snapshot per draft token; checked launches first verify that it is exact.
             block._gdn_replay_verification = validated_launches
             block._gdn_replay_probe = None if validated_launches else probe_replay_verification
+            if validated_launches and gdn_fused.ENABLED and gdn_fused.eligible(block):
+                block._gdn_fused = gdn_fused.mixer
+                block._gdn_state_dtype = gdn_fused.STATE_DTYPE
             count += 1
     if count:
         mode = "Validated SM120 Launches" if validated_launches else "Numerical Checks Before Capture"

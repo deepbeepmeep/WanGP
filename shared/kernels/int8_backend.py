@@ -393,16 +393,11 @@ def can_fuse_linear(module, x, dtypes=(torch.bfloat16,), act=None):
     Callers widen `dtypes` only for activation dtypes validated with their model; act is the input operation they want fused
     ('rms_norm', 'swiglu', or 'gelu', which only WGPKernels provide).
     WGPKernels fuse with the precision of their unfused linears (full precision or per-block activations, input operations in FP32,
-    one rounding), whatever the kernel precision setting; Comfy Kitchen's rowwise fusions need the fast (approximate) setting.
-    A layer with LoRAs keeps a fused residual with WGPKernels, its LoRAs added to the output by MMGP; an input operation stays out, since
-    their first factor reads the transformed input."""
+    one rounding), whatever the kernel precision setting; Comfy Kitchen's rowwise fusions need the fast (approximate) setting."""
+    from mmgp.offload import lora_active
     if (torch.compiler.is_compiling() or not torch.is_inference_mode_enabled() or triton._is_fake_tensor(x) or not x.is_cuda
-            or x.dtype not in dtypes):
+            or x.dtype not in dtypes or lora_active(module)):
         return False
-    if getattr(module, '_mm_lora_old_forward', None) and getattr(module, '_mm_lora_data', None) != {}:
-        from mmgp import offload
-        if act is not None or _backend != "wgpkernels" or not offload.fusion_with_loras(module):
-            return False
     if _backend == "wgpkernels":
         group = getattr(module, '_convrot_group_size', 0)
         quanto = group == 0 and getattr(getattr(module, 'weight_qtype', None), 'name', None) == "qint8"  # plain INT8 (Quanto files)
@@ -504,6 +499,7 @@ def linear_grouped(modules, x):
     WGPKernels prepare all rows at once for their path (rows are independent). No
     weights are packed or cached, so MMGP retains their lifetime and residency.
     """
+    from mmgp.offload import lora_active
     group = getattr(modules[0], '_convrot_group_size', 0)
     common = (torch.is_inference_mode_enabled() and not torch.compiler.is_compiling() and not triton._is_fake_tensor(x) and x.is_cuda
               and x.ndim == 3 and x.is_contiguous() and len(modules) == x.shape[0]
@@ -512,8 +508,7 @@ def linear_grouped(modules, x):
                       and module.in_features == x.shape[2] and module.out_features == modules[0].out_features
                       and not getattr(module, '_wangp_linear_fusion', None)
                       and not getattr(module, '_wangp_prequantized_input', None)
-                      and (not getattr(module, '_mm_lora_old_forward', None)
-                           or getattr(module, '_mm_lora_data', None) == {}) for module in modules))
+                      and not lora_active(module) for module in modules))
     if (_backend == "wgpkernels" and common and group in (16, 64, 256) and x.dtype in (torch.bfloat16, torch.float16) and x.shape[2] % 16 == 0
             and x.numel() * 2 <= _SCRATCH_BYTES and x.data_ptr() % 16 == 0):
         tokens = x.shape[1]

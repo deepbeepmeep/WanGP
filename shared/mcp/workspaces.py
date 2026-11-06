@@ -201,7 +201,7 @@ class AgentWorkspaces:
         if name != 'wangp_toolbox' or arguments.get('action') is None or arguments.get('arguments') is None:
             return False
         action = arguments['action']
-        if action in ('media_settings', 'inspect_media', 'inspect_video', 'view_media', 'check_lip_sync'):
+        if action in ('media_settings', 'inspect_media', 'inspect_video', 'view_media', 'check_lip_sync', 'detect_video_cuts', 'plan_video_windows', 'check_video_edit'):
             return False
         return action != 'inspect_audio' or bool(arguments['arguments'].get('preview'))
 

@@ -969,6 +969,17 @@ class Qwen35AssistantRuntime:
     def _get_linear_state_modules(self):
         return [module for module in self._get_live_llm().model_runner.model.blk if module.layer_type == "linear_attention"]
 
+    def _get_position_state_modules(self):
+        # state kept by position beside the recurrent layers (the rings of indexed attention and of the n-gram layer)
+        return [module for module in self._get_live_llm().model_runner.model.modules() if hasattr(module, "snapshot_sequence_state") and module.__class__.__name__ in ("IndexedAttention", "Qwen4ExpPLE")]
+
+    def _snapshot_position_states(self):
+        return [module.snapshot_sequence_state() for module in self._get_position_state_modules()]
+
+    def _restore_position_states(self, saved):
+        for module, state in zip(self._get_position_state_modules(), saved or ()):
+            module.restore_sequence_state(state)
+
     def _snapshot_linear_states(self):
         sources = [tensor.detach().as_subclass(torch.Tensor) for module in self._get_linear_state_modules() for tensor in (module.conv_state_buffer, module.recurrent_state_buffer)]
         if not sources:
@@ -1117,7 +1128,10 @@ class Qwen35AssistantRuntime:
         speculative = bool(getattr(self.model, "_prompt_enhancer_speculative_decoding", False))
         # Without MTP, the first decode step processes the final context token,
         # so the scheduled prefill leaves it for the suffix path below.
-        initial_token_ids = normalized_token_ids[:_ASSISTANT_PREFILL_CHUNK_TOKENS if speculative else min(_ASSISTANT_PREFILL_CHUNK_TOKENS, len(normalized_token_ids) - 1)]
+        chunk_tokens = self._prefill_chunk_tokens(len(normalized_token_ids))
+        initial_token_ids = normalized_token_ids[:chunk_tokens if speculative else min(chunk_tokens, len(normalized_token_ids) - 1)]
+        self._read_ahead(normalized_token_ids, 0, len(initial_token_ids))
+        self._read_ahead(normalized_token_ids, len(initial_token_ids), len(initial_token_ids) + chunk_tokens)
         seq = Sequence(initial_token_ids, SamplingParams(max_tokens=1, ignore_eos=True))
         seq._assistant_context_id = uuid4().hex
         llm.scheduler.add(seq)
@@ -1135,8 +1149,21 @@ class Qwen35AssistantRuntime:
         self._log(f"Primed assistant context with {len(normalized_token_ids)} tokens.")
         return seq
 
-    def _chunk_prefill_suffix(self, seq: Sequence, token_ids: list[int], chunk_tokens: int = _ASSISTANT_PREFILL_CHUNK_TOKENS, processed_tokens: int | None = None) -> Sequence:
+    def _read_ahead(self, token_ids: list[int], start: int, stop: int) -> None:
+        read_ahead = getattr(self.model, "lm_engine_read_ahead", None)
+        if read_ahead is not None:
+            read_ahead(token_ids, start, min(stop, len(token_ids)))
+
+    def _prefill_chunk_tokens(self, tokens: int | None = None) -> int:
+        # tokens about to be read: a model may choose its chunks by the free VRAM
+        choose = getattr(self.model, "lm_engine_prefill_chunk", None)
+        if tokens and choose is not None:
+            return choose(tokens)
+        return int(getattr(self.model, "_prefill_chunk_tokens", 0)) or _ASSISTANT_PREFILL_CHUNK_TOKENS
+
+    def _chunk_prefill_suffix(self, seq: Sequence, token_ids: list[int], chunk_tokens: int | None = None, processed_tokens: int | None = None) -> Sequence:
         suffix = [int(token_id) for token_id in list(token_ids or [])]
+        chunk_tokens = chunk_tokens or self._prefill_chunk_tokens(len(suffix))
         if suffix and seq.token_ids and suffix[0] == int(seq.token_ids[-1]) == self._single_token_id("<|im_end|>"):
             suffix = suffix[1:]  # a response that sampled its own end of turn (after parallel tool calls) keeps it once, as the chat format writes it
         if len(suffix) == 0:
@@ -1159,6 +1186,7 @@ class Qwen35AssistantRuntime:
             for chunk_index, chunk_start in enumerate(range(0, total_suffix_tokens, chunk_tokens), start=1):
                 chunk_started_at = time.perf_counter()
                 chunk = suffix[chunk_start : chunk_start + chunk_tokens]
+                self._read_ahead(suffix, chunk_start + chunk_tokens, chunk_start + 2 * chunk_tokens)
                 old_num_tokens = int(seq.num_tokens)
                 seq.token_ids.extend(chunk)
                 seq.last_token = int(seq.token_ids[-1])
@@ -1808,6 +1836,7 @@ class Qwen35AssistantRuntime:
                            for name, (tensor, axis) in runner.kv_snapshot_items().items()},
             "kv_overlay": runner.snapshot_overlay(seq),
             "linear_states": self._snapshot_linear_states(),
+            "position_states": self._snapshot_position_states(),
             "speculative_state": runner.snapshot_speculative_state(seq.seq_id, previous=None if previous is None else previous["speculative_state"], reuse_tokens=reuse_tokens) if bool(getattr(self.model, "_prompt_enhancer_speculative_decoding", False)) else None,
             "generation_state": {
                 "sampling": self.snapshot_sampling_state(),
@@ -1844,6 +1873,7 @@ class Qwen35AssistantRuntime:
             "num_cached_tokens": int(seq.num_cached_tokens),
             "block_table": [int(block_id) for block_id in seq.block_table],
             "linear_states": context_snapshot["linear_states"] if context_snapshot is not None else self._snapshot_linear_states(),
+            "position_states": context_snapshot["position_states"] if context_snapshot is not None else self._snapshot_position_states(),
             "speculative_state": speculative_state,
         }
 
@@ -1887,6 +1917,7 @@ class Qwen35AssistantRuntime:
             for module, saved_state in zip(linear_modules, linear_states):
                 module.conv_state_buffer.copy_(saved_state["conv"])
                 module.recurrent_state_buffer.copy_(saved_state["recurrent"])
+            self._restore_position_states(snapshot.get("position_states"))
         speculative_state = snapshot.get("speculative_state")
         if speculative_state is not None:
             runner.restore_speculative_rewind_state(seq.seq_id, speculative_state)
@@ -1947,6 +1978,7 @@ class Qwen35AssistantRuntime:
                     raise RuntimeError("Assistant linear-state snapshot tensor shape mismatch.")
                 module.conv_state_buffer.copy_(saved_conv)
                 module.recurrent_state_buffer.copy_(saved_recurrent)
+            self._restore_position_states(snapshot.get("position_states"))
         saved_block_manager = snapshot["block_manager"]
         llm.scheduler.block_manager = BlockManager(len(saved_block_manager["blocks"]), int(saved_block_manager["block_size"]), _kv_overlay_slots(llm.config))
         for block, saved_block in zip(llm.scheduler.block_manager.blocks, saved_block_manager["blocks"]):

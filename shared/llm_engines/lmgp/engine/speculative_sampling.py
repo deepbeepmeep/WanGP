@@ -2,6 +2,8 @@
 import time
 import torch
 
+from ..layers.draft_chain import CompactDrafts
+
 
 def bounded_support(seq):
     """Whether fixed-capacity filtering can reproduce the sampler's support."""
@@ -18,6 +20,16 @@ def can_batch_acceptance(runner, seq):
                  or callable(getattr(processor, "_speculative_batch_rules", None))))
 
 
+def capture_sampling_graph(runner, compute):
+    """The sampling graphs are captured when a shape or rule first comes up, with the model already filling the VRAM, and replayed one at a time, their retained outputs
+    read at once: they share one graph pool, as a pool holds whole 32 MiB chunks however little its graph needs (about 1.4 MiB each, up to 8 + 8 of them)."""
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, pool=runner._sampling_graph_pool, capture_error_mode="thread_local"):
+        result = compute()
+    runner._sampling_graph_pool = graph.pool()
+    return graph, result
+
+
 def draft_probabilities(runner, seq, logits):
     """Filter native MTP proposals without dynamic candidate extraction."""
     from .dflash_sampling import target_probabilities
@@ -31,9 +43,7 @@ def draft_probabilities(runner, seq, logits):
         values = logits[None].clone()
         top_k = None if seq.top_k is None else min(seq.top_k, logits.numel())
         target_probabilities(values, top_k, seq.top_p, seq.min_p, seq.temperature)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, capture_error_mode="thread_local"):
-            probabilities, _ = target_probabilities(values, top_k, seq.top_p, seq.min_p, seq.temperature)
+        graph, (probabilities, _) = capture_sampling_graph(runner, lambda: target_probabilities(values, top_k, seq.top_p, seq.min_p, seq.temperature))
         state = graph, values, probabilities
     graphs[key] = state
     graph, values, probabilities = state
@@ -62,8 +72,9 @@ def sample_verified_block(runner, seq, logits, draft_tokens, draft_distributions
     if penalty != 1 and self._sync_repetition_token_cache(seq)["span"] != (False, False, False):
         penalty = 1.  # inside code, quotes or backticks: copied text, not repetition (drafted tokens of the block are approximated as outside)
     exempt = seq.repetition_exempt_ids if penalty != 1 else None
+    compact = isinstance(draft_distributions, CompactDrafts)
     key = (n, vocab, logits.dtype, seq.top_k, seq.top_p, seq.min_p, seq.temperature, penalty, exempt,
-           tuple(rules["suppressed"]), tuple(rules["thinking_stops"]), tuple(sorted(stop_ids)))
+           tuple(rules["suppressed"]), tuple(rules["thinking_stops"]), tuple(sorted(stop_ids)), compact)
     graphs = getattr(self, "_speculative_acceptance_graphs", None)
     if graphs is None:
         graphs = self._speculative_acceptance_graphs = {}
@@ -81,7 +92,7 @@ def sample_verified_block(runner, seq, logits, draft_tokens, draft_distributions
                 value.index_fill_(0, torch.tensor(valid, device=logits.device), True)
             return value
         state = dict(logits=logits.clone(), drafts=draft_tokens.clone(),
-                     q=torch.zeros((n, vocab), dtype=torch.float32, device=logits.device),
+                     q=draft_distributions.chain.q[:n] if compact else torch.zeros((n, vocab), dtype=torch.float32, device=logits.device),
                      length=torch.full((), n, dtype=torch.int64, device=logits.device),
                      history=mask(()), bias=torch.zeros_like(logits[0]),
                      suppressed=mask(rules["suppressed"]), thinking_stops=mask(rules["thinking_stops"]),
@@ -99,15 +110,15 @@ def sample_verified_block(runner, seq, logits, draft_tokens, draft_distributions
             return accept_block(probabilities, unsafe, state["drafts"], state["q"], state["length"],
                                 state["uniforms"], state["noise"], state["stops"], greedy=seq.top_k == 1)
         compute()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, capture_error_mode="thread_local"):
-            packed = compute()
+        graph, packed = capture_sampling_graph(self, compute)
         state.update(graph=graph, packed=packed)
     graphs[key] = state
     state["logits"].copy_(logits)
     state["drafts"].copy_(draft_tokens)
     state["length"].fill_(n) if valid_length is None else state["length"].copy_(valid_length)
-    if draft_distributions is not None:
+    if compact:
+        draft_distributions.load()
+    elif draft_distributions is not None:
         if all(q.numel() == vocab for q in draft_distributions):
             torch.stack(draft_distributions, out=state["q"])
         else:

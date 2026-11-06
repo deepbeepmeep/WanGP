@@ -286,7 +286,7 @@ class ProductionStore:
             except (OSError, ValueError, KeyError) as error:
                 items.append({"id": production_id, "title": production_id, "error": str(error)})
                 continue
-            posters = [take["poster"] for shot in doc["shots"] if (take := model.chosen_take(shot)) and take.get("poster")][:4]
+            posters = [poster for shot in doc["shots"] if (poster := (model.chosen_take(shot) or {}).get("poster") or shot.get("source_poster"))][:4]  # a remake's shot without a take shows its source
             items.append({"id": production_id, "title": doc["title"], "kind": doc["brief"]["kind"], "stage": doc["stage"], "updated": doc["updated"],
                           "created": doc["created"], "shots": len(doc["shots"]), "approved": sum(shot["status"] == "approved" for shot in doc["shots"]),
                           "rendered": sum(bool(shot["takes"]) for shot in doc["shots"]), "duration_s": model.cut_length(doc),

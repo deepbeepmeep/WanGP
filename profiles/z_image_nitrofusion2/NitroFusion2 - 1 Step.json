@@ -1,0 +1,9 @@
+{
+    "activated_loras": [],
+    "loras_multipliers": "",
+    "num_inference_steps": 1,
+    "flow_shift": 3.0,
+    "guidance_scale": 0,
+    "profile_priority": 10,
+    "help": "Fastest: a single step, without the De-distillation LoRA."
+}

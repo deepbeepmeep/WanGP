@@ -1,0 +1,20 @@
+{
+    "image_mode": 0,
+    "guidance_scale": 1,
+    "flow_shift": 12,
+    "sample_solver": "euler",
+    "guidance_phases": 1,
+    "num_inference_steps": 6,
+    "video_length": 124,
+    "sliding_window_size": 294,
+    "sliding_window_overlap": 17,
+    "resolution": "832x480",
+    "multi_prompts_gen_type": "PW",
+    "settings_version": 2.82,
+    "prompt_enhancer": "",
+    "video_prompt_type": "IVU",
+    "audio_prompt_type": "K",
+    "model_type": "viggle_remake_edit",
+    "prompt": "subject_definitions:\n<Video 1> is the source video for the target video edit.\n<Picture 1> is a frame of the target video, exactly as the target video shows it at that moment.\n<Subject 1> is the red delivery van parked at the right of the street in <Video 1>.\n<Subject 2> is the setting from <Video 1>: a quiet tree-lined street on a bright morning, with cyclists passing.\n\nsummary:\n[video editing] The target video is an edited version of <Video 1>. There is no delivery van: the kerb at the right of the street is empty, with exactly the same framing, camera motion, light and timing as <Video 1>.\n\nretention_analysis:\n<Video 1> (source video editing): fully_preserved - the framing, the camera motion, the street, the trees and the cyclists.\n<Picture 1> (target keyframe): fully_preserved - the target video passes through this exact frame.\n<Subject 1> (appears in [Shot 1]): removed - the van is gone in every frame; empty kerb and pavement are visible where it stood.\n<Subject 2> (appears in [Shot 1]): fully_preserved - the street, the trees and the light are retained.\n\ndetailed_description:\nClean, sharp street footage in bright morning light.\n[Shot 1] From 00:00.000 to 00:05.000 the camera drifts along <Subject 2> exactly as in <Video 1>. The scene matches <Picture 1> at 00:01.000. Cyclists pass the empty kerb at the right, with no van anywhere in the frame.\n\noverall_soundscape:\nThe soundtrack of <Video 1>, unchanged.\n\nnon_diegetic_music:\nN/A",
+    "type": "Viggle Remake Edit"
+}

@@ -28,6 +28,17 @@ class DeepyLoadingProgress:
             finished = completed == total
         self._status(text, desc, finished)
 
+    def scope(self):
+        """MMGP's loading context around a first call: the steps after the load (weights moved to the GPU, graph captures, experts placed,
+        the instructions read) reach the status as the load's do. Without cancellation: these steps run inside the model's calls."""
+        from mmgp import offload
+
+        def report(phase, completed, total, _model_id):
+            text = f"Loading - {phase} Deepy"
+            self._status(f"{text} - {completed:,}/{total:,}" if total else f"{text} - {completed:,}" if completed else text, text, total > 0 and completed == total)
+
+        return offload.loading_context(offload.LoadingCallback(None, report))
+
     def download(self, report):
         if report is None:
             self.filename = None

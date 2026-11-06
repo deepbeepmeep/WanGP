@@ -6,6 +6,7 @@ plugin's request in its own session and workspace (shown in the UI meanwhile), t
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import queue
 import re
@@ -16,6 +17,7 @@ import traceback
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterator
 
 from shared.api import ProgressUpdate, SessionEvent, WanGPSession, extract_status_phase_label
@@ -203,9 +205,9 @@ class DeepyJob:
                 self._scan(session, known)
                 if state["phase"] == "cancelled":
                     return True
-                if state["phase"] == "finished":
-                    # Steering interrupts the turn to continue with the new message: that is not a stop.
-                    return bool(state["interrupted"]) and (self._cancel.is_set() or not self._steers)
+                if state["phase"] == "finished" and (not self._steers or service._plugin_idle()):
+                    # Steering interrupts the turn to continue with the new message: that is not a stop, and the job follows that work until Deepy is done.
+                    return self._cancel.is_set() if self._steers else bool(state["interrupted"])
                 if self._cancel.is_set() and not stopping:
                     stopping = True
                     service.control("stop", {})
@@ -563,6 +565,37 @@ class DeepyClient:
                 return False
             service._deps.controller.release_vram(service._state)
         return True
+
+    @contextlib.contextmanager
+    def turn(self, cancelled=lambda: False):
+        """Deepy's turn, for a plugin's work on the GPU without Deepy (its own renders): it waits for the jobs and generations before it, in
+        order with the jobs waiting, takes Deepy's model out of VRAM, and jobs started meanwhile wait until it ends. When cancelled() turns
+        true while it waits, the body runs at once without the turn: check the cancel there."""
+        service, holder = self._service, SimpleNamespace(owner=self.owner)
+        with service._condition:
+            service._plugin_waiters.append(holder)
+        held = False
+        try:
+            while not held and not cancelled():
+                with service._condition:
+                    if not (service._plugin_waiters[0] is holder and service._plugin_job is None and service._plugin_idle()):
+                        service._condition.wait(timeout=1)
+                        continue
+                with service._mutation_lock:  # as a job starts: idle checked here stays idle
+                    if service._plugin_job is None and service._plugin_idle():
+                        service._plugin_job, held = holder, True
+                        service._deps.controller.release_vram(service._state)
+        finally:
+            with service._condition:
+                service._plugin_waiters.remove(holder)
+                service._condition.notify_all()
+        try:
+            yield
+        finally:
+            if held:
+                with service._condition:
+                    service._plugin_job = None
+                    service._condition.notify_all()
 
     def ensure_workspace(self, name: str, folder: str | os.PathLike) -> str:
         """The id of the workspace keeping its media in folder, created (with this name) the first time."""

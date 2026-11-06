@@ -633,6 +633,10 @@ class LocalFilePickerTextbox:
 .wangp-local-file-picker-content [data-testid="file-explorer"] {
     overflow-y: auto !important;
 }
+/* Gradio marks a closed folder's arrow, the only control that opens it, with the class "hidden": a page-wide .hidden rule must not remove it. */
+.wangp-local-file-picker-content .file-wrap .icon.hidden {
+    display: inline-flex !important;
+}
 .wangp-local-file-picker-exit-btn {
     align-self: flex-end !important;
     margin-top: 8px !important;

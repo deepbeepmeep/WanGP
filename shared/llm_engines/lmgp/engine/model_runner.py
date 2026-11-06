@@ -2,6 +2,7 @@
 # MIT License (see docs/third_party_licenses/MIT.txt). Modified for WanGP.
 # Modifications Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import gc
+import os
 import time
 import math
 import torch
@@ -10,10 +11,32 @@ from mmgp import cuda_graphs, transfer
 from ..config import Config
 from .sequence import Sequence
 from ..layers import kv_formats as kvf
-from .speculative_sampling import bounded_support, draft_probabilities
+from .draft_sources import SuffixDrafter, WindowCosts
+from .speculative_sampling import bounded_support, capture_sampling_graph, draft_probabilities
+from ..layers import draft_chain
+from ..layers.draft_chain import CompactDrafts
 from ..layers.sampler import Sampler, _REPETITION_INCREMENT_LIMIT, apply_min_p_mask_, apply_sparse_repetition_penalty_
 from ..utils.context import set_context, get_context, reset_context
 
+_OUTPUT_STAGE = "output_stage" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the logits of a window in a graph, until the switches are removed
+_DRAFT = "draft" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the drafter of models with routed experts as MMGP stages (decoding A/B: specs/QWEN38_FLASH_NEXT_STRATA_DRAFT.md)
+_SUFFIX = "suffix" in os.environ.get("WGP_FN_ENABLE", "").split(",")  # drafts from repeated text, until proven
+_FIRST_ALWAYS = "firstdraft" in os.environ.get("WGP_FN_ENABLE", "").split(",")  # measuring only: the first draft always goes out, another while the one before was sure
+_CHAIN = "chain" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the drafts of a window read from mapped RAM, the switch goes with the others at the end
+_DRAFT_COSTS = "draftcost" in os.environ.get("WGP_FN_ENABLE", "").split(",")  # a greedy window's drafts decided by what they bring at the measured costs, until proven
+_SINGLE_DECODE = "host_py" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # _prepare_single_decode and its kept sampling parameters, proven: the switch goes with the others at the end
+
+
+
+class _DraftStage:
+    """A pass of a drafter as an MMGP stage, under the replay() of the graphs it stands for."""
+    def __init__(self, model, buffers):
+        self.model, self.buffers = model, buffers
+
+    def replay(self):
+        buffers = self.buffers
+        with cuda_graphs.scope(gated=False):
+            cuda_graphs.run(self.model.mtp, buffers["input_ids"], buffers["positions"], buffers["hidden_states"], buffers["outputs"], buffers["logits"], buffers["next_token"], owner=self.model, method="lm_engine_graph_forward")
 
 
 def _state_tensors(value, depth=0):
@@ -41,10 +64,14 @@ def _kv_page_tensors(runner) -> list[tuple[str, torch.Tensor, int]]:
         tensors = [("kv_cache", runner.kv_views[0], 1), ("kv_cache", runner.kv_views[1], 1), ("kv_cache_scales", runner.kv_cache_scales, 2)]
         if getattr(runner, "kv_cache_mins", None) is not None:
             tensors.append(("kv_cache_mins", runner.kv_cache_mins, 2))
+        if getattr(runner, "kv_index_pool", None) is not None:
+            tensors.append(("kv_index_pool", runner.kv_index_pool, 1))
         return tensors
     tensors = [("kv_cache", runner.kv_cache, 2)]
     if runner.config.kv_cache_int8:
         tensors.append(("kv_cache_scales", runner.kv_cache_scales, 2))
+    if getattr(runner, "kv_index_pool", None) is not None:
+        tensors.append(("kv_index_pool", runner.kv_index_pool, 1))
     return tensors
 
 
@@ -126,6 +153,7 @@ class ModelRunner:
         self._logits_bias_cache = {}
         self._repetition_token_cache = {}
         self._speculative_sampling_graphs = {}
+        self._sampling_graph_pool = None
         self._sampling_generator = None
         self._runtime_signature = None
         self._model_storage_signature = None
@@ -133,6 +161,7 @@ class ModelRunner:
         self._guard_counts = {}
         self._guard_seen_details = set()
         self._speculative_drafts = {}
+        self._draft_chain = None
         self._speculative_pending = {}
         self._speculative_commit_destinations = []
         self._speculative_commit_sources = {}
@@ -214,9 +243,12 @@ class ModelRunner:
         if not self.mmgp_graphs or self.enforce_eager:
             return
         from mmgp import cuda_graphs
-        tensors = [getattr(self, name, None) for name in ("kv_cache", "kv_cache_scales", "kv_cache_mins", "kv_overlay", "kv_overlay_scales")]
+        tensors = [getattr(self, name, None) for name in ("kv_cache", "kv_cache_scales", "kv_cache_mins", "kv_overlay", "kv_overlay_scales", "kv_index_pool")]
         for graph_vars in (getattr(self, "graph_vars", None) or {}, *(getattr(self, "speculative_graph_vars", None) or {}).values()):
             tensors.extend(graph_vars.values())
+        if isinstance(getattr(self, "mtp_graph", None), _DraftStage):
+            for graph_vars in (self.mtp_graph_vars, *self.mtp_refresh_graphs.values()):
+                tensors.extend(graph_vars.values())
         for module in self.model.modules():
             for name, value in vars(module).items():
                 if name not in ("_parameters", "_buffers", "_modules", "_hf_hook") and not name.startswith("_mm_"):  # MMGP's own records hold the weights
@@ -338,6 +370,10 @@ class ModelRunner:
             "emitted_tokens": 0,
             "drafted_by_position": [0] * self._max_speculative_draft_tokens,
             "accepted_by_position": [0] * self._max_speculative_draft_tokens,
+            "lookup_windows": 0,
+            "lookup_drafted": 0,
+            "lookup_accepted": 0,
+            "rows_by_window": {},  # rows -> [windows, milliseconds, accepted drafts]
         }
 
     def speculative_telemetry(self, seq_id: int, sequence_tokens: int) -> dict:
@@ -437,7 +473,7 @@ class ModelRunner:
         if self.model is None:
             return
         runtime_device = self._get_runtime_device()
-        if self.model.__class__.__name__ == "Qwen3_5ForCausalLM" and self.use_triton_sampling:
+        if self.model.__class__.__name__ in ("Qwen3_5ForCausalLM", "Qwen4ExpForCausalLM") and self.use_triton_sampling:
             from ..models.qwen3_5 import configure_qwen35_fla_prefill_autotune
             configure_qwen35_fla_prefill_autotune(runtime_device)
         for module in self.model.modules():
@@ -550,7 +586,7 @@ class ModelRunner:
         except Exception:
             pass
         # the cache and every view of it (kv_views keep the whole cache alive), the minimums and the exact overlays
-        for name in ("kv_cache", "kv_cache_scales", "kv_cache_mins", "kv_views", "kv_min_views", "kv_overlay", "kv_overlay_scales"):
+        for name in ("kv_cache", "kv_cache_scales", "kv_cache_mins", "kv_views", "kv_min_views", "kv_overlay", "kv_overlay_scales", "kv_index_pool"):
             if hasattr(self, name):
                 delattr(self, name)
         # CUDA graphs captured against previous model/KV pointers are unsafe after runtime reset.
@@ -580,6 +616,7 @@ class ModelRunner:
         self._logits_bias_cache.clear()
         self._repetition_token_cache.clear()
         self._speculative_drafts.clear()
+        self._draft_chain = None
         self._speculative_pending.clear()
         self._mtp_sample_params = None
         self._sampling_generator = None
@@ -674,6 +711,7 @@ class ModelRunner:
     def clear_graph_cache(self):
         self._speculative_sampling_graphs.clear()
         self._speculative_acceptance_graphs = {}
+        self._sampling_graph_pool = None
         if self._graph_cache:
             for key in list(self._graph_cache.keys()):
                 self._drop_graph_cache_entry(key)
@@ -759,6 +797,8 @@ class ModelRunner:
         for name, (shape, dtype, value) in buffers.items():
             setattr(self, name, storage[offsets[name]:offsets[name] + math.prod(shape) * dtype.itemsize].view(dtype).view(shape).fill_(value))
         self._prefill_copied = None  # the event of the last copies from the prefill buffers: chunked prefills queue without synchronizing
+        self._decode_words = self._decode_words_gpu = self._single_decode = None  # mapped RAM of _prepare_single_decode, whether it runs here
+        self._kept_sample_params = None
 
     def _release_sample_buffers(self):
         buffer_names = [
@@ -785,6 +825,10 @@ class ModelRunner:
             "_cpu_block_tables",
             "_seq_token_ids_buffer",
             "_prefill_copied",
+            "_decode_words",
+            "_decode_words_gpu",
+            "_single_decode",
+            "_kept_sample_params",
         ]
         if getattr(self, "_pinned_buffers", None) is not None:
             from mmgp import pinned
@@ -870,10 +914,18 @@ class ModelRunner:
             self.kv_overlay = torch.zeros(2, layers, rows, num_kv_heads, head_dim, device=runtime_device, dtype=torch.int8)
             self.kv_overlay_scales = torch.zeros(2, layers, rows, num_kv_heads, scale_elements, device=runtime_device, dtype=torch.float16)
 
+    def _allocate_index_pool(self, modules, runtime_device) -> None:
+        """The paged cache of indexed attention (attention_indexed): a row per block of tokens, per layer."""
+        indexed = [module for module in modules if hasattr(module, "index_pool")]
+        if indexed:
+            self.kv_index_pool = torch.zeros(len(indexed), self.config.num_kvcache_blocks + 1, self.block_size // indexed[0].ratio, indexed[0].index_dim, device=runtime_device, dtype=torch.bfloat16)  # one more page for writes that land nowhere
+
     def _bind_kv_modules(self, modules) -> None:
         config, layout = self.config, self.kv_layout
         for layer_id, module in enumerate(modules):
             module.k_cache, module.v_cache = self.kv_views[0][layer_id], self.kv_views[1][layer_id]
+            if hasattr(module, "index_pool"):
+                module.index_pool = self.kv_index_pool[layer_id]
             if not config.kv_cache_int8:
                 continue
             module.k_scale, module.v_scale = self.kv_cache_scales[0, layer_id], self.kv_cache_scales[1, layer_id]
@@ -895,6 +947,8 @@ class ModelRunner:
             items["kv_cache_scales"] = (self.kv_cache_scales, 2)
         if getattr(self, "kv_cache_mins", None) is not None:
             items["kv_cache_mins"] = (self.kv_cache_mins, 2)
+        if getattr(self, "kv_index_pool", None) is not None:
+            items["kv_index_pool"] = (self.kv_index_pool, 1)
         return items
 
     def snapshot_overlay(self, seq: Sequence) -> dict | None:
@@ -1018,6 +1072,7 @@ class ModelRunner:
                 )
         try:
             self._allocate_kv_tensors(kv_cache_layer_count, num_kv_heads, head_dim, scale_elements, runtime_device)
+            self._allocate_index_pool(kv_cache_modules, runtime_device)
         except RuntimeError as exc:
             if "out of memory" in str(exc).lower():
                 extra = ""
@@ -1143,14 +1198,14 @@ class ModelRunner:
                     end = seq.block_table[i] * self.block_size + seq.last_block_num_tokens
                 if end > start:
                     slot_mapping.extend(list(range(start, end)))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1] or getattr(self.model, "_lm_engine_prefill_block_tables", False):    # prefix cache, or a model reading the cache in every pass
             block_tables = self.prepare_block_tables(seqs)
         overlay_mapping, overlay_base, ring_start = self._overlay_context(seqs, [(seq.num_cached_tokens, len(seq)) for seq in seqs])
         if self._prefill_copied is not None:
             self._prefill_copied.synchronize()  # the previous prefill's copies have read the buffers refilled below
         staged = lambda buffer, values: self._to_runtime_device(buffer[:len(values)].copy_(torch.tensor(values, dtype=buffer.dtype)))
         if use_prompt_embeds:
-            input_ids = None
+            input_ids = staged(self._cpu_prefill_input_ids, input_ids) if getattr(self.model, "_lm_engine_ids_with_embeds", False) else None
             positions = self._to_runtime_device(torch.cat(prompt_position_ids, dim=1).unsqueeze(1).contiguous())
             inputs_embeds = self._to_runtime_device(torch.cat(prompt_embeds, dim=0).unsqueeze(0).contiguous())
         else:
@@ -1191,8 +1246,51 @@ class ModelRunner:
             seq.num_tokens = num_tokens
             seq.token_ids = token_ids
 
+    def _single_decode_supported(self) -> bool:
+        if self._single_decode is None:
+            from shared.kernels import host_doorbell
+            self._single_decode = self.mmgp_graphs and not self.enforce_eager and self.graph_vars["input_ids"].shape[0] == 1 and host_doorbell.supported(self._get_runtime_device())
+        return self._single_decode
+
+    def _prepare_single_decode(self, seq: Sequence):
+        """One sequence in MMGP graphs: its values are written where a kernel reads them for the buffers the graphs read, which keep them between passes; no tensor is made and the page table goes only when it changed.
+        The GPU waits for this between two passes, while what the host does after the launch costs it nothing."""
+        graph_vars, length = self.graph_vars, len(seq)
+        prefetch = getattr(self.model, "lm_engine_prefetch", None)
+        if prefetch is not None:
+            prefetch(seq.token_ids, length - 1)
+        words = self._decode_words
+        if words is None:
+            from mmgp import mapped
+            host, gpu = mapped.empty(8 * 8, self._get_runtime_device(), "lm")
+            words = self._decode_words = host.view(torch.int64).numpy()
+            self._decode_words_gpu = gpu.view(torch.int64)
+        words[0], words[1], words[2], words[3] = seq.last_token, length - 1 + int(getattr(seq, "position_offset", 0) or 0), seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1, length
+        layout = self.kv_layout
+        if layout is not None and layout.overlay:
+            base = seq.overlay_slot * layout.overlay_rows(self.block_size) if seq.overlay_slot >= 0 else -1
+            if base >= 0 and seq.ring_high < length - 1:
+                self._fill_overlays_from_body(seq, length - 1)
+            seq.ring_high = max(seq.ring_high, length)
+            words[4], words[5], words[6] = base + layout.overlay_row(length - 1, self.block_size) if base >= 0 else -1, base, layout.ring_start(seq.ring_high, self.block_size)
+        else:
+            words[4], words[5], words[6] = -1, -1, 1 << 30
+        from ..layers.decode_context import load_decode_context
+        load_decode_context(self._decode_words_gpu, graph_vars["input_ids"], graph_vars["positions"], graph_vars["slot_mapping"], graph_vars["context_lens"], graph_vars["overlay_mapping"], graph_vars["overlay_base"], graph_vars["ring_start"])
+        block_tables = graph_vars["block_tables"]
+        if graph_vars.get("decode_block_table") != seq.block_table:
+            count = len(seq.block_table)
+            self._cpu_block_tables[0, :count] = torch.tensor(seq.block_table, dtype=torch.int32, device="cpu")
+            block_tables.fill_(-1)
+            block_tables[:, :count].copy_(self._cpu_block_tables[:1, :count], non_blocking=True)
+            graph_vars["decode_block_table"] = list(seq.block_table)
+        set_context(False, slot_mapping=graph_vars["slot_mapping"], context_lens=graph_vars["context_lens"], block_tables=block_tables, overlay_mapping=graph_vars["overlay_mapping"], overlay_base=graph_vars["overlay_base"], ring_start=graph_vars["ring_start"])
+        return graph_vars["input_ids"], graph_vars["positions"]
+
     def prepare_decode(self, seqs: list[Sequence]):
         """Optimized decode preparation using pre-allocated buffers."""
+        if _SINGLE_DECODE and len(seqs) == 1 and self._single_decode_supported():
+            return self._prepare_single_decode(seqs[0])
         bs = len(seqs)
         
         # Use pre-allocated CPU buffers
@@ -1226,6 +1324,16 @@ class ModelRunner:
 
     def prepare_sample(self, seqs: list[Sequence], is_cfg_batch: bool = False):
         """Optimized sample preparation using pre-allocated buffers."""
+        if _SINGLE_DECODE and len(seqs) == 1 and not is_cfg_batch:
+            seq = seqs[0]
+            key = (seq.temperature, seq.cfg_scale, seq.top_k, seq.top_p, seq.min_p, seq.repetition_penalty)
+            if self._kept_sample_params is None or self._kept_sample_params[0] != key:
+                self._kept_sample_params = None
+                self._kept_sample_params = key, self._prepare_sample(seqs, is_cfg_batch)
+            return self._kept_sample_params[1]
+        return self._prepare_sample(seqs, is_cfg_batch)
+
+    def _prepare_sample(self, seqs: list[Sequence], is_cfg_batch: bool = False):
         if is_cfg_batch:
             num_seqs = len(seqs) // 2
             target_seqs = seqs[:num_seqs]
@@ -1417,9 +1525,7 @@ class ModelRunner:
             values = universe_logits.clone()
             ids = None if universe_ids is None else universe_ids.clone()
             self._filter_speculative_distribution(logits, values, ids, top_p, min_p)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, capture_error_mode="thread_local"):
-                probabilities = self._filter_speculative_distribution(logits, values, ids, top_p, min_p)
+            graph, probabilities = capture_sampling_graph(self, lambda: self._filter_speculative_distribution(logits, values, ids, top_p, min_p))
             state = graph, values, ids, probabilities
         self._speculative_sampling_graphs[key] = state
         graph, values, ids, probabilities = state
@@ -1497,9 +1603,14 @@ class ModelRunner:
             "positions": pending_position.detach().clone(),
         }
 
+    def _prefill_chunk(self, tokens: int) -> int:
+        """The tokens of a prompt of this length read together: the model's choice (by the free VRAM), or its fixed chunks, 0: no chunks."""
+        choose = getattr(self.model, "lm_engine_prefill_chunk", None)
+        return choose(tokens) if choose is not None else int(getattr(self.model, "_prefill_chunk_tokens", 0))
+
     def _prime_mtp_context(self, seq: Sequence) -> None:
-        chunk_tokens = int(getattr(self.model, "_prefill_chunk_tokens", 0))
-        if chunk_tokens and seq.prompt_embeds is not None and len(seq) > chunk_tokens:
+        chunk_tokens = self._prefill_chunk(len(seq))
+        if chunk_tokens and (seq.prompt_embeds is not None or getattr(self.model, "_lm_engine_prefill_block_tables", False)) and len(seq) > chunk_tokens:
             self._prime_embedded_mtp_chunks(seq, chunk_tokens)
             return
         self.model.mtp.reset_sequence_state()
@@ -1534,7 +1645,7 @@ class ModelRunner:
                 if previous_hidden is None:
                     mtp_hidden = hidden_states[:, :-1]
                     mtp_positions = positions[..., :-1]
-                    mtp_embeds = inputs_embeds[:, 1:]
+                    mtp_embeds = None if inputs_embeds is None else inputs_embeds[:, 1:]
                     shifted_ids = token_ids[start + 1:end]
                 else:
                     # Carry the preceding target hidden state and its full 3D position.
@@ -1629,6 +1740,9 @@ class ModelRunner:
 
     def _prepare_speculative_verify(self, seq: Sequence, draft_tokens: list[int] | torch.Tensor):
         verify_length = len(draft_tokens) + 1
+        prefetch = getattr(self.model, "lm_engine_prefetch", None) if _SINGLE_DECODE and not torch.is_tensor(draft_tokens) else None
+        if prefetch is not None:
+            prefetch([*seq.token_ids[-8:], *draft_tokens], min(len(seq.token_ids), 8) - 1, len(seq.token_ids) - min(len(seq.token_ids), 8))
         current_slot = seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
         start_position = len(seq) - 1 + int(getattr(seq, "position_offset", 0) or 0)
         if self.enforce_eager:
@@ -1680,6 +1794,26 @@ class ModelRunner:
                     overlay_mapping=overlay_mapping, overlay_base=overlay_base, ring_start=ring_start)
         return input_ids, positions
 
+    def _prepare_draft_stages(self, output_size: int, device: torch.device) -> None:
+        """The buffers of the drafter's passes, for a drafter that reads what MMGP places (routed experts). Its passes are MMGP stages, captured as they run and dropped with MMGP's graphs when a placement changes;
+        a graph captured here would keep the placement of this moment, before any expert has its GPU copy: experts missing from the graph, and skipped by the CPU once placed."""
+        vocab = int(getattr(self.model.mtp, "draft_vocab_size", None) or self.config.hf_config.vocab_size)
+
+        def stage(count):
+            buffers = dict(input_ids=torch.zeros((1, count), dtype=torch.int64, device=device), positions=torch.arange(count, dtype=torch.int64, device=device),
+                           hidden_states=torch.zeros((1, count, output_size), dtype=self.dtype, device=device), outputs=torch.zeros((1, 1, output_size), dtype=torch.float32, device=device),
+                           logits=torch.zeros((1, 1, vocab), dtype=self.dtype, device=device), next_token=torch.zeros(1, dtype=torch.int64, device=device))
+            return buffers, _DraftStage(self.model, buffers)
+        self.mtp_graph_vars, self.mtp_graph = stage(1)
+        self.mtp_graph_pool = torch.cuda.graph_pool_handle()
+        for count in range(2, self._max_speculative_draft_tokens + 2):
+            buffers, graph = stage(count)
+            self.mtp_refresh_graphs[count] = dict(buffers, graph=graph)
+        # its kernels launch once here, while VRAM is free: their first launches take the driver's memory, which the placement that follows leaves little of
+        vars = self.mtp_graph_vars
+        self.model.mtp._cache.cache_seqlens.zero_()
+        self.model.mtp(vars["input_ids"], vars["positions"], vars["hidden_states"], last_logits_only=True, cache_prepared=True)
+
     def _run_mtp_forward(self, input_ids: torch.Tensor, positions: torch.Tensor, hidden_states: torch.Tensor, inputs_embeds: torch.Tensor | None = None, compute_logits: bool = True, last_logits_only: bool = False):
         if self.enforce_eager or inputs_embeds is not None or positions.numel() != input_ids.numel() or getattr(self, "mtp_graph", None) is None:
             return self.model.mtp(input_ids, positions, hidden_states, inputs_embeds=inputs_embeds, compute_logits=compute_logits, last_logits_only=last_logits_only)
@@ -1713,6 +1847,80 @@ class ModelRunner:
         next_token = graph_vars["next_token"] if graph_vars is not None else torch.argmax(mtp_logits[0, -1]).reshape(1)
         self._speculative_drafts[seq.seq_id] = {"logits": mtp_logits[0, -1].clone(), "hidden_states": mtp_hidden[:, -1:].clone(), "next_token": next_token.clone()}
 
+    def _draft_costs(self) -> WindowCosts:
+        costs = getattr(self, "_window_costs", None)
+        if costs is None:
+            costs = self._window_costs = WindowCosts(self._max_speculative_draft_tokens + 1)
+        return costs
+
+    def _suffix_proposal(self, seq: Sequence, count: int) -> tuple[list[int], int]:
+        state = getattr(self, "_suffix_state", None)
+        if state is None or state[0] != seq.seq_id:
+            state = self._suffix_state = (seq.seq_id, SuffixDrafter())
+        self._draft_costs()
+        state[1].sync(seq.token_ids)
+        return state[1].propose(count)
+
+    def _observe_window(self, rows: int, started: float, accepted: int) -> None:
+        milliseconds = 1000.0 * (time.perf_counter() - started)
+        stats = self.speculative_stats
+        entry = stats["rows_by_window"].setdefault(rows, [0, 0.0, 0])
+        entry[0] += 1
+        entry[1] += milliseconds
+        entry[2] += accepted
+        lookup = getattr(self, "_window_lookup", 0)
+        if lookup:
+            stats["lookup_windows"] += 1
+            stats["lookup_drafted"] += rows - 1
+            stats["lookup_accepted"] += accepted
+        costs = self._draft_costs()
+        costs.observe(rows, milliseconds, accepted, bool(lookup), lookup)
+        costs.observe_confidences(getattr(self, "_window_confidences", ()), accepted)
+
+    def _chain_drafts(self, seq: Sequence, draft_state: dict, draft_count: int, start_position: int, cache_length: int, rejection_sampling: bool, threshold: float):
+        """The drafts of a window read from mapped RAM (layers/draft_chain.py): a proposal that ignores the sampler's rules, which the verification of the window applies. threshold: the confidence a draft must reach to go out."""
+        chain = self._draft_chain
+        graph_vars, cache = self.mtp_graph_vars, self.model.mtp._cache
+        temperature, top_p = (float(seq.temperature), float(seq.top_p) if seq.top_p is not None and 0.0 < float(seq.top_p) < 1.0 else 1.0) if rejection_sampling else (1.0, 1.0)
+        logits, hidden = draft_state["logits"], draft_state["hidden_states"]
+        chain.seqlens = cache.cache_seqlens
+        step_logits = graph_vars["logits"][0, -1]
+        confidences = self._window_confidences = []
+        tokens = []
+        for index in range(draft_count):
+            count = chain.top(logits, index, temperature, top_p)
+            if rejection_sampling:
+                top = float(chain.probs[index, 0] / chain.probs[index, :count].sum())
+                if top < threshold:  # before the draw: stopping does not depend on it, and each draft stays a draw of its law
+                    break
+                token = chain.draw(index, count, self._sampling_generator)
+            else:
+                top = float(chain.probs[index, 0])
+                if top < threshold:
+                    break
+                token = int(chain.ids[index, 0])
+            confidences.append(top)
+            chain.draft_ids[index] = token
+            tokens.append(token)
+            if index + 1 == draft_count:
+                break
+            chain.feed(token, start_position + index, cache.get_seq_length(), graph_vars, hidden)
+            self.mtp_graph.replay()
+            cache.advance(1)
+            logits, hidden = step_logits, graph_vars["outputs"]
+        if not rejection_sampling:
+            return tokens, cache_length, None
+        return (chain.draft_ids_gpu[:len(tokens)], cache_length, CompactDrafts(chain, len(tokens))) if tokens else ([], cache_length, None)
+
+    def _chain_ready(self, graph_vars, target_vocab: int) -> bool:
+        if self._draft_chain is None:
+            device = self._get_runtime_device()
+            vocab = int(graph_vars["logits"].shape[-1])
+            self._draft_chain = False
+            if _CHAIN and not (_SUFFIX or _DRAFT_COSTS or _FIRST_ALWAYS) and self.use_triton_sampling and draft_chain.supported(device, vocab):
+                self._draft_chain = draft_chain.DraftChain(device, vocab, target_vocab, self._max_speculative_draft_tokens)
+        return self._draft_chain is not False
+
     def _build_mtp_drafts(self, seq: Sequence, sample_params, draft_count: int, start_position: int, profile: dict | None = None) -> tuple[list[int] | torch.Tensor, int, list[torch.Tensor] | None]:
         draft_state = self._speculative_drafts[seq.seq_id]
         graph_vars = self.mtp_graph_vars if getattr(self, "mtp_graph", None) is not None and not self.enforce_eager else None
@@ -1720,9 +1928,19 @@ class ModelRunner:
         cache_length = self.model.mtp.get_cache_length()
         rejection_sampling = seq.top_k != 1
         confidence_threshold = 0.0 if rejection_sampling else float(getattr(self.model, "_prompt_enhancer_speculative_confidence", 0.0))
+        if graph_vars is not None and profile is None and self._chain_ready(graph_vars, int(self.config.hf_config.vocab_size)):
+            self._window_lookup = 0
+            return self._chain_drafts(seq, draft_state, draft_count, start_position, cache_length, rejection_sampling, float(getattr(self.model, "_prompt_enhancer_speculative_sampling_confidence", 0.0)) if rejection_sampling else confidence_threshold)
         predictive_processor = self._speculative_logits_processor(seq, predictive=True)
         predictive_repetition = sample_params[-1] is not None and seq.predictive_penalty
-        if not rejection_sampling and draft_count == 2 and confidence_threshold <= 0.0 and not predictive_repetition and predictive_processor is None:
+        sampling_gate = float(getattr(self.model, "_prompt_enhancer_speculative_sampling_confidence", 0.0)) if rejection_sampling else 0.0
+        suffix, match = self._suffix_proposal(seq, draft_count) if _SUFFIX else ((), 0)
+        self._window_lookup = 0
+        costs = self._draft_costs() if _DRAFT_COSTS and not rejection_sampling else None
+        confidences = self._window_confidences = []
+        if costs is not None:
+            costs.start_chain()
+        if not suffix and costs is None and not rejection_sampling and draft_count == 2 and confidence_threshold <= 0.0 and not predictive_repetition and predictive_processor is None:
             initial_logits = draft_state["logits"]
             bias = self._get_logits_bias(seq, initial_logits.unsqueeze(0))
             if bias is not None:
@@ -1750,6 +1968,8 @@ class ModelRunner:
         for draft_idx in range(draft_count):
             if rejection_sampling:
                 probabilities = self._speculative_distribution(seq, draft_logits, sample_params, () if sample_drafts_on_device else draft_tokens, draft_vocab_size, predictive=True, profile=profile, profile_role=f"draft{draft_idx}")
+                if sampling_gate > 0.0 and float(probabilities.max()) < sampling_gate:  # before the draw: stopping does not depend on it, and each draft stays a draw of its law
+                    break
                 draft_index = self._sample_distribution_tensor(probabilities) if sample_drafts_on_device else self._sample_distribution(probabilities)
                 draft_distributions.append(probabilities)
             else:
@@ -1757,15 +1977,28 @@ class ModelRunner:
                 penalty = 1.0 if repetition_penalties is None else float(repetition_penalties[0].item())
                 processed_logits = self._apply_speculative_logit_rules(seq, draft_logits, penalty, draft_tokens, draft_vocab_size, predictive=True)
                 top_logit, top_token = torch.max(processed_logits, dim=0)
-                if confidence_threshold > 0.0:
+                if confidence_threshold > 0.0 or costs is not None:
                     confidence = torch.exp(top_logit.float() - torch.logsumexp(processed_logits.float(), dim=0))
                     draft_index, confidence = torch.stack((top_token.float(), confidence)).tolist()
-                    if confidence < confidence_threshold:
+                    keep = costs.keep_draft(draft_idx + 1, confidence) if costs is not None else (draft_idx == 0 or confidences[-1] >= confidence_threshold) if _FIRST_ALWAYS else confidence >= confidence_threshold
+                    if not keep and not (suffix and draft_idx == 0 and int(draft_index) == suffix[0]):
                         break
+                    confidences.append(confidence)
                 else:
                     draft_index = int(top_token.item())
             draft_token = draft_index.reshape(1) if sample_drafts_on_device else int(draft_index)
             draft_tokens.append(draft_token)
+            if suffix and draft_idx == 0 and int(draft_index) == suffix[0]:  # the text repeats where the drafter's guess agrees: its first draft stays a draw of its law, what follows depends on it alone
+                rows = self._window_costs.lookup_rows(len(suffix), match)
+                if rows:
+                    self._window_lookup = match
+                    for token in suffix[1:rows - 1]:
+                        draft_tokens.append(torch.tensor([token], device=draft_hidden.device) if sample_drafts_on_device else token)
+                        if rejection_sampling:
+                            point = torch.zeros(max(probabilities.numel(), token + 1), dtype=probabilities.dtype, device=probabilities.device)
+                            point[token] = 1.0  # a draft that is certain: accepted with the target's probability of it, the target's other tokens take the rejection
+                            draft_distributions.append(point)
+                    break
             if draft_idx + 1 == draft_count:
                 break
             if graph_vars is not None:
@@ -1781,12 +2014,15 @@ class ModelRunner:
                 mtp_input_ids = draft_token.view(1, 1) if sample_drafts_on_device else torch.tensor([[draft_token]], dtype=torch.long, device=draft_hidden.device)
             draft_hidden, draft_logits = self._run_mtp_forward(mtp_input_ids, draft_position, draft_hidden, last_logits_only=True)
             draft_logits = draft_logits[0, -1]
-        return torch.cat(draft_tokens) if sample_drafts_on_device else draft_tokens, cache_length, draft_distributions
+        return torch.cat(draft_tokens) if sample_drafts_on_device and draft_tokens else draft_tokens, cache_length, draft_distributions
 
     def _run_native_mtp_target_token(self, seq: Sequence, sample_params) -> list[list[int]]:
+        started = time.perf_counter()
         input_ids, positions = self.prepare_decode([seq])
         hidden_states = self._run_decode_hidden(input_ids, positions)
         target_token = self._sample_speculative_target(seq, self.model.compute_logits(hidden_states)[0], sample_params, [])
+        self._window_lookup, self._window_confidences = 0, ()
+        self._observe_window(1, started, 0)
         self._advance_mtp(seq, [target_token], positions, hidden_states)
         reset_context()
         self.speculative_stats["target_passes"] += 1
@@ -1836,21 +2072,27 @@ class ModelRunner:
         stage_started = time.perf_counter()
         draft_tokens, mtp_cache_length, draft_distributions = self._build_mtp_drafts(seq, sample_params, draft_count, start_position, profile=profile)
         self._mark_mtp_stage_profile(profile, 1, "draft", stage_started)
+        if len(draft_tokens) > 1 and not self._window_lookup:
+            self._draft_costs().observe_draft(1000.0 * (time.perf_counter() - stage_started) / (len(draft_tokens) - 1))
         if len(draft_tokens) == 0:
             self._cancel_mtp_stage_profile(profile)
             return self._run_native_mtp_target_token(seq, sample_params)
-        stage_started = time.perf_counter()
+        stage_started = window_started = time.perf_counter()
         input_ids, positions = self._prepare_speculative_verify(seq, draft_tokens)
         self._mark_mtp_stage_profile(profile, 2, "verify_setup", stage_started)
         stage_started = time.perf_counter()
         hidden_states = self._run_speculative_verify_graph(input_ids, positions)
         self._mark_mtp_stage_profile(profile, 3, "verify", stage_started)
+        if getattr(self.model, "_lm_engine_adaptive_experts", False):
+            from mmgp import runtime
+            runtime.plan_experts(self.model)
         stage_started = time.perf_counter()
-        logits = self.model.output(hidden_states)[0]
+        logits = self._verify_logits(hidden_states)
         self._mark_mtp_stage_profile(profile, 4, "output", stage_started)
         reset_context()
         self.speculative_stats["target_passes"] += 1
         emitted, accepted_count = self._sample_verified_block(seq, logits, draft_tokens, draft_distributions, sample_params, profile)
+        self._observe_window(len(draft_tokens) + 1, window_started, accepted_count)
         stage_started = time.perf_counter()
         self._commit_speculative_target_state(len(emitted), len(draft_tokens) + 1)
         self._mark_mtp_stage_profile(profile, 7, "commit", stage_started)
@@ -1926,6 +2168,9 @@ class ModelRunner:
         return emitted, accepted_count
 
     def _replay_decode_graph_hidden(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        if input_ids is self.graph_vars["input_ids"]:  # already in the buffers of the graphs (_prepare_single_decode)
+            self._run_target_stage(input_ids, positions, self.graph_vars["outputs"], self._draft_feature_buffer(self.graph_vars, 1))
+            return self.graph_vars["outputs"]
         bs = input_ids.size(0)
         context = get_context()
         graph_bs = next((x for x in self.graph_bs if x >= bs), None)
@@ -1966,6 +2211,23 @@ class ModelRunner:
             return self.model(input_ids=input_ids, positions=positions)
         hidden_states = self._replay_decode_graph_hidden(input_ids, positions)
         return hidden_states.unsqueeze(1) if hidden_states.ndim == 2 else hidden_states
+
+    def _verify_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """The logits of a verification window: with the model's weights in VRAM, a graph stage after the pass, for the models that have it: the head and its mix cost a few launches, but about 2 ms of Python."""
+        from mmgp import cuda_graphs, runtime
+        stage = getattr(self.model.output, "lm_engine_graph_forward", None)
+        if not _OUTPUT_STAGE or stage is None or not self.mmgp_graphs or self.enforce_eager or not runtime.weights_resident(self.model):
+            return self.model.output(hidden_states)[0]
+        graph_vars = self.speculative_graph_vars[hidden_states.shape[1]]
+        logits = graph_vars.get("verify_logits")
+        if logits is None:
+            first = self.model.output(hidden_states)
+            logits = graph_vars["verify_logits"] = torch.empty_like(first)
+            self._register_graph_state()
+            return first[0]
+        with cuda_graphs.scope(gated=False):
+            cuda_graphs.run(self.model.output, hidden_states, logits, owner=self.model, method="lm_engine_graph_forward")
+        return logits[0]
 
     def _run_speculative_verify_graph(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         if self.enforce_eager:
@@ -2030,6 +2292,9 @@ class ModelRunner:
         [cond_seq1, cond_seq2, ..., uncond_seq1, uncond_seq2, ...]
         where uncond_seqi is the paired unconditional sequence of cond_seqi."""
         self.ensure_runtime_ready()
+        if not is_prefill and getattr(self.model, "_lm_engine_adaptive_experts", False):
+            from mmgp import runtime
+            runtime.adapt_experts(self.model)
         # Check if this is a CFG batch (contains paired conditional and unconditional sequences)
         is_cfg_batch = seqs[0].cfg_scale > 1.0 and seqs[0].paired_seq is not None
         if not is_cfg_batch and len(seqs) == 1 and getattr(self.model, "mtp", None) is not None and bool(getattr(self.model, "_prompt_enhancer_speculative_decoding", False)):
@@ -2113,7 +2378,7 @@ class ModelRunner:
         else:
             # Normal batch (non-CFG)
             if is_prefill:
-                chunk_tokens = int(getattr(self.model, "_prefill_chunk_tokens", 0))
+                chunk_tokens = self._prefill_chunk(seqs[0].num_tokens)
                 if chunk_tokens and len(seqs) == 1:
                     self._prefill_prefix_chunks(seqs[0], chunk_tokens)
                 input_ids, positions, inputs_embeds = self.prepare_prefill(seqs)
@@ -2153,6 +2418,8 @@ class ModelRunner:
                 # Prepare input_ids for sampler
                 # seq_input_ids = torch.tensor([seq.token_ids for seq in seqs], device=logits.device)
                 
+                # what the sampler would read back from the GPU is known here: nothing waits for the host before its result
+                k_max = (seqs[0].top_k if 0 < (seqs[0].top_k or 0) < logits.shape[-1] else 1) if _SINGLE_DECODE and len(seqs) == 1 and top_ks is not None else None
                 token_ids = self.sampler(
                     logits, 
                     temperatures,
@@ -2161,6 +2428,8 @@ class ModelRunner:
                     min_ps=min_ps if min_ps is not None else None,
                     repetition_penalties=None,  # Already applied above
                     generator=self._sampling_generator,
+                    k_max=k_max,
+                    min_p_active=_SINGLE_DECODE,
                     # input_ids=seq_input_ids,
                 ).tolist()
                 
@@ -2215,7 +2484,8 @@ class ModelRunner:
         overlay_mapping = torch.full((max_bs,), -1, dtype=torch.int32, device=model_device)
         overlay_base = torch.full((max_bs,), -1, dtype=torch.int32, device=model_device)
         ring_start = torch.full((max_bs,), 1 << 30, dtype=torch.int32, device=model_device)
-        outputs = torch.zeros(max_bs, hf_config.hidden_size, device=model_device, dtype=self.dtype)
+        output_size = getattr(self.model, "_lm_engine_output_size", None) or hf_config.hidden_size  # what the target model's forward returns per token
+        outputs = torch.zeros(max_bs, output_size, device=model_device, dtype=self.dtype)
         base_graph_bs = [1, 2, 4, 8]
         self.graph_bs = [bs for bs in base_graph_bs if bs <= max_bs]
         if max_bs > 8:
@@ -2300,7 +2570,7 @@ class ModelRunner:
                 speculative_cu_seqlens_k = torch.tensor([0, verify_length], dtype=torch.int32, device=model_device)
                 speculative_block_tables = torch.full((1, max_num_blocks), -1, dtype=torch.int32, device=model_device)
                 speculative_block_tables[0, 0] = dummy_block
-                speculative_outputs = torch.zeros(1, verify_length, hf_config.hidden_size, device=model_device, dtype=self.dtype)
+                speculative_outputs = torch.zeros(1, verify_length, output_size, device=model_device, dtype=self.dtype)
                 speculative_overlay_mapping = torch.full((verify_length,), -1, dtype=torch.int32, device=model_device)
                 speculative_overlay_base = torch.full((1,), -1, dtype=torch.int32, device=model_device)
                 speculative_ring_start = torch.full((1,), 1 << 30, dtype=torch.int32, device=model_device)
@@ -2345,10 +2615,15 @@ class ModelRunner:
             defer_commits = self.mmgp_graphs and not getattr(self.model, "_block_draft", False)
             if self._speculative_replay_modules and not defer_commits:
                 capture_commits(self.graph_pool)
-            if not getattr(self.model, "_block_draft", False):
+            if not getattr(self.model, "_block_draft", False) and _DRAFT and self.mmgp_graphs and hasattr(self.model.mtp, "lm_engine_graph_forward"):
+                self._prepare_draft_stages(output_size, model_device)
+                self.model.mtp._cache.cache_seqlens.zero_()
+                if self._speculative_replay_modules and defer_commits:
+                    capture_commits(self.mtp_graph_pool)
+            elif not getattr(self.model, "_block_draft", False):
                 mtp_input_ids = torch.zeros((1, 1), dtype=torch.int64, device=model_device)
                 mtp_positions = torch.zeros(1, dtype=torch.int64, device=model_device)
-                mtp_hidden_states = torch.zeros((1, 1, hf_config.hidden_size), dtype=self.dtype, device=model_device)
+                mtp_hidden_states = torch.zeros((1, 1, output_size), dtype=self.dtype, device=model_device)
                 self.model.mtp._cache.cache_seqlens.zero_()
                 capture_stream.wait_stream(torch.cuda.current_stream(model_device))
                 # the warmups run on the MTP graphs' pool: their temporaries are the memory the graphs then use, not memory beside it
@@ -2374,7 +2649,7 @@ class ModelRunner:
                 for count in reversed(range(2, self._max_speculative_draft_tokens + 2)):
                     refresh_ids = torch.zeros((1, count), dtype=torch.int64, device=model_device)
                     refresh_positions = torch.arange(count, dtype=torch.int64, device=model_device)
-                    refresh_hidden = torch.zeros((1, count, hf_config.hidden_size), dtype=self.dtype, device=model_device)
+                    refresh_hidden = torch.zeros((1, count, output_size), dtype=self.dtype, device=model_device)
                     self.model.mtp._cache.cache_seqlens.zero_()
                     capture_stream.wait_stream(torch.cuda.current_stream(model_device))
                     with torch.cuda.stream(capture_stream), allocator.graph_warmup(self.mtp_graph_pool):

@@ -344,7 +344,8 @@ class AutoPreload:
         experts = self.manager.expert_residency.get(model_id)
         if len(current) < len(plan.sizes) or len(wanted) < len(plan.sizes):
             for residency in self.manager.expert_residency.values():
-                residency.unload(reset=False)
+                if not (residency.elastic and residency.placed_once):  # an elastic placement makes the room of the blocks out by its rounds and under pressure: its experts stay
+                    residency.unload(reset=False)
         missing = [name for name in wanted if name not in current]
         dropped = [name for name in current if name not in wanted]
         if dropped or plan.relink:

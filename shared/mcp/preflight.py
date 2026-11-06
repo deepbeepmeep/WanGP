@@ -13,6 +13,7 @@ from pathlib import Path
 from shared import extra_settings, resolutions
 from shared.api import apply_media_flag_defaults, apply_video_length_duration
 from shared.utils.frame_scheduler import fit_video_length, has_slash_commands, normalize_frame_count
+from shared.utils.virtual_media import strip_virtual_media_suffix
 
 
 def task_settings(source):
@@ -49,8 +50,8 @@ def input_metadata(session, settings):
         for item in value if isinstance(value, list) else [value]:
             if not item:
                 continue
-            path = Path(item)
-            record = {"role": role, "path": str(path), "media_type": _mcp_media_type(str(path)), "size_bytes": path.stat().st_size}
+            path = Path(strip_virtual_media_suffix(item))
+            record = {"role": role, "path": str(item), "media_type": _mcp_media_type(str(path)), "size_bytes": path.stat().st_size}
             if record["media_type"] == "image":
                 with Image.open(path) as image:
                     record.update(zip(("width", "height"), upright_size(image)))

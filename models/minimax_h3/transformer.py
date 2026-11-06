@@ -780,10 +780,8 @@ class MiniMaxH3Model(nn.Module):
         sigma_video = sigma_video.flatten()
         if sigma_video.numel() not in (1, latent_t):
             raise ValueError(f"MiniMax H3 received {sigma_video.numel()} video sigmas for {latent_t} latent frames")
-        if not self.control_layers and sigma_video.numel() > 1 and not bool((sigma_video == sigma_video[0]).all()):
-            raise ValueError("MiniMax H3 requires one uniform video sigma")
-        # A clean first-frame ControlNet anchor must not set the text/audio prefix's noise level.
-        base_video_sigma = sigma_video.max() if self.control_layers else sigma_video[0]
+        # A nearly clean anchor (known frames of a ControlNet or a Remake window) must not set the text/audio prefix's noise level.
+        base_video_sigma = sigma_video.max()
         audio_t = audio_x.shape[-1]
         text_tags = payload["text_token_tags"].view(-1).cpu()
         layout = self._layout(text_tags, latent_t, latent_h, latent_w, audio_t, payload)
@@ -812,7 +810,7 @@ class MiniMaxH3Model(nn.Module):
                 timestep, timestep_indices, video_row, _ = _grouped_video_timestep_rows(
                     timestep, timestep_indices, video_start, target_video_rows,
                     target_video_fixed_rows, target_video_mask_active)
-            if self.control_layers and target_video_order is None and sigma_video.numel() > 1:
+            if target_video_order is None and sigma_video.numel() > 1:
                 timestep, timestep_indices, video_row, _ = _frame_video_timestep_rows(timestep, timestep_indices, sigma_video, target_video_rows)
             temb = self._time_embedding(timestep)
             audio_row = int(timestep_indices[audio_start + min(layout.num_target_condition_audio_latents,

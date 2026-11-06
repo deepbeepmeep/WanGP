@@ -20,6 +20,7 @@ from shared.ffmpeg_setup import download_ffmpeg
 from shared.utils.audio_video import get_mp4_audio_codec_settings, get_video_audio_extra_args
 from shared.utils.video_codecs import get_video_container_extension, get_video_encode_args, validate_video_output_settings
 from shared.utils.utils import get_video_frame, get_video_info
+from shared.utils.virtual_media import read_view
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".webm", ".avi"}
 _THUMB_DATA_URL_CACHE: OrderedDict[str, str] = OrderedDict()
 _THUMB_CACHE_MAX = 64
@@ -434,6 +435,19 @@ def side_by_side_media(source_paths: list[str], output_path: str, layout: str | 
             cmd += ["-movflags", "+faststart"]
         cmd += [output_path]
         _run_ffmpeg(cmd)
+    return output_path
+
+
+def view_clip(view_path: str) -> str:
+    """A view as a real video file, for what reads whole files: cut once, exact to the frame, and reused."""
+    view = read_view(view_path)
+    output_path = os.path.join(os.path.dirname(view_path), ".cut", os.path.basename(view_path))
+    if not os.path.isfile(output_path):
+        fps = get_precise_video_fps(view["source"]) or float(get_video_info(view["source"])[0])
+        start_s, seconds = view["start_frame"] / fps, (view["end_frame"] - view["start_frame"] + 1) / fps
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        _run_ffmpeg(["-i", view["source"], "-vf", f"select=between(n\\,{view['start_frame']}\\,{view['end_frame']}),setpts=PTS-STARTPTS", "-frames:v", str(view["end_frame"] - view["start_frame"] + 1), "-map", "0:v:0", "-map", "0:a?",
+                     "-af", f"atrim=start={start_s:.6f}:duration={seconds:.6f},asetpts=PTS-STARTPTS", "-c:v", "libx264", "-crf", "12", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart", output_path])
     return output_path
 
 

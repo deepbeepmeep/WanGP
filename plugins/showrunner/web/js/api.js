@@ -33,6 +33,7 @@ export const api = {
   trash: id => call('DELETE', `productions/${id}`),
   archive: (id, archived = true) => call('POST', `productions/${id}/archive`, { archived }),
   analysis: (id, refresh = false) => call('GET', `productions/${id}/analysis${refresh ? '?refresh=true' : ''}`),
+  renderGroups: (id, shots) => call('GET', `productions/${id}/render-groups?shots=${encodeURIComponent(shots.join(','))}`),
   waveform: (id, path) => call('GET', `productions/${id}/waveform?path=${encodeURIComponent(path)}`),
   subtitles: (id, path) => call('GET', `productions/${id}/subtitles?path=${encodeURIComponent(path)}`),
   rates: id => call('GET', `productions/${id}/rates`),
@@ -44,7 +45,7 @@ export const api = {
   pause: (id, now = false) => call('POST', `productions/${id}/director/pause${now ? '?now=true' : ''}`),
   resume: (id, message = '') => call('POST', `productions/${id}/director/resume`, { message }),
   rerun: (id, shot) => call('POST', `productions/${id}/shots/${shot}/rerun`),
-  renderNow: (id, shots) => call('POST', `productions/${id}/render`, { shots }),
+  renderNow: (id, shots, final = false, newSeed = null) => call('POST', `productions/${id}/render`, { shots, final, new_seed: newSeed }),
   detachSound: (id, shot) => call('POST', `productions/${id}/shots/${shot}/detach-sound`),
   cancelRender: (id, shot) => call('POST', `productions/${id}/shots/${shot}/cancel`),
   assemble: id => call('POST', `productions/${id}/assemble`),
@@ -67,6 +68,8 @@ export const api = {
     if (target) form.append('target', target);
     return call('POST', `productions/${id}/upload`, form);
   },
+  sourcePart: (id, shot) => `api/productions/${id}/source_part?shot=${encodeURIComponent(shot)}`,
+  takePart: (id, shot, take) => `api/productions/${id}/take_part?shot=${encodeURIComponent(shot)}&take=${encodeURIComponent(take)}`,
   file: (id, path, download = false) => path ? `api/productions/${id}/file?path=${encodeURIComponent(path)}${download ? '&download=true' : ''}` : '',
 };
 

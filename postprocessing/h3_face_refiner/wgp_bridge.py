@@ -141,7 +141,7 @@ class H3FaceRefinerBridge(FaceRefinerBridge):
             "media": ("video",),
             "profile": UPSAMPLER_PROFILE_VIDEO,
             "config_key": "h3_face_refiner",
-            "pos": 44,
+            "pos": 10_001,
             "methods": [("H3 Face Refiner", METHOD)],
             "vae_methods": [],
             "default_spatial_upsampling": METHOD,
@@ -149,7 +149,8 @@ class H3FaceRefinerBridge(FaceRefinerBridge):
             "progress_label": "Face Refiner",
             "default_prompt": DEFAULT_PROMPT,
             "source_audio_conditioning": True,
-            "description": "Restore blurred or damaged faces while keeping the surrounding video and resolution. Tracks up to five faces; more faces take longer.",
+            "description": "Restore blurred or damaged faces while keeping the surrounding video and resolution. Tracks up to five faces; more faces take longer. Choose it to keep mouths close to the source, or for small or distant faces; TaoMate-FVSR Face Refiner gives more detail on close-ups and corrects mouths harder.",
+            "media_descriptions": {"video": "**Pros**\n\n- Mouths stay close to the source.\n- More natural than TaoMate-FVSR on small or distant faces.\n- Accepts a prompt (Late Post Processing).\n- Reuses H3 when it is already loaded.\n- Faster than TaoMate-FVSR with several faces, and uses a little less VRAM.\n\n**Cons**\n\n- Less skin, eye and teeth detail than TaoMate-FVSR on close-ups.\n- Expressions and the upper face can change.\n- Does little to correct a mouth that looks wrong.\n- Slower than TaoMate-FVSR on a single close-up."},
             "method_parameters": {METHOD: [
                 face_count_parameter(),
                 face_strength_parameter(0.75, "Face Refinement Strength - lower preserves more of the original face", "Controls how strongly H3 replaces source facial detail. Lower values preserve more of the original face."),

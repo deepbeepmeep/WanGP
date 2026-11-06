@@ -2,6 +2,7 @@
 // Deepy panel: Deepy's own window on the production's conversation, read only: its thoughts and every step, as they are written.
 import { state, deepyWait } from './app.js';
 import { api } from './api.js';
+import { mediaPopup } from './ui.js';
 
 const WINDOW = '../deepy/window?contour=0&input=0&avatars=0&stop=0&actions=0&wide=1&font=0.84';
 
@@ -43,6 +44,7 @@ export function mountConversation(root) {
       frame.addEventListener('load', () => {
         view = frame.contentWindow.DeepyWindow;
         view.onGap = () => { clearTimeout(gap); gap = setTimeout(load, 1500); };  // an update it could not place: what Deepy saved fills the hole
+        view.onMedia = mediaPopup;  // a media of the conversation opens over the page, not in a new tab
         load().then(seed);
       });
       root.append(frame);

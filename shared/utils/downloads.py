@@ -19,6 +19,7 @@ _download_jobs = {}
 _file_downloads = {}
 _file_download_tokens = {}
 _gallery_downloads = {}
+_lost_downloads = set()  # saved links whose file restore_file_downloads did not find
 _download_jobs_lock = threading.Lock()
 _download_routes_installed = False
 _download_original_create_app = None
@@ -62,6 +63,23 @@ def register_file_download(path, mime_type=None):
             _file_download_tokens[key] = token
             _file_downloads[token] = {"path": str(file_path), "filename": file_path.name, "mime_type": mime_type or mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"}
     return {"url": f"/wangp_api/download/{token}", "filename": file_path.name, "size_bytes": file_path.stat().st_size}
+
+
+def restore_file_downloads(text, roots):
+    """Registers again the files under roots that the download links in text name: a link saved before a restart (a conversation's
+    cards) works once more. A file's token comes from its path, so the same file gets its old link back. Returns how many were found."""
+    with _download_jobs_lock:
+        missing = set(re.findall(r"/wangp_api/download/([0-9a-f]{32})", text)) - _file_downloads.keys() - _lost_downloads
+    found = 0
+    for root in roots:
+        root = Path(root).expanduser().resolve()
+        for path in root.rglob("*") if missing and root.is_dir() else ():
+            if uuid.uuid5(uuid.NAMESPACE_URL, os.path.normcase(str(path))).hex in missing and path.is_file():
+                missing.discard(register_file_download(path)["url"].rsplit("/", 1)[1])
+                found += 1
+    with _download_jobs_lock:
+        _lost_downloads.update(missing)  # gone or elsewhere: not searched for again
+    return found
 
 
 def register_gallery_download(media_id, path, mime_type=None):
@@ -216,4 +234,4 @@ def install_routes():
     _download_routes_installed = True
 
 
-__all__ = ["install_routes", "register_download", "register_file_download", "register_gallery_download", "registered_download_path", "stream_bytes", "stream_writer"]
+__all__ = ["install_routes", "register_download", "register_file_download", "register_gallery_download", "registered_download_path", "restore_file_downloads", "stream_bytes", "stream_writer"]

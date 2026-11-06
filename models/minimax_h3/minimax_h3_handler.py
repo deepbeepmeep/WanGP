@@ -25,7 +25,9 @@ from .pdd import PDD_BLOCK_SIZE, PDD_NUM_STEPS
 from .pika import PIKA_SOLVER, PIKA_STEPS, PIKA_VIDEO_SHIFT
 from .ptd import PTD_FOLDER, PTD_HEAD_FILE, PTD_INFOS, PTD_DEEPY_INFOS
 from .vae_upsampler import X2_VAE_DESCRIPTION, X2_VAE_FILE, X2_VAE_INT8_FILE, X2_VAE_METHOD, X2_VAE_VALUE, query_x2_vae_files
-from .viggle import VIGGLE_ARCHITECTURE, VIGGLE_ASSET_FOLDER, VIGGLE_INFOS, VIGGLE_PROMPT_FILE, VIGGLE_REPO_ID
+from .viggle import (VIGGLE_ARCHITECTURE, VIGGLE_ASSET_FOLDER, VIGGLE_INFOS, VIGGLE_PROMPT_FILE, VIGGLE_REMAKE_ARCHITECTURE, VIGGLE_REMAKE_DEEPY_INFOS, VIGGLE_REMAKE_DEEPY_PROMPT_INFOS,
+                     VIGGLE_REMAKE_ENHANCER_INSTRUCTIONS, VIGGLE_REMAKE_INFOS, VIGGLE_REMAKE_MAX_FRAMES, VIGGLE_REMAKE_MAX_PICTURES, VIGGLE_REMAKE_MIN_FRAMES, VIGGLE_REMAKE_OVERLAP, VIGGLE_REMAKE_PROMPT_INFOS,
+                     VIGGLE_REMAKE_SHIFT, VIGGLE_REMAKE_STEPS, VIGGLE_REPO_ID)
 from .prompt_enhancer import (FL2VA_DEEPY_PROMPT_INFOS, FL2VA_IMAGE_SYSTEM_PROMPT, FL2VA_PROMPT_INFOS, FL2VA_TEXT_SYSTEM_PROMPT,
                               H3_AUDIO_DEEPY_PROMPT_INFOS, H3_AUDIO_DIALOGUE_SYSTEM_PROMPT, H3_AUDIO_MONOLOGUE_SYSTEM_PROMPT,
                               H3_STILL_IMAGE_SYSTEM_PROMPT, H3_STILL_TEXT_SYSTEM_PROMPT,
@@ -547,7 +549,7 @@ class family_handler:
     @staticmethod
     def query_supported_types():
         return [FL2VA_ARCHITECTURE, FL2VA_PRUNED_ARCHITECTURE, CONTROL_ARCHITECTURE, CONTROL_PRUNED_ARCHITECTURE,
-                REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE, TTS_REF2VA_PRUNED_ARCHITECTURE, VIGGLE_ARCHITECTURE, P_H3_IMAGE_ARCHITECTURE]
+                REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE, TTS_REF2VA_PRUNED_ARCHITECTURE, VIGGLE_ARCHITECTURE, VIGGLE_REMAKE_ARCHITECTURE, P_H3_IMAGE_ARCHITECTURE]
 
     @staticmethod
     def query_family_maps():
@@ -558,6 +560,7 @@ class family_handler:
             REF2VA_ARCHITECTURE: FL2VA_ARCHITECTURE,
             REF2VA_PRUNED_ARCHITECTURE: FL2VA_ARCHITECTURE,
             VIGGLE_ARCHITECTURE: FL2VA_ARCHITECTURE,
+            VIGGLE_REMAKE_ARCHITECTURE: FL2VA_ARCHITECTURE,
         }, {}
 
     @staticmethod
@@ -622,6 +625,50 @@ class family_handler:
                     "labels": {"": "No Input Audio", "A": "Use Custom Audio", "K": "Reuse Control Video Audio"},
                     "letters_filter": "AK", "label": "Control Audio", "show_label": True, "default": "",
                 },
+            })
+            return result
+        if base_model_type == VIGGLE_REMAKE_ARCHITECTURE:
+            mode = model_def.get("viggle_remake_mode", "swap")
+            result = family_handler.query_model_def(REF2VA_PRUNED_ARCHITECTURE, model_def)
+            result.pop("resolution_budget_tiled", None)
+            for key in ("text_prompt_enhancer_instructions1", "image_prompt_enhancer_instructions1", "text_prompt_enhancer_max_tokens1", "image_prompt_enhancer_max_tokens1", "preset_profiles_dir"):
+                result.pop(key, None)
+            result.update({
+                "profiles_dir": [],
+                "accelerated": "native",
+                "spoken_line_prompt": None,  # the soundtrack is the source's
+                "specialities": [{"name": "character replacement", "aliases": ["recasting", "person swap"], "description": "Recasts the people of a video from painted frames, keeping motion, camera, timing and soundtrack."}]
+                                if mode == "swap" else
+                                [{"name": "video object and scene editing", "aliases": ["object removal", "background replacement", "weather change"], "description": "Removes, replaces or adds objects and changes setting, weather or light from painted frames, keeping people and motion."}],
+                "video_edit": {"kind": mode, "input": "painted_frames", "pins": True, "max_images": VIGGLE_REMAKE_MAX_PICTURES, "continuation_overlap": VIGGLE_REMAKE_OVERLAP},
+                "infos": VIGGLE_REMAKE_INFOS[mode],
+                "prompt_infos": VIGGLE_REMAKE_PROMPT_INFOS,
+                "deepy_infos": VIGGLE_REMAKE_DEEPY_INFOS[mode],
+                "deepy_prompt_infos": VIGGLE_REMAKE_DEEPY_PROMPT_INFOS,
+                "prompt_enhancer_def": {"selection": ["TI"], "labels": {"TIV": "A Remake Prompt from Text + {image_inputs}"}, "default": ""},  # it cannot see the source video: without the painted frames it invents what they show
+                "text_prompt_enhancer_instructions": VIGGLE_REMAKE_ENHANCER_INSTRUCTIONS[mode],
+                "video_prompt_enhancer_instructions": VIGGLE_REMAKE_ENHANCER_INSTRUCTIONS[mode],
+                "text_prompt_enhancer_max_tokens": 2048,
+                "video_prompt_enhancer_max_tokens": 2048,
+                "image_outputs": False, "v2i_switch_supported": False, "sliding_window": True, "video_continuation": False,
+                "resolution_budget": "1280x736",
+                "frames_minimum": VIGGLE_REMAKE_MIN_FRAMES,
+                "sliding_window_defaults": {"window_min": VIGGLE_REMAKE_MIN_FRAMES, "window_max": VIGGLE_REMAKE_MAX_FRAMES, "window_step": 17, "window_default": 294,
+                                            "overlap_min": VIGGLE_REMAKE_OVERLAP, "overlap_max": 119, "overlap_step": 17, "overlap_offset": 0, "overlap_default": VIGGLE_REMAKE_OVERLAP, "discard_step": 1},
+                "extract_guide_from_window_start": True, "control_video_trim_disabled": False, "control_video_trim": False,
+                "image_prompt_types_allowed": "T", "end_frames_always_enabled": False, "image_end_frame_position": False,
+                "guidance_max_phases": 1, "lock_guidance_phases": True, "lora_multiplier_phases": 1,
+                "phase_2_spatial_tiling": False, "inference_steps2": False, "lock_inference_steps": True, "flow_shift": False, "custom_sigmas": False, "custom_settings": [], "sample_solvers": [("Euler", "euler")],
+                "spectrum_cache": False, "first_block_cache": False,
+                "no_background_removal": True, "any_image_refs_relative_size": False, "fit_into_canvas_image_refs": 1,
+                "image_ref_choices": {"choices": [("Use Painted Frames for the Look", "I"), ("Pin Painted Frames at Chosen Positions", "FI")], "letters_filter": "FI", "default": "I", "label": "Painted Frames"},
+                "guide_custom_choices": {"choices": [("Use Source Video", "VU"), ("Use Source Video with a Mask", "VA")], "letters_filter": "V-UA", "default": "VU", "label": "Source Video"},
+                "mask_preprocessing": None, "video_mask_label": "Video Mask (white = what may change, black = kept exactly)",
+                "video_guide_label": "Source Video", "preprocess_video_guide2": False, "reference_video_enabled": False, "reference_image_enabled": False,
+                "any_audio_prompt": True, "audio_prompt_choices": True, "output_audio_is_input_audio": True, "audio_tail_ms": 0,
+                "audio_guide_label": "Custom Soundtrack",
+                "audio_prompt_type_sources": {"selection": ["K", "A"], "labels": {"K": "Keep the Source Video's Soundtrack", "A": "Use Custom Soundtrack"},
+                                              "letters_filter": "AK", "label": "Soundtrack", "show_label": True, "default": "K"},
             })
             return result
         if base_model_type in CONTROL_ARCHITECTURES:
@@ -1004,6 +1051,34 @@ class family_handler:
                 return "P-H3-Image requires the Euler sampler"
             inputs["num_inference_steps"] = P_H3_IMAGE_STEPS
             return None
+        if base_model_type == VIGGLE_REMAKE_ARCHITECTURE:
+            if inputs["video_guide"] is None:
+                return "Viggle Remake requires a Source Video"
+            if "A" in inputs["video_prompt_type"] and "U" in inputs["video_prompt_type"]:
+                return "Viggle Remake takes a Video Mask with `VA` in place of `VU`"
+            image_count = len(inputs["image_refs"] or [])
+            if not 1 <= image_count <= VIGGLE_REMAKE_MAX_PICTURES:
+                return f"Viggle Remake takes 1 to {VIGGLE_REMAKE_MAX_PICTURES} painted frames (found {image_count})"
+            if "F" in inputs["video_prompt_type"]:
+                positions = [position for position in (inputs["frames_positions"] or "").replace(",", " ").split() if position.upper() != "X"]
+                if len(positions) != image_count:
+                    return f"Viggle Remake pins one frame position per painted frame (found {len(positions)} positions and {image_count} frames)"
+                if any(not position.isdigit() for position in positions) or [int(position) for position in positions] != sorted(int(position) for position in positions):
+                    return "Viggle Remake frame positions must be frame numbers in ascending order, in the order of the painted frames"
+            window = inputs["sliding_window_size"]
+            if not VIGGLE_REMAKE_MIN_FRAMES <= window <= VIGGLE_REMAKE_MAX_FRAMES:
+                return f"Viggle Remake windows run {VIGGLE_REMAKE_MIN_FRAMES} to {VIGGLE_REMAKE_MAX_FRAMES} frames"
+            inputs.update({"num_inference_steps": VIGGLE_REMAKE_STEPS, "flow_shift": VIGGLE_REMAKE_SHIFT, "guidance_scale": 1.0, "guidance_phases": 1, "sample_solver": "euler", "custom_sigmas": "", "skip_steps_cache_type": ""})
+            inputs["sliding_window_overlap"] = normalize_overlap(int(inputs["sliding_window_overlap"] or VIGGLE_REMAKE_OVERLAP), 17, 0)[0]
+            if "K" in inputs["audio_prompt_type"]:
+                from shared.utils.audio_video import extract_audio_tracks
+
+                try:
+                    if extract_audio_tracks(inputs["video_guide"], query_only=True) == 0:
+                        inputs["audio_prompt_type"] = inputs["audio_prompt_type"].replace("K", "")  # a silent source gives a silent result
+                except Exception as error:
+                    return f"Unable to inspect the Source Video's soundtrack: {error}"
+            return None
         pika = inputs["sample_solver"] == PIKA_SOLVER
         if pika:
             if base_model_type not in (FL2VA_ARCHITECTURE, FL2VA_PRUNED_ARCHITECTURE, REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE) or any(model_def.get(flag, False) for flag in ("pdd", "ptd", "vdn", "veda", "fasth3")):
@@ -1273,8 +1348,9 @@ class family_handler:
             if not distilled_text_encoder:
                 source_folders.append(TEXT_ENCODER_FOLDER)
                 file_lists.append(["config.json", "tokenizer.json", "tokenizer_config.json", "preprocessor_config.json", "vocab.json"])
-            source_folders.append(LATENT_UPSCALER_FOLDER)
-            file_lists.append([LATENT_UPSCALER_FILE])
+            if base_model_type != VIGGLE_REMAKE_ARCHITECTURE:
+                source_folders.append(LATENT_UPSCALER_FOLDER)
+                file_lists.append([LATENT_UPSCALER_FILE])
         downloads = [{
             "repoId": REPO_ID,
             "sourceFolderList": source_folders,
@@ -1302,6 +1378,7 @@ class family_handler:
 
         pdd = model_def.get("pdd", False)
         viggle = base_model_type == VIGGLE_ARCHITECTURE
+        remake_mode = model_def.get("viggle_remake_mode", "swap") if base_model_type == VIGGLE_REMAKE_ARCHITECTURE else None
         image_model = base_model_type == P_H3_IMAGE_ARCHITECTURE
         distilled_text_encoder = model_def.get("text_encoder_folder") == P_H3_IMAGE_TEXT_ENCODER_FOLDER
         if model_def.get("ptd", False):
@@ -1312,7 +1389,7 @@ class family_handler:
             video_vae_file = model_def.get("x2_vae_file", X2_VAE_FILE)
             process_files_def_if_needed(query_x2_vae_files(video_vae_file), status_text="Downloading MiniMax H3 X2 VAE")
         pipeline = model_factory(model_filename, text_encoder_filename, dtype=dtype,
-                                 reference_mode=base_model_type in (REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE, TTS_REF2VA_PRUNED_ARCHITECTURE, VIGGLE_ARCHITECTURE, P_H3_IMAGE_ARCHITECTURE),
+                                 reference_mode=base_model_type in (REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE, TTS_REF2VA_PRUNED_ARCHITECTURE, VIGGLE_ARCHITECTURE, VIGGLE_REMAKE_ARCHITECTURE, P_H3_IMAGE_ARCHITECTURE),
                                  save_quantized=save_quantized, model_type=model_type,
                                  qkv_splitting=model_def["qkv_splitting"],
                                  qkv_layout=model_def["qkv_layout"],
@@ -1322,7 +1399,7 @@ class family_handler:
                                  vdn=model_def.get("vdn", False), veda=model_def.get("veda", False), vsa=model_def.get("fasth3", False),
                                  audio_only=base_model_type == TTS_REF2VA_PRUNED_ARCHITECTURE,
                                  fixed_prompt_filename=os.path.join(VIGGLE_ASSET_FOLDER, VIGGLE_PROMPT_FILE) if viggle else None,
-                                 image_model=image_model, distilled_text_encoder=distilled_text_encoder)
+                                 image_model=image_model, distilled_text_encoder=distilled_text_encoder, remake_mode=remake_mode)
         pipeline.ptd = model_def.get("ptd", False)
         pipe = {"transformer": pipeline.transformer}
         if image_model:
@@ -1340,7 +1417,7 @@ class family_handler:
             })
             if not viggle:
                 pipe.update({"text_encoder": pipeline.text_encoder.language_model, "vision_encoder": pipeline.text_encoder.visual,
-                             "latent_upscaler": pipeline.latent_upscaler})
+                             **({} if remake_mode else {"latent_upscaler": pipeline.latent_upscaler})})
                 if distilled_text_encoder:
                     pipe["text_connector"] = pipeline.text_encoder.text_connector
         else:
@@ -1422,6 +1499,11 @@ class family_handler:
             family_handler.update_default_settings(REF2VA_PRUNED_ARCHITECTURE, model_def, ui_defaults)
             ui_defaults.update({"num_inference_steps": 3, "flow_shift": 3.0, "video_prompt_type": "IVU",
                                 "sliding_window_size": 124, "sliding_window_overlap": 18, "prompt_enhancer": ""})
+            return
+        if base_model_type == VIGGLE_REMAKE_ARCHITECTURE:
+            family_handler.update_default_settings(REF2VA_PRUNED_ARCHITECTURE, model_def, ui_defaults)
+            ui_defaults.update({"num_inference_steps": VIGGLE_REMAKE_STEPS, "flow_shift": VIGGLE_REMAKE_SHIFT, "guidance_scale": 1.0, "guidance_phases": 1, "sample_solver": "euler", "video_prompt_type": "IVU", "audio_prompt_type": "K",
+                                "resolution": "832x480", "video_length": 124, "sliding_window_size": 294, "sliding_window_overlap": VIGGLE_REMAKE_OVERLAP, "prompt_enhancer": "", "custom_sigmas": ""})
             return
         if base_model_type == TTS_REF2VA_PRUNED_ARCHITECTURE:
             ui_defaults.update({

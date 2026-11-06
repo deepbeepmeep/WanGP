@@ -1,6 +1,6 @@
 {
     "model": {
-        "name": "Viggle-Animate Pruned 20B",
+        "name": "Viggle Animate Pruned 20B",
         "architecture": "viggle_animate",
         "description": "Replace in only 3 denoising steps a character using an original control video and one edited frame from that video. The latter is the Reference Image, it must absolutely contain one frame of the Control Video where the main character will be replaced with you want to put instead. It is recommended to use a Generative Image Editor Model for this task.",
         "URLs": [

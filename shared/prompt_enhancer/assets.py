@@ -44,6 +44,12 @@ QWEN38_9B_TEXT_GGUF_FILENAME = "Qwen3.8-9B-Uncensored-Heretic-Q4_K_M.gguf"
 QWEN38_9B_TEXT_GGUF_Q8_FILENAME = "Qwen3.8-9B-Uncensored-Heretic-Q8_0.gguf"
 BONSAI2_27B_MTP_GGUF_FILENAME = "Ternary-Bonsai-2-27B-MTP-Q8_0.gguf"
 QWEN38_27B_VISION_FILENAME = "Qwen3.8-27B-Uncensored-vision-f16.gguf"
+QWEN38_VARIANT_FLASH_NEXT = "flash_next"
+QWEN38_FLASH_NEXT_FOLDER = "Qwen3_8_Flash_Next"
+QWEN38_FLASH_NEXT_TEXT_FILENAME = "Qwen3.8-Flash-Next-Uncensored-q8g-main-IQ3_S.gguf"
+QWEN38_FLASH_NEXT_NGRAM_FILENAME = "Qwen3.8-Flash-Next-ngram-table-IQ4_NL.gguf"
+QWEN38_FLASH_NEXT_VISION_FILENAME = "Qwen3.8-Flash-Next-vision-BF16.gguf"
+QWEN38_FLASH_NEXT_MTP_FILENAME = "Qwen3.8-Flash-Next-drafter-MTP-Q2_0.safetensors"
 QWEN35_VARIANT_SPECS = {
     QWEN35_VARIANT_9B: {
         "display_name": "Qwen3.5-9B Abliterated",
@@ -165,6 +171,45 @@ QWEN35_VARIANT_SPECS = {
         "embedding_budget": 2500,
         "llm_budget": 18000,
     },
+    QWEN38_VARIANT_FLASH_NEXT: {
+        # 125B parameters, much larger than the VRAM of a PC: MMGP keeps its routed experts in RAM with the most used in VRAM, and its n-gram table stays on the drive
+        "display_name": "Qwen3.8 Flash-Next",
+        "architecture": "qwen4_exp",
+        "assets_dir_name": QWEN38_FLASH_NEXT_FOLDER,
+        "root_repo": "Qwen/Qwen3.8-Flash-Next",
+        "repo_subfolder": "",
+        "root_files": [
+            "chat_template.jinja",
+            "config.json",
+            "generation_config.json",
+            "merges.txt",
+            "preprocessor_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "video_preprocessor_config.json",
+            "vocab.json",
+        ],
+        "text_repo": None,
+        "text_required_files": [],
+        "gguf_repo": QWEN35_ABLITERATED_REPO,
+        "gguf_repo_subfolder": QWEN38_FLASH_NEXT_FOLDER,
+        "text_gguf_q3_filename": QWEN38_FLASH_NEXT_TEXT_FILENAME,
+        "text_gguf_q3_mtp_filename": QWEN38_FLASH_NEXT_MTP_FILENAME,
+        "text_gguf_extra_files": [QWEN38_FLASH_NEXT_NGRAM_FILENAME],
+        "ngram_table_filename": QWEN38_FLASH_NEXT_NGRAM_FILENAME,
+        "vision_filename": QWEN38_FLASH_NEXT_VISION_FILENAME,
+        "backend": "gguf_q3",
+        "supports_mtp": True,
+        "mtp_speculative_tokens": 4,
+        "mtp_speculative_sampling_tokens": 4,
+        "mtp_speculative_confidence": 0.5,
+        "mtp_speculative_sampling_confidence": 0.8,
+        "mtp_draft_vocab_size": 98304,  # the MTP head drafts over the first 98304 tokens, as the 27B: Han starts at 96000, so that CJK text is verified without drafts
+        "tie_word_embeddings": False,
+        "vision_budget": 1500,
+        "embedding_budget": 2500,
+        "llm_budget": 18000,
+    },
 }
 
 
@@ -204,7 +249,7 @@ def qwen_download_defs(spec, backend, speculative_decoding=False):
         shared_files.extend(draft)
     defs.append(_files(spec["root_repo"], folder, shared_files, None if folder else spec["assets_dir_name"]))
     if spec["root_repo"] != spec["gguf_repo"]:
-        defs.append(_files(spec["gguf_repo"], checkpoint_folder, [spec["vision_filename"], filename, *draft]))
+        defs.append(_files(spec["gguf_repo"], checkpoint_folder, [spec["vision_filename"], filename, *spec.get("text_gguf_extra_files", ()), *draft]))
     if spec.get("text_required_files"):
         defs.append(_files(spec["text_repo"], folder, spec["text_required_files"]))
     return defs

@@ -333,7 +333,7 @@ def _external_references(markup: str) -> list[str]:
 
 
 def _build_wangp_module() -> types.ModuleType:
-    module = types.ModuleType("wangp", "WanGP helpers inside the Python sandbox: path, font, svg, publish_video, call, toolbox, inspect, generate, listdir, io, progress, out, root.")
+    module = types.ModuleType("wangp", "WanGP helpers inside the Python sandbox: path, video_frames, font, svg, publish_video, call, toolbox, inspect, generate, listdir, io, progress, out, root.")
     module.root = "."  # the sandbox folder is the working directory: relative paths, not virtual @documents paths
     module.out = "out"
 
@@ -348,6 +348,30 @@ def _build_wangp_module() -> types.ModuleType:
         value = _rpc({"op": "path", "ref": ref})
         GRANTED.add(_key(value))
         return value
+
+    def video_frames(ref: str, start: int = 0, stop: int | None = None, step: int = 1):
+        """The frames of a video or a view (@views/...) one by one, as RGB numpy arrays, numbered from its own first frame: start to stop (excluded), every step. Nothing is encoded: for a view it is the
+        quick way in, as wangp.path cuts a real clip the first time."""
+        import cv2
+
+        part = _rpc({"op": "part", "ref": str(ref)})
+        GRANTED.add(_key(part["path"]))
+        first = part["start_frame"] + int(start)
+        last = None if part["end_frame"] is None and stop is None else part["end_frame"] if stop is None else part["start_frame"] + int(stop) - 1 if part["end_frame"] is None else min(part["end_frame"], part["start_frame"] + int(stop) - 1)
+        capture = cv2.VideoCapture(part["path"])
+        try:
+            for _ in range(first):  # read on, not seek: exact to the frame on every file
+                capture.grab()
+            index = first
+            while (last is None or index <= last) and capture.grab():
+                if (index - first) % int(step) == 0:
+                    good, frame = capture.retrieve()
+                    if not good:
+                        return
+                    yield cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                index += 1
+        finally:
+            capture.release()
 
     def svg(markup: str, width: int | None = None, height: int | None = None, background: str | None = None):
         """Rasterize self-contained SVG markup (no external file references) to an RGBA PIL image; width/height scale it."""
@@ -639,10 +663,11 @@ def _build_wangp_module() -> types.ModuleType:
         return app_rpc("progression", path=str(path))
 
     module.app = types.SimpleNamespace(new=app_new, check=app_check, logs=app_logs, publish=app_publish, import_asset=import_asset, progression=progression)
+    module.video_frames = video_frames
     module.path, module.svg, module.font, module.text_mesh, module.extrude, module.extrude_parts, module.publish_video = path, svg, font, text_mesh, extrude, extrude_parts, publish_video
     module.call, module.toolbox, module.inspect, module.generate, module.listdir, module.progress, module.io = call, toolbox, inspect, generate, listdir, progress, io
     module.web, module.download, module.plugins, module.plugin = web, download, plugins, plugin
-    module.__all__ = ["path", "svg", "font", "text_mesh", "extrude", "extrude_parts", "publish_video", "call", "toolbox", "inspect", "generate", "listdir", "io", "web", "download", "plugins", "plugin", "progress", "app", "out", "root"]
+    module.__all__ = ["path", "video_frames", "svg", "font", "text_mesh", "extrude", "extrude_parts", "publish_video", "call", "toolbox", "inspect", "generate", "listdir", "io", "web", "download", "plugins", "plugin", "progress", "app", "out", "root"]
     return module
 
 
@@ -665,7 +690,7 @@ def _format_error(exc: BaseException) -> tuple[str, list[str]]:
     name = getattr(exc, "name", None) if isinstance(exc, NameError) else None
     if name in _TOOL_NAMES:
         message += f". WanGP's tools are reached through the wangp module here: {_TOOL_NAMES[name]}"
-    elif name and (name.startswith("wangp_") or name in ("view_media", "render_3d_views", "transcribe_media", "inspect_audio", "check_lip_sync", "extract_audio", "remux_media", "merge_videos", "resize_crop")):
+    elif name and (name.startswith("wangp_") or name in ("view_media", "render_3d_views", "transcribe_media", "inspect_audio", "check_lip_sync", "detect_video_cuts", "plan_video_windows", "check_video_edit", "extract_audio", "remux_media", "merge_videos", "resize_crop")):
         message += f". WanGP's tools are reached through the wangp module here: wangp.toolbox({name.removeprefix('wangp_')!r}, ...) or wangp.call({name!r}, ...)"
     elif not isinstance(exc, PermissionError) and ("'@" in message or '"@' in message):  # open() knows @alias paths; libraries opening files in C do not
         message += ". Libraries that open files themselves (soundfile, cv2, librosa) need the local path: pass wangp.path('@...') instead of the @alias path"

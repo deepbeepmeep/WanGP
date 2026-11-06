@@ -15,7 +15,8 @@ export function mountDirector(root) {
       <div class="box"><textarea id="d-input" rows="1"></textarea><button class="btn primary small icon" id="d-send" title="Send">${icon('send')}</button></div>
       <div class="quick" id="d-actions"></div></div></div>`;
   const feed = root.querySelector('#d-feed'), input = root.querySelector('#d-input'), written = new WeakMap();
-  let historyEnd = -1, stick = true, ignored = '';  // ignored: the selection the user took off the next message
+  const lines = new Map();  // each entry of the log as a line, written once
+  let stick = true, ignored = '';  // ignored: the selection the user took off the next message
   let showAllErrors = false;
   const loadSettings = () => api.settings().then(settings => { showAllErrors = settings.show_all_errors; if (state.doc) renderFeed(); }).catch(() => {});
   loadSettings();
@@ -26,6 +27,25 @@ export function mountDirector(root) {
     if (written.get(element) === html) return;
     written.set(element, html);
     element.innerHTML = html;
+  }
+  // The conversation's lines: [key, html of one element]. A line that stays keeps its element, so that its entrance does not play again and the conversation does not blink.
+  function patch(parent, items) {
+    const kept = new Map([...parent.children].map(child => [child.dataset.key, child])), template = document.createElement('template');
+    let cursor = parent.firstElementChild;
+    for (const [key, html] of items) {
+      let element = kept.get(key);
+      kept.delete(key);
+      if (!element || written.get(element) !== html) {
+        template.innerHTML = html;
+        const line = template.content.firstElementChild;
+        if (element) { element.className = line.className; element.innerHTML = line.innerHTML; }
+        else { element = line; element.dataset.key = key; }
+        written.set(element, html);
+      }
+      if (element === cursor) cursor = cursor.nextElementSibling;
+      else parent.insertBefore(element, cursor);
+    }
+    kept.forEach(element => element.remove());
   }
   function working() { return state.live.running || (state.doc && actions.busy(state.doc)); }
   function paused() { return !state.live.running && state.doc?.director.state === 'paused'; }
@@ -98,7 +118,7 @@ export function mountDirector(root) {
     const said = steps.findLast(step => step.said != null);
     if (live.text && live.text !== said?.said) {
       if (said && live.text.startsWith(said.said)) said.said = live.text;
-      else steps.push({ said: live.text, anchor });
+      else steps.push({ said: live.text, anchor, key: `said-${steps.length}` });
     }
   }
 
@@ -109,29 +129,27 @@ export function mountDirector(root) {
     return `<div class="step ${failed ? 'error' : tool.status}">${icon(tool.status === 'running' ? 'loader' : failed ? 'alert' : 'check')}<span>${shotNames(label.replace(/^Showrunner: /, ''))}${tool.error ? `<span class="why">${esc(showAllErrors ? tool.error : tool.error.slice(0, 200))}</span>` : ''}</span></div>`;
   }
 
-  function renderFeed(force = false) {
-    const doc = state.doc;
+  // The log's entries with the task's steps among them, then what it changed.
+  function renderFeed() {
+    const doc = state.doc, live = state.live;
     noteSteps();
-    const end = Math.min(state.live.steps[0]?.anchor ?? doc.log.length, doc.log.length);  // what comes before the task's first step does not change
-    if (force || end !== historyEnd) {
-      historyEnd = end;
-      feed.innerHTML = doc.log.slice(0, end).map(message).join('') + '<div id="d-live"></div>';
+    const logged = new Set(doc.log.slice(-8).map(entry => entry.text)), steps = live.steps.slice(-MAX_STEPS), items = [];
+    let next = 0;
+    for (let index = 0; index <= doc.log.length; index++) {
+      if (!next && steps[0]?.anchor <= index && live.steps.length > MAX_STEPS) items.push(['more', `<div class="step more">${count(live.steps.length - MAX_STEPS, 'earlier step')}</div>`]);
+      for (; next < steps.length && steps[next].anchor <= index; next++) {
+        const line = stepLine(steps[next], logged);
+        if (line) items.push([steps[next].key ?? steps[next].tool.id, line]);
+      }
+      if (index < doc.log.length) {
+        const entry = doc.log[index];
+        if (!lines.has(entry.id)) lines.set(entry.id, message(entry));
+        items.push([entry.id, lines.get(entry.id)]);
+      }
     }
-    renderLive();
-  }
-
-  // The task's steps among the log's entries, then what it changed.
-  function renderLive() {
-    const doc = state.doc, live = state.live, element = feed.querySelector('#d-live');
-    if (!element) return;
-    const logged = new Set(doc.log.slice(-8).map(entry => entry.text)), steps = live.steps.slice(-MAX_STEPS);
-    let html = live.steps.length > MAX_STEPS ? `<div class="step more">${count(live.steps.length - MAX_STEPS, 'earlier step')}</div>` : '', next = 0;
-    for (let index = historyEnd; index <= doc.log.length; index++) {
-      while (next < steps.length && steps[next].anchor <= index) html += stepLine(steps[next++], logged);
-      if (index < doc.log.length) html += message(doc.log[index]);
-    }
-    const summary = !working() && live.summary ? `<div class="msg system changes">${icon('check')} ${shotNames(live.summary)}</div>` : '';
-    write(element, doc.log.length || html || summary ? html + summary : `<div class="msg system">The showrunner's decisions and your notes appear here.</div>`);
+    if (!working() && live.summary) items.push(['summary', `<div class="msg system changes">${icon('check')} ${shotNames(live.summary)}</div>`]);
+    if (!items.length) items.push(['empty', `<div class="msg system">The showrunner's decisions and your notes appear here.</div>`]);
+    patch(feed, items);
     if (stick) feed.scrollTop = feed.scrollHeight;
   }
 
@@ -152,11 +170,12 @@ export function mountDirector(root) {
   input.addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); send(); } });
   root.querySelector('#d-send').onclick = send;
 
-  return {
-    loadSettings,
-    update() { renderBanner(); renderStatus(); renderActions(); renderFeed(); },
-    live() { renderBanner(); renderStatus(); renderActions(); renderFeed(); },
+  // Out of sight (another panel, or the panel folded), only the order of the steps is kept: showing the panel draws it (app.js renderSide).
+  const draw = () => {
+    if (root.classList.contains('hidden') || root.closest('.side.collapsed')) return noteSteps();
+    renderBanner(); renderStatus(); renderActions(); renderFeed();
   };
+  return { loadSettings, update: draw, live: draw };
 }
 
 // Deepy writes Markdown: the panel shows its words (a link by its text, code as plain words, bold as bold).

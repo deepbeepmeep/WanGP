@@ -99,6 +99,7 @@ def apply_top_k_top_p(
     logits: torch.Tensor,
     k: Optional[torch.Tensor],
     p: Optional[torch.Tensor],
+    k_max: Optional[int] = None,
 ) -> torch.Tensor:
     """Apply top-k and top-p masks to the logits (vLLM style).
     
@@ -117,7 +118,7 @@ def apply_top_k_top_p(
         if k is None:
             return logits.squeeze(0) if squeezed else logits
         # Avoid sorting vocab for top-k only case
-        logits = apply_top_k_only(logits, k)
+        logits = apply_top_k_only(logits, k, k_max)
         return logits.squeeze(0) if squeezed else logits
 
     # Need to sort for top-p
@@ -150,6 +151,7 @@ def apply_top_k_top_p(
 def apply_min_p(
     logits: torch.Tensor,
     min_p: Optional[torch.Tensor],
+    known_active: bool = False,
 ) -> torch.Tensor:
     if min_p is None:
         return logits
@@ -159,7 +161,7 @@ def apply_min_p(
         squeezed = True
     min_p = min_p.reshape(-1)
     active_mask = min_p > 0
-    if not torch.any(active_mask):
+    if not known_active and not torch.any(active_mask):
         return logits.squeeze(0) if squeezed else logits
     probs = logits.softmax(dim=-1)
     max_probs, max_idx = probs.max(dim=-1, keepdim=True)
@@ -174,6 +176,7 @@ def apply_min_p(
 def apply_top_k_only(
     logits: torch.Tensor,
     k: torch.Tensor,
+    k_max: Optional[int] = None,
 ) -> torch.Tensor:
     """Apply top-k mask without sorting the entire vocab (vLLM style).
     
@@ -191,12 +194,12 @@ def apply_top_k_only(
     no_top_k_mask = (k <= 0) | (k >= vocab_size)
     # Set invalid k to 1 so we can still gather
     k_safe = k.masked_fill(no_top_k_mask, 1).long()
-    # NOTE: This int() causes CPU-GPU sync, but torch.topk requires Python int
-    max_top_k = int(k_safe.max().clamp(max=vocab_size))
+    # NOTE: This int() causes CPU-GPU sync, but torch.topk requires Python int: the operations after it would wait for the host one by one (k_max: known to the caller)
+    max_top_k = int(k_safe.max().clamp(max=vocab_size)) if k_max is None else k_max
     
     # Get top-k values for all batches
     # topk.values has shape [batch_size, max_top_k]
-    topk_values = logits.topk(max_top_k, dim=1).values
+    topk_values = logits.amax(dim=1, keepdim=True) if k_max == 1 else logits.topk(max_top_k, dim=1).values
     
     # Convert k to 0-based index: we want the k-th largest value (index k-1)
     # Clamp to valid range for gather
@@ -227,6 +230,8 @@ class Sampler(nn.Module):
         repetition_penalties: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
+        k_max: Optional[int] = None,
+        min_p_active: bool = False,
     ):
         """
         Sample tokens from logits with optional top-k and top-p filtering.
@@ -241,8 +246,9 @@ class Sampler(nn.Module):
             logits,
             top_ks,
             top_ps,
+            k_max,
         )
-        logits = apply_min_p(logits, min_ps)
+        logits = apply_min_p(logits, min_ps, min_p_active)
         if _SAMPLER_NUMERIC_GUARD:
             logits = torch.nan_to_num(logits, nan=float("-inf"))
             invalid_rows = ~torch.isfinite(logits).any(dim=-1)

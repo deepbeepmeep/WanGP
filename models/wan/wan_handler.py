@@ -263,6 +263,7 @@ class family_handler():
         extra_model_def["i2v_2_2"] = i2v_2_2 = test_i2v_2_2(base_model_type)
         if base_model_type == "kiwi_edit":
             extra_model_def.update(get_kiwi_variant_model_def(model_def))
+            extra_model_def["prompt_enhancer_def"] = {"selection": [], "labels": {}, "default": ""}  # its prompt is a short edit instruction
             text_encoder_folder = override_text_encoder_folder or extra_model_def["kiwi_text_encoder_folder"]
             kiwi_mllm_repo_id = extra_model_def["kiwi_mllm_repo_id"]
             if override_text_encoder_urls is None:

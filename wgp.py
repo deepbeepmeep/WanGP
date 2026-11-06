@@ -4,7 +4,7 @@ import os, sys
 for _stream in (sys.stdout, sys.stderr): _stream.reconfigure(encoding="utf-8", errors="replace")
 from tqdm import tqdm
 
-WanGP_version = "19.14"
+WanGP_version = "19.20"
 _welcome_message = f" WanGP v{WanGP_version} - Copyright (c) 2024-2026 DeepBeepMeep "
 tqdm.write(f"\033[1m\033[93m{_welcome_message:*^100}\033[0m")
 
@@ -84,7 +84,7 @@ from shared.utils import notification_sound
 from shared.utils.setting_names import settings_error
 from shared.utils import generation_overrides
 from shared.utils.loras_mutipliers import preparse_loras_multipliers, parse_loras_multipliers
-from shared.utils.utils import convert_tensor_to_image, convert_video_tensor_to_uint8_chunked, save_image, get_video_info, get_file_creation_date, convert_image_to_video, calculate_new_dimensions, convert_image_to_tensor, calculate_dimensions_and_resize_image, rescale_and_crop, get_video_frame, resize_and_remove_background, rgb_bw_to_rgba_mask, image_editor_layer_to_rgb_mask, to_rgb_tensor, get_resampled_video_transparent, get_video_summary_extras
+from shared.utils.utils import convert_tensor_to_image, convert_video_tensor_to_uint8_chunked, save_image, get_video_info, get_video_real_fps, get_file_creation_date, convert_image_to_video, calculate_new_dimensions, convert_image_to_tensor, calculate_dimensions_and_resize_image, rescale_and_crop, get_video_frame, resize_and_remove_background, rgb_bw_to_rgba_mask, image_editor_layer_to_rgb_mask, to_rgb_tensor, get_resampled_video_transparent, get_video_summary_extras
 from shared.utils.utils import calculate_new_dimensions, get_outpainting_dims, get_outpainting_frame_location, get_outpainting_full_area_dimensions, resolve_outpainting_dims
 from shared.utils.utils import has_video_file_extension, has_image_file_extension, has_audio_file_extension, has_mesh_file_extension, has_world_file_extension, has_app_file_extension, MESH_IMPORT_EXTENSIONS, guide_to_float, guide_mask_to_float
 from shared.utils.audio_video import extract_audio_tracks, subtitle_stream_count, combine_video_with_audio_tracks, combine_and_concatenate_video_with_audio_tracks, cleanup_temp_audio_files, normalize_audio_volumes_to_temp_files, save_video, save_hdr_video, save_image, get_image_format, get_media_duration_and_audio_layouts
@@ -93,10 +93,10 @@ from shared.utils.audio_video import truncate_audio, shift_audio_trim_ranges, tr
 from shared.utils.audio_metadata import read_audio_metadata, extract_creation_datetime_from_metadata, resolve_audio_creation_datetime
 from shared.utils.media_recording import record_file_metadata as shared_record_file_metadata
 from shared.utils.settings_bundle import is_wangp_settings_filename
-from shared.utils.video_decode import decode_video_frames_ffmpeg, probe_video_stream_metadata
+from shared.utils.video_decode import decode_video_frames_ffmpeg, probe_video_stream_metadata, virtual_own_frames
 from shared.utils.video_metadata import extract_source_images  # also a plugin global (Queue Editor)
-from shared.utils.virtual_media import get_virtual_image, get_virtual_media_entry, get_virtual_media_vsource, media_source_exists, parse_virtual_media_path, replace_virtual_media_source, strip_virtual_media_suffix
-from shared.utils.frame_scheduler import SLASH_BLOCK_RE, build_default_window_plan, build_extension_window, build_frame_scheduler, fit_video_length, floor_frame_count, has_slash_commands, normalize_frame_count, set_video_length_rounding, prepare_loras_mult_windows
+from shared.utils.virtual_media import get_virtual_image, get_virtual_media_entry, get_virtual_media_vsource, media_source_exists, padded_virtual_media, parse_virtual_media_path, replace_virtual_media_source, strip_virtual_media_suffix
+from shared.utils.frame_scheduler import resolve_window_geometry, SLASH_BLOCK_RE, build_default_window_plan, build_extension_window, build_frame_scheduler, fit_video_length, floor_frame_count, has_slash_commands, normalize_frame_count, set_video_length_rounding, prepare_loras_mult_windows
 from shared.match_archi import match_nvidia_architecture
 from shared.attention import ATTENTION_MODE_AVAILABILITY, get_attention_modes, get_supported_attention_modes, get_default_attention_mode, get_override_attention_modes, get_supported_override_attention_modes
 from shared.utils.utils import truncate_for_filesystem, sanitize_file_name, process_images_multithread, get_default_workers, resize_lanczos_frames, expand_or_shrink_mask, prepare_binary_mask_frame
@@ -391,6 +391,14 @@ def _open_image_input(image):
         return image
     virtual_image = get_virtual_image(image)
     return virtual_image if virtual_image is not None else Image.open(strip_virtual_media_suffix(image))
+
+def is_number(n):
+    try:
+        float(n)
+    except ValueError:
+        return False
+    return True
+
 
 def is_integer(n):
     try:
@@ -3193,21 +3201,27 @@ def get_model_fps(model_type):
     return fps
 
 def get_computed_fps(force_fps, base_model_type , video_guide, video_source ):
+    # A video's real rate, 23.976 and not 24: the audio of every window and the recording are counted in seconds, and a rounded rate drifts away from them
     if force_fps == "auto":
         if video_source != None:
-            fps,  _, _, _ = get_video_info(video_source)
+            fps = get_video_real_fps(video_source)
         elif video_guide != None:
-            fps,  _, _, _ = get_video_info(video_guide)
+            fps = get_video_real_fps(video_guide)
         else:
             fps = get_model_fps(base_model_type)
     elif force_fps == "control" and video_guide != None:
-        fps,  _, _, _ = get_video_info(video_guide)
+        fps = get_video_real_fps(video_guide)
     elif force_fps == "source" and video_source != None:
-        fps,  _, _, _ = get_video_info(video_source)
+        fps = get_video_real_fps(video_source)
     elif len(force_fps) > 0 and is_integer(force_fps) :
         fps = int(force_fps)
+    elif len(force_fps) > 0 and is_number(force_fps) and float(force_fps) > 0:
+        fps = float(force_fps)
     else:
         fps = get_model_fps(base_model_type)
+        control = video_source if video_source is not None else video_guide
+        if control is not None and not has_image_file_extension(strip_virtual_media_suffix(control)) and abs(get_video_real_fps(control) - fps) < 0.1:  # a control video at 23.976 for a model at 24: every frame kept, on its own clock
+            fps = get_video_real_fps(control)
     return fps
 
 def get_model_name(model_type, description_container = [""]):
@@ -3365,6 +3379,8 @@ def fix_settings(model_type, ui_defaults, min_settings_version = 0):
         ui_defaults["overrides"] = generation_overrides.format_overrides(override_values)
     model_def = get_model_def(model_type)
     base_model_type = get_base_model_type(model_type)
+    if model_def.get("image_outputs", False) and ui_defaults.get("image_mode", 0) == 0:
+        ui_defaults["image_mode"] = 1
     duration_conversion = apply_video_length_duration(ui_defaults, model_def)
     if duration_conversion is not None:
         print(f"WanGP settings converted video_length={duration_conversion['input']!r} to {duration_conversion['frames']} frames at {duration_conversion['fps']:g} fps for {model_type}")
@@ -3515,6 +3531,7 @@ def get_factory_settings(model_type):
     apply_custom_settings_defaults(model_def, ui_defaults)
     ui_defaults.update({
         "settings_version": settings_version,
+        "image_mode": 1 if model_def.get("image_outputs", False) else 0,
         "prompt": get_default_prompt(i2v),
         "resolution": "1280x720" if "720" in base_model_type else "832x480",
         "flow_shift": 7.0 if "720" not in base_model_type and i2v else 5.0,
@@ -4351,7 +4368,7 @@ def setup_prompt_enhancer(pipe, kwargs, gen=None):
         reset_prompt_enhancer()
 
 
-def ensure_prompt_enhancer_loaded(override_profile=-1, progress=None, send_cmd=None, gen=None):
+def ensure_prompt_enhancer_loaded(override_profile=-1, progress=None, send_cmd=None, gen=None, name="Prompt Enhancer"):
     global enhancer_offloadobj
 
     reset_prompt_enhancer_if_requested()
@@ -4365,12 +4382,13 @@ def ensure_prompt_enhancer_loaded(override_profile=-1, progress=None, send_cmd=N
             speculative_decoding=normalize_prompt_enhancer_speculative_decoding(server_config.get(PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY, PROMPT_ENHANCER_SPECULATIVE_DECODING_DEFAULT)),
             send_cmd=send_cmd,
             progress=progress,
+            status_text=f"Downloading {name} model files...",
             gen=gen,
         )
         if progress is not None:
-            progress(0, "Please Wait While Loading Prompt Enhancer")
+            progress(0, f"Please Wait While Loading {name}")
         def loading_progress(phase, completed, total, model_id):
-            progress((completed, total), desc=f"Loading - {phase} Prompt Enhancer", unit="items")
+            progress((completed, total), desc=f"Loading - {phase} {name}", unit="items")
 
         loading_callback = offload.LoadingCallback(lambda: gen is not None and gen.get("abort", False), loading_progress) if progress is not None else None
         with model_unload_guard():
@@ -7794,7 +7812,6 @@ def generate_media(
     model_filename = get_model_filename(base_model_type)  
 
     frames_offset = model_def.get("frames_offset", 1)
-    video_length = fit_video_length(video_length, frames_minimum, latent_size, frames_offset)
     if sliding_window_size !=0:
         sliding_window_size = floor_frame_count(sliding_window_size, frames_minimum, latent_size, frames_offset)
     sliding_window_defaults = model_def.get("sliding_window_defaults", {})
@@ -7810,7 +7827,6 @@ def generate_media(
         discard_step = sliding_window_defaults.get("discard_step", latent_size)  # 1 for models that recycle no latents
         sliding_window_discard_last_frames = sliding_window_discard_last_frames // discard_step * discard_step
 
-    current_video_length = video_length
     # VAE Tiling
     device_mem_capacity = torch.cuda.get_device_properties(None).total_memory / 1048576
     outpainting_dims = get_outpainting_dims(video_guide_outpainting, video_guide_outpainting_ratio)
@@ -7840,6 +7856,14 @@ def generate_media(
     if "L" in image_prompt_type:
         video_source = prompt_enhancer_images.resolve_continue_video(video_source, image_prompt_type, get_processed_queue(gen)[VIDEO.id][0], save_path)
     fps = 1 if is_image else get_computed_fps(force_fps, base_model_type , video_guide, video_source )
+    # A virtual control video keeps its own length, in frames at the output rate, whatever lengths the model renders: the render pads it up to the next one, and the output is trimmed back.
+    # Asked for more than that rounding, it is a shorter control video like any other: temporal outpainting
+    guide_own_frames = virtual_own_frames(video_guide, fps) if image_mode == 0 and "-" not in video_prompt_type else None
+    if guide_own_frames is not None and fit_video_length(video_length, frames_minimum, latent_size, frames_offset) > normalize_frame_count(guide_own_frames, frames_minimum, latent_size, frames_offset):
+        guide_own_frames = None
+    video_length = min(video_length, guide_own_frames) if guide_own_frames is not None else fit_video_length(video_length, frames_minimum, latent_size, frames_offset)
+    window_output_policy = "exact" if guide_own_frames is not None else model_def.get("frame_scheduler_output_policy")
+    current_video_length = video_length
     gen_state = {}
     frame_scheduler = None
     first_window_available_overlap = estimate_first_window_overlap_frames(None if fake_start_image else image_start, video_source, keep_frames_video_source, fps)
@@ -7859,7 +7883,7 @@ def generate_media(
             overlap_offset=model_def.get("sliding_window_defaults", {}).get("overlap_offset", 1),
             max_overlap=model_def.get("sliding_window_defaults", {}).get("overlap_max"),
             preserve_exact_output_frames=model_def.get("image_end_frame_position", False),
-            output_frame_policy=model_def.get("frame_scheduler_output_policy"),
+            output_frame_policy=window_output_policy,
             supported_model_commands=model_def.get("prompt_slash_commands", []),
             allow_new_shot=image_prompt_types_allow_t2v(model_def, image_mode),
             first_window_overlap_frames=first_window_available_overlap,
@@ -8054,12 +8078,12 @@ def generate_media(
         default_windows_template = []
     elif any_sliding_window:
         first_window_overlap = min(max(1, default_reuse_frames), first_window_available_overlap) if video_source is not None else min(1, first_window_available_overlap)
-        default_windows_template = build_default_window_plan(total_frames=current_video_length, window_size=sliding_window_size, default_overlap=default_reuse_frames, discard_last_frames=sliding_window_discard_last_frames, minimum=frames_minimum, step=frames_steps, frame_offset=frames_offset, overlap_offset=sliding_window_defaults.get("overlap_offset", 1), max_overlap=sliding_window_defaults.get("overlap_max"), first_window_overlap=first_window_overlap, first_window_available_overlap=first_window_available_overlap, initial_shared_frames=1 if first_window_overlap > 0 else 0, preserve_exact_output_frames=model_def.get("image_end_frame_position", False), output_frame_policy=model_def.get("frame_scheduler_output_policy"))
+        default_windows_template = build_default_window_plan(total_frames=current_video_length, window_size=sliding_window_size, default_overlap=default_reuse_frames, discard_last_frames=sliding_window_discard_last_frames, minimum=frames_minimum, step=frames_steps, frame_offset=frames_offset, overlap_offset=sliding_window_defaults.get("overlap_offset", 1), max_overlap=sliding_window_defaults.get("overlap_max"), first_window_overlap=first_window_overlap, first_window_available_overlap=first_window_available_overlap, initial_shared_frames=1 if first_window_overlap > 0 else 0, preserve_exact_output_frames=model_def.get("image_end_frame_position", False), output_frame_policy=window_output_policy)
     else:
-        default_windows_template = [{"output_frames": current_video_length, "overlap_frames": 0, "discard_last_frames": 0, "trim_last_frames": 0, "frame_num": current_video_length}]
+        default_windows_template = [resolve_window_geometry(current_video_length, 0, 0, frames_minimum, frames_steps, frame_offset=frames_offset, output_frame_policy="exact")] if guide_own_frames is not None else [{"output_frames": current_video_length, "overlap_frames": 0, "discard_last_frames": 0, "trim_last_frames": 0, "frame_num": current_video_length}]
     default_windows = [dict(window) for window in default_windows_template]
     if not scheduler_active:
-        sliding_window = len(default_windows) > 1 or default_windows[0]["overlap_frames"] > 0
+        sliding_window = len(default_windows) > 1 or default_windows[0]["overlap_frames"] > 0 or default_windows[0]["trim_last_frames"] > 0  # that path trims a window to its length
     seed = set_seed(seed)
 
     torch.set_grad_enabled(False) 
@@ -8087,6 +8111,10 @@ def generate_media(
         current_video_length = default_windows[0]["frame_num"]
 
     first_window_video_length = current_video_length
+    guide_frames_needed = video_length + (scheduled_windows if scheduler_active else default_windows)[-1]["trim_last_frames"]
+    if guide_own_frames is not None and guide_frames_needed > guide_own_frames:
+        guide_source_frames = virtual_own_frames(video_guide)  # padding counts the file's frames, at its own rate
+        video_guide = padded_virtual_media(video_guide, guide_source_frames, math.ceil(guide_frames_needed * guide_source_frames / guide_own_frames))
     original_prompts = display_original_prompts.copy()
     original_alt_prompts = display_original_alt_prompts.copy()
     gen["sliding_window"] = sliding_window 
@@ -8218,7 +8246,7 @@ def generate_media(
             extra_windows += new_extra_windows
             if scheduler_active:
                 for _ in range(new_extra_windows):
-                    scheduled_windows.append(build_extension_window(scheduled_windows[-1]["prompt"], window_size=sliding_window_size, overlap_frames=default_reuse_frames, discard_last_frames=default_discard_last_frames, minimum=frames_minimum, step=frames_steps, frame_offset=frames_offset, preserve_exact_output_frames=model_def.get("image_end_frame_position", False), output_frame_policy=model_def.get("frame_scheduler_output_policy")))
+                    scheduled_windows.append(build_extension_window(scheduled_windows[-1]["prompt"], window_size=sliding_window_size, overlap_frames=default_reuse_frames, discard_last_frames=default_discard_last_frames, minimum=frames_minimum, step=frames_steps, frame_offset=frames_offset, preserve_exact_output_frames=model_def.get("image_end_frame_position", False), output_frame_policy=window_output_policy))
                     requested_frames_to_generate += scheduled_windows[-1]["output_frames"]
                 if window_no >= len(scheduled_windows):
                     break
@@ -8232,7 +8260,7 @@ def generate_media(
             else:
                 frame_window_options, current_loras_slists, new_shot, discard_last_frames = None, loras_slists, False, default_discard_last_frames
                 for _ in range(new_extra_windows):
-                    default_windows.append(build_extension_window("", window_size=sliding_window_size, overlap_frames=default_reuse_frames, discard_last_frames=default_discard_last_frames, minimum=frames_minimum, step=frames_steps, frame_offset=frames_offset, preserve_exact_output_frames=model_def.get("image_end_frame_position", False), output_frame_policy=model_def.get("frame_scheduler_output_policy")))
+                    default_windows.append(build_extension_window("", window_size=sliding_window_size, overlap_frames=default_reuse_frames, discard_last_frames=default_discard_last_frames, minimum=frames_minimum, step=frames_steps, frame_offset=frames_offset, preserve_exact_output_frames=model_def.get("image_end_frame_position", False), output_frame_policy=window_output_policy))
                     requested_frames_to_generate += default_windows[-1]["output_frames"]
                 if window_no >= len(default_windows):
                     break
@@ -8242,7 +8270,7 @@ def generate_media(
                 if "requested_output_frames" in default_window and abs(default_window["requested_output_frames"] - default_window["output_frames"]) > 1:
                     print(f"Requested frame contribution adjusted from {default_window['requested_output_frames']} to {default_window['output_frames']} for model-compatible scheduling (Sliding Window {window_no + 1}).")
                 prompt =  prompts[window_no] if window_no < len(prompts) else prompts[-1]
-                sliding_window = len(default_windows) > 1 or reuse_frames > 0
+                sliding_window = len(default_windows) > 1 or reuse_frames > 0 or automatic_trim_last_frames > 0  # that path trims a window to its length
             gen["sliding_window"] = sliding_window
             current_alt_prompt = alt_prompts[window_no] if window_no < len(alt_prompts) else alt_prompts[-1]
             if scheduler_active:
@@ -8880,7 +8908,7 @@ def generate_media(
                     generated_audio = samples.get("audio", generated_audio)
                     overridden_inputs = samples.get("overridden_inputs", None)
                     output_audio_sampling_rate = samples.get("audio_sampling_rate", audio_sampling_rate)
-                    input_fills_window = input_waveform is not None and input_waveform.shape[0] >= int(round(current_video_length * input_waveform_sample_rate / fps))
+                    input_fills_window = input_waveform is not None and input_waveform.shape[0] >= int(round((current_video_length - automatic_trim_last_frames) * input_waveform_sample_rate / fps))  # the frames trimmed away need no sound
                     if generated_audio is not None:
                         if keep_input_audio and input_fills_window:
                             drop_generated_audio = True
@@ -13150,7 +13178,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                 prompt_enhancer_values = [value for _, value in prompt_enhancer_choices]
                 prompt_enhancer_mode_value = prompt_enhancer_chaining.normalize_choice(prompt_enhancer_value, prompt_enhancer_values, prompt_enhancer_default, require_choice=on_demand_prompt_enhancer)
 
-                prompt_enhancer_think_visible = server_config.get("enhancer_enabled", 0) in (3, 4, 5, 6)
+                prompt_enhancer_think_visible = server_config.get("enhancer_enabled", 0) in (3, 4, 5, 6, 7)
                 prompt_enhancer_think_value = prompt_enhancer_think_visible and "K" in prompt_enhancer_value and len(prompt_enhancer_mode_value) > 0
                 prompt_enhancer_value = build_prompt_enhancer_value(prompt_enhancer_mode_value, prompt_enhancer_think_value)
                 prompt_enhancer_think_classes = "cbx_centered" if on_demand_prompt_enhancer else "cbx_bottom"

@@ -38,6 +38,8 @@ class Operations(BaseModel):
 
 class RenderRequest(BaseModel):
     shots: list[str]
+    final: bool = False
+    new_seed: bool | None = None  # None: a draft draws a new seed, a final keeps its take's
 
 
 class DirectorRequest(BaseModel):
@@ -228,7 +230,7 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
     @app.post("/api/productions/{production_id}/upload")
     async def upload(production_id: str, file: UploadFile = File(...), role: str = Form("bin"), target: str | None = Form(None)):
         production(production_id)
-        if role not in ("bin", "song", "reference", "cast", "take", "track", "subtitles"):
+        if role not in ("bin", "song", "source", "reference", "cast", "take", "track", "subtitles"):
             raise HTTPException(400, "Unknown upload role.")
         with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename or "").suffix) as handle:
             shutil.copyfileobj(file.file, handle)
@@ -247,6 +249,16 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
         if not target.owns(file):
             raise HTTPException(403, "This file does not belong to the production.")
         return FileResponse(file, filename=file.name if download else None, headers={"Cache-Control": "private, max-age=3600"})  # a download keeps its name
+
+    @app.get("/api/productions/{production_id}/source_part")
+    def source_part(production_id: str, shot: str):
+        production(production_id)
+        return FileResponse(showrunner.source_part(production_id, shot), headers={"Cache-Control": "private, max-age=3600"})
+
+    @app.get("/api/productions/{production_id}/take_part")
+    def take_part(production_id: str, shot: str, take: str):
+        production(production_id)
+        return FileResponse(showrunner.take_part(production_id, shot, take), headers={"Cache-Control": "private, max-age=3600"})
 
     @app.get("/api/productions/{production_id}/analysis")
     async def analysis(production_id: str, refresh: bool = False):
@@ -267,6 +279,11 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
     async def shoot_rates(production_id: str):
         production(production_id)
         return await run_in_threadpool(showrunner.shoot_rates, production_id)
+
+    @app.get("/api/productions/{production_id}/render-groups")
+    def render_groups(production_id: str, shots: str = ""):
+        production(production_id)
+        return {"groups": showrunner.render_groups(production_id, [shot for shot in shots.split(",") if shot] or None)}
 
     @app.get("/api/productions/{production_id}/conversation")
     def conversation(production_id: str, after: int = 0):
@@ -355,7 +372,7 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
     @app.post("/api/productions/{production_id}/render")
     def render_now(production_id: str, request: RenderRequest):
         production(production_id)
-        return showrunner.render_directly(production_id, request.shots)
+        return showrunner.render_directly(production_id, request.shots, final=request.final, new_seed=request.new_seed)
 
     @app.post("/api/productions/{production_id}/shots/{shot_id}/cancel")
     def cancel(production_id: str, shot_id: str):

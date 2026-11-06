@@ -12,7 +12,8 @@ from typing import Any
 from . import production as model
 
 VIDEO_TASKS = ("gen_video", "gen_video_with_speech", "gen_video_with_refs")
-DRAWN = "draw_svg"  # the template of a shot the director draws (a card, a diagram, a map) and records with record_take
+EDIT_TASKS = ("swap_video", "edit_video")  # they change a remake's source video: never offered for a shot made from nothing
+DRAWN ="draw_svg"  # the template of a shot the director draws (a card, a diagram, a map) and records with record_take
 SHOT_RANGE_MARGIN_S = 0.5  # a model's lengths come in steps: the nearest one to the user's range is not outside it
 LIP_SYNC_WORDS = re.compile(r"\s+with natural lip[- ]movements?(?:\s+synchronized)?", re.I)  # for a face that follows a recording
 WORD_S, SPARE_S = 0.4, 2.0  # a word's time when a model says it, and the time left in a shot past which it adds words of its own (measured on H3)
@@ -29,6 +30,8 @@ ROLES = (
     {"id": "shots_without_cast", "task": "gen_video", "hint": "Shots without the cast: landscapes, objects, crowds, inserts"},
     {"id": "cast_shots_lip_synced", "task": "gen_video_with_speech", "hint": "Shots where someone sings or speaks, lip-synced to the song or to their line"},
     {"id": "cast_shots", "task": "gen_video_with_refs", "hint": "Shots with the cast, keeping each person's face, hair and outfit from their pictures"},
+    {"id": "people_edits", "task": "swap_video", "hint": "A remake's shots where people or characters are replaced"},
+    {"id": "scene_edits", "task": "edit_video", "hint": "A remake's shots where objects, the setting, weather or light change"},
     {"id": "music", "task": "gen_song", "hint": "The songs and scores the showrunner composes"},
     {"id": "voices", "task": "gen_speech_from_description", "hint": "Each speaker's voice, made once from the voice described on their cast card"},
     {"id": "cloned_voices", "task": "gen_speech_from_sample", "hint": "Every spoken line (dialogue, narration), in its speaker's voice"},
@@ -213,9 +216,12 @@ def take_lengths(entry: dict[str, Any], count: int = 5) -> list[float]:
 
 
 def take_lengths_in_range(entry: dict[str, Any], low: float | None, high: float | None) -> list[float]:
-    """The lengths a template's model really makes inside the user's range, up to its longest window; the nearest one when none falls inside."""
+    """The lengths a template's model really makes inside the user's range, up to its longest window unless its model continues a take past it
+    (sliding windows: WanGP joins the windows into one take); the nearest one when none falls inside."""
     first, step, fps = entry["take_frames"]
     last = entry["longest_frames"] or first + 4 * step
+    if entry["sliding_window"] and high:
+        last = max(last, math.ceil(high * fps))
     lengths = [_seconds(frames, fps) for frames in range(first, last + 1, step)]
     margin = step / fps / 2  # what the model makes nearest to the end of the range
     inside = [length for length in lengths if (low is None or length >= low - margin) and (high is None or length <= high + margin)]
@@ -248,6 +254,8 @@ def whole_take(doc: dict[str, Any], catalog: list[dict[str, Any]], shot: dict[st
 def advice(doc: dict[str, Any], catalog: list[dict[str, Any]], any_length: bool = False) -> dict[str, Any]:
     """What the director should choose for this production's shots and media."""
     picks, user = effective(doc, catalog), chosen(doc, catalog)
+    if doc["brief"].get("kind") != "remake":  # the editing templates are a remake's: nothing about them in any other production
+        user = {role: template for role, template in user.items() if TASKS[role] not in EDIT_TASKS}
     lip, with_cast = picks.get("cast_shots_lip_synced"), lip_synced_with_cast(picks, catalog)
     result = {"rule": RULE, "cast_with_pictures": cast_with_pictures(doc)}
     result.update({role: picks[role] for role in ("cast_shots", "shots_without_cast") if role in picks})
@@ -261,6 +269,9 @@ def advice(doc: dict[str, Any], catalog: list[dict[str, Any]], any_length: bool 
         result["masters_from_pictures"] = picks["image_edits"]
     if doc["brief"].get("kind") == "story":  # picture-book pages are stills: the cast's go through the image editing template
         result.update({key: picks[role] for key, role in (("pages", "images"), ("pages_with_cast", "image_edits")) if role in picks})
+    if doc["brief"].get("kind") == "remake":  # every shot changes the source: the two editing templates and the image editor that paints their frames
+        result = {"rule": "Each shot takes the template of what changes in it: people_edits for people or characters, scene_edits for objects, setting, weather or light. Read its input guidance with wangp_templates first.",
+                  **{role: picks[role] for role in ("people_edits", "scene_edits", "image_edits") if role in picks}}
     if user:
         result["user_choices"] = user
         result["user_rule"] = "user_choices are the user's picks for these kinds of shots and media: use them, never another template for the same kind."

@@ -297,6 +297,14 @@ def get_video_info_details(video_path):
         }
     return _get_video_info_details_cached(video_path)
 
+def get_video_real_fps(video_path):
+    """A video's real frame rate, 23.976 and not the 24 of get_video_info, for what is counted in seconds: its audio, its recording."""
+    metadata = None if isinstance(video_path, Image.Image) else probe_video_stream_metadata(video_path)
+    if metadata is None or not metadata["fps_float"]:
+        return get_video_info(video_path)[0]
+    return int(round(metadata["fps_float"])) if abs(metadata["fps_float"] - round(metadata["fps_float"])) < 0.001 else metadata["fps_float"]
+
+
 def get_video_frame(file_name: str, frame_no: int, return_last_if_missing: bool = False, target_fps = None,  return_PIL = True) -> torch.Tensor:
     """Extract nth frame from video as PyTorch tensor normalized to [-1, 1]."""
     metadata = probe_video_stream_metadata(file_name)

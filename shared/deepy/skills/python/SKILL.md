@@ -18,6 +18,7 @@ description: "Use before the first wangp_python run of a session: how the sandbo
 ## WanGP's tools from a script
 
 - `wangp.generate(settings)`: generates with a template or model and waits; returns the job result with the new media ids. `wangp.call("templates", task="gen_video")` / `wangp.call("models", action="lookup", arguments={"query": ...})` find templates and model types.
+- `wangp.video_frames(ref, start=0, stop=None, step=1)`: the frames of a video or a view (`@views/...`) as RGB numpy arrays, one by one and with nothing encoded; `wangp.path` on a view cuts a real clip the first time.
 - `wangp.inspect(media, question)`: asks the visual model about an image, a video frame (`media_inputs=[{"media_id": ref, "time_s": t}]`) or a 3D asset.
 - `wangp.toolbox(action, **arguments)`: media utilities (resize_crop, extract_video, merge_videos, remux_media, render_3d_views, create_mask, transcribe_media...).
 - `wangp.io(action, {...})`: list, info, read_text, mkdir, copy, move, zip in authorized folders (writing there goes through it: no delete).

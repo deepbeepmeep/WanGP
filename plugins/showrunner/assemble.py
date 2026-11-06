@@ -23,8 +23,10 @@ DEFAULT_AUDIO_ARGS = ["-c:a", "aac", "-b:a", "192k"]
 
 
 def _canvas(doc: dict[str, Any], takes: list[dict[str, Any]]) -> tuple[int, int, float]:
-    first = next((take for take in takes if take.get("width") and take.get("height")), None)
-    width, height = (int(first["width"]), int(first["height"])) if first else (1280, 720)
+    """The edit is made at the size of its takes: a draft edit stays a draft, and a mix takes the largest. A part kept from the source has no size of its own."""
+    sized = [take for take in takes if take.get("width") and take.get("height")]
+    largest = max([take for take in sized if not take.get("kept")] or sized, key=lambda take: int(take["width"]) * int(take["height"]), default=None)
+    width, height = (int(largest["width"]), int(largest["height"])) if largest else (1280, 720)
     fps = float(doc["edit"].get("fps") or next((take.get("fps") for take in takes if take.get("fps")), None) or 24.0)
     return width - width % 2, height - height % 2, fps
 
@@ -33,7 +35,9 @@ def plan(doc: dict[str, Any], resolve) -> dict[str, Any]:
     """The clips of the edit with their source window, and whether a stream copy is possible."""
     clips = []
     for shot, take in model.sequence(doc):
-        path = resolve(take["path"])
+        kept = bool(take.get("kept_source"))  # read from the source the cuts were measured on, the upload itself at a rate that rounds to the model's: from its full size, with no encode of its own
+        path = resolve(doc["remake"]["path"] if kept else take["path"])
+        made = doc.get("remake") and shot.get("source_range")  # a remake's shot: its frames are the source's one to one, at the source's real rate, and so is its sound
         start, end = (list(shot.get("trim") or [0.0, None]) + [None, None])[:2]
         length = take.get("duration_s") or shot.get("duration_s") or 5.0
         start = float(start or 0.0)
@@ -42,18 +46,20 @@ def plan(doc: dict[str, Any], resolve) -> dict[str, Any]:
                       "transition": shot.get("transition") or {"type": "cut"}, "has_audio": take.get("has_audio"), "sound": shot.get("sound", True), "codec": take.get("codec"),
                       "width": take.get("width"), "height": take.get("height"), "fps": take.get("fps"), "sung": bool(shot.get("audio_slice")), "dialogue": shot.get("dialogue") or [], "line_cut": shot.get("line_cut") if shot.get("line_cut") == shot.get("trim") else None,
                       "line": (shot.get("generation") or {}).get("settings", {}).get("audio_guide"), "length": float(length),
-                      "trimmed": start > 0.0 or end < float(length) - 0.01})
+                      "trimmed": start > 0.0 or end < float(length) - 0.01, "kept": kept, "seek": shot["source_range"][0] / doc["remake"]["fps"] if kept else 0.0,
+                      **({"exact": max(1, round((end - start) * doc["remake"]["fps"])), "sound_at": shot["source_range"][0] / doc["remake"]["fps"] + start} if made else {})})
     edit = doc["edit"]
+    layout_sound_untouched = bool(doc.get("remake")) and edit.get("audio_mode") == "clips" and not edit.get("audio_tracks") and all(clip.get("sound_at") is not None or not clip["has_audio"] for clip in clips)
     if doc["brief"].get("song") and edit.get("audio_mode") in ("song", "mix"):  # the song is the clock: a transition keeps every shot on its part
         for before, clip in zip(clips, clips[1:]):
             if clip["transition"].get("type", "cut") in XFADE:  # the outgoing shot runs into it: spare frames, then its last frame held (tpad, 1 s)
                 overlap = min(float(clip["transition"].get("duration_s") or 0.5), 1.0)
                 before["end"] += overlap * before["speed"]
                 clip["transition"] = {**clip["transition"], "duration_s": overlap}
-    copyable = bool(clips) and all(clip["kind"] == "video" and not clip["trimmed"] and clip["speed"] == 1.0 and clip["sound"] and clip["transition"].get("type", "cut") == "cut" for clip in clips) \
+    copyable = bool(clips) and all(clip["kind"] == "video" and not clip["trimmed"] and not clip["kept"] and clip["speed"] == 1.0 and clip["sound"] and clip["transition"].get("type", "cut") == "cut" for clip in clips) \
         and len({(clip["codec"], clip["width"], clip["height"], clip["fps"]) for clip in clips}) == 1 and edit.get("audio_mode") == "clips" and not edit.get("audio_tracks") and not edit.get("overlays") \
         and not edit.get("subtitles") and not any(clip["dialogue"] for clip in clips)  # subtitles need the encode
-    return {"clips": clips, "copy": copyable}
+    return {"clips": clips, "copy": copyable, "sound_untouched": layout_sound_untouched}
 
 
 def render(doc: dict[str, Any], resolve, out: str | Path, *, video_args: list[str] | None = None, audio_args: list[str] | None = None, progress=None) -> dict[str, Any]:
@@ -80,11 +86,12 @@ def render(doc: dict[str, Any], resolve, out: str | Path, *, video_args: list[st
         length = sum((clip["end"] - clip["start"]) / clip["speed"] for clip in clips)
         _level_voices(doc, clips)
         measure = _encode_command(doc, clips, resolve, out, video_args or DEFAULT_VIDEO_ARGS, audio_args or DEFAULT_AUDIO_ARGS, measure=True)
-        gain = _gain(-14.0 if doc["edit"].get("audio_mode") == "song" and not doc["edit"].get("audio_tracks") else -16.0, _loudness(measure, timeout=max(120.0, 5.0 * length))) if measure else 0.0
+        gain = None if layout["sound_untouched"] else _gain(-14.0 if doc["edit"].get("audio_mode") == "song" and not doc["edit"].get("audio_tracks") else -16.0, _loudness(measure, timeout=max(120.0, 5.0 * length))) if measure else 0.0  # a remake's sound alone stays at its own level
         command = _encode_command(doc, clips, resolve, out, video_args or DEFAULT_VIDEO_ARGS, audio_args or DEFAULT_AUDIO_ARGS, gain_db=gain)
         _run_graph(command, timeout=max(300.0, 30.0 * length))  # an encode that stalls fails instead of blocking the director
         method = "single encode"
-    _tame_peaks(out, audio_args or DEFAULT_AUDIO_ARGS)
+    if not layout["sound_untouched"]:
+        _tame_peaks(out, audio_args or DEFAULT_AUDIO_ARGS)
     info = media.probe(out)
     return {"path": str(out), "method": method, "seconds": round(time.time() - started, 2), "clips": len(clips), **info}
 
@@ -192,7 +199,7 @@ def _level(gain: float) -> str:
 def _in_frames(clips, fps) -> list[dict[str, Any]]:
     """Every clip lasts whole frames (span: its seconds in the cut), and its picture is cut to exactly that many: the sound, subtitles and text placed
     at the clips' starts then stay on the picture (fractions of a frame left at each cut added up to 0.1 s of lip-sync drift over a 13-shot film)."""
-    return [{**clip, "frames": (frames := max(1, round((clip["end"] - clip["start"]) / clip["speed"] * fps))), "span": frames / fps, "end": clip["start"] + frames / fps * clip["speed"]} for clip in clips]
+    return [{**clip, "frames": (frames := clip["exact"] if clip.get("exact") and clip["speed"] == 1.0 else max(1, round((clip["end"] - clip["start"]) / clip["speed"] * fps))), "span": frames / fps, "end": clip["start"] + frames / fps * clip["speed"]} for clip in clips]
 
 
 def _places(clips) -> tuple[list[float], list[float], float]:
@@ -233,16 +240,17 @@ def _encode_command(doc, clips, resolve, out, video_args, audio_args, gain_db: f
     inputs, filters = [], []
     for index, clip in enumerate(clips):
         duration, frames = clip["span"], clip["frames"]
-        timing = "PTS-STARTPTS" if clip["speed"] == 1.0 else f"(PTS-STARTPTS)/{clip['speed']:g}"  # slowed down, the fps filter below repeats frames
+        exact = clip.get("exact") and clip["speed"] == 1.0  # frame for frame, nothing repeated or dropped: its frames only take the edit's clock
+        timing = f"N/({fps:.6f}*TB)" if exact else "PTS-STARTPTS" if clip["speed"] == 1.0 else f"(PTS-STARTPTS)/{clip['speed']:g}"  # slowed down, the fps filter below repeats frames
         if clip["kind"] == "image":  # a still gets a slow push-in (6 % over the shot), cropped to the canvas
             inputs += ["-loop", "1", "-framerate", f"{fps:g}", "-t", f"{duration + 1 / fps:.4f}", "-i", str(clip["path"])]
             source = (f"[{index}:v]scale={2 * width}:{2 * height}:force_original_aspect_ratio=increase,crop={2 * width}:{2 * height},"
                       f"zoompan=z='1+0.06*on/{frames}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={width}x{height}:fps={fps:g},")
         else:
-            inputs += ["-i", str(clip["path"])]
+            inputs += [*(["-ss", f"{max(0.0, clip['seek'] - 0.0001):.6f}"] if clip.get("seek") else []), "-i", str(clip["path"])]  # just before the frame: at it, rounding can pass it by
             source = f"[{index}:v]trim=start={clip['start']:.4f},"
-        filters.append(f"{source}setpts={timing},scale={width}:{height}:force_original_aspect_ratio=decrease,"
-                       f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={fps:g},tpad=stop_mode=clone:stop_duration=1,"
+        fit = f"scale={width}:{height}" if clip.get("kept") else f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black"  # a kept part stretches as a render does: no bars
+        filters.append(f"{source}setpts={timing},{fit},setsar=1,{'' if exact else f'fps={fps:g},'}tpad=stop_mode=clone:stop_duration=1,"
                        f"trim=end_frame={frames},setpts=PTS-STARTPTS,settb=AVTB,format=yuv420p[v{index}]")
     # Video chain: cuts concatenate, transitions overlap the two clips by their duration.
     label = "v0"
@@ -280,7 +288,7 @@ def _encode_command(doc, clips, resolve, out, video_args, audio_args, gain_db: f
         command += ["-map", f"{first_subtitle + offset}:s", f"-metadata:s:s:{offset}", f"language={item.get('language', 'eng')}", f"-disposition:s:{offset}", "0"]  # the viewer turns them on
     if subtitles:
         command += ["-c:s", "mov_text" if out.suffix.lower() in (".mp4", ".mov", ".m4v") else "srt"]
-    return [*command, *video_args, "-r", f"{fps:g}", "-t", f"{total:.3f}", "-movflags", "+faststart", str(out)]
+    return [*command, *video_args, "-r", f"{fps:.6f}".rstrip("0").rstrip("."), "-t", f"{total:.3f}", "-movflags", "+faststart", str(out)]
 
 
 LANGUAGES = {"en": "eng", "fr": "fra", "de": "deu", "es": "spa", "it": "ita", "pt": "por", "nl": "nld", "ja": "jpn", "zh": "zho", "ko": "kor", "ru": "rus", "ar": "ara", "hi": "hin"}
@@ -400,13 +408,36 @@ def _track_fades(track, path) -> str:
     return fades
 
 
+def _source_stretches(clips, offsets) -> list[dict[str, float]]:
+    """The parts of a remake's source its sound plays: shots that follow each other in the source and in the edit make one stretch, with nothing at their cut."""
+    stretches = []
+    for clip, offset in zip(clips, offsets):
+        if clip.get("sound_at") is None or not clip["has_audio"] or not clip["sound"] or clip["speed"] != 1.0:
+            continue
+        last = stretches[-1] if stretches else None
+        if last and abs(last["end"] - clip["sound_at"]) < 0.001 and abs(last["offset"] + last["end"] - last["start"] - offset) < 0.001:
+            last["end"] += clip["span"]
+        else:
+            stretches.append({"start": clip["sound_at"], "end": clip["sound_at"] + clip["span"], "offset": offset})
+    return stretches
+
+
 def _audio_chain(doc, clips, resolve, inputs, filters, offsets, total, gain_db) -> str | None:
     edit, parts = doc["edit"], []
     mode = edit.get("audio_mode", "clips")
     index = len(clips)
+    if mode in ("clips", "mix") and doc.get("remake"):  # the source's own sound, taken once from the upload: the takes hold copies of it
+        for number, stretch in enumerate(_source_stretches(clips, offsets)):
+            inputs += ["-ss", f"{stretch['start']:.6f}", "-t", f"{stretch['end'] - stretch['start']:.6f}", "-i", str(resolve(doc["brief"]["source"]))]
+            length, delay = stretch["end"] - stretch["start"], f"{round(stretch['offset'] * 48000)}S"  # to the sample
+            filters.append(f"[{index}:a]asetpts=PTS-STARTPTS,aresample=48000,afade=t=in:d=0.015,afade=t=out:st={max(0.0, length - 0.03):.3f}:d=0.03,adelay={delay}|{delay}[s{number}]")  # no click where a stretch starts or stops
+            parts.append((f"s{number}", 1.0))
+            index += 1
     if mode in ("clips", "mix"):
         for position, clip in enumerate(clips):
             delay = int(offsets[position] * 1000)
+            if clip.get("sound_at") is not None and clip["speed"] == 1.0:  # in a stretch of the source
+                continue
             if clip["kind"] == "video" and clip["has_audio"] and clip["sound"] and not (mode == "mix" and clip["sung"] and doc["brief"].get("song")):  # the song already sings it
                 tempo = "" if clip["speed"] == 1.0 else _atempo(clip["speed"]) + ","
                 played = (clip["end"] - clip["start"]) / clip["speed"]

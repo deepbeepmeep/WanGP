@@ -37,6 +37,7 @@ OOM_ERROR_TORCH_VERSIONS = ((2, 6), (2, 15))
 _oom_error = None  # the companion library, kept loaded while the allocator may call it
 _pressure_callback = None  # the ctypes callback, kept alive while the library may call it
 _warmup = threading.local()
+_warmup_callbacks = []
 
 
 def library_path():
@@ -178,12 +179,20 @@ def _device_index(device=None):
     return torch.cuda.current_device() if device is None else torch.cuda._get_device_index(device, optional=True)
 
 
+def before_graph_warmup(callback, remove=False):
+    """callback() runs before each graph warmup, outside it: what a warmup and its capture allocate cannot make anything leave the VRAM (no pressure callback then)."""
+    _warmup_callbacks.remove(callback) if remove else _warmup_callbacks.append(callback)
+
+
 @contextlib.contextmanager
 def graph_warmup(pool):
     """Run warmup on the graph's storage, including its capture. Native allocation paths outside this scope are unchanged."""
     if active != "vmm":
         yield
         return
+    if not getattr(_warmup, "depth", 0):
+        for callback in _warmup_callbacks:
+            callback()
     device = torch.cuda.current_device()
     stream = torch.cuda.current_stream(device)
     token = _lib.vmm_begin_warmup(device, *pool, stream.cuda_stream)

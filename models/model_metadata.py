@@ -283,7 +283,7 @@ def store_metadata(model_type, model_def, model_types_handlers, families_infos):
         "capabilities": infer_capabilities(model_def, main_outputs, outputs, inputs, media_inputs),
         "setting_values": infer_setting_values(model_def),
         **(resolution_metadata(model_def) if any(output in ("image", "video") for output in main_outputs) else {}),
-        **{key: copy.deepcopy(model_def[key]) for key in ("accelerated", "size", "specialities") if key in model_def},
+        **{key: copy.deepcopy(model_def[key]) for key in ("accelerated", "size", "specialities", "video_edit") if key in model_def},
     }
     return model_def
 

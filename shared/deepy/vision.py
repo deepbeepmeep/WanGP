@@ -10,6 +10,7 @@ from PIL import Image
 
 from shared.deepy.image_channels import upright
 from shared.llm_engines.lmgp.models.qwen3_5 import Qwen3_5ForCausalLM
+from shared.llm_engines.lmgp.models.qwen4_exp import Qwen4ExpForCausalLM
 from shared.prompt_enhancer.qwen35_vl import TEXT_MODEL_ID as _TEXT_MODEL_ID, VISION_MODEL_ID as _VISION_MODEL_ID, _prepare_multimodal_vllm_prompt, vision_beside_text
 from shared.utils.video_decode import decode_video_frame_indices_ffmpeg
 
@@ -33,7 +34,7 @@ VISION_QA_SYSTEM_PROMPT = "Answer the user's question about the labeled visual i
 
 
 def can_keep_text_resident(runtime, manager) -> bool:
-    if runtime is None or manager is None or not isinstance(runtime.model, Qwen3_5ForCausalLM):
+    if runtime is None or manager is None or not isinstance(runtime.model, (Qwen3_5ForCausalLM, Qwen4ExpForCausalLM)):
         return False
     if manager.models.get(_TEXT_MODEL_ID) is not runtime.model or _TEXT_MODEL_ID not in manager.active_models_ids:
         return False

@@ -7,8 +7,8 @@ from typing import Any
 PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY = "prompt_enhancer_speculative_decoding"
 PROMPT_ENHANCER_SPECULATIVE_DECODING_AUTO = 2
 PROMPT_ENHANCER_SPECULATIVE_DECODING_DEFAULT = PROMPT_ENHANCER_SPECULATIVE_DECODING_AUTO
-PROMPT_ENHANCER_SPECULATIVE_DECODING_IDS = frozenset((4, 5, 6))
-PROMPT_ENHANCER_SPECULATIVE_DECODING_VRAM_GB = {4: 12, 5: 24, 6: 8}  # Auto when the model's fit in VRAM is unknown (resolve_..., fit)
+PROMPT_ENHANCER_SPECULATIVE_DECODING_IDS = frozenset((4, 5, 6, 7))
+PROMPT_ENHANCER_SPECULATIVE_DECODING_VRAM_GB = {4: 12, 5: 24, 6: 8, 7: 12}  # Auto when the model's fit in VRAM is unknown (resolve_..., fit)
 MTP_AUTO_SLACK = 512 << 20  # Auto: MTP still pays when it leaves this much of the model out of VRAM (with the model in VRAM it decodes about twice as fast)
 MTP_AUTO_FOUR_DRAFTS_VRAM_GB = 24  # Auto on Qwen3.8 27B: 4 draft tokens from this size, from MTP_AUTO_FOUR_DRAFTS_BONSAI_VRAM_GB with Bonsai, 2 otherwise
 MTP_AUTO_FOUR_DRAFTS_BONSAI_VRAM_GB = 12
@@ -126,7 +126,7 @@ def validate_prompt_enhancer_speculative_decoding(enhancer_enabled: Any, value: 
     if runtime_mode not in (0, PROMPT_ENHANCER_SPECULATIVE_DECODING_AUTO) and not prompt_enhancer_supports_speculative_decoding(enhancer_enabled):
         if int(enhancer_enabled or 0) == 3:
             raise ValueError("Speculative decoding is not available with Qwen3.5-4B.")
-        raise ValueError("Speculative decoding requires the Qwen3.5-9B, Qwen3.8-9B or Qwen3.8-27B prompt enhancer.")
+        raise ValueError("Speculative decoding requires the Qwen3.5-9B, Qwen3.8-9B, Qwen3.8-27B or Qwen3.8 Flash-Next prompt enhancer.")
     return enabled
 
 
@@ -155,10 +155,10 @@ def resolve_prompt_enhancer_speculative_decoding(enhancer_enabled: Any, value: A
             total_vram_gb = 0
     bonsai = enhancer_no == 5 and qwen_backend == "gguf_ptq1"
     detected_vram_gb = max(0, int(float(total_vram_gb) + 0.5))
-    model_label = "Bonsai PTQ1" if bonsai else {4: "Qwen3.5-9B", 6: "Qwen3.8-9B"}.get(enhancer_no, "Qwen3.8-27B")
+    model_label = "Bonsai PTQ1" if bonsai else {4: "Qwen3.5-9B", 6: "Qwen3.8-9B", 7: "Qwen3.8 Flash-Next"}.get(enhancer_no, "Qwen3.8-27B")
     if float(total_vram_gb) <= 8:  # small GPUs: the drafter, its caches and graphs would take room from the model's blocks
         return 0, f"Speculative Decoding disabled automatically for {model_label}: {max(0.0, float(total_vram_gb)):.2f} GiB VRAM detected (8 GiB or less)."
-    drafts = 4 if enhancer_no == 5 and detected_vram_gb >= (MTP_AUTO_FOUR_DRAFTS_BONSAI_VRAM_GB if bonsai else MTP_AUTO_FOUR_DRAFTS_VRAM_GB) else 2
+    drafts = 4 if enhancer_no == 7 or enhancer_no == 5 and detected_vram_gb >= (MTP_AUTO_FOUR_DRAFTS_BONSAI_VRAM_GB if bonsai else MTP_AUTO_FOUR_DRAFTS_VRAM_GB) else 2
     enabled, enabled_for = speculative_decoding_config("mtp", drafts), f"Speculative Decoding enabled automatically for {model_label} ({drafts} draft tokens)"
     sizes = None if fit is None else fit()
     if sizes is None and bonsai:

@@ -465,6 +465,7 @@ Depending on your configuration, it either:
 | **Qwen3.5 VL Abliterated 9B** | Better instruction following and richer prompts than 4B, with higher VRAM/RAM use. | Use when quality matters and it fits comfortably beside your generation model. |
 | **Qwen3.8 VL Uncensored 9B** | Instruction following close to the 27B in about a third of its memory, with less general knowledge, longer thinking and weaker image understanding. It supports Deepy Prime. | Use for Deepy Prime or quality prompts on GPUs with about 8 to 12 GB of VRAM. |
 | **Qwen3.8 VL Uncensored 27B** | Strongest local understanding and rewriting, but much heavier to load and run. It supports Deepy Prime. | Use for quality-first work and complex visual instructions on high-memory systems. |
+| **Qwen3.8 VL Flash-Next 125B** | The largest local model, kept mostly in RAM and on the drive with what the text needs in VRAM. It supports Deepy Prime. | Use on a PC with about 64 GB of RAM and a fast SSD (an 80 GB download). |
 | **Codex** | Uses the selected external Codex model and does not occupy WanGP's local GPU memory. | Use when you already have Codex configured and want strong remote instruction following. |
 | **Claude Code** | Uses the selected external Claude model and does not occupy WanGP's local GPU memory. | Use when Claude is your preferred writing/reasoning provider. |
 | **OpenCode** | Connects through OpenCode to its configured provider, including supported cloud or local OpenAI-compatible services. | Use when you need provider flexibility or already manage models through OpenCode. |

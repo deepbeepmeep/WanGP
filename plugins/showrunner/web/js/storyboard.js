@@ -11,6 +11,19 @@ import { askForFix } from './fix.js';
 const cutLengths = doc => new Map(segments(doc, actions.take).map(item => [item.shot.id, item.duration]));
 // What Shoot shoots: the included shots without a take and the ones marked for a redo.
 export const toShoot = doc => doc.shots.filter(shot => shot.included && !shot.locked && (!shot.takes.length || ['rejected', 'failed'].includes(shot.status)));
+// What Shoot shoots at the Final size: the shots with no final take yet. A shot kept from the source has nothing to shoot.
+export const notFinal = (doc, shots = doc.shots) => doc.brief.draft_resolution ? shots.filter(shot => { const take = actions.take(shot); return shot.included && !shot.locked && !take?.kept_source && (!take || take.tier === 'draft'); }) : [];
+
+// The Draft / Final choice beside Shoot: one choice for the Board and the shot panel. Draft: the showrunner renders at the draft size and looks at the take. Final: rendered at once at the target size, from the take's prompt, seed and pictures.
+export const finalTier = doc => !!doc.brief.draft_resolution && state.shootTier === 'final';
+export const tierToggle = doc => doc.brief.draft_resolution ? `<div class="seg small" data-tier-toggle title="Which size Shoot makes"><button data-tier="draft" class="${finalTier(doc) ? '' : 'on'}" title="The showrunner renders at ${esc(doc.brief.draft_resolution)} and looks at the take">Draft · ${esc(doc.brief.draft_resolution)}</button><button data-tier="final" class="${finalTier(doc) ? 'on' : ''}" title="Renders at ${esc(doc.brief.resolution)} at once, with the prompt, seed and pictures of the take: no language model, and nobody looks at the take">Final · ${esc(doc.brief.resolution)}</button></div>` : '';
+export function bindTierToggle(root) {
+  root.querySelectorAll('[data-tier]').forEach(button => button.onclick = () => {
+    state.shootTier = button.dataset.tier;
+    try { localStorage.setItem('sr.tier', state.shootTier); } catch { /* the choice only lasts this visit */ }
+    actions.tierChanged();
+  });
+}
 
 // Roughly how long shooting these shots takes, from the measured times of their models, fetched again when the takes or the format change
 // (ready: called when new times arrive).
@@ -58,7 +71,7 @@ export const SHOT_TYPE = 'application/x-showrunner-shots';
 
 export function shotPoster(shot) {
   const take = actions.take(shot);
-  return take?.poster ? actions.file(take.poster) : (take?.kind === 'image' ? actions.file(take.path) : null);
+  return take?.poster ? actions.file(take.poster) : take?.kind === 'image' ? actions.file(take.path) : !take && shot.painted_frames?.length ? actions.file(shot.painted_frames[0].path) : !take && shot.source_poster ? actions.file(shot.source_poster) : null;  // before its first take, a remake's shot shows its new look, or its moment of the source
 }
 
 export function castAvatars(ids, doc) {
@@ -103,6 +116,12 @@ export function mountStoryboard(container, doc) {
     const selected = [...state.selection];
     const shooting = toShoot(doc), todo = shooting.length, alone = state.directorInfo.available === false;  // alone: no showrunner to shoot them
     const estimate = todo ? shootTime(doc, shooting, renderTools) : '';
+    const chosen = selected.length ? doc.shots.filter(shot => state.selection.has(shot.id)) : doc.shots;
+    const final = finalTier(doc), shootable = chosen.filter(shot => shot.included && !shot.locked && !actions.take(shot)?.kept_source);
+    // the selected shots, or all that need it: with nothing to shoot, all of them again at the draft size (only when drafts exist: a new take of everything is otherwise Fix)
+    const retake = doc.brief.kind === 'remake' && selected.length && shootable.every(shot => shot.takes.length);  // a remake's selected shots all have a take: Reshoot, as the shot panel
+    const targets = final ? notFinal(doc, chosen) : retake ? [] : selected.length ? shootable : todo ? shooting : doc.brief.draft_resolution ? shootable : [];
+    const again = selected.length && !targets.length ? shootable.filter(shot => shot.takes.length) : [];  // another take of each now, as the shot panel's Reshoot
     const review = doc.brief.review_before_edit, approved = shot => actions.take(shot)?.verdict?.by === 'user' && actions.take(shot).verdict.ok;
     const waiting = review && !todo ? doc.shots.filter(shot => shot.included && !approved(shot)).length : 0;  // the showrunner waits for them before the edit
     tools.innerHTML = `<div class="col" style="gap:0;min-width:0"><h2>Storyboard</h2><span class="stat" style="white-space:nowrap">${doc.shots.length} shots · ${formatDuration(total)} · ${doc.shots.length ? frameSizes(doc, renderTools) : ''}${review ? `<span style="color:var(--green)">${counts('approved')} approved</span> · <span style="color:var(--amber)">${counts('rendered')} to review</span>` : ''}</span></div>
@@ -111,11 +130,15 @@ export function mountStoryboard(container, doc) {
       <input type="range" class="range" id="density" min="180" max="420" step="10" value="${state.cardWidth}" style="width:96px" title="Card size">
       ${selected.length > 1 ? `<span class="chip on">${selected.length} selected</span>` : ''}
       ${selected.length ? `<button class="btn small" id="reshoot" ${availability(actions.directorBlocked())}>${icon('refresh')} Fix ${count(selected.length, 'shot')}…</button>` : ''}
-      <button class="btn small" id="add">${icon('plus')} Shot</button>
+      <button class="btn small" id="add" ${doc.brief.kind === 'remake' ? 'style="display:none"' : ''}>${icon('plus')} Shot</button>
+      ${doc.brief.kind === 'remake' ? `<button class="chip clickable ${doc.brief.group_renders ? 'on' : ''}" id="group-renders" title="${doc.brief.group_renders ? 'On: short shots render with their neighbours in one render, which may improve lip sync; each keeps its own take. Click to render every shot alone.' : 'Off: every shot renders alone. Click to render short shots with their neighbours in one render, which may improve lip sync (Shots rendered together, in the Brief).'}">${icon('layers')} Group rendering</button>` : ''}
       ${estimate ? `<span class="stat" style="white-space:nowrap" title="Roughly how long generating the ${count(todo, 'shot')} to shoot takes, measured on earlier takes of the same models (this production's first, then your other productions' at the same picture size). Checks and retakes add to it.">${icon('clock')} ${esc(estimate)}</span>` : ''}
       ${waiting ? `<button class="chip clickable" id="review-wait" title="The showrunner waits for your review before the edit: approve each take, or mark it for a redo. Assemble still makes a cut now.">${icon('clock')}Waiting for your review: ${count(waiting, 'shot')}</button>` : ''}
-      ${doc.shots.length ? `<button class="btn primary small" id="shoot" ${availability((alone ? actions.renderBlocked() : actions.directorBlocked()) || (todo ? '' : actions.assembleBlocked(doc)), todo && alone ? 'Renders them now, one after the other, from what they say: nobody checks the takes' : todo ? `The showrunner shoots the shots without a take and the ones marked for a redo, then ${review ? 'waits for your review before the edit' : 'assembles the edit'}` : 'Every shot has a take: assemble the edit now (texts, sound, subtitles); the showrunner panel can also assemble and check it')}>${icon(todo ? 'clapper' : 'film')} ${todo ? `${alone ? 'Render' : 'Shoot'} ${count(todo, 'shot')}` : 'Assemble'}</button>`
-        : `<button class="btn primary small" id="plan" ${availability(actions.directorBlocked() || actions.planBlocked(doc))}>${icon('wand')} Plan with the showrunner</button>`}</div>`;
+      ${doc.shots.length ? tierToggle(doc) : ''}
+      ${targets.length ? `<button class="btn small ${todo || final || selected.length ? 'primary' : ''}" id="shoot" ${availability(final || alone ? actions.renderBlocked() : actions.directorBlocked(), final ? `Renders them at ${doc.brief.resolution} now, with the prompt, seed and pictures of their takes: no language model, and nobody looks at the takes` : alone ? 'Renders them now, one after the other, from what they say: nobody checks the takes' : !selected.length && todo ? `The showrunner shoots the shots without a take and the ones marked for a redo, then ${review ? 'waits for your review before the edit' : 'assembles the edit'}` : `The showrunner renders them${doc.brief.draft_resolution ? ` at ${doc.brief.draft_resolution}` : ''} and looks at the takes`)}>${icon(final ? 'bolt' : 'clapper')} ${alone && !final ? 'Render' : 'Shoot'} ${count(targets.length, 'shot')}</button>` : ''}
+      ${again.length ? `<button class="btn small primary" id="reshoot-now" ${availability(actions.renderBlocked(), `Another take of each now at ${final || !doc.brief.draft_resolution ? doc.brief.resolution : doc.brief.draft_resolution}, with the same prompt and pictures and a new seed, without the showrunner`)}>${icon('refresh')} Reshoot ${count(again.length, 'shot')}</button>` : ''}
+      ${!doc.shots.length ? `<button class="btn primary small" id="plan" ${availability(actions.directorBlocked() || actions.planBlocked(doc))}>${icon('wand')} Plan with the showrunner${doc.brief.plan_first ? '' : ' and shoot'}</button>`
+        : todo ? '' : `<button class="btn ${final || selected.length ? '' : 'primary'} small" id="assemble" ${availability(actions.assembleBlocked(doc), 'Every shot has a take: assemble the edit now (texts, sound, subtitles); the showrunner panel can also assemble and check it')}>${icon('film')} Assemble</button>`}</div>`;
     tools.querySelectorAll('[data-filter]').forEach(button => button.onclick = () => showFilter(button.dataset.filter));
     tools.querySelector('#density').oninput = event => { state.cardWidth = +event.target.value; localStorage.setItem('sr.card', state.cardWidth); board.style.setProperty('--card-w', `${state.cardWidth}px`); };
     tools.querySelector('#add').onclick = () => {
@@ -123,13 +146,23 @@ export function mountStoryboard(container, doc) {
       addShot(selected.length ? selected.at(-1) + 1 : null);
     };
     tools.querySelector('#plan')?.addEventListener('click', () => actions.direct('plan'));
-    tools.querySelector('#shoot')?.addEventListener('click', () => !todo ? actions.assemble() : alone ? import('./inspector.js').then(({ renderNow }) => renderNow(shooting.map(shot => shot.id))) : actions.direct('shoot'));  // as the timeline's Assemble: at once, by you
+    tools.querySelector('#group-renders')?.addEventListener('click', () => actions.ops([{ op: 'brief', fields: { group_renders: !state.doc.brief.group_renders } }]));
+    bindTierToggle(tools);
+    tools.querySelector('#assemble')?.addEventListener('click', () => actions.assemble());  // as the timeline's Assemble: at once, by you
+    tools.querySelector('#shoot')?.addEventListener('click', async () => {
+      const ids = targets.map(shot => shot.id);
+      if (final || alone) return import('./inspector.js').then(({ renderNow }) => renderNow(ids, final));
+      if (!selected.length && todo) return actions.direct('shoot');
+      if (selected.length || await confirmDialog({ title: `Shoot all ${count(ids.length, 'shot')} again?`, text: 'The showrunner makes a new draft take of each. The takes you have stay.', ok: 'Shoot' })) actions.direct('shoot', '', ids);
+    });
     tools.querySelector('#reshoot')?.addEventListener('click', () => askForFix(selected));
+    tools.querySelector('#reshoot-now')?.addEventListener('click', () => import('./inspector.js').then(({ reshoot }) => reshoot(again.map(shot => shot.id))));
     tools.querySelector('#review-wait')?.addEventListener('click', () => tools.querySelector('[data-filter="review"]').click());
   }
 
   async function addShot(position = null) {
     const doc = state.doc;
+    if (doc.brief.kind === 'remake') return;  // its shots come from the source's cuts
     const drawn = shot => shot?.generation?.template === 'draw_svg';
     if (position === null && drawn(doc.shots.at(-1))) position = doc.shots.length - 1;  // before the closing card
     const last = doc.shots.at(position === null ? -1 : position - 1);  // it joins the part of the shot it follows
@@ -141,7 +174,7 @@ export function mountStoryboard(container, doc) {
 
   function signature(shot, index) {
     const take = actions.take(shot);
-    return JSON.stringify([index, shot.title, shot.intent, shot.dialogue, shot.section, shot.status, shot.locked, shot.included, shot.duration_s, shot.trim, shot.speed, shot.camera, shot.generation?.template, shot.cast, take?.id, take?.poster, take?.verdict, shot.takes.length, state.selection.has(shot.id), state.renders[shot.id], state.flash?.has(shot.id)]);
+    return JSON.stringify([index, shot.title, shot.intent, shot.dialogue, shot.section, shot.status, shot.locked, shot.included, shot.duration_s, shot.trim, shot.speed, shot.camera, shot.generation?.template, shot.rendering_with, shot.cast, take?.id, take?.poster, take?.verdict, shot.source_poster, shot.painted_frames?.map(item => item.path), shot.takes.length, state.selection.has(shot.id), state.renders[shot.id] != null, state.flash?.has(shot.id)]);  // a render's progress moves its bar alone (progress below)
   }
 
   function card(shot, index) {
@@ -157,20 +190,22 @@ export function mountStoryboard(container, doc) {
     element.innerHTML = `<div class="shot-media">
         ${poster ? `<img src="${poster}" alt="" loading="lazy" draggable="false">` : `<div class="ph-art" style="${art(shot.id + shot.section, shot.intent)}"></div><div class="ph"><span>${esc(shot.intent || shot.generation?.settings?.prompt || 'No description yet')}</span></div>`}
         <span class="shot-num">${index + 1}</span>
-        <span class="shot-status">${shot.locked ? `<span class="tag" title="${shot.takes.length ? 'Locked: the showrunner leaves it as it is' : 'Locked before it was shot: it will not be shot nor change'}">${icon('lock')}${shot.takes.length ? '' : ' not shot'}</span>` : ''}<span class="tag ${shot.status}">${rendering ? '<span class="spinner" style="width:10px;height:10px;border-width:1.5px"></span>' : ''}${shot.status === 'rendered' && !state.doc.brief.review_before_edit ? 'Shot' : STATUS_LABEL[shot.status]}</span></span>
+        <span class="shot-status">${shot.locked ? `<span class="tag" title="${shot.takes.length ? 'Locked: the showrunner leaves it as it is' : 'Locked before it was shot: it will not be shot nor change'}">${icon('lock')}${shot.takes.length ? '' : ' not shot'}</span>` : ''}<span class="tag ${shot.status}"${shot.status === 'rendering' && shot.rendering_with ? ` title="Rendered in one render with ${shot.rendering_with}: its new take comes beside the one it uses, unless it has none"` : ''}>${shot.status === 'rendered' && !state.doc.brief.review_before_edit ? 'Shot' : shot.status === 'rendering' && shot.rendering_with ? `Rendering with ${shot.rendering_with}` : STATUS_LABEL[shot.status]}</span></span>
         ${shot.included ? '' : `<span class="tag shot-excluded" title="Excluded" aria-label="Excluded">${icon('eyeOff')}</span>`}
-        <span class="shot-badges">${shot.takes.length > 1 ? `<span class="tag" title="Takes">${icon('layers')}${shot.takes.length}</span>` : ''}${verdict ? `<span class="tag" title="${esc((verdict.by === 'user' ? 'You' : 'Showrunner') + ': ' + (verdict.note || (verdict.ok ? 'good take' : 'needs a redo')))}" style="background:${verdict.ok ? 'rgba(61,220,151,.9)' : 'rgba(255,93,108,.9)'};color:${verdict.ok ? '#002b19' : '#fff'}">${icon(verdict.ok ? 'check' : 'x')}${verdict.by === 'user' ? 'You' : 'Showrunner'}</span>` : ''}</span>
+        <span class="shot-badges">${take?.tier === 'draft' ? '<span class="tag" title="A draft take: Shoot, set to Final, renders it at the target resolution">Draft</span>' : ''}${take?.kept_source ? '<span class="tag" title="Nothing changes in this shot: it keeps your video\'s frames, with no render">Source</span>' : take || !shot.source_poster ? '' : shot.painted_frames?.some(item => item.path !== item.source) ? '<span class="tag" title="A frame of your video, painted with the new look: the mouse plays your video, this shot has no take yet">New look</span>' : '<span class="tag" title="A frame of your video: with nothing painted for it, this shot keeps your video\'s frames">Source</span>'}${shot.takes.length > 1 ? `<span class="tag" title="Takes">${icon('layers')}${shot.takes.length}</span>` : ''}${verdict ? `<span class="tag" title="${esc((verdict.by === 'user' ? 'You' : 'Showrunner') + ': ' + (verdict.note || (verdict.ok ? 'good take' : 'needs a redo')))}" style="background:${verdict.ok ? 'rgba(61,220,151,.9)' : 'rgba(255,93,108,.9)'};color:${verdict.ok ? '#002b19' : '#fff'}">${icon(verdict.ok ? 'check' : 'x')}${verdict.by === 'user' ? 'You' : 'Showrunner'}</span>` : ''}</span>
         <span class="shot-duration" title="Its length in the cut${take?.duration_s && Math.abs(take.duration_s - (cutLengths(state.doc).get(shot.id) || 0)) > 0.05 ? ` (the take lasts ${formatDuration(take.duration_s)})` : ''}">${formatDuration(cutLengths(state.doc).get(shot.id) ?? shot.duration_s)}</span>
         ${rendering ? `<span class="shot-progress"><i style="width:${state.renders[shot.id] ?? 30}%"></i></span>` : ''}
       </div>
       <div class="shot-body"><div class="shot-title">${esc(shot.title || `Shot ${index + 1}`)}</div>
         ${shot.dialogue?.length ? `<div class="shot-line" title="${esc(shot.dialogue.map(item => `${speakerName(item.speaker, doc)}: ${item.line}`).join('\n'))}">${icon('chat')}<span><b>${esc(speakerName(shot.dialogue[0].speaker, doc))}:</b> ${esc(shot.dialogue[0].line)}${shot.dialogue.length > 1 ? ` <span class="muted">+${shot.dialogue.length - 1}</span>` : ''}</span></div>` : ''}
         <div class="shot-sub">${shot.camera ? `${icon('video')}<span>${esc(shot.camera)}</span>` : `<span>${esc(templateLabel(shot.generation?.template))}</span>`}<span class="grow"></span>${castAvatars(shot.cast, doc)}</div></div>`;
-    if (take?.kind === 'video') {
+    // a remake's card plays exactly what the shot delivers, as a video of its own: a browser checks a clip's end time only 4 times a second, which shows the next camera shot
+    const hoverClip = take?.kind === 'video' ? (shot.source_range ? actions.takePart(shot, take) : actions.file(take.path)) : !take && shot.source_range ? actions.sourcePart(shot) : null;
+    if (hoverClip) {
       element.addEventListener('mouseenter', () => {
         if (element.querySelector('video')) return;
-        const video = Object.assign(document.createElement('video'), { src: actions.file(take.path), muted: true, loop: true, playsInline: true, autoplay: true });
-        video.draggable = false;
+        const video = Object.assign(document.createElement('video'), { src: hoverClip, muted: true, loop: true, playsInline: true, autoplay: true });
+        video.draggable = false; video.style.zIndex = 1;  // above the poster, below the card's tags
         element.querySelector('.shot-media').prepend(video);
         video.play().catch(() => {});
       });
@@ -186,8 +221,8 @@ export function mountStoryboard(container, doc) {
       const working = actions.busy(doc) || state.live.running;
       board.innerHTML = `<div class="sb-empty"><div class="big-icon">${icon(working ? 'director' : 'wand')}</div>
         <h2>${working ? 'The showrunner is planning…' : 'No shots yet'}</h2>
-        <p>${working ? 'Shots appear here as soon as the plan is written. Follow along in the Showrunner panel.' : 'Let the showrunner turn your brief into a shot list, or add shots yourself.'}</p>
-        <div class="row">${working ? '<span class="spinner"></span>' : `<button class="btn primary lg" id="empty-plan" ${availability(actions.directorBlocked() || actions.planBlocked(doc))}>${icon('wand')} Plan with the showrunner</button><button class="btn lg" id="empty-add">${icon('plus')} Add a shot</button>`}</div>
+        <p>${working ? 'Shots appear here as soon as the plan is written. Follow along in the Showrunner panel.' : doc.brief.kind === 'remake' ? 'Let the showrunner cut your video into shots at its cuts and prepare each one.' : 'Let the showrunner turn your brief into a shot list, or add shots yourself.'}</p>
+        <div class="row">${working ? '' : `<button class="btn primary lg" id="empty-plan" ${availability(actions.directorBlocked() || actions.planBlocked(doc))}>${icon('wand')} Plan with the showrunner</button>${doc.brief.kind === 'remake' ? '' : `<button class="btn lg" id="empty-add">${icon('plus')} Add a shot</button>`}`}</div>
         <button class="btn ghost small" id="empty-brief">${icon('brief')} Review the brief</button></div>`;
       board.querySelector('#empty-plan')?.addEventListener('click', () => actions.direct('plan'));
       board.querySelector('#empty-add')?.addEventListener('click', () => addShot());
@@ -230,7 +265,7 @@ export function mountStoryboard(container, doc) {
         seen.add(shot.id);
         grid.append(element);
       }
-      if (group === groups.at(-1) && state.filter === 'all') grid.append(Object.assign(document.createElement('div'), { className: 'add-shot', innerHTML: `<div class="col" style="align-items:center">${icon('plus')}<span>Add a shot</span></div>`, onclick: () => addShot() }));
+      if (group === groups.at(-1) && state.filter === 'all' && doc.brief.kind !== 'remake') grid.append(Object.assign(document.createElement('div'), { className: 'add-shot', innerHTML: `<div class="col" style="align-items:center">${icon('plus')}<span>Add a shot</span></div>`, onclick: () => addShot() }));
       section.append(grid);
       fragment.append(section);
     }
@@ -338,7 +373,10 @@ export function mountStoryboard(container, doc) {
     update() { renderTools(); renderBoard(); },
     showFilter,
     selection() { renderTools(); renderBoard(); },
-    progress() { renderBoard(); },
+    progress() {  // several times a second during a render: its card's bar moves; the board is drawn again only when a render starts or ends
+      if (state.doc.shots.some((shot, index) => cards.get(shot.id)?.isConnected && cards.get(shot.id).dataset.sig !== signature(shot, index))) return renderBoard();
+      for (const [id, value] of Object.entries(state.renders)) { const bar = cards.get(id)?.querySelector('.shot-progress i'); if (bar) bar.style.width = `${value}%`; }
+    },
     key(event) { boardKeys(event, addShot, visibleIds()); },
     visibleIds,
   };
@@ -354,12 +392,16 @@ export function shotMenu(anchor, ids) {
   const included = shots.every(shot => shot.included);
   const take = one && actions.take(one);
   menu(anchor, [
-    ...(take ? [{ label: 'Approve take', icon: 'check', action: () => verdict(shots, true) }, { label: 'Needs a redo…', icon: 'x', action: () => verdictWithNote(shots) }, '-'] : []),
+    ...(take ? [one.status === 'approved' ? { label: 'Unapprove take', icon: 'undo', action: () => verdict(shots, null) } : { label: 'Approve take', icon: 'check', action: () => verdict(shots, true) },
+      { label: 'Needs a redo…', icon: 'x', action: () => verdictWithNote(shots) }, '-'] : []),
     { label: locked ? 'Unlock' : 'Lock (the showrunner keeps it)', icon: locked ? 'unlock' : 'lock', action: () => actions.ops(shots.map(shot => ({ op: 'update_shot', shot: shot.id, fields: { locked: !locked } }))) },
     { label: included ? 'Exclude from the edit' : 'Include in the edit', icon: included ? 'eyeOff' : 'eye', action: () => actions.ops(shots.map(shot => ({ op: 'update_shot', shot: shot.id, fields: { included: !included } }))) },
     '-',
     ...(one && take?.kind === 'video' && take.has_audio ? [one.sound !== false ? { label: 'Detach Sound', icon: 'scissors', action: () => actions.detachSound(one.id) } : { label: 'Reattach Sound', icon: 'undo', action: () => actions.reattachSound(one.id) }] : []),
-    ...(one && take?.settings && Object.keys(take.settings).length ? [{ label: 'Render a new take', icon: 'refresh', unavailable: rendering(one) ? 'This shot is rendering: wait for its take.' : '', action: () => import('./inspector.js').then(module => module.rerun(one.id)) }] : []),
+    ...(one && take?.settings && Object.keys(take.settings).length ? [{ label: 'Reshoot', icon: 'refresh', unavailable: rendering(one) ? 'This shot is rendering: wait for its take.' : '', action: () => import('./inspector.js').then(module => module.rerun(one.id)) }] : []),
+    ...(state.doc.brief.draft_resolution ? [finalTier(state.doc)
+      ? { label: `Shoot Final (${state.doc.brief.resolution})`, icon: 'bolt', unavailable: actions.renderBlocked() || (notFinal(state.doc, shots).length ? '' : 'They already have a final take.'), action: () => import('./inspector.js').then(({ renderNow }) => renderNow(notFinal(state.doc, shots).map(shot => shot.id), true)) }
+      : { label: `Shoot Draft (${state.doc.brief.draft_resolution})`, icon: 'clapper', unavailable: actions.directorBlocked(), action: () => actions.direct('shoot', '', shots.map(shot => shot.id)) }] : []),
     ...(shots.some(shot => !shot.takes.length) ? [{ label: 'Render now', icon: 'bolt', unavailable: actions.renderBlocked(), action: () => import('./inspector.js').then(({ renderNow }) => renderNow(shots.filter(shot => !shot.takes.length).map(shot => shot.id))) }] : []),
     ...(one ? [{ label: 'Insert a shot after it…', icon: 'plus', unavailable: actions.directorBlocked(), action: () => askForFix([], null, one.id) }] : []),
     { label: `Ask the showrunner to fix ${shots.length > 1 ? `${shots.length} shots` : 'it'}…`, icon: 'director', unavailable: actions.directorBlocked(), action: () => askForFix(shots.map(shot => shot.id)) },
@@ -407,7 +449,7 @@ function boardKeys(event, addShot, ids) {
   const shots = [...state.selection].map(id => actions.shot(id)).filter(Boolean);
   if (!shots.length) { if (key.toLowerCase() === 'n') addShot(); return; }
   if (['a', 'x', 'l', 'e', 'n'].includes(key.toLowerCase())) event.preventDefault();  // the key must not reach the note field it opens
-  if (key.toLowerCase() === 'a') verdict(shots, true);
+  if (key.toLowerCase() === 'a') verdict(shots, shots.every(shot => shot.status === 'approved') ? null : true);  // approved already: A takes it back
   else if (key.toLowerCase() === 'x') verdictWithNote(shots);
   else if (key.toLowerCase() === 'l') actions.ops(shots.map(shot => ({ op: 'update_shot', shot: shot.id, fields: { locked: !shots.every(item => item.locked) } })));
   else if (key.toLowerCase() === 'e') actions.ops(shots.map(shot => ({ op: 'update_shot', shot: shot.id, fields: { included: !shots.every(item => item.included) } })));

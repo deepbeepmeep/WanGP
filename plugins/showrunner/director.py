@@ -6,6 +6,7 @@ production document through the showrunner toolbox; the user's edits and verdict
 from __future__ import annotations
 
 import hashlib
+import json
 import threading
 import time
 from pathlib import Path
@@ -18,8 +19,8 @@ from . import media, production as model
 
 TASKS = ("plan", "shoot", "continue", "message", "reshoot", "assemble", "review", "resume")
 KIND_SKILLS = {"music_video": "wangp://skills/music-video", "short_film": "wangp://skills/edited-film", "trailer": "wangp://skills/edited-film",
-               "story": "wangp://skills/production", "ad": "wangp://skills/production", "free": "wangp://skills/production"}  # long-story-writing is for long texts, and only listed with long-text tools
-KIND_NAMES = {"music_video": "music video", "short_film": "short film", "ad": "ad", "trailer": "trailer", "story": "illustrated story", "free": "production"}
+               "story": "wangp://skills/production", "ad": "wangp://skills/production", "remake": "wangp://skills/showrunner/remaking", "free": "wangp://skills/production"}  # long-story-writing is for long texts, and only listed with long-text tools
+KIND_NAMES = {"music_video": "music video", "short_film": "short film", "ad": "ad", "trailer": "trailer", "story": "illustrated story", "remake": "remake of an existing video", "free": "production"}
 KIND_RULES = {"story": "An illustrated story is narrated picture-book pages: each page a still picture (template_advice `pages`, or `pages_with_cast` for the pages "
                        "showing the cast) held as long as its narration, a narrator (a cast member with role narrator) reading every page, crossfades between "
                        "pages; the edit moves slowly over each still. A page moves (a video template) only where the brief asks for motion."}
@@ -37,14 +38,18 @@ def _brief_text(doc: dict[str, Any]) -> str:
         lines.append(f"Concept: {brief['text']}")
     if brief.get("script"):
         lines.append(f"{'Lyrics of the song' if brief['kind'] == 'music_video' else 'Script'} (keep its words exactly):\n{brief['script']}")
+    if brief.get("source"):
+        lines.append(f"Source video to remake (its motion, camera, timing and soundtrack stay): {_name(brief['source'])}")
     if brief.get("song"):
         lines.append(f"Song (drives timing and lip sync): {_name(brief['song'])}")
     if brief.get("references"):
         lines.append("Reference media: " + ", ".join(_name(path) for path in brief["references"]))
-    format_parts = [f"aspect {brief['aspect']}", f"{brief['resolution']}"]
-    if brief.get("duration_s") or not brief.get("song"):
+    format_parts = [f"aspect {brief['aspect']}", f"{brief['resolution']}" if not brief.get("draft_resolution") else f"{brief['draft_resolution']} draft for {brief['resolution']}"]
+    if brief["kind"] != "remake" and (brief.get("duration_s") or not brief.get("song")):  # a remake lasts as long as its source
         format_parts.append(f"about {brief.get('duration_s') or model.DEFAULT_LENGTH_S:g} s in total")
     lines.append("Format: " + ", ".join(format_parts) + ".")
+    if brief.get("draft_resolution"):
+        lines.append(f"Make every picture (cast, looks, places, cards) at {model.resolution(brief)}, the target: a draft and its final use the same pictures. render shoots video at the draft size by itself; the user shoots shots final when happy.")
     style = ", ".join([*brief.get("style_tags", []), brief.get("style", "")]).strip(", ")
     if style:
         lines.append(f"Style: {style}.")
@@ -104,34 +109,46 @@ def repeating_failure(failures: dict[str, int], tool: dict[str, Any]) -> bool:
     return failures[key] == 3
 
 
-def method_key() -> str:
-    """What the director's method is: its standing instructions and its skill. A production's conversation that began under another
-    method still holds the old skill: the next task asks the director to read it again."""
-    skill = Path(__file__).parent / "skills" / "directing" / "SKILL.md"
-    return hashlib.sha1((INSTRUCTIONS + skill.read_text(encoding="utf-8")).encode("utf-8")).hexdigest()[:12]
+def method_key(kind: str = "") -> str:
+    """What the director's method is: its standing instructions and its skills. A production's conversation that began under another
+    method still holds the old skills: the next task asks the director to read them again."""
+    skills = (Path(__file__).parent / "skills" / name / "SKILL.md" for name in ("directing", *(("remaking",) if kind == "remake" else ())))
+    return hashlib.sha1("".join((INSTRUCTIONS, *(skill.read_text(encoding="utf-8") for skill in skills))).encode("utf-8")).hexdigest()[:12]
+
+
+def _shoot_body(doc: dict[str, Any]) -> str:
+    """How the whole production is shot: the shoot task's request, and the plan's when the user does not review the plan."""
+    review = doc["brief"].get("review_before_edit")
+    body = ("Shoot the production: render the included shots that still need a good take, in order, inspect each take and record a verdict, then "
+            + ("stop and ask the user to review the takes: they approve them before the edit is assembled." if review else "assemble the edit, check it and report."))
+    length = doc["brief"].get("duration_s") or (doc["audio"].get("analysis") or {}).get("duration_s") or 0
+    if len(doc["shots"]) > 24 or length > 90:
+        body += " Work sequence by sequence" + ("." if review or length <= 300 else " and assemble after each one, so the user can follow the edit as it grows.")
+    return body
 
 
 def build_prompt(doc: dict[str, Any], task: str, message: str = "", shots: list[str] | tuple[str, ...] = ()) -> str:
     kind = doc["brief"]["kind"]
     header = (f"[Showrunner] Production \"{doc['title']}\" (production id: {doc['id']}). Method for its kind: {KIND_SKILLS[kind]}. "
               f"Read it with wangp_plugins(plugin=\"showrunner\", action=\"production\", arguments={{\"production\": \"{doc['id']}\"}}).")
+    review_plan = doc["brief"]["plan_first"]
+    then = (" Do not render shots: the user reviews and edits the plan first, then asks you to shoot." if review_plan else
+            " The user chose not to review the plan: once it is ready, go on to shoot it in this same task. " + _shoot_body(doc))
     if task == "plan":
         body = ("Plan the production from its brief: cast (with a master image of each recurring person, object and place that has no picture yet, and one in the "
                 "production's style for a member whose pictures have another look), style, and every shot with its template, complete generation settings and "
-                "duration. Do not render shots: the user reviews and edits the plan first, then asks you to shoot.")
+                "duration." + then)
         length = doc["brief"].get("duration_s") or (doc["audio"].get("analysis") or {}).get("duration_s") or 0
         if length > 90:
             body += f" It runs about {length / 60:.1f} minutes: outline its sequences first, then plan each sequence's shots (the skill's long productions section)."
+        if kind == "remake":
+            body = ("Plan the remake from its brief, following the method above. Change only what the brief asks for; if it does not say what should change, ask the user and stop. Read the source with ingest_source, look at its shots, cast whoever changes, prepare each shot "
+                    "as its template needs (painted frames, references, a mask) and write each shot's prompt." + then)
     elif task == "shoot" and shots:
         body = (f"Shoot {', '.join(shots)} and leave every other shot and its takes as they are: the user asked for these alone and nothing is wrong with them, so there is no fault to look for. "
                 "Render them, inspect each take and record a verdict, then stop and say how it came out. Do not assemble: the user decides what comes next.")
     elif task == "shoot":
-        review = doc["brief"].get("review_before_edit")
-        body = ("Shoot the production: render the included shots that still need a good take, in order, inspect each take and record a verdict, then "
-                + ("stop and ask the user to review the takes: they approve them before the edit is assembled." if review else "assemble the edit, check it and report."))
-        length = doc["brief"].get("duration_s") or (doc["audio"].get("analysis") or {}).get("duration_s") or 0
-        if len(doc["shots"]) > 24 or length > 90:
-            body += " Work sequence by sequence" + ("." if review or length <= 300 else " and assemble after each one, so the user can follow the edit as it grows.")
+        body = _shoot_body(doc)
     elif task == "reshoot":
         note = f' The user says: "{message}".' if message else " The user wrote no note: if no note or verdict in the document says what is wrong, shoot them again without looking for a fault."
         body = (f"Fix shots {', '.join(shots)} and leave every other shot and its takes as they are.{note} Read the user's notes and verdicts in the document first. What the user asks for is theirs to decide, a new length or other content included: do it. When they say what is wrong rather "
@@ -173,8 +190,12 @@ class Director:
         self._lock = threading.Lock()
 
     def conversation(self, production_id: str, after: int = 0) -> dict[str, Any]:
-        """What the Deepy tab shows when it opens or catches up: the conversation Deepy saved, since `after`."""
-        return session_store.read_ui_updates(self.store.get(production_id).folder / "session", after)
+        """What the Deepy tab shows when it opens or catches up: the conversation Deepy saved, since `after`, its media links working after a restart."""
+        from shared.utils.downloads import restore_file_downloads
+        folder = self.store.get(production_id).folder
+        updates = session_store.read_ui_updates(folder / "session", after)
+        restore_file_downloads(json.dumps(updates["events"]), [folder])  # the production's files: its media, the session's and the cache's
+        return updates
 
     def status(self, production_id: str) -> dict[str, Any]:
         production = self.store.get(production_id)
@@ -216,9 +237,9 @@ class Director:
             doc = production.snapshot()
             workspace = self.host.production_workspace(doc["title"], production.folder / "media")
             prompt = build_prompt(doc, task, message, shots or ())
-            method = method_key()
+            method = method_key(doc["brief"]["kind"])
             if doc["director"].get("method", "") != method and (production.folder / "session" / "context.json").is_file():
-                prompt += "\n\nThe Showrunner method changed since your last task in this production: read wangp://skills/showrunner/directing again before you act."
+                prompt += "\n\nThe Showrunner method changed since your last task in this production: read wangp://skills/showrunner/directing" + (" and wangp://skills/showrunner/remaking" if doc["brief"]["kind"] == "remake" else "") + " again before you act."
             job = self.host.run_director(prompt, session_dir=production.folder / "session", workspace=workspace, title=f"Showrunner - {doc['title']}", instructions=INSTRUCTIONS)
             job.chat_events = True
             self._jobs[production_id] = job

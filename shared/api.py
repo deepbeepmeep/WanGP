@@ -618,6 +618,7 @@ class WanGPSession:
         runtime = self._ensure_runtime()
         with _pushd(runtime.root):
             records = _strip_model_def_callables(runtime.module.list_model_defs(family=family, base_model_type=base_model_type, finetune=finetune, model_type=model_type, main_output=main_output, inputs=inputs))
+        records = [record for record in records if record.get("visible", True)]  # as in the model selector; get_model_def still reads a hidden model by its id
         name_patterns = [str(value).strip().casefold() for value in (name if isinstance(name, (list, tuple, set)) else [name]) if value is not None and str(value).strip()]
         query_text = str(query or "").strip().casefold()
         if name_patterns:

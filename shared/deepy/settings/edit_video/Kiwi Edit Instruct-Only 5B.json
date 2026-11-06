@@ -1,0 +1,13 @@
+{
+    "image_mode": 0,
+    "video_length": 81,
+    "flow_shift": 5,
+    "num_inference_steps": 30,
+    "resolution": "832x480",
+    "settings_version": 2.82,
+    "prompt_enhancer": "",
+    "model_type": "kiwi_edit_instruct_only",
+    "prompt": "Remove the red van parked at the right of the street.",
+    "video_prompt_type": "UV",
+    "type": "Kiwi Edit Instruct-Only 5B"
+}

@@ -71,6 +71,9 @@ class family_handler:
                 "infos": "Generate an image from the Text Prompt (`prompt`) at the selected resolution. The prompt supplies the subjects, composition, setting and visual style together.",
                 "prompt_infos": 'Write a description of the finished image in natural language: subject and action, composition, background, lighting, colors and medium. For example: "A man in a red coat stands beside a rainy bus stop, reflected neon on the pavement, documentary photograph." Put important details first and spell visible text exactly in quotes. English and Chinese descriptions are supported.',
             })
+        if model_def.get("uniform_sigmas", False):
+            extra_model_def["infos"] += "\n\n### Steps\n\nThis checkpoint is made for 1 to 4 steps. Choose the number of steps with its **Accelerator** profiles: each one also sets the matching **Shift Scale** and the strengths of the De-distillation LoRA, which cleans up the first step of a 2 to 4 step run. 2 steps is the default, 1 step the fastest. Other step counts or shifts still work but are not what the checkpoint was trained for."
+            extra_model_def["deepy_infos"] += " Few-step checkpoint: `num_inference_steps` 1-4 (2 by default). Its accelerator profiles set the matching `flow_shift` (3 / 6 / 8 / 9) and the dedistill LoRA multipliers (`0.5,0` at 2 steps, none at 1 step)."
         return merge_help(extra_model_def, z_image_help(base_model_type))
 
     @staticmethod

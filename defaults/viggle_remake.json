@@ -1,0 +1,14 @@
+{
+    "model": {
+        "name": "Viggle Remake Pruned 20B Swap",
+        "architecture": "viggle_remake",
+        "description": "Replaces people or characters in a video, keeping its motion, camera, timing and sound. You give it the video, one frame of that video already edited to show the new person, and a description of the result.",
+        "URLs": "minimax_h3_fl2va_pruned",
+        "loras": [
+            "https://huggingface.co/DeepBeepMeep/MiniMax-H3/resolve/main/loras/viggle_remake_swap_bf16.safetensors"
+        ],
+        "loras_multipliers": ["1"],
+        "viggle_remake_mode": "swap"
+    },
+    "prompt": "subject_definitions:\n<Video 1> is the source video: one continuous handheld take of a man in a grey hoodie juggling three oranges in a sunny courtyard.\n<Picture 1> is a frame of the target video, exactly as the target video shows it at that moment.\n<Subject 1> is Ines in <Picture 1>: a young woman with a long black braid, a mustard-yellow overall and white sneakers. She replaces the man in the grey hoodie.\n\nsummary:\n[video editing + character replacement] The man in the grey hoodie becomes <Subject 1>, juggling the same three oranges with the same rhythm. The shot, camera, motion, timing and courtyard of <Video 1> are kept.\n\nretention_analysis:\n<Video 1> (source video editing): fully_preserved - the handheld camera, the courtyard, the light and the timing of every throw.\n<Picture 1> (target keyframe): fully_preserved - the target video passes through this exact frame.\n<Subject 1> (appears in [Shot 1]): fully_preserved - her face, braid, overall and sneakers stay identical in every frame.\n\ndetailed_description:\nRealistic sunny handheld footage with natural colours.\n[Shot 1] At 00:00.000 <Subject 1> stands in the courtyard, oranges in the air, matching <Picture 1>. She keeps juggling, catches all three at about 00:04.000 and smiles at the camera. No grey hoodie appears in any frame.\n\noverall_soundscape:\nThe soundtrack of <Video 1>, unchanged.\n\nnon_diegetic_music:\nN/A"
+}

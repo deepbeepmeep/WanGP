@@ -35,6 +35,7 @@ export function mountDeliver(container) {
     const shot = included.filter(item => item.takes.length).length;
     const approved = included.filter(item => item.status === 'approved').length;
     const review = included.filter(item => item.status === 'rendered').length;
+    const drafts = included.filter(item => actions.take(item)?.tier === 'draft').length;
     const latest = versions[0];
     const stale = latest && latest.edit_key && latest.edit_key !== doc.edit_key;  // the edit changed since the last export
     const method = item => ({ 'stream copy': 'joined without re-encoding', 'single encode': 'encoded once' }[item.method] || item.method || '');
@@ -52,6 +53,7 @@ export function mountDeliver(container) {
           ${stale ? `<div class="stale-note">${icon('alert')}<span><b>The edit changed since the last version.</b> Assemble again to include your latest changes.</span></div>` : ''}
           <div class="panel" style="padding:16px"><div class="label">${icon('target')} Before the final cut</div><div class="checklist">
             ${check(shot === included.length && included.length, `${shot}/${included.length} shots shot`)}${doc.brief.review_before_edit ? check(approved === included.length && included.length, `${approved}/${included.length} approved by you`, review ? `${review} waiting for your review` : '') : ''}
+            ${doc.brief.draft_resolution ? check(!drafts, drafts ? `${drafts}/${included.length} shots are still draft` : 'No shot is a draft', drafts ? 'The edit is made at the largest size among its takes: Shoot Final on the Board renders them at the target' : '') : ''}
             ${check(doc.brief.song || doc.edit.audio_mode === 'clips', doc.edit.audio_mode === 'song' ? 'Soundtrack: the song' : doc.edit.audio_mode === 'mix' ? 'Soundtrack: song and shot sound' : 'Soundtrack: shot sound')}</div>
             <div class="row" style="margin-top:12px"><button class="btn ${latest && !stale ? '' : 'primary'} grow" id="assemble" ${availability(actions.assembleBlocked(doc))}>${icon('film')} ${latest ? 'Assemble again' : 'Assemble'}</button>
               <button class="btn" id="ask" ${availability(actions.directorBlocked() || actions.assembleBlocked(doc), 'The showrunner assembles the edit, watches it and reports')}>${icon('director')} Showrunner review</button></div></div>

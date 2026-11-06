@@ -385,3 +385,15 @@ API void moe_host_job(void* data) {
     if (count == 0) std::fill(j->out, j->out + size_t(j->batch) * j->h, 0.f);
     if (count < 0) j->status = count;
 }
+
+// A job of the host server (shared.kernels.host_doorbell): returns whether it wrote a result.
+API int moe_server_job(void* data) {
+    MoeJob* j = (MoeJob*)data;
+    const float* x = (const float*)j->payload;
+    const float* probabilities = x + size_t(j->batch) * j->h;
+    const int32_t* ids = j->payload + size_t(j->batch) * (j->h + j->topk);
+    int count = moe_forward(j->format, j->rotation, j->act, j->w13, j->w2, j->s13, j->s2, x, ids, probabilities, j->resident, j->out,
+                            j->batch, j->h, j->i, j->e, j->topk, j->block, j->block2, j->threads);
+    if (count < 0) j->status = count;
+    return count > 0;
+}

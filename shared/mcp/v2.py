@@ -41,6 +41,8 @@ DEEPY_USAGES = {
     "gen_world": "Generate an explorable world (Worlds gallery) from a world description (with its first view in image_start for templates whose input_modes include image_prompt_type S), optionally walked through with exploration instructions after it, or continue a world given as custom_guide; world_output chooses world, world_video or video. Also shows a picture from another viewpoint (a step aside, a turn, walking in): a template taking image_start, the move as instructions, world_output video, then a frame of that video",
     "gen_3d": "Create a 3D asset for the 3D gallery. Qwen3.5 GLB 3D Coder takes a text description directly and can export animated parts. Image-to-3D templates take one picture in image_refs. If the chosen template needs a picture, a gen_image template can make one: one whole object, centered on a plain background, seen three-quarters from slightly above, in soft even light. The templates are the main recipes (a shape, an optional 3D Refiner, a Texturer): the default suits most objects, keeps thin parts and copies the picture's colours and print; SUPRA-Tex Pixal3D builds the mesh in the picture's own camera (the closest fit to the picture); Hunyuan3D 2.1 PBR paints all around and tolerates unusual pictures; Solid Objects adds fine relief to solid parts (thin sheets such as leaves keep the plain shape). Other 3D models (untextured shapes, parts, Gaussian splats, mesh refinement, segmentation, animation, scene reconstruction) are found with wangp_models and used with their defaults",
     "texture_3d": "Texture a mesh of the 3D gallery given as custom_guide from one picture of the same object in image_refs, showing it from the front or three quarters, not steeply from above (PBR textures keeping the picture's colours; to restyle a mesh, edit the picture it was made from); the Hunyuan3D 2.1 Paint template tolerates a picture that differs from the mesh; a template may refine the mesh first",
+    "swap_video": "Replace people or characters in an existing video (video_guide); read the template's input guidance first",
+    "edit_video": "Change objects, setting, weather, light or style in an existing video (video_guide); read the template's input guidance first",
 }
 ARGUMENT_ALIASES = {"media": ("media_id", "video_id", "audio_ids"), "media_id": ("video_id", "audio_ids"), "video": ("video_id",), "audio": ("audio_ids", "audio_id"), "audio_id": ("audio_ids",), "image": ("media_id",), "mode": ("transitions",)}  # argument names agents mix up
 SHORT_ACTION_NAMES = {"inspect": "inspect_media", "view": "view_media", "render": "render_3d_views", "transcribe": "transcribe_media"}  # short names of toolbox actions
@@ -61,6 +63,9 @@ MEDIA_DISCOVERY_DESCRIPTIONS = {
     "view_media": "Return images or chosen video frames, optionally cropped, sized or tiled into a contact sheet, for your own visual inspection.",
     "inspect_audio": "Measure audio/video on CPU: peak/RMS, clipping indicators, loudness and silence; optionally return a playable excerpt.",
     "check_lip_sync": "Measure whether the lips of one shot follow its voice: media_id, optional start_s, duration_s, voice_id (the voice alone).",
+    "detect_video_cuts": "Find a video's hard cuts and shots, in frames at 24 fps: media_id.",
+    "plan_video_windows": "Split a video into render windows ending on cuts, for swap_video or edit_video: media_id, optional cuts, max_frames, min_frames, max_cuts.",
+    "check_video_edit": "Measure an edited take against its source: cuts moved, dropped or added, black bands at its edges: media_id, source_id, optional source_start, own_start, own_end, cuts.",
     "merge_videos": "Join up to 32 videos end to end (media_ids), with optional transitions between them.",
     "render_3d_views": "Render views of a 3D asset at one shared scale (named views or angles, animation frame, zoom, focus) as Gallery images, or a 360-degree turntable video with turntable_s.",
     "draw_svg": "Draw a Gallery image or animated clip from SVG markup (shapes, text, gradients, filters; Gallery images or authorized files embedded), or exact on-screen text and graphics burned over a video (video_id; never subtitles).",
@@ -202,8 +207,9 @@ def invocation(actions, action, arguments, *, signatures=False):
     if action is None:
         if arguments is not None:
             raise ValueError('arguments requires an action at the top level, beside arguments: {"action":"<action>","arguments":{...}}. Omit both to discover actions.')
-        compact = {name: value.get("_summary", value["description"].split(". ", 1)[0].rstrip(".") + ".") for name, value in actions.items()}
-        for name, value in actions.items():
+        listed = {name: value for name, value in actions.items() if not value.get("_unlisted")}  # an unlisted action is named by its workflow's guidance
+        compact = {name: value.get("_summary", value["description"].split(". ", 1)[0].rstrip(".") + ".") for name, value in listed.items()}
+        for name, value in listed.items():
             if not value["parameters"]["properties"]:
                 compact[name] += " Execute with arguments={}."
         if signatures:  # most calls need no contract read: rules and examples remain in each contract
@@ -269,7 +275,7 @@ def invocation(actions, action, arguments, *, signatures=False):
 
 
 def action_contract(definition):
-    result = {key: value for key, value in definition.items() if key not in {"_continuation_only", "_summary"}}
+    result = {key: value for key, value in definition.items() if key not in {"_continuation_only", "_summary", "_unlisted"}}
     result["parameters"] = strip_schema_titles(definition["parameters"])
     if not result["parameters"]["properties"]:
         result["usage"] = "No parameters: execute it with arguments={}."
@@ -521,7 +527,7 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
                 del settings["custom_settings"]
         metadata = core._compact_deepy_model_metadata(session.get_model_metadata(result["settings"]["model_type"]))
         # model information, kept apart so that it is not copied into settings
-        result["model"] = {key: metadata[key] for key in ("accelerated", "media_inputs", "resolution_budget", "resolution_budget_tiled", "resolution_min", "max_width", "max_height", "lock_resolutions", "allowed_resolutions", "vae_block_size") if key in metadata}
+        result["model"] = {key: metadata[key] for key in ("accelerated", "video_edit", "media_inputs", "resolution_budget", "resolution_budget_tiled", "resolution_min", "max_width", "max_height", "lock_resolutions", "allowed_resolutions", "vae_block_size") if key in metadata}
         return result
 
     def wangp_deepy_templates(tool_id: str | None = None, template: str = "default", cursor: str | None = None, action: str | None = None, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -633,7 +639,8 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
         actions["info"]["parameters"]["oneOf"] = [{"required": ["path"]}, {"required": ["paths"]}]
         if policy.read_enabled:
             actions["list"] = paginated(action_def('Navigate one authorized directory or list accessible roots. For a named subfolder, try its path directly, e.g. path="@outputs/selection"; no need to enumerate its parent. Use rg for recursive search; detailed metadata is available through info.', {"path": {"type": "string", "default": ""}, "pattern": {"type": "string", "default": "*"}, "media_type": {"type": "string", "enum": ["all", "image", "video", "audio", "3d", "world", "txt", "other"], "default": "all"}, "recursive": {"type": "boolean", "default": False, "description": "Also list the files of every subfolder (files only, any depth; pattern matches file names, any case)."}}))
-            actions["rg"] = paginated(action_def("Search filenames or text with ripgrep. command contains options without the rg executable, then -- and authorized paths; omit paths to search the documents folder. Filenames: --files -g '*.txt' -- @outputs (no text pattern); names containing a word, any case, subfolders included: --files --iglob '*word*' -- @outputs. Content: -n -F -e 'needle' -e 'other' -- @documents (one positional pattern or repeated -e). -l lists files containing matching text and needs a pattern. To find files inside a named folder use -g '**/selection/**', not -g '*selection*'; -i affects text matching, not glob casing. -m limits matches per file, not the page. Hidden/ignored files require explicit rg options. Excerpts are bounded; use read_text for complete lines.", {"command": {"type": "string"}}, ("command",)))
+            actions["rg"] = paginated(action_def("Search filenames or text with ripgrep. command contains options without the rg executable, then -- and authorized paths; omit paths to search the documents folder. Filenames: --files -g '*.txt' -- @outputs (no text pattern); names containing a word, any case, subfolders included: --files --iglob '*word*' -- @outputs. Content: -n -F -e 'needle' -e 'other' -- @documents (one positional pattern or repeated -e). -l lists files containing matching text and needs a pattern. To find files inside a named folder use -g '**/selection/**', not -g '*selection*'; -i affects text matching, not glob casing. -m limits matches per file, not the page. Hidden/ignored files require explicit rg options. Excerpts are bounded; use read_text for complete lines, or on a very long line -o -e '.{0,300}needle.{0,300}' for the text around the match.", {"command": {"type": "string"}}, ("command",)))
+            actions["read_text"]["description"] = f"Read a 1-based line range from a UTF-8 text file, at most {filesystem.TEXT_MAX_CHARS:,} characters per call. Use next_line to continue and eof to distinguish a completed range from the end of the file. In a long file, locate the passage first with rg -n (-C 3 shows its surroundings), then read it with start_line and end_line: without end_line a call returns the full {filesystem.TEXT_MAX_CHARS:,} characters. Read through a file only when it is short or all of it is needed."
             actions["rg"]["_summary"] = "Search via arguments.command: --files -g '*.txt' -- @outputs lists filenames; -n -F 'needle' -- @documents searches text."
         if policy.write_enabled:
             if extended:
@@ -669,7 +676,7 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
         examples = {
             "info": {"paths": ["@outputs/clip.mp4", "@outputs/voice.wav"]},
             "rg": {"command": '-n -F "needle" -- @documents/story.md'},
-            "read_text": {"path": "@documents/story.md"},
+            "read_text": {"path": "@documents/story.md", "start_line": 120, "end_line": 150},
             "write_text": {"path": "@documents/outline.md", "text": "# Outline\n"},
             "append_text": {"path": "@documents/story.md", "text": "\n\n## Chapter Two\n\nChapter text.\n"},
             "edit": {"path": "@documents/story.md", "old_string": "exact existing text", "new_string": "replacement text"},
@@ -886,7 +893,11 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
         actions = {item["name"]: {"description": item["description"], "parameters": {**item["parameters"], "additionalProperties": False}} for item in core._toolbox_discovery(get_toolbox(), policy.read_enabled) if item["name"] not in {"search_doc", "load_doc_section", "get_media_details"}}
         if not extended:
             actions.pop("inspect_audio", None)
-            actions.pop("check_lip_sync", None)
+            for name in ("check_lip_sync", "detect_video_cuts", "plan_video_windows", "check_video_edit"):
+                actions.pop(name, None)
+        for name in ("detect_video_cuts", "plan_video_windows", "check_video_edit"):  # named by the guidance of swap_video and edit_video templates
+            if name in actions:
+                actions[name]["_unlisted"] = True
         if (deepy_help or extended) and "replace_audio" in actions:
             actions.pop("replace_audio")
             actions["remux_media"] = action_def(
@@ -980,6 +991,10 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
             # frames of one video given with that video as media_id too: the items without a media_id are its frames (other media ids stay a conflict)
             arguments = {**arguments, "media_inputs": [{"media_id": arguments["media_id"], **item} if isinstance(item, dict) and "media_id" not in item else item for item in arguments["media_inputs"]]}
             arguments.pop("media_id")
+        if action == "inspect_media" and isinstance(arguments, dict) and (key := next((name for name in ("frame_no", "time_s") if isinstance(arguments.get(name), list)), None)) \
+                and (video := arguments.get("media_id") if isinstance(arguments.get("media_id"), str) else arguments["media_ids"][0] if isinstance(arguments.get("media_ids"), list) and len(arguments["media_ids"]) == 1 else None):
+            # several frames of one video asked as a list: one media_inputs item per frame (a director's commonest slip)
+            arguments = {**{name: value for name, value in arguments.items() if name not in ("media_id", "media_ids", key)}, "media_inputs": [{"media_id": video, key: value} for value in arguments[key]]}
         if action and action not in actions:
             from postprocessing import catalog
             if action in {process["id"] for kind in ("image", "video", "audio", "3d") for process in catalog.query_processes(kind)}:

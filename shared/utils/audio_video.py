@@ -800,6 +800,8 @@ def save_video(tensor,
     
     # Configure codec parameters
     codec_params = _get_codec_params(codec_type, container)
+    if float(fps) != int(fps):  # the writer rounds a rate to 2 decimals: 23.98 for 23.976 drifts from the sound. A later -r replaces it
+        codec_params = {**codec_params, "input_params": ["-r", f"{fps:.9f}"]}
     
     # Process and save
     error = None

@@ -30,9 +30,12 @@ DEEPY_TOOL_GEN_SPEECH_FROM_SAMPLE_KEY = "deepy_tool_gen_speech_from_sample"
 DEEPY_TOOL_GEN_WORLD_KEY = "deepy_tool_gen_world"
 DEEPY_TOOL_GEN_3D_KEY = "deepy_tool_gen_3d"
 DEEPY_TOOL_TEXTURE_3D_KEY = "deepy_tool_texture_3d"
+DEEPY_TOOL_SWAP_VIDEO_KEY = "deepy_tool_swap_video"
+DEEPY_TOOL_EDIT_VIDEO_KEY = "deepy_tool_edit_video"
 DEEPY_CONTEXT_TOKENS_KEY = "deepy_context_tokens"
 DEEPY_KV_CACHE_QUANTIZATION_KEY = "deepy_kv_cache_quantization"
 DEEPY_KEPT_KV_CACHES_KEY = "deepy_kept_kv_caches"
+DEEPY_ROUTE_TAIL_SKIP_KEY = "deepy_route_tail_skip"  # Qwen3.8 Flash-Next: low-ranked experts missing from VRAM are left out of decoding (faster, slightly less precise)
 DEEPY_COMPACTION_TYPE_KEY = "deepy_compaction_type"
 DEEPY_COMPACTION_THINKING_KEY = "deepy_compaction_thinking"
 DEEPY_REPETITION_PENALTY_KEY = "deepy_repetition_penalty"
@@ -96,6 +99,8 @@ DEEPY_DEFAULT_GEN_SPEECH_FROM_SAMPLE = "Index TTS 2"
 DEEPY_DEFAULT_GEN_WORLD = "Hy-Nomas World Model 8B"
 DEEPY_DEFAULT_GEN_3D = "TRELLIS.2 + SUPRA-Tex PBR 4B + 2.1B"
 DEEPY_DEFAULT_TEXTURE_3D = "SUPRA-Tex"
+DEEPY_DEFAULT_SWAP_VIDEO = "Viggle Remake Swap"
+DEEPY_DEFAULT_EDIT_VIDEO = "Viggle Remake Edit"
 DEEPY_CONTEXT_TOKENS_MIN = 20480  # Deepy Zero's system prompt and tools alone take about 12k tokens
 DEEPY_CONTEXT_TOKENS_MAX = 256000
 DEEPY_CONTEXT_TOKENS_DEFAULT = 20480
@@ -157,13 +162,14 @@ DEEPY_CONFIG_FILENAME = "wgp_config.json"
 # Deepy's existing read/write filesystem permission in addition to this switch.
 DEEPY_LONG_TEXT_TOOLS_EXPERIMENT = True
 
-DEEPY_QWEN_ENHANCER_IDS = {3, 4, 5, 6}
-_DEEPY_QWEN_VARIANT_LABELS = {3: "Qwen3.5-4B", 4: "Qwen3.5-9B", 5: "Qwen3.8-27B", 6: "Qwen3.8-9B"}
+DEEPY_QWEN_ENHANCER_IDS = {3, 4, 5, 6, 7}
+_DEEPY_QWEN_VARIANT_LABELS = {3: "Qwen3.5-4B", 4: "Qwen3.5-9B", 5: "Qwen3.8-27B", 6: "Qwen3.8-9B", 7: "Qwen3.8 Flash-Next"}
 _DEEPY_QWEN_KV_CACHE_SPECS = {
     3: {"num_kv_cache_layers": 8, "num_key_value_heads": 4, "head_dim": 256, "dtype_bytes": 2, "kvcache_block_size": 256},
     4: {"num_kv_cache_layers": 8, "num_key_value_heads": 4, "head_dim": 256, "dtype_bytes": 2, "kvcache_block_size": 256},
     5: {"num_kv_cache_layers": 16, "num_key_value_heads": 4, "head_dim": 256, "dtype_bytes": 2, "kvcache_block_size": 256},
     6: {"num_kv_cache_layers": 8, "num_key_value_heads": 4, "head_dim": 256, "dtype_bytes": 2, "kvcache_block_size": 256},
+    7: {"num_kv_cache_layers": 12, "num_key_value_heads": 2, "head_dim": 256, "dtype_bytes": 2, "kvcache_block_size": 256},
 }
 _DEEPY_DEFAULT_GEN_IMAGE_ALIASES = {"Z_Image_Turbo": "Z Image Turbo", **DEEPY_TEMPLATE_CONFIG_MIGRATIONS[DEEPY_TOOL_GEN_IMAGE_KEY]}
 _DEEPY_DEFAULT_EDIT_IMAGE_ALIASES = {"Qwen_Edit": DEEPY_DEFAULT_EDIT_IMAGE, **DEEPY_TEMPLATE_CONFIG_MIGRATIONS[DEEPY_TOOL_EDIT_IMAGE_KEY]}
@@ -275,6 +281,14 @@ def normalize_deepy_tool_gen_3d(value: Any) -> str:
 
 def normalize_deepy_tool_texture_3d(value: Any) -> str:
     return _normalize_deepy_variant(value, {}, DEEPY_DEFAULT_TEXTURE_3D)
+
+
+def normalize_deepy_tool_swap_video(value: Any) -> str:
+    return _normalize_deepy_variant(value, {}, DEEPY_DEFAULT_SWAP_VIDEO)
+
+
+def normalize_deepy_tool_edit_video(value: Any) -> str:
+    return _normalize_deepy_variant(value, {}, DEEPY_DEFAULT_EDIT_VIDEO)
 
 
 def normalize_deepy_context_tokens(value: Any) -> int:
@@ -411,7 +425,7 @@ def validate_deepy_version_config(deepy_type: Any, compaction_type: Any, context
     except (TypeError, ValueError):
         enhancer_no = 0
     if normalized_type == DEEPY_TYPE_PRIME:
-        if enhancer_no not in (5, 6):
+        if enhancer_no not in (5, 6, 7):
             raise ValueError("Deepy Prime requires a Qwen3.8 VL model.")
         if normalized_compaction != DEEPY_COMPACTION_TYPE_SUMMARIZE:
             raise ValueError("Deepy Prime requires Summarize compaction.")
@@ -664,6 +678,8 @@ def normalize_deepy_runtime_config(server_config: dict[str, Any] | None) -> dict
     runtime_config[DEEPY_TOOL_GEN_WORLD_KEY] = normalize_deepy_tool_gen_world(runtime_config.get(DEEPY_TOOL_GEN_WORLD_KEY, DEEPY_DEFAULT_GEN_WORLD))
     runtime_config[DEEPY_TOOL_GEN_3D_KEY] = normalize_deepy_tool_gen_3d(runtime_config.get(DEEPY_TOOL_GEN_3D_KEY, DEEPY_DEFAULT_GEN_3D))
     runtime_config[DEEPY_TOOL_TEXTURE_3D_KEY] = normalize_deepy_tool_texture_3d(runtime_config.get(DEEPY_TOOL_TEXTURE_3D_KEY, DEEPY_DEFAULT_TEXTURE_3D))
+    runtime_config[DEEPY_TOOL_SWAP_VIDEO_KEY] = normalize_deepy_tool_swap_video(runtime_config.get(DEEPY_TOOL_SWAP_VIDEO_KEY, DEEPY_DEFAULT_SWAP_VIDEO))
+    runtime_config[DEEPY_TOOL_EDIT_VIDEO_KEY] = normalize_deepy_tool_edit_video(runtime_config.get(DEEPY_TOOL_EDIT_VIDEO_KEY, DEEPY_DEFAULT_EDIT_VIDEO))
     runtime_config[DEEPY_AUTO_CANCEL_QUEUE_TASKS_KEY] = normalize_deepy_auto_cancel_queue_tasks(runtime_config.get(DEEPY_AUTO_CANCEL_QUEUE_TASKS_KEY, DEEPY_AUTO_CANCEL_QUEUE_TASKS_DEFAULT))
     runtime_config[DEEPY_SEPARATE_REQUESTS_WITH_EMPTY_LINE_KEY] = normalize_deepy_separate_requests_with_empty_line(runtime_config.get(DEEPY_SEPARATE_REQUESTS_WITH_EMPTY_LINE_KEY, DEEPY_SEPARATE_REQUESTS_WITH_EMPTY_LINE_DEFAULT))
     runtime_config[DEEPY_SESSION_RESET_MODE_KEY] = normalize_deepy_session_reset_mode(runtime_config.get(DEEPY_SESSION_RESET_MODE_KEY, DEEPY_SESSION_RESET_MODE_DEFAULT))
@@ -717,6 +733,7 @@ def get_deepy_default_runtime_config() -> dict[str, Any]:
         DEEPY_COMPACTION_THINKING_KEY: DEEPY_COMPACTION_THINKING_DEFAULT,
         DEEPY_REPETITION_PENALTY_KEY: DEEPY_REPETITION_PENALTY_DEFAULT,
         DEEPY_KEPT_KV_CACHES_KEY: DEEPY_KEPT_KV_CACHES_DEFAULT,
+        DEEPY_ROUTE_TAIL_SKIP_KEY: False,
         DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY: "",
         DEEPY_PRIME_CUSTOM_SYSTEM_PROMPT_KEY: DEEPY_PRIME_GUIDANCE_DEFAULT,
         DEEPY_MODEL_SPEED_KEY: "fast",

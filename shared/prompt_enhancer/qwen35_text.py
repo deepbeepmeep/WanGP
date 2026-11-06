@@ -53,6 +53,8 @@ QWEN35_LLM_PRELOAD_MARGIN_MB = 256  # VRAM the dynamic preload leaves free beyon
 # the input token table, unless the head shares it, in reserved RAM read by the GPU in place (MMGP runtime.map_in_ram): out of VRAM, same outputs
 QWEN35_LLM_MAPPED_TOKEN_TABLE = True
 QWEN35_LLM_ACTIVATIONS_MB = 512  # speculative decoding Auto: VRAM the LLM's passes take beside its weights and KV cache (about 330 MB measured for the 27B)
+QWEN4_EXP_PREFILL_CHUNK_TOKENS = 4096  # Qwen3.8 Flash-Next reads prompts by chunks: bounded activations and sparse attention, and each expert out of VRAM crosses the bus once per chunk
+QWEN4_EXP_EXPERT_MARGIN_MB = 3072  # its experts fill the VRAM: left free for the CUDA graphs of its passes, captured later
 
 QWEN35_GGUF_LLAMACPP_ENV = "WGP_GGUF_LLAMACPP_CUDA"
 QWEN35_PROMPT_MIN_NEW_TOKENS = 4
@@ -116,7 +118,7 @@ def _add_qwen35_mtp_shared_weights(state_dict, quantization_map=None, tied_weigh
 
 def _resolve_gguf_linear_attention_layout_from_filename(model_path: str) -> tuple[bool, bool, bool]:
     filename = os.path.basename(str(model_path or "")).strip().lower().replace("_", "-")
-    if filename in {
+    if filename.startswith("qwen3.8-flash-next-") or filename in {
         "qwen3.5-9b-abliterated-text-q4-k-m-bis.gguf",
         "qwen3.8-27b-uncensored-q4-k-m.gguf",
         "qwen3.8-27b-uncensored-nomtp-iq3-s.gguf",
@@ -181,7 +183,7 @@ def qwen35_mtp_fit(assets_dir: str | None, variant: str | None, backend: str, mo
         mtp_path = _resolve_qwen35_checkpoint_file(assets_dir, mtp_filename, variant=variant)
         if not mtp_path or not os.path.isfile(mtp_path):
             return None
-        mtp += sum(info.n_bytes for info in gguf._gguf_get_index(mtp_path).tensor_infos if info.name != "token_embd.weight")
+        mtp += os.path.getsize(mtp_path) if mtp_path.endswith(".safetensors") else sum(info.n_bytes for info in gguf._gguf_get_index(mtp_path).tensor_infos if info.name != "token_embd.weight")
     tokens = normalize_deepy_context_tokens(get_deepy_config_value(DEEPY_CONTEXT_TOKENS_KEY))
     kv_heads, head_dim = int(config.num_key_value_heads), int(getattr(config, "head_dim", int(config.hidden_size) // int(config.num_attention_heads)))
     work = _qwen35_kv_bytes(config, kv_cache_layout, tokens) + (QWEN35_LLM_ACTIVATIONS_MB << 20)
@@ -1018,6 +1020,54 @@ def _unload_prompt_enhancer_text_runtime(self):
             pass
 
 
+QWEN4_EXP_TAIL_RANK = 7  # of the 10 experts of a token: the three lowest weights
+
+
+def _load_qwen4_exp_model(model_path: str, config_path: str, assets_dir: str, spec: dict, features: dict, mtp_modules: list | None):
+    """Qwen3.8 Flash-Next from its first GGUF shard (the weights, its stored dtypes kept), with the n-gram table of the second shard left on the drive and the
+    drafter's weights in their own file."""
+    from shared.deepy.config import DEEPY_ROUTE_TAIL_SKIP_KEY, get_deepy_runtime_config
+    from shared.llm_engines.lmgp.models import qwen4_exp
+    from shared.llm_engines.lmgp.models.qwen4_exp import Qwen4ExpForCausalLM, draft_shared_weights, gguf_state_dict_names, open_ngram_table
+    config = _load_text_config(config_path)
+    config._prompt_enhancer_safe_legacy = not features["triton"]
+    config._prompt_enhancer_flash_attention = False  # its sparse attention reads the cache itself
+    config._prompt_enhancer_enable_mtp_speculative = bool(mtp_modules)
+    with torch.device("meta"):
+        # BF16 modules: the compute dtype of the quantized linears; the float32 norm weights keep their stored dtype (precision-locked modules)
+        model = Qwen4ExpForCausalLM(config, use_triton=features["triton"]).to(torch.bfloat16)
+    offload.load_model_data(model, model_path, preprocess_sd=gguf_state_dict_names, postprocess_sd=draft_shared_weights if mtp_modules else None, modules=mtp_modules, writable_tensors=False, default_dtype=None)
+    # measured routing shares, per byte (an expert in VRAM saves about the same CPU time whatever its format), comparable across the layers
+    usage = torch.tensor(json.load(open(os.path.join(os.path.dirname(qwen4_exp.__file__), "qwen4_exp_expert_usage.json"), encoding="utf-8"))["counts"], dtype=torch.float64)
+    for block, counts in zip(model.blk, usage):
+        bank = block.moe.experts
+        bank.expert_priority = ((counts + 1) / (counts + 1).sum() * (2 << 20) / bank.expert_nbytes).tolist()
+    if get_deepy_runtime_config().get(DEEPY_ROUTE_TAIL_SKIP_KEY, False):
+        for block in model.blk:
+            block.moe.experts.tail_rank = QWEN4_EXP_TAIL_RANK
+    if os.environ.get("WGP_FN_PROFILE"):  # TEMPORARY, comparison of the rankings: a ranked list of (layer, expert) pairs
+        import numpy as np
+        raw = open(os.environ["WGP_FN_PROFILE"], "rb").read()
+        ranked = int(np.frombuffer(raw, dtype=np.uint32, count=6)[5])
+        pairs = np.frombuffer(raw, dtype=np.uint16, offset=24, count=2 * ranked).reshape(-1, 2)
+        for block in model.blk:
+            block.moe.experts.expert_priority = [0.0] * block.moe.experts.num_experts
+        for rank, (layer, expert) in enumerate(pairs.tolist()):
+            model.blk[layer].moe.experts.expert_priority[expert] = 2.0 - rank / ranked
+    if mtp_modules:
+        # all the drafter's experts in VRAM, before those of the layers: its passes must stay short
+        model.mtp.block.moe.experts.expert_priority = [1e3] * model.mtp.block.moe.experts.num_experts
+        model.mtp.block.moe.experts.keep_resident = True
+    model._convertWeightsFloatTo = None  # the float32 norm and SSM weights stay float32
+    model._model_dtype = torch.bfloat16
+    model._mm_expert_margin = QWEN4_EXP_EXPERT_MARGIN_MB << 20
+    table_path = _resolve_qwen35_checkpoint_file(assets_dir, spec["ngram_table_filename"])
+    for block in model.blk:
+        if block.ple is not None:
+            block.ple.table = open_ngram_table(table_path, model_path, config)
+    return model
+
+
 def _load_local_text_model(
     model_path: str,
     config_path: str,
@@ -1349,19 +1399,23 @@ def load_qwen35_text_prompt_enhancer(
     elif quanto_log_ssm_a:
         print(f"[Qwen3.5VL][{spec['display_name']}][quanto_int8] SSM A parameters are stored in log form.")
 
-    model = _load_local_text_model(
-        model_path,
-        text_config_path,
-        preprocess_sd=preprocess_sd,
-        default_dtype=default_dtype,
-        safe_legacy_mode=safe_legacy_mode,
-        materialize_source_tensors=backend != enhancer_quantization_GGUF,
-        enable_mtp=enable_mtp,
-        modules=mtp_modules,
-        postprocess_sd=postprocess_sd,
-        preserve_native_dtypes=bool(prism_metadata),
-        flash_attention=features["flash"],
-    )
+    flash_next = spec.get("architecture") == "qwen4_exp"
+    if flash_next:
+        model = _load_qwen4_exp_model(model_path, text_config_path, assets_dir, spec, features, mtp_modules)
+    else:
+        model = _load_local_text_model(
+            model_path,
+            text_config_path,
+            preprocess_sd=preprocess_sd,
+            default_dtype=default_dtype,
+            safe_legacy_mode=safe_legacy_mode,
+            materialize_source_tensors=backend != enhancer_quantization_GGUF,
+            enable_mtp=enable_mtp,
+            modules=mtp_modules,
+            postprocess_sd=postprocess_sd,
+            preserve_native_dtypes=bool(prism_metadata),
+            flash_attention=features["flash"],
+        )
     if backend == enhancer_quantization_QUANTO_INT8 and spec.get("text_int8_tie_word_embeddings", False):
         _tie_qwen35_output_to_embeddings(model)
     if backend == enhancer_quantization_GGUF:
@@ -1374,7 +1428,8 @@ def load_qwen35_text_prompt_enhancer(
         )
     elif quanto_log_ssm_a:
         _configure_qwen35_text_model(model, log_ssm_a=True)
-    _apply_qwen35_projection_fusions(model, prism=bool(prism_metadata))
+    if not flash_next:
+        _apply_qwen35_projection_fusions(model, prism=bool(prism_metadata))
     if prism_metadata:
         from shared.qtypes.prism import install_prism_transforms
         install_prism_transforms(model, prism_metadata)
@@ -1383,7 +1438,7 @@ def load_qwen35_text_prompt_enhancer(
             install_prism_decode(model)
     # The sm80+ decode fusions were validated on the 27B GGUF; Turing's recurrence takes head counts, layouts and A / log A from the blocks
     # (27B, 9B, 4B; GGUF and Quanto INT8)
-    if features["triton"] and (backend == enhancer_quantization_GGUF and variant == "27b" or torch.cuda.get_device_capability(0) < (8, 0)):
+    if features["triton"] and (backend == enhancer_quantization_GGUF and variant in ("27b", "flash_next") or torch.cuda.get_device_capability(0) < (8, 0)):
         from shared.kernels.qwen_gdn import install_gdn_decode
         install_gdn_decode(model)
     mtp_draft_vocab_size = spec.get("mtp_draft_vocab_size")
@@ -1437,6 +1492,7 @@ def load_qwen35_text_prompt_enhancer(
     model._prompt_enhancer_speculative_tokens = spec.get("mtp_speculative_tokens", QWEN35_PROMPT_SPECULATIVE_TOKENS)
     model._prompt_enhancer_speculative_sampling_tokens = spec.get("mtp_speculative_sampling_tokens", QWEN35_PROMPT_SPECULATIVE_SAMPLING_TOKENS)
     model._prompt_enhancer_speculative_confidence = spec.get("mtp_speculative_confidence", 0.30)
+    model._prompt_enhancer_speculative_sampling_confidence = spec.get("mtp_speculative_sampling_confidence", 0.0)
     if block_draft_method is not None:
         from .block_draft import install_block_draft
         install_block_draft(model, block_draft_method, bonsai=bool(prism_metadata))
@@ -1456,6 +1512,8 @@ def load_qwen35_text_prompt_enhancer(
     model._mm_cpu_compute_reserve = kv_bytes + (2 << 30)  # KV cache, activations, vision tower
     if QWEN35_LLM_MAX_PRELOAD_MB:
         model._budget = model._auto_preload_max = QWEN35_LLM_MAX_PRELOAD_MB << 20
+    if flash_next:
+        model._prefill_chunk_tokens = QWEN4_EXP_PREFILL_CHUNK_TOKENS
     model._mm_graph_keys = 32  # its decoding passes: one token, then 2 to 9 for the speculative verifications
     model._mm_graph_placement_key = True  # only MMGP moves its weights: the key of a whole-model graph is checked in constant time
     model._mm_graph_check_once = True  # its passes of any length read the same state: reads checked, cuBLAS use found, at the first capture

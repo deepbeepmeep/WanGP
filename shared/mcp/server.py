@@ -26,6 +26,8 @@ from shared.mesh3d.glb import MESH_EXTENSIONS
 from shared.utils.gallery_sources import GALLERY_SOURCES, WORLD_EXTENSIONS, source_for_kind
 from shared.utils.gallery_media import disambiguate_gallery_media_ids, gallery_media_ids
 from shared.utils.setting_names import settings_error, split_settings
+from shared.utils.virtual_media import read_view
+from shared.deepy.video_tools import view_clip
 from shared.mcp.config import DEFAULT_PORT, server_port
 
 if TYPE_CHECKING:
@@ -55,8 +57,8 @@ _AGENT_INSTRUCTIONS_HEADER = ("WanGP MCP API 2.1: generate and edit images, vide
                               "These instructions are also readable as wangp://guides/agent; wangp://guides/workflows indexes workflow sections to read on demand.")
 _AGENT_SKILLS_DIR = Path(__file__).resolve().parents[1] / "deepy" / "skills"
 _DOCS_DIR = Path(__file__).resolve().parents[2] / "docs"
-_DEEPY_VISUAL_TOOL_IDS = {"gen_image", "edit_image", "gen_video", "gen_video_with_speech", "gen_video_with_refs"}
-_DEEPY_VIDEO_TOOL_IDS = {"gen_video", "gen_video_with_speech", "gen_video_with_refs"}
+_DEEPY_VISUAL_TOOL_IDS = {"gen_image", "edit_image", "gen_video", "gen_video_with_speech", "gen_video_with_refs", "swap_video", "edit_video"}
+_DEEPY_VIDEO_TOOL_IDS = {"gen_video", "gen_video_with_speech", "gen_video_with_refs", "swap_video", "edit_video"}
 _DEEPY_AUDIO_TOOL_IDS = {"gen_song", "gen_speech_from_description", "gen_speech_from_sample"}
 _DEEPY_MODEL_DEF_STRING_LIMIT = 256
 _TOOLBOX_ACTIONS = {
@@ -68,6 +70,9 @@ _TOOLBOX_ACTIONS = {
     "inspect_video",
     "inspect_audio",
     "check_lip_sync",
+    "detect_video_cuts",
+    "plan_video_windows",
+    "check_video_edit",
     "extract_image",
     "extract_video",
     "extract_audio",
@@ -92,6 +97,9 @@ _TOOLBOX_MEDIA_PARAMETERS = {
     "view_media": ("media_ids",),
     "inspect_audio": ("media_id",),
     "check_lip_sync": ("media_id", "voice_id"),
+    "detect_video_cuts": ("media_id",),
+    "plan_video_windows": ("media_id",),
+    "check_video_edit": ("media_id", "source_id"),
     "extract_image": ("media_id",),
     "extract_video": ("media_id",),
     "extract_audio": ("media_id",),
@@ -571,7 +579,7 @@ def _compact_model_metadata(records: list[dict[str, Any]]) -> list[dict[str, Any
 def _compact_deepy_model_metadata(record: dict[str, Any]) -> dict[str, Any]:
     compact = {key: copy.deepcopy(record[key]) for key in ("model_type", "name", "family", "family_label", "base_model_type", "finetune", "main_output", "outputs", "inputs") if record.get(key) not in (None, "", [], {})}
     compact["capabilities"] = [key for key, enabled in record.get("capabilities", {}).items() if enabled]
-    compact.update({key: copy.deepcopy(record[key]) for key in ("accelerated", "size", "specialities", "matched_specialities", "unmatched_specialities", "word_matches", "substring_matches", "resolution_budget", "resolution_budget_tiled", "resolution_min", "max_width", "max_height", "lock_resolutions", "allowed_resolutions", "vae_block_size", "resolution_assessment") if key in record})
+    compact.update({key: copy.deepcopy(record[key]) for key in ("accelerated", "size", "specialities", "video_edit", "matched_specialities", "unmatched_specialities", "word_matches", "substring_matches", "resolution_budget", "resolution_budget_tiled", "resolution_min", "max_width", "max_height", "lock_resolutions", "allowed_resolutions", "vae_block_size", "resolution_assessment") if key in record})
     if record.get("sliding_window") and "sliding_window" not in compact["capabilities"]:
         compact["capabilities"].append("sliding_window")
     compact["media_inputs"] = {kind: copy.deepcopy(values) if kind == "custom_file" else [key for key, enabled in values.items() if enabled] for kind, values in record.get("media_inputs", {}).items() if isinstance(values, dict) and any(values.values())}
@@ -777,7 +785,8 @@ def _is_media_id(value: Any) -> bool:
     return str(value or "").strip().lower().startswith(tuple(source.media_ids + ":" for source in GALLERY_SOURCES))
 
 
-def _resolve_mcp_media_reference(session, value: Any, label: str, allow_read_file_system: bool, file_access_policy=None) -> str:
+def _resolve_mcp_media_reference(session, value: Any, label: str, allow_read_file_system: bool, file_access_policy=None, keep_view: bool = False) -> str:
+    """The file a reference names. A view (@views/...) comes as a real clip unless the caller reads views: keep_view."""
     reference = str(value or "").strip()
     if not reference:
         raise ValueError(f"{label} is empty")
@@ -786,7 +795,8 @@ def _resolve_mcp_media_reference(session, value: Any, label: str, allow_read_fil
         return _resolve_existing_path(path, label)
     if not allow_read_file_system:
         raise PermissionError(f"Direct filesystem paths are disabled for this MCP server. Use a media_id returned by wangp_list_gallery for {label}, or restart with filesystem reads enabled.")
-    return str(file_access_policy.require_read(reference, file=True)) if file_access_policy is not None else _resolve_existing_path(reference, label)
+    resolved = str(file_access_policy.require_read(reference, file=True)) if file_access_policy is not None else _resolve_existing_path(reference, label)
+    return resolved if keep_view or read_view(resolved) is None else view_clip(resolved)
 
 
 def _resolve_mcp_media_input(session, media_id: str | None, path: str | None, allow_read_file_system: bool, file_access_policy=None) -> str:
@@ -804,8 +814,8 @@ def _resolve_mcp_media_value(session, value: Any, label: str, allow_read_file_sy
     if value is None or isinstance(value, str) and not value.strip():
         return value
     if isinstance(value, (list, tuple)):
-        return [_resolve_mcp_media_reference(session, item, label, allow_read_file_system, file_access_policy) for item in value]
-    return _resolve_mcp_media_reference(session, value, label, allow_read_file_system, file_access_policy)
+        return [_resolve_mcp_media_reference(session, item, label, allow_read_file_system, file_access_policy, keep_view=True) for item in value]
+    return _resolve_mcp_media_reference(session, value, label, allow_read_file_system, file_access_policy, keep_view=True)  # generation reads views
 
 
 def _validate_generation_media(session, settings, model_type, path):
@@ -1229,7 +1239,7 @@ def _resolve_toolbox_arguments(session, toolbox, action: str, arguments: dict[st
         value = value.strip()
         if not value or media_registry.get_media_record(toolbox.session, value) is not None:
             return value
-        media_path = _resolve_mcp_media_reference(session, value, parameter_name, allow_read_file_system, file_access_policy)
+        media_path = _resolve_mcp_media_reference(session, value, parameter_name, allow_read_file_system, file_access_policy, keep_view=True)  # each action knows whether it reads views
         record = media_registry.register_media(toolbox.session, media_path, source="gallery" if _is_media_id(value) else "filesystem")
         if record is None:
             raise ValueError(f"Unsupported media file: {media_path}")
@@ -2067,9 +2077,9 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
         action_name = str(action or "").strip()
         actions = _toolbox_discovery(sandbox_toolbox, allow_read_file_system)
         if api_version != "2.1":
-            actions = [action for action in actions if action["name"] not in ("inspect_audio", "check_lip_sync")]
+            actions = [action for action in actions if action["name"] not in ("inspect_audio", "check_lip_sync", "detect_video_cuts", "plan_video_windows", "check_video_edit")]
         if not action_name:
-            compact_actions = [{"name": candidate["name"], "description": candidate.get("description", "")} for candidate in actions]
+            compact_actions = [{"name": candidate["name"], "description": candidate.get("description", "")} for candidate in actions if candidate["name"] not in ("detect_video_cuts", "plan_video_windows", "check_video_edit")]
             return {"status": "discovery", "actions": compact_actions, "count": len(compact_actions), "next": "Call again with one action and omit arguments to get its exact schema."}
         if action_name not in _TOOLBOX_ACTIONS:
             raise ValueError(f"Unknown toolbox action '{action_name}'. Call without action to discover available actions.")
@@ -2269,8 +2279,16 @@ def _build_python_sandbox(session, toolbox, file_access_policy, call_tool=None):
     def resolve_path(reference):
         record = media_registry.get_media_record(toolbox.session, reference)
         if record is not None:
-            return _resolve_existing_path(record["path"], "ref")
+            path = _resolve_existing_path(record["path"], "ref")
+            return path if read_view(path) is None else view_clip(path)
         return _resolve_mcp_media_reference(session, reference, "ref", file_access_policy.read_enabled, file_access_policy)
+
+    def resolve_part(reference):
+        """What wangp.video_frames reads: a video file, and the frames a view keeps of it."""
+        record = media_registry.get_media_record(toolbox.session, reference)
+        path = _resolve_existing_path(record["path"], "ref") if record is not None else _resolve_mcp_media_reference(session, reference, "ref", file_access_policy.read_enabled, file_access_policy, keep_view=True)
+        view = read_view(path)
+        return {"path": path, "start_frame": 0, "end_frame": None} if view is None else {"path": view["source"], "start_frame": view["start_frame"], "end_frame": view["end_frame"]}
 
     def compact(record):
         return None if record is None else _output_record(_compact_gallery_record(record), record["path"])
@@ -2281,7 +2299,7 @@ def _build_python_sandbox(session, toolbox, file_access_policy, call_tool=None):
         apps = AppWorkshop(file_access_policy.workspace / "sandbox", resolve_path=resolve_path, publish_app=lambda package, description: compact(toolbox.publish_sandbox_app(package, description)), virtualize=file_access_policy.virtualize_path)
     return PythonSandbox(file_access_policy.workspace / "sandbox", resolve_path=resolve_path, publish_media=lambda path, description: compact(toolbox.publish_sandbox_media(path, description)),
                          publish_frames=lambda frames, fps, name, description: compact(toolbox.publish_sandbox_frames(frames, fps, name, description)), virtualize=file_access_policy.virtualize_path,
-                         call_tool=call_tool, list_dir=lambda reference: file_access_policy.require_read(reference, directory=True), apps=apps)
+                         call_tool=call_tool, list_dir=lambda reference: file_access_policy.require_read(reference, directory=True), apps=apps, resolve_part=resolve_part)
 
 
 def _http_settings(transport: str, host: str | None, port: int | None, oauth) -> dict[str, Any]:

@@ -52,6 +52,17 @@ class _Mapping:
         self.__cuda_array_interface__ = dict(shape=(nbytes,), typestr="|u1", data=(device_pointer, False), version=3)
 
 
+def empty(nbytes, device, kind="mapped"):
+    """(CPU view, CUDA view) of nbytes of mapped RAM of its own, charged to MMGP's locked bytes until both views are gone: the host and GPU kernels share it, CUDA graphs included. On Windows their
+    addresses differ. Raises MemoryError if the RAM cannot be locked."""
+    size = -(-nbytes // mmap.PAGESIZE) * mmap.PAGESIZE
+    ram, owner = pinned.block(size)
+    owner.registration = pinned.lock(owner.base, ram.data_ptr(), size, kind, _REGISTER_MAPPED)
+    if owner.registration is None:
+        raise MemoryError(f"Unable to lock {size} bytes of mapped RAM")
+    return ram[:nbytes], torch.as_tensor(_Mapping(ram, owner, nbytes, _device_pointer(ram.data_ptr())), device=device)
+
+
 def _mapped_copy(tensor, device, executor):
     """A CUDA view of a copy of tensor in mapped RAM, whole pages of its own (registration rounds to pages)."""
     nbytes = tensor.numel() * tensor.element_size()

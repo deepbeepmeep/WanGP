@@ -9,6 +9,7 @@ export const KINDS = {
   ad: { label: 'Ad', icon: 'megaphone', text: 'A product spot in 15 to 60 s', hue: 'ad' },
   trailer: { label: 'Trailer', icon: 'film', text: 'Tease a story in a minute', hue: 'trailer' },
   story: { label: 'Illustrated story', icon: 'book', text: 'Narrated picture-book pages', hue: 'story' },
+  remake: { label: 'Viggle Remake', icon: 'wand', text: 'Recast or change an existing video', hue: 'film' },
   free: { label: 'Anything', icon: 'sparkles', text: 'Start from an idea', hue: 'free' },
 };
 const STAGE_LABELS = { brief: 'Brief', planning: 'Planning', review: 'In review', shooting: 'Shooting', editing: 'Editing', delivered: 'Delivered' };

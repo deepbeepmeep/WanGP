@@ -3,15 +3,21 @@
 quantization handlers supply the storage formats and their kernels (ExpertFormat)."""
 import ctypes
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
 import torch
 from torch.nn import functional as F
 
 from .experts import ExpertBank
+from .expert_stream import pair_seconds
+from .read_ahead import cold_ranges, prefetch_ranges
 from . import allocator, pinned
 
 
 _side_streams = {}
+DOORBELL = "host" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the doorbell jobs of queue_forward, proven: the switch goes with the others at the end
 
 
 def _side_stream(device):
@@ -49,6 +55,7 @@ class ExpertFormat:
     whether the input projection holds gate then up rows (SwiGLU) or up rows only (squared ReLU), bank.blocks the scale blocks of the
     input and output projections."""
     name = ""
+    reports_usage = False  # its CPU job counts the pairs routed to each expert, in bank.usage (whatever computes them): the placement then adapts to the routing
 
     def tensors(self, experts, hidden, intermediate, gated=True, blocks=None):
         """Checkpoint name -> (shape, dtype) of a bank's tensors, in the order of the rows of the GPU pointer table. blocks: the scale
@@ -79,6 +86,24 @@ class ExpertFormat:
         addresses, zero rows contributing nothing); out and the float32 [tokens * topk, intermediate] scratch mid may be preallocated."""
         raise NotImplementedError
 
+    def doorbell(self, device):
+        """(shared.kernels.host_doorbell, address of a job function returning whether it wrote a result) when its CPU job can run beside the GPU's work on device, asked for by a kernel; None: a host function in
+        the stream, which the GPU waits for."""
+        return None
+
+    def gpu_pass_supported(self, device):
+        """Whether gpu_pass() runs on this device."""
+        return False
+
+    def pass_shares(self):
+        """Whether a short pass may leave some of its experts to the CPU kernels, whose activations are not those of the GPU's."""
+        return False
+
+    def gpu_pass(self, bank, x, host_ids, probabilities, order, zero=False):
+        """A pass of many tokens run by parts, the kernels reading each expert once for all its rows: an object with run(pointers, start, stop) computing the experts [start, stop) of order (an int array, every routed expert
+        once) and finish() returning the float32 [tokens, hidden] sum, once all of them have run. host_ids: the routing on the CPU."""
+        raise NotImplementedError
+
     def dequantize(self, bank, tensors):
         """float32 input projection (gate and up [2 * intermediate, hidden], or up [intermediate, hidden]) and down [hidden,
         intermediate] weights of one expert (name -> tensor), as applied to unrotated activations."""
@@ -88,6 +113,23 @@ class ExpertFormat:
 def _formats():
     from . import quant_router
     return quant_router.expert_formats()
+
+
+class _DoorbellJob:
+    """A job of queue_forward asked for by a GPU kernel: its payload and result in one block of mapped RAM (host and CUDA views), at fixed addresses for graph replays. Not a shared.* object: its CUDA views are no state of
+    the model."""
+    def __init__(self, bank, tokens, topk, count, kernels, function, device):
+        from . import mapped
+        offset = -(-count * 4 // 64) * 64
+        self.kernels = kernels
+        self.host, view = mapped.empty(offset + tokens * bank.hidden * 4, device, "experts")
+        self.payload, self.result = view[:count * 4].view(torch.int32), view[offset:].view(torch.float32)
+        self.job, _ = bank.format.cpu_job(bank, self.host.data_ptr(), bank.resident_flags.data_ptr(), self.host.data_ptr() + offset, tokens, topk, cpu_threads())
+        self.ticket = kernels.register(device, function, None, self.job)
+
+    def close(self):
+        self.kernels.release(self.ticket)
+        pinned.retire((self.host, self.payload, self.result))  # unlocked at the next quiet point
 
 
 def _locked(numel, dtype):
@@ -122,8 +164,20 @@ class _HostStaging:
         cls.inputs = cls.outputs = cls.uploaded = None
 
 
+_share_thread = None
+
+
+def _share_pool():
+    global _share_thread
+    if _share_thread is None:
+        _share_thread = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mmgp_expert_share")
+    return _share_thread
+
+
 ACTIVATIONS = ("swiglu", "relu2")
 TRITON_PAIRS = 64  # eager calls of more (token, slot) pairs compute their resident experts with the PyTorch path
+STREAMED_GROUP_BYTES = 512 << 20  # experts without a GPU copy uploaded together for a pass of many rows
+RESIDENT_LAUNCH = 128  # experts of a pass of many rows computed together: their scratch stays in the GPU's L2 (5-10% at 8K tokens on a 5090)
 
 
 class RoutedExperts(ExpertBank):
@@ -131,6 +185,8 @@ class RoutedExperts(ExpertBank):
     Pageable CPU storage in their checkpoint format, plus optional GPU copies. The format is that of the loaded checkpoint tensors (its
     scale blocks read from their shapes), or the registered format named at construction (the bank's tensors are then allocated on
     device, with the given scale blocks or the format's default)."""
+    tail_rank = 0  # above 0, in a decoding pass: an expert out of VRAM that no token routes above this rank is left out (formats that support it): faster, less precise
+    TAIL_WINDOW = 16  # the most rows of a pass it concerns: prompts are read whole
     def __init__(self, num_experts, hidden, intermediate, *, activation="swiglu", format=None, blocks=None, device="cpu", use_triton=False):
         super().__init__(num_experts, ())
         if activation not in ACTIVATIONS:
@@ -144,6 +200,7 @@ class RoutedExperts(ExpertBank):
         self._pointer_table = None
         self._pointer_version = -1
         self._jobs = {}  # tokens -> (host job, host function, pinned payload, pinned result) of queue_forward, at fixed addresses for graph replays
+        self._doorbell_jobs = {}  # tokens -> _DoorbellJob
         if format is not None:
             format = next(candidate for candidate in _formats() if candidate.name == format)
             self._set_format(format, device, blocks)
@@ -155,6 +212,7 @@ class RoutedExperts(ExpertBank):
         for name, (shape, dtype) in declared.items():
             self.register_buffer(name, torch.empty(shape, dtype=dtype, device=device))
         self.expert_tensor_names, self.format = tuple(declared), format
+        self.reports_usage = format.reports_usage
         self.blocks = format.blocks(self.hidden, self.intermediate, {name: getattr(self, name) for name in declared})
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
@@ -181,16 +239,38 @@ class RoutedExperts(ExpertBank):
                 pinned.retire(payload)
                 pinned.retire(result)
             self._jobs.clear()
+        if self._doorbell_jobs:
+            torch.cuda.synchronize()
+            for job in self._doorbell_jobs.values():
+                job.close()
+            self._doorbell_jobs.clear()
 
     def queue_forward(self, x, topk_ids, topk_weights, packed=None):
-        """Graph-safe forward on the current CUDA stream: the CPU computes the selected experts in a host function queued between the
-        copy of the routing payload to pinned memory and the copy of its result back, so a captured graph replays the whole call
-        without returning to Python. With the Triton backend, the experts having GPU copies are computed on the GPU instead, in a
-        branch running beside the CPU job; a placement change releases the graphs that read these copies. Failures are reported by
-        raise_job_errors() once the stream has been synchronized."""
+        """Graph-safe forward on the current CUDA stream, so a captured graph replays the whole call without returning to Python: the CPU computes the selected experts in a job asked for by a kernel (the format's
+        doorbell()), or else in a host function queued between the copy of the routing payload to pinned memory and the copy of its result back. With the Triton backend, the experts having GPU copies are computed
+        on the GPU instead, beside the CPU job; a placement change releases the graphs that read these copies. Failures are reported by raise_job_errors() once the stream has been synchronized."""
         shape = x.shape
         x = x.reshape(-1, self.hidden).contiguous()
         tokens, topk = topk_ids.shape
+        doorbell = self.format.doorbell(x.device) if DOORBELL and self.use_triton else None
+        if doorbell is not None:
+            # the CPU works beside the GPU's experts of this layer: asked for first, its result joined after them
+            kernels, function = doorbell
+            job = self._doorbell_jobs.get(tokens)
+            if job is None:
+                job = self._doorbell_jobs[tokens] = _DoorbellJob(self, tokens, topk, tokens * (self.hidden + 2 * topk), kernels, function, x.device)
+            if packed is None and kernels.parts_supported(x):
+                kernels.ask_parts(x, topk_weights.contiguous(), topk_ids.contiguous(), job.payload, job.ticket)  # as pack() lays them out
+            else:
+                kernels.ask(self.pack(x, topk_ids, topk_weights) if packed is None else packed, job.payload, job.ticket)
+            if self._resident or self.gpu_branch:
+                output = torch.empty(tokens, self.hidden, dtype=torch.float32, device=x.device)
+                mid = torch.empty(tokens * topk, self.intermediate, dtype=torch.float32, device=x.device)
+                self.format.gpu_forward(self, x, topk_ids.contiguous(), topk_weights.contiguous(), self._pointers(x.device), out=output, mid=mid)
+            else:
+                output = torch.zeros(tokens, self.hidden, dtype=torch.float32, device=x.device)
+            kernels.wait(job.ticket, job.result, output, True)
+            return output.to(dtype=x.dtype).reshape(shape)
         if packed is None:
             packed = self.pack(x, topk_ids, topk_weights)
         if tokens not in self._jobs:
@@ -200,7 +280,7 @@ class RoutedExperts(ExpertBank):
             self._jobs[tokens] = job, function, payload, result
         job, function, payload, result = self._jobs[tokens]
         stream = torch.cuda.current_stream()
-        if gpu := self.use_triton and bool(self._resident):
+        if gpu := self.use_triton and (bool(self._resident) or self.gpu_branch):
             pointers, side = self._pointers(x.device), _side_stream(x.device)
             topk_ids, topk_weights = topk_ids.contiguous(), topk_weights.contiguous()
             # Allocated on this stream, which joins the branch before anything can reuse them.
@@ -216,6 +296,116 @@ class RoutedExperts(ExpertBank):
             stream.wait_stream(side)
             output.add_(gpu_output)
         return output.to(dtype=x.dtype).reshape(shape)
+
+    def _swap(self, old, new):
+        # the addresses of the GPU copy do not change hands: in place, the graphs read this table
+        current = self._pointer_table is not None and self._pointer_version == self.residency_version
+        super()._swap(old, new)
+        if current:
+            self._pointer_table[new] = self._pointer_table[old]
+            self._pointer_table[old] = 0
+            self._pointer_version = self.residency_version
+
+    def _ring_forward(self, stream, x, ids, weights):
+        """A pass of many rows whose experts out of VRAM arrive through the stream of the model's Residency: the experts having a GPU copy run first, then the others by batches as they land. None if the format's kernels cannot take it."""
+        host_ids = ids.to("cpu")  # once the router has run: all that follows depends on it
+        counts = np.bincount(host_ids.numpy().ravel(), minlength=self.num_experts)
+        routed = counts > 0
+        with self.lease():
+            batches = stream.take(self, routed, counts)  # (a whole locked batch may hold experts out of its routing: run() reads only the rows of the lanes)
+            share = None
+            if stream.on_cpu is not None and len(stream.on_cpu):
+                routed = routed.copy()
+                routed[stream.on_cpu] = False
+                share = self._share_start(x, ids, weights, stream.on_cpu)
+            planned = np.zeros(self.num_experts, dtype=bool)
+            for batch in batches:
+                planned[batch.experts] = True
+            placed = routed & (self._flags != 0) & ~planned
+            lanes = [batch.experts[routed[batch.experts]] for batch in batches]
+            late = np.nonzero(routed & ~placed & ~planned)[0]  # lost their GPU copy since the plan, under memory pressure
+            resident = np.nonzero(placed)[0]
+            job = self.format.gpu_pass(self, x, host_ids, weights, np.concatenate((resident, *lanes, late)), zero=share is not None)
+            if self.reports_usage:
+                self._usage += counts.astype(np.uint32)
+                self._residency().adapt_due = True
+            pointers = self._pointers(x.device)
+            for start in range(0, len(resident), RESIDENT_LAUNCH):
+                job.run(pointers, start, min(start + RESIDENT_LAUNCH, len(resident)))
+            start = len(resident)
+            table = stream.addresses(self, batches)
+            for batch, lane in zip(batches, lanes):
+                stream.wait(batch)
+                job.run(table, start, start + len(lane))
+                stream.release(batch)
+                start += len(lane)
+            if len(late):
+                names = self.expert_tensor_names
+                copies = [[getattr(self, name)[expert].to(x.device) for name in names] for expert in late.tolist()]
+                table = torch.zeros(self.num_experts, len(names), dtype=torch.int64, device=x.device)
+                table[torch.from_numpy(late).to(x.device)] = torch.tensor([[tensor.data_ptr() for tensor in tensors] for tensors in copies], dtype=torch.int64, device=x.device)
+                job.run(table, start, start + len(late))
+                copies = None
+            output = job.finish()
+            if share is not None:
+                self._share_join(output, *share)
+            return output
+
+    def _share_start(self, x, ids, weights, on_cpu):
+        """Experts of a short prompt computed on the CPU beside the others on the GPU, on a thread of its own: their rows are read where they are instead of crossing the bus, for the few tokens routed to them."""
+        tokens, topk = ids.shape
+        packed = self.pack(x, ids, weights)
+        host = _HostStaging.buffer("inputs", packed.numel(), torch.int32)
+        host[:packed.numel()].copy_(packed)  # blocking: the CPU reads it next
+        result = _HostStaging.buffer("outputs", tokens * self.hidden, torch.float32)
+        if _HostStaging.uploaded is not None:
+            _HostStaging.uploaded.synchronize()
+        others = np.ones(self.num_experts, dtype=np.uint8)
+        others[on_cpu] = 0
+        base = host.data_ptr()
+
+        def run():
+            started = time.perf_counter()
+            pairs = self.format.cpu_forward(self, base, base + 4 * tokens * (self.hidden + topk), base + 4 * tokens * self.hidden, others.ctypes.data, result.data_ptr(), tokens, topk, cpu_threads())
+            if pairs:
+                pair_seconds[0] += 0.25 * ((time.perf_counter() - started) / pairs - pair_seconds[0])
+            return pairs
+
+        return _share_pool().submit(run), others, result
+
+    def _share_join(self, output, future, others, result):
+        if future.result():
+            tokens, hidden = output.shape
+            output.add_(result[:tokens * hidden].view(tokens, hidden).to(output.device, non_blocking=True))
+            _HostStaging.uploaded = _HostStaging.uploaded or torch.cuda.Event()
+            _HostStaging.uploaded.record()
+
+    def _streamed_gpu_forward(self, x, ids, weights):
+        """Passes of many rows (prompt processing) with GPU kernels that read rows in place: the experts having a GPU copy run first, then the others, uploaded by groups
+        for this pass and released. The CPU would compute each row of an expert again; the bus reads it once."""
+        device = x.device
+        x, ids, weights = x.contiguous(), ids.contiguous(), weights.contiguous()
+        residency = None if self._residency is None else self._residency()
+        if residency is not None and residency.stream is not None:
+            return self._ring_forward(residency.stream, x, ids, weights)
+        if self.reports_usage:
+            self.add_usage(ids)
+        out = self.format.gpu_forward(self, x, ids, weights, self._pointers(device))
+        with self.lease() as resident:
+            missing = [expert for expert in torch.unique(ids).tolist() if expert not in resident]
+        names = self.expert_tensor_names
+        table = torch.zeros(self.num_experts, len(names), dtype=torch.int64, device=device)
+        group = max(1, STREAMED_GROUP_BYTES // self.expert_nbytes)
+        for start in range(0, len(missing), group):
+            batch = missing[start:start + group]
+            sources = [getattr(self, name)[expert] for expert in batch for name in names]
+            prefetch_ranges(cold_ranges([(tensor.data_ptr(), tensor.numel() * tensor.element_size()) for tensor in sources]))
+            copies = [tensor.to(device) for tensor in sources]
+            table.zero_()
+            table[torch.tensor(batch, device=device)] = torch.tensor([tensor.data_ptr() for tensor in copies], dtype=torch.int64, device=device).view(len(batch), len(names))
+            out = out.add_(self.format.gpu_forward(self, x, ids, weights, table))
+            sources = copies = None
+        return out
 
     def _streamed_forward(self, x, ids, weights):
         """Passes of many rows (prompt processing) on CUDA: every selected expert runs on the GPU for all its rows, its resident copy or
@@ -250,12 +440,18 @@ class RoutedExperts(ExpertBank):
 
     def raise_job_errors(self):
         """After a stream synchronization: raise the failure of a host job queued by queue_forward, if any."""
+        for job in self._doorbell_jobs.values():
+            if job.job.status:
+                status, job.job.status = job.job.status, 0
+                raise RuntimeError(f"CPU expert kernel failed ({status})")
         for job, _, _, _ in self._jobs.values():
             if job.status:
                 status, job.status = job.status, 0
                 raise RuntimeError(f"CPU expert kernel failed ({status})")
 
     def _pointers(self, device):
+        if self.gpu_branch:
+            return self._residency().pointers(self, device)
         if self._pointer_version != self.residency_version or self._pointer_table is None:
             rows = [[resident[name].data_ptr() for name in self.expert_tensor_names] if (resident := self._resident.get(expert)) else [0] * len(self.expert_tensor_names)
                     for expert in range(self.num_experts)]
@@ -279,7 +475,10 @@ class RoutedExperts(ExpertBank):
         tokens, topk = topk_ids.shape
         cuda = x.device.type == "cuda"
         if cuda and self.streamed_pairs is not None and tokens * topk >= self.streamed_pairs:
-            return self._streamed_forward(x, topk_ids, topk_weights).to(dtype=x.dtype).reshape(shape)
+            if not self.use_triton and self.reports_usage:
+                self.add_usage(topk_ids)
+            streamed = self._streamed_gpu_forward if self.use_triton else self._streamed_forward
+            return streamed(x, topk_ids, topk_weights).to(dtype=x.dtype).reshape(shape)
         if packed is None:
             packed = self.pack(x, topk_ids, topk_weights)
         if cuda:

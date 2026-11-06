@@ -1,0 +1,19 @@
+{
+    "image_mode": 0,
+    "model_type": "viggle_animate",
+    "prompt": "Prompt ignored. Don't write anything here.",
+    "num_inference_steps": 3,
+    "flow_shift": 3.0,
+    "sample_solver": "euler",
+    "video_length": 124,
+    "sliding_window_size": 124,
+    "sliding_window_overlap": 18,
+    "guidance_phases": 1,
+    "guidance_scale": 1.0,
+    "video_prompt_type": "IVU",
+    "audio_prompt_type": "",
+    "resolution": "832x480",
+    "settings_version": 2.82,
+    "prompt_enhancer": "",
+    "type": "Viggle-Animate 3 Steps"
+}

@@ -1,0 +1,13 @@
+{
+    "image_mode": 0,
+    "video_length": 81,
+    "flow_shift": 5,
+    "num_inference_steps": 30,
+    "resolution": "832x480",
+    "settings_version": 2.82,
+    "prompt_enhancer": "",
+    "model_type": "kiwi_edit",
+    "prompt": "Change the woman's dress to a vivid red while preserving her pose, face, and the room lighting.",
+    "video_prompt_type": "UVI",
+    "type": "Kiwi Edit Instruct-Reference 5B"
+}

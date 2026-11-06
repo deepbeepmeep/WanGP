@@ -240,6 +240,7 @@ class model_factory:
         n_prompt: str | None = None,
         sampling_steps: int = 20,
         sample_solver: str = "default",
+        shift: float = None,
         width: int = 1024,
         height: int = 1024,
         guide_scale: float = 0.0,
@@ -287,6 +288,12 @@ class model_factory:
         if self.model_def.get("guidance_max_phases", 0) < 1:
             guide_scale = 0
 
+        # without the Shift setting the scheduler keeps the shift of its config (Turbo's 3.0)
+        if self.model_def.get("flow_shift", False):
+            self.scheduler.set_shift(shift)
+        # sigmas 1 - i/N (shifted): the N steps end on a real update instead of a pass at sigma 0
+        sigmas = [1.0 - i / sampling_steps for i in range(sampling_steps)] if self.model_def.get("uniform_sigmas", False) else None
+
         def _vae_upsampler_progress(_phase, current_step=None, total_steps=None):
             if callable(set_progress_status):
                 progress_label = getattr(vae_upsampler, "progress_label", "VAE Spatial Upsampling")
@@ -301,6 +308,7 @@ class model_factory:
             prompt=input_prompt,
             negative_prompt=n_prompt,
             num_inference_steps=sampling_steps,
+            sigmas=sigmas,
             sample_solver=sample_solver,
             guidance_scale=guide_scale,
             num_images_per_prompt=batch_size,

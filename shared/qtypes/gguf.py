@@ -32,12 +32,24 @@ class PrismQuantizationType(IntEnum):
     PTQ1_0 = 143
 
 
+class GgmlExtraQuantizationType(IntEnum):
+    """ggml types newer than the released gguf package."""
+    Q2_0 = 42
+
+
+_EXTRA_QUANTIZATION_SIZES = {GgmlExtraQuantizationType.Q2_0: (64, 18)}
+
+
 def _quantization_type(value):
-    return PrismQuantizationType(value) if value == 143 else gguf.GGMLQuantizationType(value)
+    if value == 143:
+        return PrismQuantizationType(value)
+    return GgmlExtraQuantizationType(value) if value in _EXTRA_QUANTIZATION_SIZES else gguf.GGMLQuantizationType(value)
 
 
 def _quantization_sizes(value):
-    return (128, 28) if value == PrismQuantizationType.PTQ1_0 else gguf.GGML_QUANT_SIZES[value]
+    if value == PrismQuantizationType.PTQ1_0:
+        return 128, 28
+    return _EXTRA_QUANTIZATION_SIZES[value] if value in _EXTRA_QUANTIZATION_SIZES else gguf.GGML_QUANT_SIZES[value]
 
 try:
     import gguf
@@ -935,6 +947,20 @@ def _llamacpp_cuda_linear(module, raw, qtype_name, shape, input_tensor, bias, ta
     return out.reshape(*input_tensor.shape[:-1], out_features)
 
 
+_IQ4_NL_OVERREAD_ROWS = 9  # beyond the short-batch kernels
+
+
+def _iq4_nl_linear_many_rows(module, weight_tensor, raw, shape, input_tensor, bias, target_dtype):
+    """llamacpp_gguf_cuda up to 1.0.29 at least: the kernel of IQ4_NL weights for many input rows reads past the end of the weight, so the memory beside it decides whether the last output
+    row is finite. The last output row is computed from its decoded weights here; its own short kernel is not concerned."""
+    rows, columns = shape
+    head = _llamacpp_cuda_linear(module, raw[:rows - 1], "IQ4_NL", (rows - 1, columns), input_tensor, None if bias is None else bias[:rows - 1], target_dtype)
+    values, size = _quantization_sizes(weight_tensor._tensor_type)
+    last = _DEQUANTIZE_FUNCTIONS[_quantization_type(weight_tensor._tensor_type)](raw[rows - 1:].reshape(-1, size), values, size, torch.float32).reshape(1, columns)
+    tail = torch.nn.functional.linear(input_tensor.float(), last, None if bias is None else bias[rows - 1:].float()).to(head.dtype)
+    return torch.cat((head, tail), -1)
+
+
 def _try_llamacpp_cuda_linear(weight_tensor, input_tensor, bias, target_dtype):
     if not _gguf_cuda_kernels_enabled():
         return None
@@ -956,6 +982,8 @@ def _try_llamacpp_cuda_linear(weight_tensor, input_tensor, bias, target_dtype):
         if flat_linear is None:
             return None
         return flat_linear(input_tensor, raw, list(shape), qtype_name, _maybe_cast_bias(bias, target_dtype), target_dtype)
+    if qtype_name == "IQ4_NL" and input_tensor.shape[0] >= _IQ4_NL_OVERREAD_ROWS and shape[0] > 1:
+        return _iq4_nl_linear_many_rows(gguf_llamacpp_cuda, weight_tensor, raw, shape, input_tensor, bias, target_dtype)
     fast_out = _llamacpp_cuda_linear(gguf_llamacpp_cuda, raw, qtype_name, shape, input_tensor, bias, target_dtype)
     _gguf_log_once(f"llamacpp_cuda_linear_active_{qtype_name}", f"[GGUF][llama.cpp CUDA] linear fast path active for {qtype_name}.")
     return fast_out
@@ -1416,10 +1444,18 @@ def _dequantize_blocks_IQ4_XS(blocks, block_size, type_size, dtype=None):
     return (dl * _iq4_values(qs).reshape(n, 8, 32)).reshape(n, block_size).to(dtype)
 
 
+def _dequantize_blocks_Q2_0(blocks, block_size, type_size, dtype=None):
+    n = blocks.shape[0]
+    d, qs = _split_block_dims(blocks, 2)
+    codes = (qs.unsqueeze(-1) >> (torch.arange(4, device=blocks.device, dtype=torch.uint8) * 2)) & 3
+    return (d.view(torch.float16).float() * (codes.reshape(n, block_size).float() - 1)).to(dtype)
+
+
 if gguf is not None:
     _IQ4_VALUES = torch.tensor(gguf.quants.IQ4_NL.kvalues, device="cpu", dtype=torch.float32)
     _DEQUANTIZE_FUNCTIONS = {
         PrismQuantizationType.PTQ1_0: _dequantize_blocks_PTQ1_0,
+        GgmlExtraQuantizationType.Q2_0: _dequantize_blocks_Q2_0,
         gguf.GGMLQuantizationType.Q8_0: _dequantize_blocks_Q8_0,
         gguf.GGMLQuantizationType.Q5_1: _dequantize_blocks_Q5_1,
         gguf.GGMLQuantizationType.Q5_0: _dequantize_blocks_Q5_0,
@@ -1535,12 +1571,20 @@ class GGUFWeightTensor(QTensor):
 
         if raw_rows.device != input.device:
             raw_rows = raw_rows.to(input.device)
-        dense_rows = _gguf_dequantize_tensor(
-            raw_rows,
-            self._tensor_type,
-            (flat_input.numel(), embedding_dim),
-            dtype=dtype,
-        )
+        kernels = None
+        if raw_rows.is_cuda and dtype in (torch.float32, torch.bfloat16):
+            from shared.kernels import expert_gguf_groups as kernels
+            if not kernels.decode_rows_supported(raw_rows.device, _quantization_type(self._tensor_type)):
+                kernels = None
+        if kernels is not None:
+            dense_rows = kernels.decode_rows(raw_rows, _quantization_type(self._tensor_type), flat_input.numel(), embedding_dim, dtype)
+        else:
+            dense_rows = _gguf_dequantize_tensor(
+                raw_rows,
+                self._tensor_type,
+                (flat_input.numel(), embedding_dim),
+                dtype=dtype,
+            )
         del raw_rows
         if dense_rows.device != input.device:
             dense_rows = dense_rows.to(input.device)
@@ -2258,3 +2302,88 @@ def apply_pre_quantization(model, state_dict, quantization_map, default_dtype=No
         if name in quantized and isinstance(module, torch.nn.Linear):
             module._router_default_dtype = default_dtype
     return quantization_map or {}, []
+
+
+# ----------------------------------------------------------------------------------------------------------------------------------------
+# Routed experts in GGUF storage: rows of ggml blocks, per expert, in the checkpoint's own tensors
+
+
+from mmgp.expert_compute import ExpertFormat
+
+
+class GgufExperts(ExpertFormat):
+    """gate_exps and up_exps: uint8 [experts, intermediate, row bytes] rows of hidden values, down_exps: uint8 [experts, hidden, row bytes] rows of
+    intermediate values, in the ggml block format of each tensor (a bank's blocks: the three ggml types, read from the row widths). The CPU kernels
+    run in place (shared.kernels.cpu_linear), the GPU kernels read the same rows (shared.kernels.expert_gguf_triton)."""
+    name = "gguf"
+    reports_usage = True
+    _TYPES = tuple(int(gguf.GGMLQuantizationType[name]) for name in ("IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_XS", "IQ4_NL")) + (int(GgmlExtraQuantizationType.Q2_0),) if gguf is not None else ()
+
+    @staticmethod
+    def _width(type, columns):
+        values, size = _quantization_sizes(_quantization_type(type))
+        return columns // values * size
+
+    def tensors(self, experts, hidden, intermediate, gated=True, blocks=None):
+        gate, up, down = blocks or (int(gguf.GGMLQuantizationType.IQ3_S), int(gguf.GGMLQuantizationType.IQ3_S), int(gguf.GGMLQuantizationType.IQ4_NL))
+        return {"gate_exps": ((experts, intermediate, self._width(gate, hidden)), torch.uint8), "up_exps": ((experts, intermediate, self._width(up, hidden)), torch.uint8),
+                "down_exps": ((experts, hidden, self._width(down, intermediate)), torch.uint8)}
+
+    def matches(self, tensors):
+        return all(tensor.dtype == torch.uint8 for tensor in tensors.values())
+
+    def blocks(self, hidden, intermediate, tensors):
+        def type_of(tensor, columns):
+            for type in self._TYPES:
+                if columns % _quantization_sizes(_quantization_type(type))[0] == 0 and self._width(type, columns) == tensor.shape[-1]:
+                    return type
+            raise ValueError(f"No GGUF expert format has rows of {tensor.shape[-1]} bytes for {columns} columns")
+        return type_of(tensors["gate_exps"], hidden), type_of(tensors["up_exps"], hidden), type_of(tensors["down_exps"], intermediate)
+
+    def _addresses(self, bank):
+        return [getattr(bank, name).data_ptr() for name in bank.expert_tensor_names]
+
+    def cpu_job(self, bank, payload, resident, out, tokens, topk, threads):
+        from shared.kernels import cpu_linear
+        gate, up, down = self._addresses(bank)
+        job = cpu_linear.MoeJob(gate=gate, up=up, down=down, payload=payload, resident=resident, usage=bank.usage.data_ptr(), out=out, gate_type=bank.blocks[0], up_type=bank.blocks[1], down_type=bank.blocks[2],
+                                tokens=tokens, h=bank.hidden, i=bank.intermediate, experts=bank.num_experts, topk=topk, threads=threads, tail_rank=bank.tail_rank if tokens <= bank.TAIL_WINDOW else 0, status=0)
+        return job, cpu_linear.moe_host_function()
+
+    def cpu_forward(self, bank, x, ids, probabilities, resident, out, tokens, topk, threads):
+        from shared.kernels import cpu_linear
+        return cpu_linear.moe_forward(*self._addresses(bank), bank.blocks, x, ids, probabilities, resident, out, tokens, bank.hidden, bank.intermediate, bank.num_experts, topk, threads)
+
+    def doorbell(self, device):
+        from shared.kernels import cpu_linear, host_doorbell
+        return (host_doorbell, cpu_linear.moe_server_function()) if host_doorbell.supported(device) else None
+
+    def gpu_forward(self, bank, x, ids, probabilities, pointers, out=None, mid=None):
+        from shared.kernels import expert_gguf_triton
+        return expert_gguf_triton.forward(x, ids, probabilities, pointers, bank.intermediate, bank.blocks, out=out, mid=mid)
+
+    def gpu_pass_supported(self, device):
+        from shared.kernels import expert_gguf_groups
+        return expert_gguf_groups.supported(device)
+
+    def pass_shares(self):
+        from shared.kernels import kernel_policy
+        return kernel_policy.allow_approximate()
+
+    def gpu_pass(self, bank, x, host_ids, probabilities, order, zero=False):
+        from shared.kernels import expert_gguf_groups
+        return expert_gguf_groups.prompt_pass(x, host_ids, probabilities, bank.intermediate, bank.blocks, order, zero)
+
+    @staticmethod
+    def _matrix(raw, type, rows, columns):
+        type = _quantization_type(type)
+        values, size = _quantization_sizes(type)
+        return _DEQUANTIZE_FUNCTIONS[type](raw.reshape(-1, size), values, size, torch.float32).reshape(rows, columns)
+
+    def dequantize(self, bank, tensors):
+        gate = self._matrix(tensors["gate_exps"], bank.blocks[0], bank.intermediate, bank.hidden)
+        up = self._matrix(tensors["up_exps"], bank.blocks[1], bank.intermediate, bank.hidden)
+        return torch.cat((gate, up)), self._matrix(tensors["down_exps"], bank.blocks[2], bank.hidden, bank.intermediate)
+
+
+EXPERT_FORMATS = (GgufExperts(),) if gguf is not None else ()

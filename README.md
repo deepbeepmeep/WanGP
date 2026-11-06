@@ -83,10 +83,24 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 ## 🔥 Latest Updates : 
 
+## 5th of November 2026: WanGP v19.20 - The Show Must Change
 
-## 2nd of November 2026: WanGP v19.13 - The Show must Go On
+- **Viggle Remake**: recast one or several people with **Swap**, or change objects, backgrounds, weather and lighting with **Edit**, while keeping the original motion, camera, timing and soundtrack. Supply your video, one to four frames from it edited to show the new look, and a prompt describing the result. An optional mask keeps everything outside the changed area exactly as it was. Works best at **720p**, with faces clearly visible and characters facing the camera; small faces and rapid cuts remain challenging.
 
-## Showrunner 0.2.1
+- **Showrunner Viggle Remake**: too lazy to do all the preparation work required by Viggle Remake? Ask Showrunner: it splits long videos into shots, extracts and edits the reference frames one by one, checks the results and writes the prompts for you. Review the prepared frames, then let it render each shot and put everything back together with the original timing and soundtrack.
+
+- **Showrunner Draft / Final**: try shots at **480p** to check the look, framing and timing before spending time on full-resolution renders. Switch to **Final** to reuse the chosen take's prompt, seed and reference pictures at the target size, without another planning pass. Both takes stay available to compare; judge lip sync at the final size.
+
+- **LoRA speedups**: LoRAs add work at every generation step, so using them comes with a speed penalty. New optimisations reduce that extra denoising time to around 10%. 
+
+- **TaoMate-FVSR Face Refiner**: sharpen lips, teeth, skin and eyes on up to five faces, with optional soundtrack guidance for mouths. Best on close-ups; mouth movements can change. Use it after generation or through **Late Post Processing**, without a prompt, while keeping the surrounding video unchanged. See the [refiner comparison](docs/PROCESSING.md#face-refinement).
+
+- **NitroFusion2 Z-Image Turbo**: generate images in **1 to 4 steps**, with **2 steps by default**, for faster prompt and composition experiments. Pick an **Accelerator** profile to apply the matching settings automatically. It uses the same memory as Z-Image Turbo and shares its LoRA folder.
+
+
+## 4th of November 2026: WanGP v19.14 - The Show must Go On
+
+### Showrunner 0.2.1
   - **Places that stay the same**: a kitchen or a cockpit no longer changes from shot to shot. The showrunner makes a picture of each recurring place and shoots in it, or uses your own photo.
   - **Fix what is wrong, keep the rest**: pause on a problem or pick shots, say what should change or press **+** to insert a shot. Only that changes; compare with the previous version and go back in one click. Bigger changes (a new actor, a new song) stay one sentence away in the chat.
   - **Voices and songs that hold together**: each voice is checked against its cast card and each line against its voice, so a man does not sound like a woman and a voice does not change between lines. Lines that are not really sung are found before any shot depends on them, subtitles follow the singing, and a shot inserted in a music video keeps every later shot in sync with the song.
@@ -95,26 +109,24 @@ WanGP is a one-stop super app for open source generative models: create videos, 
   - **Let the video model speak**: set **Voices** to **From the video model** in the Brief, or just ask the showrunner, and MiniMax H3 says the lines itself with its own sound, with nothing recorded first and no speech model needed. **Even voices** on the Timeline brings every shot to one level in the export. A voice can change from shot to shot and a take can change or add words, so listen to each one: this suits short pieces best.
   - **Long takes and shots by hand**: give the Brief a **Shot length** range, such as 8 to 15 seconds, to leave the usual 5-second shots behind. **Render now** makes a shot from what you wrote, with no language model and no showrunner, so you can build a whole production by hand, even without Deepy Prime.
 
-## 3D
+### 3D
 
 - **Qwen3.5 GLB 3D Coder 4B** turns a description and an optional reference image into a low-poly game asset. Ask for movement to export an animated GLB, or enable **Save Three.js Source** to keep the editable scene.
 - **Pixal3D Multi-View Shape** builds a mesh from front, right, back and left views. Upload four images in that order or one horizontal turnaround sheet.
-- **Pixal3D Native Texture** paints PBR materials on a new or existing mesh from one image or four views. Both models are available in BF16 and INT8 ConvRot.
-- **Speridlabs Idol** brings new weights to TripoSplat. Turn a single photo or render of an object into a 3D Gaussian splat you can rotate in the gallery or export as a PLY. Select **Create → TripoSplat Image to Gaussian Splats → Speridlabs Idol**. Choose **Photograph** for a wider crop, and raise **Gaussian Count** from 256K to 1M for finer detail.
+- **Pixal3D Native Texture** paints PBR materials on a new or existing mesh from one image or four views.
+- **Speridlabs Idol** brings new weights to TripoSplat. Turn a single photo or render of an object into a 3D Gaussian splat you can rotate in the gallery or export as a PLY. Choose **Photograph** for a wider crop.
 
-## WanGP Manager 0.1.14
+### WanGP Manager 0.1.14
 
 - **Updates that reinstall less**: your Python environment is kept when it still fits the new version and your plugins.
 - **Free disk space**: remove old rollback versions under **Update WanGP → Saved versions and rollback**.
 - **More reliable start**: many plugins no longer make a start fail, and if one does fail, the console says why.
-- **Choose where downloads go**: **Open in App** now shows the Windows **Save As** window instead of saving straight to Downloads.
-
-## Other
-- **H3 Image**: [P-H3-Image](https://huggingface.co/PrunaAI/P-H3-Image) by Pruna AI turns MiniMax H3 into an image model: **8-megapixel stills in 8 steps** without guidance, from text or by editing with up to 8 input images. Select **MiniMax H3 → P-H3-Image 8-Step 20B**. It shares the H3 LoRA list, so FL2VA LoRAs apply to it.
-- **H3 Distilled Text Encoder**: choose **Distilled Qwen3-VL-4B** under **Text Encoder** on the H3 models for **about 5 GB instead of 27 GB** (INT8) and about half the encoding time. Results are close to the original encoder but not identical, and a prompt detail can occasionally be lost.
 
 [Download it](https://github.com/deepbeepmeep/WanGP/releases/latest/download/WanGPManager.exe) and choose **Update in place**.
 
+### Other
+- **H3 Image**: [P-H3-Image](https://huggingface.co/PrunaAI/P-H3-Image) by Pruna AI turns MiniMax H3 into an image model: **8-megapixel stills in 8 steps** without guidance, from text or by editing with up to 8 input images. Select **MiniMax H3 → P-H3-Image 8-Step 20B**. 
+- **H3 Distilled Text Encoder**: choose **Distilled Qwen3-VL-4B** under **Text Encoder** on the H3 models for **about 5 GB instead of 27 GB** (INT8) and about half the encoding time.
 ## 30th of October 2026: WanGP v19.02 - More Treats Than You Can Handle
 
 - **Showrunner**: from a brief to a finished production of up to ten minutes: a music video, a short film, an ad, a trailer or an illustrated story. Deepy Prime becomes your showrunner: it plans every shot, casts, shoots, checks its own takes, redoes the failed ones and assembles the cut ([Showrunner guide](docs/SHOWRUNNER.md)).

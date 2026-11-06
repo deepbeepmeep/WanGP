@@ -1,0 +1,11 @@
+{
+    "activated_loras": [
+        "https://huggingface.co/DeepBeepMeep/Z-Image/resolve/main/loras_accelerators/NitroFusion2_dedistill_lora_bf16.safetensors"
+    ],
+    "loras_multipliers": "0.5,0.6,0.7,0",
+    "num_inference_steps": 4,
+    "flow_shift": 9.0,
+    "guidance_scale": 0,
+    "profile_priority": 20,
+    "help": "4 steps, the De-distillation LoRA at 0.5, 0.6 then 0.7 on the first three steps."
+}

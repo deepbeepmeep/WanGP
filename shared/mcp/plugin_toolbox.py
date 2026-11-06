@@ -57,6 +57,8 @@ def action_definition(action) -> dict[str, Any]:
         replaced = {"type", "anyOf", "oneOf", "enum", "const"} & override.keys()
         properties[name] = {**({key: value for key, value in properties[name].items() if key == "default"} if replaced else properties[name]), **copy.deepcopy(override)}
     definition["_summary"] = action.summary
+    if not action.listed:
+        definition["_unlisted"] = True
     if action.routing:
         definition["use_when"] = action.routing
     if action.example is not None:
@@ -265,7 +267,7 @@ def register(mcp, session, jobs, policy, *, allow_async: bool, virtualized: bool
             response["plugin"] = plugin
             if response["status"] == "discovery":
                 response["guide"] = box.guide
-                skills = {skill.uri: skill.description for skill in plugin_skills(box.plugin_id)}
+                skills = {skill.uri: skill.description for skill in plugin_skills(box.plugin_id) if skill.listed}
                 if skills:
                     response["skills"] = skills
                 response["usage"] = "Execute: plugin + action + arguments={...} following the call (* = required). Read the contract (arguments=null) for rules, defaults and examples." + (" Read the skills (resource URIs) for the plugin's method." if skills else "")
