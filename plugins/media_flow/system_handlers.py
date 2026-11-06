@@ -12,6 +12,9 @@ def get_system_handler(name: str | None) -> Any:
     if name == "seedvr2":
         from postprocessing.seedvr2.process_handler import HANDLER
         return HANDLER
+    if name == "relayvsr":
+        from postprocessing.relayvsr.process_handler import HANDLER
+        return HANDLER
     if name == "pid":
         from postprocessing.pid.process_handler import HANDLER
         return HANDLER

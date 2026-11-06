@@ -72,6 +72,10 @@ class ExpertBank(nn.Module):
         self._usage = self.usage.numpy()
         self.gpu_branch = False  # graphs run its GPU branch even when it has no GPU copy at capture: the elastic placement may give it some later, in place
 
+    def _apply(self, fn, recurse=True):
+        # the checkpoint tensors stay in RAM in their stored dtypes whatever moves or casts the model (to("cuda"), half()): the residency owns the GPU copies
+        return self
+
     @property
     def expert_nbytes(self):
         return sum(getattr(self, name)[0].numel() * getattr(self, name).element_size() for name in self.expert_tensor_names)

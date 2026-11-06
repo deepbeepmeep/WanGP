@@ -99,12 +99,14 @@ class RelayVSRBridge(SimpleScaleSuffixMixin):
         keyframes, decoder = (self.files_locator.locate_file(os.path.join(FOLDER, filename)) for filename in self._filenames(native))
         load_models(RelayVSRPaths(keyframes=keyframes, decoder=decoder, scale=native), init_pipe=init_pipe, profile=profile)
 
-    def upscale(self, sample, spatial_upsampling, *, seed=0, abort_callback=None, progress_callback=None, **kwargs):
+    def upscale(self, sample, spatial_upsampling, *, seed=0, frame_offset=0, continue_cache=None, return_continue_cache=False, abort_callback=None, progress_callback=None, **kwargs):
+        """continue_cache / return_continue_cache: the stream a Media Flow chunk hands to the next one (runtime.CarriedStream), or a
+        runtime.StreamReplay for a chunk that no stream continues; frame_offset: the sample's first frame in its source."""
         split = self.split_value(spatial_upsampling)
         if split is None:
             raise ValueError(f"Unknown RelayVSR upsampling mode: {spatial_upsampling}")
         from .runtime import upscale_video
-        return upscale_video(sample, split[1], seed=seed, abort_callback=abort_callback, progress_callback=progress_callback)
+        return upscale_video(sample, split[1], seed=seed, frame_offset=frame_offset, continue_cache=continue_cache, return_continue_cache=return_continue_cache, abort_callback=abort_callback, progress_callback=progress_callback)
 
     def release_vram(self) -> None:
         from .runtime import release_models

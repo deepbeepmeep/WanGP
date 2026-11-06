@@ -61,6 +61,7 @@ A file that fails is recorded and the batch moves on to the next one; the **Run*
 - **Target Ratio:** for outpainting, the aspect ratio of the result. Upscalers and frame interpolators show their **Upsampling** multiplier here instead, such as x2.
 - For **FlashVSR**, select the model and transformer quantization in **Configuration > Extensions > FlashVSR**, then choose One Pass or Two Pass in Media Flow.
 - For **SeedVR2**, select **3B** or **7B** in **Configuration > Extensions > SeedVR2**. The Upsampling control shows the selected model for both image and video processes. Each run or batch keeps the model it started with.
+- **RelayVSR** carries its memory of the previous keyframes from one piece to the next, so its pieces join as if the video were upscaled in one go. A resumed run rebuilds that memory from the frames just before the resume point, which keeps the join smooth but not identical to an uninterrupted run.
 - **Process Strength:** how strongly a restoration is applied. Lower values stay closer to the source, higher values push the effect further.
 - **Upscaler options:** some upscalers add their own settings below, such as the number of passes or tile sizes.
 - **Live Preview:** shows the last frame of the latest finished piece, so you can judge the result early and stop if it is not what you want.

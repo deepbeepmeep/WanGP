@@ -2287,10 +2287,12 @@ class ModelRunner:
             
             return self.model.compute_logits(self._replay_decode_graph_hidden(input_ids, positions))
 
+    @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         """Run model forward and sampling. For CFG sequences, batch is structured as:
         [cond_seq1, cond_seq2, ..., uncond_seq1, uncond_seq2, ...]
-        where uncond_seqi is the paired unconditional sequence of cond_seqi."""
+        where uncond_seqi is the paired unconditional sequence of cond_seqi.
+        In inference mode whoever calls it (Deepy's worker thread is not): its buffers and the decode graphs' are inference tensors written in place."""
         self.ensure_runtime_ready()
         if not is_prefill and getattr(self.model, "_lm_engine_adaptive_experts", False):
             from mmgp import runtime

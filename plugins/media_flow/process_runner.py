@@ -1346,4 +1346,6 @@ class ProcessRunner:
             self.active_job["running"] = False
             self.active_job["write_state"] = None
             video.clear_process_full_video_source()
+            if system_handler is not None and callable(getattr(system_handler, "release_continue_cache", None)):
+                system_handler.release_continue_cache()  # the in-memory stream a system process carried from chunk to chunk, however the run ended
 

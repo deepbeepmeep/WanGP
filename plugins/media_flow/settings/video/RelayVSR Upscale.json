@@ -1,0 +1,14 @@
+{
+  "model_type": "__system_flashvsr",
+  "model_label": "WanGP System Video Postprocessing",
+  "system_handler": "relayvsr",
+  "spatial_upsampling_method": "relayvsr",
+  "target_ratio": "relayvsr*2",
+  "chunk_size_seconds": 3.0,
+  "sliding_window_overlap": 0,
+  "prompt": "",
+  "process": {
+    "task": "upscale",
+    "summary": "RelayVSR fast generative upscaler: restores detail with steady texture across the video, its chunks joined seamlessly."
+  }
+}

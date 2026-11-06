@@ -1,0 +1,14 @@
+{
+  "model_type": "__system_image_postprocessing",
+  "model_label": "WanGP System Image Postprocessing",
+  "system_handler": "relayvsr",
+  "media_type": "image",
+  "image_mode": 1,
+  "spatial_upsampling_method": "relayvsr",
+  "target_ratio": "relayvsr*2",
+  "prompt": "",
+  "process": {
+    "task": "upscale",
+    "summary": "RelayVSR fast generative upscaler: restores detail in about a second per image."
+  }
+}
