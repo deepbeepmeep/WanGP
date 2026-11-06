@@ -88,7 +88,7 @@ class Showrunner:
 
     def upload(self, production_id: str, filename: str, data_path: Path, role: str = "bin", target: str | None = None) -> dict[str, Any]:
         """Import a dropped file into the production's media folder, then use it as: bin, song, reference, cast (target = cast id or new), take (target = shot id),
-        track (narration, score or effects over the edit) or subtitles (an SRT file)."""
+        painted (target = "shot:frame", a remake's painted frame), track (narration, score or effects over the edit) or subtitles (an SRT file)."""
         production = self.store.get(production_id)
         suffix = Path(filename).suffix.lower()
         if role == "subtitles":
@@ -125,6 +125,11 @@ class Showrunner:
                 production.apply([{"op": "update_cast", "cast": member["id"], "fields": {"images": member["images"] + [relative], "master": member["master"] or relative}}])
         elif role == "take":
             production.apply([{"op": "add_take", "shot": target, "take": {**facts, "note": "Uploaded"}}])
+        elif role == "painted":  # target "shot:frame": the user's own picture of that frame of a remake's shot
+            shot_id, _, frame = str(target or "").rpartition(":")
+            if facts["kind"] != "image" or not frame.isdigit():
+                raise ValueError("A painted frame is a picture, for one frame of a shot.")
+            ShowrunnerToolbox(self).place_picture(production, shot_id, int(frame), stored)
         elif role == "track":
             tracks = production.snapshot()["edit"]["audio_tracks"] + [{"path": relative, "start_s": 0.0, "gain_db": 0.0}]
             production.apply([{"op": "edit", "fields": {"audio_tracks": tracks, **({"audio_mode": "mix"} if production.snapshot()["edit"]["audio_mode"] == "song" else {})}}])
@@ -221,6 +226,13 @@ class Showrunner:
         shot, fps = model.find(doc["shots"], shot_id, "shot"), doc["remake"]["fps"]
         first, frames = self._delivered(shot, fps)
         return media.video_window(production.resolve(doc["remake"]["path"]), shot["source_range"][0] + first, frames, fps, production.folder / "media" / "source")
+
+    def source_frame(self, production_id: str, shot_id: str, frame: int) -> Path:
+        """One frame of a remake's source, numbered as in the source, for the user to paint elsewhere."""
+        production = self.store.get(production_id)
+        doc = production.snapshot()
+        ShowrunnerToolbox._shot_frame(doc, shot_id, frame)
+        return media.video_frame(production.resolve(doc["remake"]["path"]), frame, production.folder / "media" / "painted")
 
     def take_part(self, production_id: str, shot_id: str, take_id: str) -> Path:
         """The same of a take: a render runs on past its shot's cut, and those frames, never in the edit, show the next camera shot as it was."""

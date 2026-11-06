@@ -69,6 +69,7 @@ export const api = {
     return call('POST', `productions/${id}/upload`, form);
   },
   sourcePart: (id, shot) => `api/productions/${id}/source_part?shot=${encodeURIComponent(shot)}`,
+  sourceFrame: (id, shot, frame) => `api/productions/${id}/source_frame?shot=${encodeURIComponent(shot)}&frame=${encodeURIComponent(frame)}`,
   takePart: (id, shot, take) => `api/productions/${id}/take_part?shot=${encodeURIComponent(shot)}&take=${encodeURIComponent(take)}`,
   file: (id, path, download = false) => path ? `api/productions/${id}/file?path=${encodeURIComponent(path)}${download ? '&download=true' : ''}` : '',
 };

@@ -213,7 +213,7 @@ class Qwen21Pipeline(QwenImage21Pipeline):
         device = torch.device("cuda")
         output_channels = 4 if (custom_settings or {}).get("rgba", "Disabled") == "Enabled" else 3
         kv_cache_mode = (custom_settings or {}).get("qwen21_kv_cache", "Disabled")
-        use_kv_cache = kv_cache_mode in ("Enabled", "INT8", "INT8_RAM")
+        use_kv_cache = kv_cache_mode in ("INT8", "INT8_RAM")
         border_method = OUTPAINTING_METHOD
         if border_method not in ("Red Canvas", "Reference"):
             raise ValueError(f"Unknown outpainting border method: {border_method}")
@@ -292,9 +292,9 @@ class Qwen21Pipeline(QwenImage21Pipeline):
                 branch["target_rope_offset"] = target_rope_offset
                 # INT8_RAM: the layers in RAM, streamed to the GPU with the blocks (NAG reads its cache outside the blocks: kept in VRAM);
                 # Enabled / INT8: in VRAM as far as it fits beside the weights, the other layers in RAM and streamed
-                cache = QwenImage21KVCache(self.transformer.transformer_blocks, quantize=kv_cache_mode in ("INT8", "INT8_RAM"), native=nag_parameters is None,
+                cache = QwenImage21KVCache(self.transformer.transformer_blocks, quantize=True, native=nag_parameters is None,
                                            ram=kv_cache_mode == "INT8_RAM" and nag_parameters is None,
-                                           dynamic=kv_cache_mode in ("Enabled", "INT8")) if use_kv_cache else None
+                                           dynamic=kv_cache_mode == "INT8") if use_kv_cache else None
                 branch["kv_cache"] = cache
                 if cache is not None:
                     caches.append(cache)

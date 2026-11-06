@@ -23,8 +23,10 @@ from tqdm import tqdm
 
 from mmgp import offload
 from models.wan.modules.vae import WanVAE
+from postprocessing.memory import minimal_vram
 from shared.utils import offload_registry
 from .attention_backend import log_sparse_backend, require_sparge_attention
+from .stream_cache import StreamCache
 from .tcdecoder import build_tcdecoder, tile_plan
 from .utils import Causal_LQ4x_Proj
 from .wan_video_dit import WanModel, precompute_freqs_cis_3d, structural_block_candidates, structural_block_mask
@@ -449,8 +451,7 @@ def _denoise_stream_chunk(
     x: torch.Tensor,
     context: torch.Tensor | None,
     lq_layer_chunks: list[list[torch.Tensor | None]],
-    block_cache_k: list[torch.Tensor | None],
-    block_cache_v: list[torch.Tensor | None],
+    stream_cache: StreamCache,
     chunk_index: int,
     timestep_embed: torch.Tensor,
     timestep_mod: torch.Tensor,
@@ -463,7 +464,7 @@ def _denoise_stream_chunk(
     rope_start: int | None = None,
     plus_model: str | None = None,
     abort_callback=None,
-) -> tuple[torch.Tensor | None, list[torch.Tensor | None], list[torch.Tensor | None]]:
+) -> torch.Tensor | None:
     x, (frames, height, width) = dit.patchify(x)
     win = (2, 8, 8)
     seqlen = frames // win[0]
@@ -476,10 +477,11 @@ def _denoise_stream_chunk(
     freqs_t = dit.freqs[0][rope_start:rope_start + frames]
     freqs = tuple((freq.real.to(device=x.device, dtype=x.dtype), freq.imag.to(device=x.device, dtype=x.dtype)) for freq in (freqs_t, dit.freqs[1][:height], dit.freqs[2][:width]))
     layer_configs = _plus_layer_configs(dit, plus_model, height // 8, width // 8, seqlen, chunk_index, kv_len, window_topk, x.device) if plus_model else None
+    dit._stream_storing = stream_cache.storing
     for block_id, block in enumerate(dit.blocks):
         layer = layer_configs[block_id] if layer_configs else {"local_range": local_range, "kv_len": kv_len, "topk_groups": None, "block_mask": None}
         if _abort_requested(abort_callback):
-            return None, block_cache_k, block_cache_v
+            return None
         if block_id < len(lq_layer_chunks[0]):
             offset = 0
             for chunk in lq_layer_chunks:
@@ -489,28 +491,19 @@ def _denoise_stream_chunk(
                 offset = next_offset
                 chunk[block_id] = None
                 del lq
-        cache_refs = None
-        if block_cache_k[block_id] is not None:
-            cache_refs = [block_cache_k[block_id].to(x.device, dtype=x.dtype), block_cache_v[block_id].to(x.device, dtype=x.dtype)]
-            block_cache_k[block_id] = None
-            block_cache_v[block_id] = None
         x_ref = [x]
         x = None
-        x, next_cache_k, next_cache_v = block(
+        x = block(
             x_ref, context, timestep_mod, freqs, frames, height, width, seqlen, topk,
             block_id=block_id, kv_len=layer["kv_len"], is_stream=True,
-            pre_cache_refs=cache_refs, local_range=layer["local_range"], cache_next=cache_next, allow_short_start=allow_short_start,
+            stream_cache=stream_cache, local_range=layer["local_range"], cache_next=cache_next, allow_short_start=allow_short_start,
             topk_groups=layer["topk_groups"], block_mask=layer["block_mask"],
         )
         x_ref.clear()
-        block_cache_k[block_id] = next_cache_k
-        del next_cache_k
-        block_cache_v[block_id] = next_cache_v
-        del next_cache_v, cache_refs
         if _abort_requested(abort_callback):
-            return None, block_cache_k, block_cache_v
+            return None
     x = dit.head([x], timestep_embed)
-    return dit.unpatchify([x], (frames, height, width)), block_cache_k, block_cache_v
+    return dit.unpatchify([x], (frames, height, width))
 
 
 class FlashVSRRuntime:
@@ -575,6 +568,7 @@ class FlashVSRRuntime:
             pipe["vae"] = self.vae.model
         kwargs = {"coTenantsMap": FLASHVSR_COTENANTS_MAP}
         profile_no = init_pipe(pipe, kwargs, profile)
+        self.cache_in_ram = minimal_vram(kwargs)  # Postprocessor VRAM Usage: Minimum keeps the stream cache in RAM
         kwargs["pinnedMemory"] = False
         self.offloadobj = offload.profile(pipe, loading_callback=loading_callback(), profile_no=profile_no, quantizeTransformer=False, convertWeightsFloatTo=self.dtype, verboseLevel=-1, **kwargs)
         offload_registry.register_offloadobj("FlashVSR", self.offloadobj, self.release)
@@ -805,8 +799,10 @@ class FlashVSRRuntime:
         latents = torch.empty((1, 16, schedule.latent_frames, padded_output_height // 8, padded_output_width // 8), device="cpu", dtype=self.dtype)
         latents.normal_(generator=generator)
         process_total = len(schedule.steps)
-        pre_cache_k = [None] * len(self.dit.blocks)
-        pre_cache_v = [None] * len(self.dit.blocks)
+        local_layers = FLASHVSR_PLUS_LOCAL_LAYERS[self.model] if plus else ()
+        attention = self.dit.blocks[0].self_attn
+        windows = [FLASHVSR_PLUS_LOCAL_LAYER_CACHE_WINDOWS if block in local_layers else cache_windows for block in range(len(self.dit.blocks))]
+        stream_cache = StreamCache(self.dit.blocks, windows, 2 * (padded_output_height // 16) * (padded_output_width // 16), attention.num_heads, attention.head_dim, self.dtype, self.device, self.cache_in_ram)
         frames_out = None
         frames_cursor = 0
         lq_pre_idx = 0
@@ -837,40 +833,42 @@ class FlashVSRRuntime:
             return True
 
         _report_progress(progress_callback, "Denoising", 0, process_total)
-        for process_idx, step in enumerate(tqdm(schedule.steps, desc="FlashVSR")):
-            if _abort_requested(abort_callback):
-                return abort_result()
-            lq_layer_chunks = []
-            for lq_start, lq_end in step.lq_clips:
+        try:
+            for process_idx, step in enumerate(tqdm(schedule.steps, desc="FlashVSR")):
                 if _abort_requested(abort_callback):
                     return abort_result()
-                lq_chunk = _prepare_conditioning_range(sample, lq_start, lq_end, output_height, output_width, padded_output_height, padded_output_width, dtype=self.dtype).unsqueeze(0).to(self.device, dtype=self.dtype)
-                lq_list = [lq_chunk]
-                del lq_chunk
-                cur = self.lq_proj.stream_forward(lq_list)
-                if cur is not None:
-                    lq_layer_chunks.append(cur)
-                del cur
-            latent_start, latent_end = step.latents
-            cur_latents = latents[:, :, latent_start:latent_end].to(self.device, dtype=self.dtype)
+                lq_layer_chunks = []
+                for lq_start, lq_end in step.lq_clips:
+                    if _abort_requested(abort_callback):
+                        return abort_result()
+                    lq_chunk = _prepare_conditioning_range(sample, lq_start, lq_end, output_height, output_width, padded_output_height, padded_output_width, dtype=self.dtype).unsqueeze(0).to(self.device, dtype=self.dtype)
+                    lq_list = [lq_chunk]
+                    del lq_chunk
+                    cur = self.lq_proj.stream_forward(lq_list)
+                    if cur is not None:
+                        lq_layer_chunks.append(cur)
+                    del cur
+                latent_start, latent_end = step.latents
+                cur_latents = latents[:, :, latent_start:latent_end].to(self.device, dtype=self.dtype)
 
-            noise_pred, pre_cache_k, pre_cache_v = _denoise_stream_chunk(
-                self.dit, cur_latents, None, lq_layer_chunks, pre_cache_k, pre_cache_v, process_idx,
-                self.timestep_embed, self.timestep_mod, topk_ratio=topk_ratio, kv_ratio=cache_windows, cache_next=process_idx + 1 < process_total, allow_short_start=optimize_still_image and process_idx == 0,
-                rope_start=step.rope_start, plus_model=self.model if plus else None, abort_callback=abort_callback,
-            )
-            if noise_pred is None:
-                return abort_result()
-            cur_latents = cur_latents - noise_pred
-            _report_progress(progress_callback, "Denoising", process_idx + 1, process_total)
-            if self.variant == FLASHVSR_VARIANT_TINY_LONG:
-                if not decode_step(step, process_idx, cur_latents):
+                noise_pred = _denoise_stream_chunk(
+                    self.dit, cur_latents, None, lq_layer_chunks, stream_cache, process_idx,
+                    self.timestep_embed, self.timestep_mod, topk_ratio=topk_ratio, kv_ratio=cache_windows, cache_next=process_idx + 1 < process_total, allow_short_start=optimize_still_image and process_idx == 0,
+                    rope_start=step.rope_start, plus_model=self.model if plus else None, abort_callback=abort_callback,
+                )
+                if noise_pred is None:
                     return abort_result()
-            else:
-                latents[:, :, latent_start:latent_end].copy_(cur_latents.detach().cpu())
-            lq_layer_chunks = None
+                cur_latents = cur_latents - noise_pred
+                _report_progress(progress_callback, "Denoising", process_idx + 1, process_total)
+                if self.variant == FLASHVSR_VARIANT_TINY_LONG:
+                    if not decode_step(step, process_idx, cur_latents):
+                        return abort_result()
+                else:
+                    latents[:, :, latent_start:latent_end].copy_(cur_latents.detach().cpu())
+                lq_layer_chunks = None
+        finally:
+            stream_cache.release()
         self.lq_proj.clear_cache()
-        pre_cache_k = pre_cache_v = None
         self.dit.clear_cross_kv()
         gc.collect()
         if self.variant == FLASHVSR_VARIANT_TINY_LONG:
@@ -932,7 +930,7 @@ class FlashVSRRuntime:
             self.tcdecoder.clean_mem()
         if self.vae is not None:
             self.vae.model.clear_cache()
-        latents = frames_out = pre_cache_k = pre_cache_v = tcdecoder_tile_mems = None
+        latents = frames_out = tcdecoder_tile_mems = None
         noise_pred = cur_latents = lq_layer_chunks = None
         lq_chunk = cur = cur_lq = cur_frames = None
         if torch.is_tensor(frames) and frames.dtype == torch.uint8 and frames.ndim == 4:

@@ -4,7 +4,7 @@ import { COMPARE_SEEK, bindCompareSeek } from './ui.js';
 import { askForFix } from './fix.js';
 import { state, actions } from './app.js';
 import { api } from './api.js';
-import { icon, esc, art, fieldSaver, formatDuration, toast, promptDialog, menu, confirmDialog, shotRefs, shotText, availability } from './ui.js';
+import { icon, esc, art, fieldSaver, formatDuration, toast, promptDialog, menu, confirmDialog, shotRefs, shotText, availability, pickFiles } from './ui.js';
 import { shotMenu, notFinal, finalTier, tierToggle, bindTierToggle } from './storyboard.js';
 import { showItem } from './bin.js';
 import { choiceLabel, templateLabel } from './models.js';
@@ -117,12 +117,20 @@ export function mountInspector(root) {
     bindShot(shot, take);
   }
 
-  function remakeFrames(shot) {  // a remake's shot: what the plan saw in it, and the frames painted for it beside what they were painted from
+  function remakeFrames(shot) {  // a remake's shot: what the plan saw in it, the frames painted for it beside what they were painted from, and the user's own
     const painted = shot.painted_frames || [];
     if (!shot.source_range) return '';
     const thumb = (path, label) => `<button type="button" class="painted-thumb" data-view="${esc(path)}" data-name="${esc(label)}" title="Look at it closely"><img src="${actions.file(path)}" alt="" loading="lazy" draggable="false"><span>${label}</span></button>`;
-    return `${painted.length ? `<div class="field"><div class="label">${icon('image')} Painted frames <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">what this shot should look like</span></div>
-        <div class="painted-pairs">${painted.map(item => `${item.source ? thumb(item.source, `Source, frame ${item.frame}`) : ''}${thumb(item.path, `Painted, frame ${item.frame}`)}`).join('')}</div></div>` : ''}
+    const [start, stop] = shot.source_range, frames = state.doc.remake?.frames ?? stop;
+    const first = start ? start + 3 : start, last = stop < frames ? stop - 4 : stop - 1;  // as the server: a painted frame keeps 3 frames from a cut
+    const own = first > last ? '<div class="muted" style="font-size:12px">Too short for a painted frame of its own: it takes the look of the shots it renders with.</div>'
+      : `<div class="row"><input class="input" id="i-own-frame" type="number" min="${first}" max="${last}" step="1" value="${painted[0]?.frame ?? Math.round((first + last) / 2)}" style="width:96px" aria-label="Frame of your video">
+          <a class="btn small ghost" id="i-own-source" download title="This frame of your video, to paint in any image editor">${icon('download')} Source frame</a>
+          <button class="btn small" id="i-own-add" title="Your own painted picture of this frame">${icon('upload')} Use my picture…</button></div>
+        <div class="muted" style="font-size:12px">Frames ${first} to ${last} of your video. Paint one in any image editor and bring it back: it takes the place of a painted frame less than 72 frames from it.</div>`;
+    return `<div class="field"><div class="label">${icon('image')} Painted frames <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">what this shot should look like</span></div>
+        ${painted.length ? `<div class="painted-pairs">${painted.map(item => `${item.source ? thumb(item.source, `Source, frame ${item.frame}`) : ''}${thumb(item.path, `${item.by === 'user' ? 'Yours' : 'Painted'}, frame ${item.frame}`)}`).join('')}</div>` : ''}
+        ${own}</div>
       ${shot.seen ? `<details class="details"><summary>${icon('chevron')} What the plan saw in this shot</summary><div class="muted" style="margin-top:8px;font-size:12.5px;white-space:pre-wrap">${esc(shot.seen)}</div></details>` : ''}`;
   }
 
@@ -253,6 +261,16 @@ export function mountInspector(root) {
     bindTierToggle(root);
     root.querySelector('#i-shoot')?.addEventListener('click', () => finalTier(state.doc) ? renderNow([id], true) : actions.direct('shoot', '', [id]));
     root.querySelectorAll('[data-view]').forEach(button => button.onclick = () => showItem({ path: button.dataset.view, kind: 'image', name: button.dataset.name }));
+    const ownFrame = root.querySelector('#i-own-frame');  // a remake's shot: the user's own painted frame
+    if (ownFrame) {
+      const source = root.querySelector('#i-own-source'), sync = () => { source.href = actions.sourceFrame(shot, ownFrame.value); };
+      ownFrame.addEventListener('input', sync);
+      sync();
+      root.querySelector('#i-own-add').onclick = async () => {
+        const files = await pickFiles('image/*', false);
+        if (files.length) actions.upload(files, 'painted', `${id}:${ownFrame.value}`);
+      };
+    }
     root.querySelector('#i-render')?.addEventListener('click', () => renderNow([id]));
     root.querySelector('#i-fix')?.addEventListener('click', () => askForFix([id]));
     if (root.querySelector('#i-reshoot')) root.querySelector('#i-reshoot').onclick = () => askForFix([id]);

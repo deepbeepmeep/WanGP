@@ -1,6 +1,6 @@
 # Spatial Upsampler / Visual Refiner Plugin API
 
-Spatial upsamplers and visual refiners (Lanczos, FlashVSR, PiD, H3 Face Refiner, TaoMate-FVSR Face Refiner,
+Spatial upsamplers and visual refiners (Lanczos, FlashVSR, RelayVSR, SeedVR2, PiD, H3 Face Refiner, TaoMate-FVSR Face Refiner,
 Chain-of-Zoom, VAE upscalers, ...) are
 registered in `postprocessing/spatial_upsamplers.py`. Each upsampler declares itself and its
 capabilities through a handler object; the registry owns dropdown state, value
@@ -46,6 +46,12 @@ running those restored settings uses that version without changing the
 configuration preference. Existing `flashvsr` and `flashvsr2pass` settings mean
 FlashVSR v1.1; `flashvsrplus` and `flashvsrplus2pass` mean FlashVSR+ Turbo.
 
+FlashVSR remembers what it computed for the last frames of the video so far.
+With **Configuration > Extensions > Postprocessor VRAM Usage** set to **Minimum**,
+that memory stays in RAM and the GPU holds one layer of it at a time, the least
+VRAM. With **Manual Choice** or **Dynamic** it stays in VRAM as far as the VRAM
+allows, which speeds the upscaling further.
+
 ## SeedVR2 Models
 
 SeedVR2 3B and SeedVR2 7B have separate selections, and
@@ -58,6 +64,35 @@ INT8 file a little larger than 3B and runs slightly slower. **Extract Settings**
 restores the saved model even when the configuration hides it. Existing
 `seedvr2` settings mean SeedVR2 3B; `seedvr2_7b` means SeedVR2 7B. Media Flow's
 SeedVR2 processes use the configured model.
+
+## RelayVSR
+
+RelayVSR restores detail while upscaling real-world and generated video,
+several times faster than FlashVSR+ Turbo. Every 15 frames a one-step
+Wan 2.2 5B model generates a detailed keyframe; a small decoder then carries
+the detail of the two keyframes around each frame to every frame. Images are
+processed as one-frame videos.
+
+It has two models. The x4 model serves the ratios above x2. **RelayVSR X2**,
+LightX2V's native x2 version, serves x1 to x2: it does a quarter of the x4
+model's work with a quarter of its memory, more than twice as fast. Other ratios
+are resized from the model's output. **Configuration > Extensions > RelayVSR >
+RelayVSR Model For Upscaling Up To x2** can use the x4 model there instead,
+resized down. Each model downloads on its first use.
+
+Its memory grows with the size of the source, not with the length of the
+video: the keyframe model remembers its last four keyframes, in INT8, about
+4.6 GB for an 832x480 source and 10.5 GB for 1280x720 with the x4 model, a
+quarter of that with RelayVSR X2. Where it lives follows
+**Configuration > Extensions > Postprocessor VRAM Usage**:
+- **Minimum** keeps it in RAM: the GPU holds one layer of it at a time, the
+  least VRAM, at some cost in speed (each layer is brought in as it runs).
+- **Manual Choice** and **Dynamic** keep it in VRAM as far as the VRAM allows,
+  the rest in RAM, brought to the GPU ahead of each layer, which costs little
+  speed: a source whose memory exceeds the GPU's still runs.
+
+RelayVSR suits sources up to about 540p at x4, and larger ones at x2. Its
+keyframe models download in INT8, whatever the transformer quantization.
 
 ## Handler contract
 
@@ -284,6 +319,9 @@ parsed a second time for upsampler discovery.
 Upsampler settings are stored under `wgp_config["spatial_upsamplers"][config_key]`.
 Handlers can read old top-level keys during migration with `legacy_config()`, but
 those keys are deleted after the nested section is written.
+
+RelayVSR stores `x2_model` (`x2`: RelayVSR X2 for ratios up to x2, or `x4`)
+under `spatial_upsamplers.relayvsr`.
 
 SeedVR2 stores `model` (`3b` or `7b`) and `window_size` under
 `spatial_upsamplers.seedvr2`. For `window_size`, `0` selects the

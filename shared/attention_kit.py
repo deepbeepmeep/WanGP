@@ -327,7 +327,7 @@ def cross_qkv_attention(x_list, context_list, q_proj, k_proj, v_proj, heads, hea
 @torch.compiler.disable()
 def joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, norm_spans_heads=False, split_heads=True, kv_prefix=None,
                         attention_mask=None, force_attention=None, attention_fn=None, norm_stats=None, _cross=False, norm_v=None, softmax_scale=None,
-                        head_split_level=None, fused_quant=None):
+                        head_split_level=None, fused_quant=None, kv_window=None):
     """Attention of the q/k/v projections of several streams joined along the tokens in their order: streams is a list of
     (x_list, (q_proj, k_proj, v_proj)), each x handed off in its list, of shape (batch, tokens, features) or (tokens, features).
     Returns (batch, all tokens, heads, head_dim).
@@ -355,7 +355,11 @@ def joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, norm
     shared.kernels.ops.split_half_norm_rope_quant_), returning (q_quantized, k_quantized) for the tensors given (the other None) as
     the core's staged_quantize_q / staged_quantize_k do, or None to run norm_rope and the core's quantizers instead; used by the
     staged cores unless the attention_mask is a callable (it reads the normalized 16-bit q and k); with a kv_prefix only q is fused
-    (the prefix joins the normalized 16-bit k), except with a native prefix (k fused with the prefix's mean: settings["k_mean"])."""
+    (the prefix joins the normalized 16-bit k), except with a native prefix (k fused with the prefix's mean: settings["k_mean"]).
+    kv_window: (key, value, keep), the next window of a sliding cache, (batch, keep + new rows, kv_heads, head_dim) each, that this call
+    fills by groups of heads, once a group's prefix has joined its keys and values: the last keep rows of kv_prefix, then the last new
+    rows of the projected keys (normalized and rotated) and values. They may be kv_prefix's own tensors: the next call's prefix needs no
+    tensors of its own. kv_prefix must then be (key, value) tensors or None (keep 0); k is not fused with its quantization."""
     global _unsplit_notice
     if softmax_scale is not None and (force_attention != "sdpa" or attention_fn is not None):
         raise ValueError("An explicit softmax_scale requires force_attention='sdpa' and no attention_fn")
@@ -377,6 +381,16 @@ def joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, norm
         raise ValueError("A per-group attention mask (a callable) needs a staged attention core")
     cached = isinstance(kv_prefix, KVPrefix)
     native = cached and kv_prefix.k_mean is not None
+    if kv_window is not None and cached:
+        raise ValueError("kv_window takes its kept rows from a prefix of (key, value) tensors, not from a cached prefix")
+    prefix_rows = 0 if kv_prefix is None or cached else kv_prefix[0].shape[1]
+
+    def window(which, joined, head_range):
+        """kv_window's rows of these heads from the joined keys (which 1) or values (2), the prefix copied into them already."""
+        target, keep = kv_window[which - 1][:, :, head_range.start:head_range.stop], kv_window[2]
+        if keep:
+            target[:, :keep].copy_(joined[:, prefix_rows - keep:prefix_rows])
+        target[:, keep:].copy_(joined[:, joined.shape[1] - (target.shape[1] - keep):])
     if native and (staged is None or attention_mask is not None or not hasattr(staged[0], "prefix_k")):
         raise ValueError("A native cached prefix is attended by the unmasked staged attention it was made for (cache_prefix native=False otherwise)")
     linear_inputs = [None] * len(inputs)
@@ -460,7 +474,7 @@ def joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, norm
             attention_mask = sage_attention_mask(attention_mask, dtype)
     # a callable mask reads the normalized 16-bit q and k; a prefix joins the normalized 16-bit k (q alone is still fused), not a native one
     fusing_q = staged is not None and fused_quant is not None and not callable(attention_mask)
-    fusing_k = fusing_q and (kv_prefix is None or native)
+    fusing_k = fusing_q and (kv_prefix is None or native) and kv_window is None
     q_heads, kv_group_heads = heads // groups, kv_heads // groups
     output = None
     for index in range(groups):
@@ -476,6 +490,9 @@ def joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, norm
                 norm_v(qkv_list[2], group)
             norm_rope(qkv_list[0], qkv_list[1], group)
             qkv_list[1:] = [with_prefix(qkv_list[which], which, group.kv) for which in (1, 2)]
+            if kv_window is not None:
+                window(1, qkv_list[1], group.kv)
+                window(2, qkv_list[2], group.kv)
             if q_heads != kv_group_heads:  # pay_attention's backends do not all take fewer key/value heads
                 qkv_list[1:] = [tensor.repeat_interleave(q_heads // kv_group_heads, dim=2) for tensor in qkv_list[1:]]
             if attention_fn is None:
@@ -495,6 +512,8 @@ def joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, norm
             norm_v(value, group)
         value_list = [with_prefix(value, 2, group.kv)]
         del value
+        if kv_window is not None:
+            window(2, value_list[0], group.kv)
         quantized = [None, None, core.staged_quantize_v(value_list, settings)]
         # the keys of a native prefix's passes share its mean
         k_settings = {**settings, "k_mean": core.prefix_mean_heads(kv_prefix.k_mean, group.kv)} if native else settings
@@ -505,6 +524,8 @@ def joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, norm
             if fused is None:
                 norm_rope(None, key, group)
                 key = with_prefix(key, 1, group.kv)
+                if kv_window is not None:
+                    window(1, key, group.kv)
                 if callable(attention_mask):
                     attention_mask(None, key, group)
                 quantized[1] = core.staged_quantize_k([key], k_settings)
@@ -533,6 +554,8 @@ def joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, norm
         if fused is None or fused[1] is None:
             norm_rope(query if fused is None else None, key, group)
             key = with_prefix(key, 1, group.kv)
+            if kv_window is not None:
+                window(1, key, group.kv)
             if callable(attention_mask):
                 attention_mask(None, key, group)
             quantized[1] = core.staged_quantize_k([key], k_settings)

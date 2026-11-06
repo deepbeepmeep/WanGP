@@ -230,7 +230,7 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
     @app.post("/api/productions/{production_id}/upload")
     async def upload(production_id: str, file: UploadFile = File(...), role: str = Form("bin"), target: str | None = Form(None)):
         production(production_id)
-        if role not in ("bin", "song", "source", "reference", "cast", "take", "track", "subtitles"):
+        if role not in ("bin", "song", "source", "reference", "cast", "take", "painted", "track", "subtitles"):
             raise HTTPException(400, "Unknown upload role.")
         with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename or "").suffix) as handle:
             shutil.copyfileobj(file.file, handle)
@@ -254,6 +254,11 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
     def source_part(production_id: str, shot: str):
         production(production_id)
         return FileResponse(showrunner.source_part(production_id, shot), headers={"Cache-Control": "private, max-age=3600"})
+
+    @app.get("/api/productions/{production_id}/source_frame")
+    def source_frame(production_id: str, shot: str, frame: int):
+        production(production_id)
+        return FileResponse(showrunner.source_frame(production_id, shot, frame), filename=f"{shot}-frame{frame}.png", headers={"Cache-Control": "private, max-age=3600"})
 
     @app.get("/api/productions/{production_id}/take_part")
     def take_part(production_id: str, shot: str, take: str):

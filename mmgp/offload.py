@@ -4595,7 +4595,7 @@ class offload:
             if entry not in self.inflight and (only is None or entry in only):
                 items, layout, sources = self._block_items(entry)
                 # the pageable state attached to the block (mmgp.state_ring) is staged with it, or alone for a block whose parameters are pinned
-                state = [(ring, block, ring.records[block][0], ring.generation) for ring, block in self.state_records.get(entry, ()) if ring.stages(block)]
+                state = [(ring, block, ring.records[block][0], ring.stamp(block)) for ring, block in self.state_records.get(entry, ()) if ring.stages(block)]
                 state_bytes = builtins.sum(-(-source.numel() // BLOCK_ALIGN) * BLOCK_ALIGN for _, _, source, _ in state)
                 if items and sources is None and entry in wanted and not _pool.pending:
                     self.ring.schedule(entry, items, layout, _pool.prepare(self, model_id, entry, self._pool_plan(entry)))

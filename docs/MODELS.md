@@ -145,7 +145,7 @@ Other specialist entries remain in the selector. Use their own Help for required
 
 **[Qwen Image 2.1 7B](modeltype:qwen_image_21_7B)** combines image generation and editing. It accepts up to ten references and supports masked editing, LanPaint, outpainting, pose/depth/edge guidance and resolutions up to 4K. Enable **RGBA** and request a transparent background to save cutouts as PNG with an alpha channel.
 
-Its optional **KV Cache** trades extra GPU memory for faster denoising; its **INT8** choice gives the same speedup in about half that memory. **Viggle Turbo** and **Pruna** acceleration profiles apply the matching adapter, scheduler and step settings; these image accelerators are unrelated to the H3-based Viggle Animate video workflow. Prefer short text in Qwen 2.1 images and proofread it; use a design-oriented model for dense infographics.
+Its optional **KV Cache** (INT8) trades extra GPU memory for faster denoising. **Viggle Turbo** and **Pruna** acceleration profiles apply the matching adapter, scheduler and step settings; these image accelerators are unrelated to the H3-based Viggle Animate video workflow. Prefer short text in Qwen 2.1 images and proofread it; use a design-oriented model for dense infographics.
 
 The older 20B family remains useful:
 
@@ -304,7 +304,7 @@ Open results in the **3D gallery** to rotate, zoom and inspect them. Gaussian sp
 
 Generation models and finishing tools are separate choices. Select a processor in **Post Processing**, use **Late Post Processing** on a gallery result, or use **Media Flow** for supported batch workflows.
 
-- **Spatial upscaling and detail**: SeedVR2, FlashVSR and LTX-based upscaling offer different appearance and memory trade-offs. LTX 2.5 Detail Refiner can restore texture in soft or compressed video. Lanczos provides conventional resizing; latent/VAE upsamplers apply only to compatible generation workflows.
+- **Spatial upscaling and detail**: SeedVR2, FlashVSR, RelayVSR and LTX-based upscaling offer different appearance, speed and memory trade-offs; RelayVSR is the fast choice for x2 and x4 upscaling (its X2 model serves ratios up to x2). LTX 2.5 Detail Refiner can restore texture in soft or compressed video. Lanczos provides conventional resizing; latent/VAE upsamplers apply only to compatible generation workflows.
 - **Smoother motion**: RIFE supports x2/x3/x4 interpolation. Optional DLSS Frame Generation offers hardware-dependent multipliers on compatible RTX GPUs.
 - **Neural refinement**: optional DLSS 5 can refine lighting, material appearance and detail at native or enlarged resolution, on supported hardware. See the [DLSS 5 guide](DLSS5.md) for setup and limits.
 - **Faces**: H3 Face Refiner and TaoMate-FVSR Face Refiner refine up to five detected, tracked faces in a video, both using the soundtrack; TaoMate-FVSR pushes the mouth toward it much harder. See [Processing](PROCESSING.md#face-refinement).

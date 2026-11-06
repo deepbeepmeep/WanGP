@@ -45,15 +45,16 @@ The painter takes each person's looks from their character sheet, which is what 
 Which frames:
 
 - **One per shot** that contains a change, where it is largest and sharp, at least 3 frames from a cut. When replacing people: every replaced person visible with the whole face. A person in no painted frame renders as the source person.
-- **A second one** when `seen` shows a face turning from frontal to profile or back, or a new person entering, at least 3 seconds from the first. For a scene change, only for a shot over 8 seconds or a big change of look.
+- **A second one** when `seen` shows a face turning from frontal to profile or back, or a new person entering, at least 3 seconds from the first. A shot too short for two keeps the one that shows the face: a back view alone leaves the face to the model, a new one in every take. To move a frame, paint the new one with `replaces` set to the old one. For a scene change, only for a shot over 8 seconds or a big change of look.
 - **A shot that shows the people or what changes,** even dimmed or blurred under a title, is painted like any other. Never ask the painter to replace somebody you cannot see in that frame.
 - A part the frame does not show (legs, shoes, a bag) is fixed after the first take, by painting a frame of that take around that part, not by painting more of the source.
+- **A painted frame with `by: "user"`** is the user's own picture, brought from the page: keep it as it is. Never paint that frame again, or one that would replace it, unless the user asks.
 
 How to paint:
 
 - When people are replaced, three steps for each frame:
   1. `look_at_frame` lists everyone in that frame: where, how large, what shows of them, hair and clothes, expression, focus.
-  2. `paint_frame` with `people`, one entry per person it listed: `who` ("the woman"), `where` (the inspector's words for them, unchanged) and `becomes` (a cast member's name, or null for someone who stays as they are). `instruction` only adds what is special in this frame. The tool writes the painter's prompt. Never write that characters take each other's place: the painter swaps them.
+  2. `paint_frame` with `people`, one entry per person it listed: `who`, `where` (the inspector's words for them, unchanged) and `becomes` (a cast member's name, or null for someone who stays as they are). For someone replaced, `who` finds them by their clothes and place in this frame only, "the woman in the turquoise jumpsuit in the centre", never by their hair, face or glasses: the painter keeps what it reads there. `instruction` only adds what is special in this frame. The tool writes the painter's prompt: the new face and hair come from the cast member's photo and their card's `description`, the clothes from their sheet, and the frame keeps its expression, open mouth, pose and crop. When the brief keeps the person's costume and changes only who wears it, pass `clothes="frame"` on every paint: the frame's own clothes stay, exactly. Never write that characters take each other's place: the painter swaps them.
   3. Verify. `paint_frame` returns `before` and `after`, what the inspector sees in each picture apart, and `faults`, measured from them. Its `verify` says what fails. The painter varies a lot from try to try, so a failure usually means painting the same frame again with the same `people`, up to 3 tries, and not rewriting anything. Never go on from a picture that fails without saying so in your report: a wrong frame pulls its whole render toward it.
 - For any other change, say what changes and what fills the space, and everything that stays: composition, framing, pose, number of people, background. For a removal, say what is visible where it stood.
 - The whole person changes: face, hair, build and whole outfit. Give each character a complete outfit description, the same in every instruction, and keep faces visible (no sunglasses, masks or helmets) unless the brief asks for them.
@@ -65,6 +66,13 @@ How to paint:
 ## 4. Prompts
 
 Follow the template's prompt guidance, not the prompts of older productions: they may use a format since corrected (written lines of dialogue, a swap's painted frame as a `target keyframe`). For a six-section prompt, describe the finished video with `[Shot N]` times from `00:00.000` at the start of the shot's `source_range`, not at the source's start. Name every painted frame as `<Picture N>`, in frame order. A shot with `windows` above 1 needs one complete prompt per window, separated by a blank line, each with its own window times.
+
+What each section of a shot's prompt carries, as the model's own examples have it:
+
+- **The new character:** `<Subject 1> is Dolores in <Picture 1> and <Picture 2>: <face, hair, skin and the whole outfit down to the shoes, in the same words as her cast description>. She replaces <the source person by her own looks: hair, clothes, place in the frame> in <Video 1>.` Bind her to every painted frame of the shot. Describe the outfit as hers even when it is the source's: never "only the face" or "keeps the original clothes", which the model reads as keep the original person.
+- **`[Shot 1]` opens with its framing,** then who is where and what they do, and the time each `<Picture N>` matches: `[Shot 1] A medium shot of <Subject 1> skating down the dusty street. At 00:01.750 she is exactly as <Picture 1> shows her.`
+- **End a swap with what must not come back:** `In every frame <Subject 1> is this same woman exactly as in <Picture 1>: no short silver hair, no sunglasses at any moment.`, naming the source person's own hair, glasses and clothes items that differ.
+- `render` writes the lines that tie the window together: the painted frames' placing and `reference` lines, each character bound to all their pictures, the cuts and the opening of each later shot. Write the rest for the shot alone.
 
 When people speak, call `transcribe_media` (`wangp_toolbox`) once on the whole source, the brief's `source`, only to know who speaks in each shot and when. Never write their words in the prompt: the sound comes from the source, and a written line can make the model voice it instead of following that sound. Write `<Subject 2> (S2) is speaking with natural lip movements synchronized, <d>[unclear]</d>` with the time it starts, leave a shot's `dialogue` empty, and keep the action to speaking: a smile or gesture written at that moment competes with the mouth.
 

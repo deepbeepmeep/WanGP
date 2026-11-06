@@ -268,6 +268,8 @@ def invocation(actions, action, arguments, *, signatures=False):
             expected += f" Did you mean {', '.join(close)}?" if close else ""
             measured = [name for name in error.instance if name not in properties and name.removesuffix("_seconds") in ("black_ranges", "cut_times", "quiet_ranges", "sound_ends")]
             expected += f" {', '.join(measured)}: measured and returned in the result whenever present, not requested: drop {'them' if len(measured) > 1 else 'it'}." if measured else ""
+        if error.validator == "required" and not error.absolute_path and "example" not in definition:  # an agent reading a contract often sends what it knows, not null: the call answers with it
+            raise ValueError(f"{path}: {error.message}. Nothing was executed. The contract of {action}: {json.dumps(action_contract(definition), ensure_ascii=False)}")
         if "example" in definition:
             raise ValueError(f"{path}: {error.message}. {expected} Call structure: {json.dumps(definition['example'], ensure_ascii=False)}")
         raise ValueError(f"{path}: {error.message}. {expected} To read the contract, repeat this call with action={action!r} and arguments=null (the entire object, not a nested value).")

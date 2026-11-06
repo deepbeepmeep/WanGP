@@ -178,19 +178,37 @@ def video_subtitles(path: str | Path, out_folder: str | Path) -> list[dict[str, 
     return tracks
 
 
-def video_window(path: str | Path, start: int, frames: int, fps: float, out_folder: str | Path, size: str | None = None) -> Path:
-    """Exactly `frames` frames of a video from frame `start`, with their sound, cut once and reused, for the page's players: nothing delivered reads it. size: "WIDTHxHEIGHT" to scale them to."""
-    out = Path(out_folder) / f"{Path(path).stem}-{start}-{frames}{f'-{size}' if size else ''}.mp4"
+def video_window(path: str | Path, start: int, frames: int, fps: float, out_folder: str | Path, size: str | None = None, hold: tuple[int, int] = (0, 0)) -> Path:
+    """Exactly `frames` frames of a video from frame `start`, with their sound, cut once and reused, for the page's players: nothing delivered reads it. size: "WIDTHxHEIGHT" to scale them to.
+    hold: how many of its first and last frames are replaced by the frame next to them (a render's cut that landed a frame or two off: cut_flash)."""
+    out = Path(out_folder) / f"{Path(path).stem}-{start}-{frames}{f'-{size}' if size else ''}{f'-hold{hold[0]}-{hold[1]}' if any(hold) else ''}.mp4"
     if not out.is_file():
         out.parent.mkdir(parents=True, exist_ok=True)
         scale = f",scale={size.replace('x', ':')}" if size else ""
+        held = f",trim=start_frame={hold[0]}:end_frame={frames - hold[1]},setpts=PTS-STARTPTS,tpad=start={hold[0]}:start_mode=clone:stop={hold[1]}:stop_mode=clone" if any(hold) else ""
         # inputs that end with the part: nothing before it is decoded, and half a frame early lands the seek on its first frame
         inputs = ["-ss", f"{max(0.0, start - 0.5) / fps:.6f}", "-t", f"{(frames + 2) / fps * 1.01:.6f}", "-i", str(path), "-ss", f"{start / fps:.6f}", "-t", f"{frames / fps:.6f}", "-i", str(path)]
         making = out.with_name(f"{out.stem}.{uuid.uuid4().hex[:8]}.mp4")  # another request for this file, a mouse over a card and its player, must not read it half written
-        _run([ffmpeg(), "-y", "-v", "error", *inputs, "-filter_complex", f"[0:v]trim=end_frame={frames},setpts=PTS-STARTPTS{scale}[picture]", "-map", "[picture]", "-map", "1:a?", "-frames:v", str(frames),
+        _run([ffmpeg(), "-y", "-v", "error", *inputs, "-filter_complex", f"[0:v]trim=end_frame={frames},setpts=PTS-STARTPTS{held}{scale}[picture]", "-map", "[picture]", "-map", "1:a?", "-frames:v", str(frames),
               "-c:v", "libx264", "-crf", "12", "-pix_fmt", "yuv420p", "-r", f"{fps:.6f}", "-c:a", "aac", "-b:a", "256k", str(making)])
         os.replace(making, out)
     return out
+
+
+def cut_flash(path: str | Path, cut: int, fps: float) -> tuple[int, int]:
+    """At a cut inside a render (`cut`: the new shot's first frame), the frames on the wrong side of it, as the Viggle Remake MCP server's deflash finds them:
+    of the three frames before the cut, how many look like the shot after it (the cut came early), and of the three from it, how many look like the shot
+    before (it came late). Each frame is compared with the frames 4 before and 3 after the cut, at 160x90. Upstream holds two; Skate Queen had a cut 3
+    frames early."""
+    data = _run([ffmpeg(), "-v", "error", "-i", str(path), "-vf", f"select=between(n\\,{cut - 4}\\,{cut + 3}),scale=160:90", "-fps_mode", "passthrough", "-frames:v", "8",  # by index: a seek can land a frame off
+                 "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]).stdout
+    frames = np.frombuffer(data, dtype=np.uint8).reshape(-1, 90, 160, 3).astype(np.float32)
+    if len(frames) < 8 or cut < 4:
+        return 0, 0
+    before = lambda frame: np.abs(frame - frames[0]).mean() < np.abs(frame - frames[7]).mean()  # noqa: E731
+    early = next((count for count, index in enumerate((3, 2, 1)) if before(frames[index])), 3)  # frames cut-1, cut-2, cut-3
+    late = next((count for count, index in enumerate((4, 5, 6)) if not before(frames[index])), 3)  # frames cut, cut+1, cut+2
+    return early, late
 
 
 def changed_share(before: str | Path, after: str | Path) -> float:
@@ -228,6 +246,16 @@ def video_frame(path: str | Path, frame: int, out_folder: str | Path) -> Path:
     if not out.is_file():
         out.parent.mkdir(parents=True, exist_ok=True)
         _run([ffmpeg(), "-y", "-v", "error", "-i", str(path), "-vf", f"select=eq(n\\,{frame})", "-frames:v", "1", "-vsync", "0", str(out)])
+    return out
+
+
+def fit_picture(path: str | Path, size: str, out_folder: str | Path) -> Path:
+    """A picture at a size ("1280x704"), cropped from its centre to that shape when it has another: a painted frame from elsewhere takes the render's size."""
+    from PIL import Image, ImageOps
+    width, height = (int(value) for value in size.split("x"))
+    out = Path(out_folder) / f"{Path(path).stem}-{width}x{height}.png"
+    with Image.open(path) as picture:
+        ImageOps.fit(ImageOps.exif_transpose(picture).convert("RGB"), (width, height), Image.LANCZOS).save(out)
     return out
 
 

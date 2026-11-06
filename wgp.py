@@ -205,7 +205,7 @@ CONFIG_FILENAME = "wgp_config.json"
 PROMPT_VARS_MAX = 10
 VIDEO_LENGTH_ROUNDING = "ceil"  # how a requested video length is fitted to the model's frame steps: "floor", "ceil" (never shorter than requested) or "nearest"
 set_video_length_rounding(VIDEO_LENGTH_ROUNDING)
-settings_version = 2.82
+settings_version = 2.83
 max_source_video_frames = 3000
 prompt_enhancer_image_caption_model, prompt_enhancer_image_caption_processor, prompt_enhancer_llm_model, prompt_enhancer_llm_tokenizer = None, None, None, None
 image_names_list = ["image_start", "image_end", "image_refs"]

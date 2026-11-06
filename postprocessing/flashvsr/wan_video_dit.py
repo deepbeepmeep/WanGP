@@ -21,7 +21,7 @@ from .attention_backend import sparse_attention, staged_sparge_available
 from shared import attention_kit
 from shared.kernels import ops as kernels
 from shared.attention import get_supported_attention_modes, pay_attention
-from mmgp import offload
+from mmgp import auto_preload, offload
 from PIL import Image
 import numpy as np
 
@@ -427,16 +427,17 @@ class SelfAttention(nn.Module):
 
     def forward(self, x, freqs, f=None, h=None, w=None, local_num=None, topk=None,
                 train_img=False, block_id=None, kv_len=None, is_full_block=False,
-                is_stream=False, pre_cache_k=None, pre_cache_v=None, pre_cache_refs=None, local_range = 9, cache_next=True,
+                is_stream=False, stream_cache=None, local_range = 9, cache_next=True,
                 allow_short_start=False, topk_groups=None, block_mask=None):
         """topk_groups: top-k slabs per chunk (None: one per temporal window). block_mask: a structural (1, heads, query windows, key
-        half-windows) int8 map that replaces the draft top-k (FlashVSR+ local layers)."""
+        half-windows) int8 map that replaces the draft top-k (FlashVSR+ local layers). stream_cache: the stream's StreamCache, whose keys
+        and values of the block (from the previous chunk) are attended before the chunk's own, and which keeps the block's last kv_len
+        windows for the next chunk (cache_next)."""
         if isinstance(x, list):
             x_ref = x
             x = x_ref[0]
             x_ref.clear()
-        if pre_cache_refs is not None:
-            pre_cache_k, pre_cache_v = pre_cache_refs
+        prefix = None if stream_cache is None else stream_cache.prefix(block_id)
         B, L, D = x.shape
         win = (2, 8, 8)
         assert f % win[0] == 0, "stream chunks hold whole temporal windows"
@@ -449,7 +450,7 @@ class SelfAttention(nn.Module):
         if STAGED_SPARGE and staged_sparge_available():
             x_list = [x_w]
             x_w = None
-            return self._forward_staged(x_list, freqs, f, h, w, win, B, topk, is_stream, pre_cache_k, pre_cache_v, pre_cache_refs, kv_len, cache_next, topk_groups, block_mask)
+            return self._forward_staged(x_list, freqs, f, h, w, win, B, topk, is_stream, stream_cache, block_id, prefix, kv_len, cache_next, topk_groups, block_mask)
 
         v_w = self.v(x_w)
 
@@ -468,26 +469,20 @@ class SelfAttention(nn.Module):
 
         seqlen = f//win[0]
         one_len = k_w.shape[0] // B // seqlen
-        if pre_cache_k is not None and pre_cache_v is not None:
-            k_w = torch.cat([pre_cache_k, k_w], dim=0)
-            v_w = torch.cat([pre_cache_v, v_w], dim=0)
-            if pre_cache_refs is not None:
-                pre_cache_refs[0] = None
-                pre_cache_refs[1] = None
-            pre_cache_k = None
-            pre_cache_v = None
+        if prefix is not None:
+            k_w = torch.cat([prefix[0].view(-1, k_w.shape[1], D), k_w], dim=0)
+            v_w = torch.cat([prefix[1].view(-1, v_w.shape[1], D), v_w], dim=0)
+            prefix = None
 
         block_n = q_w.shape[0] // B
         block_s = q_w.shape[1]
         block_n_kv = k_w.shape[0] // B
 
-        cache_k = cache_v = None
-        if is_stream and cache_next:
+        if is_stream and cache_next:  # the last windows of the joined keys and values (the prefix copied into them), kept for the next chunk
             cache_blocks = min(block_n_kv, one_len * max(1, int(kv_len)))
-            cache_k = k_w.view(B, block_n_kv, block_s, D)[:, -cache_blocks:].reshape(B * cache_blocks, block_s, D)
-            cache_k = cache_k.detach().to("cpu")
-            cache_v = v_w.view(B, block_n_kv, block_s, D)[:, -cache_blocks:].reshape(B * cache_blocks, block_s, D)
-            cache_v = cache_v.detach().to("cpu")
+            for target, joined in zip(stream_cache.window(block_id, cache_blocks * block_s), (k_w, v_w)):
+                target[0].copy_(joined.view(B, block_n_kv, block_s, D)[0, -cache_blocks:].view(cache_blocks * block_s, self.num_heads, self.head_dim))
+            stream_cache.commit(block_id, cache_blocks * block_s)
 
         reorder_q = rearrange(q_w, '(b block_n) (block_s) d -> b (block_n block_s) d', block_n=block_n, block_s=block_s)
         reorder_k = rearrange(k_w, '(b block_n) (block_s) d -> b (block_n block_s) d', block_n=block_n_kv, block_s=block_s)
@@ -514,9 +509,6 @@ class SelfAttention(nn.Module):
         x = rearrange(x, 'b (block_n block_s) d -> (b block_n) (block_s) d', block_n=block_n, block_s=block_s)
         x = WindowPartition3D.reverse([x], win, (f, h, w))
         x = x.view(B, f*h*w, D)
-
-        if is_stream:
-            return self.o(x), cache_k, cache_v
         return self.o(x)
 
     def _local_mask(self, h, w, local_range, device):
@@ -526,7 +518,7 @@ class SelfAttention(nn.Module):
             self.local_attn_mask_w = w//8
             self.local_range = local_range
 
-    def _forward_staged(self, x_list, freqs, f, h, w, win, B, topk, is_stream, pre_cache_k, pre_cache_v, pre_cache_refs, kv_len, cache_next, topk_groups=None, structural_mask=None):
+    def _forward_staged(self, x_list, freqs, f, h, w, win, B, topk, is_stream, stream_cache, block_id, prefix, kv_len, cache_next, topk_groups=None, structural_mask=None):
         """The attention through the attention kit: q, k and v projected by head groups from one prepared input (the windows handed
         off in x_list), each quantized for the SpargeAttn block-sparse kernel as soon as it is ready (k before q is projected), the
         block map, the window RoPE and the stream cache slices computed per group. Same math as the whole-tensor path: RMS norm over
@@ -539,25 +531,13 @@ class SelfAttention(nn.Module):
         block_n = x_w.shape[0] // B
         seqlen = f // win[0]
         one_len = block_n // seqlen
-        prefix = None
-        if pre_cache_k is not None and pre_cache_v is not None:
-            prefix = (pre_cache_k.view(B, -1, heads, head_dim), pre_cache_v.view(B, -1, heads, head_dim))
-            if pre_cache_refs is not None:
-                pre_cache_refs[0] = pre_cache_refs[1] = None
-            pre_cache_k = pre_cache_v = None
         new_tokens = block_n * block_s
         block_n_kv = block_n + (0 if prefix is None else prefix[0].shape[1] // block_s)
-        cache_k = cache_v = None
-        if is_stream and cache_next:  # the last cache_blocks windows of the (prefixed) k and v, copied to the CPU per head group
+        window = None
+        if is_stream and cache_next:  # the last cache_blocks windows of the (prefixed) k and v, written per head group by the attention kit
             cache_blocks = min(block_n_kv, one_len * max(1, int(kv_len)))
             cache_tokens = cache_blocks * block_s
-            from_prefix = max(0, cache_tokens - new_tokens)
-            cache_k = torch.empty((B, cache_tokens, heads, head_dim), dtype=x_w.dtype, device="cpu")
-            cache_v = torch.empty((B, cache_tokens, heads, head_dim), dtype=x_w.dtype, device="cpu")
-            if from_prefix:
-                cache_k[:, :from_prefix].copy_(prefix[0][:, -from_prefix:])
-                cache_v[:, :from_prefix].copy_(prefix[1][:, -from_prefix:])
-            cached_new = cache_tokens - from_prefix
+            window = (*stream_cache.window(block_id, cache_tokens), max(0, cache_tokens - new_tokens))
         norms = (self.norm_q, self.norm_k)
 
         def norm_rope(query, key, group):
@@ -573,12 +553,6 @@ class SelfAttention(nn.Module):
                 tensor.mul_(inv_rms.to(dtype=tensor.dtype))
                 tensor.mul_(norm.weight.view(heads, head_dim)[group.q].to(dtype=tensor.dtype))
                 rope_apply_windowed([tensor.view(B * block_n, block_s, -1)], freqs, len(group.q), f, h, w, win, B)
-            if key is not None and cache_k is not None:
-                cache_k[:, from_prefix:, group.kv.start:group.kv.stop].copy_(key[:, -cached_new:])
-
-        def norm_v(value, group):
-            if cache_v is not None:
-                cache_v[:, from_prefix:, group.kv.start:group.kv.stop].copy_(value[:, -cached_new:])
 
         pooled = {}
 
@@ -595,14 +569,12 @@ class SelfAttention(nn.Module):
         x_list = [x_w.view(B, new_tokens, D)]
         x_w = None
         x = attention_kit.qkv_attention(x_list, self.q, self.k, self.v, heads, head_dim, norm_rope, norm_spans_heads=True,
-                                        kv_prefix=prefix, attention_mask=block_mask, force_attention="sparge", norm_v=norm_v)
+                                        kv_prefix=prefix, attention_mask=block_mask, force_attention="sparge", kv_window=window)
         prefix = None
+        if window is not None:  # the block's state for the next chunk written over the prefix it attended
+            stream_cache.commit(block_id, window[0].shape[1])
+            window = None
         x = WindowPartition3D.reverse([x.view(B * block_n, block_s, D)], win, (f, h, w)).view(B, f * h * w, D)
-        if is_stream:
-            if cache_k is not None:
-                cache_k = cache_k.view(B * cache_blocks, block_s, D)
-                cache_v = cache_v.view(B * cache_blocks, block_s, D)
-            return self.o(x), cache_k, cache_v
         return self.o(x)
 
 
@@ -691,7 +663,7 @@ class DiTBlock(nn.Module):
 
     def forward(self, x, context, t_mod, freqs, f, h, w, local_num=None, topk=None,
                 train_img=False, block_id=None, kv_len=None, is_full_block=False,
-                is_stream=False, pre_cache_k=None, pre_cache_v=None, pre_cache_refs=None, local_range = 9, cache_next=True,
+                is_stream=False, stream_cache=None, local_range = 9, cache_next=True,
                 allow_short_start=False, topk_groups=None, block_mask=None):
         if isinstance(x, list):
             x_ref = x
@@ -702,10 +674,10 @@ class DiTBlock(nn.Module):
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
         x_list = [input_x]
         input_x = None
-        self_attn_output, self_attn_cache_k, self_attn_cache_v = self.self_attn(
+        self_attn_output = self.self_attn(
             x_list , freqs, f, h, w, local_num, topk, train_img, block_id,
             kv_len=kv_len, is_full_block=is_full_block, is_stream=is_stream,
-            pre_cache_k=pre_cache_k, pre_cache_v=pre_cache_v, pre_cache_refs=pre_cache_refs, local_range = local_range, cache_next=cache_next,
+            stream_cache=stream_cache, local_range = local_range, cache_next=cache_next,
             allow_short_start=allow_short_start, topk_groups=topk_groups, block_mask=block_mask)
 
         x = self.gate(x, gate_msa, self_attn_output)
@@ -719,8 +691,6 @@ class DiTBlock(nn.Module):
             x = self.gate(x, gate_mlp, self.forward_ffn(x_list.pop()))
         else:  # the FFN by chunks, its gated output added to x
             kernels.mlp(x_list, self.ffn[0], self.ffn[2], "gelu", residual=x, segments=kernels.gate_segments(gate_mlp, x.shape[0], x.shape[1]))
-        if is_stream:
-            return x, self_attn_cache_k, self_attn_cache_v
         return x
 
 
@@ -767,6 +737,13 @@ class Head(nn.Module):
 # WanModel (no image branch) — init 时即产生 KV 缓存
 # ----------------------------
 class WanModel(torch.nn.Module):
+    _stream_storing = False  # the stream's first chunk runs: it stores every block's cache
+
+    def _auto_preload_workload(self, args, kwargs):
+        """Workload of MMGP's automatic VRAM preload: by input size, the first chunk of a stream apart (the cache it stores would count as
+        activations of every chunk)."""
+        return auto_preload.workload(args, kwargs), self._stream_storing
+
     def __init__(
         self,
         dim: int,
@@ -918,7 +895,7 @@ class WanModel(torch.nn.Module):
                             create_custom_forward(block),
                             x, context, t_mod, freqs, f, h, w, local_num, topk,
                             train_img, block_id, kv_len, is_full_block, False,
-                            None, None,
+                            None,
                             use_reentrant=False,
                         )
                 else:
@@ -926,13 +903,13 @@ class WanModel(torch.nn.Module):
                         create_custom_forward(block),
                         x, context, t_mod, freqs, f, h, w, local_num, topk,
                         train_img, block_id, kv_len, is_full_block, False,
-                        None, None, 
+                        None,
                         use_reentrant=False,
                     )
             else:
                 x = block([x], context, t_mod, freqs, f, h, w, local_num, topk,
                           train_img, block_id, kv_len, is_full_block, False,
-                          None, None)
+                          None)
 
         x = self.head([x], t)
         x = self.unpatchify([x], (f, h, w))

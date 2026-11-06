@@ -129,6 +129,7 @@ spatial_upsampler_handlers = [
     "postprocessing.lanczos.wgp_bridge.LanczosUpsampler",
     "postprocessing.dlss5.spatial_upsampler.DLSS5SpatialUpsampler",
     "postprocessing.flashvsr.wgp_bridge.FlashVSRBridge",
+    "postprocessing.relayvsr.wgp_bridge.RelayVSRBridge",
     "postprocessing.seedvr2.wgp_bridge.SeedVR2Bridge",
     "postprocessing.pid.wgp_bridge.PiDBridge",
     "postprocessing.h3_face_refiner.wgp_bridge.H3FaceRefinerBridge",

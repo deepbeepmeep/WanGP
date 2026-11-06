@@ -152,6 +152,7 @@ export const actions = {
   file: (path, download = false) => api.file(state.pid, path, download),
   sourcePart: shot => api.sourcePart(state.pid, shot.id),  // what a remake's shot delivers, as a video of its own
   takePart: (shot, take) => api.takePart(state.pid, shot.id, take.id),
+  sourceFrame: (shot, frame) => api.sourceFrame(state.pid, shot.id, frame),  // one frame of a remake's source, to paint elsewhere
   templateRoles(refresh = false) {  // the template picker's roles, once per production unless a pick changed them
     if (refresh || !state.templateRoles || state.templateRoles.pid !== state.pid) {
       state.templateRoles = { pid: state.pid, promise: api.templates(state.pid).then(result => result.roles) };

@@ -67,6 +67,10 @@ FRAME_POSES = ("This is one frame of a video. List every person or character vis
                "centre or right; foreground or background); which part of them shows; how tall their head is as a percentage of the picture's height, and whether the picture's edge cuts it; which way the head faces; the eyes, brows "
                "and mouth (open or closed, smiling or not); sharp or blurred. Then one line for the camera (extreme close-up, close-up, medium shot or wide) and one for the background.")
 PAINT_DRAWS = 3  # a draw that leaves the picture as it was is drawn again: the painter often does
+LOOKS_WORDS = re.compile(r"\b(?:hair|haired|blonde?|brunette|redhead|bald|glasses|sunglasses|spectacles|beard|bearded|moustache|mustache|face)\b", re.IGNORECASE)  # what a replaced person loses (colours name clothes too)
+BUILD_WORDS = re.compile(r"\b(?:slim|slender|thin|skinny|lanky|lean|wiry|petite|small|tiny|little|tall|short|stocky|broad-shouldered|muscular|athletic|plump|chubby|stout|heavy(?:set)?|round|curvy|big|large|frail)\b", re.IGNORECASE)  # a card's build, from its first phrase ("a lanky clown")
+HEAD_SHARE = r"(\d{1,3})(?:\s*-\s*(\d{1,3}))?\s*(?:%|percent)"  # the inspector's head sizes: "22 %", "20-25%", "22 percent"
+CUT_GAP, FRAME_GAP = 3, 72  # as the Viggle Remake MCP server: a painted frame keeps 3 frames of its own shot from a cut, and two of one shot are 3 s apart
 LARGE_HEAD = 30  # percent of the picture's height: below it a real change can touch too little of the picture to measure
 SAME_PICTURE = 0.15  # media.changed_share of a draw that changed nobody (0 to 0.13 on the teaser; 0.16 and up for a person replaced)
 PAINT_VERIFY = ("Verify this picture before going on: read `before` and `after`, person by person. It fails when a replaced person's old hair, face or clothes are still there; a head is much larger or smaller, or elsewhere; someone "
@@ -172,7 +176,8 @@ class ShowrunnerToolbox:
 
     def _warnings(self, production, shot_ids=None) -> list[str]:
         doc = production.snapshot()
-        return self._hold_lengths(production, doc, shot_ids) + templates.lint(doc, self._catalog(doc), shot_ids)
+        remake = [warning for shot in doc["shots"] if shot.get("source_range") and (shot_ids is None or shot["id"] in shot_ids) for warning in remake_groups.prompt_warnings(shot)]
+        return self._hold_lengths(production, doc, shot_ids) + templates.lint(doc, self._catalog(doc), shot_ids) + remake
 
     def _hold_lengths(self, production, doc: dict[str, Any], shot_ids=None) -> list[str]:
         """Every shot plays its whole take, on a length its model really makes, unless the user's settings let Deepy pick any length (`whole_take` says which shots this concerns)."""
@@ -306,9 +311,9 @@ class ShowrunnerToolbox:
             return problems, renders
         return [f"{batch[item.get('task', 0)][0]}: {item['message']}" for item in errors], renders
 
-    def _apply(self, production, ops, revision=None):
+    def _apply(self, production, ops, revision=None, by="deepy"):
         try:
-            return production.apply(ops, by="deepy", base_revision=revision)
+            return production.apply(ops, by=by, base_revision=revision)
         except model.OperationError as error:
             raise ValueError(str(error) + (f" Current value: {error.current}" if error.current is not None else "")) from None
 
@@ -601,6 +606,11 @@ class ShowrunnerToolbox:
                 return {"shot": shot_id, "error": "its lines could not be spoken (" + "; ".join(errors) + "): fix the speakers' voices, then render it"}
             shot = model.find(target.snapshot()["shots"], shot_id, "shot")
         settings, base_loras = self._generation_with_loras(ctx, target, shot, final)
+        if shot.get("source_range") and (entry or {}).get("video_edit") and settings.get("multi_prompts_gen_type") != "PW":  # one window: its prompt in the template's window format, as a group's
+            try:
+                settings["prompt"] = remake_groups.joined_prompt([shot], doc["remake"]["fps"], swap=entry["video_edit"].get("kind") == "swap")
+            except ValueError as error:
+                return {"shot": shot_id, "error": str(error)}
         tier = "draft" if doc["brief"].get("draft_resolution") and not final else "final"
         follows = model.chosen_take(shot) if final and not new_seed else None
         if follows is not None and follows.get("kind", "video") == "video" and (seed := media.generation_seed(target.resolve(follows["path"]))) is not None:
@@ -689,7 +699,7 @@ class ShowrunnerToolbox:
         if missing := [shot["id"] for shot in changed if not shot.get("painted_frames")]:
             return {"shot": shot_id, "error": f"{shot_id} renders together with {together}: paint a frame of {', '.join(missing)} first"}
         try:
-            prompt = remake_groups.joined_prompt(group, fps)
+            prompt = remake_groups.joined_prompt(group, fps, swap=entry["video_edit"].get("kind") == "swap")
         except ValueError as error:
             return {"shot": shot_id, "error": f"{shot_id} renders together with {together}: {error}"}
         lead = model.find(doc["shots"], shot_id, "shot")
@@ -729,9 +739,12 @@ class ShowrunnerToolbox:
         used = self._real_paths(ctx, {**used, **({"seed": seed} if seed is not None else {})})
         target.apply([{"op": "budget", "gpu_seconds": generated}], by="system", record=False)
         takes = {}
+        flashes = {item["source_range"][0] - start: media.cut_flash(path, item["source_range"][0] - start, fps) for item in group[1:]}  # the render's cuts a frame or two off: their frames are held
         for shot in changed:  # each shot's own frames, with their sound, as a take of its own: the edit, the checks and the players read them as any take
             own = shot["source_range"][1] - shot["source_range"][0]
-            part = media.video_window(path, shot["source_range"][0] - start, own, fps, target.folder / "media" / "parts")
+            first = shot["source_range"][0] - start
+            hold = (flashes.get(first, (0, 0))[1], flashes.get(first + own, (0, 0))[0])
+            part = media.video_window(path, first, own, fps, target.folder / "media" / "parts", hold=hold)
             choose = shot["id"] in (shot_id, *requested) or not shot["takes"]
             mates = ", ".join(item["id"] for item in group if item["id"] != shot["id"])
             added = self.showrunner.add_take(target.id, shot["id"], part, by=by, settings=used, note=f"Rendered together with {mates}", gpu_s=generated * own / (stop - start),
@@ -1229,7 +1242,7 @@ class ShowrunnerToolbox:
         source_name = ctx.virtualize(str(source))
         seen = self._look_at_shots(ctx, target, source_name, created, [group["own"] for group in groups], rate)
         return {"revision": target.doc["revision"], "source": source_name, "fps": rate, "frames": detected["frames"], "cuts": chosen, "canvas": canvas, "template": template,
-                "needs": {"painted_frames": edit.get("input") == "painted_frames", "references": entry["refs"], "mask": entry["needs_mask"], "max_images": edit.get("max_images")},
+                "needs": {"painted_frames": edit.get("input") == "painted_frames", "references": entry["refs"] and edit.get("input") != "painted_frames", "mask": entry["needs_mask"], "max_images": edit.get("max_images")},
                 "shots": [{"shot": shot_id, "source_range": item["source_range"], "windows": group["windows"], "seen": seen.get(shot_id)} for shot_id, item, group in zip(created, shots, groups)]}
 
     def _look_at_shots(self, ctx, target, source: str, shots: list[str], owns: list[list[int]], fps: float) -> dict[str, str]:
@@ -1262,27 +1275,67 @@ class ShowrunnerToolbox:
         return re.search(r"\bback of\b|from behind", str(person.get("where") or ""), re.IGNORECASE) is not None
 
     @classmethod
-    def _swap_prompt(cls, people: list[dict[str, Any]], names: dict[str, str], note: str | None = None) -> str:
-        """What the painter reads to replace people, each in the inspector's words for how they stand in this frame, those seen from behind last. Few other words: the frame must stay the frame, and long rules did not hold it. Told of someone
-        seen from behind without more, it draws them a face."""
-        changed = sorted((person for person in people if person.get("becomes")), key=cls._from_behind)
-        name = lambda person: names[str(person["becomes"]).casefold()]  # noqa: E731
-        sheets = {name(person): number for number, person in enumerate({name(person): person for person in changed}.values(), 2)}
+    def _swap_request(cls, people: list[dict[str, Any]], named: dict[str, tuple[dict[str, Any], str]], note: str | None = None, clothes: str = "sheet") -> tuple[str, list[str]]:
+        """What the painter reads to replace people, and the cast pictures it gets after the frame. Each person is found by `who`, their clothes and place in
+        this frame, and becomes a cast member: the face and hair from the member's photo (their sheet when they have none, or for a look of the shot's own,
+        or when the frame shows their back) with the looks of their card, the build and clothes of their sheet (clothes="frame": the frame's clothes, fitted
+        to that build), and the frame's expression, mouth, head angle, gaze, pose, hands and crop; those seen from behind last. Tried on several remakes'
+        frames (specs): the inspector's words for the person's hair and glasses read as something to keep, an open mouth closed unless the prompt holds it,
+        an outfit written out in words drew a whole figure into close shots, and without a word on the build the original's body stayed under the new head.
+        A member with a sheet alone takes the original's place: told that the original "becomes" them, the painter kept a robot behind its clown, put a bear's
+        head on a man's body and left people in their own clothes (better in 7 of 11 frames of 7 remakes, the same in 3).
+        named: each member by name, with the shot's picture of them."""
+        replaced = sorted((person for person in people if person.get("becomes")), key=cls._from_behind)
+        keys = list(dict.fromkeys(str(person["becomes"]).casefold() for person in replaced))
+        pictures, lines, numbers = [], ["Picture 1 is a frame from a video."], {}
+        for key in keys:
+            member, path = named[key]
+            behind = all(cls._from_behind(person) for person in replaced if str(person["becomes"]).casefold() == key)
+            photo = member["images"][0] if member.get("images") and path in (member.get("master"), member["images"][0]) and not (behind and member.get("master")) else None
+            sheet = path if path != photo else member.get("master")
+            numbers[key] = {"face": len(pictures) + 2}
+            pictures.append(photo or path)
+            lines.append(f"Picture {numbers[key]['face']} is {'a photo' if photo else 'the character sheet'} of {member['name']}.")
+            if photo and sheet and sheet != photo:  # the face from the photo, the build and the clothes from the sheet; a sheet that is the photo is sent once
+                numbers[key]["body"] = len(pictures) + 2
+                pictures.append(sheet)
+                lines.append(f"Picture {numbers[key]['body']} is the character sheet of {member['name']}.")
+            elif not photo:
+                numbers[key]["body"] = numbers[key]["face"]
+        for person in replaced:
+            key = str(person["becomes"]).casefold()
+            member, number = named[key][0], numbers[key]
+            name = member["name"]
+            if cls._from_behind(person):
+                lines.append(f"In Picture 1, {person['who']} becomes {name} seen from behind, as in the back view of Picture {number['face']}: only the back of the head and shoulders, no face, the same size and place, as blurred as in Picture 1.")
+                continue
+            looks = str(member.get("description") or "").partition(" wearing ")[0].strip().rstrip(",.")  # the face and hair: the outfit is a picture
+            body = f"of the character sheet in Picture {number['body']}" if "body" in number else f"of the photo in Picture {number['face']}"  # no sheet: the photo shows the build and clothes
+            worn = (f"{name} wears the clothes of that {'character sheet' if 'body' in number else 'photo'}, only where Picture 1 shows them." if clothes == "sheet"
+                    else f"{name} wears the clothes of Picture 1, fitted to that build.")
+            if number.get("body") == number["face"]:  # a sheet alone: the whole character in the original's place, with the card's build words only (told of a red nose, it painted one on a robot's eye)
+                who, build = person["who"], ", ".join(dict.fromkeys(word.lower() for word in BUILD_WORDS.findall(looks.partition(" with ")[0])))
+                whole = "with face, hair, body and clothes" if clothes == "sheet" else f"with face, hair and body, in the clothes {who} wore, fitted to {name}'s build"
+                lines += [f"In Picture 1, {name} takes the place of {who}: {who} is no longer in the picture and nothing of them remains, not their body, head, arms or legs, in front of {name} or behind.",
+                          f"{name} is the whole character of the character sheet in Picture {number['face']}, {build + ', ' if build else ''}{whole}, as large in the picture as {who} was."]
+            else:
+                lines += [f"In Picture 1, {person['who']} becomes {name}, with {name}'s own face and hair from Picture {number['face']}" + (f" ({looks})." if looks else "."),
+                          f"{name}'s body build is that {body}, not the original's: where {name} is slimmer or smaller, draw {name} so and fill the freed space with the background. {worn}",
+                          "Nothing of the original remains: not their face, their hair colour or cut, their glasses or their jewellery."]
+            lines += [f"{name} keeps exactly the expression and mouth shape of Picture 1, an open mouth stays open, and the same head angle, gaze, pose and hands.",
+                      f"The framing and crop stay exactly as in Picture 1: only what Picture 1 shows of {name} is painted."]
         where = lambda person: f" ({person['where']})" if str(person.get("where") or "").strip() else ""  # noqa: E731
-        lines = [f"Picture 1 is a frame of a video.", *(f"Picture {number} is the character sheet of {member}." for member, number in sheets.items())]
-        for person in changed:
-            member = name(person)
-            lines.append(f"Change {person['who']} in Picture 1{where(person)} into {member} seen from behind, as in the back view of Picture {sheets[member]}: only the back of the head and shoulders, no face, the same size and place, as blurred as in Picture 1." if cls._from_behind(person)
-                         else f"Replace {person['who']} in Picture 1{where(person)} with {member} from Picture {sheets[member]}: face, hair, skin and clothes all become {member}'s, in the same size and place, with the same head angle, gaze and mouth.")
         stays = "; ".join(f"{person['who']}{where(person)}" for person in people if not person.get("becomes"))
-        return " ".join(filter(None, [*lines, f"Leave unchanged: {stays}." if stays else "", str(note or "").strip(), "The background, light and framing stay exactly as in Picture 1."]))
+        return " ".join(filter(None, [*lines, f"Leave unchanged: {stays}." if stays else "", str(note or "").strip(),
+                                      "Everything else stays exactly as in Picture 1: the framing, background, light, sharpness and the other people."])), pictures
 
-    def _paint_people(self, ctx, target, template: str, frame_path: Path, people: list[dict[str, Any]], named: dict[str, tuple[dict[str, Any], str]], note: str | None, size: str) -> Path | None:
-        """The frame with everyone replaced in one draw. A draw that leaves a large person as they were is drawn again. Returns the picture, or None when nothing changed."""
-        changed = list({str(person["becomes"]).casefold(): named[str(person["becomes"]).casefold()] for person in sorted((person for person in people if person.get("becomes")), key=self._from_behind)}.values())
-        settings = {"template": template, "prompt": self._swap_prompt(people, {key: member["name"] for key, (member, _) in named.items()}, note), "resolution": size,  # a picture is made once, at the target: a draft and its final use the same one
-                    "image_refs": [ctx.virtualize(str(path)) for path in (frame_path, *(target.resolve(sheet) for _, sheet in changed))]}
-        heads = [int(value) for person in people for match in re.findall(r"(\d{1,3})(?:\s*-\s*(\d{1,3}))?\s*%", str(person.get("where") or "")) for value in match if value]
+    def _paint_people(self, ctx, target, template: str, frame_path: Path, people: list[dict[str, Any]], named: dict[str, tuple[dict[str, Any], str]], note: str | None, size: str,
+                      clothes: str = "sheet") -> Path | None:
+        """The frame with everyone replaced in one draw (_swap_request). A draw that leaves a large person as they were is drawn again. Returns the picture, or None when nothing changed."""
+        prompt, pictures = self._swap_request(people, named, note, clothes)
+        settings = {"template": template, "prompt": prompt, "resolution": size,  # a picture is made once, at the target: a draft and its final use the same one
+                    "image_refs": [ctx.virtualize(str(path)) for path in (frame_path, *(target.resolve(picture) for picture in pictures))]}
+        heads = [int(value) for person in people for match in re.findall(HEAD_SHARE, str(person.get("where") or "")) for value in match if value]
         for draw in range(PAINT_DRAWS):
             ctx.progress(done=draw, total=PAINT_DRAWS, text="Painting the Frame", force=True)
             entries = media_entries(ctx.call("wangp_generate", {"settings": settings}))
@@ -1317,7 +1370,7 @@ class ShowrunnerToolbox:
         if not before or not after:
             return []
         faults = []
-        heads = [max((int(value) for match in re.findall(r"(\d{1,3})(?:\s*-\s*(\d{1,3}))?\s*%", text) for value in match if value), default=0) for text in (before, after)]
+        heads = [max((int(value) for match in re.findall(HEAD_SHARE, text) for value in match if value), default=0) for text in (before, after)]
         if heads[0] and heads[1] and heads[1] < 0.6 * heads[0]:
             faults.append(f"The largest head went from about {heads[0]} % of the picture's height to about {heads[1]} %: the framing is lost.")
 
@@ -1366,28 +1419,38 @@ class ShowrunnerToolbox:
             raise ValueError(f"The inspector could not look at frame {frame}: look at {name} with your own eyes, and paint it with your instruction and references.")
         target.apply([{"op": "update_shot", "shot": shot, "fields": {"looked": {**(item.get("looked") or {}), str(int(frame)): {"poses": seen, "before": self._people_in(ctx, name)}}}}], by="system", record=False)
         return {"shot": shot, "frame": int(frame), "source_frame": name, "people": seen,
-                "next": "paint_frame with `people`: one entry per person listed here, with who (the woman), where (the inspector's words for them, unchanged) and becomes (a cast member's name, or null for someone who stays as they are)."}
+                "next": "paint_frame with `people`: one entry per person listed here, with who (for someone replaced, their clothes and place in this frame only: the woman in the turquoise jumpsuit in the centre), where (the inspector's words for them, unchanged) and becomes (a cast member's name, or null for someone who stays as they are)."}
 
-    def paint_frame(self, ctx, production: str, shot: str, frame: int, people: list[dict[str, Any]] | None = None, instruction: str | None = None, picture: str | None = None, references: list[str] | None = None, pin: bool = True, unchanged: bool = False) -> dict[str, Any]:
+    def paint_frame(self, ctx, production: str, shot: str, frame: int, people: list[dict[str, Any]] | None = None, instruction: str | None = None, picture: str | None = None, references: list[str] | None = None, pin: bool = True, unchanged: bool = False, replaces: int | None = None,
+                    clothes: Literal["sheet", "frame"] = "sheet") -> dict[str, Any]:
         """A remake: a frame of the shot's source, numbered as in the source, changed by the image editor. When people are replaced: look_at_frame first, then `people`, one entry per person it listed: who (the woman), where (the
-        inspector's words for them), becomes (a cast member's name, or null for someone who stays as they are); `instruction` then adds what is special in this frame. For any other change: `instruction`, with `references`. Or
+        inspector's words for them), becomes (a cast member's name, or null for someone who stays as they are); for someone replaced, `who` names them by their clothes and place in this frame only, never
+        their hair, face or glasses, which the painter would keep; clothes: the cast member's own outfit from their sheet, or `frame` when the brief keeps the
+        person's costume. `instruction` then adds what is special in this frame. For any other change: `instruction`, with `references`. Or
         your own finished `picture`, or the source frame as it is (`unchanged`, for a camera setup the change does not touch, to hold it in the shot). It becomes one of the shot's painted frames, in source order; painting the same
-        frame again replaces it, and each try draws differently. pin: the take passes through that picture at that moment (all frames of a shot are pinned or none); keep it on when people are replaced. Returns the source frame and the picture; when people are
+        frame again replaces it, and each try draws differently; `replaces`: another painted frame of the shot that this one takes the place of. pin: the take passes through that picture at that moment (all frames of a shot are pinned or none); keep it on when people are replaced. Returns the source frame and the picture; when people are
         replaced `before` and `after`, what the inspector sees in each, `faults` measured from them, and `verify`; otherwise `comparison`: read them before you go on."""
         target = self._production(ctx, production)
         doc = target.snapshot()
         item = self._shot_frame(doc, shot, frame)
-        start = item["source_range"][0]
+        first, last = self._paintable(doc, item)
+        if not first <= int(frame) <= last:
+            raise ValueError(f"Frame {frame} is within {CUT_GAP} frames of a cut: paint one from {first} to {last}"
+                             f" (a shot under {2 * CUT_GAP + 1} frames has none: it takes the look of the shots it renders with). Nothing was painted.")
         catalog = self._catalog(doc)
         entry = templates.resolve(catalog, item["generation"].get("template"))
         limit = ((entry or {}).get("video_edit") or {}).get("max_images") or 4
-        kept = [painted for painted in item.get("painted_frames") or [] if painted["frame"] != int(frame)]
+        dropped = {int(frame), *([int(replaces)] if replaces is not None else [])}
+        kept = [painted for painted in item.get("painted_frames") or [] if painted["frame"] not in dropped]
+        if close := [painted["frame"] for painted in kept if abs(painted["frame"] - int(frame)) < FRAME_GAP]:  # upstream: two pictures of nearly one framing snap the render between them
+            raise ValueError(f"Frame {frame} is within {FRAME_GAP} frames (3 s) of this shot's painted frame {close[0]}: a shot takes a second one only where a face turns to profile or back, or someone new enters, "
+                             f"at least 3 s after the first. Paint frame {close[0]} again, pass replaces={close[0]} to paint this frame in its place, or pick a frame at least {FRAME_GAP} frames from it. "
+                             "A shot's only painted frame shows the face: from behind alone, the model invents the face. Nothing was painted.")
         if len(kept) >= limit:
             raise ValueError(f"This shot's template takes {limit} painted frames: paint one of those again, or give the shot fewer.")
-        tries = next((painted.get("tries", 1) for painted in item.get("painted_frames") or [] if painted["frame"] == int(frame)), 0) + 1
         swap = ((entry or {}).get("video_edit") or {}).get("kind") == "swap"
         looked = (item.get("looked") or {}).get(str(int(frame)))
-        before = (looked or {}).get("before")
+        before, after = (looked or {}).get("before"), None
         folder = target.folder / "media" / "painted"
         source_frame = media.video_frame(target.resolve(doc["remake"]["path"]), int(frame), folder)
         if unchanged:
@@ -1395,8 +1458,8 @@ class ShowrunnerToolbox:
         elif picture:
             painted_path = ctx.resolve(picture)
         else:
-            directed = swap and references is None
-            pictured = [] if references is not None else self._pictured_cast(doc, item)
+            directed = swap and (people is not None or references is None)  # people replaced: the cast's own pictures, whatever references say
+            pictured = [] if references is not None and not directed else self._pictured_cast(doc, item)
             if not pictured and references is None and (swap or templates.cast_with_pictures(doc)):
                 raise ValueError(f"Shot {shot} has no cast with a picture, so the painter would draw from words alone and the same person would look different in every frame. Give the shot its cast with update_shot first, "
                                  "or pass references=[] when nobody of the cast is in this frame. Nothing was painted.")
@@ -1407,12 +1470,21 @@ class ShowrunnerToolbox:
                     raise ValueError(f"Look at frame {frame} first with look_at_frame: you direct the painter from what this frame shows. Nothing was painted.")
                 if not people or not all(str(person.get("who") or "").strip() for person in people) or not any(person.get("becomes") for person in people):
                     raise ValueError("Say in `people` what happens to everyone look_at_frame listed: who, where (its words for them) and becomes (a cast member's name, or null to stay as they are). Nothing was painted.")
+                if said := [person["who"] for person in people if person.get("becomes") and LOOKS_WORDS.search(str(person["who"]))]:
+                    raise ValueError(f"`who` names the hair, face or glasses of someone replaced ({'; '.join(said)}): the painter keeps what it reads there. Name them by their clothes and place in this frame only "
+                                     "(\"the woman in the turquoise jumpsuit in the centre\"). Nothing was painted.")
                 named = {member["name"].casefold(): (member, path) for member, path in pictured}
                 if missing := list(dict.fromkeys(str(person["becomes"]) for person in people if person.get("becomes") and str(person["becomes"]).casefold() not in named)):
                     raise ValueError(f"{', '.join(missing)} is not in this shot's cast with a picture: give the shot its cast with update_shot first. Nothing was painted.")
-                painted_path = self._paint_people(ctx, target, template, source_frame, people, named, instruction, size)
-                if painted_path is None:
-                    return {"shot": shot, "frame": int(frame), "error": f"The painter changed nobody in {PAINT_DRAWS} draws, so nothing was recorded. Call paint_frame again with the same people, or try another frame of this shot."}
+                for _ in range(PAINT_DRAWS):  # a close shot drawn as a full figure is drawn again: the painter does it about one draw in two, and its pin pulls the render out
+                    painted_path = self._paint_people(ctx, target, template, source_frame, people, named, instruction, size, clothes)
+                    if painted_path is None:
+                        return {"shot": shot, "frame": int(frame), "error": f"The painter changed nobody in {PAINT_DRAWS} draws, so nothing was recorded. Call paint_frame again with the same people, or try another frame of this shot."}
+                    ctx.progress(done=0, total=1, text=f"Checking the Painted Frame of {shot}", force=True)
+                    before = before or self._people_in(ctx, ctx.virtualize(str(source_frame)))
+                    after = self._people_in(ctx, ctx.virtualize(str(painted_path)))
+                    if not any("framing is lost" in fault or "wider" in fault for fault in self._painted_faults(before, after)):  # the size of a head kept on a full figure made a caricature
+                        break
             else:
                 if not str(instruction or "").strip():
                     raise ValueError("Give an instruction for the image editor, your own picture, or unchanged.")
@@ -1423,14 +1495,8 @@ class ShowrunnerToolbox:
                 if not entries:
                     return {"shot": shot, "frame": int(frame), "error": "the image editor returned no picture"}
                 painted_path = ctx.resolve(entries[0]["path"])
-            item = model.find(target.snapshot()["shots"], shot, "shot")  # frames painted side by side: what another call recorded while this one painted stays
-            kept = [painted for painted in item.get("painted_frames") or [] if painted["frame"] != int(frame)]
-            if len(kept) >= limit:
-                raise ValueError(f"This shot's template takes {limit} painted frames: paint one of those again, or give the shot fewer.")
-        painted = sorted([*kept, {"frame": int(frame), "path": target.adopt(painted_path), "source": target.rel(source_frame), "tries": tries}], key=lambda value: value["frame"])
-        settings = {**item["generation"]["settings"], "image_refs": [value["path"] for value in painted], "video_prompt_type": "FIVU" if pin else "IVU",
-                    "frames_positions": " ".join(str(value["frame"] - start + 1) for value in painted) if pin else ""}  # WanGP counts positions from 1
-        self._apply(target, [{"op": "update_shot", "shot": shot, "fields": {"painted_frames": painted, "generation": {**item["generation"], "settings": settings}}}])
+        painted = self._record_painted(target, shot, int(frame), painted_path, source_frame, dropped, limit, pin)
+        tries = next(value["tries"] for value in painted if value["frame"] == int(frame))
         source_name, picture_name = ctx.virtualize(str(source_frame)), ctx.virtualize(str(target.resolve(painted[[value["frame"] for value in painted].index(int(frame))]["path"])))
         result = {"revision": target.doc["revision"], "shot": shot, "frame": int(frame), "source_frame": source_name, "picture": picture_name, "painted_frames": [value["frame"] for value in painted], "pinned": pin}
         if unchanged:
@@ -1439,8 +1505,51 @@ class ShowrunnerToolbox:
             return {**result, "comparison": self._compare_painted(ctx, source_name, picture_name)}
         ctx.progress(done=0, total=1, text=f"Checking the Painted Frame of {shot}", force=True)
         before = before or self._people_in(ctx, source_name)
-        after = self._people_in(ctx, picture_name)
+        after = after or self._people_in(ctx, picture_name)
         return {**result, "before": before, "after": after, "faults": self._painted_faults(before, after), "tries": tries, "verify": PAINT_VERIFY}
+
+    @staticmethod
+    def _paintable(doc: dict[str, Any], item: dict[str, Any]) -> tuple[int, int]:
+        """The first and last frame of a shot that may be painted: upstream keeps CUT_GAP frames from a cut, next to which a frame takes the other shot's look."""
+        start, stop = item["source_range"]
+        return start + CUT_GAP if start else start, stop - CUT_GAP - 1 if stop < doc["remake"]["frames"] else stop - 1
+
+    def _record_painted(self, target, shot: str, frame: int, picture, source_frame, dropped: set[int], limit: int, pin: bool, by: str = "deepy") -> list[dict[str, Any]]:
+        """A picture as the shot's painted frame `frame`, in source order with those not `dropped`, the shot's pictures and pins following them. Read again before writing: what
+        another call recorded while this one painted stays. Returns the shot's painted frames."""
+        item = model.find(target.snapshot()["shots"], shot, "shot")
+        kept = [painted for painted in item.get("painted_frames") or [] if painted["frame"] not in dropped]
+        if len(kept) >= limit:
+            raise ValueError(f"This shot's template takes {limit} painted frames: paint one of those again, or give the shot fewer.")
+        tries = next((painted.get("tries", 1) for painted in item.get("painted_frames") or [] if painted["frame"] == frame), 0) + 1
+        painted = sorted([*kept, {"frame": frame, "path": target.adopt(picture), "source": target.rel(source_frame), "tries": tries, **({"by": "user"} if by == "user" else {})}], key=lambda value: value["frame"])
+        start = item["source_range"][0]
+        settings = {**item["generation"]["settings"], "image_refs": [value["path"] for value in painted], "video_prompt_type": "FIVU" if pin else "IVU",
+                    "frames_positions": " ".join(str(value["frame"] - start + 1) for value in painted) if pin else ""}  # WanGP counts positions from 1
+        self._apply(target, [{"op": "update_shot", "shot": shot, "fields": {"painted_frames": painted, "generation": {**item["generation"], "settings": settings}}}], by=by)
+        return painted
+
+    def place_picture(self, target, shot: str, frame: int, picture: Path) -> list[dict[str, Any]]:
+        """The user's own picture as a painted frame of a remake's shot, fitted to the size the shot renders at. It takes the place of the shot's painted frames less
+        than FRAME_GAP frames from it, and keeps the shot's pins as they are. Returns the shot's painted frames."""
+        doc = target.snapshot()
+        item = self._shot_frame(doc, shot, frame)
+        first, last = self._paintable(doc, item)
+        if first > last:
+            raise ValueError(f"Shot {shot} is too short for a painted frame of its own: it takes the look of the shots it renders with.")
+        if not first <= frame <= last:
+            raise ValueError(f"Frame {frame} is too close to a cut, where the render takes the other shot's look: pick a frame of {shot} from {first} to {last}.")
+        entry = templates.resolve(self._catalog(doc), item["generation"].get("template"))
+        limit = ((entry or {}).get("video_edit") or {}).get("max_images") or 4
+        painted = item.get("painted_frames") or []
+        dropped = {frame, *(value["frame"] for value in painted if abs(value["frame"] - frame) < FRAME_GAP)}
+        if len([value for value in painted if value["frame"] not in dropped]) >= limit:
+            raise ValueError(f"Shot {shot} already has the {limit} painted frames its model takes: replace one of them instead.")
+        folder = target.folder / "media" / "painted"
+        source_frame = media.video_frame(target.resolve(doc["remake"]["path"]), frame, folder)
+        fitted = media.fit_picture(picture, self.showrunner.shot_size(target, doc, item, final=True), folder)
+        pin = not painted or "F" in str(item["generation"]["settings"].get("video_prompt_type") or "")
+        return self._record_painted(target, shot, frame, fitted, source_frame, dropped, limit, pin, by="user")
 
     @staticmethod
     def _compare_painted(ctx, source_frame: str, picture: str) -> str | None:

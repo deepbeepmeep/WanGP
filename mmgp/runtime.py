@@ -156,32 +156,34 @@ def ensure_loaded(module):
         manager.ensure_model_loaded(model_id)
 
 
-def state_ring(blocks, name="state", resident=False):
+def state_ring(blocks, name="state", resident=False, minimal=False):
     """A state ring (mmgp.state_ring.StateRing) for tensors a model computes once per block and reads at every pass (a cached attention
-    prefix), blocks: the model's blocks (a ModuleList, called one by one). Kept in RAM and streamed block by block on the transfer stream of
+    prefix), blocks: the model's blocks (a ModuleList, called one by one), or a list of some of them in their order of use (blocks of one
+    kind whose state has its own layout; the ring of each kind then fetches the next block of its kind). Kept in RAM and streamed block by block on the transfer stream of
     the model's offload object, with the weights, following MMGP's schedule for these blocks (its prefetch window; records locked for the
     blocks whose weights are pinned, then, for a model MMGP pins, for those kept in VRAM, as far as the reserved RAM allows; the others moved
     ahead through MMGP's staging ring with their blocks): each block's forward fetches its state. The model calls store(block, tensors) once per block, and release() at the end.
     resident: blocks whose weights MMGP keeps in VRAM may keep their state there too, in the room their preload leaves (see mmgp.state_ring;
     the model then reads the lists store() returns at each pass). resident="dynamic" (where dynamic_state(blocks)): a cache the model
     computes on the GPU stays in VRAM first, the model's dynamic preload planning it with its weights, and goes to RAM only for the blocks
-    that do not stay there."""
+    that do not stay there. minimal: the least VRAM, the state of the block running only (one slot, released after each block, no
+    prefetch)."""
     from .state_ring import StateRing
-    owner = _owner(blocks)
+    owner = _owner(blocks if isinstance(blocks, torch.nn.Module) else blocks[0])
     if owner is None:
-        return StateRing(len(blocks), torch.device("cuda", torch.cuda.current_device()), None, name, modules=blocks)
+        return StateRing(len(blocks), torch.device("cuda", torch.cuda.current_device()), None, name, modules=blocks, minimal=minimal)
     manager, model_id = owner
-    prefix = next(name for name, module in manager.models[model_id].named_modules() if module is blocks) + "."
-    entries = [f"{model_id}/{prefix}{index}" for index in range(len(blocks))]  # the blocks' entries: the ring follows their schedule
+    names = {module: name for name, module in manager.models[model_id].named_modules()}
+    entries = [f"{model_id}/{names[block]}" for block in blocks]  # the blocks' entries: the ring follows their schedule
     return StateRing(len(blocks), torch.device("cuda", torch.cuda.current_device()), manager, name, modules=blocks, model_id=model_id, entries=entries,
-                     resident=resident)
+                     resident=resident, minimal=minimal)
 
 
 def dynamic_state(module):
-    """Whether a state ring of these blocks can place its state dynamically (state_ring(blocks, resident="dynamic")): their model is managed
-    by MMGP with its VRAM allocator, which reports the VRAM shortages."""
+    """Whether a state ring of these blocks (a module, or a list of blocks) can place its state dynamically (state_ring(blocks,
+    resident="dynamic")): their model is managed by MMGP with its VRAM allocator, which reports the VRAM shortages."""
     from . import allocator
-    return _owner(module) is not None and allocator.active == "vmm"
+    return _owner(module if isinstance(module, torch.nn.Module) else module[0]) is not None and allocator.active == "vmm"
 
 
 def weights_resident(module):

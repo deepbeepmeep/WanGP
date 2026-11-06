@@ -170,6 +170,8 @@ def build_prompt(doc: dict[str, Any], task: str, message: str = "", shots: list[
         body = (f"The user paused you while you were {_task_words(paused.get('task') or 'continue', paused.get('message', ''), paused.get('shots') or ())}, and now resumes: "
                 "finish that task. Read the document first: the user may have changed shots, verdicts or the edit meanwhile. Nothing you started is still "
                 "running and a call you were waiting for will not return: render again what has no take. Takes that have your verdict are judged: do not inspect them again.")
+        if paused.get("message") and (paused.get("task") or "continue") in ("plan", "shoot", "reshoot", "assemble", "review", "continue"):  # the task's own note: a conversation cut before its turn was saved lost it
+            body += f"\n\nWhen that task began, the user wrote: {paused['message']} (it may be done already: check the document before you act on it)."
         if message:
             body += f"\n\nThe user adds: {message}"
     else:
