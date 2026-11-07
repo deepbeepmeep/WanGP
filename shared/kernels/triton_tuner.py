@@ -11,6 +11,11 @@ from pathlib import Path
 
 import torch
 
+try:
+    from triton.runtime.errors import OutOfResources as _OutOfResources
+except ImportError:  # this module also loads where Triton is missing (its kernels then never run)
+    _OutOfResources = RuntimeError
+
 
 @functools.cache
 def _device_name(device):
@@ -45,8 +50,11 @@ class LaunchTuner:
         started, timings = time.time(), []
         launch = prepare_scratch()
         for config in candidates:
-            for _ in range(2):
-                launch(config)
+            try:
+                for _ in range(2):
+                    launch(config)
+            except (_OutOfResources, RuntimeError):  # a configuration this GPU cannot run (AMD RDNA: 64 KiB of shared memory)
+                continue
             start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             start.record()
             for _ in range(10):
@@ -54,6 +62,8 @@ class LaunchTuner:
             end.record()
             end.synchronize()
             timings.append((start.elapsed_time(end) / 10, config))
+        if not timings:
+            raise RuntimeError(f"[{self.label}] No launch configuration of {name} runs on this GPU: {candidates}")
         best_ms, best = min(timings)
         self._tuned[key] = list(best)
         try:
