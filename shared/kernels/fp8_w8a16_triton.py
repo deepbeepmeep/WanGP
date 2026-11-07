@@ -140,8 +140,12 @@ def _w8a16_kernel(x, w, scale, bias, out, M, N, K, sxm, sxk, swn, swk, som, son,
     tl.store(out + rm[:, None] * som + rn[None, :] * son, result, mask=(rm[:, None] < M) & (rn[None, :] < N))
 
 
+_HIP = torch.version.hip is not None  # ROCm reports the gfx version as capability (gfx1151: 11.5), not an sm level
+
+
 def _decode_mode(weight):
-    native = os.environ.get("WAN2GP_FP8_TRITON_DECODE", "") != "bits" and torch.cuda.get_device_capability(weight.device) >= (8, 9)
+    # ROCm: decode the bytes with integer operations (same values); Triton's float8 conversions do not cover every AMD GPU
+    native = os.environ.get("WAN2GP_FP8_TRITON_DECODE", "") != "bits" and not _HIP and torch.cuda.get_device_capability(weight.device) >= (8, 9)
     return _DECODE["native"] if native else _DECODE[weight.dtype]
 
 
@@ -159,7 +163,7 @@ def _launch(x, weight, scale, bias, out, decode, config):
     _w8a16_kernel[(triton.cdiv(m, bm) * triton.cdiv(n, bn),)](
         x, w, scale, bias, out, m, n, k, x.stride(0), x.stride(1), w.stride(0), w.stride(1), out.stride(0), out.stride(1),
         scale.numel() > 1, bias is not None, decode, k % bk == 0, bm, bn, bk, 8,
-        BF16_SIMT=bf16_simt, IEEE=pre_sm80, num_warps=warps, num_stages=stages)
+        BF16_SIMT=bf16_simt, IEEE=pre_sm80 or _HIP, num_warps=warps, num_stages=stages)  # Triton on ROCm has no tf32 input precision
 
 
 def _load_cache():
