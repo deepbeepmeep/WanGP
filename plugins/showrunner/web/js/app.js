@@ -26,7 +26,7 @@ const VIEWS = { brief: ['Brief', 'brief', mountBrief], storyboard: ['Board', 'gr
 const UNDONE = { add_take: 'a new take', update_shot: 'a shot edit', verdict: 'a verdict', add_shots: 'new shots', replace_plan: 'the plan', remove_shot: 'a deletion',
   move_shots: 'a move', reorder: 'a move', remove_take: 'a removed take', brief: 'a brief edit', add_cast: 'a new cast member', update_cast: 'a cast edit',
   remove_cast: 'a cast removal', edit: 'a sound edit', add_overlay: 'a text', update_overlay: 'a text edit', remove_overlay: 'a text deletion', style: 'a style edit',
-  outline: 'the outline', deliverable: 'an export', bin_add: 'a bin import', bin_remove: 'a bin removal', bin_to_take: 'a take from the bin', stage: 'a stage change' };
+  outline: 'the outline', deliverable: 'an export', bin_add: 'a bin import', bin_remove: 'a bin removal', bin_to_take: 'a take from the bin', bin_to_track: 'a sound from the bin',stage: 'a stage change' };
 const GUIDE_PAGES = { home: 'Quick Start', brief: 'Starting a Production', storyboard: 'Reviewing and Changing the Plan', timeline: 'The Timeline', cast: 'The Cast', deliver: 'Delivering' };
 const STAGES = [['brief', 'Brief'], ['planning', 'Plan'], ['review', 'Review'], ['shooting', 'Shoot'], ['editing', 'Edit'], ['delivered', 'Deliver']];
 // What each stage's button opens: its view, on the Board the shots of that step, and its tooltip

@@ -20,7 +20,7 @@ from shared.gradio import assistant_chat
 _TEMPLATE_TOOL_LAYOUT = deepy_ui_settings.TEMPLATE_TOOL_LAYOUT
 _TEMPLATE_TOOL_ORDER = tuple(tool_name for row in _TEMPLATE_TOOL_LAYOUT for tool_name in row)
 _TEMPLATE_TOOL_UI_KEY = deepy_ui_settings.TEMPLATE_TOOL_UI_KEY
-_TEMPLATE_ADD_SELECTION_ERROR = "Please Select User Settings in the Lora / Settings Dropdown Box"
+_TEMPLATE_ADD_SELECTION_ERROR = "Select your saved settings in the preset list at the top of the generator first (type a name and press Save there to create them), then press + again"
 _TEMPLATE_DELETE_BUILTIN_ERROR = "You cant delete a Built in Template"
 _TEMPLATE_CAPTURE_JS = """() => {
   const selection = window.WAC && typeof window.WAC.getWanGpSettingsSelection === 'function'

@@ -7,6 +7,8 @@ import json
 import re
 import shutil
 import tempfile
+import uuid
+import zipfile
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -14,6 +16,7 @@ from typing import Any
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
 from . import production as model, titles
@@ -51,6 +54,11 @@ class DirectorRequest(BaseModel):
 class TemplatePick(BaseModel):
     role: str
     template: str | None = None
+
+
+class PromptRules(BaseModel):
+    template: str
+    text: str = Field(default="", max_length=2000)
 
 
 class Archived(BaseModel):
@@ -155,6 +163,10 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
     def choose_default_template(request: TemplatePick):
         return showrunner.choose_default_template(request.role, request.template or None)
 
+    @app.post("/api/prompt-rules")
+    def set_prompt_rules(request: PromptRules):
+        return showrunner.set_prompt_rules(request.template, request.text)
+
     @app.get("/api/settings")
     def settings():
         return showrunner.host.settings()
@@ -214,6 +226,29 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
         production(production_id)
         return store.duplicate(production_id).snapshot()
 
+    @app.get("/api/productions/{production_id}/export")
+    async def export(production_id: str):
+        title = production(production_id).snapshot()["title"]
+        folder = store.root / ".exports"  # beside the productions, not on the system drive: a production can weigh gigabytes
+        folder.mkdir(exist_ok=True)
+        path = await run_in_threadpool(store.export, production_id, folder / f"{production_id}-{uuid.uuid4().hex[:8]}.zip")
+        name = re.sub(r'[\\/:*?"<>|]+', " ", title).strip() or production_id
+        return FileResponse(path, filename=f"{name}.zip", background=BackgroundTask(path.unlink, missing_ok=True))
+
+    @app.post("/api/productions/import")
+    async def import_production(file: UploadFile = File(...)):
+        folder = store.root / ".exports"
+        folder.mkdir(exist_ok=True)
+        temporary = folder / f"import-{uuid.uuid4().hex[:8]}.zip"
+        with temporary.open("wb") as handle:
+            shutil.copyfileobj(file.file, handle, 1 << 20)
+        try:
+            return (await run_in_threadpool(store.import_zip, temporary)).snapshot()
+        except (ValueError, zipfile.BadZipFile, json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError, AttributeError) as error:  # a file from elsewhere
+            raise HTTPException(400, f"This file cannot be imported as a production: {error}")
+        finally:
+            temporary.unlink(missing_ok=True)
+
     @app.post("/api/productions/{production_id}/archive")
     def archive(production_id: str, request: Archived):
         production(production_id)
@@ -230,7 +265,7 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
     @app.post("/api/productions/{production_id}/upload")
     async def upload(production_id: str, file: UploadFile = File(...), role: str = Form("bin"), target: str | None = Form(None)):
         production(production_id)
-        if role not in ("bin", "song", "source", "reference", "cast", "take", "painted", "track", "subtitles"):
+        if role not in ("bin", "song", "source", "reference", "cast", "take", "shot", "painted", "track", "subtitles"):
             raise HTTPException(400, "Unknown upload role.")
         with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename or "").suffix) as handle:
             shutil.copyfileobj(file.file, handle)
@@ -249,6 +284,18 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
         if not target.owns(file):
             raise HTTPException(403, "This file does not belong to the production.")
         return FileResponse(file, filename=file.name if download else None, headers={"Cache-Control": "private, max-age=3600"})  # a download keeps its name
+
+    @app.get("/api/productions/{production_id}/media/{media_id}")
+    def gallery_media(production_id: str, media_id: str):
+        target = production(production_id)
+        if not re.fullmatch(r"(visual|audio):[0-9a-f]{12}", media_id):
+            raise HTTPException(400, "Not a media id.")
+        file = showrunner.media_of(production_id, media_id)
+        if file is None or not file.is_file():
+            raise HTTPException(404, "The production has no such media.")
+        if not target.owns(file):
+            raise HTTPException(403, "This file does not belong to the production.")
+        return FileResponse(file, headers={"Cache-Control": "private, max-age=3600"})
 
     @app.get("/api/productions/{production_id}/source_part")
     def source_part(production_id: str, shot: str):

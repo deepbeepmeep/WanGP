@@ -112,6 +112,8 @@ def _validate_glb(data):
         pending.extend(node.get("children", []))
         if "mesh" in node:
             for part in doc["meshes"][node["mesh"]]["primitives"]:
+                if "POSITION" not in part.get("attributes", {}):
+                    raise ValueError("A mesh has a geometry without vertex positions (no position attribute): give every exported mesh a BufferGeometry with positions.")
                 count = doc["accessors"][part["attributes"]["POSITION"]]["count"]
                 vertices += count
                 indices += doc["accessors"][part["indices"]]["count"] if "indices" in part else count

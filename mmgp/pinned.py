@@ -19,6 +19,7 @@ goes there (a model released, the pool's entries leaving), or retire() now and c
 - Buffer: a reusable locked buffer that grows to the largest request; the outgrown one is retired.
 """
 import collections
+import ctypes
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -107,6 +108,47 @@ def block(size):
     start = -ram.ctypes.data % PAGE # page aligned, like driver pinned memory
     owner = ram[start:start + size].view(LockedRAM)
     return torch.from_numpy(owner), owner
+
+
+class _Section:
+    """A section of the paging file mapped here (Windows): unmapped and closed with its last reference."""
+    def __init__(self, nbytes):
+        import ctypes.wintypes as wt
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileMappingW.argtypes, kernel32.CreateFileMappingW.restype = [wt.HANDLE, ctypes.c_void_p, wt.DWORD, wt.DWORD, wt.DWORD, ctypes.c_wchar_p], wt.HANDLE
+        kernel32.MapViewOfFile.argtypes, kernel32.MapViewOfFile.restype = [wt.HANDLE, wt.DWORD, wt.DWORD, wt.DWORD, ctypes.c_size_t], ctypes.c_void_p
+        kernel32.UnmapViewOfFile.argtypes, kernel32.CloseHandle.argtypes = [ctypes.c_void_p], [wt.HANDLE]
+        self.kernel32 = kernel32
+        self.handle = kernel32.CreateFileMappingW(wt.HANDLE(-1), None, 0x04, nbytes >> 32, nbytes & 0xFFFFFFFF, None)  # PAGE_READWRITE
+        self.view = kernel32.MapViewOfFile(self.handle, 0x0002 | 0x0004, 0, 0, nbytes) if self.handle else None  # FILE_MAP_WRITE | FILE_MAP_READ
+        if not self.view:
+            if self.handle:
+                kernel32.CloseHandle(self.handle)
+            raise MemoryError(f"A section of {nbytes} bytes was refused ({ctypes.get_last_error()})")
+        self.sections = _sections  # held: at the interpreter's exit the module's globals are gone before the last sections
+        self.sections[self.view] = self.handle
+
+    def __del__(self):
+        self.sections.pop(self.view, None)
+        self.kernel32.UnmapViewOfFile(self.view)
+        self.kernel32.CloseHandle(self.handle)
+
+
+_sections = {}  # view address -> handle of the sections of shared_block()
+
+
+def shared_block(size):
+    """As block(), in a section of the paging file that another process may map (the helper that copies the GPU's share of experts): its handle is
+    section_of(the block's address). Windows."""
+    section = _Section(size)
+    owner = numpy.frombuffer((ctypes.c_uint8 * size).from_address(section.view), dtype=numpy.uint8).view(LockedRAM)
+    owner.section = section
+    return torch.from_numpy(owner), owner
+
+
+def section_of(address):
+    """The handle of the section of a shared_block() starting at address, None for other RAM."""
+    return _sections.get(address)
 
 
 def fits(nbytes, cap=0):

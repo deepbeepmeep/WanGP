@@ -4,8 +4,9 @@ multiplied by its scale and rounded to the compute dtype exactly as the dequanti
 activations on the tensor cores (fp32 accumulation). The weight matrix is never materialized: same values as dequantization + matmul
 up to the order of the sums.
 
-GPUs before sm89 cannot convert float8 in Triton: their weights are read as bytes and decoded with integer operations (same values).
-Before sm80, BF16 and FP32 products use IEEE FP32 arithmetic, preserving BF16's range without requiring BF16 or TF32 tensor cores.
+GPUs before sm89 and AMD GPUs cannot convert float8 in Triton: their weights are read as bytes and decoded with integer operations
+(same values). Before sm80, BF16 and FP32 products use IEEE FP32 arithmetic, preserving BF16's range without requiring BF16 or TF32
+tensor cores; AMD GPUs multiply with IEEE precision as well (Triton's AMD backend has no TF32).
 
 Tile sizes, as the INT8 Triton tuner does: the calls are grouped in slots (a range of tokens: tiny <= 16, small <= 128, large, for a
 layer shape N x K and kernel variant). A slot starts with a static configuration and is tuned once, outside CUDA graph recording and
@@ -141,7 +142,8 @@ def _w8a16_kernel(x, w, scale, bias, out, M, N, K, sxm, sxk, swn, swk, som, son,
 
 
 def _decode_mode(weight):
-    native = os.environ.get("WAN2GP_FP8_TRITON_DECODE", "") != "bits" and torch.cuda.get_device_capability(weight.device) >= (8, 9)
+    # ROCm reports the gfx version as capability and Triton does not convert float8 on every AMD GPU: bytes decoded there
+    native = os.environ.get("WAN2GP_FP8_TRITON_DECODE", "") != "bits" and torch.version.hip is None and torch.cuda.get_device_capability(weight.device) >= (8, 9)
     return _DECODE["native"] if native else _DECODE[weight.dtype]
 
 
@@ -159,7 +161,7 @@ def _launch(x, weight, scale, bias, out, decode, config):
     _w8a16_kernel[(triton.cdiv(m, bm) * triton.cdiv(n, bn),)](
         x, w, scale, bias, out, m, n, k, x.stride(0), x.stride(1), w.stride(0), w.stride(1), out.stride(0), out.stride(1),
         scale.numel() > 1, bias is not None, decode, k % bk == 0, bm, bn, bk, 8,
-        BF16_SIMT=bf16_simt, IEEE=pre_sm80, num_warps=warps, num_stages=stages)
+        BF16_SIMT=bf16_simt, IEEE=pre_sm80 or torch.version.hip is not None, num_warps=warps, num_stages=stages)  # AMD's tl.dot has no tf32
 
 
 def _load_cache():

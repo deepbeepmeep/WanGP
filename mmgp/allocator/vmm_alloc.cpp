@@ -373,6 +373,8 @@ struct Device {
     bool beyond_gpu = false;                                   // vmm_alloc's last attempt: the VRAM of other processes is not counted
     int refusal = 0;                                           // what refused new memory last (Refusal), for the out of memory message
     int64_t refused_need = 0, refused_headroom = 0;            // the new memory it needed, headroom included, and that headroom
+    int refused_result = 0;                                    // the driver's error for an address range it refused or could not map
+    bool spill_tried = false;                                  // the allocation running tried to spill into system RAM
     std::unordered_map<CUdeviceptr, DebugEntry> debug_live;  // debug mode: the live allocations of the threshold and more
     std::map<int64_t, DebugSnapshot> debug_peaks;            // per phase
     std::map<int64_t, DebugSnapshot> debug_reserved_peaks;
@@ -487,7 +489,7 @@ void trim_pools(Device& d) {
 // Deepy, ComfyUI, a game): NVML's free memory of the whole GPU is checked too. NVML only counts memory once written: it is read at most
 // every 2 s, when this process' allocations have normally been written, and the allocator's own growth since is subtracted.
 // An allocation that would fail anyway is tried once more without it (beyond_gpu): Windows pages the VRAM of idle processes out.
-enum Refusal : int { REFUSED_BY_BUDGET = 1, REFUSED_BY_GPU, REFUSED_BY_LIMIT, REFUSED_BY_DRIVER };
+enum Refusal : int { REFUSED_BY_BUDGET = 1, REFUSED_BY_GPU, REFUSED_BY_LIMIT, REFUSED_BY_DRIVER, REFUSED_ADDRESS_RANGE, REFUSED_MAPPING };
 
 // On Windows this process' budget is read from DXGI (budget - usage, what Windows manages residency by), not from the driver's free memory:
 // once a CUDA memory pool holds memory, the driver also limits that figure to the addresses left in a window the pools may grow into,
@@ -550,10 +552,11 @@ int64_t room_now(Device& d, int* bound = nullptr) {  // bound: the Refusal of th
     return room;
 }
 
-void refuse(Device& d, int refusal, size_t bytes, size_t headroom) {
+void refuse(Device& d, int refusal, size_t bytes, size_t headroom, CUresult result = CUDA_SUCCESS) {
     d.refusal = refusal;
     d.refused_need = static_cast<int64_t>(bytes + headroom);
     d.refused_headroom = static_cast<int64_t>(headroom);
+    d.refused_result = static_cast<int>(result);
 }
 
 bool vram_short(Device& d, size_t bytes, size_t headroom = vram_headroom) {
@@ -784,6 +787,7 @@ void* alloc_spilled(Device& d, size_t size, CUstream stream) {
     // Spill mode, VRAM has no room for the tensor: it goes to pinned system RAM mapped into the GPU's address space (read and written
     // over PCIe), explicitly rather than through the Windows driver's fallback, which can lose the CUDA context when it fails.
     if (!d.host_granularity) return nullptr;
+    d.spill_tried = true;
     size_t mapped = (size + d.host_granularity - 1) / d.host_granularity * d.host_granularity;
     for (auto it = d.spill_cache.begin(); it != d.spill_cache.end(); ++it) {  // a freed spilled tensor of the same size: no new pinning
         if (it->second.size == mapped && reusable(it->second.freed, it->second.stream, stream)) {
@@ -804,7 +808,8 @@ void* alloc_spilled(Device& d, size_t size, CUstream stream) {
     }
     if (result != CUDA_SUCCESS) return nullptr;
     CUdeviceptr va = 0;
-    if (cu.MemAddressReserve(&va, mapped, 0, 0, 0) != CUDA_SUCCESS) {
+    if ((result = cu.MemAddressReserve(&va, mapped, 0, 0, 0)) != CUDA_SUCCESS) {
+        refuse(d, REFUSED_ADDRESS_RANGE, mapped, 0, result);
         cu.MemRelease(handle);
         return nullptr;
     }
@@ -917,7 +922,8 @@ void* alloc_large(Device& d, size_t size, CUstream stream) {
         range.chunks.push_back(handle);
         ++d.chunks_total;
     }
-    if (cu.MemAddressReserve(&range.va, range.size, chunk_size, 0, 0) != CUDA_SUCCESS) {
+    if (CUresult result = cu.MemAddressReserve(&range.va, range.size, chunk_size, 0, 0); result != CUDA_SUCCESS) {
+        refuse(d, REFUSED_ADDRESS_RANGE, range.size, 0, result);
         for (auto h : range.chunks) d.spare.push_back({h, nullptr, stream});
         return nullptr;
     }
@@ -1019,6 +1025,7 @@ bool take_pool_chunks(Device& d, std::vector<CUmemGenericAllocationHandle>& chun
     }
     // Spill mode, VRAM has no room: a graph pool maps chunks of pinned system RAM at the addresses it needs (alloc_spilled cannot serve
     // it), owned by the pool until it is destroyed and never given to ordinary allocations. Ordinary pools spill with alloc_spilled.
+    d.spill_tried |= chunks.size() < need && spill && !pool.ordinary && d.host_granularity;
     if (chunks.size() < need && spill && !pool.ordinary && d.host_granularity && !ram_short((need - chunks.size()) * chunk_size)) {
         CUmemAllocationProp host = d.prop;
         host.location = {CU_MEM_LOCATION_TYPE_HOST, 0};
@@ -1036,11 +1043,13 @@ bool take_pool_chunks(Device& d, std::vector<CUmemGenericAllocationHandle>& chun
 
 bool map_pool_chunks(Device& d, CUdeviceptr start, const std::vector<CUmemGenericAllocationHandle>& chunks) {
     size_t mapped = 0;
+    CUresult result = CUDA_SUCCESS;
     for (; mapped < chunks.size(); ++mapped) {
-        if (cu.MemMap(start + mapped * chunk_size, chunk_size, 0, chunks[mapped], 0) != CUDA_SUCCESS) break;
+        if ((result = cu.MemMap(start + mapped * chunk_size, chunk_size, 0, chunks[mapped], 0)) != CUDA_SUCCESS) break;
         log_chunk((uint64_t)chunks[mapped], "mapped", nullptr, -1, start + mapped * chunk_size, 0);
     }
-    if (mapped == chunks.size() && cu.MemSetAccess(start, mapped * chunk_size, &d.access, 1) == CUDA_SUCCESS) return true;
+    if (mapped == chunks.size() && (result = cu.MemSetAccess(start, mapped * chunk_size, &d.access, 1)) == CUDA_SUCCESS) return true;
+    refuse(d, REFUSED_MAPPING, chunks.size() * chunk_size, 0, result);
     if (mapped) {
         {   // a lent chunk may still have a stale mapping that the thread removes (see unmapping_chunks)
             std::unique_lock<std::mutex> guard(retired_lock);
@@ -1164,7 +1173,11 @@ bool grow_pool(Device& d, Pool& pool, const MempoolId& id, CUstream stream, Pool
         size_t free_bytes, total;
         if (cu.MemGetInfo(&free_bytes, &total) != CUDA_SUCCESS) return false;
         arena.capacity = (total + chunk_size - 1) / chunk_size * chunk_size;
-        if (cu.MemAddressReserve(&arena.va, arena.capacity, chunk_size, 0, 0) != CUDA_SUCCESS) return false;
+        if (CUresult result = cu.MemAddressReserve(&arena.va, arena.capacity, chunk_size, 0, 0); result != CUDA_SUCCESS) {
+            arena.va = 0;
+            refuse(d, REFUSED_ADDRESS_RANGE, arena.capacity, 0, result);
+            return false;
+        }
     }
     size_t need = (bytes + chunk_size - 1) / chunk_size;
     if (need * chunk_size > arena.capacity - arena.size) return false;
@@ -1194,8 +1207,12 @@ void* alloc_pool_large(Device& d, const MempoolId& id, size_t size, CUstream str
     if (!dptr) {
         Range range;
         range.size = bytes;
-        if (cu.MemAddressReserve(&range.va, bytes, chunk_size, 0, 0) != CUDA_SUCCESS ||
-            !map_shared_pool_chunks(d, pool, id, stream, range.va, need, range.chunks)) {
+        CUresult result = cu.MemAddressReserve(&range.va, bytes, chunk_size, 0, 0);
+        if (result != CUDA_SUCCESS) {
+            range.va = 0;
+            refuse(d, REFUSED_ADDRESS_RANGE, bytes, 0, result);
+        }
+        if (result != CUDA_SUCCESS || !map_shared_pool_chunks(d, pool, id, stream, range.va, need, range.chunks)) {
             if (range.va) cu.MemAddressFree(range.va, bytes);
             return nullptr;
         }
@@ -1454,11 +1471,17 @@ const char* format_size(double bytes, char* text) {  // as PyTorch's out of memo
              format_size(static_cast<double>(std::max<int64_t>(reserved_now(d) - d.allocated, 0)), unused));
     static const char* reasons[] = {"", "no VRAM was left for this process", "other programs use the rest of the GPU's VRAM",
                                     "the VRAM limit set for this process was reached", "the CUDA driver refused it"};
-    if (d.refusal)
+    if (d.refusal == REFUSED_ADDRESS_RANGE)  // an address range takes no VRAM: what ran out is the process' GPU address space
+        length += snprintf(message + length, sizeof(message) - length, " Reserving %s of GPU address space failed (CUDA error %d), which takes no VRAM.",
+                           format_size(static_cast<double>(d.refused_need), need), d.refused_result);
+    else if (d.refusal == REFUSED_MAPPING)
+        length += snprintf(message + length, sizeof(message) - length, " Mapping %s of memory at its GPU addresses failed (CUDA error %d).",
+                           format_size(static_cast<double>(d.refused_need), need), d.refused_result);
+    else if (d.refusal)
         length += snprintf(message + length, sizeof(message) - length, " %s more VRAM was needed (%s of it kept free for the driver), refused "
                            "because %s.", format_size(static_cast<double>(d.refused_need), need),
                            format_size(static_cast<double>(d.refused_headroom), headroom), reasons[d.refusal]);
-    if (spill) {  // the allocation could not spill either
+    if (spill && d.spill_tried) {  // the allocation could not spill either
         unsigned long long ram_total, ram_available;
         ram_info(ram_total, ram_available);
         length += snprintf(message + length, sizeof(message) - length, " Spilling into system RAM (%s spilled) stopped: %s of RAM available, %s kept "
@@ -1806,7 +1829,7 @@ EXPORT void* vmm_alloc(size_t size, int device, CUstream stream) {
     std::unique_lock<std::mutex> guard(lock);
     Device& d = device_state(device);
     RelaxedCapture relaxed(any_capture());
-    if (!in_pressure_callback) d.refusal = 0;
+    if (!in_pressure_callback) d.refusal = 0, d.spill_tried = false;
     void* ptr = nullptr;
     bool to_pool = false;
     for (auto capture = d.captures.rbegin(); capture != d.captures.rend() && !to_pool; ++capture) {

@@ -552,7 +552,6 @@ class Qwen35AssistantRuntime:
         self.telemetry_enabled = self.debug_enabled and _DEEPY_TELEMETRY_ENABLED
         self._runtime_extra_tokens = getattr(model, "_prompt_enhancer_thinking_extra_tokens", 0)
         self._assistant_presence_state = None
-        self._repetition_rules = None
         self._nvml_handle = None
         self._nvml_module = None
         self._nvml_failed = False
@@ -1414,13 +1413,15 @@ class Qwen35AssistantRuntime:
         """The repetition penalty keeps Deepy's prose and reasoning from looping on words; ids, paths and code are copied, not repeated. Only words
         are penalized: a space then letters, or letters of a script without ASCII (CJK). Symbols, digits and the pieces glued to them in ids and
         paths (outputs, _seed, the h of 16h37) never are, and inside code fences, backticks and double quotes the penalty is suspended
-        (shared.llm_engines.lmgp.engine.model_runner). The vocabulary is classified once."""
-        if self._repetition_rules is None:
+        (shared.llm_engines.lmgp.engine.model_runner). The vocabulary is classified once per model (about 1.3 s for 248K tokens, 4 MiB kept): the
+        rules stay with the model, which outlives the runtimes rebuilt after each unload from VRAM."""
+        rules = getattr(self.model, "_prompt_enhancer_repetition_rules", None)
+        if rules is None:
             texts = self.tokenizer.batch_decode([[token_id] for token_id in range(len(self.tokenizer))], skip_special_tokens=False, clean_up_tokenization_spaces=False)
             exempt = frozenset(token_id for token_id, text in enumerate(texts) if not (text.strip().isalpha() and (text[:1] == " " or not text.isascii())))
             marks = {token_id: text for token_id, text in enumerate(texts) if "`" in text or '"' in text or "\n" in text}
-            self._repetition_rules = exempt, marks
-        seq.repetition_exempt_ids, seq.repetition_span_marks = self._repetition_rules
+            rules = self.model._prompt_enhancer_repetition_rules = exempt, marks
+        seq.repetition_exempt_ids, seq.repetition_span_marks = rules
 
     def _install_action_processors(self, seq: Sequence, phase: str, phase_limit: int, continuing_response: bool) -> None:
         penalty_enabled = phase in {"thought", "statement"}

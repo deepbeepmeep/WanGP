@@ -103,6 +103,65 @@ if triton is not None:
             tl.store(target + offsets, values, mask=mask)
 
 
+    @triton.jit
+    def _load_long(address):
+        """An int64 of mapped RAM, not from the caches."""
+        return tl.inline_asm_elementwise("ld.volatile.global.u64 $0, [$1];", "=l,l", [address], dtype=tl.int64, is_pure=False, pack=1)
+
+
+    @triton.jit
+    def _now(dummy):
+        """The GPU's clock, in ns."""
+        return tl.inline_asm_elementwise("mov.u64 $0, %globaltimer;", "=l,r", [dummy], dtype=tl.int64, is_pure=False, pack=1)
+
+
+    @triton.jit(do_not_specialize=("numel", "errors"), do_not_specialize_on_alignment=("rows", "table", "base"))
+    def _read_rows(rows, table, base, numel, errors, WIDTH: tl.constexpr, BLOCK: tl.constexpr, EARLY: tl.constexpr, COPY: tl.constexpr, TIMEOUT: tl.constexpr):
+        """table (int64 [numel // WIDTH, WIDTH]) zeroed (COPY: a copy of base), then the rows a host job wrote to mapped RAM: their count, then (index, WIDTH values) each.
+        EARLY: the job publishes them while it runs (the count is -1 until then), each row followed by the address of a word that a copy sets once it has landed: both
+        waited for (TIMEOUT ns at most: a row then left out, counted at rows[errors]), and the count set back to -1 for the next job."""
+        for start in range(0, numel, BLOCK):
+            offsets = start + tl.arange(0, BLOCK)
+            values = tl.load(base + offsets, mask=offsets < numel, other=0) if COPY else tl.zeros([BLOCK], dtype=tl.int64)
+            tl.store(table + offsets, values, mask=offsets < numel)
+        tl.debug_barrier()
+        count = _load_long(rows.to(tl.int64))
+        if EARLY:
+            started = _now(count.to(tl.int32) * 0)
+            while count < 0 and _now(count.to(tl.int32) * 0) - started < TIMEOUT:
+                count = _load_long(rows.to(tl.int64))
+            failed = (count < 0).to(tl.int64)
+            count = tl.maximum(count, 0)
+            for n in range(0, count):
+                entry = rows + 1 + n * (WIDTH + 2)
+                done = _load_long((entry + WIDTH + 1).to(tl.int64))
+                landed = (done == 0).to(tl.int32)  # 0: read in place, nothing to wait for
+                if done != 0:
+                    landed = _load_word(done)
+                    while landed == 0 and _now(landed * 0) - started < TIMEOUT:
+                        landed = _load_word(done)
+                if landed != 0:
+                    index = _load_long(entry.to(tl.int64))
+                    for k in tl.static_range(WIDTH):
+                        tl.store(table + index * WIDTH + k, _load_long((entry + 1 + k).to(tl.int64)))
+                else:
+                    failed += 1
+            if failed > 0:
+                tl.store(rows + errors, _load_long((rows + errors).to(tl.int64)) + failed)
+            tl.store(rows, count * 0 - 1)
+        else:
+            for n in range(0, count):
+                entry = rows + 1 + n * (WIDTH + 1)
+                index = _load_long(entry.to(tl.int64))
+                for k in tl.static_range(WIDTH):
+                    tl.store(table + index * WIDTH + k, _load_long((entry + 1 + k).to(tl.int64)))
+
+
+    @triton.jit(do_not_specialize=("index",), do_not_specialize_on_alignment=("words",))
+    def _mark(words, index):
+        tl.store(words + index, index * 0 + 1)
+
+
 class _Mailbox:
     """The words of the server, one set per process."""
     def __init__(self, device):
@@ -212,6 +271,25 @@ def wait(ticket, result, output, add):
     _wait[(1,)](_mailbox.views[ticket], _mailbox.state, num_warps=1)
     _read[((count + READ_WORDS - 1) // READ_WORDS,)](_mailbox.state, result, output, count, ADD=bool(add), num_warps=4)
     torch.autograd.graph.increment_version(output)
+
+
+ROWS_TIMEOUT = 2_000_000_000  # ns a row of read_rows(early=True) is waited for: a copy that never lands (its helper gone) leaves the row out instead of stopping the GPU
+
+
+def mark(words, index):
+    """Graph-safe, on the current stream: words[index] = 1 (an int64 CUDA view of mapped RAM), once the work queued before has run: a host job sees it."""
+    _mark[(1,)](words, index, num_warps=1)
+
+
+def read_rows(rows, table, early=False, errors=0, base=None):
+    """Graph-safe, on the current stream: table (int64 [entries, width] in VRAM) zeroed (or a copy of base, of its shape), then the rows a job wrote to rows (an int64 CUDA view of
+    mapped RAM: their count, then (index, width values) each), after wait() of the job. early: before wait(), the job publishing them while it runs, each row followed by the address
+    of a word set once what it points to has landed (both waited for; rows[errors] counts the rows left out after ROWS_TIMEOUT)."""
+    assert rows.is_cuda and table.is_cuda and rows.dtype == table.dtype == torch.int64 and table.is_contiguous() and table.dim() == 2
+    assert base is None or base.is_cuda and base.dtype == torch.int64 and base.is_contiguous() and base.shape == table.shape
+    _read_rows[(1,)](rows, table, table if base is None else base, table.numel(), errors, WIDTH=table.shape[1], BLOCK=1024, EARLY=bool(early), COPY=base is not None, TIMEOUT=ROWS_TIMEOUT,
+                     num_warps=4)
+    torch.autograd.graph.increment_version(table)
 
 
 # Register after definitions to preserve Triton's line-number-sensitive cache keys.

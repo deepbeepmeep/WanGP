@@ -407,7 +407,7 @@ def run_remote_deepy_turn(server_config: dict[str, Any], session, text: str, sys
         active_tool.update({"id": ui_tool_id, "label": tool_label})
         _send(send_cmd, payload)
         set_remote_status(f"tool:{ui_tool_id}", f"{tool_label}...", "tool")
-        session.messages.append({"role": "assistant", "content": "", "tool_calls": [{"id": tool_call_id, "type": "function", "function": {"name": name, "arguments": json.dumps(arguments, ensure_ascii=False)}}]})
+        session.messages.append({"role": "assistant", "content": "", "tool_calls": [{"id": tool_call_id, "type": "function", "function": {"name": name, "arguments": dict(arguments)}}]})  # a mapping, as the local engine's chat template reads it
         try:
             result = toolbox.call(name, arguments)
         except Exception as exc:

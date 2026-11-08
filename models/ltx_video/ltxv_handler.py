@@ -71,6 +71,15 @@ class family_handler():
         return "ltxv"
 
     @staticmethod
+    def query_retired_files(model_type):
+        """Checkpoints that earlier releases of a model type downloaded and its current definition no longer names (Models Manager
+        lists them with the model, to delete them)."""
+        return {
+            "ltxv_13B": ["ltxv_0.9.7_13B_dev_quanto_bf16_int8.safetensors"],
+            "ltxv_distilled": ["ltxv_0.9.8_13B_distilled_dev_bf16.safetensors"],
+        }.get(model_type, [])
+
+    @staticmethod
     def query_model_files(computeList, base_model_type, model_def=None):
         return {
             "repoId" : "DeepBeepMeep/LTX_Video", 

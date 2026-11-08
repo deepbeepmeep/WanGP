@@ -26,7 +26,7 @@ def _maybe_add_nvfp4_cu13_dll_dir():
 
 try:
     from comfy_kitchen.backends import cuda as _ck_cuda
-    _ck_cuda_available = getattr(_ck_cuda, "_EXT_AVAILABLE", False)
+    _ck_cuda_available = getattr(_ck_cuda, "_EXT_AVAILABLE", False) and torch.version.hip is None  # under ROCm it loads but takes only CUDA tensors
 except Exception:
     _ck_cuda = None
     _ck_cuda_available = False

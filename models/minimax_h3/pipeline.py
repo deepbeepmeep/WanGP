@@ -26,7 +26,8 @@ from .dialogue import H3_DIALOGUE_GENERATION, generate_dialogue, is_dialogue_pro
 from .excerpts import H3_AUDIO_EXCERPTS_SETTING, H3_VIDEO_EXCERPTS_SETTING, parse_excerpts, reference_video_frame_limit
 from .first_block_cache import MiniMaxH3FirstBlockCache
 from .interrupt import GenerationInterrupted
-from .p_h3_image import P_H3_IMAGE_SIGMAS, reference_size, size_at_area
+from .p_h3_image import p_h3_image_sigmas, reference_size, size_at_area
+from .hyperflow import HYPERFLOW_STEPS, HYPERFLOW_VIDEO_SHIFT, video_sigmas as hyperflow_video_sigmas
 from .pdd import pdd_sampling_plans, pdd_sampling_plans_for_sigmas
 from .pika import PIKA_SOLVER, PIKA_STEPS, PIKA_VIDEO_SHIFT, noise as pika_noise, renoise_ as pika_renoise_, sigma_schedule as pika_sigma_schedule
 from .spectrum import MiniMaxH3Spectrum
@@ -831,7 +832,13 @@ class MiniMaxH3Pipeline:
                 loras_slists=loras_slists, loras_selected=loras_selected, custom_settings=custom_settings,
                 set_progress_status=set_progress_status, verbose_level=verbose_level)
         self._use_shared_components()
-        phase_1_sigmas = custom_sigmas[0] if custom_sigmas else P_H3_IMAGE_SIGMAS if self.image_model else VIGGLE_REMAKE_SIGMAS[self.remake_mode] if self.remake_mode else None
+        hyperflow = self.transformer.endpoint_gate is not None
+        if hyperflow and (int(sampling_steps) not in HYPERFLOW_STEPS or sample_solver != "euler" or int(guide_phases) != 1 or float(shift) != HYPERFLOW_VIDEO_SHIFT
+                          or custom_sigmas or starting_sigma is not None or self.transformer.cache is not None):
+            raise ValueError(f"HyperFlow H3 Flash samples {', '.join(map(str, HYPERFLOW_STEPS))} steps with the Euler sampler, flow shift 12, one phase, "
+                             "no custom sigmas, no partial-schedule refinement and no step skipping")
+        phase_1_sigmas = (custom_sigmas[0] if custom_sigmas and custom_sigmas[0] is not None else p_h3_image_sigmas(int(sampling_steps)) if self.image_model else VIGGLE_REMAKE_SIGMAS[self.remake_mode] if self.remake_mode
+                          else hyperflow_video_sigmas(sampling_steps) if hyperflow else None)
         phase_2_sigmas = custom_sigmas[1] if custom_sigmas and len(custom_sigmas) > 1 else None
         if phase_1_sigmas is not None:
             sampling_steps = len(phase_1_sigmas)
@@ -1384,6 +1391,7 @@ class MiniMaxH3Pipeline:
                         _reinject_video_source(video[:, :, :source_latents.shape[2]], source_latents, source_noise, step_editable_mask,
                                                sigma_video, source_buffer, 1.0 - VISUAL_COND_TIMESTEP)
                     model_sigma_video = condition_control_video(video, sigma_video)
+                    payload["endpoint_sigmas"] = (sigma_video_next, stage_sigmas_audio[step + 1])  # where the step lands: HyperFlow's r
                     video_velocity, audio_velocity = self.transformer(video, audio, model_sigma_video, stage_sigmas_audio[step:step + 1], context, payload, spectrum=spectrum, first_block_cache=first_block_cache)
                     if spectrum is not None:
                         spectrum.finish_step()

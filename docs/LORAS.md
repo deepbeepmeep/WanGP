@@ -205,6 +205,10 @@ A LoRA trained on a custom pruned checkpoint must identify its source conditioni
 
 Conversion preserves adapter rank and strength controls. It makes the supported tensor layouts compatible; generation quality still depends on the LoRA and target fine-tune.
 
+### MiniMax H3 HyperFlow Flash
+
+HyperFlow H3 Flash removed a few H3 blocks and compressed others. LoRAs made for the matching H3 model (FL2VA or Ref2VA) still load on it: their changes to the removed blocks are skipped and their timestep part is adapted, so their effect can be somewhat weaker than on the model they were trained for. Accelerator LoRAs (Turbo, PDD, Pika) are not needed: HyperFlow is already a few-step model.
+
 WanGP supports multiple most lora formats:
 - **Safetensors** (.safetensors)
 - **Replicate** format

@@ -1,0 +1,17 @@
+{
+    "model": {
+        "name": "MiniMax H3 FL2VA HyperFlow Flash 14B",
+        "architecture": "minimax_h3_fl2va_pruned",
+        "parent_model_type": "minimax_h3_fl2va_hyperflow",
+        "description": "Generates synchronized video and stereo audio from text alone, a first frame, a last frame, or both, in 4, 6 or 8 steps without guidance. At its default 6 steps it denoises about a third faster than the 8-step PDD models from a smaller 15 GB checkpoint; as a compressed distillation it can lose some fine detail. Video Rebirth's HyperFlow distillation of H3.",
+        "URLs": [
+            "https://huggingface.co/DeepBeepMeep/MiniMax-H3/resolve/main/MiniMax-H3-FL2VA-HyperFlow-Flash-14B_int8_convrot.safetensors"
+        ],
+        "hyperflow": true
+    },
+    "num_inference_steps": 6,
+    "guidance_phases": 1,
+    "sample_solver": "euler",
+    "flow_shift": 12.0,
+    "prompt": "integrated_multimodal_description: [Shot 1] A five-second cinematic single take inside a rain-lashed glass observatory at midnight. A radio astronomer sits before an antique brass receiver while electric-blue constellations drift across a translucent star map behind her. The camera makes a slow push from medium shot to close-up as the receiver emits three precise tones. She leans toward its microphone, looks up with sudden hope, and says clearly (S1) <d>[English] If you can hear me, follow this signal.</d> While finishing the line, she presses the transmit key; one brilliant blue pulse races across the star map and lights her restrained smile. Her speech completes naturally within the shot with precise lip synchronization.\noverall_soundscape: Rain rattling across the observatory dome, a low electrical hum, three clean receiver tones, a brass switch clicking, the astronomer's synchronized voice, and a short stereo transmission pulse.\nnon_diegetic_music: One quiet bowed-glass chord rising beneath the transmission and fading at the end."
+}

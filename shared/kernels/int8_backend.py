@@ -555,7 +555,8 @@ def kitchen_linear_fused(input, weight, bias, input_act, act_weight, act_eps, re
     bias_arg = (_kitchen._gemm_vector_arg(bias, input.device, input.dtype) if bias is not None
                 else _kitchen._empty_cuda_tensor(input.device, input.dtype))
     act_arg = _kitchen._act_weight_arg(input_act, act_weight, input.device, input.dtype)
-    residual_arg = (_kitchen._gemm_vector_arg(residual_scale, input.device, input.dtype)
+    # Kitchen's residual epilogue always takes one scale per output channel: no scale (linear_residual_, an ungated mlp) is 1
+    residual_arg = (_kitchen._gemm_vector_arg(input.new_ones(n) if residual_scale is None else residual_scale, input.device, input.dtype)
                     if r is not None else None)
     for start in range(0, x.shape[0], rows):
         stop = min(start + rows, x.shape[0])
@@ -579,6 +580,7 @@ def kitchen_linear_fused(input, weight, bias, input_act, act_weight, act_eps, re
         del q, qs, tile
     if supplied is not None:
         torch.autograd.graph.increment_version(supplied)  # written in place: MMGP CUDA graphs copy a mutated block argument back
+        return supplied  # the tensor itself (an output that is an argument stays that argument in CUDA graphs)
     return out.reshape(*input.shape[:-1], n)
 
 

@@ -25,6 +25,7 @@ _FIRST_ALWAYS = "firstdraft" in os.environ.get("WGP_FN_ENABLE", "").split(",")  
 _CHAIN = "chain" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the drafts of a window read from mapped RAM, the switch goes with the others at the end
 _DRAFT_COSTS = "draftcost" in os.environ.get("WGP_FN_ENABLE", "").split(",")  # a greedy window's drafts decided by what they bring at the measured costs, until proven
 _SINGLE_DECODE = "host_py" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # _prepare_single_decode and its kept sampling parameters, proven: the switch goes with the others at the end
+_DRAFT_PREFETCH = "draft_prefetch" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the n-gram rows of a window read while its drafts are computed: Deepy's context 141 -> 147 tok/s, a short prompt 168 -> 184 (drive calm); the switch goes with the others at the end
 
 
 
@@ -1887,6 +1888,12 @@ class ModelRunner:
         step_logits = graph_vars["logits"][0, -1]
         confidences = self._window_confidences = []
         tokens = []
+        # the n-gram rows of the window (a drive read per row the cache misses) start while the drafter works: its first token's now, each draft's once drawn
+        prefetch = getattr(self.model, "lm_engine_prefetch", None) if _DRAFT_PREFETCH else None
+        recent = seq.token_ids[-8:]
+        first, offset = len(recent) - 1, len(seq.token_ids) - len(recent)
+        if prefetch is not None:
+            prefetch(recent, first, offset)
         for index in range(draft_count):
             count = chain.top(logits, index, temperature, top_p)
             if rejection_sampling:
@@ -1903,9 +1910,13 @@ class ModelRunner:
             chain.draft_ids[index] = token
             tokens.append(token)
             if index + 1 == draft_count:
+                if prefetch is not None:
+                    prefetch([*recent, *tokens], first, offset)
                 break
             chain.feed(token, start_position + index, cache.get_seq_length(), graph_vars, hidden)
             self.mtp_graph.replay()
+            if prefetch is not None:  # while the GPU computes the next draft
+                prefetch([*recent, *tokens], first, offset)
             cache.advance(1)
             logits, hidden = step_logits, graph_vars["outputs"]
         if not rejection_sampling:

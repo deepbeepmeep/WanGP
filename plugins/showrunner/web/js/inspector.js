@@ -7,7 +7,7 @@ import { api } from './api.js';
 import { icon, esc, art, fieldSaver, formatDuration, toast, promptDialog, menu, confirmDialog, shotRefs, shotText, availability, pickFiles } from './ui.js';
 import { shotMenu, notFinal, finalTier, tierToggle, bindTierToggle } from './storyboard.js';
 import { showItem } from './bin.js';
-import { choiceLabel, templateLabel } from './models.js';
+import { choiceLabel, rulesButton, showRules, templateLabel } from './models.js';
 import { segments } from './sequencer.js';
 
 const TRANSITIONS = [['cut', 'Cut'], ['crossfade', 'Dissolve'], ['fade_black', 'Fade black'], ['fade_white', 'Fade white']];
@@ -66,7 +66,7 @@ export function mountInspector(root) {
         ${take && doc.brief.review_before_edit ? `<button class="btn small icon reject ${shot.status === 'rejected' && verdict?.by === 'user' ? 'active' : ''}" id="i-reject" title="Mark the take for a redo, with a note for the showrunner, and carry on reviewing">${icon('x')}</button>` : ''}
         <button class="btn small icon" id="i-more" title="More">${icon('more')}</button></div>
       <div class="player" id="i-player">${playerHtml(shot, take, compare)}</div>
-      ${remakeFrames(shot)}
+      ${remakeFrames(shot)}${startPictures(shot)}
       ${shot.takes.length ? `<div><div class="label">${icon('layers')} Takes <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">click to use · right-click to compare or remove</span></div>
         <div class="takes">${shot.source_range ? `<div class="take ${sourceOn || compare?.id === 'source' ? 'cmp' : ''}" data-source title="Your video: click to watch it here, right-click to compare it with the used take"><img src="${shot.source_poster ? actions.file(shot.source_poster) : ''}" alt=""><span class="take-label">Source</span></div>` : ''}${shot.takes.map((item, number) => `<div class="take ${item.id === take?.id ? 'on' : ''} ${item.id === compare?.id ? 'cmp' : ''}" data-take="${item.id}" title="${esc(shotText(item.note || "", doc.shots, doc.cast))} · ${item.by === 'deepy' ? 'the showrunner' : item.by === 'user' ? 'you' : item.by}">
           ${item.poster ? `<img src="${actions.file(item.poster)}" alt="">` : `<div style="aspect-ratio:16/9;${art(item.id)}"></div>`}<span class="take-label">T${number + 1}${item.kept_source ? ' · kept' : drafts && item.height ? ` · ${Math.min(item.width, item.height)}p` : item.duration_s ? ` · ${keptSeconds(shot, item).toFixed(1)}s` : ''}</span>
@@ -79,7 +79,8 @@ export function mountInspector(root) {
           ${take.settings && Object.keys(take.settings).length ? `<button class="btn" id="i-rerun" ${availability(rendering ? 'This shot is rendering: wait for its take.' : '', 'Another take now, with the same prompt and pictures and a new seed, without the showrunner: nobody is told what was wrong. To say it, use Fix.')}>${icon('refresh')} Reshoot</button>` : ''}</div>
         ${[verdict, verdict?.by === 'user' && take.showrunner_verdict].filter(Boolean).map(item => `<div class="verdict-note ${item.ok ? 'ok' : 'bad'}">${icon(item.ok ? 'check' : 'alert')}<span><b>${item.by === 'user' ? 'You' : 'Showrunner'}:</b> ${shotRefs(item.note || (item.by === 'user' ? (item.ok ? 'Approved.' : 'Marked for a redo.') : item.ok ? 'Good take.' : 'Needs a retry.'), doc.shots, doc.cast)}</span></div>`).join('')}
         ${heardHtml(take, shot)}${checksHtml(take, shot)}` : `<div class="verdict-row">${shootButtons}${drafts ? '' : `<button class="btn primary" id="i-shoot" ${availability(rendering ? 'This shot is rendering: wait for its take.' : actions.directorBlocked())}>${icon('clapper')} ${rendering ? 'Rendering…' : 'Shoot this shot'}</button>`}
-          ${rendering ? '' : `<button class="btn" id="i-render" ${availability(actions.renderBlocked(), 'Renders it now from its prompt, without the showrunner: no language model, and nobody checks the take. Without a prompt, one is made from what you wrote on the shot.')}>${icon('bolt')} Render now</button>`}</div>`}
+          ${rendering ? '' : `<button class="btn" id="i-render" ${availability(actions.renderBlocked(), 'Renders it now from its prompt, without the showrunner: no language model, and nobody checks the take. Without a prompt, one is made from what you wrote on the shot.')}>${icon('bolt')} Render now</button>`}
+          ${rendering || remake ? '' : `<button class="btn" id="i-own-take" title="A video or a picture of yours as this shot's take, instead of rendering one">${icon('upload')} Use my video…</button>`}</div>`}
       ${remake ? '<div class="together-note" id="i-together" hidden></div>' : ''}
       <div class="field"><div class="label">${icon('sparkles')} What happens</div><textarea class="textarea" id="i-intent" rows="3" placeholder="${{ music_video: 'The singer turns to the camera as the chorus starts…', ad: 'The product in use, close up, the moment it pays off…', story: 'The fox finds the lantern at the edge of the wood…', remake: 'What changes in this shot: who replaces whom, what is removed or restyled…' }[doc.brief.kind] || 'She hears the radio crackle and turns to the window…'}">${esc(shot.intent)}</textarea></div>
       <div class="field"${notForRemake}><div class="label">${icon('chat')} Dialogue <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">${doc.brief.voices_from_model && !['music_video', 'story'].includes(doc.brief.kind) ? 'the video model says these words: they join the prompt when the shot renders' : 'words spoken or sung in this shot'}</span></div>
@@ -92,8 +93,8 @@ export function mountInspector(root) {
         <div class="field"${notForRemake}><div class="label">${icon('clock')} Duration ${take?.duration_s ? `<span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500" title="What the edit plays of this shot's video">plays ${(segments(doc, actions.take).find(item => item.shot.id === shot.id)?.duration ?? 0).toFixed(1)} s of ${take.duration_s.toFixed(1)} s</span>` : ''}</div><input class="input" id="i-duration" type="number" min="0.5" max="60" step="0.1" value="${shot.duration_s ?? ''}"></div>
         <div class="field"><div class="label">${icon('layers')} Section</div><input class="input" id="i-section" list="i-sections" value="${esc(shot.section)}"><datalist id="i-sections">${sections.map(name => `<option value="${esc(name)}">`).join('')}</datalist></div>
         <div class="field" style="grid-column:1/-1${remake ? ';display:none' : ''}"><div class="label">${icon('video')} Camera</div><input class="input" id="i-camera" value="${esc(shot.camera)}" placeholder="Slow dolly-in, low angle…"></div>
-        <div class="field" style="grid-column:1/-1"><div class="label">${icon('bolt')} Model</div><select class="select" id="i-model" title="The Deepy template that renders this shot">
-          <option value="${esc(shot.generation?.template || 'gen_video')}">${esc(templateLabel(shot.generation?.template))}</option></select></div>
+        <div class="field" style="grid-column:1/-1"><div class="label">${icon('bolt')} Model</div><div class="model-pick"><select class="select" id="i-model" title="The Deepy template that renders this shot">
+          <option value="${esc(shot.generation?.template || 'gen_video')}">${esc(templateLabel(shot.generation?.template))}</option></select>${rulesButton()}</div></div>
       </div>
       ${doc.cast.length ? `<div class="field"><div class="label">${icon('users')} In this shot</div><div class="cast-toggle">${doc.cast.map(member => {
         const image = member.master || member.images[0];
@@ -117,10 +118,19 @@ export function mountInspector(root) {
     bindShot(shot, take);
   }
 
+  const thumb = (path, label) => `<button type="button" class="painted-thumb" data-view="${esc(path)}" data-name="${esc(label)}" title="Look at it closely"><img src="${actions.file(path)}" alt="" loading="lazy" draggable="false"><span>${label}</span></button>`;
+
+  function startPictures(shot) {  // the pictures the shot's video starts and ends on, as its settings name them
+    const settings = shot.generation?.settings || {}, first = value => (Array.isArray(value) ? value[0] : value) || null;
+    const pictures = [[first(settings.image_start), 'Start'], [first(settings.image_end), 'End']].filter(([path]) => path);
+    if (shot.source_range || !pictures.length) return '';
+    return `<div class="field"><div class="label">${icon('image')} ${pictures.length > 1 ? 'Start and end pictures' : `${pictures[0][1]} picture`} <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">${pictures.length > 1 ? 'its first and last frames' : `its ${pictures[0][1] === 'Start' ? 'first' : 'last'} frame`}</span></div>
+        <div class="painted-pairs">${pictures.map(([path, label]) => thumb(path, label)).join('')}</div></div>`;
+  }
+
   function remakeFrames(shot) {  // a remake's shot: what the plan saw in it, the frames painted for it beside what they were painted from, and the user's own
     const painted = shot.painted_frames || [];
     if (!shot.source_range) return '';
-    const thumb = (path, label) => `<button type="button" class="painted-thumb" data-view="${esc(path)}" data-name="${esc(label)}" title="Look at it closely"><img src="${actions.file(path)}" alt="" loading="lazy" draggable="false"><span>${label}</span></button>`;
     const [start, stop] = shot.source_range, frames = state.doc.remake?.frames ?? stop;
     const first = start ? start + 3 : start, last = stop < frames ? stop - 4 : stop - 1;  // as the server: a painted frame keeps 3 frames from a cut
     const own = first > last ? '<div class="muted" style="font-size:12px">Too short for a painted frame of its own: it takes the look of the shots it renders with.</div>'
@@ -254,6 +264,10 @@ export function mountInspector(root) {
       if (note !== null) actions.ops([{ op: 'verdict', shot: id, take: take.id, ok: false, note }]);
     });
     root.querySelector('#i-rerun')?.addEventListener('click', () => rerun(id));
+    root.querySelector('#i-own-take')?.addEventListener('click', async () => {
+      const files = await pickFiles('video/*,image/*', false);
+      if (files.length && (await actions.upload(files, 'take', id)).length) toast('Your file is the take of this shot.', 'ok');
+    });
     if (state.doc.brief.kind === 'remake') together([id]).then(groups => {  // a click on this shot renders these with it: said before the click
       const note = root.querySelector('#i-together'), mates = (groups[0] || []).filter(other => other !== id);
       if (note && mates.length) Object.assign(note, { hidden: false, innerHTML: `${icon('layers')}<span>Renders together with ${mates.join(', ')}, in one render: short shots follow speech better that way. Each keeps its own take; one that has a take gets the new one beside it.</span>` });
@@ -320,6 +334,10 @@ export function mountInspector(root) {
       + (used.length ? `<optgroup label="Used by the other shots">${used.map(value => `<option value="${esc(value)}">${esc(templateLabel(value))}</option>`).join('')}</optgroup>` : '')
       + groups.map(role => `<optgroup label="${esc(role.label)}">${role.choices.map(choice => `<option value="${esc(choice.value)}" ${choice.value === current ? 'selected' : ''}>${esc(choice.label)}${choice.value === (role.value || role.auto) ? ' (the brief\'s choice)' : ''}</option>`).join('')}</optgroup>`).join('')
       + `<optgroup label="Other"><option value="draw_svg" ${current === 'draw_svg' ? 'selected' : ''}>${templateLabel('draw_svg')}</option></optgroup>`;
+    const rules = select.parentElement.querySelector('[data-rules]'), all = roles.flatMap(role => role.choices);  // the rules of the model picked here
+    const update = () => showRules(rules, all.find(choice => choice.value === select.value));
+    select.addEventListener('change', update);
+    update();
   }
 
   function bindCompare() {

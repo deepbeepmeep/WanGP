@@ -22,6 +22,8 @@ LANGUAGE_NAMES = {"ar": "Arabic", "de": "German", "en": "English", "es": "Spanis
 RULE = ("Shots that show a cast member take that member's pictures as reference images (a template whose inputs include references), "
         "not as image_start: a start image becomes the shot's first frame, so its framing, aspect and setting leak into the shot. "
         "Lip-synced shots also need a template that takes the song slice as driving audio.")
+PROMPT_RULES_NOTE = ("user_prompt_rules are the user's own rules for the prompts written with these templates: follow them in every prompt you write for one "
+                     "(shots, pictures, songs, voices). What the user asks in the chat comes first.")
 # The kinds of shots and media the user picks a template for, one per Deepy category in the order of Deepy's settings: the advice key,
 # the category, and what the showrunner makes with its template (shown under the category's name).
 ROLES = (
@@ -92,11 +94,13 @@ def effective(doc: dict[str, Any], catalog: list[dict[str, Any]]) -> dict[str, s
     return {**automatic(catalog), **chosen(doc, catalog)}
 
 
-def choices(doc: dict[str, Any], catalog: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The picker: every role under its Deepy category's name, with that category's templates, the automatic one and the user's pick."""
-    auto, picks = automatic(catalog), chosen(doc, catalog)
+def choices(doc: dict[str, Any], catalog: list[dict[str, Any]], rules: dict[str, str] | None = None) -> list[dict[str, Any]]:
+    """The picker: every role under its Deepy category's name, with that category's templates (and the user's prompt rules for each), the
+    automatic one and the user's pick."""
+    auto, picks, rules = automatic(catalog), chosen(doc, catalog), rules or {}
     return [{**role, "label": next(entry["category"] for entry in catalog if _fits(role["id"], entry)), "auto": auto.get(role["id"]), "value": picks.get(role["id"]),
-             "choices": [{"value": entry_name(entry), "label": entry.get("label") or entry["name"], "refs": entry.get("refs", False), "audio": entry.get("audio", False), "speaks": speaks_its_lines(entry)}
+             "choices": [{"value": entry_name(entry), "label": entry.get("label") or entry["name"], "refs": entry.get("refs", False), "audio": entry.get("audio", False), "speaks": speaks_its_lines(entry),
+                          "rules": rules.get(entry_name(entry), "")}
                          for entry in catalog if _fits(role["id"], entry)]}
             for role in ROLES if any(_fits(role["id"], entry) for entry in catalog)]
 
@@ -251,8 +255,23 @@ def whole_take(doc: dict[str, Any], catalog: list[dict[str, Any]], shot: dict[st
     return length if abs(length - planned) > 0.01 else 0.0
 
 
-def advice(doc: dict[str, Any], catalog: list[dict[str, Any]], any_length: bool = False) -> dict[str, Any]:
-    """What the director should choose for this production's shots and media."""
+def shot_entry(doc: dict[str, Any], shot: dict[str, Any], catalog: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The template a shot renders with: one left on gen_video, nobody's choice, takes the brief's Models for what it shows and says."""
+    template = shot["generation"].get("template")
+    return resolve(catalog, template == "gen_video" and template_for(doc, shot, catalog) or template)
+
+
+def rules_in_use(doc: dict[str, Any], catalog: list[dict[str, Any]], rules: dict[str, str]) -> dict[str, str]:
+    """The user's prompt rules of the templates this production makes its shots and media with (a remake's editing templates only in a remake)."""
+    if not rules:
+        return {}
+    names = [*effective(doc, catalog).values(), *(entry_name(entry) for shot in doc["shots"] if (entry := shot_entry(doc, shot, catalog)))]
+    remake = doc["brief"].get("kind") == "remake"
+    return {name: rules[name] for name in dict.fromkeys(names) if rules.get(name) and (remake or name.partition("/")[0] not in EDIT_TASKS)}
+
+
+def advice(doc: dict[str, Any], catalog: list[dict[str, Any]], any_length: bool = False, rules: dict[str, str] | None = None) -> dict[str, Any]:
+    """What the director should choose for this production's shots and media, with the user's prompt rules of the templates it uses."""
     picks, user = effective(doc, catalog), chosen(doc, catalog)
     if doc["brief"].get("kind") != "remake":  # the editing templates are a remake's: nothing about them in any other production
         user = {role: template for role, template in user.items() if TASKS[role] not in EDIT_TASKS}
@@ -305,6 +324,8 @@ def advice(doc: dict[str, Any], catalog: list[dict[str, Any]], any_length: bool 
                                        if cut_on_the_song(doc) else speaking_exception.strip()))
         if "take_lengths_s" in result:
             result["take_lengths_s"] = {template: take_lengths_in_range(resolve(catalog, template), *model.shot_range(doc)) for template in shortest}
+    if used := rules_in_use(doc, catalog, rules or {}):
+        result.update(user_prompt_rules=used, user_prompt_rules_note=PROMPT_RULES_NOTE)
     return result
 
 

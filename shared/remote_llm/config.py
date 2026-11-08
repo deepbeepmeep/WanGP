@@ -65,6 +65,7 @@ LOCAL_ENGINE_TO_ENHANCER_ID = {
     ENGINE_QWEN38_FLASH_NEXT: 7,
 }
 ENHANCER_ID_TO_LOCAL_ENGINE = {value: key for key, value in LOCAL_ENGINE_TO_ENHANCER_ID.items()}
+QWEN38_FLASH_NEXT_VISIBLE = True  # Qwen3.8 Flash-Next among the Prompt Enhancer / Deepy engines and models; False hides it
 
 LLM_ENGINE_CHOICES = [
     ("Florence 2 + Llama 3.2 3B (local)", ENGINE_LOCAL_1),
@@ -72,7 +73,7 @@ LLM_ENGINE_CHOICES = [
     ("Qwen3.5 VL Abliterated 4B (local)", ENGINE_QWEN35_4B),
     ("Qwen3.5 VL Abliterated 9B (local)", ENGINE_QWEN35_9B),
     ("Qwen3.8 VL Uncensored 27B (local)", ENGINE_QWEN38_27B),
-    # ("Qwen3.8 VL Flash-Next 125B (local, 80 GB download, 64 GB of RAM)", ENGINE_QWEN38_FLASH_NEXT),  # hidden until its issues are solved
+    *([("Qwen3.8 VL Flash-Next 125B (local, 80 GB download, 64 GB of RAM)", ENGINE_QWEN38_FLASH_NEXT)] if QWEN38_FLASH_NEXT_VISIBLE else []),
     ("Codex (external)", ENGINE_CODEX),
     ("Claude Code (external)", ENGINE_CLAUDE),
     ("OpenCode / universal providers (external)", ENGINE_OPENCODE),

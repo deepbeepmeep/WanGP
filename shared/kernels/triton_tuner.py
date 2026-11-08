@@ -3,7 +3,8 @@
 
 A call that cannot be tuned (too small to time, during CUDA graph recording or PyTorch compilation) uses the static configuration, the
 first candidate, without caching it. The first call that can be tuned times every candidate on scratch work prepared by the caller (never
-in place on live tensors) and keeps the winner in a versioned cache file shared by the sessions, so later sessions compile only it."""
+in place on live tensors), skipping those that need more shared memory than the GPU has, and keeps the winner in a versioned cache file
+shared by the sessions, so later sessions compile only it."""
 import functools
 import json
 import time
@@ -42,11 +43,16 @@ class LaunchTuner:
             return tuple(config)
         if not tunable or torch.cuda.is_current_stream_capturing() or torch.compiler.is_compiling():
             return candidates[0]
+        from triton.runtime.errors import OutOfResources
         started, timings = time.time(), []
         launch = prepare_scratch()
         for config in candidates:
-            for _ in range(2):
-                launch(config)
+            try:
+                launch(config)  # compilation: Triton refuses a configuration needing more shared memory than the GPU has (64 KiB on AMD RDNA)
+            except OutOfResources as error:
+                refused = error
+                continue
+            launch(config)
             start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             start.record()
             for _ in range(10):
@@ -54,6 +60,8 @@ class LaunchTuner:
             end.record()
             end.synchronize()
             timings.append((start.elapsed_time(end) / 10, config))
+        if not timings:
+            raise refused
         best_ms, best = min(timings)
         self._tuned[key] = list(best)
         try:

@@ -2,10 +2,13 @@
 """WanGP family handler for MiniMax H3."""
 
 import os
+import sys
 
 import gradio as gr
 import torch
+from tqdm import tqdm
 
+from shared.lora_paths import resolve_lora_dir
 from shared.utils.download import process_files_def_if_needed
 from shared.utils import files_locator as fl
 from shared.utils.hf import build_hf_url
@@ -14,13 +17,15 @@ from shared.utils.generation_overrides import get_override, set_override
 
 from .excerpts import H3_AUDIO_EXCERPTS_SETTING, H3_EXCERPT_SETTINGS, H3_VIDEO_EXCERPTS_SETTING, parse_excerpts, reference_video_frame_limit
 from .constants import (H3_AUDIO_REFINEMENT_SETTING, H3_CONTROL_LATENT_CONTINUATION, H3_MASK_MODE_DEFAULT, H3_MASK_MODE_GROUPED_ROWS,
-                        H3_MASK_MODE_SHARED_TIMESTEP, H3_MASK_MODE_SETTING, H3_PHASE_2_NOISE_LEVEL_START_DEFAULT,
+                        H3_MASK_MODE_SHARED_TIMESTEP, H3_MASK_MODE_SETTING, H3_PHASE_2_NOISE_LEVEL_START_DEFAULT, H3_REGENERATE_LORA,
                         h3_grouped_masking_enabled)
 from .dialogue import H3_DIALOGUE_GENERATION, H3_DIALOGUE_MAX_TOTAL_SECONDS, H3_DIALOGUE_PROMPT_INFOS, load_dialogue_whisper
 from .minimax_h3_main import (AUDIO_VAE_FILE, LATENT_UPSCALER_FILE, LATENT_UPSCALER_FOLDER, TEXT_ENCODER_FOLDER,
                               VIDEO_VAE_FILE, VIDEO_VAE_FP8MIX_FILE, VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_FILE, VIDEO_VAE_LIGHT_INT8_FILE)
-from .p_h3_image import (P_H3_IMAGE_ARCHITECTURE, P_H3_IMAGE_FOLDER, P_H3_IMAGE_MAX_IMAGES, P_H3_IMAGE_REPO_ID, P_H3_IMAGE_STEPS, P_H3_IMAGE_TEXT_ENCODER_BF16, P_H3_IMAGE_TEXT_ENCODER_FOLDER,
+from .p_h3_image import (P_H3_IMAGE_ARCHITECTURE, P_H3_IMAGE_FOLDER, P_H3_IMAGE_MAX_IMAGES, P_H3_IMAGE_REPO_ID, P_H3_IMAGE_STEPS, P_H3_IMAGE_SWITCH_THRESHOLD,
+                         P_H3_IMAGE_TEXT_ENCODER_BF16, P_H3_IMAGE_TEXT_ENCODER_FOLDER,
                          P_H3_IMAGE_TEXT_ENCODER_INT8, P_H3_IMAGE_VAE_FILE, P_H3_IMAGE_VAE_INT8_FILE, query_p_h3_image_def)
+from .hyperflow import HYPERFLOW_DEFAULT_STEPS, HYPERFLOW_STEPS, HYPERFLOW_VIDEO_SHIFT
 from .pdd import PDD_BLOCK_SIZE, PDD_NUM_STEPS
 from .pika import PIKA_SOLVER, PIKA_STEPS, PIKA_VIDEO_SHIFT
 from .ptd import PTD_FOLDER, PTD_HEAD_FILE, PTD_INFOS, PTD_DEEPY_INFOS
@@ -44,6 +49,21 @@ TURBO_LORA_FILE = "minimax_h3_lightx2v_fl2v_turbo_4step_alpha16_v0.1.safetensors
 TURBO_LORA_KEY = "minimax_h3_lora_turbo"
 REF_TURBO_LORA_FILE = "minimax_h3_lightx2v_ref2v_turbo_4step_alpha8_v0.1_bf16.safetensors"
 REF_TURBO_LORA_KEY = "minimax_h3_ref_lora_turbo"
+REGENERATE_LORA_FP32_SIZE = 12_452_449_080  # the first, FP32 upload of the Regenerate 2K LoRA; its BF16 replacement keeps the name
+_fp32_regenerate_checked = False
+
+
+def _remove_fp32_regenerate_lora(lora_key):
+    """Once per session: delete a local copy of the FP32 Regenerate 2K LoRA, so that its BF16 version is downloaded in its place."""
+    global _fp32_regenerate_checked
+    wgp = sys.modules.get("wgp")
+    if _fp32_regenerate_checked or wgp is None:  # outside WanGP there is no LoRA folder to clean
+        return
+    _fp32_regenerate_checked = True
+    path = os.path.join(resolve_lora_dir(lora_key, wgp.get_lora_root(), wgp.args.lora_config), H3_REGENERATE_LORA)
+    if os.path.isfile(path) and os.path.getsize(path) == REGENERATE_LORA_FP32_SIZE:
+        os.remove(path)
+        tqdm.write(f"MiniMax H3: deleted the old FP32 Open-H3 Regenerate 2K LoRA '{path}' (12.5 GB). Its BF16 version (6.2 GB) will be downloaded the next time it is used.")
 TEXT_ENCODER_VARIANTS = {
     "gguf_q2_k": [TEXT_ENCODER_GGUF_Q2],
     "gguf_q4_k_m": [TEXT_ENCODER_GGUF_Q4],
@@ -403,7 +423,22 @@ FASTH3_DEEPY_INFOS = ("Generate video and stereo sound in 8 steps (FastVideo Fas
                       "the Ref2VA base. `num_inference_steps` is locked to 8 with the Euler sampler; `flow_shift` defaults to 12 (the trained video shift). "
                       "Attention is locked to VSA sparse attention (Triton, NVIDIA SM80+). LoRAs trained for Ref2VA apply. Read `prompt_infos` for H3's structured prompt syntax.")
 
+HYPERFLOW_INFOS = """
+### HyperFlow H3 Flash — 4 to 8 steps
+
+HyperFlow H3 Flash is Video Rebirth's compressed, few-step MiniMax H3: about 14B parameters instead of 20B for the Pruned models, and no guidance pass.
+
+- **Steps:** choose **4** (fastest), **6** (default, balanced) or **8** (most detail). Other counts are not available: the model was trained on these three schedules. The sampler is Euler and the flow shift is fixed.
+- **One phase:** two-phase generation, custom sigmas, Audio Refinement and step skipping are not available.
+- **Speed and memory:** a step is slightly faster than a Pruned H3 step; most of the gain comes from the step count. At 6 steps denoising takes about a third less time than the 8-step PDD models, at 4 steps about half. Its 15 GB checkpoint needs less RAM than the 21 GB Pruned ones. **Sol-Attn** can be combined with it.
+- **LoRAs:** LoRAs made for the matching base model (FL2VA or Ref2VA) apply to the layers HyperFlow kept; their parts on the blocks it removed are skipped and their timestep part is approximated, so their effect can be weaker. Accelerator LoRAs (Turbo, PDD, Pika) are not needed: do not add them.
+"""
+HYPERFLOW_DEEPY_INFOS = (" HyperFlow H3 Flash (Video Rebirth's compressed few-step H3, 14B): `num_inference_steps` 4, 6 (default) or 8 only, Euler, `flow_shift` 12, "
+                         "one phase, empty `custom_sigmas`, no step skipping, no Audio Refinement. A step is slightly faster than Pruned: 6 steps take about a third "
+                         "less denoising time than 8-step PDD, 4 steps about half; 15 GB checkpoint. LoRAs for the matching base model apply partially (removed "
+                         "blocks skipped, timestep part approximated); never add accelerator LoRAs.")
 H3_RUNTIME_INFOS = H3_PHASE_INFOS + H3_PHASE_TURBO_INFOS + H3_AUDIO_REFINEMENT_INFOS + H3_SPEED_INFOS + H3_STANDARD_SAMPLER_INFOS + H3_COMMON_RUNTIME_INFOS
+H3_HYPERFLOW_RUNTIME_INFOS = HYPERFLOW_INFOS.rstrip("\n") + H3_COMMON_RUNTIME_INFOS
 H3_PDD_RUNTIME_INFOS = PDD_INFOS + H3_SPEED_INFOS + H3_COMMON_RUNTIME_INFOS
 H3_FASTH3_RUNTIME_INFOS = FASTH3_INFOS + H3_SPEED_INFOS + H3_COMMON_RUNTIME_INFOS
 
@@ -579,6 +614,7 @@ class family_handler:
 
     @staticmethod
     def get_lora_dir(base_model_type):
+        _remove_fp32_regenerate_lora("minimax_h3")
         return "minimax_h3"
 
     @staticmethod
@@ -590,8 +626,8 @@ class family_handler:
 
     @staticmethod
     def query_model_def(base_model_type, model_def):
-        if base_model_type == P_H3_IMAGE_ARCHITECTURE:
-            return query_p_h3_image_def(H3_DENOISING_PRIORITY_INFOS)
+        if base_model_type == P_H3_IMAGE_ARCHITECTURE:  # phase 2 adds the FL2VA Turbo when no accelerator has a phase-2 multiplier
+            return {**query_p_h3_image_def(H3_DENOISING_PRIORITY_INFOS), TURBO_LORA_KEY: build_hf_url(REPO_ID, "loras", TURBO_LORA_FILE)}
         if base_model_type == VIGGLE_ARCHITECTURE:
             result = family_handler.query_model_def(REF2VA_PRUNED_ARCHITECTURE, model_def)
             result.pop("resolution_budget_tiled", None)
@@ -716,7 +752,10 @@ class family_handler:
         fasth3 = model_def.get("fasth3", False)
         if fasth3 and not (reference_mode and pdd):
             raise ValueError("FastH3 Omni is a Ref2VA PDD student: declare it on the Ref2VA architecture with pdd")
-        fixed_schedule = pdd or fasth3
+        hyperflow = model_def.get("hyperflow", False)
+        if hyperflow and (not pruned or any(model_def.get(flag, False) for flag in ("pdd", "ptd", "vdn", "veda", "fasth3"))):
+            raise ValueError("HyperFlow H3 Flash is declared on the pruned FL2VA or Ref2VA architecture, without other acceleration flags")
+        fixed_schedule = pdd or fasth3 or hyperflow
         pika_supported = not (fixed_schedule or ptd or vdn or veda)
         text_encoder_variant = model_def.get("text_encoder_variant")
         text_encoder_files = [TEXT_ENCODER_BF16, TEXT_ENCODER_INT8] if text_encoder_variant is None else TEXT_ENCODER_VARIANTS[text_encoder_variant]
@@ -727,7 +766,7 @@ class family_handler:
             "uint8_guides": _uint8_guides,
             "tiny_vae_architecture": REF2VA_ARCHITECTURE,
             "size": "lighter" if pruned else "large",
-            **({"accelerated": "native"} if pdd or vdn or veda or fasth3 else {}),
+            **({"accelerated": "native"} if pdd or vdn or veda or fasth3 or hyperflow else {}),
             **({"specialities": [{"name": "character consistency", "aliases": ["identity preservation"]}, {"name": "motion transfer", "description": "Transfer motion or camera from reference videos to image-reference characters."}]} if reference_mode else {}),
             "fps": 24,
             "v2i_switch_supported": True,
@@ -778,10 +817,10 @@ class family_handler:
             },
             "inference_steps": True,
             "inference_steps2": not fixed_schedule,
-            "lock_inference_steps": fixed_schedule,
-            "flow_shift": True,
-            "spectrum_cache": True,
-            "first_block_cache": True,
+            "lock_inference_steps": pdd or fasth3,
+            "flow_shift": not hyperflow,
+            "spectrum_cache": not hyperflow,
+            "first_block_cache": not hyperflow,
             "skip_steps_multiplier_choices": FIRST_BLOCK_CACHE_STRENGTHS,
             "skip_steps_multiplier_label": "First Block Cache Threshold",
             "first_block_cache_thresholds": FIRST_BLOCK_CACHE_THRESHOLDS,
@@ -815,7 +854,8 @@ class family_handler:
             "control_video_trim_disabled": True,
             "extract_guide_from_window_start": True,  # sliding windows get pure window-aligned guide frames; continuation comes through input_video
             "prompt_enhancer_picture_labels": True,  # enhancer images are labelled with the <Picture N> the pipeline presents
-            "infos": (H3_FASTH3_RUNTIME_INFOS if fasth3 else (REF2VA_INFOS if reference_mode else FL2VA_INFOS) + (H3_PDD_RUNTIME_INFOS if pdd else H3_RUNTIME_INFOS)) + (PRUNED_INFOS if pruned else "") + (H3_VDN_INFOS if vdn else "") + model_def.get("infos", ""),
+            "infos": (H3_FASTH3_RUNTIME_INFOS if fasth3 else (REF2VA_INFOS if reference_mode else FL2VA_INFOS) + (H3_PDD_RUNTIME_INFOS if pdd else H3_HYPERFLOW_RUNTIME_INFOS if hyperflow else H3_RUNTIME_INFOS))
+                     + (PRUNED_INFOS if pruned and not hyperflow else "") + (H3_VDN_INFOS if vdn else "") + model_def.get("infos", ""),
             "prompt_infos": REF2VA_PROMPT_INFOS if reference_mode else FL2VA_PROMPT_INFOS,
             "prompt_enhancer_button_label": "Write",
             "prompt_enhancer_def": {
@@ -836,7 +876,7 @@ class family_handler:
             "image_prompt_enhancer_instructions1": H3_STILL_IMAGE_SYSTEM_PROMPT,
             "text_prompt_enhancer_max_tokens1": 1024,
             "image_prompt_enhancer_max_tokens1": 1024,
-            "profiles_dir": ["minimax_h3_vdn"] if vdn else ["minimax_h3_fasth3"] if fasth3 else [] if pdd else ["minimax_h3", "minimax_h3_ref2va" if reference_mode else "minimax_h3_fl2va"],
+            "profiles_dir": ["minimax_h3_vdn"] if vdn else ["minimax_h3_fasth3"] if fasth3 else ["minimax_h3_hyperflow"] if hyperflow else [] if pdd else ["minimax_h3", "minimax_h3_ref2va" if reference_mode else "minimax_h3_fl2va"],
             "preset_profiles_dir": [] if fixed_schedule or vdn else ["minimax_h3_presets"],
             "finetune_custom_urls": ["video_vae_file", "audio_vae_file"],
             "vae_upsamplers": {X2_VAE_METHOD: [0, 1, 2]},
@@ -876,7 +916,7 @@ class family_handler:
                 "lower_ram": {"name": "Lower RAM", "qkv_splitting": False},
             },
         }
-        if pdd:
+        if pdd or hyperflow:
             result["custom_settings"] = result["custom_settings"][:1]
         if reference_mode:
             result.update({
@@ -1008,6 +1048,8 @@ class family_handler:
             result["deepy_infos"] = FASTH3_DEEPY_INFOS
         if pdd:
             result["deepy_infos"] += " PDD requires exactly 8 inference steps and the Euler sampler. LoRAs trained for the matching base model apply."
+        elif hyperflow:
+            result["deepy_infos"] += HYPERFLOW_DEEPY_INFOS
         else:
             result["deepy_infos"] += " Two-phase generation uses `num_inference_steps2` (default 3) for final enhancement and `switch_threshold` for its starting noise. Accelerator LoRAs before `|` with any nonzero phase-2 multiplier replace the automatic Turbo together, at their specified multipliers; if all are zero, the automatic Turbo is used. `1;0` means phase 1 only, `1;0.6` sets phase 2 to 0.6, and `1` applies to both phases. LoRAs after `|` keep their multipliers."
         if vdn:
@@ -1049,7 +1091,6 @@ class family_handler:
                 return f"P-H3-Image edits with at most {P_H3_IMAGE_MAX_IMAGES} images"
             if inputs["sample_solver"] != "euler":
                 return "P-H3-Image requires the Euler sampler"
-            inputs["num_inference_steps"] = P_H3_IMAGE_STEPS
             return None
         if base_model_type == VIGGLE_REMAKE_ARCHITECTURE:
             if inputs["video_guide"] is None:
@@ -1081,7 +1122,7 @@ class family_handler:
             return None
         pika = inputs["sample_solver"] == PIKA_SOLVER
         if pika:
-            if base_model_type not in (FL2VA_ARCHITECTURE, FL2VA_PRUNED_ARCHITECTURE, REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE) or any(model_def.get(flag, False) for flag in ("pdd", "ptd", "vdn", "veda", "fasth3")):
+            if base_model_type not in (FL2VA_ARCHITECTURE, FL2VA_PRUNED_ARCHITECTURE, REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE) or any(model_def.get(flag, False) for flag in ("pdd", "ptd", "vdn", "veda", "fasth3", "hyperflow")):
                 return "Pika H3 Flex requires a standard FL2VA or Ref2VA model"
             if inputs["num_inference_steps"] != PIKA_STEPS or inputs["flow_shift"] != PIKA_VIDEO_SHIFT or inputs["guidance_phases"] != 1:
                 return "Pika H3 Flex requires 6 steps, flow shift 12 and one generation phase; apply its matching accelerator profile"
@@ -1145,6 +1186,12 @@ class family_handler:
             if inputs["sample_solver"] != "euler":
                 return "MiniMax H3 PDD requires the Euler sampler"
             inputs["num_inference_steps"] = required_steps
+        if model_def.get("hyperflow", False):
+            if inputs["num_inference_steps"] not in HYPERFLOW_STEPS:
+                return f"HyperFlow H3 Flash runs {', '.join(map(str, HYPERFLOW_STEPS[:-1]))} or {HYPERFLOW_STEPS[-1]} inference steps"
+            if inputs["sample_solver"] != "euler":
+                return "HyperFlow H3 Flash requires the Euler sampler"
+            inputs.update({"flow_shift": HYPERFLOW_VIDEO_SHIFT, "guidance_scale": 1.0, "guidance_phases": 1, "custom_sigmas": "", "skip_steps_cache_type": ""})
         overlap, error = normalize_overlap(int(inputs["sliding_window_overlap"] or 0), 17, 5 if H3_CONTROL_LATENT_CONTINUATION and base_model_type in CONTROL_ARCHITECTURES else 1)
         if error:
             return error
@@ -1321,6 +1368,15 @@ class family_handler:
         return {**model_def, "video_vae_file": filename, "x2_vae_file": X2_VAE_INT8_FILE if filename == VIDEO_VAE_INT8_FILE else X2_VAE_FILE}
 
     @staticmethod
+    def query_retired_files(model_type):
+        """Checkpoints that earlier releases of a model type downloaded and its current definition no longer names (Models Manager
+        lists them with the model, to delete them)."""
+        return {
+            "minimax_h3_fl2va_pruned": ["MiniMax-H3-FL2VA-pruned_bf16.safetensors", "MiniMax-H3-FL2VA-pruned_int8_convrot.safetensors"],
+            "minimax_h3_ref2va_pruned": ["MiniMax-H3-Ref2VA-pruned_bf16.safetensors", "MiniMax-H3-Ref2VA-pruned_int8_convrot.safetensors"],
+        }.get(model_type, [])
+
+    @staticmethod
     def query_model_files(computeList, base_model_type, model_def=None):
         if base_model_type == P_H3_IMAGE_ARCHITECTURE:
             vae_file = model_def.get("video_vae_file", P_H3_IMAGE_VAE_FILE)
@@ -1404,7 +1460,7 @@ class family_handler:
         pipe = {"transformer": pipeline.transformer}
         if image_model:
             pipe.update({"vae": pipeline.video_decoder, "video_encoder": pipeline.video_encoder, "text_encoder": pipeline.text_encoder.language_model,
-                         "vision_encoder": pipeline.text_encoder.visual, "text_connector": pipeline.text_encoder.text_connector})
+                         "vision_encoder": pipeline.text_encoder.visual, "text_connector": pipeline.text_encoder.text_connector, "latent_upscaler": pipeline.latent_upscaler})
             return pipeline, {"pipe": pipe, "pinnedMemory": False} if disable_pinning else pipe
         if base_model_type == TTS_REF2VA_PRUNED_ARCHITECTURE and H3_DIALOGUE_GENERATION:
             pipeline.dialogue_whisper = load_dialogue_whisper()
@@ -1492,8 +1548,9 @@ class family_handler:
     def update_default_settings(base_model_type, model_def, ui_defaults):
         ui_defaults.pop("input_video_strength", None)
         if base_model_type == P_H3_IMAGE_ARCHITECTURE:
-            ui_defaults.update({"image_mode": 1, "resolution": "2912x2912", "num_inference_steps": P_H3_IMAGE_STEPS, "guidance_phases": 1, "guidance_scale": 1.0,
-                                "sample_solver": "euler", "flow_shift": 12.0, "video_prompt_type": "", "audio_prompt_type": "", "prompt_enhancer": "", "batch_size": 1})
+            ui_defaults.update({"image_mode": 1, "resolution": "2912x2912", "num_inference_steps": P_H3_IMAGE_STEPS, "num_inference_steps2": 3, "guidance_phases": 1,
+                                "switch_threshold": P_H3_IMAGE_SWITCH_THRESHOLD, "custom_sigmas": "", "guidance_scale": 1.0, "sample_solver": "euler", "flow_shift": 12.0,
+                                "video_prompt_type": "", "audio_prompt_type": "", "prompt_enhancer": "", "batch_size": 1})
             return
         if base_model_type == VIGGLE_ARCHITECTURE:
             family_handler.update_default_settings(REF2VA_PRUNED_ARCHITECTURE, model_def, ui_defaults)
@@ -1548,5 +1605,7 @@ class family_handler:
             ui_defaults.update({"num_inference_steps": 8, "video_prompt_type": "I", "prompt_enhancer": "", "skip_steps_cache_type": ""})
         if model_def.get("fasth3", False):
             ui_defaults.update({"num_inference_steps": FASTH3_STEPS, "flow_shift": FASTH3_VIDEO_SHIFT, "guidance_phases": 1, "sample_solver": "euler"})
+        if model_def.get("hyperflow", False):
+            ui_defaults.update({"num_inference_steps": HYPERFLOW_DEFAULT_STEPS, "flow_shift": HYPERFLOW_VIDEO_SHIFT, "guidance_phases": 1, "sample_solver": "euler"})
         if base_model_type in CONTROL_ARCHITECTURES:
             ui_defaults.update({"video_prompt_type": "PV", "control_net_weight": 1.0, "sliding_window_overlap": 22 if H3_CONTROL_LATENT_CONTINUATION else 18})

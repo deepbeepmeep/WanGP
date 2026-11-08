@@ -752,4 +752,4 @@ def open_ngram_table(table_path, metadata_path, config):
         raise NotImplementedError(f"The n-gram table reader expects IQ4_NL rows, not {info.tensor_type}")
     metadata = read_metadata(metadata_path, ("qwen4exp.ple.layer_multipliers", "qwen4exp.ple.head_offsets", "qwen4exp.ple.head_vocab_sizes"))
     return NgramTable(table_path, info.data_offset, rows, values // block * size, values, int(config.ngram_size), int(config.heads_per_ngram),
-                      metadata["qwen4exp.ple.layer_multipliers"], metadata["qwen4exp.ple.head_offsets"], metadata["qwen4exp.ple.head_vocab_sizes"], other_bytes=os.path.getsize(metadata_path))
+                      metadata["qwen4exp.ple.layer_multipliers"], metadata["qwen4exp.ple.head_offsets"], metadata["qwen4exp.ple.head_vocab_sizes"])

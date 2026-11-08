@@ -87,8 +87,9 @@ class Showrunner:
         return facts
 
     def upload(self, production_id: str, filename: str, data_path: Path, role: str = "bin", target: str | None = None) -> dict[str, Any]:
-        """Import a dropped file into the production's media folder, then use it as: bin, song, reference, cast (target = cast id or new), take (target = shot id),
-        painted (target = "shot:frame", a remake's painted frame), track (narration, score or effects over the edit) or subtitles (an SRT file)."""
+        """Import a dropped file into the production's media folder, then use it as: bin, song, reference, cast (target = cast id or new), take (target = shot id; a sound
+        plays over the edit from that shot), shot (a video or a picture as a new shot, target = its position or the end), painted (target = "shot:frame",
+        a remake's painted frame), track (narration, score or effects over the edit, from shot target or 0 s) or subtitles (an SRT file)."""
         production = self.store.get(production_id)
         suffix = Path(filename).suffix.lower()
         if role == "subtitles":
@@ -123,16 +124,23 @@ class Showrunner:
                 production.apply([{"op": "update_cast", "cast": member["id"], "fields": {"voice": relative}}])
             else:
                 production.apply([{"op": "update_cast", "cast": member["id"], "fields": {"images": member["images"] + [relative], "master": member["master"] or relative}}])
+        elif role == "track" or role == "take" and facts["kind"] == "audio":  # a sound dropped on a shot plays over the edit from that shot, never as its take
+            doc = production.snapshot()
+            start = next((part["start_s"] for part in model.timeline(doc) if part["shot"] == target), 0.0)
+            tracks = doc["edit"]["audio_tracks"] + [{"path": relative, "start_s": round(start, 3), "gain_db": 0.0}]
+            production.apply([{"op": "edit", "fields": {"audio_tracks": tracks, **({"audio_mode": "mix"} if doc["edit"]["audio_mode"] == "song" else {})}}])
         elif role == "take":
             production.apply([{"op": "add_take", "shot": target, "take": {**facts, "note": "Uploaded"}}])
+        elif role == "shot":  # a video or a picture of the user's as a new shot (target: its position, else the end)
+            if facts["kind"] == "audio":
+                raise ValueError("A shot is a video or a picture: drop a sound on a shot to play it from there.")
+            position, fields = model.media_shot(production.snapshot(), {**facts, "name": filename}, int(target) if str(target or "").isdigit() else None)
+            target = production.apply([{"op": "add_shots", "position": position, "shots": [fields]}])[0]["shots"][0]
         elif role == "painted":  # target "shot:frame": the user's own picture of that frame of a remake's shot
             shot_id, _, frame = str(target or "").rpartition(":")
             if facts["kind"] != "image" or not frame.isdigit():
                 raise ValueError("A painted frame is a picture, for one frame of a shot.")
             ShowrunnerToolbox(self).place_picture(production, shot_id, int(frame), stored)
-        elif role == "track":
-            tracks = production.snapshot()["edit"]["audio_tracks"] + [{"path": relative, "start_s": 0.0, "gain_db": 0.0}]
-            production.apply([{"op": "edit", "fields": {"audio_tracks": tracks, **({"audio_mode": "mix"} if production.snapshot()["edit"]["audio_mode"] == "song" else {})}}])
         else:
             production.apply([{"op": "bin_add", "item": {**facts, "name": Path(filename).name, "by": "user"}}])
         return {"path": relative, "role": role, "target": target, **facts}
@@ -219,6 +227,17 @@ class Showrunner:
         entry = templates.resolve(self.catalog(doc), shot["generation"].get("template"))
         return media.fitted_canvas(production.resolve(doc["remake"]["path"]), name, (entry or {}).get("pixels"))
 
+    def media_of(self, production_id: str, media_id: str) -> Path | None:
+        """The file a Gallery media id the showrunner names: the take or the bin item that recorded it, else its media in the production's
+        workspace Gallery (a picture used as a shot's start, say); None when neither has it."""
+        production = self.store.get(production_id)
+        doc = production.snapshot()
+        path = next((item["path"] for item in [*doc["bin"], *(take for shot in doc["shots"] for take in shot["takes"])] if item.get("media") == media_id), None)
+        if path:
+            return production.resolve(path)
+        found = doc["director"].get("workspace") and self.host.gallery_media(doc["director"]["workspace"], media_id)
+        return Path(found) if found else None
+
     def source_part(self, production_id: str, shot_id: str) -> Path:
         """What a remake's shot delivers, as a video of its own for the page's player: cut once, the first time it is looked at."""
         production = self.store.get(production_id)
@@ -273,7 +292,7 @@ class Showrunner:
     def template_roles(self, production_id: str) -> dict[str, Any]:
         """The template picker: each Deepy category with its templates, the automatic one (Deepy's selection) and the user's pick."""
         doc = self.store.get(production_id).snapshot()
-        return {"roles": templates.choices(doc, self.catalog(doc))}
+        return {"roles": templates.choices(doc, self.catalog(doc), self.host.prompt_rules())}
 
     def choose_template(self, production_id: str, role: str, template: str | None) -> dict[str, Any]:
         production = self.store.get(production_id)
@@ -289,11 +308,20 @@ class Showrunner:
 
     def default_template_roles(self) -> dict[str, Any]:
         """The same picker for the templates new productions start with."""
-        return {"roles": templates.choices(self._defaults(), self.catalog(self._defaults()))}
+        return {"roles": templates.choices(self._defaults(), self.catalog(self._defaults()), self.host.prompt_rules())}
 
     def choose_default_template(self, role: str, template: str | None) -> dict[str, Any]:
         self.host.save_default_templates(templates.pick(self.host.default_templates(), self.catalog(self._defaults()), role, template))
         return self.default_template_roles()
+
+    def set_prompt_rules(self, template: str, text: str) -> dict[str, Any]:
+        """The user's rules for the prompts the showrunner writes with a template, in every production (empty text: none)."""
+        entry = templates.resolve(self.host.template_catalog([template]), template)
+        if entry is None:
+            raise ValueError(f"{template} is not one of Deepy's templates.")
+        name, text = templates.entry_name(entry), text.strip()
+        self.host.save_prompt_rules({key: value for key, value in self.host.prompt_rules().items() if key != name} | ({name: text} if text else {}))
+        return {"template": name, "rules": text}
 
     def frame_sizes(self, production_id: str) -> dict[str, Any]:
         """What the shots of the edit come out at: their take's real size (shot true); not shot yet, what their model makes of the brief's format or of

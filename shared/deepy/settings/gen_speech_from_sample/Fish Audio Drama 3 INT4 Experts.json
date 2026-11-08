@@ -1,0 +1,20 @@
+{
+    "model_type": "fish_drama3_int4",
+    "prompt": "",
+    "alt_prompt": "",
+    "audio_prompt_type": "A",
+    "duration_seconds": 30,
+    "seed": -1,
+    "temperature": 0.8,
+    "top_k": 30,
+    "top_p": 0.95,
+    "prompt_enhancer": "",
+    "override_profile": -1,
+    "image_mode": 0,
+    "video_length": 0,
+    "num_inference_steps": 1,
+    "guidance_scale": 1.0,
+    "batch_size": 1,
+    "repeat_generation": 1,
+    "settings_version": 2.55
+}

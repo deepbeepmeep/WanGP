@@ -2,8 +2,7 @@
 // Rows of a large table read from its file past the OS cache, included by linear.cpp: a table much larger than RAM of which a pass needs a few
 // scattered rows (an n-gram embedding table). The rows of a call are grouped by aligned page and read concurrently (Windows: overlapped reads and a
 // completion port; elsewhere: blocking reads on short-lived threads), and a small set-associative cache of rows keeps the ones in use, which common
-// n-grams repeat. Where the RAM allows it, a thread also brings the whole table into the OS file cache, front to back, and the rows it has passed are copied
-// from a mapped view: RAM the OS takes back when it needs it, and which the thread gives up before that. Decoding: IQ4_NL rows into float32.
+// n-grams repeat. Only the rows a pass asks for are read. Decoding: IQ4_NL rows into float32.
 #include <cstdio>
 #ifndef _WIN32
 #include <fcntl.h>
@@ -15,7 +14,6 @@
 static const size_t ROW_PAGE = 4096;
 static const int ROW_WINDOW = 64;  // concurrent reads
 static const uint32_t ROW_WAYS = 8, ROW_EMPTY = 0xFFFFFFFFu;
-static const uint64_t ROW_FILL_PIECE = 64ull << 20;
 
 struct RowRead {
 #ifdef _WIN32
@@ -59,19 +57,6 @@ struct RowTable {
     std::vector<RowMiss> misses;
     std::mutex serial;
     uint64_t lookups = 0, hits = 0, read_count = 0, read_bytes = 0, read_us = 0, calls = 0;
-    // The table in the file cache: the view of the file, the bytes the fill has passed (a row before them is copied from the view)
-    const uint8_t * view = nullptr;
-    uint64_t view_bytes = 0;
-    std::atomic<uint64_t> filled{0};
-#ifdef _WIN32
-    HANDLE view_file = INVALID_HANDLE_VALUE, view_mapping = nullptr;
-#else
-    int view_file = -1;
-#endif
-    std::thread filler;
-    std::mutex fill_mutex;
-    std::condition_variable fill_wake;
-    bool fill_stop = false;
 };
 
 static inline uint64_t row_set(const RowTable & t, uint32_t row) {
@@ -95,109 +80,6 @@ static inline void row_insert(RowTable & t, uint32_t row, const uint8_t * bytes)
     t.next[s] = (uint8_t)((w + 1) % ROW_WAYS);
     t.keys[s * ROW_WAYS + w] = row;
     memcpy(t.data + (s * ROW_WAYS + w) * t.row_bytes, bytes, t.row_bytes);
-}
-
-static void row_view_close(RowTable & t) {
-    std::lock_guard<std::mutex> guard(t.serial);
-    t.filled.store(0);
-    if (t.view == nullptr) return;
-    // on a thread of its own: taking a view of tens of GiB away takes seconds, with nobody waiting for them
-#ifdef _WIN32
-    std::thread([view = t.view, mapping = t.view_mapping, file = t.view_file] {
-        UnmapViewOfFile(view);
-        CloseHandle(mapping);
-        CloseHandle(file);
-    }).detach();
-#else
-    std::thread([view = t.view, bytes = t.view_bytes, file = t.view_file] {
-        munmap((void *)view, (size_t)bytes);
-        close(file);
-    }).detach();
-#endif
-    t.view = nullptr;
-}
-
-static void row_fill_main(RowTable * table, uint64_t keep_available) {
-    RowTable & t = *table;
-    const uint64_t stop = t.offset + t.rows * t.row_bytes;
-    volatile uint8_t sink = 0;
-    for (uint64_t at = t.offset / ROW_FILL_PIECE * ROW_FILL_PIECE; at < stop; at += ROW_FILL_PIECE) {
-        {
-            std::lock_guard<std::mutex> lock(t.fill_mutex);
-            if (t.fill_stop) return;
-        }
-        const uint64_t bytes = std::min(ROW_FILL_PIECE, t.view_bytes - at);
-#ifdef _WIN32
-        WIN32_MEMORY_RANGE_ENTRY range{(void *)(t.view + at), (SIZE_T)bytes};
-        PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0);
-#else
-        madvise((void *)(t.view + at), (size_t)bytes, MADV_WILLNEED);
-#endif
-        sink = t.view[at + bytes - 1];  // a hint until now: the last byte of the piece waits for its read
-        t.filled.store(at + bytes, std::memory_order_release);
-    }
-    (void)sink;
-#ifdef _WIN32
-    // The available RAM counts the table's pages: under the table's size, the OS is about to take them, which would turn rows into page faults, one at a time
-    for (;;) {
-        {
-            std::unique_lock<std::mutex> lock(t.fill_mutex);
-            if (t.fill_wake.wait_for(lock, std::chrono::seconds(1), [&] { return t.fill_stop; })) return;
-        }
-        MEMORYSTATUSEX memory;
-        memory.dwLength = sizeof(memory);
-        if (GlobalMemoryStatusEx(&memory) && memory.ullAvailPhys < keep_available) {
-            row_view_close(t);
-            return;
-        }
-    }
-#endif
-}
-
-// The whole table starts reaching the file cache, on a thread. keep_available: the available RAM under which the thread stops using it. Returns 0, or a nonzero system error.
-CPU_LINEAR_API int row_table_fill(void * table, const char * utf8_path, uint64_t keep_available) {
-    RowTable & t = *(RowTable *)table;
-#ifdef _WIN32
-    wchar_t path[4096];
-    if (!MultiByteToWideChar(CP_UTF8, 0, utf8_path, -1, path, 4096)) return (int)GetLastError();
-    t.view_file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (t.view_file == INVALID_HANDLE_VALUE) return (int)GetLastError();
-    LARGE_INTEGER size;
-    GetFileSizeEx(t.view_file, &size);
-    t.view_mapping = CreateFileMappingW(t.view_file, nullptr, PAGE_READONLY, 0, 0, nullptr);
-    if (t.view_mapping == nullptr) {
-        const int error = (int)GetLastError();
-        CloseHandle(t.view_file);
-        return error;
-    }
-    t.view_bytes = (uint64_t)size.QuadPart;
-    t.view = (const uint8_t *)MapViewOfFile(t.view_mapping, FILE_MAP_READ, 0, 0, 0);
-    if (t.view == nullptr) {
-        const int error = (int)GetLastError();
-        CloseHandle(t.view_mapping);
-        CloseHandle(t.view_file);
-        return error;
-    }
-#else
-    t.view_file = open(utf8_path, O_RDONLY);
-    if (t.view_file < 0) return 5;
-    struct stat info;
-    fstat(t.view_file, &info);
-    t.view_bytes = (uint64_t)info.st_size;
-    void * view = mmap(nullptr, (size_t)t.view_bytes, PROT_READ, MAP_SHARED, t.view_file, 0);
-    if (view == MAP_FAILED) {
-        close(t.view_file);
-        return 5;
-    }
-    t.view = (const uint8_t *)view;
-#endif
-    t.filler = std::thread(row_fill_main, &t, keep_available);
-    return 0;
-}
-
-// The bytes of the file the fill has passed, 0 once it gave the table up
-CPU_LINEAR_API uint64_t row_table_filled(void * table) {
-    return ((RowTable *)table)->filled.load(std::memory_order_acquire);
 }
 
 // Opens the table; null when the file cannot be opened. cache_bytes: the cache of rows (0: none), in cache_memory (RAM the caller locked, kept until row_table_close), or null for ordinary RAM.
@@ -242,15 +124,6 @@ CPU_LINEAR_API void * row_table_open(const char * utf8_path, uint64_t offset, ui
 
 CPU_LINEAR_API void row_table_close(void * table) {
     RowTable * t = (RowTable *)table;
-    if (t->filler.joinable()) {
-        {
-            std::lock_guard<std::mutex> lock(t->fill_mutex);
-            t->fill_stop = true;
-        }
-        t->fill_wake.notify_all();
-        t->filler.join();
-    }
-    row_view_close(*t);
     if (t->prefetch != nullptr) {
         {
             std::lock_guard<std::mutex> lock(t->prefetch->mutex);
@@ -296,13 +169,7 @@ CPU_LINEAR_API int row_table_read(void * table, const int64_t * rows, int64_t co
     t.misses.clear();
     t.lookups += (uint64_t)count;
     ++t.calls;
-    const uint64_t filled = t.filled.load(std::memory_order_acquire);
     for (int64_t n = 0; n < count; ++n) {
-        const uint64_t at = t.offset + (uint64_t)rows[n] * rb;
-        if (at + rb <= filled) {
-            memcpy(out + (size_t)n * rb, t.view + at, rb);
-            continue;
-        }
         const uint8_t * hit = row_find(t, (uint32_t)rows[n]);
         if (hit) memcpy(out + (size_t)n * rb, hit, rb);
         else t.misses.push_back({rows[n], n});

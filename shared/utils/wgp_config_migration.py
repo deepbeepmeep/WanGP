@@ -6,6 +6,7 @@ from postprocessing.mmaudio import MMAUDIO_DEFAULT_MODE
 from postprocessing.mmaudio.audio_processor import MMAudioProcessor
 from postprocessing.seedvc_processor.audio_processor import SeedVCProcessor
 from shared.deepy.config import DEEPY_CONTEXT_TOKENS_KEY, DEEPY_CONTEXT_TOKENS_MIN, DEEPY_ENABLED_KEY, DEEPY_TEMPLATE_CONFIG_MIGRATIONS
+from shared.remote_llm.config import QWEN38_FLASH_NEXT_VISIBLE
 
 
 LEGACY_EXTENSIONS_DEFAULTS_MIGRATED_KEY = "_extensions_defaults_migrated"
@@ -21,7 +22,7 @@ PROMPT_ENHANCER_CHOICES = [
     ("Qwen3.5VL Abliterated 4B (recommended, captioning + uncensored text enhancement, vllm accelerated if available)", 3),
     ("Qwen3.5VL Abliterated 9B (captioning + uncensored high end text enhancement, vllm accelerated if available)", 4),
     ("Qwen3.8VL Uncensored 27B by Jonathan Coletti (highest quality, choose GGUF Q2, Q3 or Q4 below)", 5),
-    # ("Qwen3.8VL Flash-Next 125B (80 GB download, 64 GB of RAM)", 7),  # hidden until its issues are solved
+    *([("Qwen3.8VL Flash-Next 125B (80 GB download, 64 GB of RAM)", 7)] if QWEN38_FLASH_NEXT_VISIBLE else []),
 ]
 
 SEEDVC_DEFAULT_MODE = 2

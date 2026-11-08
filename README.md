@@ -83,13 +83,15 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 ## 🔥 Latest Updates : 
 
-## 5th of November 2026: WanGP v19.20 - Showrunner Makes and Remakes
+## 8th of November 2026: WanGP v19.22 - Showrunner Makes and Remakes
 
 - **Viggle Remake**: recast one or several people with **Swap**, or change objects, backgrounds, weather and lighting with **Edit**, while keeping the original motion, camera, timing and soundtrack. Supply your video, one to four frames from it edited to show the new look, and a prompt describing the result. An optional mask keeps everything outside the changed area exactly as it was. Works best at **720p**, with faces clearly visible and characters facing the camera; small faces and rapid cuts remain challenging.
 
 - **Showrunner Viggle Remake**: too lazy to do all the preparation work required by Viggle Remake? Ask Showrunner: it splits long videos into shots, extracts and edits the reference frames one by one, checks the results and writes the prompts for you. Review the prepared frames, then let it render each shot and put everything back together with the original timing and soundtrack.
 
 - **Showrunner Draft / Final**: try shots at **480p** to check the look, framing and timing before spending time on full-resolution renders. Switch to **Final** to reuse the chosen take's prompt, seed and reference pictures at the target size, without another planning pass. Both takes stay available to compare; judge lip sync at the final size.
+
+- **Showrunner: more control**: drop your own videos or pictures onto **Add a shot**, and drop sound onto a shot to add a soundtrack. Save prompt rules per model template, including style instructions and LoRA trigger words, for reuse across productions. Export a production as a **ZIP** to back it up or open it in another WanGP, with its shots, media, versions and exports.
 
 - **LoRA speedups**: LoRAs add work at every generation step, so using them comes with a speed penalty. New optimisations reduce that extra denoising time to around 10%. 
 
@@ -101,6 +103,13 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 - **NitroFusion2 Z-Image Turbo**: generate images in **1 to 4 steps**, with **2 steps by default**, for faster prompt and composition experiments. Pick an **Accelerator** profile to apply the matching settings automatically. It uses the same memory as Z-Image Turbo and shares its LoRA folder.
 
+- **H3 HyperFlow Flash**: generate video with sound in **4, 6 or 8 steps**, from text, start/end frames or references. The smaller **14B** models need less RAM; at the default 6 steps, denoising takes about a third less time than 8-step PDD. Matching H3 LoRAs are supported, though their effect can be weaker.
+
+- **H3 Image: pDMD + Regenerate**: generate and edit images in **2 or 4 steps** with pDMD: 2 steps is about **2.5x faster** than the usual 8, while 4 gives more detail and better text. Add **Regenerate 2K Detail** after either a 2-step or 8-step draft for a three-step detail pass at full resolution; faces can change.
+
+- **Singularity V1.3 + LoRAs**: the **Pruned 20B** release joins H3 for those who prefer its look. Matching Ref2VA LoRAs, including Turbo accelerators, now load on V1.3 and the WAS V2 r2 repack that previously rejected them.
+
+- **WanGP Manager 0.1.15**: a new **Update WanGP** shortcut on the Overview takes you straight to updating to the latest release, with a summary of what changed since your version. Manager also notifies you of its own updates, and **Open in App** now supports dragging files into WanGP and moving items within its pages, including Showrunner.
 
 ## 4th of November 2026: WanGP v19.14 - The Show must Go On
 

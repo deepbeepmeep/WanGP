@@ -57,10 +57,6 @@ def library():
             lib.gguf_moe_host_job.restype = None
             lib.row_table_open.argtypes = [ctypes.c_char_p, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_void_p]
             lib.row_table_open.restype = ctypes.c_void_p
-            lib.row_table_fill.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64]
-            lib.row_table_fill.restype = ctypes.c_int
-            lib.row_table_filled.argtypes = [ctypes.c_void_p]
-            lib.row_table_filled.restype = ctypes.c_uint64
             lib.row_table_close.argtypes = [ctypes.c_void_p]
             lib.row_table_close.restype = None
             lib.row_table_stats.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64)]
@@ -84,10 +80,169 @@ def moe_stats():
     return dict(zip(("jobs", "pairs", "microseconds"), out))
 
 
+SHARE_ROWS = 64  # experts of a job given to the GPU at most (experts_gguf.inc MOE_SHARE_MAX)
+
+
+class MoeShare(ctypes.Structure):
+    """The GPU's share of the experts of a bank that miss VRAM, and its experts in locked RAM (experts_gguf.inc MoeShare): read by the host jobs while they run."""
+    _fields_ = [("sources", ctypes.c_void_p), ("offsets", ctypes.c_uint64 * 3), ("slot_bytes", ctypes.c_uint64), ("ring", ctypes.c_void_p), ("fraction", ctypes.c_float)] + \
+               [(name, ctypes.c_int32) for name in ("experts", "status", "pad")] + [(name, ctypes.c_uint64) for name in ("asked", "landed", "missing", "jobs")] + [("remote_sources", ctypes.c_void_p), ("device_sources", ctypes.c_void_p),
+               ("live", ctypes.c_float), ("pad2", ctypes.c_int32)]
+
+
+def moe_share_supported():
+    """Whether the host jobs can give the GPU a share (the CUDA driver found)."""
+    return bool(library().gguf_moe_share_supported())
+
+
+REMOTE_COPIES = os.name == "nt" and "share_thread" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the copies of the share asked of a helper process (Windows: a copy call of this process waits for its page faults)
+_HELPER = """import ctypes, sys
+lib = ctypes.CDLL(sys.argv[1])
+lib.gguf_moe_copy_helper.argtypes = [ctypes.c_uint32] + [ctypes.c_uint64] * 4 + [ctypes.c_int32]
+sys.exit(lib.gguf_moe_copy_helper(*[int(value) for value in sys.argv[2:8]]))"""
+_FILL_HELPER = """import ctypes, sys
+lib = ctypes.CDLL(sys.argv[1])
+lib.gguf_moe_fill_helper.argtypes = [ctypes.c_uint32, ctypes.c_uint64]
+sys.exit(lib.gguf_moe_fill_helper(int(sys.argv[2]), int(sys.argv[3])))"""
+
+
+class MoeRemoteMove(ctypes.Structure):
+    _fields_ = [("file", ctypes.c_uint64), ("source", ctypes.c_uint64), ("offset", ctypes.c_uint64), ("bytes", ctypes.c_uint64)]
+
+
+class MoeRemoteFill(ctypes.Structure):  # experts_gguf.inc
+    _fields_ = [("section", ctypes.c_uint64), ("target", ctypes.c_uint64), ("moves", MoeRemoteMove * 3), ("count", ctypes.c_int32), ("drop", ctypes.c_int32), ("result", ctypes.c_int32),
+                ("pad", ctypes.c_int32)]
+
+
+class ShareRing:
+    """The VRAM slots of the GPU's share of the experts out of VRAM (experts_gguf.inc MoeRing), and what asks the copy engine to fill them: on Windows a helper
+    process of its own (the driver's calls of this process wait while its page faults hold its memory, up to hundreds of ms when RAM is short), elsewhere a
+    thread of the library. handle: for MoeShare.ring; base: the device address of the first slot; remote: copies of sections (MoeShare.remote_sources)."""
+    def __init__(self, slot_bytes, slots, device):
+        lib, self.remote, self.helper, self.filler, self.handle = library(), REMOTE_COPIES, None, None, None
+        index = torch.device(device).index or 0
+        if self.remote:
+            lib.gguf_moe_ring_open_remote.argtypes = [ctypes.c_uint64, ctypes.c_int32, ctypes.c_int32, ctypes.c_void_p]
+            lib.gguf_moe_ring_open_remote.restype = ctypes.c_void_p
+            lib.gguf_moe_ring_remote_state.argtypes = lib.gguf_moe_ring_remote_stop.argtypes = lib.gguf_moe_ring_fill_state.argtypes = [ctypes.c_void_p]
+            lib.gguf_moe_ring_forget.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int32]
+            lib.gguf_moe_ring_fill.argtypes, lib.gguf_moe_ring_fill.restype = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32], ctypes.c_int64
+            lib.gguf_moe_ring_filled.argtypes, lib.gguf_moe_ring_filled.restype = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_int32, ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int64
+            out = (ctypes.c_uint64 * 5)()
+            self.handle = lib.gguf_moe_ring_open_remote(slot_bytes, slots, index, out)
+            if not self.handle:
+                raise RuntimeError("The VRAM of the GPU's share of the experts could not be made")
+            self.base = out[0]
+            import subprocess
+            import sys
+            import time
+            self.helper = subprocess.Popen([sys.executable, "-I", "-c", _HELPER, str(library_path()), str(os.getpid()), *(str(value) for value in out[1:5]), str(index)],
+                                           creationflags=0x08000000 | 0x00008000)  # CREATE_NO_WINDOW, ABOVE_NORMAL_PRIORITY_CLASS: it wakes up before the CPU's workers
+            # the fills of level 2 in a process of their own, which makes no driver call: its page faults hold none (MoeRemoteFill)
+            self.filler = subprocess.Popen([sys.executable, "-I", "-c", _FILL_HELPER, str(library_path()), str(os.getpid()), str(out[1])],
+                                           creationflags=0x08000000 | 0x00004000)  # CREATE_NO_WINDOW, BELOW_NORMAL_PRIORITY_CLASS
+            deadline = time.monotonic() + 60
+            for name, process, state in (("copy", self.helper, lib.gguf_moe_ring_remote_state), ("fill", self.filler, lib.gguf_moe_ring_fill_state)):
+                while state(self.handle) != 1:
+                    if process.poll() is not None or time.monotonic() > deadline:
+                        code = process.poll()
+                        self.close()
+                        raise RuntimeError(f"The {name} helper of the GPU's share of the experts did not start ({code})")
+                    time.sleep(0.01)
+        else:
+            from mmgp import allocator, pinned
+            lib.gguf_moe_ring_open.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64]
+            lib.gguf_moe_ring_open.restype = ctypes.c_void_p
+            with torch.inference_mode(False):
+                self.done = pinned.empty(4 * slots, "experts")
+                with allocator.normal_allocations():  # read by the graphs, not graph scratch
+                    self.ring = torch.empty(slots * slot_bytes, dtype=torch.uint8, device=device)
+                    self.one = torch.ones(16, dtype=torch.int32, device=device)
+            context = ctypes.c_void_p()
+            ctypes.CDLL("nvcuda.dll" if os.name == "nt" else "libcuda.so.1").cuCtxGetCurrent(ctypes.byref(context))
+            self.handle = None if self.done is None else lib.gguf_moe_ring_open(self.ring.data_ptr(), slot_bytes, slots, context, self.done.data_ptr(), self.one.data_ptr())
+            if not self.handle:
+                raise RuntimeError("The copy thread of the GPU's share of the experts could not start")
+            self.base = self.ring.data_ptr()
+
+    def pause(self, paused):
+        """While paused, the jobs ask for no copies (the placement's own copies hold the copy engine)."""
+        lib = library()
+        lib.gguf_moe_ring_pause.argtypes = [ctypes.c_void_p, ctypes.c_int32]
+        lib.gguf_moe_ring_pause(self.handle, int(paused))
+
+    def prepare(self, sections):
+        """The sections (handles) of experts' copies the helper maps ahead of their first copies. A thread's ring needs nothing."""
+        if self.remote and len(sections):
+            import numpy as np
+            sections = np.ascontiguousarray(sections, dtype=np.uint64)
+            lib = library()
+            lib.gguf_moe_ring_prepare.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32]
+            lib.gguf_moe_ring_prepare.restype = ctypes.c_int32
+            lib.gguf_moe_ring_prepare(self.handle, sections.ctypes.data, len(sections))
+
+    def fill(self, fills):
+        """Copies of experts from their checkpoint files into slots of level 2, made by the helper: (section, target, [(file, source, offset, bytes)], drop) each (see MoeRemoteFill).
+        The sequence number of the first, None when its queue lacks room for them all."""
+        array = (MoeRemoteFill * len(fills))()
+        for record, (section, target, moves, drop) in zip(array, fills):
+            record.section, record.target, record.count, record.drop = section, target, len(moves), int(drop)
+            for move, values in zip(record.moves, moves):
+                move.file, move.source, move.offset, move.bytes = values
+        first = library().gguf_moe_ring_fill(self.handle, array, len(fills))
+        return None if first < 0 else first
+
+    def filled(self, first, count):
+        """The fills done so far (the sequence number after the last), the results of those of [first, first + count) done (0: copied), and the helper's (seconds, bytes) of fills."""
+        results, stats = (ctypes.c_int32 * max(count, 1))(), (ctypes.c_uint64 * 2)()
+        done = library().gguf_moe_ring_filled(self.handle, first, count, results, stats)
+        return done, list(results[:max(0, min(count, done - first))]), (stats[0] / 1e9, stats[1])
+
+    def forget(self, section):
+        """A section of experts' copies leaves: the helper lets it go first. False if it did not answer."""
+        return not self.remote or self.helper is None or bool(library().gguf_moe_ring_forget(self.handle, section, 5000))
+
+    def stats(self):
+        return moe_ring_stats(self.handle)
+
+    def close(self):
+        """Once nothing in flight asks for copies."""
+        lib = library()
+        lib.gguf_moe_ring_close.argtypes = [ctypes.c_void_p]
+        lib.gguf_moe_ring_close.restype = None
+        if self.handle and self.remote and self.helper is not None:
+            import subprocess
+            lib.gguf_moe_ring_remote_stop(self.handle)  # both helpers leave
+            for process in (self.helper, self.filler):
+                if process is None:
+                    continue
+                try:
+                    process.wait(10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+        if self.handle:
+            lib.gguf_moe_ring_close(self.handle)
+        if not self.remote and getattr(self, "done", None) is not None:
+            from mmgp import pinned
+            pinned.retire(self.done)
+        self.handle = self.helper = self.filler = None
+
+
+def moe_ring_stats(handle):
+    """copies issued, the copy thread's time issuing them, first failure, the copies' time in its queue, jobs with copies and their CPU parts' time."""
+    out = (ctypes.c_int64 * 16)()
+    library().gguf_moe_ring_stats(ctypes.c_void_p(handle), out)
+    names = ("issued", "issue_microseconds", "status", "wait_nanoseconds", "parts", "part_nanoseconds", "call_nanoseconds", "call_max_nanoseconds", "wakes", "wake_nanoseconds")
+    return dict(zip(names, out), calls_under=dict(zip(("50us", "200us", "1ms", "10ms", "more"), out[10:15])), fraction=out[15] / 1000)
+
+
 class MoeJob(ctypes.Structure):
     """One routed call in GGUF storage, run by a CUDA host function (experts_gguf.inc MoeJob): the addresses stay fixed while graphs replay it."""
     _fields_ = [(name, ctypes.c_void_p) for name in ("gate", "up", "down", "payload", "resident", "usage", "out")] + \
-               [(name, ctypes.c_int32) for name in ("gate_type", "up_type", "down_type", "tokens", "h", "i", "experts", "topk", "threads", "tail_rank", "status")]
+               [(name, ctypes.c_int32) for name in ("gate_type", "up_type", "down_type", "tokens", "h", "i", "experts", "topk", "threads", "tail_rank", "status")] + \
+               [("share", ctypes.POINTER(MoeShare)), ("share_rows", ctypes.c_void_p)]
 
 
 def moe_host_function():

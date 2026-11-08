@@ -72,6 +72,7 @@ def prepare_run(
     source_audio_track: str,
     chunk_size_seconds: float,
     sliding_window_overlap: int,
+    sliding_window_size: int | None,
     start_seconds: float,
     end_seconds: float | None,
     model_type: str,
@@ -115,6 +116,12 @@ def prepare_run(
         chunk_frame_step = int(getattr(system_handler, "chunk_frame_step", frame_plan_rules.frame_step)) if system_handler is not None else frame_plan_rules.frame_step
         get_chunk_frames = getattr(system_handler, "get_chunk_frames", None) if system_handler is not None else None
         chunk_frames = int(get_chunk_frames(end_frame_exclusive - start_frame)) if callable(get_chunk_frames) else frames.normalize_chunk_frames(chunk_size_seconds, processing_fps, frame_step=chunk_frame_step, minimum_requested_frames=frame_plan_rules.minimum_requested_frames, frame_offset=frame_plan_rules.frame_offset)
+        # WanGP splits a longer chunk into its own sliding windows: no gain, a coarser resume and a step counter that restarts in each window.
+        if system_handler is None and sliding_window_size and frames.require_model_def(model_type, get_model_def).get("sliding_window", False):
+            window_frames = frames.align_requested_frames(int(sliding_window_size), frame_step=frame_plan_rules.frame_step, frame_offset=frame_plan_rules.frame_offset, round_up=False)
+            if chunk_frames > window_frames >= frame_plan_rules.minimum_requested_frames:
+                common.plugin_info(f"Chunk Size reduced to {window_frames / processing_fps:.2f} seconds ({window_frames} frames), the longest piece this process generates in one pass.")
+                chunk_frames = window_frames
         if system_handler is not None:
             get_target_overlap_frames = getattr(system_handler, "get_overlap_frames_for_target", None)
             get_overlap_frames = getattr(system_handler, "get_overlap_frames", None)

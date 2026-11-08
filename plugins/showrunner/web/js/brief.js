@@ -4,7 +4,7 @@ import { state, actions } from './app.js';
 import { api } from './api.js';
 import { icon, esc, fieldSaver, drawWave, formatTime, formatDuration, sectionColor, pickFiles, toast, confirmDialog, promptDialog, availability, AUDIO_ACCEPT, personFields } from './ui.js';
 import { kindTiles, KINDS } from './home.js';
-import { modelRows, openDefaultModels } from './models.js';
+import { bindRules, modelRows, openDefaultModels } from './models.js';
 
 const STYLES = ['Cinematic', 'Anime', 'Documentary', 'Noir', 'Neon', 'Pastel', 'Claymation', 'Watercolor', 'Vintage film', 'VHS', 'Epic', 'Minimal', 'Dreamy', 'Gritty', 'Surreal', 'Cyberpunk'];
 const ASPECT_FRAMES = { '16:9': [44, 25], '9:16': [20, 34], '1:1': [30, 30], '4:3': [38, 28], '2.39:1': [50, 21] };
@@ -202,8 +202,9 @@ export function mountBrief(container, doc) {
     const editing = ['people_edits', 'scene_edits'], used = role => kind === 'remake' ? role.id === 'image_edits' : !editing.includes(role.id)
       && !(kind === 'music_video' && ['voices', 'cloned_voices'].includes(role.id)) && !(role.id === 'music' && state.doc.brief.song);  // kinds this production makes
     box.innerHTML = modelRows(roles.filter(role => used(role) || role.value))  // a remake's shots are Viggle Remake's: their templates show only when picked before, to be reset
-      + '<div class="muted" style="grid-column:1/-1;font-size:12px">Auto is the template selected in Deepy\'s settings for the category; add your own templates there (Ask Deepy &gt; Settings). A pick applies to the shots of its category that still use the previous template; the shot panel changes one shot. <button class="link" id="models-defaults">Default models</button> sets what new productions start with.</div>';
+      + '<div class="muted" style="grid-column:1/-1;font-size:12px">Auto is the template selected in Deepy\'s settings for the category; add your own templates there (Ask Deepy &gt; Settings). A pick applies to the shots of its category that still use the previous template; the shot panel changes one shot. The notes button beside a list holds your rules for the prompts written with its model. <button class="link" id="models-defaults">Default models</button> sets what new productions start with.</div>';
     box.querySelector('#models-defaults').onclick = () => openDefaultModels();
+    bindRules(box, roles);
     box.querySelectorAll('[data-role]').forEach(select => select.onchange = async () => {
       try {
         await api.chooseTemplate(state.doc.id, select.dataset.role, select.value || null);

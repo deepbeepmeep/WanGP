@@ -49,7 +49,7 @@ def library():
 
 class Job(ctypes.Structure):
     """One routed call run by a CUDA host function (experts.cpp MoeJob): the addresses stay fixed while graphs replay it."""
-    _fields_ = [(name, ctypes.c_void_p) for name in ("w13", "w2", "s13", "s2", "payload", "resident", "out")] + \
+    _fields_ = [(name, ctypes.c_void_p) for name in ("w13", "w2", "s13", "s2", "payload", "resident", "usage", "out")] + \
                [(name, ctypes.c_int32) for name in ("format", "rotation", "act", "batch", "h", "i", "e", "topk", "block", "block2", "threads", "status")]
 
 
@@ -79,6 +79,7 @@ class NativeExpertFormat(ExpertFormat):
     (FP8_BLOCK, INT4_GROUP, INT8_ROWS) and the default scale block, and dequantize_matrix() for the PyTorch path. A bank's scale blocks
     follow from the widths of its scale tensors."""
     native = block = None
+    reports_usage = True
 
     def blocks(self, hidden, intermediate, tensors):
         s13, s2 = list(tensors.values())[2:]
@@ -87,9 +88,9 @@ class NativeExpertFormat(ExpertFormat):
     def _addresses(self, bank):
         return [getattr(bank, name).data_ptr() for name in bank.expert_tensor_names]
 
-    def cpu_job(self, bank, payload, resident, out, tokens, topk, threads):
-        w13, w2, s13, s2 = self._addresses(bank)
-        job = Job(w13=w13, w2=w2, s13=s13, s2=s2, payload=payload, resident=resident, out=out, format=self.native, rotation=bank.rotation, act=ACTIVATIONS[bank.activation],
+    def cpu_job(self, bank, payload, resident, out, tokens, topk, threads, share=None, share_rows=0):
+        w13, w2, s13, s2 = self._addresses(bank)  # share: always None (cpu_share() gives none)
+        job = Job(w13=w13, w2=w2, s13=s13, s2=s2, payload=payload, resident=resident, usage=bank.usage.data_ptr(), out=out, format=self.native, rotation=bank.rotation, act=ACTIVATIONS[bank.activation],
                   batch=tokens, h=bank.hidden, i=bank.intermediate, e=bank.num_experts, topk=topk, block=bank.blocks[0], block2=bank.blocks[1], threads=threads, status=0)
         return job, host_function()
 

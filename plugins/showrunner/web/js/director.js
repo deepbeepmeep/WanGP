@@ -2,7 +2,8 @@
 // Showrunner panel: the conversation in time order, what the showrunner is doing now, an input for tasks or notes while it works, and what can be done at this moment.
 import { state, actions, activity, deepyWait } from './app.js';
 import { api } from './api.js';
-import { icon, esc, shotRefs, count, availability } from './ui.js';
+import { icon, esc, shotRefs, count, availability, markdownHtml } from './ui.js';
+import { showItem } from './bin.js';
 import { toShoot, shootTime } from './storyboard.js';
 import { askForFix } from './fix.js';
 
@@ -105,8 +106,23 @@ export function mountDirector(root) {
 
   function message(entry) {
     const who = entry.by === 'user' ? 'user' : entry.by === 'deepy' ? 'deepy' : 'system';
-    return `<div class="msg ${who}">${shotNames(entry.text.replace(/^Told the showrunner: /, ''))}${who !== 'system' ? `<span class="when">${new Date(entry.time * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>` : ''}</div>`;
+    return `<div class="msg ${who}${who === 'deepy' ? ' md' : ''}">${who === 'deepy' ? said(entry.text) : shotNames(entry.text.replace(/^Told the showrunner: /, ''))}${who !== 'system' ? `<span class="when">${new Date(entry.time * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>` : ''}</div>`;
   }
+  // A Gallery media id the showrunner names: the picture (click to look at it closely) or the sound; its id when the file is not found.
+  function mediaHtml(id) {
+    const url = `api/productions/${state.pid}/media/${encodeURIComponent(id)}`;
+    return id.startsWith('audio:') ? `<audio class="md-audio" controls preload="none" src="${url}" title="${id}"></audio>`
+      : `<button type="button" class="md-media" data-media-url="${url}" data-media-id="${id}" title="Look at it closely"><img src="${url}" alt="${id}" loading="lazy"></button>`;
+  }
+  feed.addEventListener('click', event => {
+    const button = event.target.closest('[data-media-url]');
+    if (button) showItem({ url: button.dataset.mediaUrl, kind: 'image', name: button.dataset.mediaId });
+  });
+  feed.addEventListener('error', event => {  // a picture the production no longer has: its id stays, as written
+    const button = event.target.closest?.('.md-media');
+    if (button) button.replaceWith(Object.assign(document.createElement('code'), { textContent: button.dataset.mediaId }));
+  }, true);
+  const said = text => markdownHtml(text, shotRefsOf, mediaHtml);
 
   // What the showrunner says and does during its task, in the order it comes: each step knows how many entries of the log came before it.
   function noteSteps() {
@@ -123,7 +139,7 @@ export function mountDirector(root) {
   }
 
   function stepLine(step, logged) {
-    if (step.said != null) return logged.has(step.said) ? '' : `<div class="msg deepy">${shotNames(step.said.slice(-1800))}</div>`;  // its last words join the log when its task ends
+    if (step.said != null) return logged.has(asLogged(step.said)) ? '' : `<div class="msg deepy md">${said(step.said.slice(-1800))}</div>`;  // its last words join the log when its task ends
     const tool = step.tool, label = tool.label || tool.name || '', failed = tool.status === 'error' || tool.error;
     if (!showAllErrors && (/Schema$/.test(label) || (failed && (REFUSED.test(tool.error || '') || /^(Unknown Tool|Retrying)/.test(label))))) return '';  // the contracts it reads, the calls it corrects by itself
     return `<div class="step ${failed ? 'error' : tool.status}">${icon(tool.status === 'running' ? 'loader' : failed ? 'alert' : 'check')}<span>${shotNames(label.replace(/^Showrunner: /, ''))}${tool.error ? `<span class="why">${esc(showAllErrors ? tool.error : tool.error.slice(0, 200))}</span>` : ''}</span></div>`;
@@ -178,9 +194,11 @@ export function mountDirector(root) {
   return { loadSettings, update: draw, live: draw };
 }
 
-// Deepy writes Markdown: the panel shows its words (a link by its text, code as plain words, bold as bold).
+// Deepy's words outside its messages (step labels, the change summary): a link by its text, code as plain words, bold as bold.
 // A call refused before anything ran: Deepy reads why and corrects it, and nothing was lost. Anything else that failed is the user's to see.
 const REFUSED = /^(Deepy's tool call|No action was named|Name the plugin|MCP tool result exceeded|Markdown section not found|arguments is not valid JSON|Unknown or unavailable action|Unknown Deepy template)|media_id must be returned by|inspect_audio measures audio|Path does not exist|^Error executing tool \w+: (arguments:|Unknown |No [\w ]+ has the id|Every sequence|'Unknown WanGP media_id)|Nothing was (submitted|executed)|is a required property|is not of type|is not one of|is not valid under any|Additional properties are not allowed|Visual inspection currently supports/;
+// Words as the log keeps them (production.py _op_log): the spaces of each line collapsed, its lines kept.
+const asLogged = text => String(text).trim().split(/\r?\n/).map(line => line.split(/\s+/).filter(Boolean).join(' ')).join('\n').replace(/\n{3,}/g, '\n\n').slice(0, 4000);
 function plainWords(text) { return String(text ?? '').replace(/\[([^\]]*)\]\([^)\s]*\)/g, '$1').replace(/`/g, ''); }
 function shotNames(text) { return shotRefsOf(plainWords(text)).replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>'); }
 function shotRefsOf(text) { return shotRefs(text, state.doc?.shots || [], state.doc?.cast || [], state.doc?.deliverables || []); }

@@ -86,6 +86,8 @@ class TextModel(nn.Module):
 
 
 class FishOmniBackbone(nn.Module):
+    _lm_engine_adaptive_experts = True  # each clip routes to fewer experts than the shipped ranking's mix of voices and languages: its GPU experts follow the routing
+
     def __init__(self, config, features, head_rows, vq_codebooks):
         super().__init__()
         self.config, self.features = config, features

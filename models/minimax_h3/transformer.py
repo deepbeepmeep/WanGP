@@ -28,6 +28,7 @@ from tqdm import tqdm
 from shared import attention_kit
 from shared.attention import pay_attention
 
+from .hyperflow import DroppedBlock, row_runs, two_time_rows
 from .interrupt import GenerationInterrupted
 from shared.kernels import ops as kernels
 from shared.utils.lora_mapping import convert_lora_keys
@@ -567,12 +568,26 @@ class MiniMaxH3Model(nn.Module):
                         converted[prefix + "linear." + key[len(prefix):]] = converted.pop(key)
         from .lora_affine import convert_adaln_loras
 
-        if self.use_adaln_curves:
-            ignored = sorted(key for key in converted if key.startswith("time_embedder."))
+        if self.use_adaln_curves or self.endpoint_gate is not None:
+            ignored = sorted(key for key in converted if key.startswith(("time_embedder.", "endpoint_time_embedder.")))
             for key in ignored:
                 converted.pop(key)
             if ignored:
                 tqdm.write("MiniMax H3 LoRA: ignored unsupported pruned timestep tensors: " + ", ".join(ignored))
+        if self.dropped_blocks:
+            ignored = [key for key in converted if key.startswith("blocks.") and int(key.split(".", 2)[1]) in self.dropped_blocks]
+            for key in ignored:
+                converted.pop(key)
+            if ignored:
+                tqdm.write(f"MiniMax H3 LoRA: skipped {len(ignored)} tensors of the blocks this model removed ({', '.join(map(str, self.dropped_blocks))})")
+        if self.endpoint_gate is not None:
+            from .hyperflow import convert_adaln_loras as convert_two_time_adaln_loras
+
+            start = time.perf_counter()
+            count = convert_two_time_adaln_loras(self, model_type, converted, source_package)
+            if count:
+                tqdm.write(f"MiniMax H3 LoRA: moved {count} AdaLN adapters onto HyperFlow's two-time AdaLN input in {time.perf_counter() - start:.2f}s (fitted, approximate)")
+            return converted
 
         start = time.perf_counter()
         count, architecture, source_width, target_width = convert_adaln_loras(
@@ -618,7 +633,7 @@ class MiniMaxH3Model(nn.Module):
                  final_norm_eps=1e-5, sigma_shift_video=12.0, sigma_shift_audio=3.0,
                  adaln_curve_grid=None, adaln_dtype=torch.float32, image_model=None,
                  hybrid_ref2va_blocks=None, pdd_num_steps=None, pdd_block_size=None, vdn=False, vsa=False,
-                 control_layers=(), control_in_dim=0, dtype=None, device=None, **kwargs):
+                 control_layers=(), control_in_dim=0, dropped_blocks=(), endpoint_gate=None, dtype=None, device=None, **kwargs):
         super().__init__()
         self._interrupt = False
         self.cache = None
@@ -645,6 +660,10 @@ class MiniMaxH3Model(nn.Module):
         else:
             self.time_embedder = TimeEmbedder(timestep_input_dim, time_embed_hidden_size, time_embed_dim,
                                               dtype=torch.float32, device=device)
+        self.endpoint_gate = endpoint_gate  # HyperFlow: AdaLN reads temb(t, r), r the time each step lands on
+        if endpoint_gate is not None:
+            self.endpoint_time_embedder = TimeEmbedder(timestep_input_dim, time_embed_hidden_size, time_embed_dim,
+                                                       dtype=torch.float32, device=device)
         self.rope = RotaryEmbedding(rope_inv_freq_len, rope_theta, device=device)
         self.token_refiner = TokenRefiner(token_refiner_num_layers, hidden_size, num_attention_heads,
                                           attention_head_dim, ffn_hidden_size, norm_eps, qk_norm_eps,
@@ -652,10 +671,13 @@ class MiniMaxH3Model(nn.Module):
         self.sol_attention = MiniMaxH3SolAttention()
         curve = {"apply_silu": not self.use_adaln_curves,
                  "adaln_dtype": adaln_dtype if self.use_adaln_curves else dtype}
-        self.blocks = nn.ModuleList([DiTBlock(hidden_size, num_attention_heads, attention_head_dim, ffn_hidden_size,
-                                               time_embed_dim, norm_eps, qk_norm_eps, **curve,
-                                               sol_attention=self.sol_attention, vdn=vdn, vsa=vsa,
-                                               dtype=dtype, device=device) for _ in range(num_layers)])
+        self.blocks = nn.ModuleList([DroppedBlock() if index in dropped_blocks else
+                                     DiTBlock(hidden_size, num_attention_heads, attention_head_dim, ffn_hidden_size,
+                                              time_embed_dim, norm_eps, qk_norm_eps, **curve,
+                                              sol_attention=self.sol_attention, vdn=vdn, vsa=vsa,
+                                              dtype=dtype, device=device) for index in range(num_layers)])
+        self.dropped_blocks = tuple(dropped_blocks)
+        self.kept_blocks = [index for index in range(num_layers) if index not in dropped_blocks]
         self.final_layer = FinalLayer(hidden_size, time_embed_dim, video_dim, audio_latents_dim,
                                       final_norm_eps, **curve, pdd_num_steps=pdd_num_steps, dtype=dtype, device=device)
         self.control_layers = tuple(control_layers)
@@ -674,6 +696,8 @@ class MiniMaxH3Model(nn.Module):
                 module._lock_dtype = adaln_dtype
         else:
             fp32_modules.extend((self.time_embedder.proj_in, self.time_embedder.proj_out))
+        if endpoint_gate is not None:
+            fp32_modules.append(self.endpoint_time_embedder)
         for module in fp32_modules:
             for submodule in module.modules():
                 submodule._lock_dtype = torch.float32
@@ -746,7 +770,10 @@ class MiniMaxH3Model(nn.Module):
             for start, stop in _chunk_rows(first, last):
                 kernels.linear_residual_(after_proj, [stream[start:stop]], hidden[start:stop], scale)
 
-    def _time_embedding(self, timesteps, table=None):
+    def _time_embedding(self, timesteps, table=None, endpoints=None):
+        if endpoints is not None:
+            current = self.time_embedder(timesteps)
+            return current.add_(self.endpoint_time_embedder(endpoints).sub_(current), alpha=self.endpoint_gate)
         if not self.use_adaln_curves:
             return self.time_embedder(timesteps)
         table = self.adaln_t_table if table is None else table
@@ -856,13 +883,16 @@ class MiniMaxH3Model(nn.Module):
         else:
             video_x = audio_x = None
 
+        video_time = float(1.0 - base_video_sigma)
+        condition_video_time = max(video_time, VISUAL_COND_TIMESTEP)
+        keyframe_times = _keyframe_timesteps(payload.get("keyframes"), latent_h // self.patch_size[1] * (latent_w // self.patch_size[2]))
         timestep, timestep_indices = build_row_timesteps(
             layout,
-            float(1.0 - base_video_sigma),
+            video_time,
             float(1.0 - sigma_audio.flatten()[0]),
-            max(float(1.0 - base_video_sigma), VISUAL_COND_TIMESTEP),
+            condition_video_time,
             AUDIO_COND_TIMESTEP,
-            keyframe_timesteps=_keyframe_timesteps(payload.get("keyframes"), latent_h // self.patch_size[1] * (latent_w // self.patch_size[2])),
+            keyframe_timesteps=keyframe_times,
         )
         timestep, timestep_indices = timestep.to(device), timestep_indices.to(device)
         target_video_rows = latent_t * (latent_h // self.patch_size[1]) * (latent_w // self.patch_size[2])
@@ -875,6 +905,19 @@ class MiniMaxH3Model(nn.Module):
                 target_video_fixed_rows, target_video_mask_active)
         elif sigma_video.numel() == latent_t:
             timestep, timestep_indices, video_head_row, frame_rows = _frame_video_timestep_rows(timestep, timestep_indices, sigma_video, target_video_rows)
+        endpoints = None
+        if self.endpoint_gate is not None:  # HyperFlow: one (t, r) pair per row; rows pinned at their own noise level (fixed, anchored) keep r = t
+            rows_per_frame = target_video_rows // latent_t
+            spans = (grouped_segments if grouped_segments is not None else
+                     [(video_start + index * rows_per_frame, video_start + (index + 1) * rows_per_frame, int(row) * 3) for index, row in enumerate(frame_rows)]
+                     if frame_rows is not None else [])
+            pinned = [(start, stop, value) for start, stop, row in spans if (value := float(timestep[row // 3])) != video_time]
+            video_endpoint, audio_endpoint = payload["endpoint_sigmas"]
+            timestep, endpoints, timestep_indices = two_time_rows(layout, timestep, timestep_indices, (1.0 - float(video_endpoint), 1.0 - float(audio_endpoint)),
+                                                                  condition_video_time, keyframe_times, pinned)
+            frame_rows = grouped_segments = None
+            runs = row_runs(timestep_indices, video_start, layout.sequence_length)
+            video_head_row = runs[0][2] if len(runs) == 1 else runs
         adaln_indices = timestep_indices * 3 + layout.token_tags.to(device).clamp_min(0)
         changes = torch.cat((torch.ones(1, dtype=torch.bool, device=device), adaln_indices[1:] != adaln_indices[:-1],
                              torch.ones(1, dtype=torch.bool, device=device))).nonzero().flatten()
@@ -888,7 +931,7 @@ class MiniMaxH3Model(nn.Module):
         elif grouped_segments is not None:
             segments = [segment for segment in segments if segment[0] < video_start]
             segments.extend(grouped_segments)
-        temb = self._time_embedding(timestep)
+        temb = self._time_embedding(timestep, endpoints=endpoints)
         ref2va_temb = self._time_embedding(timestep, self.ref2va_adaln_t_table) if self.hybrid_ref2va_blocks is not None else None
         rope = payload.get("rope")
         if rope is None:
@@ -951,17 +994,17 @@ class MiniMaxH3Model(nn.Module):
 
         with cuda_graphs.scope():
             if first_block_cache is None:
-                for block_index in range(len(self.blocks)):
+                for block_index in self.kept_blocks:
                     self._check_interrupt()
                     h_list = [hidden]
                     hidden = None
                     hidden = run_block(block_index, h_list)
             else:
                 self._check_interrupt()
-                hidden, signature = run_block(0, [hidden], first_block_cache.MAX_SIGNATURE_ELEMENTS)
+                hidden, signature = run_block(self.kept_blocks[0], [hidden], first_block_cache.MAX_SIGNATURE_ELEMENTS)
                 if first_block_cache.should_compute(signature):
                     head_output = first_block_cache.capture_head_output(hidden[audio_start:])
-                    for block_index in range(1, len(self.blocks)):
+                    for block_index in self.kept_blocks[1:]:
                         self._check_interrupt()
                         h_list = [hidden]
                         hidden = None

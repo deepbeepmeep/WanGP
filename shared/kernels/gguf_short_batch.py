@@ -74,7 +74,7 @@ def _save_disk():
         print(f"[GGUF] Short-Batch choice cache not saved: {exc}")
 
 
-def _measure(native, qtype, shape, peers, x, dtype, warm_seconds=0.):
+def _measure(native, qtype, shape, peers, x, dtype, warm_seconds=0., pool=None):
     """Per-call time (ms) of both kernels over the weights in rotation, or None if tensor cores disagree
     with single-row MMVQ (the decode kernel; batched native may be MMQ, which is itself less accurate)."""
     times, graphs = {"native": [], "mma": []}, {}
@@ -90,7 +90,7 @@ def _measure(native, qtype, shape, peers, x, dtype, warm_seconds=0.):
             native.set_short_batch_mode(mode)
             native.linear(peers[0], qtype, shape, x, None, dtype)  # load the timed variant before capture
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+            with torch.cuda.graph(graph, pool=pool, capture_error_mode="thread_local"):
                 for raw in peers:
                     native.linear(raw, qtype, shape, x, None, dtype)
             graphs[mode] = graph
@@ -143,6 +143,7 @@ def prepare(model, native):
     if native is None or not getattr(native, "has_short_batch_policy", lambda: False)() or native.short_batch_mode() != "auto":
         return
     measured, lines, started = 0, [], time.perf_counter()
+    pools = {}  # one graph pool per device for every timing capture: each new pool reserves GPU address space (as large as the card with MMGP's allocator)
     for (device, qtype, shape), weights in _gguf_weights(model).items():
         props = torch.cuda.get_device_properties(device)
         if props.major < 8:
@@ -171,9 +172,11 @@ def prepare(model, native):
             if record is None:
                 if timed is None:  # the weights read from RAM are timed from VRAM copies, as when they were resident
                     timed = [raw.clone() if mapped else raw for raw, mapped in peers]
+                if device not in pools:
+                    pools[device] = torch.cuda.graph_pool_handle()
                 with torch.inference_mode(), torch.cuda.device(device):
                     x = torch.randn((rows, shape[1]), device=device, dtype=dtype)
-                    timings, error = _measure(native, qtype, shape, timed, x, dtype, warm_seconds=0. if measured else .05)
+                    timings, error = _measure(native, qtype, shape, timed, x, dtype, warm_seconds=0. if measured else .05, pool=pools[device])
                 measured += 1
                 if timings is None:
                     record = {"mma": False, "error": error}

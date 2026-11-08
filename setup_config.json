@@ -6,8 +6,12 @@
             "3.12": { "ver": "3.12.10", "label": "Python 3.12.10 (AMD ROCm)" }
         },
         "torch": {
+            "cu126": {
+                "label": "Torch 2.7.1 + CUDA 12.6 (GTX 10XX: the Linux CUDA 12.8 wheels start at RTX 20XX, CUDA 13 no longer supports them)",
+                "cmd": "torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu126"
+            },
             "cu128": {
-                "label": "Torch 2.7.1 + CUDA 12.8 (GTX 10XX only: CUDA 13 no longer supports them)",
+                "label": "Torch 2.7.1 + CUDA 12.8 (legacy stack, RTX 20XX and newer)",
                 "cmd": "torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128"
             },
             "cu130": {
@@ -178,7 +182,7 @@
         }
     },
     "gpu_profiles": {
-        "GTX_10":      { "platforms": ["win", "linux"], "python": "3.10", "torch": "cu128", "triton": null,     "sage": null,       "sparge": null, "flash": null, "kernels": [] },
+        "GTX_10":      { "platforms": ["win", "linux"], "python": "3.10", "torch": "cu126", "triton": null,     "sage": null,       "sparge": null, "flash": null, "kernels": [] },
         "RTX_20":      { "platforms": ["win", "linux"], "python": "3.11", "torch": "cu130", "triton": "v33", "sage": "v1", "sparge": null, "flash": null, "kernels": ["wgpkernels", "nunchaku_cu13", "gguf"] },
         "RTX_30":      { "platforms": ["win", "linux"], "python": "3.11", "torch": "cu130", "triton": "v37", "sage": "v220_cu13", "sparge": "v010_cu13", "flash": "v210", "kernels": ["wgpkernels", "nunchaku_cu13", "gguf"] },
         "RTX_40":      { "platforms": ["win", "linux"], "python": "3.11", "torch": "cu130", "triton": "v37", "sage": "v220_cu13", "sparge": "v010_cu13", "flash": "v210", "kernels": ["wgpkernels", "nunchaku_cu13", "gguf"] },

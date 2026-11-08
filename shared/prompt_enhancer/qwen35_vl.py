@@ -108,12 +108,22 @@ def _get_qwen35_gguf_filename(spec: dict, backend: str) -> str:
     return spec[QWEN_CHECKPOINTS[backend][0]]
 
 
+def locate_qwen35_folder(folder_name: str) -> str | None:
+    """A Qwen model's folder among the checkpoint roots: the first that holds its config.json, else the first that exists. Its large files may sit in
+    the folder of the same name of another root (a table moved to a faster drive), which _resolve_qwen35_checkpoint_file finds."""
+    if not os.path.isabs(folder_name):
+        configured = fl.installed_copies(os.path.join(folder_name, "config.json"))
+        if configured:
+            return os.path.dirname(configured[0])
+    return fl.locate_folder(folder_name, error_if_none=False)
+
+
 def _resolve_qwen35_assets_dir(assets_dir: str | None, variant: str | None = None, error_if_none: bool = True) -> str | None:
     folder_name = get_qwen35_assets_dir_name(variant)
     candidate = folder_name if assets_dir is None else assets_dir
-    resolved = fl.locate_folder(candidate, error_if_none=False)
+    resolved = locate_qwen35_folder(candidate)
     if resolved is None and assets_dir is not None and candidate != folder_name:
-        resolved = fl.locate_folder(folder_name, error_if_none=False)
+        resolved = locate_qwen35_folder(folder_name)
     if resolved is None and error_if_none:
         raise FileNotFoundError(f"Missing Qwen3.5 assets folder '{candidate}'")
     return resolved
@@ -143,7 +153,9 @@ def _resolve_qwen35_checkpoint_file(
     del variant
     if assets_dir is None:
         return None
-    resolved = fl.locate_file(filename, error_if_none=False, extra_paths=[assets_dir])
+    # the downloads' relative path (folder/file) in the first root that has it, so that a model's files may be spread over the roots
+    resolved = fl.locate_file(filename, error_if_none=False) or fl.locate_file(os.path.join(os.path.basename(os.path.normpath(assets_dir)), filename), error_if_none=False) \
+        or fl.locate_file(filename, error_if_none=False, extra_paths=[assets_dir])
     if resolved is not None:
         return resolved
     fallback_path = os.path.join(assets_dir, filename)

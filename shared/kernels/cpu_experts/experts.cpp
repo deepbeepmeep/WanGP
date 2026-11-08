@@ -368,18 +368,26 @@ API int moe_forward(int format, int rotation, int act, const uint8_t* w13, const
 // One routed call run by a CUDA host function (cuLaunchHostFunc), from a stream or a captured graph: the payload is written by the
 // device-to-host copy queued before it ([batch*h float32 x | batch*topk float32 probabilities | batch*topk int32 ids]), and the
 // full float32 result (zeros when every pair is computed elsewhere) is read by the copy back queued after it. A failure is kept in
-// status (sticky) for the host to report once the stream is synchronized.
+// status (sticky) for the host to report once the stream is synchronized. usage (or null): per expert, the pairs routed to it are
+// counted there, wherever they are computed (the placement follows the routing).
 struct MoeJob {
     const uint8_t* w13; const uint8_t* w2; const void* s13; const void* s2;
-    const int32_t* payload; const uint8_t* resident; float* out;
+    const int32_t* payload; const uint8_t* resident; uint32_t* usage; float* out;
     int32_t format, rotation, act, batch, h, i, e, topk, block, block2, threads, status;
 };
+
+static void count_usage(const MoeJob* j, const int32_t* ids) {
+    if (j->usage == nullptr) return;
+    for (size_t n = 0; n < size_t(j->batch) * j->topk; ++n)
+        if (ids[n] >= 0) ++j->usage[ids[n]];
+}
 
 API void moe_host_job(void* data) {
     MoeJob* j = (MoeJob*)data;
     const float* x = (const float*)j->payload;
     const float* probabilities = x + size_t(j->batch) * j->h;
     const int32_t* ids = j->payload + size_t(j->batch) * (j->h + j->topk);
+    count_usage(j, ids);
     int count = moe_forward(j->format, j->rotation, j->act, j->w13, j->w2, j->s13, j->s2, x, ids, probabilities, j->resident, j->out,
                             j->batch, j->h, j->i, j->e, j->topk, j->block, j->block2, j->threads);
     if (count == 0) std::fill(j->out, j->out + size_t(j->batch) * j->h, 0.f);
@@ -392,6 +400,7 @@ API int moe_server_job(void* data) {
     const float* x = (const float*)j->payload;
     const float* probabilities = x + size_t(j->batch) * j->h;
     const int32_t* ids = j->payload + size_t(j->batch) * (j->h + j->topk);
+    count_usage(j, ids);
     int count = moe_forward(j->format, j->rotation, j->act, j->w13, j->w2, j->s13, j->s2, x, ids, probabilities, j->resident, j->out,
                             j->batch, j->h, j->i, j->e, j->topk, j->block, j->block2, j->threads);
     if (count < 0) j->status = count;

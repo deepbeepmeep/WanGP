@@ -198,8 +198,10 @@ class FishAudioPipeline:
                 frame_done.record()
                 if step + 1 < max_frames:
                     placed = placed or runtime.place_experts(backbone)
+                    runtime.adapt_experts(backbone)  # in place: the graphs read the placement through its table and flags
                     # Queued before this frame is checked: the GPU goes on with the next step while the host waits and checks.
                     hidden, logits = backbone.decode(sampled[:, 0], extra, semantic, positions[position + 1:position + 2], position + 1)
+                    runtime.plan_experts(backbone)  # the next round's numbers, while the host would only wait
                 del sampled, finite, extra, semantic
                 # The frame's one host sync: a blocking event, whose wait sleeps instead of spinning beside the CPU experts.
                 frame_done.synchronize()

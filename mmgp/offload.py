@@ -1290,12 +1290,11 @@ ONCE_PER_GENERATION_MODELS = ("text_encoder", "text_encoder_2", "vae") # unless 
 DROP_UNREFERENCED_PAGES = True # comparison switch: once the models are profiled, the checkpoint pages that nothing reads any more (sources of the copies made at load) leave the working set
 
 if os.name == "nt":
-    class _MemoryInformation(ctypes.Structure):
-        _fields_ = [("BaseAddress", ctypes.c_size_t), ("AllocationBase", ctypes.c_void_p), ("AllocationProtect", ctypes.c_ulong), ("PartitionId", ctypes.c_ushort),
-                    ("RegionSize", ctypes.c_size_t), ("State", ctypes.c_ulong), ("Protect", ctypes.c_ulong), ("Type", ctypes.c_ulong)]
-    _virtual_query = ctypes.WinDLL("kernel32", use_last_error=True).VirtualQuery
-    _virtual_query.argtypes = (ctypes.c_void_p, ctypes.POINTER(_MemoryInformation), ctypes.c_size_t)
-    _virtual_query.restype = ctypes.c_size_t
+    class _RegionInformation(ctypes.Structure): # WIN32_MEMORY_REGION_INFORMATION
+        _fields_ = [("AllocationBase", ctypes.c_size_t), ("AllocationProtect", ctypes.c_ulong), ("Flags", ctypes.c_ulong), ("RegionSize", ctypes.c_size_t), ("CommitSize", ctypes.c_size_t)]
+    _query_region = ctypes.WinDLL("kernelbase", use_last_error=True).QueryVirtualMemoryInformation
+    _query_region.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(_RegionInformation), ctypes.c_size_t, ctypes.c_void_p)
+    _query_region.restype = ctypes.c_int
     _virtual_unlock = ctypes.WinDLL("kernel32", use_last_error=True).VirtualUnlock
     _virtual_unlock.argtypes = (ctypes.c_void_p, ctypes.c_size_t)
     _mapped_file_name = ctypes.WinDLL("psapi", use_last_error=True).GetMappedFileNameW
@@ -1312,17 +1311,28 @@ def _drop_mapped_pages(ranges):
         for start, end in ranges:
             _virtual_unlock(start, end - start)
 
+_PRIVATE, _MAPPED_FILE, _MAPPED_PAGE_FILE = 0x1, 0x2, 0x8 # WIN32_MEMORY_REGION_INFORMATION flags
+
+def _allocation(pointer):
+    # (start, end, flags) of the allocation holding pointer (a view of a file or of shared memory, private RAM), (0, 0, 0) for none: the record of
+    # the allocation itself (Windows 10 1607 and later). VirtualQuery instead walks the page table from the address to the end of the range of
+    # pages alike: 0.4-0.7 s from the start of a 51 GiB view of a checkpoint whose pages were read, on the thread that asks
+    info = _RegionInformation()
+    if not _query_region(ctypes.c_void_p(-1), pointer, 0, ctypes.byref(info), ctypes.sizeof(info), None) or not info.AllocationBase: # MemoryRegionInfo
+        return 0, 0, 0
+    return info.AllocationBase, info.AllocationBase + info.RegionSize, info.Flags
+
 def _mapped_pages(leaves):
     # the pages of the tensors (address, bytes) mapped from a checkpoint file, to drop once copied: rounded out to whole pages, a range per
     # run of tensors that follow each other in a view of the file (one call each). A page shared with a tensor not read yet, dropped, comes
     # back from the standby list without reading the drive when that tensor is read (and is dropped again with it). Windows only
     if os.name != "nt":
         return []
-    info, ranges, region = _MemoryInformation(), [], (0, 0, None)
+    ranges, region = [], (0, 0, None)
     for pointer, nbytes in sorted(leaves):
         if not region[0] <= pointer < region[1]:
-            found = _virtual_query(pointer, ctypes.byref(info), ctypes.sizeof(info)) != 0
-            region = (info.BaseAddress, info.BaseAddress + info.RegionSize, info.AllocationBase if info.Type != 0x20000 else None) if found else (0, 0, None) # not MEM_PRIVATE: its view
+            start, end, flags = _allocation(pointer)
+            region = (start, end, start if end and not flags & _PRIVATE else None) # not private: its view
         if region[2] is None or nbytes == 0:
             continue
         start, end = pointer // PAGE_SIZE * PAGE_SIZE, (pointer + nbytes + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE
@@ -1348,20 +1358,19 @@ def _unreferenced_pages(spans):
     # them. A page shared with a tensor stays. Dropping pages that are not in the working set costs almost nothing. Windows only
     if os.name != "nt":
         return []
-    info, views, region = _MemoryInformation(), {}, (0, 0, None)
+    views, ends, region = {}, {}, (0, 0, None)
     for pointer, nbytes in sorted(spans):
         if not region[0] <= pointer < region[1]:
-            found = _virtual_query(pointer, ctypes.byref(info), ctypes.sizeof(info)) != 0
-            region = (info.BaseAddress, info.BaseAddress + info.RegionSize, info.AllocationBase if info.Type == 0x40000 else None) if found else (0, 0, None) # MEM_MAPPED: its view
+            start, end, flags = _allocation(pointer)
+            region = (start, end, start if flags & (_MAPPED_FILE | _MAPPED_PAGE_FILE) else None) # a view
+            ends[start] = end
         if region[2] is not None and nbytes:
             views.setdefault(region[2], []).append((pointer // PAGE_SIZE * PAGE_SIZE, (pointer + nbytes + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE))
     ranges, name = [], ctypes.create_unicode_buffer(260)
     for base, used in views.items():
         if not _mapped_file_name(ctypes.c_void_p(-1), base, name, 260): # a view of a file, not of shared memory
             continue
-        end = base
-        while _virtual_query(end, ctypes.byref(info), ctypes.sizeof(info)) and info.AllocationBase == base:
-            end = info.BaseAddress + info.RegionSize
+        end = ends[base]
         position = base
         for start, stop in sorted(used):
             if start > position:
@@ -1371,16 +1380,61 @@ def _unreferenced_pages(spans):
             ranges.append((position, end))
     return ranges
 
+_file_mappings = {} # Windows: the allocation base of a view of a whole file -> a read-only mapping of that file (its handle), or None for a view of part of a file
+
+def file_mapping(address):
+    """For an address in a view of a whole file mapped here (Windows): the handle of a read-only mapping of that file, which another process may duplicate and map
+    (the copy helper of the GPU's share of the experts, mmgp.experts._Level2), and the address's offset in the file. None for other memory, or for a view of part of a
+    file, whose offset in the file is not known here."""
+    if os.name != "nt":
+        return None
+    base, end, flags = _allocation(address)
+    if not flags & _MAPPED_FILE:
+        return None
+    if base not in _file_mappings:
+        _file_mappings[base] = _map_whole_file(base, end)
+    mapping = _file_mappings[base]
+    return None if mapping is None else (mapping, address - base)
+
+def _map_whole_file(base, end):
+    import ctypes.wintypes as wt
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes, kernel32.CreateFileW.restype = [ctypes.c_wchar_p, wt.DWORD, wt.DWORD, ctypes.c_void_p, wt.DWORD, wt.DWORD, wt.HANDLE], wt.HANDLE
+    kernel32.CreateFileMappingW.argtypes, kernel32.CreateFileMappingW.restype = [wt.HANDLE, ctypes.c_void_p, wt.DWORD, wt.DWORD, wt.DWORD, ctypes.c_wchar_p], wt.HANDLE
+    kernel32.GetFileSizeEx.argtypes, kernel32.CloseHandle.argtypes = [wt.HANDLE, ctypes.POINTER(ctypes.c_int64)], [wt.HANDLE]
+    name = ctypes.create_unicode_buffer(1024)
+    if not _mapped_file_name(ctypes.c_void_p(-1), base, name, 1024):
+        return None
+    file = kernel32.CreateFileW("\\\\?\\GLOBALROOT" + name.value, 0x80000000, 0x7, None, 3, 0, None) # GENERIC_READ, any sharing, OPEN_EXISTING (an NT device path)
+    if file in (None, wt.HANDLE(-1).value):
+        return None
+    size, mapping = ctypes.c_int64(0), None
+    # the view holds the file's last byte: it covers the whole file, from its start (a view never reaches past the file's end)
+    if kernel32.GetFileSizeEx(file, ctypes.byref(size)) and size.value and end - base >= size.value:
+        mapping = kernel32.CreateFileMappingW(file, None, 0x02, 0, 0, None) or None # PAGE_READONLY
+    kernel32.CloseHandle(file)
+    return mapping
+
+def close_file_mappings():
+    """Once no helper maps them (the checkpoints may be unloaded, and another file mapped at the same address)."""
+    if os.name == "nt":
+        close = ctypes.WinDLL("kernel32").CloseHandle
+        close.argtypes = [ctypes.c_void_p]
+        for mapping in _file_mappings.values():
+            if mapping is not None:
+                close(mapping)
+    _file_mappings.clear()
+
 def _private_memory(pointers):
     # whether each address (in increasing order) lies in RAM the process allocated (PyTorch's allocators, the heap), rather than in a mapping
     # of a file (a checkpoint). One query per region of memory: each call from a thread waits for the GIL on return, a few ms while the main
     # thread runs a model
     if os.name == "nt":
-        info, private, region = _MemoryInformation(), [], (0, 0, False)
+        private, region = [], (0, 0, False)
         for pointer in pointers:
             if not region[0] <= pointer < region[1]:
-                found = _virtual_query(pointer, ctypes.byref(info), ctypes.sizeof(info)) != 0
-                region = (info.BaseAddress, info.BaseAddress + info.RegionSize, info.Type == 0x20000) if found else (0, 0, False) # MEM_PRIVATE
+                start, end, flags = _allocation(pointer)
+                region = (start, end, bool(flags & _PRIVATE))
             private.append(region[2])
         return private
     regions = []
@@ -1398,13 +1452,16 @@ def _private_memory(pointers):
 class _PoolEntry:
     # a block in the pinned pool: its locked RAM (registrations), the pinned sources of its VRAM buffer as [(offset, uint8 tensor)] for the
     # layout it was made for, the bytes it locks, its page ranges locked in place and its plain tensors as (address, bytes)
-    __slots__ = ("model_id", "registrations", "sources", "layout", "nbytes", "in_place", "leaves")
+    __slots__ = ("model_id", "registrations", "sources", "layout", "nbytes", "in_place", "leaves", "leave")
 
-    def __init__(self, model_id, registrations, sources, layout, nbytes, in_place, leaves):
-        self.model_id, self.registrations, self.sources, self.layout, self.nbytes, self.in_place, self.leaves = model_id, registrations, sources, layout, nbytes, in_place, leaves
+    def __init__(self, model_id, registrations, sources, layout, nbytes, in_place, leaves, leave=None):
+        self.model_id, self.registrations, self.sources, self.layout, self.nbytes, self.in_place, self.leaves, self.leave = model_id, registrations, sources, layout, nbytes, in_place, leaves, leave
 
     def close(self):
         # unlocks (waits for the work queued on the GPU) and frees its buffer; tensors locked in place stay the model's, in pageable RAM
+        if self.leave is not None:  # its owner stops reading it first
+            self.leave()
+            self.leave = None
         for registration in self.registrations:
             registration.close()
         self.registrations, self.sources = [], None
@@ -1413,8 +1470,11 @@ class _PoolEntry:
 # How a block enters the pinned pool, made once for its layout: the page ranges to lock in place [(start, end, storages)] and their sources
 # [(offset in the block's VRAM buffer, uint8 tensor)], the runs copied into a buffer of locked RAM of its own (_copy_runs), the size of that
 # buffer, its pieces [(offset in the VRAM buffer, offset in the buffer, bytes)], the bytes locked and the plain tensors as (address, bytes)
-_PoolPlan = collections.namedtuple("_PoolPlan", "layout ranges sources runs copy_nbytes pieces nbytes leaves mapped fill", defaults=(None,)) # mapped: the pages of the
-# tensors mapped from a checkpoint file [(start, end)] (_mapped_pages), dropped from the working set once copied. fill(buffer, helpers), if not None, fills the buffer instead of the runs
+_PoolPlan = collections.namedtuple("_PoolPlan", "layout ranges sources runs copy_nbytes pieces nbytes leaves mapped fill leave added block flags", defaults=(None, None, None, None, 0)) # mapped: the pages of the
+# tensors mapped from a checkpoint file [(start, end)] (_mapped_pages), dropped from the working set once copied. fill(buffer, helpers), if not None, fills the buffer instead of the runs;
+# leave(), if not None, is called before the entry's RAM goes; added, if not None, the RAM the entry takes from the system's available RAM (copy_nbytes: a fill that drops as much of its sources from the working
+# set takes less, none when they all were there); block(nbytes), if not None, makes the buffer instead of pinned.block (e.g. pinned.shared_block); flags: of the
+# buffer's registration (2: mapped for the GPU, which reads it in place)
 
 
 class _PinnedPool:
@@ -1529,13 +1589,13 @@ class _PinnedPool:
         # a page already locked by someone else)
         registrations, device = [], torch.cuda.current_device()
         try:
-            reserved = pinned.fits(plan.nbytes, cap)
-            if reserved and psutil.virtual_memory().available - plan.copy_nbytes < POOL_RAM_FLOOR:
-                self._drop_idle_pages(manager, POOL_RAM_FLOOR + plan.copy_nbytes)
-                if psutil.virtual_memory().available - plan.copy_nbytes < POOL_RAM_FLOOR: # the pages of its own experts in VRAM, before refusing
+            reserved, added = pinned.fits(plan.nbytes, cap), plan.copy_nbytes if plan.added is None else plan.added
+            if reserved and added and psutil.virtual_memory().available - added < POOL_RAM_FLOOR:
+                self._drop_idle_pages(manager, POOL_RAM_FLOOR + added)
+                if psutil.virtual_memory().available - added < POOL_RAM_FLOOR: # the pages of its own experts in VRAM, before refusing
                     for residency in manager.expert_residency.values():
                         residency.release_copied_pages(wait=True)
-            if reserved and psutil.virtual_memory().available - plan.copy_nbytes >= POOL_RAM_FLOOR:
+            if reserved and (not added or psutil.virtual_memory().available - added >= POOL_RAM_FLOOR):  # an entry taking no available RAM never makes it shorter
                 for start, end, storages in plan.ranges:
                     registration = pinned.Registration(storages, start, end - start, device, kind="pool")
                     if int(registration.register()) != 0:
@@ -1543,19 +1603,19 @@ class _PinnedPool:
                     registrations.append(registration)
                 else:
                     if plan.copy_nbytes:
-                        buffer, owner = pinned.block(plan.copy_nbytes)
+                        buffer, owner = (plan.block or pinned.block)(plan.copy_nbytes)
                         if plan.fill is not None:
                             plan.fill(buffer, self.helpers)
                         else:
                             _copy_runs(buffer.data_ptr(), plan.runs, self.helpers)
                             _drop_mapped_pages(plan.mapped)
-                        registration = pinned.Registration(owner, buffer.data_ptr(), plan.copy_nbytes, device, kind="pool")
+                        registration = pinned.Registration(owner, buffer.data_ptr(), plan.copy_nbytes, device, flags=plan.flags, kind="pool")
                         if int(registration.register()) == 0:
                             registrations.append(registration)
             if len(registrations) == len(plan.ranges) + bool(plan.copy_nbytes):
                 with torch.inference_mode(False):
                     sources = plan.sources + [(offset, buffer[start:start + nbytes]) for offset, start, nbytes in plan.pieces]
-                entry = _PoolEntry(model_id, registrations, sources, plan.layout, plan.nbytes, [(start, end) for start, end, _ in plan.ranges], plan.leaves)
+                entry = _PoolEntry(model_id, registrations, sources, plan.layout, plan.nbytes, [(start, end) for start, end, _ in plan.ranges], plan.leaves, plan.leave)
                 with self.guard:
                     self.entries.setdefault(manager, {})[entry_name] = entry
                     self.version += 1
@@ -4748,12 +4808,13 @@ class offload:
         return {(leaf.data_ptr(), leaf.numel() * leaf.element_size()) for _, _, p, _, tied in self.blocks_of_modules.get(entry_name, ()) if tied is None
                 for leaf in _staging_leaves(p.data if type(p) is torch.nn.Parameter else p) or ()}
 
-    def pool_experts(self, model_id, entry_name, nbytes, fill):
-        # a batch of experts that streams enters the pinned pool like a block (Residency): the future of its entry, None if the pool takes no more until the next quiet point
+    def pool_experts(self, model_id, entry_name, nbytes, fill, leave=None, added=None, block=None, flags=0):
+        # a batch of experts that streams enters the pinned pool like a block (Residency): the future of its entry, None if the pool takes no more until the next quiet point.
+        # leave, added, block, flags: see _PoolPlan
         if not self._pool_admits(model_id) or _pool.full:
             return None
         size = (nbytes + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE
-        return _pool.prepare(self, model_id, entry_name, _PoolPlan(None, [], [], None, size, [(0, 0, nbytes)], size, (), (), fill))
+        return _pool.prepare(self, model_id, entry_name, _PoolPlan(None, [], [], None, size, [(0, 0, nbytes)], size, (), (), fill, leave, added, block, flags))
 
     def pool_source(self, entry_name):
         # the locked copy of a batch of experts, None once it left the pool

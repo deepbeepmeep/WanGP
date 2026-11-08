@@ -930,14 +930,15 @@ def _generate_messages_vllm(
             thinking_open = thinking_enabled
             for marker in re.finditer(r"</?think>", raw_text, flags=re.IGNORECASE):
                 thinking_open = marker.group().lower() == "<think>"
-            if thinking_open:
-                raise RuntimeError("Prompt Enhancement Ended With Unfinished Thinking. Please Try Again.")
-            if response["stop_reason"] != "stop_token":
-                raise RuntimeError(f"Prompt Enhancement Did Not Finish ({response['stop_reason']}). Please Try Again.")
             thinking_text, answer_text = _split_generated_text(raw_text)
-            if not answer_text.strip():
-                raise RuntimeError("Prompt Enhancement Returned No Final Prompt. Please Try Again.")
-            engine._last_failure_reason = ""
+            # A generation that ends without a final prompt is no error: its caller keeps the original prompt of this slot
+            failure = ("Prompt Enhancement Ended With Unfinished Thinking" if thinking_open else
+                       f"Prompt Enhancement Did Not Finish ({response['stop_reason']})" if response["stop_reason"] != "stop_token" else
+                       "Prompt Enhancement Returned No Final Prompt" if not answer_text.strip() else "")
+            if failure:
+                tqdm.write(f"[Prompt Enhancer] {failure}: the enhanced prompt {idx + 1} is not usable.")
+                answer_text = ""
+            engine._last_failure_reason = failure
         except BaseException as exc:
             engine._last_failure_reason = str(exc)
             # Discard failed/cancelled runtime state before another enhancement (beside a live context, aside() already discarded the
