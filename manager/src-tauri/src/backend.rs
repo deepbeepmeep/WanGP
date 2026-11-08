@@ -16,7 +16,7 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum Action { Hardware, CondaEnvironments, DetectInstallation, ManagerUpdate, Catalog, Sources, Register, Inspect, Preview, Apply, Recover, Versions, RemoveVersion, Launch, Demo }
+enum Action { Hardware, CondaEnvironments, DetectInstallation, ManagerUpdate, LatestVersions, Catalog, Sources, Register, Inspect, Preview, Apply, Recover, Versions, RemoveVersion, Launch, Demo }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -428,6 +428,7 @@ async fn open_server(window: WebviewWindow, app: tauri::AppHandle, state: tauri:
             let origin = parsed.origin().ascii_serialization();
             let title = format!("WanGP App - {installation_name}");
             let window = tauri::WebviewWindowBuilder::new(&app, label, WebviewUrl::External(parsed)).title(&title).inner_size(1280.0, 850.0)
+                .disable_drag_drop_handler()  // WebView2 keeps its own drag and drop: pages drag their items and take dropped files, as in a browser
                 .icon(tauri::include_image!("../assets/wangp.png")).map_err(|e| e.to_string())?
                 .on_document_title_changed(move |window, _| { let _ = window.set_title(&title); })
                 .on_navigation(move |url| url.origin().ascii_serialization() == origin).build().map_err(|e| e.to_string())?;

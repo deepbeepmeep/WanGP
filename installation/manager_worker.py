@@ -31,7 +31,7 @@ from .version import local_version
 
 
 PROTOCOL = 1
-ACTIONS = {"hardware", "conda_environments", "detect_installation", "catalog", "sources", "register", "inspect", "preview", "apply", "recover", "versions", "remove_version", "launch", "demo", "manager_update"}
+ACTIONS = {"hardware", "conda_environments", "detect_installation", "catalog", "sources", "register", "inspect", "preview", "apply", "recover", "versions", "remove_version", "launch", "demo", "manager_update", "latest_versions"}
 
 
 def application_root(root):
@@ -152,6 +152,8 @@ def run_action(action, args, data, runtime, cancelled, emit, request_id):
             config, version = remote_catalog(args["repository"], args["commit"], runner)
             return {**catalog_summary(config), "bundled": True, "release": version, "commit": args["commit"], "repository": args["repository"]}
         return source_catalog(args["source"])
+    if action == "latest_versions":  # the newest official builds, for the update notice of the Overview: no progress shown
+        return list_versions(OFFICIAL_REPOSITORY, data, runner, lambda event: None)
     if action == "sources":
         return list_versions(args.get("repository", OFFICIAL_REPOSITORY), data, runner, emit, refresh=bool(args.get("refresh", False)), page=args.get("page", 1), catalog_id=args.get("catalog_id"))
     if action in ("register", "inspect"):

@@ -60,3 +60,4 @@ dialog{border:1px solid var(--line);border-radius:17px;padding:29px;width:460px;
 .version-options > summary { padding:8px 0; font-size:17px; font-weight:650; cursor:pointer; }
 .version-options[open] > summary { margin-bottom:20px; }
 .detected-environment { margin-top:18px; }
+.whats-new .changes{list-style:none;margin:16px 0 0;padding:0}.whats-new .changes li{display:flex;gap:14px;align-items:baseline;padding:8px 0;border-top:1px solid var(--line);font-size:13px}.whats-new .changes li strong{min-width:46px}.whats-new .changes li .hint{min-width:86px;flex-shrink:0}.whats-new h3{margin:0}.manager-new{display:block;margin-top:6px;font-size:11px}
