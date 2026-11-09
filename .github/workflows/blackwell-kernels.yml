@@ -1,0 +1,69 @@
+# blackwell-kernels.yml
+# One-time build factory for Blackwell-specific NVFP4 kernels (LightX2V).
+# This should be manually run once to populate the blackwell-kernels release.
+# After that, the kernels are available for download from the release page and 
+# can be used in the Dockerfile.cu13
+# Release: blackwell-kernels
+---
+name: Blackwell Static Kernels (cu130)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-kernels:
+    name: Build LightX2V Kernels
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Lowercase Repository Name
+        id: repo
+        run: echo "nameslc=${GITHUB_REPOSITORY,,}" >> $GITHUB_OUTPUT
+
+      - name: Build blackwell-tools stage
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.cu13
+          target: blackwell-tools
+          load: true
+          push: false
+          tags: blackwell-tools:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            REPO_OWNER=${{ steps.repo.outputs.nameslc }}
+
+      - name: Extract wheels
+        run: |
+          mkdir -p dist
+          docker run --rm \
+            -v "$(pwd)/dist:/out" \
+            blackwell-tools:latest \
+            bash -c "cp /tmp/bw_dist/*.whl /out/"
+          
+          ls -lh dist/
+
+      - name: Upload to Static Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="blackwell-kernels"
+          
+          # Ensure release exists
+          if ! gh release view "$TAG" 1>/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --title "Static Blackwell Kernels (CUDA 13.0)" \
+              --notes "Optimized NVFP4 kernels for RTX 50-series (Blackwell) | Python 3.12" \
+              --prerelease --latest=false
+          fi
+          
+          gh release upload "$TAG" dist/*.whl --clobber

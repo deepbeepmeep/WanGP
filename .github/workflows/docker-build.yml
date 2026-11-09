@@ -1,0 +1,79 @@
+# docker-build.yml
+# Builds and pushes the Wan2GP container image to GHCR.
+#
+# Triggers:
+#   push to fng-infra or main/master  -> build + push image
+#   pull_request targeting main/master -> build only (merge gate, no push)
+#
+# Image: ghcr.io/deepbeepmeep/wan2gp
+# Cache: GitHub Actions cache (type=gha) via BuildKit
+---
+name: Docker Build & Push
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - fng-infra
+      - main
+      - master
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'Custom Resolutions Instructions.txt'
+  pull_request:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'Custom Resolutions Instructions.txt'
+
+jobs:
+  build-and-push:
+    name: Build image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        # actions/checkout v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Set up Docker Buildx
+        # docker/setup-buildx-action v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Log in to GHCR
+        # docker/login-action v3 — skipped on PR runs (no push token available for forks)
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lowercase Repository Name
+        id: repo
+        run: echo "nameslc=${GITHUB_REPOSITORY,,}" >> $GITHUB_OUTPUT
+
+      - name: Build and push
+        # docker/build-push-action v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          # Push only on direct push events; PR runs build-only as a merge gate
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ghcr.io/${{ steps.repo.outputs.nameslc }}:latest
+            ghcr.io/${{ steps.repo.outputs.nameslc }}:${{ github.sha }}
+          # GHA cache stores BuildKit layer blobs between runs.
+          # The expensive deps stage (SageAttention NVCC compile) is a one-time cost.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            CUDA_ARCHITECTURES=8.0;8.6;8.9;9.0+PTX
+            REPO_OWNER=${{ steps.repo.outputs.nameslc }}

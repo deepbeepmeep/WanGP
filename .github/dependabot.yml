@@ -1,0 +1,17 @@
+# dependabot.yml
+# Dependabot configuration for automated dependency updates.
+#
+# GitHub Actions pins are bumped automatically via weekly PRs.
+# Note: Dependabot does not support git-clone ref bumps inside Dockerfiles.
+# The SageAttention tag pin in the Dockerfile requires a manual PR bump.
+---
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    labels:
+      - dependencies
+      - ci

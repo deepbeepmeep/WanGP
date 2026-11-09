@@ -1,0 +1,9 @@
+# yamllint configuration for Wan2GP project.
+# Line-length is relaxed to 120 to accommodate SHA-pinned GitHub Actions references.
+# Truthy rule is disabled: 'on' is valid YAML for GitHub Actions workflow triggers.
+---
+extends: default
+rules:
+  line-length:
+    max: 120
+  truthy: disable
