@@ -65,7 +65,7 @@ class family_handler:
             "prompt_infos": TRIPOSPLAT_PROMPT_INFOS,
             "deepy_infos": IDOL_DEEPY_INFOS if idol else TRIPOSPLAT_DEEPY_INFOS,
             "deepy_prompt_infos": TRIPOSPLAT_DEEPY_PROMPT_INFOS,
-            "specialities": [{"name": "image to 3D Gaussian splat", "aliases": ["3D Gaussian splatting", "3DGS", "splat", "PLY splat"],
+            "specialities": [{"name": "image to 3D Gaussian splat", "aliases": ["Gaussian splat", "3D Gaussian splatting", "3DGS", "splat", "PLY splat"],
                               "description": "Turns one picture of an object into a 3D Gaussian splat (PLY) for photographic 3D viewing."}],
         }
         if idol:

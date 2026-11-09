@@ -65,7 +65,7 @@ LOCAL_ENGINE_TO_ENHANCER_ID = {
     ENGINE_QWEN38_FLASH_NEXT: 7,
 }
 ENHANCER_ID_TO_LOCAL_ENGINE = {value: key for key, value in LOCAL_ENGINE_TO_ENHANCER_ID.items()}
-QWEN38_FLASH_NEXT_VISIBLE = True  # Qwen3.8 Flash-Next among the Prompt Enhancer / Deepy engines and models; False hides it
+QWEN38_FLASH_NEXT_VISIBLE = False  # Qwen3.8 Flash-Next among the Prompt Enhancer / Deepy engines and models; False hides it
 
 LLM_ENGINE_CHOICES = [
     ("Florence 2 + Llama 3.2 3B (local)", ENGINE_LOCAL_1),

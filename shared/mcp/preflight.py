@@ -99,6 +99,9 @@ def window_report(model_def, effective, fps, diagnostics, index, frames_maximum=
     if frames_maximum and frames_maximum > default_overlap and len(plan) > (needed := 1 + math.ceil(max(0, frames - frames_maximum) / (frames_maximum - default_overlap))):
         warning += (f" {len(plan)} windows are planned where {needed} would cover {frames} frames at the model's {frames_maximum}-frame maximum: every window boundary is a transition."
                     " Fewer, longer windows usually flow better; where the model supports injected frames (frames_positions), they anchor intermediate moments without a new window.")
+    if len(plan) > 1 and plan[-1]["new_frames"] < window_size // 4 and ("W" not in mode or len(prompts) < len(windows)):  # a window made by the length alone, for a few frames
+        warning += (f" The last window generates {plan[-1]['generated_frames']} frames to add only {plan[-1]['new_frames']} new ones: video_length {frames - plan[-1]['new_frames']}"
+                    f" ({round((frames - plan[-1]['new_frames']) / fps, 2)} s) needs one window fewer.")
     if warning.strip():
         diagnostics.append({"severity": "warning", "task": index, "message": warning.strip()})
     report = {"windows": plan, "total_frames": frames, "total_seconds": round(frames / fps, 3)}
@@ -161,6 +164,8 @@ def validate_declared_settings(session, supplied, resolve_media=None):
         if choices and value is not None and value not in [choice[1] if isinstance(choice, (list, tuple)) else choice for choice in choices]:
             raise ValueError(f"custom_settings.{key} must be one of the model's declared choices.")
     refs = effective.get("image_refs") or []
+    if isinstance(refs, str):
+        raise ValueError(f'image_refs is a list of media ids or paths: ["{refs}"].')
     if model_def.get("one_image_ref_needed") and len(refs) != 1:
         raise ValueError("This model requires exactly one image_refs input.")
     if (model_def.get("at_least_one_image_ref_needed") or "I" in effective.get("video_prompt_type", "")) and not refs:

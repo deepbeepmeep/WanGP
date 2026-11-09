@@ -478,7 +478,7 @@ class QLinearInt8ConvRot(QModuleMixin, torch.nn.Linear):
         if self.weight_qtype == _QINT8_CONVROT_QTYPE:
             if int8_backend.wgp_enabled() and self._convrot_group_size in (16, 64, 256) and int8_backend._wgp_supports(input, qweight):
                 return int8_backend.wgp_linear(input, qweight, self.bias, group=self._convrot_group_size)
-            if (int8_backend.kitchen_enabled() and self._convrot_group_size == 256
+            if (int8_backend.kitchen_enabled() and self._convrot_group_size == 256 and qweight._data.shape[0] % 4 == 0  # the kitchen GEMM rejects other widths
                     and input.is_cuda and input.dtype in (torch.bfloat16, torch.float16, torch.float32)):
                 # This direct kernel bypasses F.linear's autocast (LayerNorm can supply FP32 even in a BF16 encoder).
                 if torch.is_autocast_enabled("cuda"):
@@ -489,6 +489,8 @@ class QLinearInt8ConvRot(QModuleMixin, torch.nn.Linear):
                     and input.is_cuda and input.dtype == torch.bfloat16
                     and input.numel() // input.shape[-1] <= 4 and not quanto_int8_inject._prefer_native_quanto_path(input)):
                 return quanto_int8_inject.fused_convrot_linear(input, qweight, self.bias)
+            if int8_backend.rotated_triton_supported(input, qweight, self._convrot_group_size):
+                return int8_backend.rotated_triton_linear(input, qweight, self.bias, self._convrot_group_size)
             input = _rotate_activation(input, self._convrot_group_size)
         _debug_forward_dtype(self, original_input, input, qweight)
         return torch.nn.functional.linear(input, qweight, bias=self.bias)

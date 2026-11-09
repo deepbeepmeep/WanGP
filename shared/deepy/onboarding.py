@@ -41,7 +41,7 @@ QWEN38_VRAM_GIB = {"gguf_ptq1": 6.3, "gguf_q2": 9.8, "gguf_q3": 12.1, "gguf": 15
 OTHER_PROGRAMS_VRAM_GIB = 1.5
 MTP_WEIGHTS_VRAM_GIB = 0.42
 MTP_KV_VRAM_GIB_PER_TOKEN = 4 / 2**20  # its own BF16 KV cache
-BLOCK_DRAFTER_VRAM_GIB = 4.5  # DSpark and DFlash2
+BLOCK_DRAFTER_VRAM_GIB = 3.0  # DSpark, DFlash2 and DSpine at 32K context: weights, their window-capped cache (DSpark's grows 20 KiB per token) and buffers
 
 
 def detected_nvidia_vram_gb() -> float:

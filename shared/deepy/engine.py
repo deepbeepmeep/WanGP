@@ -4899,7 +4899,7 @@ class DeepyZeroTools:
 
     @assistant_tool(
         display_name="Inspect Audio",
-        description="Inspect the selected audio stream's playable range on CPU: peak/RMS, clipping indicators, EBU R128 loudness and below-threshold silence intervals. Coverage excludes decoder tail padding when track duration is known; silence does not mean zero or missing audio. Optional playable preview (at most 30 seconds). Does not transcribe or judge musical quality.",
+        description="Inspect the selected audio stream's playable range on CPU: peak/RMS, clipping indicators, EBU R128 loudness and below-threshold silence intervals, optionally the music's tempo and beats. Coverage excludes decoder tail padding when track duration is known; silence does not mean zero or missing audio. Optional playable preview (at most 30 seconds). Does not transcribe or judge musical quality.",
         parameters={
             "media_id": {"type": "string", "description": "Audio or video media ID or authorized file.", "required": True},
             "audio_track_no": {"type": "integer", "description": "1-based audio stream; default 1.", "required": False},
@@ -4909,13 +4909,14 @@ class DeepyZeroTools:
             "min_silence_s": {"type": "number", "description": "Minimum silence interval in seconds; default 0.2.", "required": False},
             "preview": {"type": "boolean", "description": "Create a playable Gallery excerpt; default false.", "required": False},
             "pitch": {"type": "boolean", "description": "Optional, for an isolated voice (a vocal stem or speech, not a full mix): voice_pitch_hz, its median pitch; female voices mostly sit above about 165 Hz, male ones below.", "required": False},
+            "beats": {"type": "boolean", "description": "Optional, for music: beats.tempo_bpm, beats.times (the beats, in seconds) and beats.bar_starts (first beats of 4-beat bars, when clear): the cut points for editing to the music.", "required": False},
             "preview_s": {"type": "number", "description": "Excerpt length, at most 30 seconds; default 10. Starts at start_s.", "required": False},
             "window_s": {"type": "number", "description": "Optional envelope window in seconds (0.1..600, at most 600 windows): adds lists of RMS, peak and loudest momentary loudness per window (window i starts at start_s + i * window_s), for finding climaxes, gaps and balance in one call.", "required": False},
         },
         pause_runtime=False,
     )
-    def inspect_audio(self, media_id: str, audio_track_no: int = 1, start_s: float = 0.0, duration_s: float | None = None, silence_db: float = -50.0, min_silence_s: float = 0.2, preview: bool = False, preview_s: float = 10.0, pitch: bool = False, window_s: float | None = None) -> dict[str, Any]:
-        from shared.deepy.audio_inspection import inspect_audio, voice_pitch
+    def inspect_audio(self, media_id: str, audio_track_no: int = 1, start_s: float = 0.0, duration_s: float | None = None, silence_db: float = -50.0, min_silence_s: float = 0.2, preview: bool = False, preview_s: float = 10.0, pitch: bool = False, window_s: float | None = None, beats: bool = False) -> dict[str, Any]:
+        from shared.deepy.audio_inspection import inspect_audio, music_beats, voice_pitch
 
         self._sync_recent_media()
         source = self._resolve_media_record_input(media_id)
@@ -4927,6 +4928,8 @@ class DeepyZeroTools:
         result["source_media_id"] = source["media_id"]
         if pitch:
             result["voice_pitch_hz"] = voice_pitch(source["path"], start_time=start_s, duration=duration_s)
+        if beats:
+            result["beats"] = music_beats(source["path"], audio_track_no=audio_track_no, start_time=result["coverage"]["start_time"], duration=result["coverage"]["duration_seconds"])
         if output:
             settings = self._build_direct_media_settings(source, "Audio inspection preview")
             record = self._record_direct_media(output, settings, is_image=False, audio_only=True, label="Audio Preview")

@@ -48,6 +48,7 @@ class MiniMaxH3PreparedReference:
     latent_height: int = 0
     latent_width: int = 0
     num_audio_latents: int = 0
+    spatial_context: tuple = None  # (canvas h, canvas w, top, left) in latents: a crop of a reference video, placed where it sits on its whole frame
 
     @property
     def num_video_rows(self):
@@ -265,7 +266,7 @@ def build_ref2va_packed_sequence(text_token_tags, references, num_latent_frames,
                 dense_spans.append((audio_rows.start, audio_rows.stop))
             audio_indices.append(torch.arange(audio_rows.start, audio_rows.stop))
             video_indices.append(torch.arange(video_rows.start, video_rows.stop))
-            frame_grid, width_grid = _frame_grid(ref.latent_height, ref.latent_width, patch_h, patch_w)
+            frame_grid, width_grid = _frame_grid(ref.latent_height, ref.latent_width, patch_h, patch_w, ref.spatial_context)
             reference_video_spans.append((video_rows.start, video_rows.stop, (ref.num_latent_frames, ref.latent_height // patch_h, ref.latent_width // patch_w)))
             _fill_audio_positions(position_ids, audio_rows, ref.num_audio_latents, time_cursor, width_grid)
             video_grid = position_ids[video_rows].view(ref.num_latent_frames, frame_grid.shape[0], 3)

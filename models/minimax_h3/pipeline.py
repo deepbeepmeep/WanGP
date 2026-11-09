@@ -21,13 +21,14 @@ from shared.utils.utils import guide_mask_to_float, guide_to_float
 from shared.utils.frame_scheduler import SLASH_BLOCK_RE, floor_frame_count, normalize_frame_count, normalize_overlap
 from shared.utils.utils import convert_video_tensor_to_uint8_chunked
 from .constants import (H3_AUDIO_REFINEMENT_DENOISE, H3_AUDIO_REFINEMENT_SETTING, H3_AUDIO_REFINEMENT_STEPS, H3_CONTROL_LATENT_CONTINUATION,
-                        H3_PHASE_2_NOISE_LEVEL_START_DEFAULT, H3_REGENERATE_LORA, h3_grouped_masking_enabled)
+                        H3_HYPERFLOW_LORA, H3_PHASE_2_NOISE_LEVEL_START_DEFAULT, H3_REGENERATE_IC_LORA, H3_REGENERATE_IC_TASK, H3_REGENERATE_LORA,
+                        h3_grouped_masking_enabled)
 from .dialogue import H3_DIALOGUE_GENERATION, generate_dialogue, is_dialogue_prompt
 from .excerpts import H3_AUDIO_EXCERPTS_SETTING, H3_VIDEO_EXCERPTS_SETTING, parse_excerpts, reference_video_frame_limit
 from .first_block_cache import MiniMaxH3FirstBlockCache
 from .interrupt import GenerationInterrupted
 from .p_h3_image import p_h3_image_sigmas, reference_size, size_at_area
-from .hyperflow import HYPERFLOW_STEPS, HYPERFLOW_VIDEO_SHIFT, video_sigmas as hyperflow_video_sigmas
+from .hyperflow import HYPERFLOW_STEPS, HYPERFLOW_VIDEO_SHIFT, grid_tail_sigmas, load_lora_offsets, video_sigmas as hyperflow_video_sigmas
 from .pdd import pdd_sampling_plans, pdd_sampling_plans_for_sigmas
 from .pika import PIKA_SOLVER, PIKA_STEPS, PIKA_VIDEO_SHIFT, noise as pika_noise, renoise_ as pika_renoise_, sigma_schedule as pika_sigma_schedule
 from .spectrum import MiniMaxH3Spectrum
@@ -161,6 +162,30 @@ def _build_frozen_control_video(input_frames, input_video, frame_num, prefix_fra
 
 def _qwen_frames(video):
     return guide_to_float(video).permute(1, 2, 3, 0).add(1.0).mul_(0.5).clamp_(0.0, 1.0)
+
+
+def _selected_lora(loras_selected, loras_slists, name, phase):
+    """(path, multiplier) of the selected LoRA file `name` in phase 1 or 2, (None, 0.0) when it is not selected."""
+    if loras_slists is None:
+        return None, 0.0
+    for index, lora in enumerate(loras_selected or ()):
+        path = str(lora).split("|", 1)[0]
+        if os.path.basename(path).lower() == name:
+            multiplier = loras_slists[f"phase{phase}"][index]
+            values = set(multiplier) if isinstance(multiplier, list) else {multiplier}
+            if len(values) > 1:
+                raise ValueError(f"The LoRA '{name}' takes one multiplier per phase")
+            return path, float(values.pop())
+    return None, 0.0
+
+
+def _draft_crop(draft_size, canvas, tile, patch=2):
+    """(top, left, height, width) of the draft latent under a phase-2 tile of the canvas (latent units), rounded outward to whole patches."""
+    def axis(start, length, size, full):
+        first = math.floor(start * size / full / patch) * patch
+        return first, min(size, math.ceil((start + length) * size / full / patch) * patch) - first
+    (top, height), (left, width) = axis(tile[0], tile[2], draft_size[0], canvas[0]), axis(tile[1], tile[3], draft_size[1], canvas[1])
+    return top, left, height, width
 
 
 def _fit_audio_samples(audio, sample_count):
@@ -465,7 +490,7 @@ class MiniMaxH3Pipeline:
     def get_loras_transformer(self, _get_model_recursive_prop, model_type, model_def, guidance_phases, activated_loras,
                               loras_multipliers="", transformer_loras_filenames=(), num_inference_steps=1, prompts=(), **_kwargs):
         self._phase_2_loras = None
-        if int(guidance_phases) > 1 and not model_def.get("pdd", False):
+        if int(guidance_phases) > 1 and not model_def.get("pdd", False) and not model_def.get("hyperflow", False):  # no Turbo on HyperFlow Flash
             accelerator_loras, _ = extract_loras_side(activated_loras, loras_multipliers)
             self._phase_2_loras = (len(transformer_loras_filenames), len(accelerator_loras))
         if model_def.get("vdn", False):
@@ -492,6 +517,12 @@ class MiniMaxH3Pipeline:
 
     def get_trans_lora(self):
         return self.transformer, None
+
+    def _hyperflow_lora_offsets(self, path):
+        transformer, package = self.transformer, self.transformer.h3_lora_affine_package
+        if transformer.endpoint_gate is not None or transformer.control_layers or transformer.hybrid_ref2va_blocks is not None or transformer.pdd_num_steps or package is None:
+            raise ValueError("The HyperFlow 8-step LoRA applies to the standard MiniMax H3 checkpoints, not to HyperFlow Flash, PDD, ControlNet or hybrid ones")
+        return load_lora_offsets(path, package.name.removesuffix("_rank8"), os.path.getmtime(path))
 
     def _check_abort(self):
         inference_checkpoint()
@@ -685,14 +716,15 @@ class MiniMaxH3Pipeline:
         self._check_abort()
         context = presentation = None
 
-    def _add_video_reference(self, video, soundtrack, fps, presentation, visual_latents, audio_latents, refs):
+    def _add_video_reference(self, video, soundtrack, fps, presentation, visual_latents, audio_latents, refs, latent=None):
         video = _as_video(video)
         if video is None:
             return
         if video.shape[1] < 5 or (video.shape[1] - 5) % 17:
             raise ValueError(f"MiniMax H3 reference videos must contain 17n+5 preprocessed frames, got {video.shape[1]}")
-        with control_video_encoding():
-            latent = self._encode_video(video)
+        if latent is None:  # a given latent is the video's (a phase-1 draft)
+            with control_video_encoding():
+                latent = self._encode_video(video)
         audio_latent = self._encode_audio(soundtrack) if soundtrack is not None else None
         if audio_latent is not None:
             presentation.append({"type": "audio"})
@@ -832,14 +864,28 @@ class MiniMaxH3Pipeline:
                 loras_slists=loras_slists, loras_selected=loras_selected, custom_settings=custom_settings,
                 set_progress_status=set_progress_status, verbose_level=verbose_level)
         self._use_shared_components()
-        hyperflow = self.transformer.endpoint_gate is not None
-        if hyperflow and (int(sampling_steps) not in HYPERFLOW_STEPS or sample_solver != "euler" or int(guide_phases) != 1 or float(shift) != HYPERFLOW_VIDEO_SHIFT
-                          or custom_sigmas or starting_sigma is not None or self.transformer.cache is not None):
-            raise ValueError(f"HyperFlow H3 Flash samples {', '.join(map(str, HYPERFLOW_STEPS))} steps with the Euler sampler, flow shift 12, one phase, "
-                             "no custom sigmas, no partial-schedule refinement and no step skipping")
+        hyperflow = self.transformer.endpoint_gate is not None  # HyperFlow H3 Flash
+        two_phases = int(guide_phases) > 1
+        # LoRAs with their own process are recognized by their file name: HyperFlow 8-step (pruned AdaLN offsets) and Regenerate 2K IC
+        hyperflow_lora_path, hyperflow_lora_1 = _selected_lora(loras_selected, loras_slists, H3_HYPERFLOW_LORA, 1)
+        hyperflow_lora_2 = _selected_lora(loras_selected, loras_slists, H3_HYPERFLOW_LORA, 2)[1] if two_phases else 0.0
+        hyperflow_lora = self._hyperflow_lora_offsets(hyperflow_lora_path) if hyperflow_lora_1 or hyperflow_lora_2 else None
+        hyperflow_phase_1, hyperflow_phase_2 = hyperflow or bool(hyperflow_lora_1), two_phases and (hyperflow or bool(hyperflow_lora_2))
+        regenerate_ic = two_phases and bool(_selected_lora(loras_selected, loras_slists, H3_REGENERATE_IC_LORA, 2)[1])
+        if regenerate_ic and not self.reference_mode:
+            raise ValueError("Open-H3 Regenerate 2K IC is a Ref2VA LoRA: select a MiniMax H3 Ref2VA model")
+        if (hyperflow_phase_1 or hyperflow_phase_2) and (sample_solver != "euler" or float(shift) != HYPERFLOW_VIDEO_SHIFT or starting_sigma is not None
+                                                         or self.transformer.cache is not None):
+            raise ValueError("HyperFlow samples with the Euler sampler and flow shift 12, without partial-schedule refinement or step skipping")
+        # MMGP hands float32 tensor arguments to the model in its dtype: HyperFlow's (t, r) grid comes as float64 sigmas, which stay exact
+        sigma_argument = (lambda sigma: sigma.double()) if hyperflow_phase_1 or hyperflow_phase_2 else (lambda sigma: sigma)
+        hyperflow_steps = HYPERFLOW_STEPS if hyperflow else (8,)
+        if hyperflow_phase_1 and (int(sampling_steps) not in hyperflow_steps or custom_sigmas and custom_sigmas[0] is not None):
+            raise ValueError(f"HyperFlow runs {' or '.join(map(str, hyperflow_steps))} steps on its own schedule, without phase-1 custom sigmas")
         phase_1_sigmas = (custom_sigmas[0] if custom_sigmas and custom_sigmas[0] is not None else p_h3_image_sigmas(int(sampling_steps)) if self.image_model else VIGGLE_REMAKE_SIGMAS[self.remake_mode] if self.remake_mode
-                          else hyperflow_video_sigmas(sampling_steps) if hyperflow else None)
-        phase_2_sigmas = custom_sigmas[1] if custom_sigmas and len(custom_sigmas) > 1 else None
+                          else hyperflow_video_sigmas(sampling_steps) if hyperflow_phase_1 else None)
+        phase_2_sigmas = (custom_sigmas[1] if custom_sigmas and len(custom_sigmas) > 1 and custom_sigmas[1] is not None
+                          else grid_tail_sigmas(sampling_steps2) if hyperflow_phase_2 else None)  # HyperFlow phase 2: the last steps of its 8-step grid
         if phase_1_sigmas is not None:
             sampling_steps = len(phase_1_sigmas)
         if phase_2_sigmas is not None:
@@ -1256,7 +1302,7 @@ class MiniMaxH3Pipeline:
                    "cond_audio_rows": cond_audio_rows, "frame_count": aligned_target_frames, "text_token_tags": text_tags,
                    "fps": fps, "audio_time_offset": audio_time_offset, "target_audio_condition_latents": target_audio_condition_latents,
                    "target_video_condition_frames": target_video_condition_frames,
-                   "attention_sparsity": float(attention_sparsity)}
+                   "attention_sparsity": float(attention_sparsity), "hyperflow_lora": (hyperflow_lora, hyperflow_lora_1) if hyperflow_lora_1 else None}
         if control_rows is not None:
             payload.update(control_rows=control_rows, control_scale=float(context_scale[0]), control_anchor_frames=control_anchor_frames)
         control_rows = None
@@ -1392,7 +1438,7 @@ class MiniMaxH3Pipeline:
                                                sigma_video, source_buffer, 1.0 - VISUAL_COND_TIMESTEP)
                     model_sigma_video = condition_control_video(video, sigma_video)
                     payload["endpoint_sigmas"] = (sigma_video_next, stage_sigmas_audio[step + 1])  # where the step lands: HyperFlow's r
-                    video_velocity, audio_velocity = self.transformer(video, audio, model_sigma_video, stage_sigmas_audio[step:step + 1], context, payload, spectrum=spectrum, first_block_cache=first_block_cache)
+                    video_velocity, audio_velocity = self.transformer(video, audio, sigma_argument(model_sigma_video), sigma_argument(stage_sigmas_audio[step:step + 1]), context, payload, spectrum=spectrum, first_block_cache=first_block_cache)
                     if spectrum is not None:
                         spectrum.finish_step()
                     if stage_solver == "er_sde":
@@ -1571,6 +1617,7 @@ class MiniMaxH3Pipeline:
             mean = video.new_tensor(LATENTS_MEAN, dtype=torch.bfloat16).view(1, -1, 1, 1, 1)
             std = video.new_tensor(LATENTS_STD, dtype=torch.bfloat16).view(1, -1, 1, 1, 1)
             normalized_video = (video.to(torch.bfloat16) - mean) / std
+            draft_latent = video.detach().cpu() if regenerate_ic else None  # Regenerate 2K IC: the phase-1 draft stays in context as a reference video
             video = self.latent_upscaler(normalized_video, effective_scale, target_size=(latent_t, target_latent_h, target_latent_w), abort_callback=lambda: self._interrupt, progress_callback=upscaler_progress)
             video = (video * std + mean).float()
             normalized_video = mean = std = None
@@ -1596,7 +1643,14 @@ class MiniMaxH3Pipeline:
                 del silence
             phase_2_reference_presentation, phase_2_reference_latents = [], []
             phase_2_refs = []
-            if self.reference_mode:
+            if regenerate_ic:  # the draft is the only reference: its latent at its own size, its frames shown to the prompt encoder as <Video 1>
+                if set_progress_status is not None:
+                    set_progress_status("Decoding the Phase 1 Draft for Regenerate 2K IC")
+                draft_frames = self.vae.decode(draft_latent.to(self.device, self.vae._model_dtype), "round")[0, :, :aligned_target_frames]
+                self._add_video_reference(draft_frames, None, fps, phase_2_reference_presentation, phase_2_reference_latents, [], phase_2_refs, latent=draft_latent)
+                draft_frames = None
+                payload["cond_audio_rows"] = None
+            elif self.reference_mode:
                 for image in input_ref_images or []:
                     self._add_image_reference(image, target_width, target_height, image_refs_relative_size, phase_2_reference_presentation, phase_2_reference_latents, phase_2_refs)
                 for index, source in enumerate(video_sources):
@@ -1617,7 +1671,9 @@ class MiniMaxH3Pipeline:
             phase_2_visual_latents.extend(phase_2_reference_latents)
             if set_progress_status is not None:
                 set_progress_status("Encoding H3 phase 2 prompt and references")
-            context, text_tags = self._encode_prompt(input_prompt, phase_2_presentation)
+            context, text_tags = self._encode_prompt(f"{H3_REGENERATE_IC_TASK}\n\nScene description: {input_prompt}" if regenerate_ic else input_prompt,
+                                                     phase_2_presentation)
+            payload["hyperflow_lora"] = (hyperflow_lora, hyperflow_lora_2) if hyperflow_lora_2 else None
             self._check_abort()
             phase_2_generator = torch.Generator(device="cpu").manual_seed(int(seed))
             phase_2_sigmas_video = (torch.tensor((float(switch_threshold), *H3_PHASE_2_SIGMAS[1:]), dtype=torch.float32, device=self.device)
@@ -1635,7 +1691,7 @@ class MiniMaxH3Pipeline:
                     condition = latent.float().mul_(timestep)
                     condition.add_(torch.randn(latent.shape, generator=phase_2_generator, dtype=torch.float32, device="cpu"), alpha=1.0 - timestep)
                     phase_2_keyframe_conditions.append(condition)
-                phase_2_reference_rows, _ = self._prepare_condition_rows(phase_2_visual_latents[phase_2_keyframe_count:], [], phase_2_generator)
+                phase_2_reference_rows = None if regenerate_ic else self._prepare_condition_rows(phase_2_visual_latents[phase_2_keyframe_count:], [], phase_2_generator)[0]
                 phase_2_visual_latents = None
                 phase_2_base_video = video.detach().to(device="cpu", copy=True, non_blocking=False)
                 phase_2_noise = torch.randn(video.shape, generator=torch.Generator(device="cpu").manual_seed(int(seed)), dtype=torch.float32, device="cpu")
@@ -1685,8 +1741,16 @@ class MiniMaxH3Pipeline:
                         weights = _phase_2_tile_weights(latent_height, latent_width, top_overlap // 16, bottom_overlap // 16,
                                                         left_overlap // 16, right_overlap // 16)
                         phase_2_weight_sum[..., latent_top:latent_top + latent_height, latent_left:latent_left + latent_width].add_(weights)
+                        tile_reference = None
+                        if regenerate_ic:  # the part of the draft under the tile, placed where it sits on the whole draft
+                            crop_top, crop_left, crop_height, crop_width = _draft_crop(draft_latent.shape[-2:], (target_latent_h, target_latent_w),
+                                                                                       (latent_top, latent_left, latent_height, latent_width))
+                            crop = draft_latent[..., crop_top:crop_top + crop_height, crop_left:crop_left + crop_width]
+                            tile_reference = (self._prepare_condition_rows([crop], [], phase_2_generator)[0],
+                                              [{**phase_2_refs[0], "latent_h": crop_height, "latent_w": crop_width,
+                                                "spatial_context": (*draft_latent.shape[-2:], crop_top, crop_left)}])
                         phase_2_tiles.append((latent_top, latent_left, latent_height, latent_width, weights,
-                                              tile_condition_rows, (target_latent_h, target_latent_w, latent_top, latent_left)))
+                                              tile_condition_rows, (target_latent_h, target_latent_w, latent_top, latent_left), tile_reference))
 
                 source_latents = source_noise = source_buffer = editable_mask = None
                 self._use_transformer()
@@ -1719,6 +1783,7 @@ class MiniMaxH3Pipeline:
                         self.transformer.final_layer.video_out.set_plan(phase_2_pdd_video_plans[step:step + 1])
                         self.transformer.final_layer.audio_out.set_plan(phase_2_pdd_audio_plan)
                     sigma_video, sigma_video_next = phase_2_sigmas_video[step], phase_2_sigmas_video[step + 1]
+                    payload["endpoint_sigmas"] = (sigma_video_next, sigma_video_next.new_zeros(()))  # HyperFlow's r; the frozen audio stays clean
                     step_editable_mask = _masking_step_mask(phase_2_editable_mask, step, denoising_start_step, mask_end_step)
                     grouped_mask_active = grouped_masking and step_editable_mask is not None
                     if grouped_mask_active:
@@ -1726,11 +1791,13 @@ class MiniMaxH3Pipeline:
                                                phase_2_source_noise, step_editable_mask, sigma_video, phase_2_source_buffer,
                                                1.0 - VISUAL_COND_TIMESTEP)
                     phase_2_accumulator = torch.zeros_like(phase_2_latent_canvas)
-                    for tile_no, (latent_top, latent_left, latent_height, latent_width, weights, tile_condition_rows, spatial_context) in enumerate(phase_2_tiles, 1):
+                    for tile_no, (latent_top, latent_left, latent_height, latent_width, weights, tile_condition_rows, spatial_context, tile_reference) in enumerate(phase_2_tiles, 1):
                         self._check_abort()
                         progress_step = step * tile_count + tile_no
-                        condition_rows = [rows for rows in (tile_condition_rows, phase_2_reference_rows) if rows is not None]
+                        reference_rows, tile_refs = (phase_2_reference_rows, phase_2_refs) if tile_reference is None else tile_reference
+                        condition_rows = [rows for rows in (tile_condition_rows, reference_rows) if rows is not None]
                         payload["cond_video_rows"] = torch.cat(condition_rows) if len(condition_rows) > 1 else (condition_rows[0] if condition_rows else None)
+                        payload["refs"] = tile_refs or None
                         payload["target_spatial_context"] = spatial_context
                         for key in ("layout_signature", "layout", "rope"):
                             payload.pop(key, None)
@@ -1739,7 +1806,7 @@ class MiniMaxH3Pipeline:
                             tile_editable_mask = _crop_spatial_tile(phase_2_editable_mask, latent_top, latent_left, latent_height, latent_width).to(self.device)
                             _set_grouped_video_rows(payload, tile_editable_mask, tile_video.shape[-3:], tile_video.device)
                             payload["target_video_mask_active"] = grouped_mask_active
-                        tile_velocity, audio_velocity = self.transformer(tile_video, audio, sigma_video.view(1), phase_2_sigmas_video.new_zeros(1), context, payload)
+                        tile_velocity, audio_velocity = self.transformer(tile_video, audio, sigma_argument(sigma_video.view(1)), sigma_argument(phase_2_sigmas_video.new_zeros(1)), context, payload)
                         tile_denoised = tile_velocity.float().mul_(sigma_video).add_(tile_video)
                         tile_prediction = tile_denoised.detach().to(device="cpu", non_blocking=False)
                         tile_prediction.mul_(weights)
@@ -1804,7 +1871,7 @@ class MiniMaxH3Pipeline:
                     set_progress_status("Phase 2/2 High Resolution")
                 run_denoising(phase_2_sigmas_video, torch.zeros_like(phase_2_sigmas_video), "H3 phase 2 denoising", "Phase 2/2 High Resolution", 2,
                               freeze_audio=True, stage_solver=H3_PHASE_2_SAMPLE_SOLVER, use_cache=False)
-            phase_2_presentation = phase_2_visual_latents = phase_2_reference_presentation = phase_2_reference_latents = phase_2_refs = None
+            phase_2_presentation = phase_2_visual_latents = phase_2_reference_presentation = phase_2_reference_latents = phase_2_refs = draft_latent = None
             if saved_phase_1_audio is not None:
                 audio = saved_phase_1_audio
                 saved_phase_1_audio = None

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import weakref
 from copy import copy
 import torch
 import torch.distributed as dist
@@ -82,7 +84,9 @@ from ..layers.layernorm import RMSNorm
 from shared.kernels import bf16_bits
 from ..layers.linear import ColumnParallelLinear, RowParallelLinear
 from ..utils.context import get_context
-from mmgp import cuda_graphs
+from mmgp import cuda_graphs, runtime as mmgp_runtime
+from gguf import GGMLQuantizationType
+from shared.qtypes.gguf import GGUFWeightTensor
 
 _CU_SEQLENS_CACHE: dict[tuple[tuple[int, ...], str], torch.Tensor] = {}
 _MROPE_FREQ_CACHE: dict[tuple[str, int, int, float], torch.Tensor] = {}
@@ -304,6 +308,38 @@ def _take_tensor(x_list: list[torch.Tensor]) -> torch.Tensor:
 
 
 _AB_ROWS_GEMV_MAX = 16  # verification passes (at most 9 rows) and small batches; prefill chunks keep the GEMM
+_BRANCHES = "gemm_branches" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the switch goes with the others at the end
+_BRANCH_ROWS_MAX = 8
+_BRANCH_STREAMS = {}
+
+
+def _branches(owner, hidden_states, *projections):
+    """The independent projections of one input as concurrent branches of the CUDA graph being captured, for short passes (decoding,
+    verification) whose small linears each leave the GPU's bandwidth unused: Q4_K_M 27B MTP-4 passes 16.8 -> 16.4 ms, for about 10 MB of
+    card memory. The same kernels: the same outputs. Outside a capture (warmups, eager passes) they run one after the other, and so do
+    - other weight formats than the GGUF K and I quants: side by side, the Q8_0 projections of the 9B are 2-3 % slower and its Quanto INT8
+      ones 1-3 % (WGPKernels streams with their own split-K counters, wgpkernels.int8.prepare_stream);
+    - the blocks of a model (owner: a weak reference to it) that is not all in VRAM: streamed blocks gain nothing, and their graphs cost
+      54 MB with branches (27B Q4_K_M, 20 of its 64 blocks streamed)."""
+    if not (_BRANCHES and owner is not None and hidden_states.is_cuda and hidden_states.numel() // hidden_states.shape[-1] <= _BRANCH_ROWS_MAX
+            and torch.cuda.is_current_stream_capturing()
+            and all(isinstance(projection.weight, GGUFWeightTensor) and projection.weight._tensor_type != GGMLQuantizationType.Q8_0 for projection in projections)
+            and mmgp_runtime.weights_resident(owner())):
+        return [projection(hidden_states) for projection in projections]
+    main = torch.cuda.current_stream(hidden_states.device)
+    streams = _BRANCH_STREAMS.setdefault(hidden_states.device, [])
+    while len(streams) < len(projections) - 1:
+        streams.append(torch.cuda.Stream(hidden_states.device))
+    outputs = [None] * len(projections)
+    for index, stream in enumerate(streams[:len(projections) - 1], start=1):
+        stream.wait_stream(main)
+        with torch.cuda.stream(stream):
+            outputs[index] = projections[index](hidden_states)
+    outputs[0] = projections[0](hidden_states)
+    for index, stream in enumerate(streams[:len(projections) - 1], start=1):
+        main.wait_stream(stream)
+        outputs[index].record_stream(main)  # made on the branch, read on the main stream
+    return outputs
 
 
 def _rows_linear(module, hidden_states):
@@ -763,6 +799,7 @@ def _flash_attention(
 class Qwen3_5Block(nn.Module):
     def __init__(self, config, layer_idx: int):
         super().__init__()
+        self._owner = None  # a weak reference to the model, which sets it: its residency decides the concurrent projections (_branches)
         triton_kernels = _triton_kernels(config)
         self.layer_type = str(config.layer_types[layer_idx])
         self.attn_norm = RMSNorm(int(config.hidden_size), eps=float(config.rms_norm_eps))
@@ -870,6 +907,7 @@ class Qwen3_5Block(nn.Module):
             self.speculative_conv_state_buffer = torch.empty(0)
             self.speculative_recurrent_state_buffer = torch.empty(0)
             self.speculative_replay = None
+            self.tree_conv_inputs = None
             self._gguf_interleave_ssm_ab = False
             self._gguf_v_head_reordered = False
             self._gguf_ssm_param_reordered = False
@@ -927,9 +965,17 @@ class Qwen3_5Block(nn.Module):
             setattr(self, name, tensor)
             tensor.copy_(copy)
 
-    def prepare_speculative_state(self, max_verify_tokens: int) -> None:
+    def prepare_speculative_state(self, max_verify_tokens: int, tree_rows: int = 0) -> None:
+        """tree_rows: the rows of a draft tree this layer verifies too (0: chains only). The replay buffers then hold one row per tree node
+        and the node's convolution inputs are kept, for the commit to replay the accepted path."""
         if self.layer_type != "linear_attention":
             return
+        replay_tokens = max(int(max_verify_tokens), int(tree_rows))  # the snapshots serve chains only: their size stays the chain's
+        channels = self.conv_state_buffer.shape[1]
+        if not tree_rows:
+            self.tree_conv_inputs = None
+        elif self.tree_conv_inputs is None or tuple(self.tree_conv_inputs.shape) != (tree_rows, channels) or self.tree_conv_inputs.device != self.conv_state_buffer.device:
+            self.tree_conv_inputs = torch.empty((tree_rows, channels), device=self.conv_state_buffer.device, dtype=self.conv_state_buffer.dtype)
         # Final verification states are written to the live buffers. Only
         # prefixes before a rejected suffix need separate snapshots.
         conv_shape = (int(max_verify_tokens) - 1, *self.conv_state_buffer.shape)
@@ -940,12 +986,12 @@ class Qwen3_5Block(nn.Module):
             # Accepted prefixes are replayed from the state before verification: no recurrent snapshot per draft token.
             from shared.kernels.qwen_gdn import RecurrentReplay
             state = self.recurrent_state_buffer
-            if self.speculative_replay is None or not self.speculative_replay.fits(state, int(max_verify_tokens), state.dtype, state.dtype):
+            if self.speculative_replay is None or not self.speculative_replay.fits(state, replay_tokens, state.dtype, state.dtype):
                 if self._gdn_fused is not None:
                     from shared.kernels.gdn_fused import FusedReplay
                     self.speculative_replay = FusedReplay(state, self.key_dim * 2 + self.value_dim, int(max_verify_tokens))
                 else:
-                    self.speculative_replay = RecurrentReplay(state, self.num_k_heads, self.head_k_dim, int(max_verify_tokens), state.dtype, state.dtype)
+                    self.speculative_replay = RecurrentReplay(state, self.num_k_heads, self.head_k_dim, replay_tokens, state.dtype, state.dtype)
                 # the commit replays run in the engine's own graphs, which must not read weights that MMGP may stream: copies of the two
                 # small per-head parameters stay with the replay buffers
                 self._replay_ssm_parameters = tuple(t.detach().to(device=state.device, copy=True) for t in self._recurrence_ssm_parameters(getattr(self, "_gdn_direct_layout", True)))
@@ -975,6 +1021,60 @@ class Qwen3_5Block(nn.Module):
         direct_recurrent_layout = getattr(self, "_gdn_direct_layout", True)
         ssm_a, ssm_dt = self._replay_ssm_parameters
         recurrent_raw_replay(self.speculative_replay, ssm_a, ssm_dt, int(processed_tokens), self.recurrent_state_buffer, **self._recurrence_layout(direct_recurrent_layout))
+
+    def _tree_convolution(self, mixed_qkv_input: torch.Tensor, conv_state: torch.Tensor, context) -> torch.Tensor:
+        """The convolution of a draft tree: each root-to-leaf path from the live window, which stays as it is ([P * T, C] path rows). The
+        nodes' inputs are kept: the window after the accepted path is rebuilt from them at the commit."""
+        from shared.llm_engines.lmgp.layers.speculative_state import conv_verify
+        paths = context.tree_paths
+        count, steps = paths.shape
+        inputs = mixed_qkv_input.reshape(-1, mixed_qkv_input.shape[-1])  # [N, C], one row per node
+        self.tree_conv_inputs[:inputs.shape[0]].copy_(inputs)
+        state = conv_state[:1].expand(count, *conv_state.shape[1:]).contiguous()
+        windows = torch.empty((steps - 1, count, *conv_state.shape[1:]), device=conv_state.device, dtype=conv_state.dtype)
+        output, _ = conv_verify(inputs.index_select(0, paths.reshape(-1)).view(count, steps, -1), state, self.ssm_conv1d.weight, self.ssm_conv1d.bias, windows)
+        return output.reshape(count * steps, -1)
+
+    def _tree_recurrence(self, query, key, value, a, b, ssm_a, ssm_dt, recurrent_state, context, direct_recurrent_layout) -> torch.Tensor:
+        """The recurrence of a draft tree: each path from a copy of the live state, which stays as it is. Returns the nodes' outputs
+        [1, N, HV, Dv]; the replay buffers receive the live state and one row of inputs per node, for the commit to replay the accepted path."""
+        paths, rows = context.tree_paths, context.tree_rows
+        count, steps = paths.shape
+        nodes = rows.numel()
+        a, b = a.reshape(nodes, -1), b.reshape(nodes, -1)
+        a_paths = a.index_select(0, paths.reshape(-1)).view(count, steps, -1)
+        b_paths = b.index_select(0, paths.reshape(-1)).view(count, steps, -1)
+        from shared.kernels import qwen_gdn
+        layout = self._recurrence_layout(direct_recurrent_layout)
+        if self._gdn_recurrent_raw is qwen_gdn.recurrent_raw_gates:  # every path reads the live state itself, and none writes it back
+            output, _ = qwen_gdn.recurrent_raw_gates(query, key, value, a_paths, b_paths, ssm_a, ssm_dt, recurrent_state, None, None, shared_initial=True, **layout)
+        else:  # the checked launches of other GPUs: a copy of the live state per path
+            state = recurrent_state[:1].expand(count, *recurrent_state.shape[1:]).contiguous()
+            output, _ = self._gdn_recurrent_raw(query, key, value, a_paths, b_paths, ssm_a, ssm_dt, state, None, None, **layout)
+        replay = self.speculative_replay
+        replay.pre.copy_(recurrent_state)
+        replay.k[0, :nodes].copy_(key.reshape(count * steps, *key.shape[2:]).index_select(0, rows))
+        replay.v[0, :nodes].copy_(value.reshape(count * steps, *value.shape[2:]).index_select(0, rows))
+        replay.a[0, :nodes].copy_(a)
+        replay.b[0, :nodes].copy_(b)
+        return output.reshape(count * steps, *output.shape[2:]).index_select(0, rows).unsqueeze(0)
+
+    def commit_tree_state(self, nodes: torch.Tensor) -> None:
+        """After a tree verification: the live states advanced along the accepted path, `nodes` the node indices from the anchor (j + 1 of
+        them). The path's inputs move to the first replay rows and the replay kernel recomputes the state; the window is the path's last inputs."""
+        if self.layer_type != "linear_attention":
+            return
+        from shared.kernels.qwen_gdn import recurrent_raw_replay
+        replay, count = self.speculative_replay, nodes.numel()
+        for buffer in (replay.k, replay.v, replay.a, replay.b):
+            buffer[0, :count].copy_(buffer[0].index_select(0, nodes))
+        ssm_a, ssm_dt = self._replay_ssm_parameters
+        # from the live state itself, which the tree's pass left as it was (each program reads its tile once, then writes it)
+        recurrent_raw_replay(replay, ssm_a, ssm_dt, count, self.recurrent_state_buffer,
+                             **self._recurrence_layout(getattr(self, "_gdn_direct_layout", True)))
+        window = self.conv_state_buffer.shape[-1]
+        history = torch.cat((self.conv_state_buffer[0], self.tree_conv_inputs.index_select(0, nodes).T), dim=-1)
+        self.conv_state_buffer[0].copy_(history[:, -window:])
 
     def _recurrence_ssm_parameters(self, direct_recurrent_layout: bool):
         # The raw recurrence addresses checkpoint heads directly. Other paths
@@ -1012,6 +1112,7 @@ class Qwen3_5Block(nn.Module):
             self.speculative_conv_state_buffer = torch.empty(0)
             self.speculative_recurrent_state_buffer = torch.empty(0)
             self.speculative_replay = None
+            self.tree_conv_inputs = None
             self._replay_ssm_parameters = None  # its GPU copies of ssm_a / ssm_dt, made again with the next replay
 
     def _get_runtime_conv_state(self, batch_size: int, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1073,11 +1174,13 @@ class Qwen3_5Block(nn.Module):
         hidden_states = _take_tensor(x_list)
         batch_size, seq_len, _ = hidden_states.shape
         is_cuda = hidden_states.is_cuda
-        if self.attn_qkv_full is None:
+        if self.attn_qkv_full is not None:
+            q_and_gate, fused_key, fused_value = self._fused_qkv(hidden_states)
+        elif self.attn_kv is None:
+            q_and_gate, fused_key, fused_value = _branches(self._owner, hidden_states, self.attn_q, self.attn_k, self.attn_v)
+        else:
             q_and_gate = self.attn_q(hidden_states)
             fused_key = fused_value = None
-        else:
-            q_and_gate, fused_key, fused_value = self._fused_qkv(hidden_states)
         q_and_gate = q_and_gate.reshape(batch_size, seq_len, self.num_heads, self.head_dim * 2)
         query_states, gate = torch.chunk(q_and_gate, 2, dim=-1)
         gate = gate.reshape(batch_size, seq_len, -1)
@@ -1180,10 +1283,13 @@ class Qwen3_5Block(nn.Module):
         use_raw_recurrent = (self._gdn_recurrent_raw is not None and is_cuda
                              and cache_params is None and (use_precomputed_states or speculative_verify))
         direct_recurrent_layout = use_raw_recurrent and getattr(self, "_gdn_direct_layout", True)
-        if speculative_verify:
+        if speculative_verify and context.tree_mask is None:
             recurrent_capacity = self.speculative_replay.tokens - 1 if self.speculative_replay is not None else self.speculative_recurrent_state_buffer.shape[0]
             if self.speculative_conv_state_buffer.shape[0] < seq_len - 1 or recurrent_capacity < seq_len - 1:
                 raise RuntimeError(f"Predictive state buffers do not cover a {seq_len}-token verification pass.")
+        tree = speculative_verify and context.tree_mask is not None
+        if tree and not (use_raw_recurrent and self._gdn_fused is None and self.speculative_replay is not None and self.tree_conv_inputs is not None and self.speculative_replay.tokens >= seq_len):
+            raise RuntimeError("Tree verification needs the raw recurrence with replayed commits, prepared for the tree's rows.")
         if self._gdn_fused is not None and is_cuda and cache_params is None and (use_precomputed_states or speculative_verify):
             return self._gdn_fused(self, hidden_states, conv_state, recurrent_state, speculative_verify)
 
@@ -1202,8 +1308,7 @@ class Qwen3_5Block(nn.Module):
             a = self.ssm_alpha(hidden_states)
             b = self.ssm_beta(hidden_states)
         else:
-            mixed_qkv_input = self.attn_qkv(hidden_states)
-            gate_ab = self.attn_gate_ab(hidden_states)
+            mixed_qkv_input, gate_ab = _branches(self._owner, hidden_states, self.attn_qkv, self.attn_gate_ab)
             gate_proj, a, b = torch.split(gate_ab, [self.value_dim, self.num_v_heads, self.num_v_heads], dim=-1)
             z = gate_proj.reshape(batch_size, seq_len, -1, self.head_v_dim)
         hidden_states = None
@@ -1239,7 +1344,9 @@ class Qwen3_5Block(nn.Module):
             and isinstance(self.ssm_conv1d, self._short_convolution_cls)
         )
 
-        if speculative_verify and use_short_convolution and is_cuda:
+        if tree:
+            mixed_qkv, last_conv_state = self._tree_convolution(mixed_qkv_input, conv_state, context), conv_state  # the live window is left as it is
+        elif speculative_verify and use_short_convolution and is_cuda:
             from shared.llm_engines.lmgp.layers.speculative_state import conv_verify
             mixed_qkv, last_conv_state = conv_verify(mixed_qkv_input, conv_state, self.ssm_conv1d.weight, self.ssm_conv1d.bias, self.speculative_conv_state_buffer)
         elif speculative_verify and use_short_convolution:
@@ -1342,9 +1449,10 @@ class Qwen3_5Block(nn.Module):
         mixed_qkv_input = None
 
         query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
-        query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
+        rows = tuple(context.tree_paths.shape) if tree else (batch_size, seq_len)  # a tree's rows are those of its paths
+        query = query.reshape(*rows, -1, self.head_k_dim)
+        key = key.reshape(*rows, -1, self.head_k_dim)
+        value = value.reshape(*rows, -1, self.head_v_dim)
         if self._gguf_v_head_reordered and not direct_recurrent_layout:
             value = _reorder_v_head_axis_tiled_to_grouped(
                 value,
@@ -1354,7 +1462,10 @@ class Qwen3_5Block(nn.Module):
             )
 
         ssm_a, ssm_dt = self._recurrence_ssm_parameters(direct_recurrent_layout)
-        if use_raw_recurrent:
+        if tree:
+            core_attn_out = self._tree_recurrence(query, key, value, a, b, ssm_a, ssm_dt, recurrent_state, context, direct_recurrent_layout)
+            last_recurrent_state, g, beta = recurrent_state, None, None  # the live state is left as it is: the commit replays the accepted path
+        elif use_raw_recurrent:
             core_attn_out, last_recurrent_state = self._gdn_recurrent_raw(
                 query, key, value, a, b, ssm_a, ssm_dt, recurrent_state,
                 self.speculative_recurrent_state_buffer if speculative_verify and self.speculative_replay is None else None,
@@ -1536,7 +1647,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.output_norm.use_triton_rmsnorm = _triton_kernels(config)
         self.output = nn.Linear(int(config.hidden_size), int(config.vocab_size), bias=False)
         self.mtp = Qwen3_5MTP(config) if bool(getattr(config, "_prompt_enhancer_enable_mtp_speculative", False)) else None
+        for block in (*self.blk, *(() if self.mtp is None else (self.mtp.block,))):
+            block._owner = weakref.ref(self)
         self._block_draft = False
+        self._block_draft_tree = None  # a draft_tree.StaticTree: the block drafter's tokens verified as a tree
         self._draft_features = None
 
     @property

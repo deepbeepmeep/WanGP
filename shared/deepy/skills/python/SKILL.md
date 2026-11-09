@@ -31,6 +31,8 @@ Each call costs what the tool costs (a generation takes the GPU, an inspection r
 
 ## Which skill next
 
+Read the one the next run needs when you are about to write that run, not all of them while planning: early reads are compacted away before use.
+
 - `wangp://skills/python-images`: text over pictures, posters, grids and contact sheets, palettes, masks, procedural SVG.
 - `wangp://skills/python-clips`: clips built frame by frame, animated charts and titles, pan and zoom, subtitles (SRT) from timestamps.
 - `wangp://skills/python-3d`: 3D models built in Python, read it before any of them: diagrams, 3D charts, props, terrains, 3D text and labels (`wangp.text_mesh`), logos, flags, icons and silhouettes extruded from a picture (`wangp.extrude`, `wangp.extrude_parts` per colour); rendered with `render_3d_views`. An exact shape (a logo, a diagram, a chart) is built here; the image-to-3D models suit organic objects, not flat designs.

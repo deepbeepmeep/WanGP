@@ -7,7 +7,9 @@ Every AdaLN reads temb(t, r) = emb_t(t) + gate * (emb_r(r) - emb_t(t)), r being 
 rows step to r; text rows follow the video; conditioning rows (keyframes, references, known audio) and rows pinned at their own noise
 level go nowhere: r = t."""
 
+import functools
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -16,6 +18,7 @@ from torch.utils._pytree import tree_map
 from tqdm import tqdm
 
 from mmgp import offload
+from safetensors import safe_open
 
 from .components.packing import MINIMAX_H3_KEYFRAME_NOISE_AUG, build_row_timesteps
 
@@ -38,6 +41,57 @@ def _shift(sigma, shift):
 def video_sigmas(steps):
     """The shifted video noise levels of a step count, without the final 0 (the pipeline's explicit phase schedule)."""
     return [_shift(sigma, HYPERFLOW_VIDEO_SHIFT) for sigma in SIGMA_GRIDS[int(steps)][:-1]]
+
+
+def grid_tail_sigmas(steps):
+    """The last `steps` noise levels of the 8-step grid: a refinement phase from an upscaled draft (3 steps from 0.835, 4 from 0.923,
+    8 from pure noise)."""
+    if not 1 <= int(steps) <= 8:
+        raise ValueError(f"A HyperFlow refinement phase runs 1 to 8 steps of the 8-step grid, got {steps}")
+    return video_sigmas(8)[-int(steps):]
+
+
+LORA_ADALN_PREFIX = "hyperflow_adaln."  # tensors of WanGP's HyperFlow 8-step LoRA repack that are not LoRA factors
+_PAIR_TOLERANCE = 1e-4
+
+
+class LoraAdaLNOffsets:
+    """HyperFlow 8-step LoRA on a pruned model (WanGP's repack): pruned AdaLN curves cannot hold its time-embedder LoRAs, so the file
+    stores the change of every block's and the final layer's modulation they cause at each (t, r) pair of its 8-step schedules, computed
+    from the full model's AdaLN weights. The pruned AdaLN keeps reading the base curve at t; the offsets of the rows' pairs are added."""
+
+    def __init__(self, path, architecture):
+        prefix = f"{LORA_ADALN_PREFIX}{architecture}."
+        with safe_open(path, framework="pt", device="cpu") as stream:
+            if prefix + "pairs" not in stream.keys():
+                raise ValueError(f"HyperFlow 8-step LoRA '{os.path.basename(path)}' has no AdaLN offsets for {architecture} "
+                                 f"(it has {stream.metadata().get('adaln_architectures', 'none')})")
+            self.pairs = stream.get_tensor(prefix + "pairs").double()
+            self.blocks = stream.get_tensor(prefix + "blocks")  # [blocks, pairs, 18 * hidden]
+            self.final = stream.get_tensor(prefix + "final")  # [pairs, 2 * hidden]
+
+    def rows(self, t, r):
+        """Index of each (t, r) pair in the table."""
+        query = torch.stack((t.detach().double().cpu(), r.detach().double().cpu()), dim=1)
+        distance, rows = (query[:, None] - self.pairs[None]).abs().amax(-1).min(1)
+        if bool((distance > _PAIR_TOLERANCE).any()):
+            t_value, r_value = query[int(distance.argmax())].tolist()
+            raise ValueError(f"The HyperFlow 8-step LoRA has no AdaLN offsets for (t, r) = ({t_value:.6f}, {r_value:.6f}): it runs the 8-step grid "
+                             "(a refinement phase: its last steps), with conditions at full strength")
+        return rows
+
+    def gather(self, rows, scale, device):
+        """Offsets of the pairs `rows` for every block ([blocks, rows, 18 * hidden]) and for the final layer, on `device`."""
+        blocks, final = self.blocks[:, rows].to(device), self.final[rows].to(device)
+        if scale != 1.0:
+            blocks.mul_(scale)
+            final.mul_(scale)
+        return blocks, final
+
+
+@functools.lru_cache(maxsize=1)
+def load_lora_offsets(path, architecture, mtime):
+    return LoraAdaLNOffsets(path, architecture)
 
 
 class LowRankWeight(torch.Tensor):
@@ -156,7 +210,7 @@ def row_runs(indices, start, stop):
 def _cpu_embedding(embedder, timesteps):
     """embedder(timesteps) (models.minimax_h3.transformer.TimeEmbedder) computed on the CPU from its weights, wherever MMGP holds them."""
     half = embedder.freq_dim // 2
-    angles = timesteps.float().unsqueeze(1) * torch.exp(-math.log(10000.0) * torch.arange(half, dtype=torch.float32) / half).unsqueeze(0)
+    angles = timesteps.float().cpu().unsqueeze(1) * torch.exp(-math.log(10000.0) * torch.arange(half, dtype=torch.float32, device="cpu") / half).unsqueeze(0)
     weights = lambda layer: (layer.weight.detach().float().cpu(), layer.bias.detach().float().cpu())
     return F.linear(F.silu(F.linear(torch.cat((angles.cos(), angles.sin()), dim=-1), *weights(embedder.proj_in))), *weights(embedder.proj_out))
 
@@ -173,7 +227,7 @@ def _sample_pairs():
                     condition = max(1.0 - sigma, MINIMAX_H3_KEYFRAME_NOISE_AUG)
                     pairs.add((condition, condition))
     pairs.add((1.0, 1.0))
-    return torch.tensor(sorted(pairs), dtype=torch.float32)
+    return torch.tensor(sorted(pairs), dtype=torch.float32, device="cpu")
 
 
 @torch.no_grad()
@@ -232,5 +286,6 @@ def convert_adaln_loras(model, model_type, state_dict, source_package=None):
     return count
 
 
-__all__ = ["DroppedBlock", "HYPERFLOW_DEFAULT_STEPS", "HYPERFLOW_STEPS", "HYPERFLOW_VIDEO_SHIFT", "LowRankLinear", "SIGMA_GRIDS",
-           "convert_adaln_loras", "replace_low_rank_linears", "row_runs", "two_time_rows", "video_sigmas"]
+__all__ = ["DroppedBlock", "HYPERFLOW_DEFAULT_STEPS", "HYPERFLOW_STEPS", "HYPERFLOW_VIDEO_SHIFT", "LORA_ADALN_PREFIX", "LoraAdaLNOffsets",
+           "LowRankLinear", "SIGMA_GRIDS", "convert_adaln_loras", "grid_tail_sigmas", "load_lora_offsets", "replace_low_rank_linears",
+           "row_runs", "two_time_rows", "video_sigmas"]

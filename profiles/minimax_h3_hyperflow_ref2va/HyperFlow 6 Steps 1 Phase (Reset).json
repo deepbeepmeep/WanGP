@@ -1,0 +1,9 @@
+{
+    "activated_loras": [],
+    "loras_multipliers": "",
+    "guidance_phases": 1,
+    "num_inference_steps": 6,
+    "custom_sigmas": "",
+    "guidance_scale": 1,
+    "sample_solver": "euler"
+}

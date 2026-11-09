@@ -30,7 +30,7 @@ def read_thumbnails(path: str, *, start: int = 0, count: int | None = None, fps:
     filters = [*([f"fps={fps:g}"] if fps else []), f"scale={frame_width}:{frame_height}"]
     if start or count is not None:
         filters.insert(len(filters) - 1, f"select=between(n\\,{start}\\,{start + (count or 10**9) - 1})")
-    command = [_get_ffmpeg_path(), "-v", "error", "-i", str(path), "-vf", ",".join(filters), "-vsync", "0", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+    command = [_get_ffmpeg_path(), "-v", "error", "-i", str(path), "-vf", ",".join(filters), "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
     process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     size = frame_width * frame_height * 3
     thumbnails = []

@@ -57,6 +57,8 @@ class family_handler:
             "text_prompt_enhancer_instructions": prompts.ENHANCER,
             "infos": prompts.INFOS, "prompt_infos": prompts.PROMPT_INFOS,
             "deepy_infos": prompts.DEEPY_INFOS, "deepy_prompt_infos": prompts.DEEPY_PROMPT_INFOS,
+            "specialities": [{"name": "text to 3D", "aliases": ["3D from text", "low-poly GLB", "animated 3D"],
+                              "description": "Writes a low-poly GLB from a text description (or one reference picture), with animated parts when the prompt asks for motion."}],
         }
 
     @staticmethod

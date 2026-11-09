@@ -63,7 +63,15 @@ def _hf_download(*, gen=None, show_filename=True, file_index=1, file_count=1, **
     except DownloadCancelled:
         raise
     except Exception as exc:
-        raise DownloadError(f"Unable to Download {kwargs['filename']} From {kwargs['repo_id']}: {exc}\nDownload URL: {url}") from exc
+        from huggingface_hub import constants
+
+        target = kwargs.get("local_dir") or constants.HF_HUB_CACHE  # without local_dir, hf_hub_download writes into the Hugging Face cache
+        folder = os.path.abspath(target)
+        while not os.path.isdir(folder) and os.path.dirname(folder) != folder:
+            folder = os.path.dirname(folder)
+        free_mb = shutil.disk_usage(folder).free >> 20  # a download that fills its disk leaves it nearly empty, whatever the (localized) error says
+        full = f"\nThe disk of {target} is full ({free_mb} MB free): free space on it, or list a checkpoints folder on another drive first, then retry." if free_mb < 1024 else ""
+        raise DownloadError(f"Unable to Download {kwargs['filename']} From {kwargs['repo_id']}: {exc}{full}\nDownload URL: {url}") from exc
 
 # Global variables to track download progress
 _start_time = None

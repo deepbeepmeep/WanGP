@@ -204,7 +204,7 @@ Create a world, then walk through it with the keyboard in the new **Worlds galle
 
 - **Fast Quantized KV Cache**: **MOSS Image Edit**, **Qwen Image 2.1** and **Wan Animate 2** now support quantized KV caches that make generation from image or video references much faster, even with **memory profiles 4 and 5**.
 
-- **More Speed Boost and VRAM Savers**: update **WGPKernels to 1.4.2** and **GGUF kernels to 1.0.29** using the [installation guide](docs/INSTALLATION.md).
+- **More Speed Boost and VRAM Savers**: update **WGPKernels to 1.4.3** and **GGUF kernels to 1.0.29** using the [installation guide](docs/INSTALLATION.md).
 
 ### Deepy Prime — Twice the Context, More Ways to Create
 

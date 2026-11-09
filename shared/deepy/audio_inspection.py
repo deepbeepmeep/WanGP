@@ -144,6 +144,101 @@ def inspect_audio(path, *, audio_track_no=1, start_time=0.0, duration=None, sile
     return result
 
 
+BEAT_RATE, BEAT_HOP, MAX_LISTED_BEATS, MAX_BEAT_SECONDS = 22050, 512, 240, 900  # 23 ms onset frames
+
+
+def music_beats(path, *, audio_track_no=1, start_time=0.0, duration=None):
+    """Tempo, beat times and bar starts of music, in seconds of the source file. The tempo is the onset envelope's most prominent
+    periodicity, preferring 70-140 BPM over its double or half; beats come from librosa's dynamic-programming tracker at that tempo,
+    moved half a beat when the kick drum falls between them (a tracker locked on the off-beats or on the snare of a half-time feel).
+    Bar starts assume 4 beats a bar and are given only when chord changes, bass changes and kick-versus-snare accents clearly agree
+    on one beat of the four, and the chords do not follow a 3-beat bar instead."""
+    import librosa
+    from scipy.signal import find_peaks
+
+    limit = MAX_BEAT_SECONDS + 1 if duration is None else min(duration, MAX_BEAT_SECONDS + 1)
+    command = [_get_ffmpeg_path(), "-nostdin", "-hide_banner", "-loglevel", "error", "-ss", str(start_time), "-i", str(path), "-t", str(limit),
+               "-map", f"0:a:{audio_track_no - 1}", "-vn", "-ac", "1", "-ar", str(BEAT_RATE), "-f", "f32le", "pipe:1"]
+    completed = subprocess.run(command, capture_output=True)
+    if completed.returncode:
+        raise ValueError(f"Audio decoding failed: {completed.stderr.decode(errors='replace')[-1500:]}")
+    samples, fps = np.frombuffer(completed.stdout, dtype="<f4"), BEAT_RATE / BEAT_HOP
+    if len(samples) > MAX_BEAT_SECONDS * BEAT_RATE:
+        raise ValueError(f"beats are measured over {MAX_BEAT_SECONDS // 60} minutes at most: choose a range with start_s and duration_s.")
+    none = {"tempo_bpm": None, "note": "No steady beat found."}
+    if len(samples) < 4 * BEAT_RATE:
+        return none
+    spectrum = np.abs(librosa.stft(samples, n_fft=2048, hop_length=BEAT_HOP))
+    onset = librosa.onset.onset_strength(S=librosa.power_to_db(librosa.feature.melspectrogram(S=spectrum ** 2, sr=BEAT_RATE)), sr=BEAT_RATE, center=False)
+    centered = onset - onset.mean()
+    if not centered.any():
+        return none
+    correlation = librosa.autocorrelate(centered, max_size=int(2 * fps) + 2)
+    correlation = correlation / correlation[0] / (1 - np.arange(len(correlation)) / len(centered))  # unbiased: long lags overlap fewer frames
+    shortest = int(fps * 60 / 240)  # lags of 240 to 40 BPM
+    peaks, properties = find_peaks(correlation[shortest:int(np.ceil(fps * 60 / 40)) + 1], prominence=0.02)
+    if not len(peaks):
+        return none
+    lags = peaks + shortest
+    lag = lags[np.argmax(properties["prominences"] * np.exp(-0.5 * (np.log2(60 * fps / lags / 100) / 0.5) ** 2))]
+    before, peak, after = correlation[lag - 1: lag + 2]
+    curvature = before - 2 * peak + after
+    tempo = 60 * fps / (lag + (0.5 * (before - after) / curvature if curvature else 0.0))
+    beats = librosa.beat.beat_track(onset_envelope=onset, sr=BEAT_RATE, hop_length=BEAT_HOP, bpm=tempo, trim=True)[1]
+    if len(beats) < 4:
+        return none
+    freqs = librosa.fft_frequencies(sr=BEAT_RATE, n_fft=2048)
+
+    def flux(low, high):  # rise of the log energy of a band, per frame
+        band = np.log1p(100 * spectrum[(freqs >= low) & (freqs < high)]).sum(0)
+        return np.maximum(0, np.diff(band, prepend=band[:1]))
+
+    def near(values, frames):  # strongest value within 2 frames of each frame
+        return np.array([values[max(0, frame - 2): frame + 3].max() for frame in frames])
+
+    kick = flux(0, 120)
+    if len(beats) > 8 and near(kick, (beats[:-1] + beats[1:]) // 2).mean() > 1.5 * near(kick, beats[:-1]).mean():
+        beats = (beats[:-1] + beats[1:]) // 2
+    times = start_time + (beats + 1) / fps  # the energy rise of an attack peaks about one frame before it
+    tempo = float(60 * (len(times) - 1) / (times[-1] - times[0]))
+    result = {"tempo_bpm": round(tempo, 1), "beat_s": round(60 / tempo, 3), "times": [round(float(value), 2) for value in times[:MAX_LISTED_BEATS]]}
+    spans = len(beats) - 1  # beat i spans frames beats[i]..beats[i + 1]
+    if spans >= 12:
+        def bar_change(features, beats_per_bar=4):  # cosine distance between the bar before each beat and the bar from it
+            values = librosa.util.sync(features, beats, aggregate=np.mean)[:, 1:spans + 1]
+            change = np.full(spans, np.nan)
+            for index in range(beats_per_bar, spans - beats_per_bar + 1):
+                before, after = values[:, index - beats_per_bar:index].mean(1), values[:, index:index + beats_per_bar].mean(1)
+                change[index] = 1 - before @ after / (np.linalg.norm(before) * np.linalg.norm(after) + 1e-9)
+            return change
+
+        def by_phase(values, beats_per_bar=4):
+            return np.array([np.nanmean(values[phase::beats_per_bar]) for phase in range(beats_per_bar)])
+
+        def contrast(values):  # how much more on one beat of the bar than on average
+            return (values.max() - values.mean()) / values.mean()
+
+        def standard(values):
+            return (values - values.mean()) / (values.std() + 1e-9)
+
+        chroma = librosa.feature.chroma_stft(S=spectrum ** 2, sr=BEAT_RATE)
+        chords = bar_change(chroma)
+        accent = standard(near(kick, beats[:spans])) - standard(near(flux(150, 400), beats[:spans]) + near(flux(1500, 6000), beats[:spans]))  # kick, not snare
+        phases = np.stack([by_phase(chords), by_phase(bar_change(librosa.feature.chroma_stft(S=(spectrum * (freqs < 250)[:, None]) ** 2, sr=BEAT_RATE))), by_phase(accent)], 1)
+        scores = ((phases - phases.mean(0)) / (phases.std(0) + 1e-9)).sum(1)
+        best, runner_up = np.argsort(-scores)[:2]
+        # chords changing more on a 3-beat grid than on a 4-beat one: 4-beat bars would drift through the bar
+        if scores[best] - scores[runner_up] >= 1.5 and contrast(phases[:, 0]) >= contrast(by_phase(bar_change(chroma, 3), 3)):
+            result["bar_starts"] = result["times"][best::4]
+    notes = [] if "bar_starts" in result else ["Bar starts are unclear: count bars of 4 beats from a beat where a sung line or a section starts."]
+    if len(times) > MAX_LISTED_BEATS:
+        result["truncated"] = True
+        notes.append(f"These are the first {MAX_LISTED_BEATS} of {len(times)} beats: inspect a later range (start_s) for the others.")
+    if notes:
+        result["note"] = " ".join(notes)
+    return result
+
+
 SPEECH_RATE, SPEECH_FRAME = 16000, 320  # 20 ms windows
 
 

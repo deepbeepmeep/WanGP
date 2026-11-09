@@ -1395,6 +1395,8 @@ def _compact_job_snapshot(snapshot: dict[str, Any], *, keep_webui: bool = False,
             compact.setdefault("status", "done" if result.get("success") else "interrupted" if result.get("cancelled") else "error")
             if not keep_paths and {Path(path).name for path in result.get("generated_files", [])} <= {item["filename"] if "filename" in item else Path(item["path"]).name for item in result.get("gallery_items", [])}:
                 compact["result"] = {key: value for key, value in result.items() if key != "generated_files"}
+            if result.get("success") and any(item.get("media_type") == "3d" for item in result.get("gallery_items", [])):  # the way to look at a new 3D asset
+                compact["next"] = "Look at a 3D asset with wangp_toolbox render_3d_views: named views or angles, frame_no for an animation frame, turntable_s for a turntable video."
     elif isinstance(progress, dict) and isinstance(progress.get("status"), str):
         compact["progress"] = {**progress, "status": _UI_PROMPT_COUNTER.sub("", progress["status"])}  # the counter numbers the whole UI queue, not this job's tasks
     return compact
@@ -1466,6 +1468,8 @@ class _JobRecord:
                         quiet = quiet_ranges(str((self.session._root / record["path"]).resolve()))
                         if quiet and item.get("duration_seconds", 0) - quiet[-1][1] < 0.1 and quiet[-1][1] - quiet[-1][0] >= 1:
                             item["sound_ends_seconds"] = quiet[-1][0]
+                            item["note"] = (f"The sound ends at {quiet[-1][0]:g} s of {item['duration_seconds']:g} s; the rest is silence. To fill a length, read the model's "
+                                            "input guidance on its timing (wangp_model definition, property infos) or ask for more duration and trim, rather than looping the take.")
                     elif item["media_type"] == "video":  # a generated shot can cut away to another shot or go black: measured, not seen
                         from shared.deepy.video_tools import picture_checks
                         item.update(picture_checks(str((self.session._root / record["path"]).resolve())))
@@ -2113,6 +2117,8 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
                 settings = task
                 for key in ("params", "settings"):
                     if key in task:
+                        if key == "settings" and any(name in task for name in ("model_type", "base_model_type", "prompt")):  # a settings object holding another one; queue items keep a prompt beside params
+                            raise ValueError(f"{path}.{key}: settings is one flat object. Put these values beside model_type and prompt instead of nesting them. Nothing was submitted.")
                         settings, path = task[key], f"{path}.{key}"
                         break
                 if not isinstance(settings, dict):

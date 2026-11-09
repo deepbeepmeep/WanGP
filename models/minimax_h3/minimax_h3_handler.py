@@ -291,6 +291,8 @@ Enable **Advanced Mode**, open **General**, and choose an option under **Phases*
 Leave **Custom Sigmas** empty for the normal schedules. Use commas between values and `;` between phases; an empty phase slot keeps its normal schedule. Explicit values set that phase's steps and starting noise. The **i** beside the field explains the syntax.
 
 For FL2VA, **Open-H3 Regenerate 2K Phase 2** selects the refiner LoRA and its three-step schedule. Phase 2 uses the first phase's audio as frozen conditioning while preserving its output soundtrack. **H3 Phase 2 (Original)** restores the usual Turbo and schedule; **Vanilla Phase 1 (Reset)** returns to one-phase generation. Tiling remains experimental with the refiner.
+
+For Ref2VA, the **H3 Regenerate 2K IC HyperFlow 2 Phases** preset draws an 8-step HyperFlow draft at half the selected size, then regenerates it at full size in 3 steps with the Open-H3 Regenerate 2K IC LoRA and LMS Sharp. Unlike the refiner above, phase 2 keeps the draft in view as a reference video, so faces, lip sync, lettering and layout follow it while detail is drawn at full resolution; the reference images and videos of phase 1 are not used again there. Pass the prompt as written for the draft. It works with tiling: each area sees the matching part of the draft. Its HyperFlow 8-step LoRA also works alone: the **HyperFlow Ref2VA 8 Steps** accelerator profile (8 steps on HyperFlow's own schedule, Euler, no guidance pass).
 """
 
 H3_PHASE_TURBO_INFOS = """
@@ -429,12 +431,15 @@ HYPERFLOW_INFOS = """
 HyperFlow H3 Flash is Video Rebirth's compressed, few-step MiniMax H3: about 14B parameters instead of 20B for the Pruned models, and no guidance pass.
 
 - **Steps:** choose **4** (fastest), **6** (default, balanced) or **8** (most detail). Other counts are not available: the model was trained on these three schedules. The sampler is Euler and the flow shift is fixed.
-- **One phase:** two-phase generation, custom sigmas, Audio Refinement and step skipping are not available.
+- **Phases:** one phase by default. **Two Phases** draw the video at half the selected size, then finish it at full size with the last steps of HyperFlow's 8-step schedule: **Phase 2 Steps** 3 (default) or 4 start from the enlarged draft, 8 start again from noise; **Custom Sigmas** apply to phase 2 only. For Ref2VA, the **Regenerate 2K IC (6 + 3 Steps)** profile adds the Open-H3 Regenerate 2K IC LoRA to phase 2: the draft stays in view as a reference video, so faces, lip sync, lettering and layout stay as drafted while detail is drawn at full size, up to 2560×1440. **HyperFlow 6 Steps 1 Phase (Reset)** returns to one phase. Audio Refinement and step skipping are not available.
 - **Speed and memory:** a step is slightly faster than a Pruned H3 step; most of the gain comes from the step count. At 6 steps denoising takes about a third less time than the 8-step PDD models, at 4 steps about half. Its 15 GB checkpoint needs less RAM than the 21 GB Pruned ones. **Sol-Attn** can be combined with it.
 - **LoRAs:** LoRAs made for the matching base model (FL2VA or Ref2VA) apply to the layers HyperFlow kept; their parts on the blocks it removed are skipped and their timestep part is approximated, so their effect can be weaker. Accelerator LoRAs (Turbo, PDD, Pika) are not needed: do not add them.
 """
 HYPERFLOW_DEEPY_INFOS = (" HyperFlow H3 Flash (Video Rebirth's compressed few-step H3, 14B): `num_inference_steps` 4, 6 (default) or 8 only, Euler, `flow_shift` 12, "
-                         "one phase, empty `custom_sigmas`, no step skipping, no Audio Refinement. A step is slightly faster than Pruned: 6 steps take about a third "
+                         "no step skipping, no Audio Refinement. `guidance_phases` 2: phase 1 at half size, latent upscale, phase 2 at full size on the last "
+                         "`num_inference_steps2` points of the 8-step grid (3 from sigma 0.835, 4 from 0.923, 8 from noise); `custom_sigmas` only in the phase-2 slot. "
+                         "Ref2VA profile `Regenerate 2K IC (6 + 3 Steps)`: `open_h3_regenerate_2k_ic_lora_bf16.safetensors` and `minimax_h3_lms_v1.0_r64.safetensors` "
+                         "at `0;1`; phase 2 keeps the phase-1 draft as its only reference video (faces, lip sync, text and layout follow it). A step is slightly faster than Pruned: 6 steps take about a third "
                          "less denoising time than 8-step PDD, 4 steps about half; 15 GB checkpoint. LoRAs for the matching base model apply partially (removed "
                          "blocks skipped, timestep part approximated); never add accelerator LoRAs.")
 H3_RUNTIME_INFOS = H3_PHASE_INFOS + H3_PHASE_TURBO_INFOS + H3_AUDIO_REFINEMENT_INFOS + H3_SPEED_INFOS + H3_STANDARD_SAMPLER_INFOS + H3_COMMON_RUNTIME_INFOS
@@ -756,6 +761,7 @@ class family_handler:
         if hyperflow and (not pruned or any(model_def.get(flag, False) for flag in ("pdd", "ptd", "vdn", "veda", "fasth3"))):
             raise ValueError("HyperFlow H3 Flash is declared on the pruned FL2VA or Ref2VA architecture, without other acceleration flags")
         fixed_schedule = pdd or fasth3 or hyperflow
+        single_phase = pdd or fasth3  # HyperFlow Flash takes a second, higher-resolution phase (Regenerate 2K IC)
         pika_supported = not (fixed_schedule or ptd or vdn or veda)
         text_encoder_variant = model_def.get("text_encoder_variant")
         text_encoder_files = [TEXT_ENCODER_BF16, TEXT_ENCODER_INT8] if text_encoder_variant is None else TEXT_ENCODER_VARIANTS[text_encoder_variant]
@@ -777,14 +783,14 @@ class family_handler:
             "frames_offset": 5,
             "block_size": 32,
             "vae_block_size": 32,
-            "guidance_max_phases": 1 if fixed_schedule else 2,
-            "lock_guidance_phases": fixed_schedule,
+            "guidance_max_phases": 1 if single_phase else 2,
+            "lock_guidance_phases": single_phase,
             "visible_phases": 0,
-            "lora_multiplier_phases": 1 if fixed_schedule else 2,
-            "phase_2_spatial_tiling": not fixed_schedule,
-            "custom_sigmas": not fixed_schedule and not ptd,
+            "lora_multiplier_phases": 1 if single_phase else 2,
+            "phase_2_spatial_tiling": not single_phase,
+            "custom_sigmas": not single_phase and not ptd,
             "resolution_budget": "2048x2048",
-            **({"resolution_budget_tiled": "3840x2176"} if not fixed_schedule else {}),
+            **({"resolution_budget_tiled": "3840x2176"} if not single_phase else {}),
             "custom_settings": [{
                 "id": H3_MASK_MODE_SETTING,
                 "name": "Mask Denoising Mode",
@@ -816,7 +822,7 @@ class family_handler:
                 "step": 0.0001,
             },
             "inference_steps": True,
-            "inference_steps2": not fixed_schedule,
+            "inference_steps2": not single_phase,
             "lock_inference_steps": pdd or fasth3,
             "flow_shift": not hyperflow,
             "spectrum_cache": not hyperflow,
@@ -876,8 +882,8 @@ class family_handler:
             "image_prompt_enhancer_instructions1": H3_STILL_IMAGE_SYSTEM_PROMPT,
             "text_prompt_enhancer_max_tokens1": 1024,
             "image_prompt_enhancer_max_tokens1": 1024,
-            "profiles_dir": ["minimax_h3_vdn"] if vdn else ["minimax_h3_fasth3"] if fasth3 else ["minimax_h3_hyperflow"] if hyperflow else [] if pdd else ["minimax_h3", "minimax_h3_ref2va" if reference_mode else "minimax_h3_fl2va"],
-            "preset_profiles_dir": [] if fixed_schedule or vdn else ["minimax_h3_presets"],
+            "profiles_dir": ["minimax_h3_vdn"] if vdn else ["minimax_h3_fasth3"] if fasth3 else [("minimax_h3_hyperflow_ref2va" if reference_mode else "minimax_h3_hyperflow")] if hyperflow else [] if pdd else ["minimax_h3", "minimax_h3_ref2va" if reference_mode else "minimax_h3_fl2va"],
+            "preset_profiles_dir": [] if fixed_schedule or vdn else ["minimax_h3_presets", "minimax_h3_ref2va_presets"] if reference_mode else ["minimax_h3_presets"],
             "finetune_custom_urls": ["video_vae_file", "audio_vae_file"],
             "vae_upsamplers": {X2_VAE_METHOD: [0, 1, 2]},
             "finetunes_infos": H3_FINETUNES_INFOS,
@@ -1054,8 +1060,16 @@ class family_handler:
             result["deepy_infos"] += " Two-phase generation uses `num_inference_steps2` (default 3) for final enhancement and `switch_threshold` for its starting noise. Accelerator LoRAs before `|` with any nonzero phase-2 multiplier replace the automatic Turbo together, at their specified multipliers; if all are zero, the automatic Turbo is used. `1;0` means phase 1 only, `1;0.6` sets phase 2 to 0.6, and `1` applies to both phases. LoRAs after `|` keep their multipliers."
         if vdn:
             result["deepy_infos"] += " VDN loads its acceleration LoRA automatically and defaults to 8 steps."
-        if result["custom_sigmas"]:
+        if result["custom_sigmas"] and hyperflow:
+            result["custom_sigmas_schedulers"] = ["euler"]
+        elif result["custom_sigmas"]:
             result["custom_sigmas_schedulers"] = ["euler", "res_multistep", "ralston_2s"]
+            if reference_mode:
+                result["deepy_infos"] += (" Ref2VA preset `H3 Regenerate 2K IC HyperFlow 2 Phases` (accelerators before `|`): `minimax_h3_hyperflow_8step_lora_bf16.safetensors` `1;1`, "
+                                          "`open_h3_regenerate_2k_ic_lora_bf16.safetensors` `0;1`, `minimax_h3_lms_v1.0_r64.safetensors` `0;1`, `guidance_phases` 2, 8 + 3 steps, "
+                                          "`custom_sigmas` `; 0.834942, 0.696852, 0.468753`. Phase 2 keeps the phase-1 draft as its only reference video (faces, lip sync, text "
+                                          "and layout follow it); phase-1 references are not reused. Accelerator profile `HyperFlow Ref2VA 8 Steps`: the HyperFlow 8-step LoRA alone at `1` "
+                                          "(Euler, `flow_shift` 12, exactly 8 steps, no custom phase-1 sigmas).")
             result["deepy_infos"] += " `custom_sigmas` defaults to empty. Commas separate positive descending sigmas below 1; semicolons separate exactly `guidance_phases` slots. Blank slots use normal schedules; trailing zero is ignored. Explicit schedules override that phase's steps and starting sigma without another flow shift. FL2VA and Ref2VA share the H3 presets. Open-H3 Regenerate uses `;0.909375,0.8571428571428571,0.6666666666666666` and `open_h3_regenerate_2k_lora.safetensors` at `0;1` before `|`; it uses phase-1 audio as frozen phase-2 conditioning and retains phase-1 output audio. Tiling is experimental. The presets replace accelerator LoRAs while preserving additional LoRAs and their multipliers. Original Phase 2 and Vanilla Phase 1 reset presets clear custom sigmas."
         if veda:
             result["compile"] = False
@@ -1191,7 +1205,11 @@ class family_handler:
                 return f"HyperFlow H3 Flash runs {', '.join(map(str, HYPERFLOW_STEPS[:-1]))} or {HYPERFLOW_STEPS[-1]} inference steps"
             if inputs["sample_solver"] != "euler":
                 return "HyperFlow H3 Flash requires the Euler sampler"
-            inputs.update({"flow_shift": HYPERFLOW_VIDEO_SHIFT, "guidance_scale": 1.0, "guidance_phases": 1, "custom_sigmas": "", "skip_steps_cache_type": ""})
+            if inputs["custom_sigmas"].split(";", 1)[0].strip():
+                return "HyperFlow H3 Flash runs its own schedule in phase 1: Custom Sigmas apply to phase 2 only"
+            if int(inputs["guidance_phases"]) > 1 and not inputs["custom_sigmas"].strip() and not 1 <= int(inputs["num_inference_steps2"]) <= 8:
+                return "A HyperFlow phase 2 runs 1 to 8 steps (the end of its 8-step grid)"
+            inputs.update({"flow_shift": HYPERFLOW_VIDEO_SHIFT, "guidance_scale": 1.0, "skip_steps_cache_type": ""})
         overlap, error = normalize_overlap(int(inputs["sliding_window_overlap"] or 0), 17, 5 if H3_CONTROL_LATENT_CONTINUATION and base_model_type in CONTROL_ARCHITECTURES else 1)
         if error:
             return error

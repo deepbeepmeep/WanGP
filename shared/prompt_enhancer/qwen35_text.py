@@ -202,7 +202,7 @@ def _map_qwen35_token_table(model) -> None:
     raw = lambda tensor: tensor._data if hasattr(tensor, "_data") else tensor
     if raw(model.output.weight).data_ptr() == raw(model.token_embd.weight).data_ptr():
         return
-    runtime.map_in_ram(model.token_embd, *([] if model.mtp is None else [model.mtp.embed_tokens]))
+    runtime.map_in_ram(model.token_embd, *([] if model.mtp is None or model._block_draft else [model.mtp.embed_tokens]))  # block drafters read the target's table
 
 
 def _load_text_config(config_path: str) -> Qwen3_5TextConfig:
@@ -1359,7 +1359,7 @@ def load_qwen35_text_prompt_enhancer(
     from .config import BLOCK_DRAFT_METHODS
     block_draft_method = speculative_decoding if speculative_decoding in BLOCK_DRAFT_METHODS else None
     if block_draft_method is not None and (variant != "27b" or not (features["triton"] and features["flash"])):
-        raise ValueError("DSpark and DFlash2 require Qwen3.8/Bonsai 27B, Triton and FlashAttention 2.")
+        raise ValueError("DSpark, DFlash2 and DSpine require Qwen3.8/Bonsai 27B, Triton and FlashAttention 2.")
     enable_mtp = bool(speculative_decoding and block_draft_method is None and spec.get("supports_mtp", False))
     mtp_filename = _qwen35_mtp_filename(spec, backend, model_path, prism_metadata) if enable_mtp else None
     mtp_modules = [_resolve_qwen35_checkpoint_file(assets_dir, mtp_filename, variant=variant)] if mtp_filename else None

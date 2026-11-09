@@ -354,6 +354,22 @@ def get_gguf_kernels_version() -> str:
         return ""
 
 
+GGUF_KERNELS_VERSION = "1.0.29"  # the GGUF kernels of this WanGP release (docs/INSTALLATION.md), never looked up online
+GGUF_KERNELS_RELEASE_URL = f"https://github.com/deepbeepmeep/kernels/releases/tag/gguf-v{GGUF_KERNELS_VERSION}"
+
+
+def gguf_kernels_warning() -> str:
+    """The Qwen models of Deepy and the prompt enhancer run their fast paths on this release's GGUF kernels: what to tell when they are missing or older."""
+    installed = get_gguf_kernels_version()
+    try:
+        if installed and Version(installed) >= Version(GGUF_KERNELS_VERSION):
+            return ""
+    except InvalidVersion:
+        pass
+    state = f"GGUF kernels {installed.split('+')[0]} are outdated" if installed else "GGUF kernels are missing"
+    return f"{state}: Deepy and the Prompt Enhancer will not reach their optimal performance. Install GGUF kernels {GGUF_KERNELS_VERSION} from {GGUF_KERNELS_RELEASE_URL}"
+
+
 @lru_cache(maxsize=1)
 def deepy_lower_kv_cache_supported() -> bool:
     """A KV cache below INT8 reads through Triton kernels, on NVIDIA GPUs with native BF16 conversions; elsewhere it would go through the dense paths."""

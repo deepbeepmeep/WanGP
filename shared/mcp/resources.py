@@ -12,13 +12,14 @@ WORKFLOWS_URI = "wangp://guides/workflows"
 GUIDE_PATH = Path(__file__).parents[1] / "deepy" / "prime_guide.md"
 INDEXED_DOCUMENTS = {WORKFLOWS_URI: GUIDE_PATH}  # index resources whose searches and section reads cover the whole document
 RESOURCE_ALIASES = {"wangp://guides/v2": "wangp://guides/workflows"}
-RESOURCE_DESCRIPTION = "Find documentation, skills and workflows. Without uri, query filters the resource index (e.g. 'skills' or a task). With uri, query searches passages ('*' lists headings), section reads matching headings; omit both for full text. User skills include a revision for updates with wangp_io(action='save_skill'). limit caps results/text blocks per page; cursor continues unchanged filters. Follow next_call for more."
+RESOURCE_DESCRIPTION = "Find and read WanGP documentation, skills and workflows. Without uri, query filters the resource index (e.g. 'skills' or a task). With uri, query searches passages ('*' lists headings), section reads matching headings; omit both for full text. Follow next_call for more."
 _MARKDOWN_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 
 
 GUIDE_SECTIONS = {  # heading -> when to read it; the workflows index lists these, each section is its own resource
     "Templates and generation": "choosing a template or model and building settings: defaults, accelerator profiles, presets, LoRAs, batches",
     "Media selection and inputs": "giving a generation images, videos or audio: start/end frames, references, control videos, masks, selected Gallery media",
+    "3D assets and worlds": "3D assets from text or a picture, refiners and texturers, retexturing a mesh, checking 3D views and animations; explorable worlds: walks, continuation, a picture from another viewpoint",
     "Post-processing and media utilities": "upscaling, frame interpolation, sound treatments, and the toolbox utilities (extract, merge, remux, resize, 3D views, SVG drawings)",
     "Speech and chained media": "speech, songs and media made from other generated media, such as talking videos driven by a speech clip",
     "Extraction by spoken words": "cutting audio or video where given words are spoken",

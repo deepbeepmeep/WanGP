@@ -28,7 +28,7 @@ from tqdm import tqdm
 from shared import attention_kit
 from shared.attention import pay_attention
 
-from .hyperflow import DroppedBlock, row_runs, two_time_rows
+from .hyperflow import LORA_ADALN_PREFIX, DroppedBlock, row_runs, two_time_rows
 from .interrupt import GenerationInterrupted
 from shared.kernels import ops as kernels
 from shared.utils.lora_mapping import convert_lora_keys
@@ -327,10 +327,15 @@ class AdalnProj(nn.Module):
         self.linear = nn.Linear(time_dim, expand * modalities * hidden, bias=True, dtype=dtype, device=device)
 
     def forward(self, temb):
+        offset = None
+        if temb.shape[-1] != self.linear.in_features:  # HyperFlow LoRA on pruned curves: the rows' AdaLN offsets follow their curve
+            temb, offset = temb.split((self.linear.in_features, temb.shape[-1] - self.linear.in_features), dim=-1)
         if self.apply_silu:
             temb = F.silu(temb)
-        output = self.linear(temb.to(self.linear.weight.dtype)).view(-1, self.expand * self.hidden)
-        return output.chunk(self.expand, dim=-1)
+        output = self.linear(temb.to(self.linear.weight.dtype))
+        if offset is not None:
+            output = output.add_(offset.to(output.dtype))
+        return output.view(-1, self.expand * self.hidden).chunk(self.expand, dim=-1)
 
 
 def _norm_modulate(norm, hidden, shift_scale, segments):
@@ -497,6 +502,7 @@ def _prepared_references(refs):
             latent_height=ref.get("latent_h", 0),
             latent_width=ref.get("latent_w", 0),
             num_audio_latents=ref.get("ref_audio_t", 0),
+            spatial_context=ref.get("spatial_context"),
         ))
     return prepared
 
@@ -506,6 +512,8 @@ class MiniMaxH3Model(nn.Module):
         from .lora_tables import pop_source_tag
 
         source_package = pop_source_tag(state_dict)
+        for key in [key for key in state_dict if key.startswith(LORA_ADALN_PREFIX)]:  # the HyperFlow LoRA's AdaLN offsets: read by the pipeline
+            state_dict.pop(key)
         attention = self.blocks[0].attn
         split_map = get_linear_split_map(self.attention_inner_size, attention.heads, attention.head_dim)
         modules = dict(self.named_modules())
@@ -722,7 +730,7 @@ class MiniMaxH3Model(nn.Module):
                      payload.get("target_video_condition_frames", 0),
                      tuple((k["anchor"], k["latent_frame_count"], k.get("frame_index")) for k in payload.get("keyframes") or ()),
                      tuple((k["anchor"], k["latent_frame_count"]) for k in payload.get("audio_keyframes") or ()),
-                     tuple((r["kind"], r.get("latent_t"), r.get("latent_h"), r.get("latent_w"), r.get("ref_audio_t"))
+                     tuple((r["kind"], r.get("latent_t"), r.get("latent_h"), r.get("latent_w"), r.get("ref_audio_t"), r.get("spatial_context"))
                            for r in payload.get("refs") or ()))
         if payload.get("layout_signature") == signature:
             return payload["layout"]
@@ -906,7 +914,8 @@ class MiniMaxH3Model(nn.Module):
         elif sigma_video.numel() == latent_t:
             timestep, timestep_indices, video_head_row, frame_rows = _frame_video_timestep_rows(timestep, timestep_indices, sigma_video, target_video_rows)
         endpoints = None
-        if self.endpoint_gate is not None:  # HyperFlow: one (t, r) pair per row; rows pinned at their own noise level (fixed, anchored) keep r = t
+        lora_offsets = payload.get("hyperflow_lora")  # (LoraAdaLNOffsets, multiplier): HyperFlow's 8-step LoRA on a pruned model
+        if self.endpoint_gate is not None or lora_offsets is not None:  # HyperFlow: one (t, r) pair per row; rows pinned at their own noise level (fixed, anchored) keep r = t
             rows_per_frame = target_video_rows // latent_t
             spans = (grouped_segments if grouped_segments is not None else
                      [(video_start + index * rows_per_frame, video_start + (index + 1) * rows_per_frame, int(row) * 3) for index, row in enumerate(frame_rows)]
@@ -931,7 +940,14 @@ class MiniMaxH3Model(nn.Module):
         elif grouped_segments is not None:
             segments = [segment for segment in segments if segment[0] < video_start]
             segments.extend(grouped_segments)
-        temb = self._time_embedding(timestep, endpoints=endpoints)
+        block_offsets = final_temb = None
+        if lora_offsets is not None:  # the pruned curve at t, each block's AdaLN offsets of the rows' (t, r) pairs in extra columns
+            temb = self._time_embedding(timestep)
+            block_offsets, final_offsets = lora_offsets[0].gather(lora_offsets[0].rows(timestep, endpoints), lora_offsets[1], device)
+            final_temb = torch.cat((temb, final_offsets.to(temb.dtype)), dim=1)
+            del final_offsets
+        else:
+            temb = self._time_embedding(timestep, endpoints=endpoints)
         ref2va_temb = self._time_embedding(timestep, self.ref2va_adaln_t_table) if self.hybrid_ref2va_blocks is not None else None
         rope = payload.get("rope")
         if rope is None:
@@ -981,6 +997,8 @@ class MiniMaxH3Model(nn.Module):
             nonlocal control_list
             block = self.blocks[block_index]
             block_temb = ref2va_temb if ref2va_temb is not None and self.hybrid_ref2va_blocks[0] <= block_index <= self.hybrid_ref2va_blocks[1] else temb
+            if block_offsets is not None:
+                block_temb = torch.cat((temb, block_offsets[block_index].to(temb.dtype)), dim=1)
             control = block.control if control_list is not None and hasattr(block, "control") else None
             if control is not None:
                 control_list = [control(control_list, block_temb, segments, rope)]
@@ -1020,9 +1038,9 @@ class MiniMaxH3Model(nn.Module):
             spectrum.observe(hidden[audio_start:], target_audio_rows, self._check_interrupt)
         h_list = [hidden]
         hidden = None
-        video, audio = self.final_layer(h_list, temb, (video_start, layout.sequence_length, video_head_row),
+        video, audio = self.final_layer(h_list, temb if final_temb is None else final_temb, (video_start, layout.sequence_length, video_head_row),
                                         (audio_start, video_start, audio_row))
-        del temb, ref2va_temb, rope, timestep_indices
+        del temb, ref2va_temb, rope, timestep_indices, block_offsets, final_temb
         if target_video_inverse_order is not None:
             video = video.index_select(0, target_video_inverse_order)
         video = _to_dtype([video], video_dtype)

@@ -122,7 +122,8 @@ def _recurrent_raw_kernel(Q, K, V, A, BETA_IN, SSM_A, DT, STATE, STATE_OUT, OUT,
                           BATCH, BK: tl.constexpr, BV: tl.constexpr,
                           SAVE_PREFIX: tl.constexpr, SAVE_INPUTS: tl.constexpr, SAVE_TOKENS,
                           V_HEADS_TILED: tl.constexpr, SSM_PARAMS_TILED: tl.constexpr,
-                          INTERLEAVE_AB: tl.constexpr):
+                          INTERLEAVE_AB: tl.constexpr, SHARED_STATE: tl.constexpr):
+    # SHARED_STATE: every batch entry (a draft tree's path) starts from the one state of batch 0 and none writes a state back
     vb, bh = tl.program_id(0), tl.program_id(1)
     batch, head = bh // HV, bh % HV
     kh = head // (HV // H)
@@ -135,7 +136,7 @@ def _recurrent_raw_kernel(Q, K, V, A, BETA_IN, SSM_A, DT, STATE, STATE_OUT, OUT,
     values = vb * BV + tl.arange(0, BV)
     state_index = bh * DK * DV + keys[:, None] * DV + values[None, :]
     mask = (keys[:, None] < DK) & (values[None, :] < DV)
-    raw_state = tl.load(STATE + state_index, mask, 0)
+    raw_state = tl.load(STATE + (head * DK * DV + keys[:, None] * DV + values[None, :] if SHARED_STATE else state_index), mask, 0)
     state = raw_state.to(tl.float32)
     if SAVE_INPUTS:  # what a replay of any accepted prefix needs: the state before verification and every input as read
         tl.store(PRE + state_index, raw_state, mask)
@@ -181,7 +182,8 @@ def _recurrent_raw_kernel(Q, K, V, A, BETA_IN, SSM_A, DT, STATE, STATE_OUT, OUT,
         if SAVE_PREFIX:
             if token + 1 < T:
                 tl.store(SNAPSHOTS + token * BATCH * HV * DK * DV + state_index, state, mask)
-    tl.store(STATE_OUT + state_index, state, mask)
+    if not SHARED_STATE:
+        tl.store(STATE_OUT + state_index, state, mask)
 
 
 class RecurrentReplay:
@@ -205,8 +207,9 @@ class RecurrentReplay:
 
 
 def recurrent_raw_gates(q, k, v, a, b, ssm_a, ssm_dt, initial, snapshots=None, replay=None,
-                        *, v_heads_tiled=False, ssm_params_tiled=False, interleave_ab=False):
-    """Read projection layouts directly; keep state and snapshots in grouped order."""
+                        *, v_heads_tiled=False, ssm_params_tiled=False, interleave_ab=False, shared_initial=False):
+    """Read projection layouts directly; keep state and snapshots in grouped order. shared_initial: each batch entry starts from the state of
+    batch 0 of `initial`, which stays as it is (the paths of a draft tree)."""
     batch, tokens, heads, dim_k = q.shape
     hv, dim_v = v.shape[-2:]
     output = torch.empty(v.shape, device=v.device, dtype=v.dtype)
@@ -219,7 +222,7 @@ def recurrent_raw_gates(q, k, v, a, b, ssm_a, ssm_dt, initial, snapshots=None, r
         *q.stride()[:3], *k.stride()[:3], *v.stride()[:3],
         *a.stride()[:2], *b.stride()[:2], batch,
         triton.next_power_of_2(dim_k), 8, snapshots is not None, replay is not None, replay.tokens if replay is not None else 0,
-        v_heads_tiled, ssm_params_tiled, interleave_ab,
+        v_heads_tiled, ssm_params_tiled, interleave_ab, shared_initial,
         num_warps=1, num_stages=3,
     )
     return output, initial
@@ -235,7 +238,7 @@ def recurrent_raw_replay(replay, ssm_a, ssm_dt, tokens, state, *, v_heads_tiled=
         *replay.k.stride()[:3], *replay.k.stride()[:3], *replay.v.stride()[:3],
         *replay.a.stride()[:2], *replay.b.stride()[:2], batch,
         triton.next_power_of_2(dim_k), 8, False, False, 0,
-        v_heads_tiled, ssm_params_tiled, interleave_ab,
+        v_heads_tiled, ssm_params_tiled, interleave_ab, False,
         num_warps=1, num_stages=3,
     )
 
