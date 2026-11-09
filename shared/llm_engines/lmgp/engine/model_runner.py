@@ -26,6 +26,9 @@ _CHAIN = "chain" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the d
 _DRAFT_COSTS = "draftcost" in os.environ.get("WGP_FN_ENABLE", "").split(",")  # a greedy window's drafts decided by what they bring at the measured costs, until proven
 _SINGLE_DECODE = "host_py" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # _prepare_single_decode and its kept sampling parameters, proven: the switch goes with the others at the end
 _GPU_CHAIN = "gpu_chain" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # a sampled window's drafts drawn on the GPU in one graph, no host wait per draft: MTP-4 on Deepy's prose 17.1 -> 16.75 ms per pass
+_LONG_CHAIN = "long_chain" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the model's long draft chain while its recent drafts are accepted (Qwen3.8 27B on Deepy's tool calls: 4.6 -> 6.2 tokens per pass, 231 -> 261 tok/s)
+_LONG_CHAIN_RATE = 0.7  # the acceptance from which the drafts beyond the usual chain bring more than their rows and drafter passes cost
+_LONG_CHAIN_FADE = 0.9  # what a verification weighs in that acceptance against the ones before it
 _DRAFT_PREFETCH = "draft_prefetch" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the n-gram rows of a window read while its drafts are computed: Deepy's context 141 -> 147 tok/s, a short prompt 168 -> 184 (drive calm); the switch goes with the others at the end
 
 
@@ -189,7 +192,7 @@ class ModelRunner:
         self.mmgp = self.mmgp_graphs or bool(getattr(model_object, "_lm_engine_mmgp", False))
         if self.mmgp_graphs:  # only MMGP moves its weights: the weights key of a whole-model graph is checked in constant time
             model_object._mm_graph_placement_key = True
-        self._max_speculative_draft_tokens = min(self._MAX_SPECULATIVE_DRAFT_TOKENS, max(1, int(getattr(self.model, "_prompt_enhancer_speculative_tokens", 2))))
+        self._max_speculative_draft_tokens = min(self._MAX_SPECULATIVE_DRAFT_TOKENS, max(1, int(getattr(self.model, "_prompt_enhancer_speculative_tokens", 2)), self._long_chain_tokens()))
         self.speculative_stats = self._new_speculative_stats()
         self.sampler = Sampler()
         
@@ -376,7 +379,13 @@ class ModelRunner:
             "lookup_drafted": 0,
             "lookup_accepted": 0,
             "rows_by_window": {},  # rows -> [windows, milliseconds, accepted drafts]
+            "recent_accepted": 0.0,  # the drafts of the latest verifications, fading: those accepted, and those verified (the accepted ones and the one refused)
+            "recent_verified": 0.0,
         }
+
+    def _long_chain_tokens(self) -> int:
+        """The drafts of a window while the recent ones are accepted (0: the usual count always)."""
+        return int(getattr(self.model, "_prompt_enhancer_speculative_long_tokens", 0)) if _LONG_CHAIN else 0
 
     def speculative_telemetry(self, seq_id: int, sequence_tokens: int) -> dict:
         stats = self.speculative_stats
@@ -1880,6 +1889,9 @@ class ModelRunner:
             stats["lookup_windows"] += 1
             stats["lookup_drafted"] += rows - 1
             stats["lookup_accepted"] += accepted
+        if rows > 1:
+            stats["recent_accepted"] = _LONG_CHAIN_FADE * stats["recent_accepted"] + accepted
+            stats["recent_verified"] = _LONG_CHAIN_FADE * stats["recent_verified"] + min(accepted + 1, rows - 1)
         costs = self._draft_costs()
         costs.observe(rows, milliseconds, accepted, bool(lookup), lookup)
         costs.observe_confidences(getattr(self, "_window_confidences", ()), accepted)
@@ -2113,7 +2125,8 @@ class ModelRunner:
             execution = "eager" if self.enforce_eager else "CUDA graph"
             draft_tokens = self.model._prompt_enhancer_speculative_sampling_tokens if seq.top_k != 1 else self.model._prompt_enhancer_speculative_tokens
             method = self.model.mtp.method if getattr(self.model, "_block_draft", False) else "native MTP"
-            print(f"[Deepy][Speculative] method={method} ({sampling_method}, up to {draft_tokens} draft tokens, {execution} verification).")
+            long_chain = f", {self._long_chain_tokens()} while they are accepted" if self._long_chain_tokens() > draft_tokens else ""
+            print(f"[Deepy][Speculative] method={method} ({sampling_method}, up to {draft_tokens} draft tokens{long_chain}, {execution} verification).")
             self.model._prompt_enhancer_speculative_method_logged = True
         sample_key = (seq.temperature, seq.cfg_scale, seq.top_k, seq.top_p, seq.min_p, seq.repetition_penalty)
         if self._mtp_sample_params is None or self._mtp_sample_params[0] != sample_key:
@@ -2133,6 +2146,9 @@ class ModelRunner:
         max_drafts = min(self._max_speculative_draft_tokens, max(1, int(getattr(self.model, "_prompt_enhancer_speculative_tokens", 1))))
         if seq.top_k != 1:
             max_drafts = min(max_drafts, max(1, int(getattr(self.model, "_prompt_enhancer_speculative_sampling_tokens", max_drafts))))
+        stats = self.speculative_stats
+        if stats["recent_accepted"] >= _LONG_CHAIN_RATE * stats["recent_verified"] > 0:  # predictable text (a tool call, code, a list): the drafts beyond the usual chain are accepted too
+            max_drafts = max(max_drafts, min(self._max_speculative_draft_tokens, self._long_chain_tokens()))
         tree = self._speculative_tree()
         if tree is not None and remaining_tokens > tree.depth and seq.last_block_num_tokens + tree.size - 1 <= self.block_size:
             return self._run_tree_pass(seq, sample_params)  # its rows fit the last KV page and its longest path the token budget

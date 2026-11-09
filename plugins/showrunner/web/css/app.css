@@ -630,8 +630,8 @@ input[type=range].range::-webkit-slider-thumb { -webkit-appearance: none; width:
 .fix-shot.on { border-color: rgba(255, 61, 129, .85); background: var(--grad-soft); color: var(--text); }
 .fix-shot:disabled { opacity: .45; cursor: not-allowed; }
 .fix-hint { font-size: 12.5px; }
-.fix-keep { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
-.fix-keep[hidden] { display: none; }
+.fix-keep, .fix-version { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
+.fix-keep[hidden], .fix-version[hidden] { display: none; }
 .fix-row { gap: 10px; align-items: center; flex-wrap: wrap; font-size: 12.5px; }
 .modal p { margin: 0; color: var(--text-2); }
 .modal .actions { display: flex; justify-content: flex-end; gap: 8px; }

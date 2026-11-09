@@ -39,7 +39,7 @@ export const api = {
   rates: id => call('GET', `productions/${id}/rates`),
   sizes: id => call('GET', `productions/${id}/sizes`),
   director: id => call('GET', `productions/${id}/director`),
-  direct: (id, task, message = '', shots = []) => call('POST', `productions/${id}/director`, { task, message, shots }),
+  direct: (id, task, message = '', shots = [], newVersion = true) => call('POST', `productions/${id}/director`, { task, message, shots, new_version: newVersion }),
   steer: (id, text) => call('POST', `productions/${id}/director/steer`, { text }),
   stop: id => call('POST', `productions/${id}/director/stop`),
   pause: (id, now = false) => call('POST', `productions/${id}/director/pause${now ? '?now=true' : ''}`),

@@ -653,7 +653,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                         )
                         self.enhancer_speculative_tokens_choice = gr.Dropdown(
                             choices=token_choices, value=speculative_tokens, label="Number of Tokens",
-                            info="Maximum draft tokens per prediction. More tokens can increase memory use and may be slower",
+                            info="Maximum draft tokens per prediction. Auto picks the count for your model and GPU. More tokens can increase memory use and may be slower",
                             interactive=bool(token_choices) and not self.args.lock_config,
                         )
                     with gr.Row(visible=not deepy_remote_default and enhancer_enabled_value in QWEN_PROMPT_ENHANCER_IDS) as self.enhancer_decoding_row:

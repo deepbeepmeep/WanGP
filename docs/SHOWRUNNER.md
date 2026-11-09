@@ -406,6 +406,10 @@ The window lets you add or remove shots (Shift+click for a run of them) and say 
 
 With **Keep everything else as it is** on, the showrunner cannot touch anything but those shots. It then makes a new version and tells you what changed. Locked shots are never changed.
 
+**Make a new version when done** is on by default. Turn it off when you fix shot after shot before watching: the showrunner stops once the new takes are judged and makes no version, and you press **Assemble** when you are ready to watch the edit. The window keeps your choice for the next fixes until the page is reloaded. With **Review the takes before the edit** in the brief, a fix always ends on your review instead, so the window does not offer this choice.
+
+To try another take of a shot with the same prompt and a new seed, **Reshoot** on the Board or in the shot's panel renders it at once, without the showrunner and without a new version.
+
 **On a film,** the rest moves along when a shot is inserted or changes length: each shot's sound, the voice-over lines, the cards and the subtitles (also those of an SRT file you added) stay on their pictures. A score keeps playing from where it starts, so its hits may no longer land on the same pictures; you are warned if the film outlasts it.
 
 **On a music video,** the song keeps its timing, so the film does not get longer: a new or longer shot takes its time first from the shots before it where nobody sings, then covers what comes next, like a cutaway while the song carries on, and every later shot stays in sync. A shot that sings for longer needs a new take on a longer part of the song, and a shot made shorter can leave a gap that only a new take of the next one can fill; the showrunner tells you.

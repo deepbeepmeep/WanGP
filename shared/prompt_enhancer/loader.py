@@ -24,7 +24,7 @@ from .assets import (
     LLAMAJOY_FOLDER,
 )
 from shared.deepy.config import gguf_kernels_warning, resolve_deepy_kv_cache_quantization
-from .config import resolve_prompt_enhancer_speculative_decoding, speculative_decoding_runtime
+from .config import mtp_auto_long_drafts, resolve_prompt_enhancer_speculative_decoding, speculative_decoding_runtime, split_speculative_decoding
 
 
 @dataclass(slots=True)
@@ -177,6 +177,7 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, qwen_
             default_dtype = torch.bfloat16
         text_model_path = get_qwen35_text_gguf_path(assets_dir, variant=qwen35_variant, backend=quantization) if backend == enhancer_quantization_GGUF else None
         fit = lambda: qwen35_mtp_fit(assets_dir, qwen35_variant, backend, text_model_path, deepy_kv_cache_quantization)
+        auto_draft_count = split_speculative_decoding(speculative_decoding)[1] is None  # Auto, or MTP with an automatic draft count
         speculative_decoding, speculative_decoding_message = resolve_prompt_enhancer_speculative_decoding(enhancer_enabled, speculative_decoding, qwen_backend=qwen_backend, fit=fit)
         speculative_decoding, speculative_tokens = speculative_decoding_runtime(speculative_decoding)
         if speculative_decoding_message:
@@ -200,6 +201,8 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, qwen_
                 speculative_tokens = min(speculative_tokens, 7)
             runtime.llm_model._prompt_enhancer_speculative_tokens = speculative_tokens
             runtime.llm_model._prompt_enhancer_speculative_sampling_tokens = speculative_tokens
+            if auto_draft_count and speculative_decoding == 1:
+                runtime.llm_model._prompt_enhancer_speculative_long_tokens = mtp_auto_long_drafts(enhancer_enabled, qwen_backend, speculative_tokens)
         runtime.llm_tokenizer = getattr(runtime.llm_model, "_prompt_enhancer_tokenizer", None)
         runtime.llm_model.eval()
         caption_embedding_model = alias_qwen35_text_embedding_for_mmgp(runtime.llm_model)

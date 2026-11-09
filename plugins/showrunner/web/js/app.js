@@ -86,9 +86,9 @@ export const actions = {
     renderSide();
     mounted?.selection?.();
   },
-  async direct(task, message = '', shots = [], { show = false } = {}) {  // show: the user just asked for it and wants to see it taken up, even with a shot open
+  async direct(task, message = '', shots = [], { show = false, newVersion = true } = {}) {  // show: the user just asked for it and wants to see it taken up, even with a shot open
     try {
-      const status = await api.direct(state.pid, task, message, shots);
+      const status = await api.direct(state.pid, task, message, shots, newVersion);
       state.directorBaseline = structuredClone(state.doc);
       state.live = { text: '', tools: [], status: null, progress: null, running: true, task, summary: null };
       if (show || !(state.side === 'inspector' && state.selection.size)) state.side = 'director';  // a shot being looked at stays in view

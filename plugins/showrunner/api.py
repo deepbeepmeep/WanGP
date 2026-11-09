@@ -49,6 +49,7 @@ class DirectorRequest(BaseModel):
     task: str
     message: str = ""
     shots: list[str] = Field(default_factory=list)
+    new_version: bool = True  # False: the task ends without assembling, the user makes the next version
 
 
 class TemplatePick(BaseModel):
@@ -350,7 +351,7 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
     @app.post("/api/productions/{production_id}/director")
     def direct(production_id: str, request: DirectorRequest):
         production(production_id)
-        return showrunner.director.start(production_id, request.task, request.message, request.shots)
+        return showrunner.director.start(production_id, request.task, request.message, request.shots, request.new_version)
 
     @app.post("/api/productions/{production_id}/director/steer")
     def steer(production_id: str, request: Steer):

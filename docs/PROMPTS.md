@@ -542,7 +542,8 @@ Speculative decoding can make supported local Qwen text generation faster by pre
 
 - **Auto** is recommended. It normally enables acceleration with at least 12 GB VRAM for Qwen3.5 9B or 24 GB for Qwen3.8 27B.
 - **Disabled** saves the additional VRAM and is appropriate when the generation model needs that memory.
-- **2, 3, or 4 draft tokens** allows manual tuning. More draft tokens are not always faster; start with 2 and compare repeated prompts if you want to tune it.
+- **A method with Number of Tokens on Auto** keeps that method on and lets WanGP choose the draft count for your model and GPU.
+- **A method with a fixed Number of Tokens** allows manual tuning. More draft tokens are not always faster; compare repeated prompts if you want to tune it.
 
 Qwen3.5 4B and the Florence/Llama engines do not support this option. Quantization, speculative decoding, local sampling controls, and local VRAM-loading controls are hidden when an external engine is selected because the external provider owns its runtime behavior.
 

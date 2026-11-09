@@ -1494,6 +1494,7 @@ def load_qwen35_text_prompt_enhancer(
     model._prompt_enhancer_speculative_sampling_tokens = spec.get("mtp_speculative_sampling_tokens", QWEN35_PROMPT_SPECULATIVE_SAMPLING_TOKENS)
     model._prompt_enhancer_speculative_confidence = spec.get("mtp_speculative_confidence", 0.30)
     model._prompt_enhancer_speculative_sampling_confidence = spec.get("mtp_speculative_sampling_confidence", 0.0)
+    model._prompt_enhancer_speculative_long_tokens = 0  # Auto sets it (shared.prompt_enhancer.config.mtp_auto_long_drafts)
     if block_draft_method is not None:
         from .block_draft import install_block_draft
         install_block_draft(model, block_draft_method, bonsai=bool(prism_metadata))

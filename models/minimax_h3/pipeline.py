@@ -1662,7 +1662,8 @@ class MiniMaxH3Pipeline:
                 draft_frames = self.vae.decode(draft_latent.to(self.device, self.vae._model_dtype), "round")[0, :, :aligned_target_frames]
                 self._add_video_reference(draft_frames, None, fps, phase_2_reference_presentation, phase_2_reference_latents, [], phase_2_refs, latent=draft_latent)
                 draft_frames = None
-                payload["cond_audio_rows"] = None
+                # the audio rows start with the continuation audio, which stays (as its keyframes do); the reference audio leaves with the references
+                payload["cond_audio_rows"] = self._prepare_condition_rows([], audio_latents[:len(audio_keyframes)], None)[1]
             elif self.reference_mode:
                 for image in input_ref_images or []:
                     self._add_image_reference(image, target_width, target_height, image_refs_relative_size, phase_2_reference_presentation, phase_2_reference_latents, phase_2_refs)

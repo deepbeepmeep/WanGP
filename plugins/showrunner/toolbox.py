@@ -1168,7 +1168,10 @@ class ShowrunnerToolbox:
         to assemble)."""
         target = self._production(ctx, production)
         doc = target.snapshot()
-        asked = self._own(ctx) is not None and doc["director"].get("task") == "assemble"
+        own = self._own(ctx) is not None
+        if own and doc["director"].get("new_version") is False:
+            raise ValueError("The user asked for no new version in this task: do not assemble. Stop here and say how the new takes came out; the user assembles the edit when they are ready.")
+        asked = own and doc["director"].get("task") == "assemble"
         waiting = model.awaiting_approval(doc) if doc["brief"]["review_before_edit"] and not asked else []
         if waiting:
             raise ValueError(f"The user reviews every take before the edit (the brief's review_before_edit): do not assemble on your own. Stop here and ask the user to "
