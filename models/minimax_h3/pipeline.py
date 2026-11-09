@@ -31,6 +31,7 @@ from .p_h3_image import p_h3_image_sigmas, reference_size, size_at_area
 from .hyperflow import HYPERFLOW_STEPS, HYPERFLOW_VIDEO_SHIFT, grid_tail_sigmas, load_lora_offsets, video_sigmas as hyperflow_video_sigmas
 from .pdd import pdd_sampling_plans, pdd_sampling_plans_for_sigmas
 from .pika import PIKA_SOLVER, PIKA_STEPS, PIKA_VIDEO_SHIFT, noise as pika_noise, renoise_ as pika_renoise_, sigma_schedule as pika_sigma_schedule
+from .dmad import DMAD_AUDIO_SHIFT, DMAD_SOLVER, renoise_ as dmad_renoise_
 from .spectrum import MiniMaxH3Spectrum
 from .transformer import VISUAL_COND_TIMESTEP, pack_audio, patchify_video, unpack_audio
 from .video_vae import LATENTS_MEAN, LATENTS_STD
@@ -490,7 +491,7 @@ class MiniMaxH3Pipeline:
     def get_loras_transformer(self, _get_model_recursive_prop, model_type, model_def, guidance_phases, activated_loras,
                               loras_multipliers="", transformer_loras_filenames=(), num_inference_steps=1, prompts=(), **_kwargs):
         self._phase_2_loras = None
-        if int(guidance_phases) > 1 and not model_def.get("pdd", False) and not model_def.get("hyperflow", False):  # no Turbo on HyperFlow Flash
+        if int(guidance_phases) > 1 and not model_def.get("pdd", False) and not model_def.get("hyperflow", False):  # no automatic LoRA Accelerator on HyperFlow Flash
             accelerator_loras, _ = extract_loras_side(activated_loras, loras_multipliers)
             self._phase_2_loras = (len(transformer_loras_filenames), len(accelerator_loras))
         if model_def.get("vdn", False):
@@ -872,13 +873,11 @@ class MiniMaxH3Pipeline:
         hyperflow_lora = self._hyperflow_lora_offsets(hyperflow_lora_path) if hyperflow_lora_1 or hyperflow_lora_2 else None
         hyperflow_phase_1, hyperflow_phase_2 = hyperflow or bool(hyperflow_lora_1), two_phases and (hyperflow or bool(hyperflow_lora_2))
         regenerate_ic = two_phases and bool(_selected_lora(loras_selected, loras_slists, H3_REGENERATE_IC_LORA, 2)[1])
-        if regenerate_ic and not self.reference_mode:
-            raise ValueError("Open-H3 Regenerate 2K IC is a Ref2VA LoRA: select a MiniMax H3 Ref2VA model")
+        if regenerate_ic and (not self.reference_mode or self.image_model):  # P-H3-Image has Ref2VA's edit layout on FL2VA weights
+            raise ValueError("Open-H3 Regenerate 2K IC is a Ref2VA LoRA: select a MiniMax H3 Ref2VA model" + (" (P-H3-Image is built on FL2VA: use its Regenerate 2K presets)" if self.image_model else ""))
         if (hyperflow_phase_1 or hyperflow_phase_2) and (sample_solver != "euler" or float(shift) != HYPERFLOW_VIDEO_SHIFT or starting_sigma is not None
                                                          or self.transformer.cache is not None):
             raise ValueError("HyperFlow samples with the Euler sampler and flow shift 12, without partial-schedule refinement or step skipping")
-        # MMGP hands float32 tensor arguments to the model in its dtype: HyperFlow's (t, r) grid comes as float64 sigmas, which stay exact
-        sigma_argument = (lambda sigma: sigma.double()) if hyperflow_phase_1 or hyperflow_phase_2 else (lambda sigma: sigma)
         hyperflow_steps = HYPERFLOW_STEPS if hyperflow else (8,)
         if hyperflow_phase_1 and (int(sampling_steps) not in hyperflow_steps or custom_sigmas and custom_sigmas[0] is not None):
             raise ValueError(f"HyperFlow runs {' or '.join(map(str, hyperflow_steps))} steps on its own schedule, without phase-1 custom sigmas")
@@ -899,8 +898,11 @@ class MiniMaxH3Pipeline:
         self._set_interrupt_state()
         self._check_abort()
         self._configure_tiling(VAE_tile_size)
-        if sample_solver not in ("euler", "er_sde", "res_multistep", "ralston_2s", PIKA_SOLVER):
+        if sample_solver not in ("euler", "er_sde", "res_multistep", "ralston_2s", PIKA_SOLVER, DMAD_SOLVER):
             raise ValueError(f"Unsupported MiniMax H3 sampler {sample_solver!r}")
+        dmad = sample_solver == DMAD_SOLVER
+        if dmad and self.transformer.cache is not None:
+            raise ValueError("The DMAD re-noise sampler requires No Skipping")
         pika = sample_solver == PIKA_SOLVER
         if pika:
             if int(sampling_steps) != PIKA_STEPS or float(shift) != PIKA_VIDEO_SHIFT or int(guide_phases) != 1:
@@ -1021,7 +1023,7 @@ class MiniMaxH3Pipeline:
                     name = os.path.basename(str(lora).split("|", 1)[0])
                     if "turbo" not in name.lower():
                         continue
-                    print(f"MiniMax H3 PDD phase 2: disabled Turbo LoRA '{name}' so it does not stack with the PDD accelerator")
+                    print(f"MiniMax H3 PDD phase 2: disabled LoRA Accelerator '{name}' so it does not stack with the PDD accelerator")
                     loras_slists["phase2"][index] = 0.0
                     loras_slists["shared"][index] = False
                 return
@@ -1324,12 +1326,13 @@ class MiniMaxH3Pipeline:
             base_start = starting_sigma / (float(shift) - starting_sigma * (float(shift) - 1.0))
             base_sigmas = torch.linspace(base_start, 0.0, int(sampling_steps) + 1, dtype=torch.float32, device=self.device)
         sigmas_video = torch.unique_consecutive(float(shift) * base_sigmas / (1.0 + (float(shift) - 1.0) * base_sigmas))
-        sigmas_audio = torch.unique_consecutive(3.0 * base_sigmas / (1.0 + 2.0 * base_sigmas))
+        audio_shift = DMAD_AUDIO_SHIFT if dmad else 3.0
+        sigmas_audio = torch.unique_consecutive(audio_shift * base_sigmas / (1.0 + (audio_shift - 1.0) * base_sigmas))
         if pika:
             sigmas_video, sigmas_audio = pika_sigma_schedule(self.device)
         if phase_1_sigmas is not None:
             sigmas_video = torch.tensor([*phase_1_sigmas, 0.0], dtype=torch.float32, device=self.device)
-            sigmas_audio = sigmas_video.clone() if self.image_model else _map_shifted_sigma(sigmas_video, float(shift), 3.0)  # the two audio latents of an image model share its grid
+            sigmas_audio = sigmas_video.clone() if self.image_model else _map_shifted_sigma(sigmas_video, float(shift), audio_shift)  # the two audio latents of an image model share its grid
             video[:, :, target_video_condition_frames:].mul_(sigmas_video[0])
             audio[..., target_audio_condition_latents:].mul_(sigmas_audio[0])
         if sigmas_video.shape != sigmas_audio.shape:
@@ -1406,7 +1409,7 @@ class MiniMaxH3Pipeline:
                 old_video_denoised = old_audio_denoised = None
                 old_video_denoised_d = old_audio_denoised_d = None
                 er_generator = torch.Generator(device=video.device).manual_seed(int(seed)) if stage_solver == "er_sde" else None
-                renoise_generator = torch.Generator(device=video.device).manual_seed(int(seed) + 1) if stage_solver == PIKA_SOLVER else None
+                renoise_generator = torch.Generator(device=video.device).manual_seed(int(seed) + 1) if stage_solver in (PIKA_SOLVER, DMAD_SOLVER) else None
                 for step in tqdm(range(model_steps), desc=pass_description):
                     self._set_interrupt_state()
                     self._check_abort()
@@ -1438,7 +1441,7 @@ class MiniMaxH3Pipeline:
                                                sigma_video, source_buffer, 1.0 - VISUAL_COND_TIMESTEP)
                     model_sigma_video = condition_control_video(video, sigma_video)
                     payload["endpoint_sigmas"] = (sigma_video_next, stage_sigmas_audio[step + 1])  # where the step lands: HyperFlow's r
-                    video_velocity, audio_velocity = self.transformer(video, audio, sigma_argument(model_sigma_video), sigma_argument(stage_sigmas_audio[step:step + 1]), context, payload, spectrum=spectrum, first_block_cache=first_block_cache)
+                    video_velocity, audio_velocity = self.transformer(video, audio, model_sigma_video, stage_sigmas_audio[step:step + 1], context, payload, spectrum=spectrum, first_block_cache=first_block_cache)
                     if spectrum is not None:
                         spectrum.finish_step()
                     if stage_solver == "er_sde":
@@ -1477,6 +1480,16 @@ class MiniMaxH3Pipeline:
                         if audio_tail.shape[-1] and not freeze_audio:
                             velocity_list, audio_velocity = [audio_velocity[..., target_audio_condition_latents:]], None
                             pika_renoise_(audio_tail, velocity_list, stage_sigmas_audio[step], stage_sigmas_audio[step + 1], renoise_generator, final=final, audio=True)
+                    elif stage_solver == DMAD_SOLVER:
+                        final = step == model_steps - 1
+                        if not target_video_condition_frames:
+                            video_denoised = video_velocity.float().mul_(sigma_video).add_(video)
+                            if effective_sigmas_video is None and source_latents is not None and step_editable_mask is not None:
+                                _blend_video_source(video_denoised, source_latents, step_editable_mask)
+                            dmad_renoise_(video, video_denoised, sigma_video_next, renoise_generator, final=final)
+                        if audio_tail.shape[-1]:
+                            dmad_renoise_(audio_tail, audio_velocity[..., target_audio_condition_latents:].float().mul_(stage_sigmas_audio[step]).add_(audio_tail),
+                                          stage_sigmas_audio[step + 1], renoise_generator, final=final)
                     elif stage_solver == "euler":
                         video_ratio = sigma_video_next / sigma_video
                         if not target_video_condition_frames:
@@ -1806,7 +1819,7 @@ class MiniMaxH3Pipeline:
                             tile_editable_mask = _crop_spatial_tile(phase_2_editable_mask, latent_top, latent_left, latent_height, latent_width).to(self.device)
                             _set_grouped_video_rows(payload, tile_editable_mask, tile_video.shape[-3:], tile_video.device)
                             payload["target_video_mask_active"] = grouped_mask_active
-                        tile_velocity, audio_velocity = self.transformer(tile_video, audio, sigma_argument(sigma_video.view(1)), sigma_argument(phase_2_sigmas_video.new_zeros(1)), context, payload)
+                        tile_velocity, audio_velocity = self.transformer(tile_video, audio, sigma_video.view(1), phase_2_sigmas_video.new_zeros(1), context, payload)
                         tile_denoised = tile_velocity.float().mul_(sigma_video).add_(tile_video)
                         tile_prediction = tile_denoised.detach().to(device="cpu", non_blocking=False)
                         tile_prediction.mul_(weights)

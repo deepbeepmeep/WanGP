@@ -105,7 +105,7 @@ A **Viggle Remake** recasts the people of an existing video, or changes its obje
 
 **Shots rendered together**, beside your video in the Brief, joins short shots with their neighbours in one render (at least 8 seconds by default): rendered alone, a short shot's lips barely follow the speech or the singing. Each shot still gets its own take. When you render one shot again, its neighbours render with it and each gets a new take beside the one it uses, so nothing you chose changes; the shot's takes say what they were rendered with. Select shots that follow each other to render them together, up to the model's longest render (about 14 seconds): the panel says which shots render together, and **Reshoot N shots** on the toolbar, like **Reshoot them** in the panel, gives each a new take, at the size **Draft** / **Final** says. While shots render, the Showrunner button at the top says which ones and how far they are. Set it to 0, or turn off **Group rendering** on the Board's toolbar, to render every shot alone.
 
-Under **Models**, choose the image editor that paints the frames. Choose a **Draft resolution** of 480p in the Brief for a fast first version: a two-minute video with many cuts takes hours at 720p on one graphics card.
+Under **Models**, the **Frame Painter** paints the frames where people are replaced. Its Auto is Viggle Image Swap, a model made for this: it gives each new person the body of their character sheet, not the original's, and dresses them in the sheet's outfit, so describe the costume you want on their cast card. A moving pose can come out a little stiffer. The **Image Editor** paints the frames of other changes and makes the character sheets. Choose a **Draft resolution** of 480p in the Brief for a fast first version: a two-minute video with many cuts takes hours at 720p on one graphics card.
 
 A shot with nothing to change is not rendered at any size: the edit reads it directly from your video.
 
@@ -278,6 +278,7 @@ Showrunner generates with Deepy's templates, in the same categories as Deepy's s
 | --- | --- |
 | **Image Generator** | Stills, illustrated pages and backgrounds. |
 | **Image Editor** | The cast's reference pictures and looks, made from their photos. |
+| **Frame Painter** (remakes, an Image Editor template) | A remake's frames where people are replaced by the cast, painted before the video. |
 | **Video Generator** | Shots without the cast: landscapes, objects, crowds, inserts. |
 | **Video With Speech** | Shots where someone sings or speaks, lip-synced to the song or to their line. |
 | **Video Generator with Ref.** | Shots with the cast, keeping each person's face, hair and outfit from their pictures. |
@@ -289,7 +290,8 @@ Each category lists the same templates as Deepy's settings: the built-in ones an
 a category can do it, **(keeps faces)** marks those that take the cast's pictures and **(lip sync)** those that follow the song or a
 spoken line.
 
-- **Auto** uses the template selected in Deepy's settings for the category; its name is shown next to Auto.
+- **Auto** uses the template selected in Deepy's settings for the category; its name is shown next to Auto. The Frame Painter's Auto is
+  Viggle Image Swap, which replaces people far more reliably than a general image editor.
 - **When a template cannot do what a shot needs**, the showrunner takes the one of another category. For example, when the Video With
   Speech template cannot keep the cast's faces, the singers and speakers of the cast are shot with the Video Generator with Ref.
   template, which follows the song or the line as its soundtrack (when its model can, as MiniMax H3 Ref2VA can).

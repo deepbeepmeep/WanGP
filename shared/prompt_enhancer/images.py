@@ -19,7 +19,9 @@ class ImageContext:
 
 
 def enabled(server_config, mode):
-    return MULTI_IMAGE_PROMPT_ENHANCEMENT and "I" in mode and server_config.get("enhancer_enabled", 0) in (3, 4, 5, 6, 7) and not is_remote_engine(resolve_role_engine(server_config, "prompt_enhancer"))
+    """Whether the enhancer receives every image of a prompt with its label: the local Qwen3.5 enhancers caption them, remote engines receive them."""
+    enhancer = server_config.get("enhancer_enabled", 0)
+    return MULTI_IMAGE_PROMPT_ENHANCEMENT and "I" in mode and (enhancer in (3, 4, 5, 6, 7) or enhancer > 0 and is_remote_engine(resolve_role_engine(server_config, "prompt_enhancer")))
 
 
 def image_list(images):

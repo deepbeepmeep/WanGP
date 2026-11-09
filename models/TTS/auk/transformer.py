@@ -78,6 +78,8 @@ class AuKModel(nn.Module):
     def __init__(self, architecture):
         super().__init__()
         self.transformer = Flux2Edit(**architecture)
+        # holds no weights itself: its lock keeps MMGP from rounding the float32 time to BF16 before `1000 * t` and the sinusoid (its layers run under BF16 autocast)
+        self.transformer._lock_dtype = torch.float32
         self.layer_weights = nn.Parameter(torch.zeros(36))
         self.layer_scale = nn.Parameter(torch.ones(1))
 

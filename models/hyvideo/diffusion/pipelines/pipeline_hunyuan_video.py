@@ -1652,8 +1652,8 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                         [embedded_guidance_scale] * latent_model_input.shape[0],
                         dtype=torch.float32,
                         device=device,
-                    ).to(latent_dtype)
-                    * 1000.0
+                    )
+                    * 1000.0  # in FP32: the FP32-locked root and guidance_in pass it unrounded to the guidance embedding
                     if embedded_guidance_scale is not None
                     else None
                 )

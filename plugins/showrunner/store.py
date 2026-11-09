@@ -37,6 +37,35 @@ def _write_json(path: Path, payload: Any) -> None:
             time.sleep(0.05)
 
 
+def settings_folder(settings_root: str | os.PathLike | None) -> Path:
+    """Showrunner's configuration folder, in WanGP's settings folder (--settings)."""
+    return Path(settings_root or "settings").resolve() / "showrunner"
+
+
+def rename_templates(folder: str | os.PathLike, renames: dict[str, str]) -> int:
+    """Deepy templates renamed ("task/old name": "task/new name"): the references Showrunner saved, in its configuration `folder` (the default
+    picks, the keys of the prompt rules) and in every production (its document, versions and undo history). Returns the files rewritten."""
+    def renamed(value):
+        if isinstance(value, str):
+            return renames.get(value, value)
+        if isinstance(value, list):
+            return [renamed(item) for item in value]
+        return {renames.get(key, key): renamed(item) for key, item in value.items()} if isinstance(value, dict) else value
+    config_path, count = Path(folder) / "config.json", 0
+    config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.is_file() else {}
+    if (new := renamed(config)) != config:
+        config_path.write_text(json.dumps(new, indent=1), encoding="utf-8")
+        count += 1
+    root = Path(os.path.expanduser(config.get("productions_root") or Path(folder) / "productions"))
+    for production in (path for path in root.iterdir() if (path / DOCUMENT).is_file()) if root.is_dir() else ():
+        for path in (production / DOCUMENT, *(production / "versions").glob("*.json"), *(production / "history").glob("*.json")):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if (new := renamed(payload)) != payload:
+                _write_json(path, new)
+                count += 1
+    return count
+
+
 def _media_settings(settings: dict[str, Any], convert: Callable[[str], str]) -> dict[str, Any]:
     one = lambda value: [one(item) for item in value] if isinstance(value, list) else convert(value) if isinstance(value, str) and value else value
     return {key: one(value) if key in model.MEDIA_SETTINGS else value for key, value in settings.items()}

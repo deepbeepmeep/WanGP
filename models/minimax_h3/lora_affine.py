@@ -150,7 +150,7 @@ def convert_adaln_loras(model_type, state_dict, target_table=None, hybrid_ref2va
             target_package is not None and not canonical_target or checkpoint_checked and target_package is None):
         raise ValueError("MiniMax H3 cannot identify this pruned LoRA's source table. Attach its source affine package; the target checkpoint does not identify the adapter's training basis.")
     if checkpoint_checked and target_table is not None and target_package is None and hybrid_ref2va_blocks is None:
-        raise ValueError("MiniMax H3 checkpoint table is not registered and has no embedded affine map")
+        raise ValueError("MiniMax H3 checkpoint table is not registered, is not a mix of registered tables and has no embedded affine map")
     same_basis = source_package is None or target_package is not None and torch.equal(source_package.table, target_package.table) and torch.equal(source_package.affine, target_package.affine)
     if source_width == target_width and hybrid_ref2va_blocks is None and same_basis:
         return 0, architecture, source_width, target_width

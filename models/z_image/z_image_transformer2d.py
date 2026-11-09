@@ -537,6 +537,8 @@ class ZImageTransformer2DModel(nn.Module):
             ]
         )
         self.t_embedder = TimestepEmbedder(min(dim, ADALN_EMBED_DIM), mid_size=1024)
+        # It holds no weights itself: its lock keeps MMGP from rounding `t * t_scale` (computed in FP32 below) to BF16 before the FP32 sinusoid
+        self.t_embedder._lock_dtype = torch.float32
         self.cap_embedder = nn.Sequential(
             RMSNorm(cap_feat_dim, eps=norm_eps),
             nn.Linear(cap_feat_dim, dim, bias=True),

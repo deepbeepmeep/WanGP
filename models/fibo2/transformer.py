@@ -286,6 +286,9 @@ class BriaFibo2Transformer2DModel(nn.Module):
         self.perceiver = BriaFibo2PerceiverResampler(dim, n_heads, cap_feat_dim, max_num_gist_tokens, perceiver_num_layers, norm_eps)
         self.layers = nn.ModuleList([BriaFibo2TransformerBlock(dim, n_heads, norm_eps, cross_attention_dim=cap_feat_dim if i in injection_layer_ids else None) for i in range(n_layers)])
         self.final_layer = FinalLayer(dim, patch_size * patch_size * in_channels)
+        # These hold no weights themselves: their locks keep MMGP from rounding the float32 timestep to BF16 before t_scale and the FP32
+        # sinusoid (the pipeline passes BF16 latents and text features)
+        self.t_embedder._lock_dtype = self._lock_dtype = torch.float32
 
     def preprocess_loras(self, model_type, state_dict):
         state_dict = convert_lora_keys(state_dict, dict(self.named_modules()), split_linear_modules_map=self.split_linear_modules_map)

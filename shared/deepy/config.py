@@ -61,11 +61,11 @@ DEEPY_TEMPLATE_CONFIG_MIGRATIONS = {
         "Qwen Image 2.1 Viggle Turbo 8 Steps": "Qwen Image 2.1 Viggle Turbo v0.2.1 6 Steps",
     },
     DEEPY_TOOL_GEN_VIDEO_KEY: {
-        "MiniMax H3 FL2VA Turbo Lightx2v 8 Steps": "MiniMax H3 FL2VA Pruned Turbo Lightx2v 8 Steps",
+        "MiniMax H3 FL2VA Turbo Lightx2v 8 Steps": "MiniMax H3 FL2VA Pruned Lightx2v 8 Steps",
         "Pika H3 Flex FL2VA 6 Steps": "Pika H3 Flex FL2VA Pruned 6 Steps",  # Pika templates moved to the pruned models (2026-10-31)
     },
     DEEPY_TOOL_GEN_VIDEO_WITH_SPEECH_KEY: {
-        "MiniMax H3 FL2VA Turbo Lightx2v 8 Steps With Sound": "MiniMax H3 FL2VA Pruned Turbo Lightx2v 8 Steps With Sound",
+        "MiniMax H3 FL2VA Turbo Lightx2v 8 Steps With Sound": "MiniMax H3 FL2VA Pruned Lightx2v 8 Steps With Sound",
         "Pika H3 Flex Ref2VA 6 Steps With Audio References": "Pika H3 Flex Ref2VA Pruned 6 Steps With Audio References",
     },
     DEEPY_TOOL_GEN_VIDEO_WITH_REFS_KEY: {

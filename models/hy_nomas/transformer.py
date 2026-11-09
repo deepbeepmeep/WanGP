@@ -188,6 +188,10 @@ class HYNomasTransformer(nn.Module):
         self.extrinsics_embedding_camctrl = nn.Linear(CAMERA_DIM, CAMERA_DIM)
         self.c2ws_hidden_states_layer1 = nn.Linear(CAMERA_DIM, CAMERA_DIM)
         self.c2ws_hidden_states_layer2 = nn.Linear(CAMERA_DIM, CAMERA_DIM)
+        # These hold no weights themselves: their locks keep MMGP from rounding the float32 timestep to BF16 before the FP32 sinusoids,
+        # and the root's lock keeps the RoPE table FP32 (read in FP32 by the norm + RoPE op, as upstream); latents and camera poses are cast in forward
+        for module in (self, self.time_in, self.txt_in):
+            module._lock_dtype = torch.float32
 
     @staticmethod
     def _auto_preload_workload(args, kwargs):

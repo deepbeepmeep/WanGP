@@ -162,14 +162,14 @@ class WanGPHost:
         from .templates import EDIT_TASKS, ROLES, VIDEO_TASKS
         settings = get_persisted_assistant_tool_ui_settings(self.plugin.server_config)
         catalog = []
-        for task in (role["task"] for role in ROLES):
+        for task in dict.fromkeys(role["task"] for role in ROLES):  # two roles draw on the image editor's templates
             default = settings[tool_settings.TOOL_UI_KEYS[task]]
             kept = [name for category, _, name in (str(item or "").partition("/") for item in keep) if category == task]
             choices = {variant: label for current in (default, *kept) for label, variant in tool_settings.list_tool_variant_choices(task, current_variant=current)}
             for variant, label in choices.items():
                 preset = tool_settings.clone_tool_preset(task, variant)  # the model type of every template: speech models differ in how they take cues
                 video = preset if task in (*VIDEO_TASKS, *EDIT_TASKS) else {}
-                model_def = (self.plugin.get_model_def(video["model_type"]) or {}) if video else {}
+                model_def = (self.plugin.get_model_def(preset["model_type"]) or {}) if video or task == "edit_image" else {}  # an image editor may declare its trained swap sentences
                 if task in EDIT_TASKS and not model_def.get("video_edit"):  # a remake's shots take painted frames and pins: only a model made for that (Viggle Remake) is offered
                     continue
                 sources = model_def.get("audio_prompt_type_sources") or {}
@@ -180,6 +180,7 @@ class WanGPHost:
                                 "pixels": resolutions.resolution_budget(model_def)["default"] if task in EDIT_TASKS else None,
                                 "soundtrack": "AS" in (sources.get("selection") or []),  # its model can follow an audio_guide kept as the soundtrack
                                 "spoken_line": model_def.get("spoken_line_prompt"),  # how its model takes a line to voice, written in its prompt
+                                "swap_prompt": model_def.get("character_swap_prompt"),  # the sentences its model was trained on to replace people, filled by the frame painter
                                 "sized_by_ref": "K" in refs,  # its output takes the first reference's size, not the production's format
                                 "shortest_s": math.floor(model_def.get("frames_minimum", 0) / model_def.get("fps", 16) * 1000) / 1000,  # the shortest take its model makes
                                 "take_frames": [model_def.get("frames_minimum", 0), model_def.get("frames_steps", 1), model_def.get("fps", 16)],  # its first length and the steps after it
@@ -274,7 +275,8 @@ class ShowrunnerPlugin(WAN2GPPlugin):
 
     def settings_folder(self) -> Path:
         """The plugin's configuration lives in WanGP's settings folder."""
-        return Path(getattr(self.args, "settings", None) or "settings").resolve() / "showrunner"
+        from .store import settings_folder
+        return settings_folder(getattr(self.args, "settings", None))
 
     def config(self) -> dict:
         path = self.settings_folder() / "config.json"

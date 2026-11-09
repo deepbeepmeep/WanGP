@@ -137,6 +137,9 @@ class model_factory:
 
         with init_empty_weights():
             dit = get_dit(conf.model.dit_params)
+        # These hold no weights themselves: their FP32 locks keep MMGP from rounding the float32 timesteps and time embedding to BF16
+        for module in (dit, dit.time_embeddings, dit.out_layer):
+            module._lock_dtype = torch.float32
         offload.load_model_data(
             dit,
             model_filename,

@@ -1,0 +1,19 @@
+{
+    "settings_version": 2.83,
+    "type": "Qwen Image 2.1 Viggle Image Swap 6 Steps",
+    "model_type": "qwen_image_21_viggle_image_swap_7B",
+    "prompt": "",
+    "negative_prompt": "",
+    "image_mode": 1,
+    "resolution": "1024x1024",
+    "num_inference_steps": 6,
+    "sample_solver": "viggle_v02",
+    "guidance_scale": 1.0,
+    "batch_size": 1,
+    "video_prompt_type": "KI",
+    "prompt_enhancer": "",
+    "activated_loras": [],
+    "loras_multipliers": "",
+    "remove_background_images_ref": 0,
+    "custom_settings": {"qwen21_kv_cache": "Disabled"}
+}

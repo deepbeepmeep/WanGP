@@ -271,6 +271,9 @@ class MagiHumanModel:
             default_dtype=dtype,
         )
         transformer.eval().requires_grad_(False)
+        # These hold no weights themselves: their FP32 locks keep MMGP from rounding the float32 coordinates to BF16 before the Fourier
+        # RoPE (the adapter casts the tokens to BF16 itself, as MMGP did)
+        transformer._lock_dtype = transformer.adapter._lock_dtype = torch.float32
         transformer._interrupt_check = self._interrupt_requested
         transformer.block._interrupt_check = self._interrupt_requested
         return transformer

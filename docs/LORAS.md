@@ -207,7 +207,7 @@ Conversion preserves adapter rank and strength controls. It makes the supported 
 
 ### MiniMax H3 HyperFlow Flash
 
-HyperFlow H3 Flash removed a few H3 blocks and compressed others. LoRAs made for the matching H3 model (FL2VA or Ref2VA) still load on it: their changes to the removed blocks are skipped and their timestep part is adapted, so their effect can be somewhat weaker than on the model they were trained for. Accelerator LoRAs (Turbo, PDD, Pika) are not needed: HyperFlow is already a few-step model.
+HyperFlow H3 Flash removed a few H3 blocks and compressed others. LoRAs made for the matching H3 model (FL2VA or Ref2VA) still load on it: their changes to the removed blocks are skipped and their timestep part is adapted, so their effect can be somewhat weaker than on the model they were trained for. LoRA Accelerators (Lightx2v, PDD, Pika, DMAD) are not needed: HyperFlow is already a few-step model.
 
 WanGP supports multiple most lora formats:
 - **Safetensors** (.safetensors)

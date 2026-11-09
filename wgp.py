@@ -4,7 +4,7 @@ import os, sys
 for _stream in (sys.stdout, sys.stderr): _stream.reconfigure(encoding="utf-8", errors="replace")
 from tqdm import tqdm
 
-WanGP_version = "19.25"
+WanGP_version = "19.27"
 _welcome_message = f" WanGP v{WanGP_version} - Copyright (c) 2024-2026 DeepBeepMeep "
 tqdm.write(f"\033[1m\033[93m{_welcome_message:*^100}\033[0m")
 
@@ -93,7 +93,7 @@ from shared.utils.audio_video import truncate_audio, shift_audio_trim_ranges, tr
 from shared.utils.audio_metadata import read_audio_metadata, extract_creation_datetime_from_metadata, resolve_audio_creation_datetime
 from shared.utils.media_recording import record_file_metadata as shared_record_file_metadata
 from shared.utils.settings_bundle import is_wangp_settings_filename
-from shared.utils.video_decode import decode_video_frames_ffmpeg, probe_video_stream_metadata, virtual_own_frames
+from shared.utils.video_decode import decode_video_frames_ffmpeg, probe_video_stream_metadata, read_frame_count, virtual_own_frames
 from shared.utils.video_metadata import extract_source_images  # also a plugin global (Queue Editor)
 from shared.utils.virtual_media import get_virtual_image, get_virtual_media_entry, get_virtual_media_vsource, media_source_exists, padded_virtual_media, parse_virtual_media_path, replace_virtual_media_source, strip_virtual_media_suffix
 from shared.utils.frame_scheduler import resolve_window_geometry, SLASH_BLOCK_RE, build_default_window_plan, build_extension_window, build_frame_scheduler, fit_video_length, floor_frame_count, has_slash_commands, normalize_frame_count, set_video_length_rounding, prepare_loras_mult_windows
@@ -427,8 +427,7 @@ def estimate_first_window_overlap_frames(image_start, video_source, keep_frames_
     if video_source is None:
         return 0
     try:
-        source_fps, _, _, source_frames = get_video_info(video_source)
-        source_frames = int(source_frames / source_fps * target_fps) if source_fps else int(source_frames)
+        source_frames = read_frame_count(video_source, target_fps)
     except Exception:
         return max_source_video_frames
     try:
@@ -2976,7 +2975,7 @@ from shared.utils import offload_registry
 upsampler_api.register_spatial_upsamplers(server_config, fl)
 audio_processor_api.register_audio_processors(server_config, fl)
 temporal_upsampler_api.register_temporal_upsamplers(server_config, fl)
-migrate_extension_defaults(server_config, server_config_filename, workspace_root=args.workspaces_dir or server_config.get('workspaces_dir') or os.path.join(wgp_root, 'workspaces'))
+migrate_extension_defaults(server_config, server_config_filename, workspace_root=args.workspaces_dir or server_config.get('workspaces_dir') or os.path.join(wgp_root, 'workspaces'), family_handlers=family_handlers)
 
 def _normalize_profile_defaults(config):
     if "profile" not in config:
@@ -7018,6 +7017,7 @@ def process_prompt_enhancer(model_type, model_def, prompt_enhancer, original_pro
                 prompt_images,
                 instructions=prompt_enhancer_instructions or "",
                 max_output_tokens=text_encoder_max_tokens,
+                image_contexts=image_contexts,
                 prompt_durations=prompt_durations,
                 template_context=template_context,
                 inject_duration=inject_duration,

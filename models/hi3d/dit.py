@@ -244,6 +244,9 @@ class Sparc3DTransformer(nn.Module):
         self.out_blocks = nn.ModuleList([ResBlock(model_channels * 2, model_channels, io, upsample=True)]
                                         + [ResBlock(io * 2, model_channels, io) for _ in range(num_io_res_blocks - 1)])
         self.out_layer = nn.Linear(io, out_channels)
+        # These hold no weights themselves: their locks keep MMGP from rounding the float32 model time to BF16 before the FP32 sinusoid
+        # (forward casts the latents to the compute dtype itself)
+        self.t_embedder._lock_dtype = self._lock_dtype = torch.float32
 
     def plan(self, coords):
         return SparsePlan(coords, self.head_dim)

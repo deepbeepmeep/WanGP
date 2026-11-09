@@ -210,7 +210,8 @@ class model_factory:
             short = short_full if stage == 0 else short_plain
             short_indices = [0, *indices["noise"], base - 1] if stage == 0 else [0, base - 1]
             layout = token_plan({**indices, "short": short_indices}, short.shape[2], latent_hw, latents.shape[-2:], keep if stage == 0 else None, device)
-            return self.transformer(latents, torch.tensor(float(timestep), device=device), context, {**tiers, "short": short}, layout)
+            # int64, as the source passes it: MMGP would round a float32 timestep to BF16 at the root before the FP32 sinusoid
+            return self.transformer(latents, torch.tensor(timestep, dtype=torch.int64, device=device), context, {**tiers, "short": short}, layout)
 
         latents = sampler.sample(predict, noise, generator, on_step)
         del short_full, short_plain, view, tiers, context

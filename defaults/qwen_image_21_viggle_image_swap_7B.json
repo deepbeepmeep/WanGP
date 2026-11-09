@@ -1,0 +1,26 @@
+{
+    "model": {
+        "name": "Qwen Image 2.1 Viggle Image Swap 7B",
+        "architecture": "qwen_image_21_7B",
+        "parent_model_type": "qwen_image_21_viggle_image_swap_7B",
+        "group": "qwen_image_2",
+        "qwen21_variant": "viggle_image_swap",
+        "accelerated": "native",
+        "description": "Replaces people in a picture with characters from character sheets, keeping their pose, expression, framing, background and lighting. Add the picture first, then one sheet per person: it runs in 6 steps at about 1 MP with Viggle's Image Swap LoRA built in. The adapter is licensed for non-commercial research and evaluation.",
+        "URLs": "qwen_image_21_7B",
+        "loras": ["https://huggingface.co/DeepBeepMeep/Qwen_image_2/resolve/main/loras/Qwen-Image-2.1-viggle-image-swap-v0.1-lora-r256.safetensors"],
+        "loras_multipliers": [1]
+    },
+    "image_mode": 1,
+    "resolution": "1024x1024",
+    "video_prompt_type": "KI",
+    "custom_settings": {"qwen21_kv_cache": "Disabled"},
+    "prompt": "Replace the man in a green shirt in image 1 with the character from image 2. Keep everything else exactly as in image 1: the pose, expression, framing, background and lighting.",
+    "negative_prompt": "",
+    "num_inference_steps": 6,
+    "sample_solver": "viggle_v02",
+    "guidance_scale": 1.0,
+    "batch_size": 1,
+    "remove_background_images_ref": 0,
+    "prompt_enhancer": ""
+}

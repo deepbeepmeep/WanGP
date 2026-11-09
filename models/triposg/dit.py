@@ -158,6 +158,9 @@ class TripoSGDiT(nn.Module):
         self.blocks = nn.ModuleList([DiTBlock(width, num_attention_heads, cross_attention_dim, skip=layer > num_layers // 2) for layer in range(num_layers)])
         self.norm_out = nn.LayerNorm(width)
         self.proj_out = nn.Linear(width, in_channels)
+        # It holds no weights itself: its lock keeps MMGP from rounding the float32 timestep to FP16 before the FP32 sinusoid (the
+        # pipeline passes FP16 latents, whose dtype the embedding is cast to, and FP16 contexts)
+        self._lock_dtype = torch.float32
 
     def forward(self, x, t, contexts, part_ids=None):
         """x (batch, latents, channels) and t (batch,) shared by the guidance branches; contexts: the image conditioning of each branch,

@@ -83,7 +83,21 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 ## 🔥 Latest Updates : 
 
-## 8th of November 2026: WanGP v19.22 - Showrunner Makes and Remakes
+## 9th of November 2026: WanGP v19.25 - Bonus Track
+- **Qwen Image 2.1 Viggle Image Swap**: a Qwen Image 2.1 variant and **Showrunner's default frame painter for Viggle Remake character swaps**. Replace one or several people in **6 steps**, keeping their poses, expressions and the scene's framing. Add the **source picture first**, then one **character sheet** per person; the picture's aspect ratio is preserved at about **1 megapixel**. Results can be slightly darker.
+
+- **H3 HyperFlow LoRA**: bring **8-step** generation to the standard and Pruned **Ref2VA** models with the new **HyperFlow Ref2VA 8 Steps** accelerator profile.
+
+- **H3 Regenerate 2K IC**: **better identity preservation and fewer hallucinated details** than the previous Regenerate release, which could invent features and change faces. IC uses the draft itself as a reference to add detail while keeping its identity, lip sync and composition, with the original soundtrack. Finish at up to **2560x1440** in **3 extra steps**: **6 + 3** on **HyperFlow Flash Ref2VA**, or **8 + 3** through the **Ref2VA preset**; tiling reduces memory use and works much better here than before.
+
+- **H3 LoRA compatibility**: improved LoRA loading on supported merges of Pruned models, fixing the rejection of adapters such as **Neat Prime** on **DaSiWa GXS v5**.
+
+- **H3 DMAD accelerators**: generate video with sound in **4 or 8 steps** on FL2VA and Ref2VA: choose 4 for speed or 8 for better quality. The profiles apply the matching LoRA and settings automatically. The new **DMAD Re-noise** sampler also supports **H3 Turbo Neat Prime**.
+
+
+
+
+## 8th of November 2026: WanGP v19.25 - Showrunner Makes and Remakes
 
 - **Viggle Remake**: recast one or several people with **Swap**, or change objects, backgrounds, weather and lighting with **Edit**, while keeping the original motion, camera, timing and soundtrack. Supply your video, one to four frames from it edited to show the new look, and a prompt describing the result. An optional mask keeps everything outside the changed area exactly as it was. Works best at **720p**, with faces clearly visible and characters facing the camera; small faces and rapid cuts remain challenging.
 

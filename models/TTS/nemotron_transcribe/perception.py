@@ -458,6 +458,7 @@ def load_perception(perception_file, config, compute_dtype=torch.float32):
     for module in perception.modules():  # precision locks: the word timestamp head is stored in float32, the encoders in BF16
         if any(parameter.dtype == torch.float32 for parameter in module.parameters(recurse=False)):
             module._lock_dtype = torch.float32
+    perception._lock_dtype = torch.float32  # holds no weights itself: keeps MMGP from rounding the float32 log-mel features to BF16 at forward
     with safe_open(perception_file, framework="pt", device="cpu") as weights:
         perception.ctc_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=weights.get_tensor("ctc_timestamp.tokenizer.model_proto").numpy().tobytes())
     return perception.eval()

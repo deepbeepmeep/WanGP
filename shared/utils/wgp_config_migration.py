@@ -1,4 +1,5 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
+import importlib
 from shared.utils.config_store import write_config
 from decimal import Decimal, InvalidOperation
 
@@ -11,7 +12,7 @@ from shared.remote_llm.config import QWEN38_FLASH_NEXT_VISIBLE
 
 LEGACY_EXTENSIONS_DEFAULTS_MIGRATED_KEY = "_extensions_defaults_migrated"
 EXTENSIONS_DEFAULTS_VERSION_KEY = "extensions_defaults_version"
-EXTENSIONS_DEFAULTS_TARGET_VERSION = Decimal("1.30")
+EXTENSIONS_DEFAULTS_TARGET_VERSION = Decimal("1.31")
 EXTENSIONS_DEFAULTS_TARGET_VERSION_TEXT = str(EXTENSIONS_DEFAULTS_TARGET_VERSION)
 INSTALLED_REMOTE_PLUGINS_KEY = "installed_remote_plugins"
 
@@ -223,7 +224,11 @@ def _migrate_int8_kernels(server_config) -> bool:
     return changed
 
 
-def migrate_extension_defaults(server_config, server_config_filename="", *, workspace_root=None) -> bool:
+def migrate_extension_defaults(server_config, server_config_filename="", *, workspace_root=None, family_handlers=()) -> bool:
+    """`family_handlers`: module paths of the model family handlers. Each one's optional `migrate_config(server_config, config_version)` is
+    called once per startup with the config version saved before this migration (a Decimal) and returns whether it changed the config.
+    A handler migration acts below the target version it was introduced with (bump EXTENSIONS_DEFAULTS_TARGET_VERSION in the same
+    change), so it runs once."""
     if not isinstance(server_config, dict):
         return False
 
@@ -320,6 +325,10 @@ def migrate_extension_defaults(server_config, server_config_filename="", *, work
     changed = _migrate_temporal_upsamplers_config(server_config) or changed
     from postprocessing.memory import migrate_config as migrate_postprocessor_memory
     changed = migrate_postprocessor_memory(server_config) or changed
+    for path in family_handlers:
+        migrate_config = getattr(importlib.import_module(path).family_handler, "migrate_config", None)
+        if migrate_config is not None:
+            changed = migrate_config(server_config, version) or changed
 
     if server_config.pop(LEGACY_EXTENSIONS_DEFAULTS_MIGRATED_KEY, None) is not None:
         changed = True

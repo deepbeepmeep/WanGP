@@ -1280,7 +1280,7 @@ class ShowrunnerToolbox:
         return re.search(r"\bback of\b|from behind", str(person.get("where") or ""), re.IGNORECASE) is not None
 
     @classmethod
-    def _swap_request(cls, people: list[dict[str, Any]], named: dict[str, tuple[dict[str, Any], str]], note: str | None = None, clothes: str = "sheet") -> tuple[str, list[str]]:
+    def _swap_request(cls, people: list[dict[str, Any]], named: dict[str, tuple[dict[str, Any], str]], note: str | None = None, clothes: str = "sheet", declared: dict[str, str] | None = None) -> tuple[str, list[str]]:
         """What the painter reads to replace people, and the cast pictures it gets after the frame. Each person is found by `who`, their clothes and place in
         this frame, and becomes a cast member: the face and hair from the member's photo (their sheet when they have none, or for a look of the shot's own,
         or when the frame shows their back) with the looks of their card, the build and clothes of their sheet (clothes="frame": the frame's clothes, fitted
@@ -1289,9 +1289,23 @@ class ShowrunnerToolbox:
         an outfit written out in words drew a whole figure into close shots, and without a word on the build the original's body stayed under the new head.
         A member with a sheet alone takes the original's place: told that the original "becomes" them, the painter kept a robot behind its clown, put a bear's
         head on a man's body and left people in their own clothes (better in 7 of 11 frames of 7 remakes, the same in 3).
-        named: each member by name, with the shot's picture of them."""
+        named: each member by name, with the shot's picture of them. declared: the sentences the painter's model was trained on (its character_swap_prompt),
+        filled instead, with the frame as image 1 and each member's character sheet after it: such a model takes their outfit from the sheet whatever `clothes` says."""
         replaced = sorted((person for person in people if person.get("becomes")), key=cls._from_behind)
         keys = list(dict.fromkeys(str(person["becomes"]).casefold() for person in replaced))
+        if declared:
+            if str(note or "").strip():
+                raise ValueError("This Frame Painter takes only the sentences its model was trained on: paint without `instruction`, or ask the user to pick another Frame Painter in the brief's Models. Nothing was painted.")
+            pictures = []
+            for key in keys:
+                member, path = named[key]
+                sheet = member.get("master") if path in (member.get("images") or [])[:1] else path  # the sheet, or the shot's own look of them
+                if not sheet:
+                    raise ValueError(f"{member['name']} has no character sheet, which this Frame Painter needs: make_sheet first. Nothing was painted.")
+                pictures.append(sheet)
+            stays = sum(1 for person in people if not person.get("becomes"))
+            end = declared["end_others"].format(others="other person" if stays == 1 else "other people") if stays else declared["end"]
+            return " ".join([*(declared["person"].format(who=person["who"], image=keys.index(str(person["becomes"]).casefold()) + 2) for person in replaced), end]), pictures
         pictures, lines, numbers = [], ["Picture 1 is a frame from a video."], {}
         for key in keys:
             member, path = named[key]
@@ -1335,9 +1349,9 @@ class ShowrunnerToolbox:
                                       "Everything else stays exactly as in Picture 1: the framing, background, light, sharpness and the other people."])), pictures
 
     def _paint_people(self, ctx, target, template: str, frame_path: Path, people: list[dict[str, Any]], named: dict[str, tuple[dict[str, Any], str]], note: str | None, size: str,
-                      clothes: str = "sheet") -> Path | None:
+                      clothes: str = "sheet", declared: dict[str, str] | None = None) -> Path | None:
         """The frame with everyone replaced in one draw (_swap_request). A draw that leaves a large person as they were is drawn again. Returns the picture, or None when nothing changed."""
-        prompt, pictures = self._swap_request(people, named, note, clothes)
+        prompt, pictures = self._swap_request(people, named, note, clothes, declared)
         settings = {"template": template, "prompt": prompt, "resolution": size,  # a picture is made once, at the target: a draft and its final use the same one
                     "image_refs": [ctx.virtualize(str(path)) for path in (frame_path, *(target.resolve(picture) for picture in pictures))]}
         heads = [int(value) for person in people for match in re.findall(HEAD_SHARE, str(person.get("where") or "")) for value in match if value]
@@ -1431,7 +1445,7 @@ class ShowrunnerToolbox:
         """A remake: a frame of the shot's source, numbered as in the source, changed by the image editor. When people are replaced: look_at_frame first, then `people`, one entry per person it listed: who (the woman), where (the
         inspector's words for them), becomes (a cast member's name, or null for someone who stays as they are); for someone replaced, `who` names them by their clothes and place in this frame only, never
         their hair, face or glasses, which the painter would keep; clothes: the cast member's own outfit from their sheet, or `frame` when the brief keeps the
-        person's costume. `instruction` then adds what is special in this frame. For any other change: `instruction`, with `references`. Or
+        person's costume (a Frame Painter trained on swaps, as Auto's, always takes the sheet's outfit and no `instruction`: give the card that costume). `instruction` then adds what is special in this frame. For any other change: `instruction`, with `references`. Or
         your own finished `picture`, or the source frame as it is (`unchanged`, for a camera setup the change does not touch, to hold it in the shot). It becomes one of the shot's painted frames, in source order; painting the same
         frame again replaces it, and each try draws differently; `replaces`: another painted frame of the shot that this one takes the place of. pin: the take passes through that picture at that moment (all frames of a shot are pinned or none); keep it on when people are replaced. Returns the source frame and the picture; when people are
         replaced `before` and `after`, what the inspector sees in each, `faults` measured from them, and `verify`; otherwise `comparison`: read them before you go on."""
@@ -1468,7 +1482,7 @@ class ShowrunnerToolbox:
             if not pictured and references is None and (swap or templates.cast_with_pictures(doc)):
                 raise ValueError(f"Shot {shot} has no cast with a picture, so the painter would draw from words alone and the same person would look different in every frame. Give the shot its cast with update_shot first, "
                                  "or pass references=[] when nobody of the cast is in this frame. Nothing was painted.")
-            template = templates.effective(doc, catalog).get("image_edits")
+            template = templates.effective(doc, catalog).get("frame_painter" if directed else "image_edits")  # people replaced: the brief's Frame Painter
             size = self.showrunner.shot_size(target, doc, item, final=True)
             if directed:
                 if not looked:
@@ -1482,7 +1496,7 @@ class ShowrunnerToolbox:
                 if missing := list(dict.fromkeys(str(person["becomes"]) for person in people if person.get("becomes") and str(person["becomes"]).casefold() not in named)):
                     raise ValueError(f"{', '.join(missing)} is not in this shot's cast with a picture: give the shot its cast with update_shot first. Nothing was painted.")
                 for _ in range(PAINT_DRAWS):  # a close shot drawn as a full figure is drawn again: the painter does it about one draw in two, and its pin pulls the render out
-                    painted_path = self._paint_people(ctx, target, template, source_frame, people, named, instruction, size, clothes)
+                    painted_path = self._paint_people(ctx, target, template, source_frame, people, named, instruction, size, clothes, templates.resolve(catalog, template)["swap_prompt"])
                     if painted_path is None:
                         return {"shot": shot, "frame": int(frame), "error": f"The painter changed nobody in {PAINT_DRAWS} draws, so nothing was recorded. Call paint_frame again with the same people, or try another frame of this shot."}
                     ctx.progress(done=0, total=1, text=f"Checking the Painted Frame of {shot}", force=True)

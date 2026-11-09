@@ -325,6 +325,8 @@ class ACEStepTransformer2DModel(
             self.inner_dim, patch_size=patch_size, out_channels=out_channels
         )
         self.gradient_checkpointing = False
+        # These hold no weights themselves: their FP32 locks keep MMGP from rounding the float32 timesteps (0..1000) to BF16 before the sinusoid
+        self._lock_dtype = self.time_proj._lock_dtype = torch.float32
 
     # Copied from diffusers.models.unets.unet_3d_condition.UNet3DConditionModel.enable_forward_chunking
     def enable_forward_chunking(
@@ -433,6 +435,7 @@ class ACEStepTransformer2DModel(
         temb = self.t_block(embedded_timestep)
 
         hidden_states = self.proj_in(hidden_states)
+        encoder_hidden_mask = encoder_hidden_mask.to(hidden_states.dtype)  # float32 from encode(): the blocks' compute dtype, as MMGP converted it before the root lock
 
         # controlnet logic
         if block_controlnet_hidden_states is not None:

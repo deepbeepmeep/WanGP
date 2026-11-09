@@ -704,6 +704,7 @@ class Adapter(torch.nn.Module):
         text_mask: torch.Tensor,
     ):
         rope = self.rope(coords_mapping)
+        x = x.to(self.config.params_dtype)  # FP32 tokens: the FP32 lock leaves them to this cast, which MMGP made before
         output_x = torch.zeros(x.shape[0], self.config.hidden_size, device=x.device, dtype=self.config.params_dtype)
         output_x[text_mask] = self.text_embedder(x[text_mask, : self.config.text_in_channels])
         output_x[audio_mask] = self.audio_embedder(x[audio_mask, : self.config.audio_in_channels])

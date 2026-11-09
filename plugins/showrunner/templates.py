@@ -29,6 +29,9 @@ PROMPT_RULES_NOTE = ("user_prompt_rules are the user's own rules for the prompts
 ROLES = (
     {"id": "images", "task": "gen_image", "hint": "Stills, illustrated pages and backgrounds"},
     {"id": "image_edits", "task": "edit_image", "hint": "The cast's reference pictures and looks, made from their photos"},
+    # Its own Auto: a model trained on character swaps (6/6 frames swapped with the sheet's build where Qwen 2.1 Turbo, Deepy's default editor, did 2/6: specs).
+    {"id": "frame_painter", "task": "edit_image", "label": "Frame Painter", "hint": "A remake's frames where people are replaced by the cast, painted before the video",
+     "auto_template": "edit_image/Qwen Image 2.1 Viggle Image Swap 6 Steps"},
     {"id": "shots_without_cast", "task": "gen_video", "hint": "Shots without the cast: landscapes, objects, crowds, inserts"},
     {"id": "cast_shots_lip_synced", "task": "gen_video_with_speech", "hint": "Shots where someone sings or speaks, lip-synced to the song or to their line"},
     {"id": "cast_shots", "task": "gen_video_with_refs", "hint": "Shots with the cast, keeping each person's face, hair and outfit from their pictures"},
@@ -40,6 +43,7 @@ ROLES = (
 )
 ROLE_IDS = tuple(role["id"] for role in ROLES)
 TASKS = {role["id"]: role["task"] for role in ROLES}
+REMAKE_ROLES = ("people_edits", "scene_edits", "frame_painter")  # used by remakes alone
 
 
 def planned_length(doc: dict[str, Any], shot: dict[str, Any], entry: dict[str, Any] | None) -> dict[str, str]:
@@ -75,8 +79,8 @@ def _fits(role: str, entry: dict[str, Any]) -> bool:
 
 
 def automatic(catalog: list[dict[str, Any]]) -> dict[str, str]:
-    """The template of each role when the user picks none: the one selected in Deepy's settings for its category."""
-    return {role["id"]: entry_name(entry) for role in ROLES if (entry := resolve(catalog, role["task"])) is not None}
+    """The template of each role when the user picks none: the one selected in Deepy's settings for its category, or the role's own."""
+    return {role["id"]: entry_name(entry) for role in ROLES if (entry := resolve(catalog, role.get("auto_template") or role["task"])) is not None}
 
 
 def chosen(doc: dict[str, Any], catalog: list[dict[str, Any]]) -> dict[str, str]:
@@ -98,7 +102,7 @@ def choices(doc: dict[str, Any], catalog: list[dict[str, Any]], rules: dict[str,
     """The picker: every role under its Deepy category's name, with that category's templates (and the user's prompt rules for each), the
     automatic one and the user's pick."""
     auto, picks, rules = automatic(catalog), chosen(doc, catalog), rules or {}
-    return [{**role, "label": next(entry["category"] for entry in catalog if _fits(role["id"], entry)), "auto": auto.get(role["id"]), "value": picks.get(role["id"]),
+    return [{**role, "label": role.get("label") or next(entry["category"] for entry in catalog if _fits(role["id"], entry)), "auto": auto.get(role["id"]), "value": picks.get(role["id"]),
              "choices": [{"value": entry_name(entry), "label": entry.get("label") or entry["name"], "refs": entry.get("refs", False), "audio": entry.get("audio", False), "speaks": speaks_its_lines(entry),
                           "rules": rules.get(entry_name(entry), "")}
                          for entry in catalog if _fits(role["id"], entry)]}
@@ -265,8 +269,8 @@ def rules_in_use(doc: dict[str, Any], catalog: list[dict[str, Any]], rules: dict
     """The user's prompt rules of the templates this production makes its shots and media with (a remake's editing templates only in a remake)."""
     if not rules:
         return {}
-    names = [*effective(doc, catalog).values(), *(entry_name(entry) for shot in doc["shots"] if (entry := shot_entry(doc, shot, catalog)))]
     remake = doc["brief"].get("kind") == "remake"
+    names = [*(template for role, template in effective(doc, catalog).items() if remake or role not in REMAKE_ROLES), *(entry_name(entry) for shot in doc["shots"] if (entry := shot_entry(doc, shot, catalog)))]
     return {name: rules[name] for name in dict.fromkeys(names) if rules.get(name) and (remake or name.partition("/")[0] not in EDIT_TASKS)}
 
 
@@ -274,7 +278,7 @@ def advice(doc: dict[str, Any], catalog: list[dict[str, Any]], any_length: bool 
     """What the director should choose for this production's shots and media, with the user's prompt rules of the templates it uses."""
     picks, user = effective(doc, catalog), chosen(doc, catalog)
     if doc["brief"].get("kind") != "remake":  # the editing templates are a remake's: nothing about them in any other production
-        user = {role: template for role, template in user.items() if TASKS[role] not in EDIT_TASKS}
+        user = {role: template for role, template in user.items() if role not in REMAKE_ROLES}
     lip, with_cast = picks.get("cast_shots_lip_synced"), lip_synced_with_cast(picks, catalog)
     result = {"rule": RULE, "cast_with_pictures": cast_with_pictures(doc)}
     result.update({role: picks[role] for role in ("cast_shots", "shots_without_cast") if role in picks})
@@ -288,9 +292,10 @@ def advice(doc: dict[str, Any], catalog: list[dict[str, Any]], any_length: bool 
         result["masters_from_pictures"] = picks["image_edits"]
     if doc["brief"].get("kind") == "story":  # picture-book pages are stills: the cast's go through the image editing template
         result.update({key: picks[role] for key, role in (("pages", "images"), ("pages_with_cast", "image_edits")) if role in picks})
-    if doc["brief"].get("kind") == "remake":  # every shot changes the source: the two editing templates and the image editor that paints their frames
-        result = {"rule": "Each shot takes the template of what changes in it: people_edits for people or characters, scene_edits for objects, setting, weather or light. Read its input guidance with wangp_templates first.",
-                  **{role: picks[role] for role in ("people_edits", "scene_edits", "image_edits") if role in picks}}
+    if doc["brief"].get("kind") == "remake":  # every shot changes the source: the two editing templates, the painter of frames whose people are replaced, and the image editor for the rest
+        result = {"rule": "Each shot takes the template of what changes in it: people_edits for people or characters, scene_edits for objects, setting, weather or light. Read its input guidance with wangp_templates first. "
+                          "paint_frame paints a frame whose people are replaced with frame_painter, any other frame and the character sheets with image_edits.",
+                  **{role: picks[role] for role in ("people_edits", "scene_edits", "frame_painter", "image_edits") if role in picks}}
     if user:
         result["user_choices"] = user
         result["user_rule"] = "user_choices are the user's picks for these kinds of shots and media: use them, never another template for the same kind."

@@ -196,6 +196,8 @@ class LTXV:
         transformer._model_dtype = dtype
         if mixed_precision_transformer:
             transformer._lock_dtype = torch.float
+        # holds no weights itself: its FP32 lock keeps MMGP from rounding the float32 timestep (x1000) to BF16 before its sinusoid
+        transformer.adaln_single._lock_dtype = torch.float32
 
 
         scheduler = RectifiedFlowScheduler.from_pretrained(fl.locate_file("ltxv_scheduler.json"))

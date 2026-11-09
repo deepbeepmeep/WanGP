@@ -703,12 +703,16 @@ class MiniMaxH3Model(nn.Module):
             for module in (*adaln_modules, self.final_layer.adaln_proj.linear):
                 module._lock_dtype = adaln_dtype
         else:
-            fp32_modules.extend((self.time_embedder.proj_in, self.time_embedder.proj_out))
+            fp32_modules.append(self.time_embedder)  # the container too: MMGP converts a direct child's float32 arguments to its lock dtype
         if endpoint_gate is not None:
             fp32_modules.append(self.endpoint_time_embedder)
         for module in fp32_modules:
             for submodule in module.modules():
                 submodule._lock_dtype = torch.float32
+        # These hold no weights themselves: their locks only keep MMGP from converting their float32 arguments to BF16 (the model's
+        # sigmas, its latents for the FP32 patch projections, the final layer's FP32 AdaLN input)
+        self.final_layer._lock_dtype = torch.float32
+        self._lock_dtype = torch.float32
 
     def preprocess_text_embeds(self, text_states):
         if text_states.shape[-1] == self.hidden_size:

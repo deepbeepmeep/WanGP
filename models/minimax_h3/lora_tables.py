@@ -99,15 +99,52 @@ def _unique(matches):
     return first
 
 
+def _packages_at_width(width):
+    """Registered packages, rank-8 ones cut to their first four columns for width-4 tables."""
+    return [AffinePackage(package.name, package.table[:, :4], torch.cat((package.affine[:4], package.affine[-1:])), package.full_fingerprint)
+            if width == 4 and package.width == 8 else package for package in local_packages()]
+
+
 def detect_table(table):
     fingerprint = tensor_fingerprint(table)
-    matches = []
-    for package in local_packages():
-        if table.shape[1] == 4 and package.width == 8:
-            package = AffinePackage(package.name, package.table[:, :4], torch.cat((package.affine[:4], package.affine[-1:])), package.full_fingerprint)
-        if package.table_fingerprint == fingerprint:
-            matches.append(package)
-    return _unique(matches)
+    return _unique([package for package in _packages_at_width(table.shape[1]) if package.table_fingerprint == fingerprint])
+
+
+MIX_WEIGHT_TOLERANCE = 1e-4
+MIX_RESIDUAL_TOLERANCE = 1e-6  # relative: float32 rounding of a merged table
+MIX_MAP_TOLERANCE = 1e-5  # relative: the bound of the alignment of a checkpoint table to a canonical map
+
+
+def _mix_weights(target, packages):
+    columns = torch.stack([package.table.double().flatten() for package in packages], 1)
+    fit = torch.linalg.lstsq(columns, target.flatten().unsqueeze(1))
+    weights = fit.solution.squeeze(1)
+    return weights, int(fit.rank), float(torch.linalg.vector_norm(columns @ weights - target.flatten()) / torch.linalg.vector_norm(target))
+
+
+def detect_mix(table):
+    """Merging pruned checkpoints mixes their tables linearly. A table that is such a mix of registered tables (weights >= 0 summing
+    to 1, exact up to float32 rounding) gets the map of the same mix of their full timestep embeddings."""
+    packages = [package for package in _packages_at_width(table.shape[1]) if package.table.shape == table.shape]
+    if not packages:
+        return None
+    target = table.detach().to(device="cpu", dtype=torch.float64)
+    weights, rank, _ = _mix_weights(target, packages)
+    # Linearly dependent registered tables would make the mix, and so its embedding, ambiguous.
+    if rank < len(packages) or bool((weights < -MIX_WEIGHT_TOLERANCE).any()) or abs(float(weights.sum()) - 1) > MIX_WEIGHT_TOLERANCE:
+        return None
+    packages = [package for package, weight in zip(packages, weights.tolist()) if weight > MIX_WEIGHT_TOLERANCE]
+    weights, _, residual = _mix_weights(target, packages)
+    if residual > MIX_RESIDUAL_TOLERANCE:
+        return None
+    embedding = sum(weight * (package.table.double() @ package.affine[:-1].double() + package.affine[-1].double())
+                    for weight, package in zip(weights.tolist(), packages))
+    target_h = torch.cat((target, target.new_ones(target.shape[0], 1)), dim=1)
+    affine = torch.linalg.lstsq(target_h, embedding).solution
+    if torch.linalg.vector_norm(target_h @ affine - embedding) / torch.linalg.vector_norm(embedding) > MIX_MAP_TOLERANCE:
+        return None
+    name = "mix(" + " + ".join(f"{weight:.4g} {package.name}" for weight, package in zip(weights.tolist(), packages)) + ")"
+    return AffinePackage(name, table.detach().to(device="cpu", dtype=torch.float32), affine.float())
 
 
 def _conditioning_tensors(source):
@@ -172,7 +209,7 @@ def _detect_checkpoint(path, mtime, size, allow_native):
         if table is not None:
             package = detect_table(table)
             if package is None and allow_native:
-                package = _native_package(source, table_key, table, Path(path).stem)
+                package = _native_package(source, table_key, table, Path(path).stem) or detect_mix(table)
             return package
     if times is not None:
         fingerprint = time_fingerprint(times)

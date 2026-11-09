@@ -484,7 +484,7 @@ def prepare(device):
         for type, quant, size in ((IQ3_S, gguf.quants.IQ3_S, torch.int32), (IQ3_XXS, gguf.quants.IQ3_XXS, torch.int32), (IQ2_S, gguf.quants.IQ2_S, torch.int64)):
             quant.init_grid()
             grid = torch.from_numpy(quant.grid.copy()).reshape(quant.grid_shape).to(torch.int64)
-            word = (grid << (torch.arange(grid.shape[1]) * 8)).sum(1)
+            word = (grid << (torch.arange(grid.shape[1], device=grid.device) * 8)).sum(1)
             packed[type] = word.to(size)
         with allocator.normal_allocations():
             tables = {type: table.to(device) for type, table in packed.items()}

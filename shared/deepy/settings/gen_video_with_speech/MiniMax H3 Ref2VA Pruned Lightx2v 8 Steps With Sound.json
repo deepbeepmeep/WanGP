@@ -13,7 +13,7 @@
         "https://huggingface.co/DeepBeepMeep/MiniMax-H3/resolve/main/loras/minimax_h3_lightx2v_ref2v_turbo_8step_alpha8_v1.0_768p_bf16.safetensors"
     ],
     "loras_multipliers": "1.0",
-    "type": "MiniMax H3 Ref2VA Pruned Turbo Lightx2v 8 Steps",
+    "type": "MiniMax H3 Ref2VA Pruned Lightx2v 8 Steps",
     "settings_version": 2.73,
     "model_type": "minimax_h3_ref2va_pruned",
     "prompt_enhancer": "TI",

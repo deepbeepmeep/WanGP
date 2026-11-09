@@ -835,6 +835,21 @@ def build_generation_task(
     return task
 
 
+def rename_saved_templates(server_config: dict[str, Any], renames: dict[str, dict[str, str]], settings_root: str | None = None) -> bool:
+    """Built-in templates renamed ({task: {old name: new name}}), for a model family's migrate_config: the choice saved in Deepy's settings and
+    the references Showrunner saved (in WanGP's settings folder: --settings unless given). Returns whether server_config changed."""
+    from plugins.showrunner.store import rename_templates, settings_folder
+    changed = False
+    for task, names in renames.items():
+        key = TOOL_CONFIG_KEYS[task]
+        if server_config.get(key) in names:
+            server_config[key] = names[server_config[key]]
+            changed = True
+    rename_templates(settings_folder(sys.modules["wgp"].args.settings if settings_root is None else settings_root),
+                     {f"{task}/{old}": f"{task}/{new}" for task, names in renames.items() for old, new in names.items()})
+    return changed
+
+
 __all__ = [
     "AGENT_TOOL_IDS",
     "GENERATION_TOOL_IDS",
@@ -867,6 +882,7 @@ __all__ = [
     "normalize_tool_loras",
     "load_tool_preset",
     "refresh_tool_presets",
+    "rename_saved_templates",
     "resolve_tool_variant",
     "resolve_wangp_settings_file",
     "validate_wangp_settings_for_tool",

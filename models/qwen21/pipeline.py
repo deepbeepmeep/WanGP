@@ -2,6 +2,7 @@
 import json
 import math
 import hashlib
+import re
 
 import numpy as np
 import torch
@@ -32,6 +33,27 @@ PRUNA_SIGMAS = {
     5: (1.0, 0.94, 6 / 7, 2 / 3, 0.4),
     8: (1.0, 14 / 15, 6 / 7, 10 / 13, 2 / 3, 6 / 11, 0.4, 2 / 9),
 }
+ORDINALS = ("first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth")
+IMAGE_NUMBER = re.compile(r"\b(<?image\s*)(\d+)", re.IGNORECASE)
+IMAGE_ORDINAL = re.compile(r"\b(" + "|".join(ORDINALS) + r"|last)(?=\s+(?:(?:reference|input|source)\s+)?(?:image|picture|photo)s?\b)", re.IGNORECASE)
+
+
+def main_image_last_prompt(prompt, count):
+    """Renumber the prompt's image references for images passed with the main image moved last: image 1 becomes image `count` and
+    image k image k - 1, as numbers ("image 2", "<image2>") and as ordinals ("the first image" -> "the last image")."""
+    moved = lambda k: count if k == 1 else k - 1
+    def number(match):
+        k = int(match.group(2))
+        return match.group(1) + str(moved(k)) if 1 <= k <= count else match.group(0)
+    def ordinal(match):
+        word = match.group(1)
+        k = count if word.lower() == "last" else ORDINALS.index(word.lower()) + 1
+        if k > count:
+            return word
+        k = moved(k)
+        new = "last" if k == count else ORDINALS[k - 1]
+        return new.capitalize() if word[0].isupper() else new
+    return IMAGE_ORDINAL.sub(ordinal, IMAGE_NUMBER.sub(number, prompt))
 
 
 def reference_outpainting_offset(location, width, height):
@@ -163,8 +185,9 @@ def source_latent_canvas(source, width, height, location):
 
 
 class Qwen21Pipeline(QwenImage21Pipeline):
-    def __init__(self, transformer, text_encoder, vae, processor, scheduler_config):
+    def __init__(self, transformer, text_encoder, vae, processor, scheduler_config, main_image_last=False):
         self.transformer, self.text_encoder, self.vae = transformer, text_encoder, vae
+        self.main_image_last = main_image_last  # the model was trained with the main image after the other references
         self.processor, self.tokenizer = processor, processor.tokenizer
         self._interrupt = False
         self.text_encoder_cache = TextEncoderCache()
@@ -221,6 +244,9 @@ class Qwen21Pipeline(QwenImage21Pipeline):
         images = list(input_ref_images) if input_ref_images else []
         if input_frames is not None:
             images.insert(0, convert_tensor_to_image(input_frames))
+        if self.main_image_last and len(images) > 1:
+            images.append(images.pop(0))
+            input_prompt = main_image_last_prompt(input_prompt, len(images))
         if len(images) > 10:
             raise ValueError("Qwen Image 2.1 accepts at most 10 reference images.")
         if width % 32 or height % 32:

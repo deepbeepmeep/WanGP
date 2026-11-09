@@ -834,8 +834,10 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         layer_list = [self.final_layer, self.final_layer.linear, self.final_layer.adaLN_modulation[1]]
         for layer in layer_list:
             layer._lock_dtype = dtype
-
-        self._lock_dtype = dtype
+        # These hold no weights themselves: their FP32 locks keep MMGP from rounding the float32 timesteps / guidance to BF16 before their sinusoids
+        for module in (self, self.time_in, self.txt_in, self.guidance_in, self.time_r_in):
+            if module is not None:
+                module._lock_dtype = torch.float32
 
     def enable_deterministic(self):
         for block in self.double_blocks:

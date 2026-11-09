@@ -131,6 +131,7 @@ class LongCatModel:
             raise ValueError("Missing LongCat transformer weights path.")
         offload.load_model_data(transformer, model_path, writable_tensors=False, default_dtype=torch.bfloat16)
         transformer._model_dtype = dtype
+        transformer.final_layer._lock_dtype = torch.float32  # holds no weights itself: keeps MMGP from rounding its FP32 AdaLN input to BF16
         transformer.eval().requires_grad_(False)
         self.transformer = transformer
         if save_quantized:

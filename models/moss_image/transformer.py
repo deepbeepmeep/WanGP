@@ -144,6 +144,9 @@ class MOSSImageTransformer(nn.Module):
         self.final_norm_video = RMSNorm(dim)
         self.final_linear_video = nn.Linear(dim, latent_channels, bias=False)
         self.video_head_modulation = nn.Linear(dim, 2 * dim)
+        # Holds no weights itself: the lock keeps MMGP from rounding the float32 timestep to BF16 before the FP64 sinusoid (forward casts
+        # the latents to the video_embedder's dtype itself)
+        self._lock_dtype = torch.float32
 
     def preprocess_loras(self, model_type, state_dict):
         return convert_lora_keys(state_dict, dict(self.named_modules()), split_linear_modules_map=self.split_linear_modules_map)

@@ -314,8 +314,7 @@ def _decode_virtual_media_frames(video_path, metadata, entry, start_frame, max_f
             start_index = max(0, int(start_frame))
             frames = tensor[:, start_index:start_index + max(0, int(max_frames))].permute(1, 2, 3, 0)
         else:
-            source_fps = metadata["fps"] if metadata["fps"] > 0 else max(1, int(round(metadata["fps_float"] or 0)))
-            frame_nos = _resample_frame_indices(source_fps, frame_count, int(max_frames), float(target_fps), int(start_frame))
+            frame_nos = _resample_frame_indices(_read_rate(metadata, target_fps), frame_count, int(max_frames), float(target_fps), int(start_frame))
             frames = tensor[:, frame_nos].permute(1, 2, 3, 0) if len(frame_nos) > 0 else tensor[:, :0].permute(1, 2, 3, 0)
         if entry.get("hdr"):
             frames = frames.to(torch.float32).contiguous()
@@ -590,16 +589,24 @@ def _read_rate(metadata, target_fps):
     return float(target_fps) if abs(float(metadata["fps_float"] or 0) - float(target_fps)) < 0.1 else metadata["fps"] if metadata["fps"] > 0 else max(1, int(round(metadata["fps_float"] or 0)))
 
 
+def _frames_read(metadata, frame_count, target_fps):
+    rate = _read_rate(metadata, target_fps)
+    return len(_resample_frame_indices(rate, frame_count, int(frame_count * float(target_fps) / rate) + 2, float(target_fps), 0))
+
+
+def read_frame_count(video_path, target_fps):
+    """How many frames decode_video_frames_ffmpeg gives for a whole video read at target_fps."""
+    metadata = probe_video_stream_metadata(video_path)
+    return _frames_read(metadata, metadata["frame_count"], target_fps)
+
+
 def virtual_own_frames(video_path, target_fps=None):
     """How many frames of a file a virtual video names, without its padding, or how many they give at target_fps; None for a real file or one held in memory."""
     if not isinstance(video_path, str) or parse_virtual_media_path(video_path) is None or get_virtual_media_entry(video_path) is not None:
         return None
     metadata = probe_video_stream_metadata(video_path)
     own_frames = None if metadata is None else metadata.get("virtual_own_frames")
-    if own_frames is None or target_fps is None:
-        return own_frames
-    rate = _read_rate(metadata, target_fps)
-    return len(_resample_frame_indices(rate, own_frames, int(own_frames * float(target_fps) / rate) + 2, float(target_fps), 0))
+    return own_frames if own_frames is None or target_fps is None else _frames_read(metadata, own_frames, target_fps)
 
 
 def decode_video_frames_ffmpeg(video_path, start_frame, max_frames, target_fps=None, bridge="torch", hdr_linear=False):

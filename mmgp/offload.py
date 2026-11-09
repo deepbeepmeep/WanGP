@@ -2024,16 +2024,17 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
     tied_weights_total = 0
     tied_weights_last = None
 
-    for n, (p, _) in params_dict.items():
+    for n, (p, is_buffer) in params_dict.items():
         ref = _get_tensor_ref(p)
         match = ref_cache.get(ref, None)
         if match != None:
             match_name, match_size = match
-            tied_weights_count += 1
-            tied_weights_total += match_size
-            if verboseLevel >=1:
-                tied_weights_last = f"{match_name} <-> {n}"
             tied_weights[n] = match_name
+            if not is_buffer or verboseLevel >= 2: # shared buffers (the scalar scales of split projections) are not tied weights
+                tied_weights_count += 1
+                tied_weights_total += match_size
+                if verboseLevel >=1:
+                    tied_weights_last = f"{match_name} <-> {n}"
         else:
             sub_tensors = _get_quantized_subtensors(p)
             if sub_tensors:

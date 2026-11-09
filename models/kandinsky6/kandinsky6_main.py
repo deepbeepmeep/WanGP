@@ -53,6 +53,10 @@ class model_factory:
         if save_quantized:
             from wgp import save_quantized_model
             save_quantized_model(transformer, model_type, model_filename, torch.bfloat16, None)
+        # These hold no weights themselves: their locks only keep MMGP from rounding their float32 arguments to BF16 (the time, the FP32
+        # time embeddings of the output layers); the latents and text are cast by the unlocked embedding layers as before.
+        for module in (transformer, transformer.video_time_embeddings, transformer.audio_time_embeddings, transformer.out_layer, transformer.audio_out_layer):
+            module._lock_dtype = torch.float32
         self.text_encoder = Kandinsky6TextEncoder(text_encoder_filename, fl.locate_folder(CLIP_FOLDER))
         self.vae = offload.fast_load_transformers_model(fl.locate_file(VIDEO_VAE_FILE), writable_tensors=False, modelClass=Kandinsky6VideoVAE,
                                                         defaultConfigPath=fl.locate_file(VIDEO_VAE_CONFIG_FILE), default_dtype=torch.float16).eval()

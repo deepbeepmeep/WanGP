@@ -60,7 +60,9 @@ def save_convrot_model(model, source_file, output_file, layout=None, verboseLeve
     # Embedding lookups do not apply the inverse activation rotation used by
     # ConvRot Linear layers. Preserve their original weights, including relative
     # attention biases inside otherwise quantized transformer blocks.
-    locked_modules = tuple(name for name, module in model.named_modules() if isinstance(module, torch.nn.Embedding) or getattr(module, "_lock_dtype", None) is not None)
+    # A lock on a module holding no weights directly only keeps MMGP from converting its arguments: it says nothing about weights.
+    locked_modules = tuple(name for name, module in model.named_modules() if isinstance(module, torch.nn.Embedding)
+                           or getattr(module, "_lock_dtype", None) is not None and any(True for _ in module.parameters(recurse=False)))
     if layout is None:
         layout = {}
     source_file, output_file = os.path.abspath(source_file), os.path.abspath(output_file)
