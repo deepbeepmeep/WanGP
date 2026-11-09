@@ -1595,7 +1595,8 @@ class LTX2:
                         control_start_frame =  0
                     input_video = None
                 elif skip_first_guide_latent:
-                    control_start_frame = -prefix_frames_count
+                    if not self.model_def.get("dont_cat_preguide", False):
+                        control_start_frame = -prefix_frames_count
 
                 if LTX2_PAD_MASKED_CONTROL_VIDEO_TAIL and new_outpainting:
                     target_control_frames = int(frame_num) - int(control_start_frame) if control_start_frame > 0 else int(frame_num)
