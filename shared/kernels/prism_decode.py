@@ -41,13 +41,14 @@ def select_decode(input, raw, signs, bias, rows, grouped_shape, native):
             return 0
         graphs = {}
         outputs = {}
+        pool = torch.cuda.graph_pool_handle()  # one pool for the candidates' timing graphs: each pool reserves GPU address space
         try:
             for tile, fn in list(candidates.items()):
                 for _ in range(3):
                     fn()
                 graph = torch.cuda.CUDAGraph()
                 graphs[tile] = graph
-                with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+                with torch.cuda.graph(graph, pool=pool, capture_error_mode="thread_local"):
                     for _ in range(16):
                         outputs[tile] = fn()
                 graph.replay()

@@ -302,6 +302,15 @@ class family_handler():
         return "flux"
 
     @staticmethod
+    def query_retired_files(model_type):
+        """Checkpoints that earlier releases of a model type downloaded and its current definition no longer names (Models Manager
+        lists them with the model, to delete them)."""
+        return {
+            "flux2_klein_4b": ["flux-2-klein-4b_bf16.safetensors"],
+            "flux2_klein_9b": ["flux-2-klein-9b_bf16.safetensors"],
+        }.get(model_type, [])
+
+    @staticmethod
     def query_model_files(computeList, base_model_type, model_def=None):
         if base_model_type in ["flux2_klein_4b", "flux2_klein_9b", "flux2_klein_9b_kv"]:
             if base_model_type == "flux2_klein_4b":

@@ -1,0 +1,18 @@
+{
+    "model": {
+        "name": "MiniMax H3 Ref2VA HyperFlow Flash 14B",
+        "architecture": "minimax_h3_ref2va_pruned",
+        "parent_model_type": "minimax_h3_ref2va_hyperflow",
+        "description": "Generates synchronized video and stereo audio from text plus ordered image, video and audio references, in 4, 6 or 8 steps without guidance. At its default 6 steps it denoises about a third faster than the 8-step PDD models from a smaller 15 GB checkpoint; as a compressed distillation it can lose some fine detail. Video Rebirth's HyperFlow distillation of H3.",
+        "URLs": [
+            "https://huggingface.co/DeepBeepMeep/MiniMax-H3/resolve/main/MiniMax-H3-Ref2VA-HyperFlow-Flash-14B_int8_convrot.safetensors"
+        ],
+        "hyperflow": true
+    },
+    "num_inference_steps": 6,
+    "guidance_phases": 1,
+    "sample_solver": "euler",
+    "flow_shift": 12.0,
+    "video_prompt_type": "I",
+    "prompt": "subject_definitions:\n<Subject 1> is the person in <Picture 1>, preserving their exact identity, facial features, skin tone, hairstyle, body proportions, clothing, footwear, and distinctive accessories.\nsummary:\n[reference generation] Place <Subject 1> on a deserted midnight railway platform where a paper bird awakens the station clock during one five-second shot.\nretention_analysis:\n<Subject 1> (appears in [Shot 1]): fully_preserved - their identity, face, hair, proportions, clothing, footwear, and visible accessories remain recognizable and unchanged; only the location, lighting, action, and paper-bird prop are new.\ndetailed_description:\nThe target video is a five-second cinematic magical-realist single take on an abandoned railway platform before dawn. [Shot 1] <Subject 1> stands beneath a monumental stopped clock, framed in a steady medium close-up that keeps their recognizable face and exact appearance from <Picture 1> clearly visible. Cold blue light outlines the iron platform while a warm lamp illuminates their natural skin texture, hair, clothing, and accessories without changing them. A tiny folded paper bird rests on their raised palm. As its paper wings open, the camera gently pushes closer and <Subject 1> watches it with quiet resolve, saying clearly (S1) <d>[English] Some journeys begin when the map runs out.</d> During the final words, the bird lifts a few inches, lands on the clock's minute hand, and the mechanism advances with one solid click. <Subject 1> follows it with their eyes and gives a small hopeful smile. The spoken line and simple transformation complete naturally within the five-second shot; identity, lip motion, gaze, hand position, posture, and paper movement remain stable and physically coherent.\noverall_soundscape: Spacious nighttime station ambience, faint wind through ironwork, a soft paper-wing flutter crossing the stereo field, the synchronized spoken line, one heavy clockwork click, and a distant rail hum.\nnon_diegetic_music: A minimal celesta phrase of three notes, resolving softly as the clock moves."
+}

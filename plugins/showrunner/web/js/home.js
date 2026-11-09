@@ -1,7 +1,7 @@
 // Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 // Home: start a production from its kind, or open one.
 import { api } from './api.js';
-import { icon, esc, art, ago, formatDuration, menu, confirmDialog, promptDialog, toast, adviceBar, bindAdvice } from './ui.js';
+import { icon, esc, art, ago, formatDuration, menu, confirmDialog, promptDialog, toast, adviceBar, bindAdvice, pickFiles } from './ui.js';
 
 export const KINDS = {
   music_video: { label: 'Music video', icon: 'music', text: 'Cut to the beat of your song', hue: 'music' },
@@ -30,7 +30,8 @@ export function renderHome(container, state, { open }) {
     </div>
     ${adviceBar(state.directorInfo)}
     <div class="kinds">${kindTiles()}</div>
-    <div class="section-title">${icon('layers')} Your productions <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">${productions.length || ''}</span></div>
+    <div class="section-title">${icon('layers')} Your productions <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">${productions.length || ''}</span><span class="grow"></span>
+      <button class="btn small ghost" id="import-zip" title="A production exported as a .zip (from its … menu), here or in another WanGP" style="text-transform:none;letter-spacing:0">${icon('upload')} Import a .zip…</button></div>
     ${productions.length ? `<div class="productions">${productions.map(card).join('')}</div>` : `<div class="empty-state">${archived.length ? 'Every production is archived: open the list below to bring one back.' : 'No production yet. Choose a format above to start.'}</div>`}
     ${archived.length ? `<details class="archived-productions" ${state.archivedOpen ? 'open' : ''}><summary class="section-title">${icon('chevron', 'chev')} Archived <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">${archived.length}</span></summary>
       <div class="productions">${archived.map(card).join('')}</div></details>` : ''}
@@ -46,6 +47,14 @@ export function renderHome(container, state, { open }) {
       await api.trash(id);
       toast('Deleted (moved to the trash).');
     }
+  };
+  container.querySelector('#import-zip').onclick = async event => {
+    const [file] = await pickFiles('.zip', false), button = event.currentTarget;
+    if (!file) return;
+    button.disabled = true;
+    toast(`Importing ${file.name}…`, 'info', 4000);
+    try { const doc = await api.importZip(file); toast(`Imported "${doc.title}".`, 'ok'); } catch (error) { toast(error.message, 'error', 8000); }
+    button.disabled = false;
   };
   container.querySelectorAll('[data-kind]').forEach(button => button.onclick = async () => {
     const title = await promptDialog({ title: `New ${KINDS[button.dataset.kind].label.toLowerCase()}`, text: 'Its name (you can change it later, at the top of the page).',
@@ -76,6 +85,10 @@ export function renderHome(container, state, { open }) {
           Object.assign(document.createElement('a'), { href: api.file(item.id, item.latest, true), download: item.latest.split('/').pop() }).click();
         } }] : []),
         { label: 'Duplicate', icon: 'copy', action: async () => { await api.duplicate(element.dataset.id); toast('Duplicated.', 'ok'); } },
+        { label: 'Export as .zip', icon: 'download', action: () => {  // to keep, or to open in another WanGP with Import
+          toast('Preparing the .zip: the download starts when it is ready.', 'info', 5000);
+          Object.assign(document.createElement('a'), { href: api.exportUrl(element.dataset.id), download: '' }).click();
+        } },
         { label: item.archived ? 'Bring back from the archive' : 'Archive', icon: item.archived ? 'undo' : 'archive', action: () => archive(item.id, !item.archived) },
         '-',
         { label: 'Delete…', icon: 'trash', danger: true, action: () => trash(item.id) },

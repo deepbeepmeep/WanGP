@@ -9,6 +9,7 @@ import re
 import shutil
 import threading
 import time
+import zipfile
 from pathlib import Path
 from typing import Any, Callable
 
@@ -259,6 +260,55 @@ class ProductionStore:
             copy_.save()
         self.publish({"type": "productions"})
         return copy_
+
+    def export(self, production_id: str, target: Path) -> Path:
+        """The production as one .zip, to keep or to open in another WanGP (import_zip): its document, media, versions with their saved states,
+        exports and posters. As in a duplicate, the showrunner's conversation and the undo history stay behind."""
+        source = self.get(production_id)
+        doc = source.snapshot()
+        with zipfile.ZipFile(target, "w", allowZip64=True) as archive:
+            for item in doc["deliverables"]:  # versions older than saved states travel with their state from the undo history
+                saved = source.folder / f"history/{int(item.get('revision') or -1):06d}.json"
+                if not item.get("snapshot") and saved.is_file():
+                    item["snapshot"] = f"versions/{saved.name}"
+                    archive.write(saved, item["snapshot"], zipfile.ZIP_DEFLATED)
+            archive.writestr(DOCUMENT, json.dumps({**doc, "director": {"state": "idle"}}, indent=1, ensure_ascii=False), zipfile.ZIP_DEFLATED)
+            for name in ("media", "cache", "versions", "exports"):
+                for path in sorted((source.folder / name).rglob("*")):
+                    if path.is_file():  # media are compressed already: stored as they are
+                        archive.write(path, path.relative_to(source.folder).as_posix(), zipfile.ZIP_DEFLATED if path.suffix.lower() in (".json", ".srt", ".vtt", ".txt", ".svg") else zipfile.ZIP_STORED)
+        return target
+
+    def import_zip(self, path: Path) -> Production:
+        """A production exported as a .zip, as a new production here (its own id; the showrunner starts afresh). The file comes from elsewhere:
+        only a production's own folders are read from it, and nothing outside the new production's folder is written."""
+        with zipfile.ZipFile(path) as archive:
+            if DOCUMENT not in archive.namelist():
+                raise ValueError("This .zip is not a Showrunner production: it has no production.json.")
+            doc = json.loads(archive.read(DOCUMENT).decode("utf-8"))
+            if not isinstance(doc, dict) or not isinstance(doc.get("brief"), dict):
+                raise ValueError("Its production.json is not a Showrunner production.")
+            production = self.create(str(doc.get("title") or "Imported production")[:80], str((doc.get("brief") or {}).get("kind") or "free"))
+            folder = production.folder.resolve()
+            try:
+                for entry in archive.infolist():
+                    top, target = entry.filename.split("/", 1)[0], (folder / entry.filename).resolve()
+                    if entry.is_dir() or top not in ("media", "cache", "versions", "exports") or not target.is_relative_to(folder / top):
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.open(entry) as source, open(target, "wb") as out:
+                        shutil.copyfileobj(source, out, 1 << 20)
+                with production.lock:
+                    doc.update(id=production.id, title=production.doc["title"], director={"state": "idle"}, created=model.now(), updated=model.now(), archived=False)
+                    production.doc = model.normalize(doc)
+                    production.save()
+            except Exception:  # a broken file leaves no half production behind
+                with self._lock:
+                    self._open.pop(production.id, None)
+                shutil.rmtree(production.folder, ignore_errors=True)
+                raise
+        self.publish({"type": "productions"})
+        return production
 
     def archive(self, production_id: str, archived: bool = True) -> None:
         """Hide a production from the home grid (or show it again): a flag of the production, outside its undo history."""

@@ -27,7 +27,8 @@ TEXTURE_PROMPT_INFOS = """The prompt only names the output files (for example "L
 TEXTURE_DEEPY_INFOS = ("Textures an existing mesh (custom_guide: .glb/.obj/.ply/.stl) with PBR base colour, metallic and roughness from one object image "
                        "(image_refs, video_prompt_type 'I'). The visible side keeps the image's colours and print; hidden sides are completed in 3D. The mesh is "
                        "placed automatically from its silhouette, so the image must show the same object facing the mesh front (+Z): ideal for the image a mesh was "
-                       "generated from. num_inference_steps 25 (completion steps); custom_settings.max_faces 0 keeps every face; custom_settings.texture_size "
+                       "generated from. To restyle a mesh (another material or colour), edit the image it was generated from with an edit_image template and texture "
+                       "with the edited image: a new picture rarely lines up with the mesh. num_inference_steps 25 (completion steps); custom_settings.max_faces 0 keeps every face; custom_settings.texture_size "
                        "1024/2048/4096. Also available as the 'supratex' Texturer of 3D post-processing (temporal_upsampling slot), alone or after the 'hi3d' 3D Refiner. "
                        "The most faithful Texturer when the image lines up with the mesh (then hunyuan3d_paint, then trellis2_texture); a steep top-down photo misplaces the colours. "
                        "The material adapter is non-commercial (Qwen Research License).")

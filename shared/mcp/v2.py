@@ -38,15 +38,18 @@ DEEPY_USAGES = {
     "gen_song": "Generate music or songs",
     "gen_speech_from_description": "Generate speech using a text-described voice",
     "gen_speech_from_sample": "Generate speech using a voice sample",
-    "gen_world": "Generate an explorable world (Worlds gallery) from a world description (with its first view in image_start for templates whose input_modes include image_prompt_type S), optionally walked through with exploration instructions after it, or continue a world given as custom_guide; world_output chooses world, world_video or video. Also shows a picture from another viewpoint (a step aside, a turn, walking in): a template taking image_start, the move as instructions, world_output video, then a frame of that video",
-    "gen_3d": "Create a 3D asset for the 3D gallery. Qwen3.5 GLB 3D Coder takes a text description directly and can export animated parts. Image-to-3D templates take one picture in image_refs. If the chosen template needs a picture, a gen_image template can make one: one whole object, centered on a plain background, seen three-quarters from slightly above, in soft even light. The templates are the main recipes (a shape, an optional 3D Refiner, a Texturer): the default suits most objects, keeps thin parts and copies the picture's colours and print; SUPRA-Tex Pixal3D builds the mesh in the picture's own camera (the closest fit to the picture); Hunyuan3D 2.1 PBR paints all around and tolerates unusual pictures; Solid Objects adds fine relief to solid parts (thin sheets such as leaves keep the plain shape). Other 3D models (untextured shapes, parts, Gaussian splats, mesh refinement, segmentation, animation, scene reconstruction) are found with wangp_models and used with their defaults",
-    "texture_3d": "Texture a mesh of the 3D gallery given as custom_guide from one picture of the same object in image_refs, showing it from the front or three quarters, not steeply from above (PBR textures keeping the picture's colours; to restyle a mesh, edit the picture it was made from); the Hunyuan3D 2.1 Paint template tolerates a picture that differs from the mesh; a template may refine the mesh first",
-    "swap_video": "Replace people or characters in an existing video (video_guide); read the template's input guidance first",
-    "edit_video": "Change objects, setting, weather, light or style in an existing video (video_guide); read the template's input guidance first",
+    "gen_world": "Generate an explorable world (Worlds gallery), walk through it or continue it; also shows a picture from another viewpoint",
+    "gen_3d": "Create a 3D asset for the 3D gallery from a picture or a text description",
+    "texture_3d": "Texture a mesh of the 3D gallery from a picture of the same object",
+    "swap_video": "Replace people or characters in an existing video",
+    "edit_video": "Change objects, setting, weather, light or style in an existing video",
 }
+TEMPLATE_ROWS_NOTE = "media_inputs lists the inputs a template's model supports, not the ones it requires."  # task methods are in the workflows guide (wangp://guides/workflows)
 ARGUMENT_ALIASES = {"media": ("media_id", "video_id", "audio_ids"), "media_id": ("video_id", "audio_ids"), "video": ("video_id",), "audio": ("audio_ids", "audio_id"), "audio_id": ("audio_ids",), "image": ("media_id",), "mode": ("transitions",)}  # argument names agents mix up
 SHORT_ACTION_NAMES = {"inspect": "inspect_media", "view": "view_media", "render": "render_3d_views", "transcribe": "transcribe_media"}  # short names of toolbox actions
-ACTION_SYNONYMS = {"status": ("get_job", "wait_jobs"), "job_status": ("get_job",), "jobs": ("wait_jobs",), "list_jobs": ("wait_jobs",), "search_files": ("rg",), "search": ("rg",), "grep": ("rg",), "find": ("rg", "list"), "list_files": ("list",), "trim_media": ("extract_video", "extract_audio"), "trim_video": ("extract_video",), "trim_audio": ("extract_audio",), "cut_video": ("extract_video",), "concat_videos": ("merge_videos",), "contact_sheet": ("view_media", "inspect_video"), "edit_text": ("edit",), "replace_text": ("edit",),
+ACTION_SYNONYMS = {"status": ("get_job", "wait_jobs"), "job_status": ("get_job",), "jobs": ("wait_jobs",), "list_jobs": ("wait_jobs",), "search_files": ("rg",), "search": ("rg",), "grep": ("rg",), "find": ("rg", "list"), "list_files": ("list",), "trim_media": ("extract_video", "extract_audio"), "trim_video": ("extract_video",), "trim_audio": ("extract_audio",), "cut_video": ("extract_video",),
+                   "extract_frame": ("extract_image",), "get_frame": ("extract_image",), "last_frame": ("extract_image",), "frame": ("extract_image",), "screenshot": ("extract_image",),
+                   "measure_audio": ("inspect_audio",), "audio_levels": ("inspect_audio",), "loudness": ("inspect_audio",), "measure": ("inspect_audio",), "concat_videos": ("merge_videos",), "contact_sheet": ("view_media", "inspect_video"), "edit_text": ("edit",), "replace_text": ("edit",),
                    "execute": ("run",), "exec": ("run",), "run_code": ("run",), "run_python": ("run",), "python": ("run",), "code": ("run",), "reset": ("restart",), "reboot": ("restart",), "list_sandbox": ("files",)}  # unknown action names agents try
 PER_FILE_MIX_OPTIONS = ("gains_db", "trim_start_s", "trim_duration_s", "offsets_s", "fade_in_s", "fade_out_s")  # remux_media lists aligned with audio_ids
 NAMED_OUTPUT_ACTIONS = {"create_color_frame", "create_mask", "image_channels", "extract_audio", "extract_image", "extract_video", "merge_videos", "mute_video",
@@ -61,7 +64,7 @@ MEDIA_DISCOVERY_DESCRIPTIONS = {
     "inspect_media": "Answer a required question about images, 3D assets or worlds (their last frame, with the world's facts) via media_id/media_ids, or exact video frames / 3D views and animation frames via media_inputs, with optional crops; no frame extraction needed.",
     "inspect_video": "Answer question about a video from automatically sampled frames: media_id, question, optional start_s / end_s (default: the whole video).",
     "view_media": "Return images or chosen video frames, optionally cropped, sized or tiled into a contact sheet, for your own visual inspection.",
-    "inspect_audio": "Measure audio/video on CPU: peak/RMS, clipping indicators, loudness and silence; optionally return a playable excerpt.",
+    "inspect_audio": "Measure audio/video on CPU: peak/RMS, clipping indicators, loudness and silence; optionally the music's tempo and beats, or a playable excerpt.",
     "check_lip_sync": "Measure whether the lips of one shot follow its voice: media_id, optional start_s, duration_s, voice_id (the voice alone).",
     "detect_video_cuts": "Find a video's hard cuts and shots, in frames at 24 fps: media_id.",
     "plan_video_windows": "Split a video into render windows ending on cuts, for swap_video or edit_video: media_id, optional cuts, max_frames, min_frames, max_cuts.",
@@ -227,7 +230,7 @@ def invocation(actions, action, arguments, *, signatures=False):
             raise ValueError(f"{action} is a wangp_toolbox action: call wangp_toolbox with action={action!r} (from a Python script: wangp.toolbox({action!r}, ...), or wangp.inspect(media, question) for inspect_media). Nothing was executed.")
         close = ([name for name in ACTION_SYNONYMS.get(action, ()) if name in actions]
                  or sorted(difflib.get_close_matches(action, actions, n=3, cutoff=0.6) or [name for name in actions if action in name or name in action.split("_")][:3]))
-        raise ValueError(f"Unknown or unavailable action: {action}. " + (f"Did you mean {' or '.join(close)}? Omit action to discover available actions." if close else f"Available actions: {', '.join(actions)}."))
+        raise ValueError(f"Unknown or unavailable action: {action}. " + (f"Did you mean {' or '.join(close)}? Omit action to discover available actions." if close else f"Available actions: {', '.join(actions)}. Omit action to list them with their descriptions."))
     definition = actions[action]
     if arguments is None:
         return {"status": "schema", "action": {"name": action, **action_contract(definition)}}
@@ -240,7 +243,8 @@ def invocation(actions, action, arguments, *, signatures=False):
             error = max((item for item in error.context if item.validator != "type"), key=lambda item: len(item.absolute_path), default=error)
         path = ".".join(map(str, error.absolute_path)) or "arguments"
         if action == "inspect_media" and error.validator == "oneOf":
-            raise ValueError("inspect_media requires exactly one of media_id (one visual), media_ids (a list), or media_inputs (selected frames), inside arguments alongside question.")
+            raise ValueError("inspect_media requires exactly one of media_id (one visual), media_ids (a list), or media_inputs (selected frames), inside arguments alongside question."
+                             " To read its contract instead, pass arguments=null (the entire object, not null values inside it).")
         if action == "inspect_media" and "media_inputs" in error.path and error.validator == "type":
             raise ValueError(f"{path}: {error.message}. media_inputs items are objects such as {{\"media_id\": \"visual:VIDEO\", \"time_s\": 2.5}} (or frame_no, or view for 3D, with an optional bbox); for a list of media use media_ids.")
         if action == "remux_media" and list(error.absolute_path) == ["ducking"] and error.validator == "type" and not isinstance(error.instance, str):
@@ -251,10 +255,14 @@ def invocation(actions, action, arguments, *, signatures=False):
             raise ValueError("write_text creates or overwrites a file; to add to the end of one, call the append_text action with the same path and text.")
         if action == "inspect_audio" and error.validator == "additionalProperties" and "question" in error.instance:
             raise ValueError("inspect_audio measures audio (levels, loudness, clipping, silence intervals) and answers no question: omit question. For spoken words use transcribe_media.")
+        if action == "inspect_media" and error.validator == "additionalProperties" and isinstance(error.instance, dict) and {"times", "timestamps", "times_s", "frames", "frame_nos"} & set(error.instance):
+            raise ValueError('inspect_media reads several frames in one call: media_inputs=[{"media_id": "visual:VIDEO", "time_s": 3}, {"media_id": "visual:VIDEO", "time_s": 12}, ...] (one item per frame, or frame_no), beside question. Nothing was executed.')
         if action == "inspect_media" and path in ("time_s", "frame_no") and isinstance(error.instance, list):
             raise ValueError(f"{path} takes one value. For several frames, pass media_inputs=[{{\"media_id\": \"visual:VIDEO\", \"{path}\": value}}, ...] (one item per frame), or use inspect_video for a time range.")
         if action == "inspect_media" and "bbox" in error.path:
             raise ValueError(f"{path}: {error.message}. bbox=[x_min,y_min,x_max,y_max], integers 0..1000 relative to the full image; x_max>x_min and y_max>y_min.")
+        if error.validator == "type" and isinstance(error.instance, list) and f"{path}s" in definition["parameters"]["properties"]:  # media_id / media_ids, path / paths
+            raise ValueError(f"{path} takes one value; pass several in {path}s: {{\"{path}s\": {json.dumps(error.instance, ensure_ascii=False)}}}. Nothing was executed.")
         if error.validator == "maxItems":
             raise ValueError(f"{path} has {len(error.instance)} items; this action takes at most {error.validator_value}: split them across calls (they may follow one another in one response). Nothing was executed.")
         if error.validator == "type" and (problem := json_string_problem(path, error.instance)):
@@ -332,9 +340,10 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
     model_filters["resolution"] = {"type": "string", "pattern": "^[1-9][0-9]*x[1-9][0-9]*$", "description": "Exact target canvas WIDTHxHEIGHT, e.g. 2048x2048. Require a recommended pixel budget in an available phase mode and respect max_width/max_height hard limits; unknown budgets are counted separately. Results include any phase setting to apply and block-aligned dimensions. This quality recommendation does not guarantee final dimensions after input fitting/upscaling. Use the same resolution string for generation; preset membership is unnecessary."}
     model_filters["capabilities"] = {"type": "array", "items": {"type": "string"}, "description": "Require every named capability. image_to_video means opening-frame support; reference_images means image reference conditioning; reference_videos means video reference conditioning, distinct from continuation or spatial control. Other examples: audio_output, video_continuation. Never relaxed by speciality matching."}
     filter_schema = {"type": "object", "properties": model_filters, "additionalProperties": False}
-    search_def = paginated(action_def("Find models by name, strict capabilities or specialities, ranked by speed/size preferences. query is a literal case-insensitive substring of name, ID, family or description; filters stay strict. specialities matches all named strengths or aliases, ignoring plural forms; only when no exact matches exist, returns partial matches with missing, word-match or substring evidence. Results sort by speciality relevance, then models dedicated to the filtered main_output, then matching speed/size preferences (both, one, neither). Without query or specialities, results are compact rows; read details with wangp_model. Prime inherits its live preferences; standalone MCP is neutral. Override preferences for this request only, using 'any' for no preference. accelerated='native' uses defaults; 'profiles' offers accelerator profiles; 'none' has none. size='lighter'/'large' is relative, not GB or a quality score. templates names the ready-made recipes built on a model ('task: template', readable with the templates tool).", {"query": {"type": "string", "default": ""}, "filters": filter_schema, "specialities": {"type": "array", "items": {"type": "string", "minLength": 1}}, "preferences": {"type": "object", "properties": {"speed": {"type": "string", "enum": ["fast", "standard", "any"]}, "size": {"type": "string", "enum": ["smaller", "larger", "any"]}}, "additionalProperties": False}}))
+    search_def = paginated(action_def("Find models by name, strict capabilities or specialities, ranked by speed/size preferences. query is a literal case-insensitive substring of name, ID, family or description; filters stay strict. specialities matches all named strengths or aliases, ignoring plural forms; only when no exact matches exist, returns partial matches with missing, word-match or substring evidence. Results sort by speciality relevance, then models dedicated to the filtered main_output, then matching speed/size preferences (both, one, neither). Without query or specialities, results are compact rows; read details with wangp_model. Prime inherits its live preferences; standalone MCP is neutral. Override preferences for this request only, using 'any' for no preference. accelerated='native' uses defaults; 'profiles' offers accelerator profiles; 'none' has none. size='lighter'/'large' is relative, not GB or a quality score. templates names the ready-made recipes built on a model as 'task/template', the form a generation's template setting takes (readable with the templates tool).", {"query": {"type": "string", "default": ""}, "filters": filter_schema, "specialities": {"type": "array", "items": {"type": "string", "minLength": 1}}, "preferences": {"type": "object", "properties": {"speed": {"type": "string", "enum": ["fast", "standard", "any"]}, "size": {"type": "string", "enum": ["smaller", "larger", "any"]}}, "additionalProperties": False}}))
     lookup_def = paginated(action_def("Light lookup of model types: model_type, name and main output media (image, video, audio, 3d, world) of the models whose type, name or family hold every word of query (case, spaces and dashes ignored: 'wan 2.2 text to video' finds Wan2.2 Text2video). Use it to turn a model the user names into its model_type; search gives capabilities, specialities and resolutions.", {"query": {"type": "string", "default": ""}, "output": {"type": "string", "enum": ["image", "video", "audio", "3d", "world"], "description": "Only models whose main output is this media (world: interactive world models, whose worlds are also videos)."}}))
     specialities_def = paginated(action_def("List declared model specialities and aliases, optionally filtered by model capabilities. Use returned names in search.specialities. Search directly first: plurals and aliases already match, so list the catalog only if a search finds nothing.", {"filters": filter_schema}))
+    specialities_def["_summary"] = "List declared model specialities and aliases, only when a search by specialities finds nothing: search already matches plurals and aliases."
 
     def template_index():
         """model_type -> the Deepy templates built on it, as 'task: template'."""
@@ -344,12 +353,12 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
         for group in operations["wangp_list_deepy_templates"]():
             for item in group["templates"]:
                 model_type = tool_settings.clone_tool_preset(group["tool_id"], item["template"])["model_type"]
-                index.setdefault(model_type, []).append(f"{group['tool_id']}: {item['template']}" + (" (default)" if item["default"] else ""))
+                index.setdefault(model_type, []).append(f"{group['tool_id']}/{item['template']}" + (" (default)" if item["default"] else ""))
         return index
 
     @mcp.tool()
     def wangp_models(action: str | None = None, arguments: dict[str, Any] | None = None, query: str | None = None) -> dict[str, Any]:
-        """Find models by name (query alone), or discover search filters, speciality matching and speed/size preferences. Search specialities directly (plurals and aliases already match); action='specialities', arguments={} lists declared strengths only if a search finds nothing. action='lookup', arguments={'query': ...} only names models (model_type, name, output)."""
+        """Find models for a need, by name (query) or by output, inputs, capabilities, specialities and speed/size preferences, and identify the ones to examine."""
         if query is not None:
             if action is not None or arguments is not None:
                 raise ValueError("Pass query alone, or use action='search' with query inside arguments alongside advanced filters.")
@@ -530,6 +539,12 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
         metadata = core._compact_deepy_model_metadata(session.get_model_metadata(result["settings"]["model_type"]))
         # model information, kept apart so that it is not copied into settings
         result["model"] = {key: metadata[key] for key in ("accelerated", "video_edit", "media_inputs", "resolution_budget", "resolution_budget_tiled", "resolution_min", "max_width", "max_height", "lock_resolutions", "allowed_resolutions", "vae_block_size") if key in metadata}
+        if result["general_properties_active"]:
+            result["notes"] = "These settings already include the active general_properties; apply the user's explicit values last."
+        model_type, model_def = result["settings"]["model_type"], session.get_model_def(result["settings"]["model_type"])
+        for property_name, route in (("infos", "input_guidance"), ("prompt_infos", "prompt_guidance")):  # the model's own help, as wangp_model defaults routes it
+            if model_def.get(f"deepy_{property_name}", model_def.get(property_name)) if agent_help else model_def.get(property_name):
+                result[route] = f'wangp_model(model_type="{model_type}", action="definition", arguments={{"property": "{property_name}"}})'
         return result
 
     def wangp_deepy_templates(tool_id: str | None = None, template: str = "default", cursor: str | None = None, action: str | None = None, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -547,17 +562,13 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
         return {**result, **template_names(tool_id, records)}
 
     if extended:
-        template_help = (
-            "Browse reusable generation recipes shared with Deepy. No arguments lists tasks and their configured defaults; task alone lists compact templates; "
-            "task + template returns full resolved settings. Use template='default' to read the configured default directly without browsing. "
-            "Browse rows include model specialities and supported media_inputs, not mandatory inputs: read model input/prompt guidance for the selected modes. "
-            "Returned settings already include active general_properties; apply explicit user overrides last. "
-            "Follow next_call to continue a template list. Sound effects have no task: find their models with wangp_models (specialities such as 'sound effects')."
-        )
+        template_help = "Deepy's reusable generation recipes by task (image, video, speech, music, 3D, worlds): browse them and read their full settings, including the user's configured defaults."
         template_parameters = {"type": "object", "properties": {
             "task": {"type": "string", "enum": list(DEEPY_USAGES), "description": "; ".join(f"{name}: {usage}" for name, usage in DEEPY_USAGES.items())},
-            "template": {"type": "string", "minLength": 1, "description": "A returned template name, or default for the configured default. Omit to browse without full settings."},
+            "template": {"type": "string", "minLength": 1, "description": "A template name, or default for the configured default."},
             "limit": copy.deepcopy(PAGING["limit"]), "cursor": copy.deepcopy(PAGING["cursor"])}, "required": [], "additionalProperties": False}
+        templates_usage = ("task alone lists its templates, to choose an alternative; task with template (a name, or default for the configured default) returns its full settings. "
+                           "Sound effects have no task: find their models with wangp_models (specialities such as 'sound effects').")
 
         @mcp.tool(description=template_help)
         def wangp_templates(task: str | None = None, template: str | None = None, limit: int = PAGE_SIZE, cursor: str | None = None) -> dict[str, Any]:
@@ -566,30 +577,31 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
             if task is None:
                 if template is not None or cursor is not None:
                     raise ValueError("task is required with template or cursor. Call wangp_templates() to list tasks.")
-                return {"tasks": [{"task": group["tool_id"], "description": DEEPY_USAGES[group["tool_id"]], "default_template": group["default_template"], "template_count": len(group["templates"])} for group in operations["wangp_list_deepy_templates"]()]}
+                return {"tasks": [{"task": group["tool_id"], "description": DEEPY_USAGES[group["tool_id"]], "default_template": group["default_template"], "template_count": len(group["templates"])} for group in operations["wangp_list_deepy_templates"]()], "usage": templates_usage}
             if task not in DEEPY_USAGES:
                 raise ValueError(f"Unknown task: {task}. Available tasks: {', '.join(DEEPY_USAGES)}.")
             if template is not None:
                 if not template.strip() or cursor is not None:
                     raise ValueError("template must be a nonempty name or 'default', and cannot be combined with cursor.")
-                result = template_settings(task, template)
+                result = template_settings(task, template.removeprefix(f"{task}/"))  # "task/template", as model search lists it and generation takes it
                 result.pop("tool_id", None)
                 return {"task": task, **result}
             records, metadata = None, None
             if not cursor:
                 group = operations["wangp_list_deepy_templates"](task)[0]
                 records = []
-                for item in sorted(group["templates"], key=lambda item: not item["default"]):
+                for item in sorted(group["templates"], key=lambda item: not item["default"]):  # the default first, named once by default_template
                     settings = tool_settings.clone_tool_preset(task, item["template"])
                     model = core._compact_deepy_model_metadata(session.get_model_metadata(settings["model_type"]))
-                    row = {"template": item["template"], "default": item["default"], "model_type": settings["model_type"], "media_inputs": model["media_inputs"]}
+                    # one string of roles per media kind (custom_file keeps its mode description)
+                    row = {"template": item["template"], "model_type": settings["model_type"], "media_inputs": {kind: roles if kind == "custom_file" else ", ".join(roles) for kind, roles in model["media_inputs"].items()}}
                     if item["label"] != item["template"]:
                         row["label"] = item["label"]
                     if model.get("specialities"):
                         row["specialities"] = [entry["name"] for entry in model["specialities"]]
                     row["input_modes"] = {key: settings[key] for key in ("image_prompt_type", "video_prompt_type", "audio_prompt_type") if settings.get(key)}
                     records.append(row)
-                metadata = {"task": task, "default_template": group["default_template"]}
+                metadata = {"task": task, "default_template": group["default_template"], "notes": TEMPLATE_ROWS_NOTE}
             result = collection(["templates", task], records, {"limit": limit, "cursor": cursor}, "templates", metadata)
             if result["has_more"]:
                 result["next_call"] = {"task": task, "limit": limit, "cursor": result["next_cursor"]}
@@ -597,8 +609,8 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
     else:
         mcp.tool(description=template_help)(wangp_deepy_templates)
 
-    gallery_help = ("List current and remembered Gallery images, videos, audio, 3D assets and worlds. selected_only=true returns only the media the user selected in the gallery WanGP shows (with the video playhead time); media_type filters by kind. "
-                    "Results alternate image/video, audio, 3D and Worlds, newest-first within each gallery. A world is explored by the user in the Worlds gallery; its video is in the image/video gallery and IO info on its media_id lists its segments. Returned media_id values identify inputs to other tools. " + ("Continue with unchanged filters and cursor=next_cursor." if deepy_help else PAGING_HELP))
+    gallery_help = ("List the Gallery's current and remembered images, videos, audio, 3D assets and worlds, or only the media the user selected (with the video playhead time); their media_id values are the inputs of the other tools."
+                    + ("" if deepy_help else " " + PAGING_HELP))
     gallery_parameters = {"type": "object", "properties": {"media_type": {"type": "string", "enum": ["all", "image", "video", "audio", "3d", "world"], "default": "all"}, "selected_only": {"type": "boolean", "default": False}, **copy.deepcopy(PAGING)}, "required": [], "additionalProperties": False}
 
     @mcp.tool(description=gallery_help)
@@ -620,8 +632,12 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
             with core._GALLERY_LOCK:
                 snapshot = copy.deepcopy(list(core._gallery_history(session).values()))
             ordered = [record for record in reversed(snapshot) if (kind == "all" or record["media_type"] == kind) and (not selected or record["selected"])]
+            if any(record["media_type"] == "world" for record in ordered):
+                metadata["worlds"] = "The user explores a world in the Worlds gallery; its video is in the image/video gallery, and wangp_io info on the world's media_id lists its segments."
             if kind == "all":
                 galleries = [[record for record in ordered if record["gallery"] == source.media_ids] for source in core.GALLERY_SOURCES]
+                if sum(1 for group in galleries if group) > 1:
+                    metadata["order"] = "The galleries alternate (image/video, audio, 3D, Worlds), newest first within each."
                 ordered = (record for group in zip_longest(*galleries) for record in group if record is not None)
             records = (gallery_row(record) for record in ordered)
         return collection(["gallery", kind, selected], records, arguments, "media", metadata)
@@ -1029,6 +1045,8 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
                 return {"status": "done", "items": [run_toolbox(action, {"media_id": media_id}) for media_id in arguments["media_ids"]]}
             result = operations["wangp_get_media_settings"](**arguments)
             hide_enhancer(result["settings"])
+            if str(result["settings"].get("mode") or "").startswith("edit_"):
+                result["note"] = "A post-processing task: wangp_generate takes these settings as they are, without model_type or prompt."
             return public_media_result(result, get_toolbox().session.media_registry)
         if action == "remux_media":
             toolbox = get_toolbox()
@@ -1058,6 +1076,8 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
             result = public_media_result(view_images(records, **resolved), toolbox.session.media_registry)
         else:
             result = public_media_result(operations["wangp_toolbox"](action, arguments), get_toolbox().session.media_registry, compact=True, virtualize=virtualize)
+        if action == "inspect_media" and "media_inputs" not in arguments and any(item.get("media_type") == "video" for item in result.get("media", [])):  # a video named by id is one frame
+            result["note"] = "A video given by media_id is read as one frame (its first). For motion or change over time use inspect_video, which samples a time range."
         if "_mcp_images" in result:
             from mcp.types import CallToolResult, TextContent
 
@@ -1094,16 +1114,17 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
 
     generate_help = (
         "Generate image, video, audio or 3D assets. settings is one flat WanGP settings object, or a list of them for a batch submitted together in order. "
-        "Each object needs model_type and the complete prompt; other WanGP settings go beside them, only custom_settings and the post-processing slots' spatial/temporal_postprocessing_parameters hold nested values, and media go directly in fields such as image_start or audio_guide. "
-        "Template and media settings can be copied and edited. edit_* post-processing tasks need no model or prompt. "
-        + ("" if deepy_help else "A prompt may be @file(\"@documents/prompt.txt\"): WanGP reads and snapshots that authorized UTF-8 file, preserving blank lines. ") +
-        "Omitted resolution, video_length or duration_seconds, and seed use Deepy's standing defaults (world models keep their own resolution and length) before model factory settings; supplied values are preserved. " + wait_help)
+        "Each object needs model_type and the complete prompt (a template supplies model_type), with the other settings beside them; only custom_settings and *_postprocessing_parameters hold objects, and media go directly in fields such as image_start or audio_guide. "
+        "Template and media settings can be copied and edited. "
+        + ("" if deepy_help else "A prompt may be @file(\"@documents/prompt.txt\"): WanGP reads and snapshots that authorized UTF-8 file, preserving blank lines. "
+           "Omitted resolution, video_length or duration_seconds, and seed use Deepy's standing defaults (world models keep their own resolution and length) before model factory settings; supplied values are preserved. ")  # Prime's system message states the defaults
+        + wait_help)
     generation_settings = {"type": "object", "properties": {"template": {"type": "string", "description": 'Optional template to start from: "<task>" (such as "gen_video") for its configured default, or "<task>/<template name>". WanGP fills in its settings except its example prompt and alt_prompt; give only the keys you change.'},
                                                             "model_type": {"type": "string", "description": "WanGP model type (from the template when one is named)."}, "prompt": {"type": "string", "description": "Complete prompt text or @file reference."}},
                            "required": ["prompt"], "additionalProperties": True}
     request_properties = {"request_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 200, "description": "Optional retry key: the same key and payload returns the original job, even after a restart; a different payload is rejected."}} if extended else {}
     if extended:
-        @mcp.tool(description="CPU-only preflight without submitting, downloading or loading models. Supply settings (one generation or batch), OR media + process + parameters for a processor. Summary returns requested size/duration, grid-adjusted canvas and initial dimensions for simple inputs, the window_plan of sliding-window videos (each window's generated_seconds), adjustments, inputs, diagnostics, availability and queue counts. Initial dimensions precede optional upscaling; complex input sizing is marked unresolved. Requested values are not predictions of final output geometry or cumulative duration. detail='full' only adds every effective setting and its origin (about 10 KB per task). valid does not guarantee runtime memory or model-specific inference checks.")
+        @mcp.tool(description="Check generation settings (one generation or a batch), or media + process + parameters for a processor, on the CPU without submitting, downloading or loading anything: sizes, durations, the sliding-window plan, adjustments and diagnostics. detail='full' adds every effective setting and its origin (about 10 KB per task).")
         def wangp_validate(settings: dict[str, Any] | list[dict[str, Any]] | None = None, media: str | None = None, process: str | None = None, parameters: dict[str, Any] | None = None, detail: Literal["summary", "full"] = "summary") -> dict[str, Any]:
             return public_media_result(operations["wangp_validate"](expand_templates(settings), media, process, parameters, detail), virtualize=virtualize)
 
@@ -1164,7 +1185,7 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
 
     @mcp.tool()
     def wangp_postprocess(media: str, action: str | None = None, arguments: dict[str, Any] | None = None, wait: bool = True, timeout_s: float | None = None, event_limit: int = 0, request_id: str | None = None) -> dict[str, Any]:
-        """Discover and apply compatible image, video, audio or 3D mesh treatments, including upscaling, refinement, interpolation, sound processing, and mesh refinement and texturing. media is the media ID or path to process; use "image", "video", "audio" or "3d" only to list treatments before any media exists."""
+        """Discover and apply image, video, audio or 3D mesh treatments: upscaling, refinement, interpolation, sound processing, mesh refinement and texturing. media is the media ID or path to process, or "image", "video", "audio" or "3d" with no action to list the treatments of that media."""
         from postprocessing import catalog
         from shared.utils import mesh_postprocessing
 

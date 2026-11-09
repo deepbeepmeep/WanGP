@@ -90,6 +90,9 @@ def parse_instruction(line, controls=CAMERA_CONTROLS):
         if event is not None:
             break
     if event is None and rest:
+        if rest.lstrip().startswith("+"):  # [Left] + [Look_Right]: moves held together share one bracket
+            joined = "[" + "+".join(part.strip() for part in re.findall(r"\[([^\]]*)\]", line)) + "]"
+            raise ValueError(f"Moves made together go in one bracket, {joined}, not '{line.strip()}'")
         raise ValueError(f"Text after a world instruction needs an [Event] before it: '{line.strip()}'")
     return {"keys": keys, "seconds": seconds, "event": (rest if event is not None else "").strip(), "text": line.strip()}
 

@@ -1,8 +1,8 @@
 {
     "model": {
-        "name": "MiniMax H3 P-H3-Image 8-Step 20B",
+        "name": "MiniMax H3 P-H3-Image 20B",
         "architecture": "minimax_h3_image",
-        "description": "Generates a single image from text, or edits an image with up to 8 input images, in 8 steps without guidance. Works best at 8 megapixels, and is strongest at photorealism, film and editorial looks and graphic styles with short quoted text. No video or audio; hands and dense text can break.",
+        "description": "Generates a single image from text, or edits an image with up to 8 input images, in 8 steps without guidance, or in 2 to 4 steps with the pDMD accelerator profiles. Works best at 8 megapixels, and is strongest at photorealism, film and editorial looks and graphic styles with short quoted text. No video or audio; hands and dense text can break.",
         "URLs": "minimax_h3_fl2va_pruned",
         "loras": [
             "https://huggingface.co/DeepBeepMeep/MiniMax-H3/resolve/main/loras/p-h3-image_lora_bf16.safetensors"

@@ -387,7 +387,6 @@ class MotionDesignerPlugin(WAN2GPPlugin):
                     c="copy",
                     r=frame_rate,
                     **{
-                        "vsync": "cfr",
                         "fps_mode": "cfr",
                         "fflags": "+genpts",
                         "copyts": None,

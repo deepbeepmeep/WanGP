@@ -8,6 +8,7 @@ from typing import Any, Tuple
 import torch
 from mmgp import offload
 from safetensors import safe_open
+from tqdm import tqdm
 from shared.utils import files_locator as fl
 from shared.utils.cancellation import check_cancelled
 
@@ -22,7 +23,7 @@ from .assets import (
     LLAMA32_FOLDER,
     LLAMAJOY_FOLDER,
 )
-from shared.deepy.config import resolve_deepy_kv_cache_quantization
+from shared.deepy.config import gguf_kernels_warning, resolve_deepy_kv_cache_quantization
 from .config import resolve_prompt_enhancer_speculative_decoding, speculative_decoding_runtime
 
 
@@ -139,6 +140,9 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, qwen_
     ensure_prompt_enhancer_assets(process_files_def, enhancer_enabled=enhancer_enabled, qwen_backend=qwen_backend, speculative_decoding=speculative_decoding)
 
     if enhancer_enabled in (3, 4, 5, 6, 7):
+        kernels_warning = gguf_kernels_warning() if torch.cuda.is_available() else ""  # the kernels exist for NVIDIA and AMD GPUs only
+        if kernels_warning:
+            tqdm.write(f"\033[91m[Prompt Enhancer / Deepy] {kernels_warning}\033[0m")
         deepy_kv_cache_quantization, kv_cache_message = resolve_deepy_kv_cache_quantization(deepy_kv_cache_quantization)
         if kv_cache_message:
             print(f"[Prompt Enhancer / Deepy] {kv_cache_message}")
@@ -157,6 +161,7 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, qwen_
             get_qwen35_text_gguf_path,
             get_qwen35_variant_spec,
             load_qwen35_vl_prompt_enhancer,
+            locate_qwen35_folder,
         )
 
         qwen35_variant = get_qwen35_prompt_enhancer_variant(enhancer_enabled)
@@ -164,7 +169,7 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, qwen_
         quantization = get_qwen35_quantization(qwen_backend or enhancer_quantization_QUANTO_INT8, variant=qwen35_variant)
         backend = enhancer_quantization_GGUF if quantization in (enhancer_quantization_GGUF_Q3, enhancer_quantization_GGUF_Q2, enhancer_quantization_GGUF_PTQ1, enhancer_quantization_GGUF_Q8) else quantization
         assets_dir_name = get_qwen35_assets_dir_name(qwen35_variant)
-        assets_dir = fl.locate_folder(assets_dir_name, error_if_none=False) or fl.get_download_location(assets_dir_name)
+        assets_dir = locate_qwen35_folder(assets_dir_name) or fl.get_download_location(assets_dir_name)
         if backend == enhancer_quantization_GGUF:
             from shared.qtypes.gguf import get_gguf_compute_dtype
             default_dtype = get_gguf_compute_dtype()

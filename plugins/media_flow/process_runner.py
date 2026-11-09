@@ -820,6 +820,7 @@ class ProcessRunner:
                     source_audio_track=source_audio_track,
                     chunk_size_seconds=chunk_size_seconds,
                     sliding_window_overlap=sliding_window_overlap,
+                    sliding_window_size=process_settings.get("sliding_window_size"),
                     start_seconds=start_seconds,
                     end_seconds=end_seconds,
                     model_type=model_type,

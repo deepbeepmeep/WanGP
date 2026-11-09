@@ -1,8 +1,11 @@
 """Shared fixed-shape sampling for native MTP and block drafters."""
+import os
 import time
 import torch
 
 from ..layers.draft_chain import CompactDrafts
+
+_COMPACT = "compact_accept" in os.environ.get("WGP_FN_ENABLE", "").split(",")  # the acceptance on the target's top-k support (compact_acceptance), until validated
 
 
 def bounded_support(seq):
@@ -73,8 +76,10 @@ def sample_verified_block(runner, seq, logits, draft_tokens, draft_distributions
         penalty = 1.  # inside code, quotes or backticks: copied text, not repetition (drafted tokens of the block are approximated as outside)
     exempt = seq.repetition_exempt_ids if penalty != 1 else None
     compact = isinstance(draft_distributions, CompactDrafts)
+    from . import compact_acceptance
+    support = _COMPACT and seq.top_k != 1 and compact_acceptance.supported(seq, logits)
     key = (n, vocab, logits.dtype, seq.top_k, seq.top_p, seq.min_p, seq.temperature, penalty, exempt,
-           tuple(rules["suppressed"]), tuple(rules["thinking_stops"]), tuple(sorted(stop_ids)), compact)
+           tuple(rules["suppressed"]), tuple(rules["thinking_stops"]), tuple(sorted(stop_ids)), compact, support)
     graphs = getattr(self, "_speculative_acceptance_graphs", None)
     if graphs is None:
         graphs = self._speculative_acceptance_graphs = {}
@@ -100,6 +105,10 @@ def sample_verified_block(runner, seq, logits, draft_tokens, draft_distributions
                      stops=mask(stop_ids), uniforms=torch.ones(n, device=logits.device),
                      noise=torch.ones(vocab, device=logits.device), exempt=None if exempt is None else mask(exempt))
         def compute():
+            if support:
+                ids, probabilities, unsafe = compact_acceptance.target_probabilities(state["logits"], state["drafts"], state["history"], state["bias"], state["suppressed"], state["thinking_stops"],
+                                                                                     state["thinking"], penalty, state["exempt"], min(seq.top_k, vocab), seq.top_p, seq.min_p, seq.temperature)
+                return compact_acceptance.accept_block(ids, probabilities, unsafe, state["drafts"], state["q"], state["length"], state["uniforms"], state["noise"], state["stops"])
             scores = apply_rules(state["logits"], state["drafts"], state["history"], state["bias"],
                                  state["suppressed"], state["thinking_stops"], state["thinking"], penalty, state["exempt"])
             if seq.top_k == 1:
@@ -153,7 +162,7 @@ def sample_verified_block(runner, seq, logits, draft_tokens, draft_distributions
     rounds = getattr(self, counter, 0) + 1
     setattr(self, counter, rounds)
     if rounds == 1:
-        label = {"mtp": "MTP", "dflash": "DFlash2", "dspark": "DSpark"}[method]
+        label = {"mtp": "MTP", "dflash": "DFlash2", "dspark": "DSpark", "dspine": "DSpine"}[method]
         print(f"[Deepy][{label}] GPU block acceptance active (one completed-block readback).")
     emitted = tokens[:count]
     for i in range(visited):
@@ -168,3 +177,81 @@ def sample_verified_block(runner, seq, logits, draft_tokens, draft_distributions
     self._mark_mtp_stage_profile(profile, 6, "sampling", started)
     return emitted, accepted
 
+
+
+def sample_verified_tree(runner, seq, logits, tokens, tree):
+    """Tree acceptance on GPU (draft_tree.accept_tree): the target's own sampling at each visited node, under the rules of the path that
+    leads there. Returns (emitted tokens, accepted nodes in order), or None when a row of the tree has an ambiguous nucleus support: the
+    caller then walks the tree with the reference sampler."""
+    self = runner
+    from .dflash_sampling import target_probabilities
+    from .draft_tree import accept_tree, apply_tree_rules
+    count, vocab = tree.size, logits.shape[-1]
+    processor = seq.logits_processor
+    rules = processor._speculative_batch_rules() if processor is not None else {"suppressed": (), "thinking_stops": (), "thinking": (-1, 0, 0)}
+    stop_ids = set(getattr(seq, "speculative_stop_token_ids", ()))
+    if not seq.ignore_eos:
+        stop_ids.add(self.config.eos)
+    penalty = float(seq.repetition_penalty or 1.)
+    if penalty != 1 and self._sync_repetition_token_cache(seq)["span"] != (False, False, False):
+        penalty = 1.  # inside code, quotes or backticks: copied text, not repetition
+    exempt = seq.repetition_exempt_ids if penalty != 1 else None
+    key = ("tree", count, vocab, logits.dtype, seq.top_k, seq.top_p, seq.min_p, seq.temperature, penalty, exempt,
+           tuple(rules["suppressed"]), tuple(rules["thinking_stops"]), tuple(sorted(stop_ids)))
+    graphs = getattr(self, "_speculative_acceptance_graphs", None)
+    if graphs is None:
+        graphs = self._speculative_acceptance_graphs = {}
+    state = graphs.pop(key, None)
+    if state is None:
+        if len(graphs) >= 8:
+            graphs.pop(next(iter(graphs)))
+
+        def mask(ids):
+            value = torch.zeros(vocab, dtype=torch.bool, device=logits.device)
+            valid = [int(i) for i in ids if 0 <= int(i) < vocab]
+            if valid:
+                value.index_fill_(0, torch.tensor(valid, device=logits.device), True)
+            return value
+        parents, depths, _, _, _ = tree.tensors(logits.device)
+        ancestors = torch.tensor([[node in line for node in range(count)] for line in tree.lineage], dtype=torch.bool, device=logits.device)
+        state = dict(logits=logits.clone(), tokens=tokens.clone(), parents=parents, depths=depths, ancestors=ancestors,
+                     history=mask(()), bias=torch.zeros_like(logits[0]), suppressed=mask(rules["suppressed"]), thinking_stops=mask(rules["thinking_stops"]),
+                     thinking=torch.tensor(rules["thinking"], dtype=torch.int64, device=logits.device), stops=mask(stop_ids),
+                     noise=torch.ones((count, vocab), device=logits.device), exempt=None if exempt is None else mask(exempt))
+
+        def compute():
+            scores = apply_tree_rules(state["logits"], state["tokens"], state["ancestors"], state["depths"], state["history"], state["bias"],
+                                      state["suppressed"], state["thinking_stops"], state["thinking"], penalty, state["exempt"])
+            if seq.top_k == 1:
+                probabilities, unsafe = scores, torch.zeros(count, dtype=torch.bool, device=logits.device)
+            else:
+                probabilities, unsafe = target_probabilities(scores, None if seq.top_k is None else min(seq.top_k, vocab), seq.top_p, seq.min_p, seq.temperature)
+            return accept_tree(probabilities, unsafe, state["tokens"], state["parents"], state["noise"], state["stops"], tree.depth, greedy=seq.top_k == 1)
+        compute()
+        graph, packed = capture_sampling_graph(self, compute)
+        state.update(graph=graph, packed=packed)
+    graphs[key] = state
+    state["logits"].copy_(logits)
+    state["tokens"].copy_(tokens)
+    state["history"].zero_()
+    if penalty != 1:
+        history = self._sync_repetition_token_cache(seq)["token_ids"]
+        if history:
+            state["history"].index_fill_(0, torch.tensor(history, dtype=torch.int64, device="cpu").to(logits.device, non_blocking=True), True)
+    bias = self._get_logits_bias(seq, logits)
+    state["bias"].zero_() if bias is None else state["bias"].copy_(bias.reshape(-1))
+    for i, value in enumerate(rules["thinking"]):
+        state["thinking"][i].fill_(value)
+    if seq.top_k != 1:
+        state["noise"].exponential_(1, generator=self._sampling_generator).clamp_min_(1e-10)
+    state["graph"].replay()
+    packed = state["packed"].tolist()  # the sole D2H boundary of the tree's acceptance
+    emitted_count, accepted, fallback = packed[:3]
+    if fallback:
+        return None
+    nodes = packed[3:3 + tree.depth][:accepted]
+    emitted = packed[3 + tree.depth:][:emitted_count]
+    if seq.logits_processor_update_state is not None:
+        for token in emitted:
+            seq.logits_processor_update_state(token)
+    return emitted, nodes

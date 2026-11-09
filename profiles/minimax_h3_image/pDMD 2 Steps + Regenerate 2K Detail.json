@@ -1,0 +1,14 @@
+{
+    "activated_loras": [
+        "https://huggingface.co/DeepBeepMeep/MiniMax-H3/resolve/main/loras/minimax_h3_pdmd_2nfe_bf16.safetensors",
+        "https://huggingface.co/DeepBeepMeep/MiniMax-H3/resolve/main/loras/open_h3_regenerate_2k_lora.safetensors"
+    ],
+    "loras_multipliers": "1;0 0;1",
+    "guidance_phases": 2,
+    "num_inference_steps": 2,
+    "num_inference_steps2": 3,
+    "switch_threshold": 0.7,
+    "custom_sigmas": "; 0.700000, 0.659794, 0.513173",
+    "guidance_scale": 1,
+    "sample_solver": "euler"
+}

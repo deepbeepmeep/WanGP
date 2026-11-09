@@ -657,7 +657,7 @@ class AssistantRuntimeHooks:
     unload_weights: Callable[[], None]
     ensure_vision_loaded: Callable[[], tuple[Any, Any]] | None = None
     get_offload_manager: Callable[[], Any] = lambda: None
-    loading_scope: Callable[[], Any] = nullcontext  # a context that shows the progress of a first call's preparation (MMGP's loading context)
+    loading_scope: Callable[[bool, Callable[[str], None]], Any] = lambda _show_status, _on_phase: nullcontext()  # MMGP's loading context around a call's preparation: its steps to on_phase, and to the status when show_status (a first call)
 
 
 def get_or_create_assistant_session(state) -> AssistantSessionState:
@@ -4899,7 +4899,7 @@ class DeepyZeroTools:
 
     @assistant_tool(
         display_name="Inspect Audio",
-        description="Inspect the selected audio stream's playable range on CPU: peak/RMS, clipping indicators, EBU R128 loudness and below-threshold silence intervals. Coverage excludes decoder tail padding when track duration is known; silence does not mean zero or missing audio. Optional playable preview (at most 30 seconds). Does not transcribe or judge musical quality.",
+        description="Inspect the selected audio stream's playable range on CPU: peak/RMS, clipping indicators, EBU R128 loudness and below-threshold silence intervals, optionally the music's tempo and beats. Coverage excludes decoder tail padding when track duration is known; silence does not mean zero or missing audio. Optional playable preview (at most 30 seconds). Does not transcribe or judge musical quality.",
         parameters={
             "media_id": {"type": "string", "description": "Audio or video media ID or authorized file.", "required": True},
             "audio_track_no": {"type": "integer", "description": "1-based audio stream; default 1.", "required": False},
@@ -4909,13 +4909,14 @@ class DeepyZeroTools:
             "min_silence_s": {"type": "number", "description": "Minimum silence interval in seconds; default 0.2.", "required": False},
             "preview": {"type": "boolean", "description": "Create a playable Gallery excerpt; default false.", "required": False},
             "pitch": {"type": "boolean", "description": "Optional, for an isolated voice (a vocal stem or speech, not a full mix): voice_pitch_hz, its median pitch; female voices mostly sit above about 165 Hz, male ones below.", "required": False},
+            "beats": {"type": "boolean", "description": "Optional, for music: beats.tempo_bpm, beats.times (the beats, in seconds) and beats.bar_starts (first beats of 4-beat bars, when clear): the cut points for editing to the music.", "required": False},
             "preview_s": {"type": "number", "description": "Excerpt length, at most 30 seconds; default 10. Starts at start_s.", "required": False},
             "window_s": {"type": "number", "description": "Optional envelope window in seconds (0.1..600, at most 600 windows): adds lists of RMS, peak and loudest momentary loudness per window (window i starts at start_s + i * window_s), for finding climaxes, gaps and balance in one call.", "required": False},
         },
         pause_runtime=False,
     )
-    def inspect_audio(self, media_id: str, audio_track_no: int = 1, start_s: float = 0.0, duration_s: float | None = None, silence_db: float = -50.0, min_silence_s: float = 0.2, preview: bool = False, preview_s: float = 10.0, pitch: bool = False, window_s: float | None = None) -> dict[str, Any]:
-        from shared.deepy.audio_inspection import inspect_audio, voice_pitch
+    def inspect_audio(self, media_id: str, audio_track_no: int = 1, start_s: float = 0.0, duration_s: float | None = None, silence_db: float = -50.0, min_silence_s: float = 0.2, preview: bool = False, preview_s: float = 10.0, pitch: bool = False, window_s: float | None = None, beats: bool = False) -> dict[str, Any]:
+        from shared.deepy.audio_inspection import inspect_audio, music_beats, voice_pitch
 
         self._sync_recent_media()
         source = self._resolve_media_record_input(media_id)
@@ -4927,6 +4928,8 @@ class DeepyZeroTools:
         result["source_media_id"] = source["media_id"]
         if pitch:
             result["voice_pitch_hz"] = voice_pitch(source["path"], start_time=start_s, duration=duration_s)
+        if beats:
+            result["beats"] = music_beats(source["path"], audio_track_no=audio_track_no, start_time=result["coverage"]["start_time"], duration=result["coverage"]["duration_seconds"])
         if output:
             settings = self._build_direct_media_settings(source, "Audio inspection preview")
             record = self._record_direct_media(output, settings, is_image=False, audio_only=True, label="Audio Preview")
@@ -6854,6 +6857,7 @@ class AssistantEngine:
         self._compaction_thinking_enabled = False
         self._prefill_started_at: float | None = None
         self._live_prefill_tokens = 0
+        self._prepared_at = 0.0  # time of MMGP's last report of a preparation step (loading_scope)
         self._context_progress_at = 0.0
         self._segment_generated_tokens = 0
         self._segment_metrics_checkpoint_at: float | None = None
@@ -7043,13 +7047,19 @@ class AssistantEngine:
             if long_call:
                 self.runtime.context_progress = None
                 self._close_context_progress()
-            elapsed_seconds = max(0.0, time.perf_counter() - started_at - (0.0 if runtime is None else runtime.prefill_setup_seconds))
+            # the runtime's setup and the call's preparation after a load (experts placed by the first forward's hook) both open the call
+            setup_seconds = max(0.0 if runtime is None else runtime.prefill_setup_seconds, self._prepared_at - started_at)
+            elapsed_seconds = max(0.0, time.perf_counter() - started_at - setup_seconds)
             self._prefill_started_at = None
             self._live_prefill_tokens = 0
             should_record = record_if(result) if callable(record_if) else bool(record_if)
             if completed and should_record:
                 self._record_prefill_metrics(tokens, elapsed_seconds)
             self._emit_stats(force=True)
+
+    def _note_preparation(self, phase: str) -> None:
+        if phase != "Reading the Prompt":  # Flash-Next's own prompt pass (qwen4_exp): the reading the prefill speed measures
+            self._prepared_at = time.perf_counter()
 
     def _report_context_progress(self, done: int, total: int) -> None:
         """A conversation being rebuilt moves the bar of the status line, three times a second at most."""
@@ -10095,7 +10105,10 @@ class AssistantEngine:
             self.session.current_turn["selected_mesh_media_snapshot"] = copy.deepcopy(mesh_media_record)
             world_media_record, _world_error = self.tool_box._get_selected_media_record_from_source("world", "world")
             self.session.current_turn["selected_world_media_snapshot"] = copy.deepcopy(world_media_record)
-        if replay is None:
+        if replay is None:  # a new answer shows its own speeds from its start, not the last seconds of the previous one
+            self.session.prefill_speed_window.clear()
+            self.session.generation_speed_window.clear()
+            self._emit_stats(force=True)
             self._refresh_runtime_status_note()
             self.session.messages.append(self._build_pending_user_message(user_text))
             checkpoint_assistant_turn(self.session)
@@ -10142,8 +10155,9 @@ class AssistantEngine:
                         encoded_prefix = runtime.tokenizer.encode(str(replay["completion_prefix"]), add_special_tokens=False)
                         replay_prefix_token_ids = encoded_prefix.tolist() if hasattr(encoded_prefix, "tolist") else list(encoded_prefix)
                         action_reserve_tokens += len(replay_prefix_token_ids)
-                    # a first call moves the weights to the GPU, captures graphs, places experts and reads the instructions: its status says which
-                    with self.runtime_hooks.loading_scope() if show_loading_status else nullcontext():
+                    # a call after a load moves the weights to the GPU, captures graphs, places experts and reads the instructions: the prefill speed
+                    # leaves the preparation out, and the status of a first call says which step runs
+                    with self.runtime_hooks.loading_scope(show_loading_status, self._note_preparation):
                         self._sync_generation_context(action_reserve_tokens)
                     if self.session.interrupt_requested:
                         break

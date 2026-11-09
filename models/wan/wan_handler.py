@@ -1000,6 +1000,15 @@ class family_handler():
         return latent_rgb_factors, latent_rgb_factors_bias
     
     @staticmethod
+    def query_retired_files(model_type):
+        """Checkpoints that earlier releases of a model type downloaded and its current definition no longer names (Models Manager
+        lists them with the model, to delete them)."""
+        return {
+            "i2v_2_2": ["WAN22.XX_Palingenesis_high_i2v_fix.safetensors", "WAN22.XX_Palingenesis_low_i2v_fix.safetensors"],
+            "t2v_2_2": ["WAN22.XX_Palingenesis_high_t2v.safetensors", "WAN22.XX_Palingenesis_low_t2v.safetensors", "Wan2.2-T2V-A14B-4steps-250928-dyno-high-lightx2v.safetensors"],
+        }.get(model_type, [])
+
+    @staticmethod
     def query_model_files(computeList, base_model_type, model_def=None):
         download_def = []
         if base_model_type == "kiwi_edit":

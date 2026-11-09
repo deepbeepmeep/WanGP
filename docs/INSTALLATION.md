@@ -14,7 +14,7 @@ Existing-installation updates require Git and a WanGP Git checkout with no pendi
 
 To update **Manager itself**, use **Preferences → Check for Manager updates**, download the latest installer, close Manager and run it. The installer defaults to **Update in place** when upgrading and preserves your installation list and preferences; uninstalling first is unnecessary. The permanent download URL stays the same across releases.
 
-It is recommended to use Python 3.10.9, PyTorch 2.7.1 with Cuda 12.8 for GTX 10XX and Python 3.11.14, PyTorch 2.10 with Cuda 13.0/13.1 for RTX 20XX - RTX 50XX. RTX 20XX requires Triton 3.2.
+It is recommended to use Python 3.10.9, PyTorch 2.7.1 with Cuda 12.6 for GTX 10XX and Python 3.11.14, PyTorch 2.10 with Cuda 13.0/13.1 for RTX 20XX - RTX 50XX. RTX 20XX requires Triton 3.2.
 
 It is not recommended to use either PytTorch 2.8.0 as some System RAM memory leaks have been observed when switching models or 2.9.0 which has some Convolution 3D perf issues (VAE VRAM requirements explode).
 
@@ -40,7 +40,7 @@ pip install -r requirements.txt
 
 ### GTX 10xx Installation
 
-you must install Cuda 12.8: https://developer.nvidia.com/cuda-12-8-0-download-archive
+you must install Cuda 12.6: https://developer.nvidia.com/cuda-12-6-0-download-archive
 
 Then open a Terminal Window get in the parent folder where you would to install WanGP and then type in:
 ```bash
@@ -48,9 +48,11 @@ git clone https://github.com/deepbeepmeep/Wan2GP.git
 cd Wan2GP
 conda create -n wan2gp python=3.10.9
 conda activate wan2gp
-pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/test/cu128
+pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu126
 pip install -r requirements.txt
 ```
+
+Use the CUDA 12.6 build on Windows and Linux: the Linux CUDA 12.8 build of PyTorch 2.7.1 only runs on RTX 20XX and newer, so WanGP stops at startup with "no kernel image is available for execution on the device" on a GTX 10XX.
 
 ## INT8 Math Kernels
 
@@ -76,27 +78,27 @@ For **PyTorch 2.10 / CUDA 13** (NVIDIA R580+ driver):
 
 ```bash
 # Windows
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.2/wgpkernels-1.4.2%2Bcu130-py3-none-win_amd64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Bcu130-py3-none-win_amd64.whl
 # Linux (glibc 2.34+)
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.2/wgpkernels-1.4.2%2Bcu130-py3-none-linux_x86_64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Bcu130-py3-none-linux_x86_64.whl
 ```
 
 For **PyTorch 2.7.1 / CUDA 12.8** (NVIDIA R570+ driver):
 
 ```bash
 # Windows
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.2/wgpkernels-1.4.2%2Bcu128-py3-none-win_amd64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Bcu128-py3-none-win_amd64.whl
 # Linux (glibc 2.34+)
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.2/wgpkernels-1.4.2%2Bcu128-py3-none-linux_x86_64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Bcu128-py3-none-linux_x86_64.whl
 ```
 
 For **AMD RDNA4 (`gfx1200`, `gfx1201`) with PyTorch 2.13.0 / ROCm 10.0** (experimental):
 
 ```bash
 # Windows
-python -m pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.2/wgpkernels-1.4.2%2Brocm100-py3-none-win_amd64.whl
+python -m pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Brocm100-py3-none-win_amd64.whl
 # Linux
-python -m pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.2/wgpkernels-1.4.2%2Brocm100-py3-none-linux_x86_64.whl
+python -m pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Brocm100-py3-none-linux_x86_64.whl
 ```
 
 The AMD wheel provides INT8 linear kernels. Native AdaLN, PixelNorm + SiLU and Conv3D remain CUDA-only; AMD retains the independent supported backends for those operations. AMD packages pass installation and library-loading checks, but kernel execution on AMD hardware remains unvalidated.

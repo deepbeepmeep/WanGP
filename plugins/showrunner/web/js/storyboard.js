@@ -68,10 +68,34 @@ const FILTERS = [['all', 'All'], ['todo', 'To shoot'], ['review', 'To review'], 
 const STATUS_LABEL = { planned: 'Not shot', queued: 'Queued', rendering: 'Rendering', rendered: 'To review', approved: 'Approved', rejected: 'Redo', failed: 'Failed' };
 export const BIN_TYPE = 'application/x-showrunner-bin';
 export const SHOT_TYPE = 'application/x-showrunner-shots';
+export const SOUND_LAID = 'The sound plays from this shot on: shorten or move it on the Timeline\'s Sound lane.';
 
 export function shotPoster(shot) {
-  const take = actions.take(shot);
-  return take?.poster ? actions.file(take.poster) : take?.kind === 'image' ? actions.file(take.path) : !take && shot.painted_frames?.length ? actions.file(shot.painted_frames[0].path) : !take && shot.source_poster ? actions.file(shot.source_poster) : null;  // before its first take, a remake's shot shows its new look, or its moment of the source
+  const take = actions.take(shot), start = startPicture(shot);
+  return take?.poster ? actions.file(take.poster) : take?.kind === 'image' ? actions.file(take.path) : !take && shot.painted_frames?.length ? actions.file(shot.painted_frames[0].path) : !take && shot.source_poster ? actions.file(shot.source_poster)
+    : !take && start ? actions.file(start) : null;  // before its first take, a remake's shot shows its new look, or its moment of the source; another shot, the picture it starts from
+}
+
+// A video or a picture of the user's as a shot of its own, with it as its take: a bin item or a file, at a position (null: at the end), then selected.
+export async function shotFromBin(itemId, position) {
+  shotAdded((await actions.ops([{ op: 'bin_to_shot', item: itemId, position }]).catch(() => null))?.[0]?.shots?.[0]);
+}
+export async function shotFromFile(file, position) {
+  shotAdded((await actions.upload([file], 'shot', position))[0]?.target);
+}
+function shotAdded(id) {
+  if (id) { actions.select(id); toast('A new shot with your file as its take: drag its card to move it.', 'ok', 5000); }
+}
+// Just after the selected shots (null: nothing selected, at the end).
+export function afterSelection() {
+  const indexes = state.doc.shots.flatMap((shot, index) => state.selection.has(shot.id) ? [index] : []);
+  return indexes.length ? Math.max(...indexes) + 1 : null;
+}
+
+// The picture a shot's video starts from (its settings' image_start), when it has one.
+export function startPicture(shot) {
+  const start = shot.generation?.settings?.image_start;
+  return (Array.isArray(start) ? start[0] : start) || null;
 }
 
 export function castAvatars(ids, doc) {
@@ -160,6 +184,21 @@ export function mountStoryboard(container, doc) {
     tools.querySelector('#review-wait')?.addEventListener('click', () => tools.querySelector('[data-filter="review"]').click());
   }
 
+  function addShotCard() {  // a click adds an empty shot; a video or a picture dropped here, a file or a bin item, a shot of its own at the end
+    const element = Object.assign(document.createElement('div'), { className: 'add-shot', title: 'Click for a new shot, or drop a video or a picture here: it becomes a shot of its own',
+      innerHTML: `<div class="col" style="align-items:center">${icon('plus')}<span>Add a shot</span><span style="font-size:11.5px">or drop a video here</span></div>`, onclick: () => addShot() });
+    element.ondragover = event => { if (['Files', BIN_TYPE].some(type => event.dataTransfer.types.includes(type))) { event.preventDefault(); element.classList.add('over'); } };
+    element.ondragleave = () => element.classList.remove('over');
+    element.ondrop = event => {
+      event.preventDefault(); event.stopPropagation();
+      element.classList.remove('over'); document.getElementById('veil')?.classList.remove('on');
+      const binId = event.dataTransfer.getData(BIN_TYPE);
+      if (binId) shotFromBin(binId, null);
+      else if (event.dataTransfer.files.length) shotFromFile(event.dataTransfer.files[0], null);
+    };
+    return element;
+  }
+
   async function addShot(position = null) {
     const doc = state.doc;
     if (doc.brief.kind === 'remake') return;  // its shots come from the source's cuts
@@ -192,7 +231,7 @@ export function mountStoryboard(container, doc) {
         <span class="shot-num">${index + 1}</span>
         <span class="shot-status">${shot.locked ? `<span class="tag" title="${shot.takes.length ? 'Locked: the showrunner leaves it as it is' : 'Locked before it was shot: it will not be shot nor change'}">${icon('lock')}${shot.takes.length ? '' : ' not shot'}</span>` : ''}<span class="tag ${shot.status}"${shot.status === 'rendering' && shot.rendering_with ? ` title="Rendered in one render with ${shot.rendering_with}: its new take comes beside the one it uses, unless it has none"` : ''}>${shot.status === 'rendered' && !state.doc.brief.review_before_edit ? 'Shot' : shot.status === 'rendering' && shot.rendering_with ? `Rendering with ${shot.rendering_with}` : STATUS_LABEL[shot.status]}</span></span>
         ${shot.included ? '' : `<span class="tag shot-excluded" title="Excluded" aria-label="Excluded">${icon('eyeOff')}</span>`}
-        <span class="shot-badges">${take?.tier === 'draft' ? '<span class="tag" title="A draft take: Shoot, set to Final, renders it at the target resolution">Draft</span>' : ''}${take?.kept_source ? '<span class="tag" title="Nothing changes in this shot: it keeps your video\'s frames, with no render">Source</span>' : take || !shot.source_poster ? '' : shot.painted_frames?.some(item => item.path !== item.source) ? '<span class="tag" title="A frame of your video, painted with the new look: the mouse plays your video, this shot has no take yet">New look</span>' : '<span class="tag" title="A frame of your video: with nothing painted for it, this shot keeps your video\'s frames">Source</span>'}${shot.takes.length > 1 ? `<span class="tag" title="Takes">${icon('layers')}${shot.takes.length}</span>` : ''}${verdict ? `<span class="tag" title="${esc((verdict.by === 'user' ? 'You' : 'Showrunner') + ': ' + (verdict.note || (verdict.ok ? 'good take' : 'needs a redo')))}" style="background:${verdict.ok ? 'rgba(61,220,151,.9)' : 'rgba(255,93,108,.9)'};color:${verdict.ok ? '#002b19' : '#fff'}">${icon(verdict.ok ? 'check' : 'x')}${verdict.by === 'user' ? 'You' : 'Showrunner'}</span>` : ''}</span>
+        <span class="shot-badges">${take?.tier === 'draft' ? '<span class="tag" title="A draft take: Shoot, set to Final, renders it at the target resolution">Draft</span>' : ''}${take?.kept_source ? '<span class="tag" title="Nothing changes in this shot: it keeps your video\'s frames, with no render">Source</span>' : take || !shot.source_poster ? (!take && startPicture(shot) ? '<span class="tag" title="The picture this shot starts from: it has no take yet">Start picture</span>' : '') :shot.painted_frames?.some(item => item.path !== item.source) ? '<span class="tag" title="A frame of your video, painted with the new look: the mouse plays your video, this shot has no take yet">New look</span>' : '<span class="tag" title="A frame of your video: with nothing painted for it, this shot keeps your video\'s frames">Source</span>'}${shot.takes.length > 1 ? `<span class="tag" title="Takes">${icon('layers')}${shot.takes.length}</span>` : ''}${verdict ? `<span class="tag" title="${esc((verdict.by === 'user' ? 'You' : 'Showrunner') + ': ' + (verdict.note || (verdict.ok ? 'good take' : 'needs a redo')))}" style="background:${verdict.ok ? 'rgba(61,220,151,.9)' : 'rgba(255,93,108,.9)'};color:${verdict.ok ? '#002b19' : '#fff'}">${icon(verdict.ok ? 'check' : 'x')}${verdict.by === 'user' ? 'You' : 'Showrunner'}</span>` : ''}</span>
         <span class="shot-duration" title="Its length in the cut${take?.duration_s && Math.abs(take.duration_s - (cutLengths(state.doc).get(shot.id) || 0)) > 0.05 ? ` (the take lasts ${formatDuration(take.duration_s)})` : ''}">${formatDuration(cutLengths(state.doc).get(shot.id) ?? shot.duration_s)}</span>
         ${rendering ? `<span class="shot-progress"><i style="width:${state.renders[shot.id] ?? 30}%"></i></span>` : ''}
       </div>
@@ -265,7 +304,7 @@ export function mountStoryboard(container, doc) {
         seen.add(shot.id);
         grid.append(element);
       }
-      if (group === groups.at(-1) && state.filter === 'all' && doc.brief.kind !== 'remake') grid.append(Object.assign(document.createElement('div'), { className: 'add-shot', innerHTML: `<div class="col" style="align-items:center">${icon('plus')}<span>Add a shot</span></div>`, onclick: () => addShot() }));
+      if (group === groups.at(-1) && state.filter === 'all' && doc.brief.kind !== 'remake') grid.append(addShotCard());
       section.append(grid);
       fragment.append(section);
     }
@@ -355,11 +394,13 @@ export function mountStoryboard(container, doc) {
       await actions.ops([{ op: 'move_shots', shots: ids, before },
         ...ids.filter(id => (actions.shot(id)?.section || '') !== section).map(id => ({ op: 'update_shot', shot: id, fields: { section } }))]);
     } else if (types.includes(BIN_TYPE)) {
-      await actions.ops([{ op: 'bin_to_take', item: event.dataTransfer.getData(BIN_TYPE), shot: target.id }]);
-      toast('Added as a take.', 'ok');
+      const item = state.doc.bin.find(entry => entry.id === event.dataTransfer.getData(BIN_TYPE)), sound = item?.kind === 'audio';
+      await actions.ops([{ op: sound ? 'bin_to_track' : 'bin_to_take', item: item?.id, shot: target.id }]);
+      toast(sound ? SOUND_LAID : 'Added as a take.', 'ok');
     } else if (event.dataTransfer.files.length) {
-      await actions.upload([...event.dataTransfer.files].slice(0, 1), 'take', target.id);
-      toast('Added as a take.', 'ok');
+      const file = event.dataTransfer.files[0];
+      await actions.upload([file], 'take', target.id);
+      toast(file.type.startsWith('audio/') ? SOUND_LAID : 'Added as a take.', 'ok');
     }
   });
   function clearDrop() {
@@ -429,7 +470,7 @@ async function duplicate(shot) {
 }
 
 async function remove(shots) {
-  if (!(await confirmDialog({ title: shots.length > 1 ? `Delete ${shots.length} shots?` : `Delete "${shots[0].title || shots[0].id}"?`, text: shots.length > 1 ? 'Their takes stay in the production folder. Undo brings the shots back.' : 'Its takes stay in the production folder. Undo brings the shot back.', ok: 'Delete', danger: true }))) return;
+  if (!(await confirmDialog({ title: shots.length > 1 ? `Delete ${shots.length} shots?` : `Delete "${shots[0].title || shots[0].id}"?`, text: shots.length > 1 ? 'Their takes wait in the media bin. Undo brings the shots back.' : 'Its takes wait in the media bin. Undo brings the shot back.', ok: 'Delete', danger: true }))) return;
   await actions.ops(shots.map(shot => ({ op: 'remove_shot', shot: shot.id })));
   state.selection.clear();
   actions.select(null, { open: false });

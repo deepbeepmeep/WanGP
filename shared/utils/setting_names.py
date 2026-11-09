@@ -38,6 +38,7 @@ SETTING_HINTS = {
     "sampler": "sample_solver", "scheduler": "sample_solver", "solver": "sample_solver",
     "frames": "video_length", "num_frames": "video_length", "duration": "duration_seconds", "negative": "negative_prompt",
     "lora": "activated_loras", "loras": "activated_loras", **dict.fromkeys(("name", "filename", "output_name"), "output_filename"),
+    **dict.fromkeys(("image", "images", "reference_image", "reference_images"), "image_refs, a list of reference pictures, or image_start for an opening frame"), "mesh": "custom_guide",
     **dict.fromkeys(("accelerator", "accelerator_profile", "profile"), "an accelerator profile's settings"),
 }
 # Model information returned beside template settings and in model metadata: never a setting.

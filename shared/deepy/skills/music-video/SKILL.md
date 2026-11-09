@@ -11,7 +11,7 @@ The song comes first: every shot is driven by an exact slice of it, so that the 
 
 - Read the `gen_song` default template and keep its settings. Lyrics go in `prompt` with section markers (`[Verse]`, `[Chorus]`), the style in `alt_prompt`. Ask for about 4 seconds more than the video: songs often end with a fade.
 - Name the lead voice first and plainly in `alt_prompt`, matching the singer the video shows: `female vocals, female lead singer, ...` or `male vocals, ...`; adjectives such as warm or mezzo can pull a voice lower.
-- Measure it: `inspect_audio` with `window_s=1` gives where the music plays and its loudness.
+- Measure it: `inspect_audio` with `window_s=1` and `beats: true` gives where the music plays, its loudness and its beats.
 - Isolate the voice for timing: `wangp_postprocess(media="<song id>", action="remove_background", arguments={})` keeps the vocals. The envelope of that stem (`inspect_audio`, `window_s=0.5`, `silence_db=-40`) shows the sung blocks: they are the lyric timings. A stem that is nearly silent means an instrumental: regenerate the song with a new seed. Check the voice on the stem with `inspect_audio` `pitch: true`: a female lead sits mostly above about 165 Hz (`voice_pitch_hz`), a male one below; regenerate with a new seed when it does not match the singer.
 - Read the words from the song itself, not from the stem: taking the music away damages the voice and `transcribe_media` reads it worse. The stem is for timing. Sung words transcribe unevenly, but a clearly sung line reads nearly word for word: when the transcript reads the chorus and cannot read a verse, that verse is not sung as written, even with a block of voice where it should be. One `transcribe_media` of the song shows it; do not transcribe phrase by phrase. A line that stays unreadable after a new take is worth telling the user, who can listen to it.
 - The user's lyrics must all be sung, and a new song keeps them unless the user says otherwise. Compare the sung blocks and the transcript with the lines. A song that leaves lines out, or turns a chorus instrumental, is a failed take: compose again, at most three times, with the lines fewer or the length greater. Do this before anything depends on the song: no shot is re-shot on it. If lines are still missing, stop and tell the user which ones, and let them choose; do not deliver it first and mention it after.
@@ -30,8 +30,11 @@ Make one master image of the singer (`gen_image` default template): face visible
 - Cut consecutive slices of exactly that length with `extract_audio` (`start_s` = previous end, `end_s` = start + length), starting where the song starts. A gap between slices becomes a skip at the cut; an overlap repeats words.
 - Vary framing between shots (close-up, medium, wide, another angle) and give each shot its own short prompt; submit all shots in one batch.
 - A shot shows what is sung while it is on screen: put the timing of each line beside the shots before writing their prompts. Pictures one line behind the words is the usual mistake.
-- Vary the pace with the song: one slice length for the whole song gives a monotonous cut. Validate two or three lengths (one to three
-  bars, shorter in choruses), and keep the slices consecutive whatever their lengths.
+- Vary the pace with the song and cut on its beat: one slice length for the whole song gives a monotonous cut. End each slice on a
+  bar start of the song (`beats.bar_starts`, otherwise a beat of `beats.times`), one to three bars long, shorter in choruses. A
+  slice runs from the previous slice's end to its cut, with that span as the shot's `video_length` in frames: `wangp_validate`
+  gives the length the shot will really have, and the next slice starts at that real end, so the rounding never adds up and every
+  cut stays within a frame step of its beat. Keep the slices consecutive whatever their lengths.
 
 ## 4. Edit and master
 

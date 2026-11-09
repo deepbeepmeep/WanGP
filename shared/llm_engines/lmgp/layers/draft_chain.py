@@ -98,6 +98,49 @@ def _load_q(Q, IDS, PROBS, COUNTS, OLD_IDS, OLD_COUNTS, VOCAB: tl.constexpr, OUT
     tl.store(OLD_COUNTS + row, tl.load(COUNTS + row))
 
 
+@triton.jit(do_not_specialize=("temperature", "top_p", "slot"))
+def _select_draw(VALUES, IDS, SUMS, OUT_IDS, OUT_PROBS, OUT_COUNT, DRAFT_IDS, UNIFORMS, BASES, NEXT_INPUT, NEXT_POSITION, NEXT_SEQLEN, temperature, top_p, slot,
+                 BLOCKS: tl.constexpr, KEPT: tl.constexpr, TILE: tl.constexpr, OUT: tl.constexpr, FEED: tl.constexpr):
+    """_select into device memory, then the draw of the host chain (DraftChain.draw) on the GPU: the proposal normalized in place, the token
+    the first whose cumulative probability reaches the slot's uniform. FEED: the drafter's next pass reads its token, position (BASES[0] + slot)
+    and cache length (BASES[1] + slot)."""
+    index = tl.arange(0, TILE)
+    present = index < BLOCKS * KEPT
+    values = tl.load(VALUES + index, mask=present, other=_LOWEST)
+    ids = tl.load(IDS + index, mask=present, other=0)
+    top = tl.max(values)
+    heads = present & (index % KEPT == 0)
+    total = tl.sum(tl.load(SUMS + index // KEPT, mask=heads, other=0.0) * libdevice.exp((values - top) / temperature))
+    outs = tl.arange(0, OUT)
+    out_ids = tl.zeros((OUT,), dtype=tl.int32)
+    out_probs = tl.zeros((OUT,), dtype=tl.float32)
+    mass = top * 0.0
+    count = tl.program_id(0) * 0
+    for out in range(OUT):
+        if mass < top_p:
+            position = tl.argmax(values, 0)
+            chosen = index == position
+            probability = tl.div_rn(libdevice.exp((tl.max(values) - top) / temperature), total)
+            out_ids = tl.where(outs == out, tl.sum(tl.where(chosen, ids, 0)), out_ids)
+            out_probs = tl.where(outs == out, probability, out_probs)
+            values = tl.where(chosen, _LOWEST, values)
+            mass = mass + probability
+            count = count + 1
+    kept = outs < count
+    out_probs = tl.where(kept, tl.div_rn(out_probs, tl.sum(tl.where(kept, out_probs, 0.0))), 0.0)
+    cdf = tl.cumsum(out_probs, 0)
+    choice = tl.minimum(tl.sum((kept & (cdf < tl.load(UNIFORMS + slot))).to(tl.int32)), count - 1)
+    token = tl.sum(tl.where(outs == choice, out_ids, 0)).to(tl.int64)
+    tl.store(OUT_IDS + slot * OUT + outs, out_ids)
+    tl.store(OUT_PROBS + slot * OUT + outs, out_probs)
+    tl.store(OUT_COUNT + slot, count)
+    tl.store(DRAFT_IDS + slot, token)
+    if FEED:
+        tl.store(NEXT_INPUT, token)
+        tl.store(NEXT_POSITION, tl.load(BASES) + slot)
+        tl.store(NEXT_SEQLEN, (tl.load(BASES + 1) + slot).to(NEXT_SEQLEN.dtype.element_ty))
+
+
 def supported(device, vocab):
     """Mapped RAM and the PTX fence: CUDA only. Larger vocabularies do not fit the kernels' tiles."""
     return device.type == "cuda" and mapped.supported() and vocab <= MAX_VOCAB
@@ -132,6 +175,12 @@ class DraftChain:
         self.old_ids = torch.zeros(max_drafts, MAX_OUT, dtype=torch.int32, device=device)
         self.old_counts = torch.zeros(max_drafts, dtype=torch.int32, device=device)
         self.rng, self.rng_seed = None, None
+        # the GPU chain (sampling without a confidence exit): its proposals in device memory, its CUDA graphs per drafter graph and law
+        self.device_ids = torch.zeros(max_drafts, MAX_OUT, dtype=torch.int32, device=device)
+        self.device_probs = torch.zeros(max_drafts, MAX_OUT, dtype=torch.float32, device=device)
+        self.device_counts = torch.zeros(max_drafts, dtype=torch.int32, device=device)
+        self.device_draft_ids = torch.zeros(max_drafts, dtype=torch.int64, device=device)
+        self.graphs = {}
 
     def top(self, logits, slot, temperature=1.0, top_p=1.0):
         """Queues the kernels and waits for the words of this proposal in mapped RAM: the number of its tokens."""
@@ -164,6 +213,15 @@ class DraftChain:
     def load(self, rows):
         _load_q[(rows,)](self.q, self.ids_gpu, self.probs_gpu, self.counts_gpu, self.old_ids, self.old_counts, self.target_vocab, MAX_OUT, num_warps=1)
 
+    def select_draw(self, logits, slot, temperature, top_p, uniforms, bases, next_input, next_position, next_seqlen, feed):
+        """A draft of the GPU chain: no host wait (see _select_draw)."""
+        _block_top[(self.blocks,)](logits, self.values, self.block_ids, self.sums, temperature, self.vocab, BLOCK, KEEP, num_warps=2)
+        _select_draw[(1,)](self.values, self.block_ids, self.sums, self.device_ids, self.device_probs, self.device_counts, self.device_draft_ids, uniforms, bases,
+                           next_input, next_position, next_seqlen, temperature, top_p, slot, self.blocks, KEEP, CANDIDATES, MAX_OUT, bool(feed), num_warps=8)
+
+    def load_device(self, rows):
+        _load_q[(rows,)](self.q, self.device_ids, self.device_probs, self.device_counts, self.old_ids, self.old_counts, self.target_vocab, MAX_OUT, num_warps=1)
+
 
 class CompactDrafts:
     """The draft distributions of a window: entries of the chain's proposals, dense rows only when asked (the reference sampler)."""
@@ -185,6 +243,19 @@ class CompactDrafts:
 
     def load(self):
         self.chain.load(self.count)
+
+
+class DeviceDrafts(CompactDrafts):
+    """The draft distributions of a GPU chain: its proposals stay in device memory (read back only for the reference sampler)."""
+    def _dense(self, row):
+        chain = self.chain
+        count = int(chain.device_counts[row])
+        q = torch.zeros(chain.target_vocab, dtype=torch.float32, device=chain.q.device)
+        q[chain.device_ids[row, :count].long()] = chain.device_probs[row, :count]
+        return q
+
+    def load(self):
+        self.chain.load_device(self.count)
 
 
 from shared.kernels.triton_compilation_log import install_triton_compilation_logger  # noqa: E402

@@ -28,7 +28,7 @@ for i in range(fps * seconds):
 wangp.publish_video(frames, fps=fps, name="title_reveal")
 ```
 
-- Frames never go under `out/` (each file there is published). Keep short clips in memory; for clips longer than about 10 s write PNGs under `tmp/frames/` while rendering and pass the glob.
+- Frames never go under `out/` (each file there is published). Keep short clips in memory; for clips longer than about 10 s write PNGs under `tmp/frames/` (create it first: `os.makedirs("tmp/frames", exist_ok=True)`) while rendering and pass the glob. Rendering hundreds of large frames (a zoom per frame over 30 s at 1024 px) takes minutes: pass `timeout_s=300` to that run.
 - Match an existing video's size and frame rate (`wangp.io("info", {"path": ref})`) when the clip will be merged with it; then `merge_videos`. Sound comes afterwards with `remux_media` (music, narration).
 - Pan and zoom over a still: crop a moving window of a large image per frame (ease the motion) and resize it to the output size.
 - Animated chart: draw the same matplotlib figure per frame with values scaled by an easing of `t`, turn it into a PIL image (`fig.canvas.draw(); Image.frombuffer("RGBA", fig.canvas.get_width_height(), fig.canvas.buffer_rgba())`), close the figure, collect.

@@ -9,10 +9,14 @@ BLOCK_DRAFT_ASSETS = {
     "dspark": {"folder": "Qwen3_8_27B_Uncensored", "config": "Qwen3_8_27B_DSpark.config.json", "weights": "Qwen3_8_27B_DSpark_int8_convrot.safetensors", "drafts": 7},
     "dflash2": {"folder": "Qwen3_8_27B_Uncensored", "config": "Qwen3_8_27B_DFlash2.config.json", "weights": "Qwen3_8_27B_DFlash2_int8_convrot.safetensors", "drafts": 7},
     "dflash2_bonsai": {"folder": "Qwen3_8_27B_Uncensored", "config": "Bonsai_2_27B_DFlash2.config.json", "weights": "Bonsai_2_27B_DFlash2_int8_convrot.safetensors", "drafts": 5},
+    "dspine": {"folder": "Qwen3_8_27B_Uncensored", "config": "Qwen3_8_27B_DSpine.config.json", "weights": "Qwen3_8_27B_DSpine_int8_convrot.safetensors", "drafts": 7},
 }
+BLOCK_DRAFT_LABELS = {"dspark": "DSpark", "dflash2": "DFlash2", "dspine": "DSpine"}
 
 
 def block_draft_spec(method, *, bonsai=False):
+    if method == "dspine" and bonsai:
+        raise ValueError("DSpine drafts for Qwen3.8 27B only: its refinement reads the target's output rows, which Bonsai stores rotated.")
     return BLOCK_DRAFT_ASSETS["dflash2_bonsai" if method == "dflash2" and bonsai else method]
 
 
@@ -54,12 +58,11 @@ def install_block_draft(model, method, *, bonsai=False):
     config = _load_draft_config(config_path)
     if config.hidden_size != model.config.hidden_size or config.vocab_size != model.config.vocab_size:
         raise ValueError("Draft checkpoint hidden size/vocabulary does not match the target model.")
-    label = "DSpark" if method == "dspark" else "DFlash2"
-    print(f"Loading - {label} {'Bonsai 2' if bonsai and method == 'dflash2' else 'Qwen3.8'} Draft Model")
+    print(f"Loading - {BLOCK_DRAFT_LABELS[method]} {'Bonsai 2' if bonsai and method == 'dflash2' else 'Qwen3.8'} Draft Model")
     if spec["weights"].endswith("_int8_convrot.safetensors"):
         quant_router.register_handler("shared.qtypes.int8_convrot")
     with torch.device("meta"):
-        draft = BlockDraft(config, method)
+        draft = BlockDraft(config, method, block_size=spec["drafts"] + 1 if method == "dspine" else None)
     from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
     with torch.device("cpu"):
         draft.rotary_emb = Qwen3RotaryEmbedding(config)

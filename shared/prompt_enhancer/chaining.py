@@ -134,8 +134,9 @@ def run_chain(mode: str, prompts: list[str], alt_prompts: list[str], alt_prompt_
         else:
             inputs = _combined_inputs(current_prompts, current_alt_prompts, step.output_field)
         outputs = list(enhance(step, inputs))
-        if len(outputs) != len(inputs):
-            raise RuntimeError(f"Prompt enhancer step '{without_thinking(step.mode)}' returned {len(outputs)} outputs for {len(inputs)} inputs.")
+        if len(outputs) != len(inputs):  # not usable: the step leaves its field as it was
+            print(f"[Prompt Enhancer] Step '{without_thinking(step.mode)}' returned {len(outputs)} outputs for {len(inputs)} inputs: its enhanced {step.output_field.replace('_', ' ')} is not usable, the previous one is kept.")
+            continue
         if step.output_field == "prompt":
             current_prompts, prompt_changed = outputs, True
         else:

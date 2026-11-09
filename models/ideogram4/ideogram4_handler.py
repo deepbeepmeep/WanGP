@@ -266,6 +266,12 @@ class family_handler:
         return "ideogram4"
 
     @staticmethod
+    def query_retired_files(model_type):
+        """Checkpoints that earlier releases of a model type downloaded and its current definition no longer names (Models Manager
+        lists them with the model, to delete them)."""
+        return {"ideogram4": ["Ideogram4_Transformer_nvfp4.safetensors", "Ideogram4_Unconditional_Transformer_nvfp4.safetensors"]}.get(model_type, [])
+
+    @staticmethod
     def query_model_files(computeList, base_model_type, model_def=None):
         transformer_configs = ["ideogram4_transformer_config.json"]
         if not _conditional_transformer_only(base_model_type, model_def):

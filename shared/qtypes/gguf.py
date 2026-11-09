@@ -1,5 +1,6 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import ast
+import ctypes
 import functools
 import os
 import re
@@ -2343,12 +2344,33 @@ class GgufExperts(ExpertFormat):
     def _addresses(self, bank):
         return [getattr(bank, name).data_ptr() for name in bank.expert_tensor_names]
 
-    def cpu_job(self, bank, payload, resident, out, tokens, topk, threads):
+    def cpu_job(self, bank, payload, resident, out, tokens, topk, threads, share=None, share_rows=0):
         from shared.kernels import cpu_linear
         gate, up, down = self._addresses(bank)
         job = cpu_linear.MoeJob(gate=gate, up=up, down=down, payload=payload, resident=resident, usage=bank.usage.data_ptr(), out=out, gate_type=bank.blocks[0], up_type=bank.blocks[1], down_type=bank.blocks[2],
-                                tokens=tokens, h=bank.hidden, i=bank.intermediate, experts=bank.num_experts, topk=topk, threads=threads, tail_rank=bank.tail_rank if tokens <= bank.TAIL_WINDOW else 0, status=0)
+                                tokens=tokens, h=bank.hidden, i=bank.intermediate, experts=bank.num_experts, topk=topk, threads=threads, tail_rank=bank.tail_rank if tokens <= bank.TAIL_WINDOW else 0, status=0,
+                                share=None if share is None else ctypes.pointer(share), share_rows=share_rows)
         return job, cpu_linear.moe_host_function()
+
+    def cpu_share(self, fields):
+        from shared.kernels import cpu_linear
+        if not cpu_linear.moe_share_supported():
+            return None
+        share = cpu_linear.MoeShare()
+        for name, value in fields.items():
+            if name == "offsets":
+                share.offsets[:] = value
+            else:
+                setattr(share, name, value)
+        return share
+
+    def share_ring(self, slot_bytes, slots, device):
+        from shared.kernels import cpu_linear
+        return cpu_linear.ShareRing(slot_bytes, slots, device)
+
+    def share_sections(self):
+        from shared.kernels import cpu_linear
+        return cpu_linear.REMOTE_COPIES
 
     def cpu_forward(self, bank, x, ids, probabilities, resident, out, tokens, topk, threads):
         from shared.kernels import cpu_linear

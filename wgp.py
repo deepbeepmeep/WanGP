@@ -4,7 +4,7 @@ import os, sys
 for _stream in (sys.stdout, sys.stderr): _stream.reconfigure(encoding="utf-8", errors="replace")
 from tqdm import tqdm
 
-WanGP_version = "19.21"
+WanGP_version = "19.25"
 _welcome_message = f" WanGP v{WanGP_version} - Copyright (c) 2024-2026 DeepBeepMeep "
 tqdm.write(f"\033[1m\033[93m{_welcome_message:*^100}\033[0m")
 
@@ -346,7 +346,9 @@ def format_generation_time(seconds):
     
     return f"{raw_seconds} ({human_readable})"
 
-def pil_to_base64_uri(pil_image, format="png", quality=75):
+QUEUE_THUMBNAIL_SIZE = 256  # longest side of the queue and running-task thumbnails (shown at 50-120 px, high-density screens included); a click shows the original
+
+def pil_to_base64_uri(pil_image, format="png", quality=75, max_size=None):
     if pil_image is None:
         return None
 
@@ -366,6 +368,9 @@ def pil_to_base64_uri(pil_image, format="png", quality=75):
 
     if format.lower() == "jpeg" and (pil_image.mode in ("RGBA", "LA", "PA") or "transparency" in pil_image.info):
         format = "png"
+    if max_size is not None and max(pil_image.size) > max_size:
+        pil_image = pil_image.copy()
+        pil_image.thumbnail((max_size, max_size))
 
     buffer = io.BytesIO()
     try:
@@ -1814,8 +1819,8 @@ def add_video_task(**inputs):
         "end_image_labels": end_image_labels,
         "start_image_data": start_image_data,
         "end_image_data": end_image_data,
-        "start_image_data_base64": [pil_to_base64_uri(img, format="jpeg", quality=70) for img in start_image_data] if start_image_data != None else None,
-        "end_image_data_base64": [pil_to_base64_uri(img, format="jpeg", quality=70) for img in end_image_data] if end_image_data != None else None
+        "start_image_data_base64": [pil_to_base64_uri(img, format="jpeg", quality=70, max_size=QUEUE_THUMBNAIL_SIZE) for img in start_image_data] if start_image_data != None else None,
+        "end_image_data_base64": [pil_to_base64_uri(img, format="jpeg", quality=70, max_size=QUEUE_THUMBNAIL_SIZE) for img in end_image_data] if end_image_data != None else None
     })
 
 def update_task_thumbnails(task,  inputs):
@@ -1824,8 +1829,8 @@ def update_task_thumbnails(task,  inputs):
     task.update({
         "start_image_labels": start_labels,
         "end_image_labels": end_labels,
-        "start_image_data_base64": [pil_to_base64_uri(img, format="jpeg", quality=70) for img in start_image_data] if start_image_data != None else None,
-        "end_image_data_base64": [pil_to_base64_uri(img, format="jpeg", quality=70) for img in end_image_data] if end_image_data != None else None
+        "start_image_data_base64": [pil_to_base64_uri(img, format="jpeg", quality=70, max_size=QUEUE_THUMBNAIL_SIZE) for img in start_image_data] if start_image_data != None else None,
+        "end_image_data_base64": [pil_to_base64_uri(img, format="jpeg", quality=70, max_size=QUEUE_THUMBNAIL_SIZE) for img in end_image_data] if end_image_data != None else None
     })
 
 def move_task(queue, old_index_str, new_index_str):
@@ -2089,8 +2094,8 @@ def _build_runtime_task(task_id_val, params, plugin_data=None):
     """Build a runtime task dict from params."""
     primary_preview, secondary_preview, primary_labels, secondary_labels = get_preview_images(params)
 
-    start_b64 = [pil_to_base64_uri(primary_preview[0], format="jpeg", quality=70)] if isinstance(primary_preview, list) and primary_preview else None
-    end_b64 = [pil_to_base64_uri(secondary_preview[0], format="jpeg", quality=70)] if isinstance(secondary_preview, list) and secondary_preview else None
+    start_b64 = [pil_to_base64_uri(primary_preview[0], format="jpeg", quality=70, max_size=QUEUE_THUMBNAIL_SIZE)] if isinstance(primary_preview, list) and primary_preview else None
+    end_b64 = [pil_to_base64_uri(secondary_preview[0], format="jpeg", quality=70, max_size=QUEUE_THUMBNAIL_SIZE)] if isinstance(secondary_preview, list) and secondary_preview else None
 
     return {
         "id": task_id_val,
@@ -7195,6 +7200,20 @@ def _normalize_generated_prompt_lines(prompt, multi_prompts_gen_type, multi_prom
         return prompt
     return re.sub(r"[\r\n]+", " ", prompt).strip()
 
+def usable_enhanced_prompts(enhanced, originals, label="prompt"):
+    """(prompts, enhanced): an enhancer can end without a final prompt; such a slot keeps its original prompt, and all of them when none
+    is usable (enhanced False)."""
+    if not any(str(value).strip() for value in enhanced):
+        print(f"[Prompt Enhancer] The enhanced {label} is not usable (empty): the original {label} is used.")
+        return list(originals), False
+    usable = []
+    for index, value in enumerate(enhanced):
+        if not str(value).strip():
+            print(f"[Prompt Enhancer] The enhanced {label} {index + 1} is not usable (empty): the original {label} is used.")
+            value = originals[min(index, len(originals) - 1)]
+        usable.append(value)
+    return usable, True
+
 def enhance_prompt(state, prompt, alt_prompt, prompt_enhancer, multi_images_gen_type, multi_prompts_gen_type, overrides, video_prompt_type, image_prompt_type, audio_prompt_type, progress=WangpProgress()):
     override_profile = generation_overrides.get_override(overrides, "memory_profile")
     model_type = get_state_model_type(state)
@@ -7288,17 +7307,27 @@ def enhance_prompt(state, prompt, alt_prompt, prompt_enhancer, multi_images_gen_
 
     progress.check_cancelled()
 
+    results = []  # whether each requested field came back usable: when none did, the user's text stays as it was
     if routed:
         if enhanced.prompt_changed:
-            output_prompts = [normalize_generated_prompt_lines(value, multi_prompts_gen_type, multi_prompt_output=multi_prompt_output) for value in enhanced.prompts]
-            prompt = prompt_parser.serialize_prompt_blocks_with_prefix(output_prompts, original_prompts)
+            output_prompts, usable = usable_enhanced_prompts([normalize_generated_prompt_lines(value, multi_prompts_gen_type, multi_prompt_output=multi_prompt_output) for value in enhanced.prompts], original_prompts)
+            if usable:
+                prompt = prompt_parser.serialize_prompt_blocks_with_prefix(output_prompts, original_prompts)
+            results.append(usable)
         if enhanced.alt_prompt_changed:
-            output_alt_prompts = [normalize_generated_prompt_lines(value, multi_prompts_gen_type) for value in enhanced.alt_prompts]
-            alt_prompt = prompt_parser.serialize_prompt_blocks_with_prefix(output_alt_prompts, prompt_enhancer_chaining.originals_for_outputs(original_alt_prompts, len(output_alt_prompts)))
+            alt_originals = prompt_enhancer_chaining.originals_for_outputs(original_alt_prompts, len(enhanced.alt_prompts))
+            output_alt_prompts, usable = usable_enhanced_prompts([normalize_generated_prompt_lines(value, multi_prompts_gen_type) for value in enhanced.alt_prompts], alt_originals, "alt prompt")
+            if usable:
+                alt_prompt = prompt_parser.serialize_prompt_blocks_with_prefix(output_alt_prompts, alt_originals)
+            results.append(usable)
     else:
-        output_prompts = [normalize_generated_prompt_lines(value[0], multi_prompts_gen_type, multi_prompt_output=multi_prompt_output) for value in enhanced if value is not None]
-        prompt = prompt_parser.serialize_prompt_blocks_with_prefix(output_prompts, original_prompts)
-    if num_prompts > 1:
+        output_prompts, usable = usable_enhanced_prompts([normalize_generated_prompt_lines(value[0], multi_prompts_gen_type, multi_prompt_output=multi_prompt_output) for value in enhanced if value is not None], original_prompts)
+        if usable:
+            prompt = prompt_parser.serialize_prompt_blocks_with_prefix(output_prompts, original_prompts)
+        results.append(usable)
+    if not any(results):  # also a chain whose steps all came back unusable
+        gr.Info("The Prompt Enhancer returned no usable prompt: your prompt was kept.")
+    elif num_prompts > 1:
         gr.Info(f'{num_prompts} Prompts have been Enhanced')
     else:
         gr.Info("Prompt enhancement completed")
@@ -8210,26 +8239,32 @@ def generate_media(
             if enhanced is not None:
                 if routed:
                     if enhanced.prompt_changed:
-                        prompts = [normalize_generated_prompt_lines(value, multi_prompts_gen_type, multi_prompt_output=multi_prompt_output) for value in enhanced.prompts]
-                        task["prompt"] = prompt_parser.ENHANCED_PROMPT_PREFIX + prompt_parser.serialize_prompt_units("", prompts, multi_prompts_gen_type)
-                        prompt_was_enhanced = True
+                        enhanced_prompts, usable = usable_enhanced_prompts([normalize_generated_prompt_lines(value, multi_prompts_gen_type, multi_prompt_output=multi_prompt_output) for value in enhanced.prompts], prompts)
+                        if usable:
+                            prompts = enhanced_prompts
+                            task["prompt"] = prompt_parser.ENHANCED_PROMPT_PREFIX + prompt_parser.serialize_prompt_units("", prompts, multi_prompts_gen_type)
+                            prompt_was_enhanced = True
                     if enhanced.alt_prompt_changed:
-                        alt_prompts = [normalize_generated_prompt_lines(value, multi_prompts_gen_type) for value in enhanced.alt_prompts]
-                        task["alt_prompt"] = prompt_parser.serialize_prompt_blocks_with_prefix(alt_prompts, prompt_enhancer_chaining.originals_for_outputs(original_alt_prompts, len(alt_prompts)))
-                        alt_prompt_was_enhanced = True
+                        enhanced_alt_prompts, usable = usable_enhanced_prompts([normalize_generated_prompt_lines(value, multi_prompts_gen_type) for value in enhanced.alt_prompts], alt_prompts, "alt prompt")
+                        if usable:
+                            alt_prompts = enhanced_alt_prompts
+                            task["alt_prompt"] = prompt_parser.serialize_prompt_blocks_with_prefix(alt_prompts, prompt_enhancer_chaining.originals_for_outputs(original_alt_prompts, len(alt_prompts)))
+                            alt_prompt_was_enhanced = True
                     print(f"Enhanced prompts: {prompts}; enhanced alt prompts: {alt_prompts}")
                 else:
                     enhanced_prompts = enhanced
                     print(f"Enhanced prompts: {enhanced_prompts}" )
                     if multi_prompt_output:
-                        enhanced_prompt = normalize_generated_prompt_lines(enhanced_prompts[0], multi_prompts_gen_type, multi_prompt_output=True)
+                        enhanced_prompt = normalize_generated_prompt_lines(enhanced_prompts[0] if enhanced_prompts else "", multi_prompts_gen_type, multi_prompt_output=True)
                         enhanced_prompts = prompt_parser.split_prompt_units(enhanced_prompt, multi_prompts_gen_type)
                     else:
                         enhanced_prompts = [normalize_generated_prompt_lines(one_prompt, multi_prompts_gen_type) for one_prompt in enhanced_prompts]
-                    # On-the-fly enhancement keeps task prompts clean; originals are saved in metadata.
-                    task["prompt"] = prompt_parser.ENHANCED_PROMPT_PREFIX + prompt_parser.serialize_prompt_units("", enhanced_prompts, multi_prompts_gen_type)
-                    prompts = enhanced_prompts
-                    prompt_was_enhanced = True
+                    enhanced_prompts, usable = usable_enhanced_prompts(enhanced_prompts, prompts)
+                    if usable:
+                        # On-the-fly enhancement keeps task prompts clean; originals are saved in metadata.
+                        task["prompt"] = prompt_parser.ENHANCED_PROMPT_PREFIX + prompt_parser.serialize_prompt_units("", enhanced_prompts, multi_prompts_gen_type)
+                        prompts = enhanced_prompts
+                        prompt_was_enhanced = True
                 workspace_storage.recording_gallery(gen)["last_gallery_source"] = "audio" if audio_only else MESH.id if model_def.get("mesh_outputs", False) else WORLD.id if model_def.get("world_outputs", False) else VIDEO.id
                 send_cmd("output")
                 if scheduler_active:
@@ -12125,20 +12160,13 @@ def show_modal_image(state, action_string):
         return gr.HTML(), gr.Column(visible=False)
 
     task_item = queue[task_index]
-    image_data = None
-    label_data = None
+    start_images, end_images, _, _ = get_preview_images(task_item["params"])  # the originals: the task keeps thumbnails only
+    images, labels = {'start': (start_images, task_item.get('start_image_labels')), 'end': (end_images, task_item.get('end_image_labels'))}.get(img_type, (None, None))
 
-    if img_type == 'start':
-        image_data = task_item.get('start_image_data_base64')
-        label_data = task_item.get('start_image_labels')
-    elif img_type == 'end':
-        image_data = task_item.get('end_image_data_base64')
-        label_data = task_item.get('end_image_labels')
-
-    if not image_data or not label_data or img_index >= len(image_data):
+    if not images or not labels or img_index >= len(images):
         return gr.HTML(), gr.Column(visible=False)
 
-    html_content = get_modal_image(image_data[img_index], label_data[img_index])
+    html_content = get_modal_image(pil_to_base64_uri(images[img_index], format="jpeg", quality=90), labels[img_index])
     return gr.HTML(value=html_content), gr.Column(visible=True)
 
 def get_prompt_labels(multi_prompts_gen_type, model_def, image_outputs = False, audio_only = False):

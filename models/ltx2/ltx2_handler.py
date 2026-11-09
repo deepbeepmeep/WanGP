@@ -878,6 +878,12 @@ class family_handler:
         return "ltx2"
 
     @staticmethod
+    def query_retired_files(model_type):
+        """Checkpoints that earlier releases of a model type downloaded and its current definition no longer names (Models Manager
+        lists them with the model, to delete them)."""
+        return {"ltx2_19B": ["ltx-2-19b-ic-lora-canny-control.safetensors", "ltx-2-19b-ic-lora-depth-control.safetensors", "ltx-2-19b-ic-lora-pose-control.safetensors"]}.get(model_type, [])
+
+    @staticmethod
     def query_model_files(computeList, base_model_type, model_def=None):
         spec = _get_arch_spec(base_model_type)
 

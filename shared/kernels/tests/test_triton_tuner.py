@@ -46,7 +46,7 @@ class LaunchTunerTests(unittest.TestCase):
                 raise OutOfResources(73728, 65536, "shared memory")
             return launch
 
-        with tempfile.TemporaryDirectory() as folder, self.assertRaises(RuntimeError):
+        with tempfile.TemporaryDirectory() as folder, self.assertRaises(OutOfResources):  # the refusal of the last candidate
             self._tuner(folder).config("kernel", "identity", torch.device("cuda"), ["a", "b"], prepare, True)
 
     def test_rowmap_gemm_tunes_on_this_gpu(self):

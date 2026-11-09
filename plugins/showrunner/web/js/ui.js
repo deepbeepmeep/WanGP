@@ -92,6 +92,51 @@ export function personFields(text) {
   return role.length ? { name: name.trim(), role: role.join(',').trim() } : { name: name.trim() };
 }
 
+// Deepy writes Markdown: the panel shows it as Deepy's own chat does (tables, lists, headings, bold, italics, code, links), raw HTML as text.
+// words(text) turns the plain words between the marks into HTML (shot and cast names); media(id) shows a Gallery media id (visual:…, audio:…).
+export function markdownHtml(text, words, media) {
+  const lines = String(text ?? '').replace(/\r\n?/g, '\n').split('\n'), out = [], item = /^\s*([-*+]|\d+[.)])\s+/;
+  const cells = line => line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(cell => mdSpan(cell.trim(), words, media));
+  let paragraph = [];
+  const flush = () => { if (paragraph.length) out.push(`<p>${paragraph.map(line => mdSpan(line, words, media)).join('<br>')}</p>`); paragraph = []; };
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
+    if (/^\s*```/.test(line)) {  // code, as it is
+      flush();
+      const code = [];
+      while (++index < lines.length && !/^\s*```/.test(lines[index])) code.push(lines[index]);
+      out.push(`<pre>${esc(code.join('\n'))}</pre>`);
+    } else if (line.includes('|') && /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(lines[index + 1] || '')) {  // a table: its head, the rule under it, its rows
+      flush();
+      const head = cells(line), rows = [];
+      for (index += 2; index < lines.length && lines[index].includes('|'); index++) rows.push(cells(lines[index]));
+      index--;
+      out.push(`<div class="md-table"><table><thead><tr>${head.map(cell => `<th>${cell}</th>`).join('')}</tr></thead><tbody>${rows.map(row => `<tr>${row.map(cell => `<td>${cell}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`);
+    } else if (/^\s*#{1,6}\s+/.test(line)) {
+      flush();
+      out.push(`<p class="md-h">${mdSpan(line.replace(/^\s*#{1,6}\s+/, '').replace(/\s+#+\s*$/, ''), words, media)}</p>`);
+    } else if (item.test(line)) {  // a list, numbered or not
+      flush();
+      const numbered = /^\s*\d/.test(line), tag = numbered ? 'ol' : 'ul', items = [];
+      for (; index < lines.length && item.test(lines[index]) && /^\s*\d/.test(lines[index]) === numbered; index++) items.push(`<li>${mdSpan(lines[index].replace(item, ''), words, media)}</li>`);
+      index--;
+      out.push(`<${tag}>${items.join('')}</${tag}>`);
+    } else if (!line.trim() || /^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) flush();
+    else paragraph.push(line);
+  }
+  flush();
+  return out.join('');
+}
+const MEDIA_ID = /^(?:.*\/)?((?:visual|audio):[0-9a-f]{12})$/;  // an id, or a link to it (/wangp_api/gallery/media/visual:…)
+function mdSpan(text, words, media) {  // the marks of a line: code, pictures, links and media ids are set aside while its words become HTML
+  const kept = [], keep = html => `\u0000${kept.push(html) - 1}\u0000`, idOf = url => { try { return decodeURIComponent(url).match(MEDIA_ID)?.[1]; } catch { return null; } };
+  text = text.replace(/`([^`\n]+)`/g, (_, code) => keep(`<code>${esc(code)}</code>`))
+    .replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (_, alt, url) => keep(idOf(url) ? media(idOf(url)) : words(alt)))
+    .replace(/\[([^\]]*)\]\(([^)\s]+)\)/g, (_, label, url) => keep(idOf(url) ? media(idOf(url)) : /^https?:\/\//.test(url) ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(label)}</a>` : words(label)))
+    .replace(/\b(?:visual|audio):[0-9a-f]{12}\b/g, id => keep(media(id)));
+  return words(text).replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>').replace(/(^|[^*\w])\*([^*\s][^*\n]*)\*(?!\w)/g, '$1<i>$2</i>').replace(/\u0000(\d+)\u0000/g, (_, number) => kept[number]);
+}
+
 export function shotText(text, shots, cast = [], versions = []) {
   return versionRefs(text, versions).replace(/\b([sc])(\d+)\b/g, match => {
     if (match[0] === 'c') return cast.find(member => member.id === match)?.name || match;
@@ -248,9 +293,10 @@ export function mediaPopup({ kind, url, name = '' }) {
   document.getElementById('overlay-root').append(back);
 }
 
-export function promptDialog({ title, text = '', value = '', placeholder = '', ok = 'Save', multiline = false }) {
+export function promptDialog({ title, text = '', value = '', placeholder = '', ok = 'Save', multiline = false, rows = 4, maxLength = 0 }) {
   return new Promise(resolve => {
-    const field = multiline ? `<textarea class="textarea" rows="4" placeholder="${esc(placeholder)}">${esc(value)}</textarea>` : `<input class="input" value="${esc(value)}" placeholder="${esc(placeholder)}">`;
+    const limit = maxLength ? ` maxlength="${maxLength}"` : '';
+    const field = multiline ? `<textarea class="textarea" rows="${rows}"${limit} placeholder="${esc(placeholder)}">${esc(value)}</textarea>` : `<input class="input"${limit} value="${esc(value)}" placeholder="${esc(placeholder)}">`;
     const back = h(`<div class="modal-back"><div class="modal" role="dialog" aria-modal="true"><h3>${esc(title)}</h3>${text ? `<p>${esc(text)}</p>` : ''}${field}
       <div class="actions"><button class="btn ghost" data-r="0">Cancel</button><button class="btn primary" data-r="1">${esc(ok)}</button></div></div></div>`);
     const input = back.querySelector('input,textarea');

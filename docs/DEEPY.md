@@ -9,7 +9,7 @@ Use Deepy when you want to work toward an outcome instead of manually operating 
 ## Choose Deepy Zero or Deepy Prime
 
 - **Deepy Zero** is fast and lightweight. Use it for focused tasks such as generating one asset, editing selected media, extracting a clip, resizing a file, or producing a transcript. It works well with the smaller supported Qwen models.
-- **Deepy Prime** is for projects that need planning or several connected actions. Use it when Deepy must compare compatible models, combine multiple media assets, inspect intermediate results, manage project files, or work with external MCP services. Prime requires a local Qwen3.8 VL model (9B or 27B) or a configured remote LLM.
+- **Deepy Prime** is for projects that need planning or several connected actions. Use it when Deepy must compare compatible models, combine multiple media assets, inspect intermediate results, manage project files, or work with external MCP services. Prime requires a local Qwen3.8 VL model or a configured remote LLM.
 
 Both versions share generation features, galleries, media references, and saved sessions. Both offer a dedicated video-with-references template. Choose the assistant in **Configuration > Prompt Enhancer / Deepy**.
 
@@ -25,7 +25,6 @@ Supported local choices are:
 
 - `Qwen3.5VL Abliterated 4B`
 - `Qwen3.5VL Abliterated 9B`
-- `Qwen3.8VL Uncensored 9B` (supports local Deepy Prime)
 - `Qwen3.8VL Uncensored 27B` (supports local Deepy Prime)
 - `Qwen3.8VL Flash-Next 125B` (supports local Deepy Prime)
 
@@ -257,8 +256,9 @@ Deepy uses **Video Generator with Ref.** when images or videos supply subject id
 
 WanGP includes built-in templates. To reuse your own model setup:
 
-1. Configure and save normal WanGP generation settings.
-2. Select that user settings file in WanGP's **Lora / Settings** dropdown.
+1. Configure normal WanGP generation settings.
+2. Save them as a preset: in the preset list at the top of the generator (beside **Apply** and **Save**), type a name, press **Save** and
+   confirm. Keep that preset selected.
 3. Open Deepy settings.
 4. Click **+** beside the Deepy tool that should use it.
 5. Confirm the link and save Deepy settings.
@@ -410,8 +410,7 @@ This selects the language and vision model that understands requests, plans work
 
 - **Qwen3.5VL Abliterated 4B** starts quickly and uses the least memory, but is less reliable with long instructions and multi-step decisions. **Recommended for:** Deepy Zero on limited hardware and simple, direct requests.
 - **Qwen3.5VL Abliterated 9B** understands more complex instructions and media better than 4B, with higher VRAM and RAM use. **Recommended for:** the best general Deepy Zero experience when it fits comfortably.
-- **Qwen3.8VL Uncensored 9B** runs local Deepy Prime in about 6.5 GB of VRAM with its default GGUF Q4_K_M, or about 11 GB with GGUF Q8_0, which stays closest to the full-precision model. It follows instructions and multi-step tool use about as well as the 27B and remembers earlier parts of long conversations reliably, but has less general knowledge, thinks longer before answering, and understands images less accurately than the 27B. **Recommended for:** local Prime on 8 to 12 GB GPUs.
-- **Qwen3.8VL Uncensored 27B** offers the strongest local planning, knowledge and image understanding for Deepy Prime, but needs considerably more memory and takes longer to load. **Recommended for:** local Prime and complex multimedia projects when it fits.
+- **Qwen3.8VL Uncensored 27B** offers the strongest local planning, knowledge and image understanding for Deepy Prime, but needs considerably more memory and takes longer to load. On GPUs with less than 16 GB of VRAM, choose its **Bonsai 2 PTQ1_0** quantization (see below), whose weights take less than 6 GB. **Recommended for:** local Prime and complex multimedia projects.
 - **Qwen3.8VL Flash-Next 125B** is much larger than the VRAM of a PC: it keeps in VRAM what the current conversation uses and leaves the rest in RAM and on the drive, so it stays usable on 12 GB GPUs and gets faster as a conversation goes on. It needs an 80 GB download on a fast SSD and about 64 GB of RAM: with less, it spends its time reading the drive. Long prompts take longer to read than with the 27B. **Recommended for:** local Prime on a PC with plenty of RAM, when you want the largest local model.
 - **A remote LLM** avoids loading the language model on the WanGP GPU and may provide stronger reasoning, but adds network latency and sends conversation content to the configured provider. Remote engines require Prime. **Recommended for:** Prime when local memory is insufficient or a supported remote engine is preferred. Review [Remote LLMs](REMOTE_LLMS.md) before using one with private media or instructions.
 

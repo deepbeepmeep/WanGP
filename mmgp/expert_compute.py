@@ -70,11 +70,27 @@ class ExpertFormat:
         """The scale blocks (input projection, output projection) of a bank's loaded tensors (name -> tensor)."""
         raise NotImplementedError
 
-    def cpu_job(self, bank, payload, resident, out, tokens, topk, threads):
+    def cpu_job(self, bank, payload, resident, out, tokens, topk, threads, share=None, share_rows=0):
         """(job, host function address) of a CPU computation from the addresses of a pinned routing payload (bank.pack()), of resident
         flags (or 0) and of a pinned float32 [tokens, hidden] result (zeros when every pair is computed elsewhere). The job is a ctypes
-        structure passed by address; a nonzero status field reports a failure."""
+        structure passed by address; a nonzero status field reports a failure. share: a structure of cpu_share(), for a doorbell job only,
+        with share_rows, the address of mapped RAM where the job writes the experts the GPU computes once it has answered (the count, then
+        int64 (expert, its tensors' addresses) each)."""
         raise NotImplementedError
+
+    def cpu_share(self, fields):
+        """The structure through which its CPU jobs read experts in locked RAM and give the GPU a share of those missing VRAM (fields: see
+        Residency._init_share), None when its kernels or the driver have none."""
+        return None
+
+    def share_ring(self, slot_bytes, slots, device):
+        """The VRAM slots the share's experts are copied into, and what asks the copy engine for them: an object with handle (for cpu_share()), base (the
+        device address of the first slot), remote (copies of shared sections), forget(section), stats() and close()."""
+        raise NotImplementedError
+
+    def share_sections(self):
+        """Whether the experts' copies in locked RAM must be shared memory sections (the share's copies asked of another process)."""
+        return False
 
     def cpu_forward(self, bank, x, ids, probabilities, resident, out, tokens, topk, threads):
         """The same computation from the addresses of float32 activations and probabilities and int32 ids: returns the number of pairs
@@ -117,14 +133,25 @@ def _formats():
 
 class _DoorbellJob:
     """A job of queue_forward asked for by a GPU kernel: its payload and result in one block of mapped RAM (host and CUDA views), at fixed addresses for graph replays. Not a shared.* object: its CUDA views are no state of
-    the model."""
+    the model. share: the GPU's share of its experts out of VRAM (Residency._init_share): its table in VRAM and the rows the job writes for it in mapped RAM, or None."""
+    SHARE_ROWS = 64
+    ROW_WORDS = 5  # an expert, the addresses of its tensors, and with an early share the address of its copy's done word
+    ERRORS = 1 + ROW_WORDS * SHARE_ROWS  # the word of the rows region counting the rows the GPU left out (read_rows)
+    DONE = ERRORS + 1  # the word the GPU sets once it has computed an early share: the job sizes the next one (experts_gguf.inc MOE_SHARE_DONE)
+
     def __init__(self, bank, tokens, topk, count, kernels, function, device):
         from . import mapped
         offset = -(-count * 4 // 64) * 64
+        rows_offset = offset + -(-tokens * bank.hidden * 4 // 64) * 64
         self.kernels = kernels
-        self.host, view = mapped.empty(offset + tokens * bank.hidden * 4, device, "experts")
-        self.payload, self.result = view[:count * 4].view(torch.int32), view[offset:].view(torch.float32)
-        self.job, _ = bank.format.cpu_job(bank, self.host.data_ptr(), bank.resident_flags.data_ptr(), self.host.data_ptr() + offset, tokens, topk, cpu_threads())
+        self.host, view = mapped.empty(rows_offset + 8 * (self.DONE + 1), device, "experts")
+        self.payload, self.result = view[:count * 4].view(torch.int32), view[offset:rows_offset].view(torch.float32)
+        rows = self.host[rows_offset:].view(torch.int64)
+        rows.zero_()
+        rows[0] = -1  # an early share: no rows published yet
+        self.share = None if bank.cpu_share is None else (bank.gpu_share, view[rows_offset:].view(torch.int64), bank.share_early)
+        self.job, _ = bank.format.cpu_job(bank, self.host.data_ptr(), bank.resident_flags.data_ptr(), self.host.data_ptr() + offset, tokens, topk, cpu_threads(), bank.cpu_share,
+                                          self.host.data_ptr() + rows_offset if bank.cpu_share is not None else 0)
         self.ticket = kernels.register(device, function, None, self.job)
 
     def close(self):
@@ -201,6 +228,8 @@ class RoutedExperts(ExpertBank):
         self._pointer_version = -1
         self._jobs = {}  # tokens -> (host job, host function, pinned payload, pinned result) of queue_forward, at fixed addresses for graph replays
         self._doorbell_jobs = {}  # tokens -> _DoorbellJob
+        self.cpu_share = self.gpu_share = None  # the GPU's share of the experts out of VRAM, for the doorbell jobs (Residency._init_share): the format's structure, its table in VRAM
+        self.share_early = False  # the share's copies land without the jobs' thread: the GPU waits for them beside the CPU's part
         if format is not None:
             format = next(candidate for candidate in _formats() if candidate.name == format)
             self._set_format(format, device, blocks)
@@ -256,20 +285,32 @@ class RoutedExperts(ExpertBank):
         if doorbell is not None:
             # the CPU works beside the GPU's experts of this layer: asked for first, its result joined after them
             kernels, function = doorbell
+            pointers = self._pointers(x.device) if self._resident or self.gpu_branch else None  # before the job: the share comes with the table
             job = self._doorbell_jobs.get(tokens)
             if job is None:
                 job = self._doorbell_jobs[tokens] = _DoorbellJob(self, tokens, topk, tokens * (self.hidden + 2 * topk), kernels, function, x.device)
+            topk_ids, topk_weights = topk_ids.contiguous(), topk_weights.contiguous()
             if packed is None and kernels.parts_supported(x):
-                kernels.ask_parts(x, topk_weights.contiguous(), topk_ids.contiguous(), job.payload, job.ticket)  # as pack() lays them out
+                kernels.ask_parts(x, topk_weights, topk_ids, job.payload, job.ticket)  # as pack() lays them out
             else:
                 kernels.ask(self.pack(x, topk_ids, topk_weights) if packed is None else packed, job.payload, job.ticket)
-            if self._resident or self.gpu_branch:
+            if pointers is not None:
                 output = torch.empty(tokens, self.hidden, dtype=torch.float32, device=x.device)
                 mid = torch.empty(tokens * topk, self.intermediate, dtype=torch.float32, device=x.device)
-                self.format.gpu_forward(self, x, topk_ids.contiguous(), topk_weights.contiguous(), self._pointers(x.device), out=output, mid=mid)
+                if job.share is not None and job.share[2]:
+                    # early: one pass over the experts in VRAM and those of the share (copied by a helper process while the CPU computes the others, or read in place), once
+                    # they are there: a second pass over a table of the share alone cost about as much as the share saved when the CPU had few misses
+                    table, rows, _ = job.share
+                    kernels.read_rows(rows, table, True, job.ERRORS, base=pointers)
+                    self.format.gpu_forward(self, x, topk_ids, topk_weights, table, out=output, mid=mid)
+                    kernels.mark(rows, job.DONE)
+                else:
+                    self.format.gpu_forward(self, x, topk_ids, topk_weights, pointers, out=output, mid=mid)
             else:
                 output = torch.zeros(tokens, self.hidden, dtype=torch.float32, device=x.device)
             kernels.wait(job.ticket, job.result, output, True)
+            if job.share is not None and not job.share[2]:  # the experts whose copies landed in VRAM while the CPU computed the others: the job wrote their rows before answering
+                self._share_forward(job, kernels, x, topk_ids, topk_weights, output, mid)
             return output.to(dtype=x.dtype).reshape(shape)
         if packed is None:
             packed = self.pack(x, topk_ids, topk_weights)
@@ -296,6 +337,13 @@ class RoutedExperts(ExpertBank):
             stream.wait_stream(side)
             output.add_(gpu_output)
         return output.to(dtype=x.dtype).reshape(shape)
+
+    def _share_forward(self, job, kernels, x, topk_ids, topk_weights, output, mid):
+        table, rows, _ = job.share
+        kernels.read_rows(rows, table)
+        shared = torch.empty(output.shape, dtype=torch.float32, device=x.device)
+        self.format.gpu_forward(self, x, topk_ids, topk_weights, table, out=shared, mid=mid)
+        output.add_(shared)
 
     def _swap(self, old, new):
         # the addresses of the GPU copy do not change hands: in place, the graphs read this table

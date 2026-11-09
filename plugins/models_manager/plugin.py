@@ -14,6 +14,7 @@ from mmgp import quant_router
 VARIANT_LABEL_OTHER_NON_SHARED = "Other Non Shared"
 VARIANT_LABEL_OTHER_SHARED = "Other Shared"
 VARIANT_LABEL_MISSING = "Missing"
+VARIANT_LABEL_RETIRED = "Older Releases"
 
 
 class modelsManagerPlugin(WAN2GPPlugin):
@@ -815,6 +816,9 @@ class modelsManagerPlugin(WAN2GPPlugin):
                     "primary_paths": [],
                 }
             )
+        retired_files = self._collect_retired_files(model_type)
+        if retired_files:
+            variants.append({"id": self._make_variant_id(model_type, "retired", "retired"), "label": VARIANT_LABEL_RETIRED, "type": "variant", "files": retired_files, "primary_paths": []})
 
         model_files = set()
         for variant in variants:
@@ -1799,6 +1803,14 @@ class modelsManagerPlugin(WAN2GPPlugin):
         if text_encoder_filename:
             self._add_file(files, text_encoder_filename, force_folder=text_encoder_folder)
         return files
+
+    def _collect_retired_files(self, model_type):
+        """The files of earlier releases of the model type that are still on disk: its handler names them (query_retired_files), as the
+        current definitions no longer do. A few file checks, no folder scan."""
+        query = getattr(self.get_model_handler(model_type), "query_retired_files", None)
+        if query is None:
+            return set()
+        return {self._normalize_path(copy) for relative in query(model_type) for copy in fl.installed_copies(relative)}
 
     def _collect_handler_file_paths(self, model_type, model_def):
         handler = self.get_model_handler(model_type)

@@ -1,8 +1,8 @@
 // Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 // Media bin: uploads and the director's untracked media, ready to be dragged onto shots (as takes) or cast members.
 import { state, actions } from './app.js';
-import { icon, esc, art, h, pickFiles, menu, AUDIO_ACCEPT } from './ui.js';
-import { BIN_TYPE } from './storyboard.js';
+import { icon, esc, art, h, pickFiles, menu, toast, AUDIO_ACCEPT } from './ui.js';
+import { BIN_TYPE, SOUND_LAID, shotFromBin, afterSelection } from './storyboard.js';
 
 // Generated files are named "<date>_seed<n>_<start of the prompt>": the bin shows the prompt's words.
 const readable = name => name.replace(/^\d{4}-\d\d-\d\d-\d\dh\d\dm\d\ds_seed\d+_/, '').replace(/\.\w+$/, '');
@@ -19,7 +19,7 @@ function loadZoom() {
 
 // A bin item in full: a video or a sound plays at once; a picture zooms with the wheel or the buttons and moves when held, as in the gallery.
 export function showItem(item) {
-  const src = actions.file(item.path), name = readable(item.name || item.path.split('/').pop()), picture = item.kind === 'image';
+  const src = item.url || actions.file(item.path), name = readable(item.name || item.path.split('/').pop()), picture = item.kind === 'image';  // url: a media id the showrunner named
   actions.pausePlayback();
   const media = item.kind === 'audio' ? `<audio src="${src}" controls autoplay></audio>`
     : picture ? `<div class="bin-image modal-image-viewport"><img src="${src}" alt="" draggable="false"></div>`
@@ -79,7 +79,9 @@ export function mountBin(root) {
         const shot = state.selection.size === 1 ? [...state.selection][0] : null;
         menu({ x: event.clientX, y: event.clientY }, [
           { label: item.kind === 'image' ? 'View' : 'Play', icon: item.kind === 'image' ? 'eye' : 'play', action: () => showItem(item) },
+          ...(item.kind !== 'audio' && state.doc.brief.kind !== 'remake' ? [{ label: state.selection.size ? 'New shot from it, after the selected shot' : 'New shot from it, at the end', icon: 'plus', action: () => shotFromBin(item.id, afterSelection()) }] : []),
           ...(shot && item.kind !== 'audio' ? [{ label: `Use as a take of the selected shot`, icon: 'layers', action: () => actions.ops([{ op: 'bin_to_take', item: item.id, shot }]) }] : []),
+          ...(shot && item.kind === 'audio' ? [{ label: `Play it from the selected shot on`, icon: 'audio', action: () => actions.ops([{ op: 'bin_to_track', item: item.id, shot }]).then(() => toast(SOUND_LAID, 'ok'), () => {}) }] : []),
           { label: 'Open', icon: 'expand', action: () => window.open(actions.file(item.path), '_blank') },
           '-',
           { label: 'Remove from the bin', icon: 'trash', danger: true, action: () => actions.ops([{ op: 'bin_remove', item: item.id }]) },

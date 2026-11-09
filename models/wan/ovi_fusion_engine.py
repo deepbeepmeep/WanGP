@@ -140,7 +140,7 @@ class OviFusionEngine:
                     sampling_steps=50,
                     shift=5.0,
                     guide_scale=5.0,
-                    audio_cfg_scalecale=4.0,
+                    audio_cfg_scale=4.0,
                     perturbation_layers=[11],
                     perturbation_start = 0.0,
                     perturbation_end = 1.0,
@@ -265,27 +265,27 @@ class OviFusionEngine:
                 if is_i2v:
                     video_noise[:, :1] = latents_images
                 computed_perturbation_layers = perturbation_layers if int(perturbation_start * sampling_steps) <= i < int(perturbation_end * sampling_steps) else None
-                any_guidance = not (guide_scale == 1 and audio_cfg_scalecale ==1)
+                any_guidance = not (guide_scale == 1 and audio_cfg_scale ==1)
 
-                if any_guidance and not joint_pass:
+                if not (any_guidance and joint_pass):
                     pred_vid_pos, pred_audio_pos = self.model(
                         audio_context= [text_embeddings_audio_pos],
                         vid_context= [text_embeddings_video_pos],
                         x_id_list =[0],
                         **kwargs
                     )
-                    if pred_vid_pos is None: 
+                    if pred_vid_pos is None:
                         return ret()
-                    
-                    pred_vid_neg, pred_audio_neg = self.model(
-                        audio_context= [text_embeddings_audio_neg],
-                        vid_context =[text_embeddings_video_neg],
-                        x_id_list =[1],
-                        computed_perturbation_layers = computed_perturbation_layers,
-                        **kwargs
-                    )
-                    if pred_vid_neg is None: 
-                        return ret()
+                    if any_guidance: # no negative pass when both scales are 1: the guided predictions are then the conditional ones
+                        pred_vid_neg, pred_audio_neg = self.model(
+                            audio_context= [text_embeddings_audio_neg],
+                            vid_context =[text_embeddings_video_neg],
+                            x_id_list =[1],
+                            computed_perturbation_layers = computed_perturbation_layers,
+                            **kwargs
+                        )
+                        if pred_vid_neg is None:
+                            return ret()
                 else:
                     vid, audio = self.model(
                         audio_context= [text_embeddings_audio_pos, text_embeddings_audio_neg],
@@ -299,9 +299,11 @@ class OviFusionEngine:
                     pred_vid_pos, pred_vid_neg = vid
                     pred_audio_pos, pred_audio_neg = audio
                     vid = audio = None
-                # Apply classifier-free guidance
-                pred_video_guided = pred_vid_neg + guide_scale * (pred_vid_pos - pred_vid_neg)
-                pred_audio_guided = pred_audio_neg + audio_cfg_scalecale * (pred_audio_pos - pred_audio_neg)
+                if any_guidance: # Apply classifier-free guidance
+                    pred_video_guided = pred_vid_neg + guide_scale * (pred_vid_pos - pred_vid_neg)
+                    pred_audio_guided = pred_audio_neg + audio_cfg_scale * (pred_audio_pos - pred_audio_neg)
+                else:
+                    pred_video_guided, pred_audio_guided = pred_vid_pos, pred_audio_pos
                 pred_audio_neg = pred_audio_pos = pred_vid_neg = pred_vid_pos = None
                 # Update noise using scheduler
                 video_noise = scheduler_video.step(

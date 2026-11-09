@@ -84,6 +84,10 @@ class WanGPHost:
     def production_workspace(self, title: str, folder: Path) -> str:
         return self._client().ensure_workspace(f"Showrunner - {title}"[:120], folder)
 
+    def gallery_media(self, workspace: str, media_id: str) -> str | None:
+        """The file of a Gallery media id in a production's workspace, None when its Gallery has no such media."""
+        return next((item["path"] for item in self._client().gallery(workspace) if item["id"] == media_id), None)
+
     def gpu_turn(self, cancelled):
         """The turn of renders made without the showrunner: after the showrunners at work in other productions, in order with them, never beside Deepy's model."""
         return self._client().turn(cancelled)
@@ -194,6 +198,13 @@ class WanGPHost:
 
     def save_default_templates(self, picks: dict) -> None:
         self.plugin.save_config(templates=picks)
+
+    def prompt_rules(self) -> dict:
+        """The user's rules for writing prompts with a template ("category/name": text), for every production."""
+        return self.plugin.config().get("prompt_rules") or {}
+
+    def save_prompt_rules(self, rules: dict) -> None:
+        self.plugin.save_config(prompt_rules=rules)
 
     def frame_size(self, entry: dict, resolution: str) -> str:
         """The size a template's model makes of a resolution: fitted to its grid, as generation does."""

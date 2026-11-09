@@ -201,9 +201,9 @@ if triton is not None and tl is not None:
 
 
     @triton.jit(do_not_specialize=("Q_PER_SEQ", "TABLE_WIDTH"), do_not_specialize_on_alignment=("Q_PER_SEQ", "TABLE_WIDTH"))
-    def q8_grouped_partials_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tables_ptr, lengths_ptr, partial_ptr, maximum_ptr, sum_ptr,
+    def q8_grouped_partials_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tables_ptr, lengths_ptr, partial_ptr, maximum_ptr, sum_ptr, tree_ptr,
                                   Q_PER_SEQ, H_Q: tl.constexpr, H_KV: tl.constexpr, D: tl.constexpr, PAGE: tl.constexpr,
-                                  TABLE_WIDTH, SPLITS: tl.constexpr, M: tl.constexpr, N: tl.constexpr, SCALE: tl.constexpr):
+                                  TABLE_WIDTH, SPLITS: tl.constexpr, M: tl.constexpr, N: tl.constexpr, SCALE: tl.constexpr, TREE: tl.constexpr):
         sequence, kv_head, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
         split, query_block = tile % SPLITS, tile // SPLITS
         group: tl.constexpr = H_Q // H_KV
@@ -215,6 +215,8 @@ if triton is not None and tl is not None:
         q = tl.load(q_ptr + (query_index[:, None] * H_Q + query_head[:, None]) * D + dims[None, :], mask=valid_rows[:, None], other=0.0)
         context_len = tl.load(lengths_ptr + sequence)
         prefix_len = context_len - Q_PER_SEQ
+        if TREE:  # tree verification: each row sees the prefix and the verify rows marked in its ancestor bits (itself included)
+            ancestors = tl.load(tree_ptr + sequence * Q_PER_SEQ + rows // group, mask=valid_rows, other=0)
         tiles_per_split = tl.cdiv(tl.cdiv(context_len, N), SPLITS)
         begin = split * tiles_per_split * N
         end = tl.minimum(context_len, (split + 1) * tiles_per_split * N)
@@ -234,7 +236,12 @@ if triton is not None and tl is not None:
             k_lo = (k - k_hi.to(tl.float32)).to(q.dtype)
             scores = tl.dot(q, k_hi)
             scores = tl.dot(q, k_lo, scores) * SCALE
-            valid = valid_rows[:, None] & valid_columns[None, :] & (columns[None, :] <= prefix_len + rows[:, None] // group)
+            if TREE:
+                local = columns - prefix_len
+                visible = (local[None, :] < 0) | (((ancestors[:, None] >> tl.maximum(local, 0)[None, :].to(tl.int64)) & 1) != 0)
+                valid = valid_rows[:, None] & valid_columns[None, :] & visible
+            else:
+                valid = valid_rows[:, None] & valid_columns[None, :] & (columns[None, :] <= prefix_len + rows[:, None] // group)
             scores = tl.where(valid, scores, -1.0e20)
             new_maximum = tl.maximum(maximum, tl.max(scores, 1))
             correction = tl.exp2((maximum - new_maximum) * 1.4426950408889634)
@@ -271,7 +278,8 @@ if triton is not None and tl is not None:
         tl.store(out_ptr + row * D + dims, result)
 
 
-def _q8_grouped_attention(q, k_cache, v_cache, k_scale, v_scale, block_tables, context_lens, softmax_scale):
+def _q8_grouped_attention(q, k_cache, v_cache, k_scale, v_scale, block_tables, context_lens, softmax_scale, tree_mask=None):
+    """tree_mask: per verify row, int64 bits of the verify rows it sees (tree verification); None: causal rows."""
     queries_per_sequence = q.shape[0] // context_lens.numel()
     groups = q.shape[1] // k_cache.shape[2]
     query_rows = queries_per_sequence * groups
@@ -285,13 +293,18 @@ def _q8_grouped_attention(q, k_cache, v_cache, k_scale, v_scale, block_tables, c
     maximum = torch.empty((*q.shape[:2], splits), device=q.device, dtype=torch.float32)
     denominator = torch.empty_like(maximum)
     output = torch.empty_like(q)
-    if _use_sm120_q8(q):
-        _log_kv_attention_backend_once("sm120_grouped_q8", f"[Deepy][KV cache] SM120 asynchronous copies enabled for Q8 decode/verification ({_SM120_Q8.__name__}).")
-        _SM120_Q8.q8_grouped_partials(q, k_cache, v_cache, k_scale, v_scale, block_tables, context_lens, partial, maximum, denominator, splits, softmax_scale)
+    sm120 = _SM120_Q8 if tree_mask is None else _sm120_tree_kernels()  # the wheel's precompiled SM120 kernel masks chains only
+    if sm120 is not None and _use_sm120_q8(q):
+        _log_kv_attention_backend_once("sm120_grouped_q8" + ("" if tree_mask is None else "_tree"), f"[Deepy][KV cache] SM120 asynchronous copies enabled for Q8 {'decode/verification' if tree_mask is None else 'tree verification'} ({sm120.__name__}).")
+        if tree_mask is None:
+            sm120.q8_grouped_partials(q, k_cache, v_cache, k_scale, v_scale, block_tables, context_lens, partial, maximum, denominator, splits, softmax_scale)
+        else:
+            sm120.q8_grouped_partials(q, k_cache, v_cache, k_scale, v_scale, block_tables, context_lens, partial, maximum, denominator, splits, softmax_scale, tree_mask)
     else:
         q8_grouped_partials_kernel[(context_lens.numel(), k_cache.shape[2], query_blocks * splits)](
-            q, k_cache, v_cache, k_scale, v_scale, block_tables, context_lens, partial, maximum, denominator,
-            queries_per_sequence, q.shape[1], k_cache.shape[2], q.shape[2], k_cache.shape[1], block_tables.shape[1], splits, block_m, 32, softmax_scale, num_warps=4, num_stages=1)
+            q, k_cache, v_cache, k_scale, v_scale, block_tables, context_lens, partial, maximum, denominator, context_lens if tree_mask is None else tree_mask,
+            queries_per_sequence, q.shape[1], k_cache.shape[2], q.shape[2], k_cache.shape[1], block_tables.shape[1], splits, block_m, 32, softmax_scale, tree_mask is not None,
+            num_warps=4, num_stages=1)
     q8_grouped_reduce_kernel[(q.shape[0] * q.shape[1],)](partial, maximum, denominator, output, splits, q.shape[2], num_warps=4)
     return output
 
@@ -793,6 +806,8 @@ class Attention(nn.Module):
         q8_grouped = q8_kernels and use_triton and self.head_dim in (32, 64, 128, 256) and (context.speculative_verify or not context.is_prefill)
         q8_prefill = q8_kernels and context.is_prefill and context.block_tables is not None and use_triton
         q8_speculative = q8_kernels and not mixed and context.speculative_verify and _Q8_PAGED_ATTENTION is not None
+        if context.tree_mask is not None and (bits or not q8_grouped or not (q.is_cuda and q.is_contiguous() and q.dtype in (torch.float16, torch.bfloat16))):
+            raise RuntimeError("Tree verification needs the grouped Q8 paged attention (a Q8 KV cache with Triton): this layer's backend only masks a chain.")
         if bits and quantized_cache and not mixed and (context.speculative_verify or not context.is_prefill) and q.dtype == torch.bfloat16 and self.head_dim == 256 and q.is_contiguous():
             _log_kv_attention_backend_once("bf16_bits_q8", "[Deepy][KV cache] decode/verification backend=grouped Q8 paged attention for Turing (BF16 read as bits, FP16 tensor cores, FP32 accumulation).")
             context_lens = context.cu_seqlens_k[1:] if context.speculative_verify else context.context_lens
@@ -811,7 +826,7 @@ class Attention(nn.Module):
             if q8_grouped:
                 _log_kv_attention_backend_once("grouped_triton_q8", f"[Deepy][KV cache] decode/verification backend=grouped Q8 paged attention ({dtype_name} I/O, FP32 accumulation, no dense KV materialization).")
                 context_lens = context.cu_seqlens_k[1:] if context.speculative_verify else context.context_lens
-                output = _q8_grouped_attention(q, k_cache, v_cache, self.k_scale, self.v_scale, context.block_tables, context_lens, self.scale)
+                output = _q8_grouped_attention(q, k_cache, v_cache, self.k_scale, self.v_scale, context.block_tables, context_lens, self.scale, context.tree_mask)
                 return output if context.speculative_verify else output.unsqueeze(1)
             if context.speculative_verify:
                 _log_kv_attention_backend_once("speculative_llamacpp_q8", f"[Deepy][Speculative] verification backend=batched llama.cpp fattn-vec Q8 paged attention ({dtype_name} I/O, FP32 accumulation, no dense KV materialization).")
@@ -942,6 +957,20 @@ if triton is not None:
 
 def _use_sm120_q8(q):
     return torch.version.hip is None and _SM120_Q8 is not None and q.shape[-1] == 256 and torch.cuda.get_device_capability(q.device) == (12, 0)
+
+
+_SM120_TREE = []
+
+
+def _sm120_tree_kernels():
+    """The Gluon source of the SM120 kernel, which also masks trees (None without Gluon: the portable Triton kernel serves trees)."""
+    if not _SM120_TREE:
+        try:
+            from . import attention_sm120
+        except ImportError:
+            attention_sm120 = None
+        _SM120_TREE.append(attention_sm120 if torch.version.hip is None else None)
+    return _SM120_TREE[0]
 
 
 if triton is not None and tl is not None:

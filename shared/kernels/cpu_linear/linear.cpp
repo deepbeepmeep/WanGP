@@ -25,6 +25,7 @@
 #define CPU_LINEAR_API extern "C" __declspec(dllexport)
 #else
 #include <cpuid.h>
+#include <dlfcn.h>
 #include <sched.h>
 #define CPU_LINEAR_API extern "C" __attribute__((visibility("default")))
 #endif

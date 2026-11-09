@@ -340,7 +340,7 @@ class ShowrunnerToolbox:
             result["cast"] = [{**member, "images": full["images"], "voice": full["voice"], **({"voice_description": full["voice_description"]} if full["voice_description"] else {})}
                               for member, full in zip(result["cast"], doc["cast"])]
             catalog = self._catalog(doc)
-            result["template_advice"] = templates.advice(doc, catalog, self.showrunner.host.settings()["any_shot_length"])
+            result["template_advice"] = templates.advice(doc, catalog, self.showrunner.host.settings()["any_shot_length"], self.showrunner.host.prompt_rules())
             warnings = templates.lint(doc, catalog) + templates.places_missing(doc, catalog) + model.cut_lines(doc) + model.singing_without_song(doc) + model.song_drift(doc) + model.song_words(doc) + self._length_warning(doc)
             if warnings:
                 result["warnings"] = warnings
@@ -348,8 +348,12 @@ class ShowrunnerToolbox:
                 analysis = doc["audio"]["analysis"]
                 result["song_analysis"] = {key: analysis.get(key) for key in ("duration_s", "bpm", "sections")} | {"bars": analysis.get("bars", [])[:200]}
             return result
-        if section == "shot":
-            return {"revision": doc["revision"], "shot": model.find(doc["shots"], shot, "shot")}
+        if section == "shot":  # read before a reshoot or a new prompt: the user's rules for its template go with it
+            result = {"revision": doc["revision"], "shot": model.find(doc["shots"], shot, "shot")}
+            rules = self.showrunner.host.prompt_rules()
+            if rules and (entry := templates.shot_entry(doc, result["shot"], self._catalog(doc))) and (text := rules.get(name := templates.entry_name(entry))):
+                result.update(user_prompt_rules={name: text}, user_prompt_rules_note=templates.PROMPT_RULES_NOTE)
+            return result
         if section == "timeline":  # before assembling: what assemble would warn about, while it costs no version
             warnings = self._music_warnings(target, target.snapshot(), model.cut_length(doc)) + model.cut_lines(doc) + model.singing_without_song(doc) + model.song_drift(doc) + model.song_words(doc) + model.missing_ends(doc) + self._length_warning(doc)
             return {"revision": doc["revision"], "total_s": model.cut_length(doc), "timeline": model.timeline(doc), **({"warnings": warnings} if warnings else {})}
@@ -903,14 +907,15 @@ class ShowrunnerToolbox:
 
     @staticmethod
     def _resolve_settings(ctx, target, settings: dict[str, Any]) -> dict[str, Any]:
-        """Media paths in settings become the caller's names for them (tools refuse absolute paths without Read Everywhere)."""
+        """Media paths in settings become the caller's names for them (tools refuse absolute paths without Read Everywhere). Only the media
+        settings: a prompt is text, and a long one is no valid file name (Errno 36)."""
         def resolve(value):
             if isinstance(value, str) and value and ":" not in value[:12].replace(":\\", "").replace(":/", "") and target.resolve(value).is_file():
                 return ctx.virtualize(str(target.resolve(value)))
             if isinstance(value, list):
                 return [resolve(item) for item in value]
             return value
-        return {key: resolve(value) for key, value in settings.items()}
+        return {key: resolve(value) if key in MEDIA_SETTINGS else value for key, value in settings.items()}
 
     @staticmethod
     def _real_paths(ctx, settings: dict[str, Any]) -> dict[str, Any]:

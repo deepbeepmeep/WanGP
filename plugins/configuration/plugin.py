@@ -701,7 +701,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                         choices=[("Disabled", DEEPY_TYPE_DISABLED), ("Deepy Zero", DEEPY_TYPE_ZERO), ("Deepy Prime", DEEPY_TYPE_PRIME)],
                         value=deepy_type_default,
                         label="Deepy",
-                        info="Deepy Zero uses local Qwen models for focused tasks such as generation, editing and transcription. Deepy Prime plans multi-step projects, manages workspace files and can use external tools; it requires a local Qwen3.8 VL model (9B or 27B) or an external LLM.",
+                        info="Deepy Zero uses local Qwen models for focused tasks such as generation, editing and transcription. Deepy Prime plans multi-step projects, manages workspace files and can use external tools; it requires a local Qwen3.8 VL model or an external LLM.",
                         elem_id="deepy_type_choice",
                     )
                     with gr.Row(visible=deepy_type_default != DEEPY_TYPE_DISABLED and not deepy_remote_default) as self.deepy_vram_row:

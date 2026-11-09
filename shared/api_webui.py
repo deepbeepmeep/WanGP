@@ -410,13 +410,19 @@ class WebUIQueueProbe:
                 self._register_error(client_id, error_text or "WanGP queue error", stage="generation")
 
     def _check_outputs(self, queue_client_ids: list[str]) -> None:
-        galleries = self._wgp.get_processed_queue(self._session._workspace_gallery())
+        galleries = None
         for client_id in self._client_ids:
             if client_id in self._outputs_by_client_id or client_id in self._errors_by_client_id:
                 continue
+            if client_id in queue_client_ids:  # still queued or running: no output yet, and no gallery read (each job polls 5 times a second)
+                self._missing_output_since.pop(client_id, None)
+                self._logged_missing_output_client_ids.discard(client_id)
+                continue
+            if galleries is None:  # an agent's own workspace is read from disk
+                galleries = self._wgp.get_processed_queue(self._session._workspace_gallery())
             output_paths = self._find_outputs_for_client(client_id, galleries)
             pending_artifact = self._session._peek_output_artifact(client_id)
-            if pending_artifact is not None and client_id not in queue_client_ids:
+            if pending_artifact is not None:
                 if not queue_client_ids and self._gen.get("in_progress", False):
                     if client_id not in self._logged_missing_output_client_ids:
                         print(f"WanGP API delaying completion for client_id={client_id} until main queue settles")
@@ -453,7 +459,7 @@ class WebUIQueueProbe:
                 for output_path in resolved_output_paths:
                     self._publish("output", {"client_id": client_id, "path": output_path}, "on_output")
                 continue
-            if output_paths and client_id not in queue_client_ids:
+            if output_paths:
                 if not queue_client_ids and self._gen.get("in_progress", False):
                     if client_id not in self._logged_missing_output_client_ids:
                         print(f"WanGP API delaying gallery completion for client_id={client_id} until main queue settles")
@@ -479,10 +485,6 @@ class WebUIQueueProbe:
                 print(f"WanGP API completed client_id={client_id} via gallery paths={output_paths}")
                 for output_path in output_paths:
                     self._publish("output", {"client_id": client_id, "path": output_path}, "on_output")
-                continue
-            if client_id in queue_client_ids:
-                self._missing_output_since.pop(client_id, None)
-                self._logged_missing_output_client_ids.discard(client_id)
                 continue
             if client_id not in self._admitted_client_ids:
                 continue

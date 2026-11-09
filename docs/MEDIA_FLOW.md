@@ -71,7 +71,7 @@ A file that fails is recorded and the batch moves on to the next one; the **Run*
 
 Long videos are processed in **chunks**, short pieces processed one after the other and joined without visible seams. Only the current chunk is held in memory, so a two-hour video needs no more memory than a short clip.
 
-- **Chunk Size:** the length of each piece, in seconds. Shorter chunks need less memory and give earlier previews; longer chunks give the model more context and fewer joins.
+- **Chunk Size:** the length of each piece, in seconds. Shorter chunks need less memory and give earlier previews; longer chunks give the model more context and fewer joins. A chunk cannot be longer than what the process generates in one pass (481 frames for the LTX processes, 16 seconds at 30 FPS); a longer value is reduced to that length when the run starts.
 - **Sliding Window Overlap:** the number of frames each chunk shares with the previous one so that the joins stay seamless. The default suits most videos; increase it if you notice jumps at chunk boundaries.
 - **Start** and **End:** process only part of the video. Enter seconds (`90`), minutes and seconds (`01:30`) or hours, minutes and seconds (`01:02:30.5`). Leave them empty to process the whole video.
 - **Audio Track:** **Auto** keeps every audio track of the source; choose a track number to keep only that one. The audio is copied as it is, without re-encoding.

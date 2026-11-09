@@ -53,6 +53,7 @@ export const api = {
   chooseTemplate: (id, role, template) => call('POST', `productions/${id}/templates`, { role, template }),
   defaultTemplates: () => call('GET', 'templates'),
   chooseDefaultTemplate: (role, template) => call('POST', 'templates', { role, template }),
+  setPromptRules: (template, text) => call('POST', 'prompt-rules', { template, text }),
   guide: () => call('GET', 'guide'),
   settings: () => call('GET', 'settings'),
   conversation: (id, after) => call('GET', `productions/${id}/conversation?after=${after}`),
@@ -65,8 +66,14 @@ export const api = {
     const form = new FormData();
     form.append('file', file, file.name);
     form.append('role', role);
-    if (target) form.append('target', target);
+    if (target != null && target !== '') form.append('target', target);  // a position can be 0
     return call('POST', `productions/${id}/upload`, form);
+  },
+  exportUrl: id => `api/productions/${id}/export`,
+  importZip(file) {
+    const form = new FormData();
+    form.append('file', file, file.name);
+    return call('POST', 'productions/import', form);
   },
   sourcePart: (id, shot) => `api/productions/${id}/source_part?shot=${encodeURIComponent(shot)}`,
   sourceFrame: (id, shot, frame) => `api/productions/${id}/source_frame?shot=${encodeURIComponent(shot)}&frame=${encodeURIComponent(frame)}`,

@@ -263,7 +263,7 @@ def florence_llama_download_def(enhancer_id):
 def checkpoint_inventory():
     """Local model choices, including unselected formats and optional draft weights."""
     from shared.utils.files_locator import installed_copies
-    from .block_draft import BLOCK_DRAFT_ASSETS, draft_download_def
+    from .block_draft import BLOCK_DRAFT_ASSETS, BLOCK_DRAFT_LABELS, draft_download_def
 
     for number, label in [(1, "Llama 3.2 3B"), (2, "Llama Joy 8B")]:
         yield {"name": "Florence 2", "variant": label, "download_defs": [florence_llama_download_def(number)]}
@@ -288,7 +288,7 @@ def checkpoint_inventory():
                 yield {"name": model, "variant": label, "download_defs": [_files(spec["gguf_repo"], spec["assets_dir_name"], [spec[key]])]}
     for name, spec in BLOCK_DRAFT_ASSETS.items():
         model = bonsai if name.endswith("_bonsai") else QWEN35_VARIANT_SPECS[QWEN38_VARIANT_27B]["display_name"]
-        method = "DSpark" if name == "dspark" else "DFlash2"
+        method = BLOCK_DRAFT_LABELS[name.removesuffix("_bonsai")]
         yield {"name": model, "variant": f"{method} Draft", "download_defs": [draft_download_def(spec)]}
 
     # Earlier 9B weights can remain beside the current releases after an upgrade.

@@ -1,17 +1,14 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
-"""A hashed n-gram embedding table read from its GGUF file, with a few rows read per token. The rows of a pass are read past the OS cache, grouped by page,
-and a small cache keeps the rows in use (shared.kernels.cpu_linear, rows.inc). Where the RAM allows it, the whole table also reaches the OS file cache on a
-thread: reading new text then takes a third of the time, and the OS can take that RAM back. Each token's rows give its embedding: heads_per_ngram rows per
-n-gram order, in float32."""
+"""A hashed n-gram embedding table read from its GGUF file, with a few rows read per token: only the rows a pass asks for, read past the OS cache, grouped by
+page, and a small cache keeps the rows in use (shared.kernels.cpu_linear, rows.inc). Each token's rows give its embedding: heads_per_ngram rows per n-gram
+order, in float32."""
 import ctypes
 import os
 import threading
 
-import psutil
 import torch
-from tqdm import tqdm
 
-from mmgp import mapped, offload, pinned
+from mmgp import mapped, pinned
 from mmgp.expert_compute import DOORBELL, launch_host_job
 from shared.kernels import cpu_linear
 
@@ -19,8 +16,6 @@ if DOORBELL:
     from shared.kernels import host_doorbell
 
 ROW_CACHE_BYTES = 512 << 20
-TABLE_MARGIN = 4 << 30  # under the table's size and this much available RAM, the fill gives the table up: it uses spare RAM only, whatever else needs it comes first, and the OS is about to take its pages
-_TABLE_IN_RAM = "table_ram" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # until the switches are removed
 QUEUED_ROWS = 16  # decoding and verification passes: a host function in the stream (and in the graphs); larger passes run eagerly
 
 
@@ -31,9 +26,8 @@ class NgramJob(ctypes.Structure):
 
 
 class NgramTable:
-    """path: the file; offset, rows, row_bytes: the IQ4_NL table in it; values: floats per row. multipliers, head_offsets, vocab_sizes: the hash.
-    other_bytes: the other weights of the model, which come before the table when the RAM is counted."""
-    def __init__(self, path, offset, rows, row_bytes, values, ngram_size, heads_per_ngram, multipliers, head_offsets, vocab_sizes, cache_bytes=ROW_CACHE_BYTES, other_bytes=0):
+    """path: the file; offset, rows, row_bytes: the IQ4_NL table in it; values: floats per row. multipliers, head_offsets, vocab_sizes: the hash."""
+    def __init__(self, path, offset, rows, row_bytes, values, ngram_size, heads_per_ngram, multipliers, head_offsets, vocab_sizes, cache_bytes=ROW_CACHE_BYTES):
         self.library = cpu_linear.library()
         # locked: under memory pressure a hit stays a hit, instead of a read of the page file. Refused by the reserved RAM: ordinary RAM
         self.cache = pinned.empty(cache_bytes, "n-gram rows") if cache_bytes else None
@@ -41,14 +35,6 @@ class NgramTable:
         self.table = self.library.row_table_open(encoded, offset, row_bytes, rows, cache_bytes, None if self.cache is None else self.cache.data_ptr())
         if not self.table:
             raise FileNotFoundError(f"The n-gram table could not be opened: {path}")
-        table_bytes = rows * row_bytes
-        self.fill_end = 0  # where the fill stops in the file
-        if _TABLE_IN_RAM and psutil.virtual_memory().available >= table_bytes + other_bytes + offload.POOL_RAM_FLOOR:
-            status = self.library.row_table_fill(self.table, encoded, table_bytes + TABLE_MARGIN)
-            if status:
-                raise OSError(status, f"The n-gram table could not be mapped: {path}")
-            self.fill_end = offset + table_bytes
-            tqdm.write(f"N-Gram Table: Reading {table_bytes / 2**30:.1f} GiB Into the File Cache in the Background")
         self.values, self.ngram_size, self.heads_per_ngram = values, ngram_size, heads_per_ngram
         self.heads = (ngram_size - 1) * heads_per_ngram
         self.width = self.heads * values
@@ -92,7 +78,7 @@ class NgramTable:
     def stats(self):
         out = (ctypes.c_uint64 * 6)()
         self.library.row_table_stats(self.table, out)
-        return dict(zip(("lookups", "hits", "reads", "bytes", "read_us", "calls"), out), filled=self.library.row_table_filled(self.table), fill_end=self.fill_end)
+        return dict(zip(("lookups", "hits", "reads", "bytes", "read_us", "calls"), out))
 
     def _job(self, context, out, tokens):
         return NgramJob(self.table, context, out, ctypes.addressof(self.multipliers), ctypes.addressof(self.head_offsets), ctypes.addressof(self.vocab_sizes), tokens, self.ngram_size, self.heads_per_ngram, self.values, 0, 0)

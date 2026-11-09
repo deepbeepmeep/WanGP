@@ -99,8 +99,9 @@ def _collect_specs(state_dict, metadata=None):
         convrot_group_size = int(config.get("convrot_groupsize", 256))
         if group_size != inferred_group_size:
             raise ValueError(f"W4A8 group size mismatch for '{base}': metadata={group_size}, tensors={inferred_group_size}")
-        if logical_k % group_size != 0 or logical_k % convrot_group_size != 0:
-            raise ValueError(f"Invalid W4A8 grouping for '{base}': K={logical_k}, group={group_size}, ConvRot={convrot_group_size}")
+        if logical_k % group_size != 0 or logical_k % convrot_group_size != 0:  # K counts two 4-bit weights per byte
+            raise ValueError(f"Unsupported quantized checkpoint: '{base}' is not in WanGP's asymmetric W4A8 layout (read as 4-bit weights: K={logical_k}, "
+                             f"group={group_size}, ConvRot={convrot_group_size}). Other formats, such as W6A8, are not supported.")
         if correction is not None and tuple(correction.shape) != (logical_k // group_size, weight.shape[0]):
             raise ValueError(f"Invalid W4A8 correction shape for '{base}': {tuple(correction.shape)}")
         specs.append({"name": base, "weight": weight, "s_rel": s_rel, "s_channel": s_channel, "codebook": codebook,

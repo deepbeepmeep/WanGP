@@ -245,7 +245,7 @@ def video_frame(path: str | Path, frame: int, out_folder: str | Path) -> Path:
     out = Path(out_folder) / f"{Path(path).stem}-frame{frame}.png"
     if not out.is_file():
         out.parent.mkdir(parents=True, exist_ok=True)
-        _run([ffmpeg(), "-y", "-v", "error", "-i", str(path), "-vf", f"select=eq(n\\,{frame})", "-frames:v", "1", "-vsync", "0", str(out)])
+        _run([ffmpeg(), "-y", "-v", "error", "-i", str(path), "-vf", f"select=eq(n\\,{frame})", "-frames:v", "1", "-fps_mode", "passthrough", str(out)])
     return out
 
 

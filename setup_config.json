@@ -6,8 +6,12 @@
             "3.12": { "ver": "3.12.10", "label": "Python 3.12.10 (AMD ROCm)" }
         },
         "torch": {
+            "cu126": {
+                "label": "Torch 2.7.1 + CUDA 12.6 (GTX 10XX: the Linux CUDA 12.8 wheels start at RTX 20XX, CUDA 13 no longer supports them)",
+                "cmd": "torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu126"
+            },
             "cu128": {
-                "label": "Torch 2.7.1 + CUDA 12.8 (GTX 10XX only: CUDA 13 no longer supports them)",
+                "label": "Torch 2.7.1 + CUDA 12.8 (legacy stack, RTX 20XX and newer)",
                 "cmd": "torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128"
             },
             "cu130": {
@@ -113,24 +117,24 @@
         },
         "kernels": {
             "wgpkernels": {
-                "label": "WGPKernels 1.4.2 (CUDA 13, RTX 20XX+)",
+                "label": "WGPKernels 1.4.3 (CUDA 13, RTX 20XX+)",
                 "cmd": {
-                    "win": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.2/wgpkernels-1.4.2%2Bcu130-py3-none-win_amd64.whl",
-                    "linux": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.2/wgpkernels-1.4.2%2Bcu130-py3-none-linux_x86_64.whl"
+                    "win": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Bcu130-py3-none-win_amd64.whl",
+                    "linux": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Bcu130-py3-none-linux_x86_64.whl"
                 }
             },
             "wgpkernels_cu128": {
-                "label": "WGPKernels 1.4.2 (CUDA 12.8, RTX 20XX+)",
+                "label": "WGPKernels 1.4.3 (CUDA 12.8, RTX 20XX+)",
                 "cmd": {
-                    "win": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.2/wgpkernels-1.4.2%2Bcu128-py3-none-win_amd64.whl",
-                    "linux": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.2/wgpkernels-1.4.2%2Bcu128-py3-none-linux_x86_64.whl"
+                    "win": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Bcu128-py3-none-win_amd64.whl",
+                    "linux": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Bcu128-py3-none-linux_x86_64.whl"
                 }
             },
             "wgpkernels_rocm10": {
-                "label": "WGPKernels 1.4.2 (ROCm 10, RDNA4, experimental)",
+                "label": "WGPKernels 1.4.3 (ROCm 10, RDNA4, experimental)",
                 "cmd": {
-                    "win": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.2/wgpkernels-1.4.2%2Brocm100-py3-none-win_amd64.whl",
-                    "linux": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.2/wgpkernels-1.4.2%2Brocm100-py3-none-linux_x86_64.whl"
+                    "win": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Brocm100-py3-none-win_amd64.whl",
+                    "linux": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.4.3/wgpkernels-1.4.3%2Brocm100-py3-none-linux_x86_64.whl"
                 }
             },
             "nunchaku": { 
@@ -178,7 +182,7 @@
         }
     },
     "gpu_profiles": {
-        "GTX_10":      { "platforms": ["win", "linux"], "python": "3.10", "torch": "cu128", "triton": null,     "sage": null,       "sparge": null, "flash": null, "kernels": [] },
+        "GTX_10":      { "platforms": ["win", "linux"], "python": "3.10", "torch": "cu126", "triton": null,     "sage": null,       "sparge": null, "flash": null, "kernels": [] },
         "RTX_20":      { "platforms": ["win", "linux"], "python": "3.11", "torch": "cu130", "triton": "v33", "sage": "v1", "sparge": null, "flash": null, "kernels": ["wgpkernels", "nunchaku_cu13", "gguf"] },
         "RTX_30":      { "platforms": ["win", "linux"], "python": "3.11", "torch": "cu130", "triton": "v37", "sage": "v220_cu13", "sparge": "v010_cu13", "flash": "v210", "kernels": ["wgpkernels", "nunchaku_cu13", "gguf"] },
         "RTX_40":      { "platforms": ["win", "linux"], "python": "3.11", "torch": "cu130", "triton": "v37", "sage": "v220_cu13", "sparge": "v010_cu13", "flash": "v210", "kernels": ["wgpkernels", "nunchaku_cu13", "gguf"] },

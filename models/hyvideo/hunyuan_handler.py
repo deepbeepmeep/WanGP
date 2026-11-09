@@ -186,6 +186,15 @@ class family_handler():
         return latent_rgb_factors, latent_rgb_factors_bias
 
     @staticmethod
+    def query_retired_files(model_type):
+        """Checkpoints that earlier releases of a model type downloaded and its current definition no longer names (Models Manager
+        lists them with the model, to delete them)."""
+        return {
+            "hunyuan": ["hunyuan_video_720_bf16.safetensors.safetensors"],
+            "hunyuan_1_5_upsampler": ["hunyuan_video_1.5_upsampler_720_quanto_int8_bf16.safetensors"],
+        }.get(model_type, [])
+
+    @staticmethod
     def query_model_files(computeList, base_model_type, model_def=None):
         if test_hunyuan_1_5(base_model_type):
             download_def = [{  

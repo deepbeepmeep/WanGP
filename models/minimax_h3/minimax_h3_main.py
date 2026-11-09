@@ -14,6 +14,7 @@ from shared.utils import files_locator as fl
 
 from .audio_vae import MiniMaxH3AudioVAE
 from .convrot_layout import get_convrot_layout
+from .hyperflow import replace_low_rank_linears
 from .latent_upscaler import MiniMaxH3LatentUpscaler
 from .p_h3_image import P_H3_IMAGE_TEXT_ENCODER_FOLDER, P_H3_IMAGE_VAE_FILE, P_H3_IMAGE_VAE_INT8_FILE
 from .pipeline import MiniMaxH3Pipeline
@@ -103,7 +104,7 @@ def probe_h3_checkpoint(filename):
     """Inspect tensor headers before allocating the network."""
     checkpoint_path = filename[0] if isinstance(filename, (list, tuple)) else filename
     hybrid_ref2va_blocks = _hybrid_ref2va_blocks(filename)
-    state_dict, _ = quant_router.load_metadata_state_dict(checkpoint_path)
+    state_dict, metadata = quant_router.load_metadata_state_dict(checkpoint_path)
     normalized = {}
     for key, value in state_dict.items():
         for prefix in ("model.diffusion_model.", "diffusion_model."):
@@ -111,12 +112,18 @@ def probe_h3_checkpoint(filename):
                 key = key[len(prefix):]
                 break
         normalized[key] = value
-    separate_qkv = any(key.endswith(".attn.q_proj.weight") for key in normalized)
+    separate_qkv = any(key.endswith((".attn.q_proj.weight", ".attn.q_proj.down.weight")) for key in normalized)
     table = next((tensor for key, tensor in normalized.items() if key == "adaln_t_table"), None)
     if table is None:
         if hybrid_ref2va_blocks is not None:
             raise ValueError("MiniMax H3 FL2VA/Ref2VA hybrid checkpoints require compressed AdaLN tables")
-        return {"compressed_modulation": False, "adaln_curve_grid": None, "time_embed_dim": 2688, "adaln_dtype": None, "separate_qkv": separate_qkv}
+        hyperflow = {}
+        if "endpoint_time_embedder.proj_in.weight" in normalized:  # HyperFlow: removed blocks, low-rank linears, two-time AdaLN of width 16
+            present = {int(key.split(".", 2)[1]) for key in normalized if key.startswith("blocks.")}
+            hyperflow = {"time_embed_dim": int(normalized["time_embedder.proj_out.weight"].shape[0]), "endpoint_gate": float(metadata["hyperflow_gate"]),
+                         "dropped_blocks": tuple(index for index in range(NUM_TRANSFORMER_BLOCKS) if index not in present),
+                         "low_rank": {key[:-len(".down.weight")]: int(tensor.shape[0]) for key, tensor in normalized.items() if key.endswith(".down.weight")}}
+        return {"compressed_modulation": False, "adaln_curve_grid": None, "time_embed_dim": 2688, "adaln_dtype": None, "separate_qkv": separate_qkv, **hyperflow}
     if not table.dtype.is_floating_point:
         raise ValueError(f"H3 AdaLN curve table must use an unquantized floating-point GGUF qtype, got {table.dtype}")
     if len(table.shape) != 2 or table.shape[0] < 2:
@@ -200,7 +207,8 @@ def _load_transformer(filename, dtype, qkv_splitting=True, qkv_layout="interleav
         transformer = MiniMaxH3Model(adaln_curve_grid=checkpoint["adaln_curve_grid"], time_embed_dim=checkpoint["time_embed_dim"], adaln_dtype=checkpoint["adaln_dtype"],
                                      hybrid_ref2va_blocks=hybrid_ref2va_blocks, pdd_num_steps=pdd_num_steps,
                                      pdd_block_size=pdd_block_size, vdn=vdn, vsa=vsa, control_layers=control_layers,
-                                     control_in_dim=control_in_dim, dtype=dtype, device="meta")
+                                     control_in_dim=control_in_dim, dropped_blocks=checkpoint.get("dropped_blocks", ()),
+                                     endpoint_gate=checkpoint.get("endpoint_gate"), dtype=dtype, device="meta")
         if veda:
             transformer.veda_attention = veda_policy
             for layer, block in enumerate(transformer.blocks):
@@ -219,6 +227,8 @@ def _load_transformer(filename, dtype, qkv_splitting=True, qkv_layout="interleav
         for module in transformer.modules():
             if hasattr(module, "qkv_interleaved"):
                 module.qkv_interleaved = qkv_layout == "interleaved"
+    if checkpoint.get("low_rank"):
+        replace_low_rank_linears(transformer, checkpoint["low_rank"], dtype)
     transformer.requires_grad_(False)
     preprocess_sd = partial(_strip_wrappers, pdd=pdd, ref2va_adaln_t_table=ref2va_adaln_t_table)
     offload.load_model_data(transformer, filenames, writable_tensors=False, default_dtype=dtype, preprocess_sd=preprocess_sd,
@@ -333,7 +343,7 @@ def model_factory(model_filename, text_encoder_filename, qkv_splitting, dtype=to
             (VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_INT8_FILE, X2_VAE_INT8_FILE, P_H3_IMAGE_VAE_INT8_FILE) if VIDEO_VAE_SPLIT_INT8 else ())
         video_vae = _load_video_vae(video_vae_filename, video_vae_qkv_splitting, upsampling=video_vae_filename in (X2_VAE_FILE, X2_VAE_INT8_FILE), single_frame=image_model)
         audio_vae = None if image_model else _load_audio_vae(audio_vae_filename)
-        latent_upscaler = _load_latent_upscaler(latent_upscaler_filename) if fixed_prompt_filename is None and not image_model and remake_mode is None else None
+        latent_upscaler = _load_latent_upscaler(latent_upscaler_filename) if fixed_prompt_filename is None and remake_mode is None else None
     else:
         text_encoder = shared_h3_pipeline.text_encoder
         video_vae = shared_h3_pipeline.vae

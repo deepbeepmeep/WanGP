@@ -10,6 +10,7 @@ import bisect
 import collections
 import contextlib
 import ctypes
+import functools
 import itertools
 import os
 import threading
@@ -40,6 +41,7 @@ ELASTIC_SLAB = 256 << 20  # GPU copies live in slabs of slots of one size, given
 ELASTIC_REBALANCE = 32  # rounds between two moves of a slab from the size whose experts are worth least to the one whose missing experts are worth most
 ELASTIC_DECAY = float(os.environ.get("WGP_FN_DECAY", 0.9)), 0.995  # per pass, of the two routing counts of an expert: the topic of the last passes, what this text always reads
 ELASTIC_SLOW_SHARE = float(os.environ.get("WGP_FN_SLOW", 0.2))  # the second count's weight in the value of an expert. Replays of real routing, a text staying on its topic: at 15 GiB of experts 25 misses per token against 107 with 0.02 and a gain of 5; texts changing topics 187 against 206
+ELASTIC_PROMPT_SLOW = int("prompt_slow" in os.environ.get("WGP_FN_ENABLE", "").split(","))  # a prompt's routing counts reach the topic's count only, not the one of what the text always reads: a system prompt of tools before a story kept 4-6 CPU pairs per token more, 134 -> 142 tok/s (WGP_FN_ENABLE=prompt_slow: as before)
 ELASTIC_TIE = 1e-3  # what the ranking weighs beside the routing counts: it decides between experts of equal counts
 ELASTIC_GAIN = float(os.environ.get("WGP_FN_GAIN", 3.0))  # an expert takes the place of another when it is worth this many pairs more (of an average expert)
 ELASTIC_KEEP = 1 << 30  # VRAM the placement leaves free when it grows: what the allocator keeps free beyond its allocations, and small allocations of the driver
@@ -47,6 +49,18 @@ ELASTIC_LOW = 640 << 20  # below this it gives VRAM back, whatever took it: anot
 ELASTIC_FIRST_MARGIN = 1 << 30  # VRAM the first placement leaves free for the first passes
 ELASTIC_TRIM = 128 << 20  # VRAM the allocator holds unused from which it is asked to give it back, when the room is short
 ELASTIC_TRIM_ROUNDS = 64  # rounds between two such requests at most
+LEVEL2 = "level2" in os.environ.get("WGP_FN_ENABLE", "").split(",")  # experts out of VRAM in locked RAM (pinned pool entries), and the GPU's share of each layer's misses copied from there by the host jobs, until proven
+# level 2 and the share only where VRAM holds less than this part of the experts' bytes: with 47 % (Flash-Next, 32 GB card) a layer misses 0.4 expert
+# on average, nothing for the copy engine to take beside the CPU, and the share's wait for each job's rows and level 2's rounds cost 25 % of decoding;
+# with 12 % (16 GB card) a layer misses 5-7 of them
+LEVEL2_VRAM_BELOW = float(os.environ.get("WGP_FN_LEVEL2_BELOW", 0.33))
+LEVEL2_BYTES = int(float(os.environ.get("WGP_FN_LEVEL2_GIB", 8)) * 2**30)  # what they lock at most, within the pinned pool's room
+LEVEL2_ENTRY = 128 << 20  # an entry of the pinned pool: slots of one size, in the layout of a VRAM slot
+LEVEL2_ROUND = int(os.environ.get("WGP_FN_LEVEL2_ROUND", 16))  # experts copied into level 2 per round at most (each about 2 MiB, by a helper process)
+LEVEL2_SWAPS = 4  # copies a full level 2 replaces per round at most
+SHARE_PERCENT = int(os.environ.get("WGP_FN_SHARE", 50))  # of a layer's experts missing VRAM, the share the GPU computes at most: those with a locked copy, the most read first
+SHARE_SLOTS = 16  # of the VRAM ring the share is copied into
+SHARE_MODE = os.environ.get("WGP_FN_SHARE_MODE", "copies")  # copies: the copy engine brings the share into a ring of VRAM; mapped: the GPU reads it in place in mapped RAM, over the bus (no copy engine)
 
 
 class ExpertBank(nn.Module):
@@ -156,6 +170,268 @@ def _copy_moves(base, moves):
     for offset, source, nbytes in moves:
         ctypes.memmove(base + offset, source, nbytes)
     drop_behind([(source, nbytes) for _, source, nbytes in moves])  # the GPU's copies replace them
+
+
+def _efficient_cores():
+    """On a hybrid CPU (Windows), its threads go to the least efficient cores, where no CPU expert worker waits for them: the workers' pool waits for its
+    slowest worker at each phase, and a copy taking a performance core from one held a whole job (0.3 -> 1.7 ms per job at 160 GB)."""
+    if os.name != "nt":
+        return
+    kernel32 = ctypes.WinDLL("kernel32")
+    size = ctypes.c_uint32(0)
+    kernel32.GetLogicalProcessorInformationEx(0, None, ctypes.byref(size))  # RelationProcessorCore
+    buffer = ctypes.create_string_buffer(size.value)
+    if not size.value or not kernel32.GetLogicalProcessorInformationEx(0, buffer, ctypes.byref(size)):
+        return
+    raw, masks, offset = buffer.raw, {}, 0
+    while offset < size.value:
+        record = int.from_bytes(raw[offset + 4:offset + 8], "little")
+        efficiency, groups = raw[offset + 9], int.from_bytes(raw[offset + 30:offset + 32], "little")
+        for group in range(groups):
+            at = offset + 32 + 16 * group
+            if int.from_bytes(raw[at + 8:at + 10], "little") == 0:
+                masks[efficiency] = masks.get(efficiency, 0) | int.from_bytes(raw[at:at + 8], "little")
+        offset += record
+    if len(masks) > 1:
+        kernel32.GetCurrentThread.restype = ctypes.c_void_p
+        kernel32.SetThreadAffinityMask.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        kernel32.SetThreadAffinityMask(kernel32.GetCurrentThread(), masks[min(masks)])
+
+
+class _Level2:
+    """Copies of experts out of VRAM in locked RAM (mmgp level 2), filled as the routing reads them: entries of the pinned pool of one slot size each,
+    empty when made, whose slots the experts worth most that are neither in VRAM nor here take, a few per round. With a copy helper (sections of level 2)
+    the helper copies them from their files: its page faults and drive reads hold nothing of this process, and no thread of this process runs for them (a
+    copying thread here cost about 8 % of decoding at 160 GB, where nothing faults: the GIL, working-set queries). Otherwise a thread of its own copies them,
+    on the efficient cores of a hybrid CPU, their checkpoint pages then dropped when RAM is short. One copy per expert: an expert placed in VRAM, or worth much
+    less than one waiting, leaves, after a round's synchronization: nothing in flight reads a slot then. Per expert, read by the host jobs: the address of its
+    copy (sources), its section and offset for a copy helper (remote), its device address for a GPU reading it in place (device), 0 without."""
+    def __init__(self, residency, total):
+        self.residency = weakref.ref(residency)
+        self.sources, self.remote, self.device = (np.zeros(total, dtype=np.uint64) for _ in range(3))
+        self.slot_of = np.full(total, -1, dtype=np.int64)
+        self.pending = set()  # experts whose copy is on its way
+        self.slots, self.free = [], [[] for _ in residency.slot_bytes]  # slot -> [entry name, address, offset, owner]; free slots of each size
+        self.entries, self.making, self.names = {}, set(), 0  # entry name -> (class, its slots, section, device base); the sizes whose entry is being made
+        self.guard = threading.Lock()
+        self.copier = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mmgp_level2", initializer=_efficient_cores)
+        self.filling, self.files = [], {}  # the helper's fills on their way: (sequence number, expert, slot); per bank, its parts' (offset, file mapping, offset in the file, bytes), or None
+        self.counts = dict(rounds=0, copies=0, left=0, entries=0, refused=0, copy_seconds=0.0, fills=0, failed=0)
+
+    def nbytes(self):
+        residency = self.residency()
+        return sum(len(slots) * residency.slot_bytes[klass] for klass, slots, _, _ in self.entries.values())
+
+    def round(self, value, sync=False):
+        """At a round: the experts worth most out of VRAM and out of here take free slots, LEVEL2_ROUND at most; an entry is asked of the pool when a size has
+        no free slot left, and when the pool holds no more (sync: after a synchronization of the GPU, nothing in flight reads a slot) a copy of an expert in
+        VRAM, else one worth much less, makes room. Copies of experts placed in VRAM stay until then: the rounds move experts in and out of VRAM all the
+        time, and each copy that left with its expert was copied again from the file when it came back (at 64 GB, 56K copies in 13 min, 170 MB/s of
+        drive reads, the CPU's experts faulting behind them). Those worth enough to take a place in VRAM at the next two rounds (the first
+        2 x ELASTIC_SWAPS missing ones) are left to them."""
+        residency = self.residency()
+        self.counts["rounds"] += 1
+        with self.guard:  # the ring read under it: once _free_share has settled, no round asks a closed ring
+            share = residency.share
+            ring = share[0] if share is not None and share[0] is not None and share[0].remote else None
+            if ring is not None:
+                self._settle(ring)
+            missing = np.flatnonzero((residency.all_flags == 0) & (value > 0))
+            missing = missing[np.argsort(-value[missing], kind="stable")][2 * ELASTIC_SWAPS:]  # the next two rounds' promotions left to them
+            candidates = missing[self.slot_of[missing] < 0][:LEVEL2_ROUND]
+            if not len(candidates):
+                return
+            copies, replaced = [], 0
+            for index in candidates.tolist():
+                if index in self.pending:
+                    continue
+                klass = int(residency.class_of[index])
+                if not self.free[klass]:
+                    if klass not in self.making and self.nbytes() + LEVEL2_ENTRY * (1 + len(self.making)) <= LEVEL2_BYTES and self._make_entry(klass):
+                        continue  # its slots come with the entry
+                    if not sync or replaced >= LEVEL2_SWAPS:
+                        continue
+                    held = np.flatnonzero((self.slot_of >= 0) & (self.sources != 0) & (residency.class_of == klass))
+                    if not len(held):
+                        continue
+                    # the copy worth least makes room for one worth much more, a copy of an expert in VRAM counting half (read once it comes back): full, it
+                    # replaced up to 16 copies per round, which came back from the file soon after (31K copies in 3 answers at 64 GB)
+                    worth = value[held] * np.where(residency.all_flags[held] != 0, 0.5, 1.0)
+                    victim = int(np.argmin(worth))
+                    if value[index] <= 1.5 * worth[victim] + 1:
+                        continue
+                    self._leave(int(held[victim]))
+                    replaced += 1
+                slot = self.free[klass].pop()
+                self.slots[slot][3] = index
+                self.slot_of[index] = slot
+                self.pending.add(index)
+                copies.append((index, slot))
+            if ring is not None:
+                copies = self._fill(ring, copies)
+        for index, slot in copies:
+            self.copier.submit(self._copy, index, slot)
+
+    def _file_moves(self, bank):
+        # its parts as offsets in their files, None unless each is in a view of a whole file (gguf)
+        if bank not in self.files:
+            from . import offload
+            residency = self.residency()
+            moves = [(start, offload.file_mapping(source), nbytes) for start, source, nbytes in residency.sources[bank]]
+            self.files[bank] = None if any(found is None for _, found, _ in moves) else [(start, found[0], found[1], nbytes) for start, found, nbytes in moves]
+        return self.files[bank]
+
+    def _fill(self, ring, copies):
+        """Under the guard: the copies the helper makes from the files, asked of it; returns the others (for the thread of this process)."""
+        residency, fills, posted, others = self.residency(), [], [], []
+        drop = ram_short()
+        for index, slot in copies:
+            bank = residency.banks[residency.bank_of[index]]
+            moves, name = self._file_moves(bank), self.slots[slot][0]
+            section = self.entries[name][2]
+            if moves is None or section is None:
+                others.append((index, slot))
+                continue
+            expert = index - residency.first[bank]
+            fills.append((section, self.slots[slot][2], [(mapping, offset + expert * nbytes, start, nbytes) for start, mapping, offset, nbytes in moves], drop))
+            posted.append((index, slot))
+        first = ring.fill(fills) if fills else None
+        if first is None:  # its queue is full: free slots again, the next rounds ask again
+            for index, slot in posted:
+                self._release(index, slot)
+            return others
+        self.filling.extend((first + n, index, slot) for n, (index, slot) in enumerate(posted))
+        return others
+
+    def _settle(self, ring, abandon=False):
+        """Under the guard: the helper's fills done are published (the slot still theirs), those that failed free their slot; abandon: those still on their way too
+        (their ring closes)."""
+        if not self.filling:
+            return
+        first = self.filling[0][0]
+        done, results, (seconds, _) = ring.filled(first, self.filling[-1][0] + 1 - first)
+        self.counts["copy_seconds"] = seconds
+        waiting = []
+        for sequence, index, slot in self.filling:
+            if sequence >= done:
+                if abandon:
+                    self._release(index, slot)
+                else:
+                    waiting.append((sequence, index, slot))
+                continue
+            if results[sequence - first] != 0:
+                self.counts["failed"] += 1
+                self._release(index, slot)
+            elif self.slots[slot][3] == index and self.slots[slot][0] in self.entries:
+                self.pending.discard(index)
+                self.counts["fills"] += 1
+                self._publish(index, slot)
+        self.filling = waiting
+
+    def settle(self, ring):
+        """Before the helper's ring closes: its fills done published, the others given up."""
+        with self.guard:
+            self._settle(ring, abandon=True)
+        self.files.clear()  # the mappings go with the ring (offload.close_file_mappings)
+
+    def _release(self, index, slot):
+        self.pending.discard(index)
+        if self.slots[slot][3] == index and self.slots[slot][0] in self.entries:
+            self.slot_of[index] = -1
+            self.slots[slot][3] = -1
+            self.free[self.entries[self.slots[slot][0]][0]].append(slot)
+
+    def _publish(self, index, slot):
+        _, address, offset, _ = self.slots[slot]
+        _, _, section, device = self.entries[self.slots[slot][0]]
+        if section is not None:
+            self.remote[index] = (section << 32) | offset
+        if device is not None:
+            self.device[index] = device + offset
+        self.sources[index] = address + offset  # last: a job takes it once all its addresses are there
+
+    def _copy(self, index, slot):
+        residency = self.residency()
+        if residency is None:
+            return
+        bank = residency.banks[residency.bank_of[index]]
+        expert = index - residency.first[bank]
+        name, address, offset, _ = self.slots[slot]
+        started = time.perf_counter()
+        _copy_moves(address + offset, [(start, source + expert * nbytes, nbytes) for start, source, nbytes in residency.sources[bank]])
+        self.counts["copies"] += 1
+        self.counts["copy_seconds"] += time.perf_counter() - started
+        with self.guard:
+            self.pending.discard(index)
+            if self.slots[slot][3] != index or name not in self.entries:  # its entry left meanwhile
+                return
+            self._publish(index, slot)
+
+    def _leave(self, index):
+        self.counts["left"] += 1
+        slot = int(self.slot_of[index])
+        self.sources[index] = self.remote[index] = self.device[index] = 0
+        self.slot_of[index] = -1
+        self.slots[slot][3] = -1
+        self.free[self.entries[self.slots[slot][0]][0]].append(slot)
+
+    def _make_entry(self, klass):
+        """An entry of slots of a size asked of the pool: False if it takes no more until the next quiet point."""
+        residency = self.residency()
+        manager, size = residency.manager(), residency.slot_bytes[klass]
+        sections = pinned.shared_block if SHARE_MODE == "copies" and residency.banks[0].format.share_sections() else None  # a helper process copies them
+        flags = 2 if SHARE_MODE == "mapped" else 0  # mapped for the GPU, which reads them in place
+        self.names += 1
+        name = f"{residency.model_id}/level2/{self.names}"
+        count = LEVEL2_ENTRY // size
+        # empty when made: its slots take the place of checkpoint pages as they fill, which leave the working set (added 0)
+        future = manager.pool_experts(residency.model_id, name, count * size, lambda buffer, helpers: None, functools.partial(self._entry_out, name), 0, sections, flags)
+        if future is None:
+            self.counts["refused"] += 1
+            return False
+        self.making.add(klass)
+        future.add_done_callback(functools.partial(self._entry_in, name, klass, count, size, flags == 2))
+        return True
+
+    def _entry_in(self, name, klass, count, size, mapped_ram, future):
+        # on the pool's thread
+        residency = self.residency()
+        with self.guard:
+            self.making.discard(klass)
+            if not future.result() or residency is None:
+                self.counts["refused"] += 1
+                return
+            self.counts["entries"] += 1
+            base = residency.manager().pool_source(name).data_ptr()
+            section = pinned.section_of(base)
+            device = None
+            if mapped_ram:
+                from . import mapped
+                device = mapped._device_pointer(base)
+            first = len(self.slots)
+            self.slots.extend([name, base, n * size, -1] for n in range(count))
+            self.entries[name] = (klass, list(range(first, first + count)), section, device)
+            self.free[klass].extend(range(first, first + count))
+        if section is not None and residency.share is not None and residency.share[0] is not None:
+            residency.share[0].prepare([section])  # the helper maps it now, before its first copy
+
+    def _entry_out(self, name):
+        # at a quiet point, before the entry's RAM goes: its experts are read in the checkpoint again, and a copy helper lets its section go
+        residency = self.residency()
+        with self.guard:
+            if name not in self.entries:
+                return
+            klass, slots, section, _ = self.entries.pop(name)
+            for slot in slots:
+                index = self.slots[slot][3]
+                if index >= 0:
+                    self.sources[index] = self.remote[index] = self.device[index] = 0
+                    self.slot_of[index] = -1
+                    self.pending.discard(index)
+                self.slots[slot] = [None, 0, 0, -1]
+            self.free[klass] = [slot for slot in self.free[klass] if self.slots[slot][0] is not None]
+        if section is not None and residency is not None and residency.share is not None and residency.share[0] is not None:
+            residency.share[0].forget(section)
 
 
 _Batch = collections.namedtuple("_Batch", "future plan removals staging slot")  # experts on their way to a locked buffer: their placement waits for the next round
@@ -284,7 +560,7 @@ class Residency:
         self.trimmed = -ELASTIC_TRIM_ROUNDS
         self.last_round, self.next_round, self.plan_due, self.round_room, self.arrivals = 0, 0, False, 0, None
         self.round_seconds, self.rounds_done, self.moved_slabs = 0.0, 0, 0  # what rounds cost on the thread that runs them; slabs moved between sizes
-        self.batch, self.round_thread, self.round_events = None, None, [None, None]
+        self.batch, self.round_thread, self.round_events, self.pass_done = None, None, [None, None], None
         # one size of slot per size of expert: tensors one after the other, aligned
         self.parts, self.sources, sizes = {}, {}, []
         for bank in self.banks:
@@ -298,6 +574,12 @@ class Residency:
             self.parts[bank], self.sources[bank] = parts, sources
             sizes.append(start)
         self.slot_bytes = sorted(set(sizes))
+        self.slot_size = dict(zip(self.banks, sizes))
+        self.level2 = LEVEL2 and torch.version.hip is None
+        self.level2_store = _Level2(self, total) if self.level2 else None
+        if self.level2:  # read by the host jobs: see _Level2
+            self.level2_sources, self.level2_remote, self.level2_device = self.level2_store.sources, self.level2_store.remote, self.level2_store.device
+        self.share, self.share_percent = None, None
         self.class_of = np.repeat(np.array([self.slot_bytes.index(size) for size in sizes]), counts)
         self.class_members = [np.flatnonzero(self.class_of == klass) for klass in range(len(self.slot_bytes))]
         self.capacity = [(ELASTIC_SLAB - 4096) // size for size in self.slot_bytes]
@@ -334,7 +616,56 @@ class Residency:
                 self.write_row(item, expert, item._resident[expert])
             self.table_dirty = True
             self.flush_table()
+            if self.level2 and self._expert_room() < LEVEL2_VRAM_BELOW * self.cumulative[-1]:
+                self._init_share(device)
         return self.table_views[bank]
+
+    def _init_share(self, device):
+        """The GPU's share of the misses: a ring of VRAM slots that the format's library fills with experts of locked RAM for the host jobs (format.share_ring: a helper process on Windows, a
+        thread elsewhere), and per bank a table of the addresses of the experts the GPU computes from there, written by the GPU from the rows the job leaves in mapped RAM. Made with the address
+        table, outside graph capture, and freed with it: the doorbell jobs made from then on hold them."""
+        total, format = len(self.all_flags), self.banks[0].format
+        with torch.inference_mode(False), allocator.normal_allocations():  # read by the graphs, not graph scratch
+            tables = torch.zeros(total, 3, dtype=torch.int64, device=device)
+        ring = format.share_ring(max(self.slot_bytes), SHARE_SLOTS, device) if SHARE_MODE == "copies" else None
+        if ring is not None:  # the sections of level 2 mapped by the helper now, while the prompt is read, before the first copies need them
+            ring.prepare([section for _, _, section, _ in self.level2_store.entries.values() if section is not None])
+        self.share, self.share_percent = (ring, tables), SHARE_PERCENT
+        for bank in self.banks:
+            first = self.first[bank]
+            bank.cpu_share = bank.format.cpu_share(dict(sources=self.level2_sources.ctypes.data + 8 * first, offsets=[part[1] for part in self.parts[bank]], slot_bytes=self.slot_size[bank],
+                                                        ring=None if ring is None else ring.handle, fraction=SHARE_PERCENT / 100, experts=bank.num_experts,
+                                                        remote_sources=self.level2_remote.ctypes.data + 8 * first, device_sources=self.level2_device.ctypes.data + 8 * first))
+            bank.gpu_share = None if bank.cpu_share is None else tables[first:first + bank.num_experts]
+            bank.share_early = ring is None or ring.remote
+
+    def _pause_share(self, paused):
+        """A GPU with one copy engine (WDDM) serves the placement's copies and the share's in turn, by slices of about a millisecond: the share asks for
+        none while the placement's copies are on their way, the GPU would wait for them in every layer."""
+        if self.share is not None and self.share[0] is not None:
+            self.share[0].pause(paused)
+
+    def _free_share(self):
+        """Once the doorbell jobs are released and nothing in flight asks for copies."""
+        if self.share is not None:
+            for bank in self.banks:
+                bank.cpu_share = bank.gpu_share = None
+            ring, self.share = self.share[0], None  # the rounds from now on ask no ring
+            if ring is not None:
+                if ring.remote and self.level2_store is not None:
+                    self.level2_store.settle(ring)  # its fills done published, the others given up
+                ring.close()
+                if ring.remote:
+                    from . import offload
+                    offload.close_file_mappings()  # no helper maps them now
+
+    def share_stats(self):
+        """(experts in locked RAM, their bytes, copies asked for, landed in time, experts missing VRAM, host jobs, first failure) since the share was made."""
+        shares = [bank.cpu_share for bank in self.banks if bank.cpu_share is not None]
+        sizes = np.asarray(self.slot_bytes, dtype=np.int64)[self.class_of]
+        held = self.level2_sources != 0
+        return (int(held.sum()), int(sizes[held].sum()), sum(share.asked for share in shares), sum(share.landed for share in shares), sum(share.missing for share in shares),
+                sum(share.jobs for share in shares), next((share.status for share in shares if share.status), 0))
 
     def write_row(self, bank, expert, tensors):
         if self.table_host is not None:
@@ -361,15 +692,16 @@ class Residency:
     def placeable(self):
         """The ranked experts this residency could ever place: within its budget, or (dynamic) within the whole VRAM beside the ordinary
         blocks of the model and its co-tenants."""
+        return self.ranking[:bisect.bisect_right(self.cumulative, self._expert_room())]
+
+    def _expert_room(self):
         if self.dynamic:
             manager = self.manager()
             cotenants = manager.cotenants_map.get(self.model_id, ())
             model_ids = set(manager.models if cotenants == "*" else (self.model_id, *cotenants))
             ordinary = sum(size for name, size in manager.blocks_of_modules_sizes.items() if name.split("/", 1)[0] in model_ids)
-            target = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory - ordinary - MARGIN
-        else:
-            target = max(0, self.budget - self._nonexpert_bytes()) if self.budget else 0
-        return self.ranking[:bisect.bisect_right(self.cumulative, target)]
+            return torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory - ordinary - MARGIN
+        return max(0, self.budget - self._nonexpert_bytes()) if self.budget else 0
 
     def pin(self, pin_module):
         """Pinned copies of the experts this residency could place, in ranking order and as far as the reserved RAM left by the models
@@ -484,6 +816,10 @@ class Residency:
     def _pool_enter(self, banks):
         """After a pass that read whole layers, the placement known: the experts that crossed and no entry holds enter the pinned pool on the pool's thread, for the next passes, by batches of the size of the stream's, in the same layout. The last
         if at least half of one: a few experts out of an entry cross with the staged ones."""
+        if self.share is not None and self.level2_store.nbytes() + LEVEL2_ENTRY <= LEVEL2_BYTES:
+            # level 2 first: both take the same reserved RAM, which these batches filled before level 2's first entry at 64 GB (decoding reads level 2 at
+            # each pass, these batches serve the prompts); they take what it leaves
+            return
         manager, value = self.manager(), self.prior + self._value()
         for bank in banks:
             parts = [part for part in self.pool_parts.get(bank, ()) if not part[2].done() or (part[2].result() and manager.pool_source(part[0]) is not None)]
@@ -607,6 +943,11 @@ class Residency:
         and at the same addresses: no VRAM moves, and the graphs read the new placement through the pointer table and the resident flags, which they do not capture. Bounded by the
         routing seen since the last time, so that a change of topic costs a few short pauses. The ranking follows, so that a later placement keeps what was learned."""
         self.adapt_calls += 1
+        if self.share is not None and self.share_percent != SHARE_PERCENT:
+            self.share_percent = SHARE_PERCENT
+            for bank in self.banks:
+                if bank.cpu_share is not None:
+                    bank.cpu_share.fraction = SHARE_PERCENT / 100
         if self.elastic:
             return self._adapt_elastic()
         if not self.adapt_due and self.adapt_calls % ADAPT_PASSES or self.changing or not self.loaded or cuda_graphs.recording() or torch.cuda.is_current_stream_capturing():
@@ -707,14 +1048,17 @@ class Residency:
 
     def _plan(self):
         self.plan_due = False
+        if self.level2_store is not None and self.share is not None:  # level 2 is read by the share's jobs only
+            self.level2_store.round(self.prior + self._value())
         passes, self.last_round = self.adapt_calls - self.last_round, self.adapt_calls
         flags, new_pairs = self.all_flags, self.all_usage - self.seen
         self.seen[:] = self.all_usage
-        if self.adapt_due:  # a prompt read since the last round: thousands of pairs per expert would weigh on the counts for dozens of passes
+        prompt = self.adapt_due
+        if prompt:  # a prompt read since the last round: thousands of pairs per expert would weigh on the counts for dozens of passes
             self.adapt_due = False
             new_pairs = np.where(new_pairs > 16, 16 + np.sqrt(np.maximum(new_pairs, 16).astype(np.float32) - 16), new_pairs)
         self.heat = self.heat * ELASTIC_DECAY[0] ** passes + new_pairs
-        self.slow = self.slow * ELASTIC_DECAY[1] ** passes + new_pairs
+        self.slow = self.slow * ELASTIC_DECAY[1] ** passes + (0 if prompt and not ELASTIC_PROMPT_SLOW else new_pairs)
         room = self.round_room
         value = self._value()
         missing = np.flatnonzero((flags == 0) & (value >= ELASTIC_GAIN))
@@ -873,7 +1217,9 @@ class Residency:
         before = self.nbytes
         self.changing = True
         try:
-            torch.cuda.synchronize()  # the last pass reads these copies, the flags and the table no more
+            self._passes_done()
+            if self.level2_store is not None and self.share is not None:  # nothing in flight reads level 2 either: its experts placed now, or worth much less than others, leave
+                self.level2_store.round(self.prior + self._value(), sync=True)
             copies = expert_stream.copy_stream(torch.device("cuda", torch.cuda.current_device()))
             base, stream, arrivals = batch.staging.data_ptr(), _stream_handle(copies), []
             for index in batch.removals:
@@ -901,11 +1247,20 @@ class Residency:
             event = self.round_events[batch.slot] = self.round_events[batch.slot] or torch.cuda.Event()
             event.record(copies)
             self.arrivals = arrivals, event
+            self._pause_share(True)  # the copy engine is this round's until its copies land
             self.flush_table()
             if self.nbytes != before:
                 self._placement_changed()
         finally:
             self.changing = False
+
+    def _passes_done(self):
+        """Waits for the passes queued on this thread's stream: the copies, the flags and the table change once nothing in flight reads them. A blocking
+        wait: where a pass still runs at the round (Fish decodes a frame ahead), its CPU experts are computing, and a spinning wait took their cores
+        (Fish: 48 ms per round)."""
+        self.pass_done = self.pass_done or torch.cuda.Event(blocking=True)
+        self.pass_done.record()
+        self.pass_done.synchronize()
 
     def _land(self, wait=False):
         """The experts whose copies have arrived take their place, between two passes: what follows reads them."""
@@ -917,6 +1272,8 @@ class Residency:
         elif not event.query():
             return
         self.arrivals = None
+        self._pause_share(False)
+        self._passes_done()  # a pass in flight would find their flags set and their table rows not yet there: computed by neither
         for index, slot in arrivals:
             bank, expert = self._item(index)
             bank._place(expert, slot)
@@ -1199,6 +1556,17 @@ class Residency:
                 bank.release_execution_cache()
             if self.elastic and self.table is not None:
                 torch.cuda.synchronize()
+                if self.share is not None and self.manager().verboseLevel >= 1:
+                    held, nbytes, asked, landed, missing, jobs, status = self.share_stats()
+                    ring = self.share[0].stats() if self.share[0] is not None else dict(wait_nanoseconds=0, issued=0, part_nanoseconds=0, parts=0, call_nanoseconds=0, call_max_nanoseconds=0,
+                                                                                        calls_under={}, wake_nanoseconds=0, wakes=0, status=0,
+                                                                                        fraction=float(np.mean([bank.cpu_share.live for bank in self.banks if bank.cpu_share is not None])))
+                    tqdm.write(f"Expert Level 2 - {self.model_id}: {held} Experts in Locked RAM ({nbytes / 2**30:.1f} GiB); of {missing} Experts Missing VRAM over {jobs} Jobs, {asked} Copied, "
+                               f"{landed} in Time for the GPU; a copy waits {ring['wait_nanoseconds'] / max(ring['issued'], 1) / 1e3:.0f} us to be issued, a CPU part lasts "
+                               f"{ring['part_nanoseconds'] / max(ring['parts'], 1) / 1e3:.0f} us; copy call {ring['call_nanoseconds'] / max(ring['issued'], 1) / 1e3:.0f} us (longest "
+                               f"{ring['call_max_nanoseconds'] / 1e6:.1f} ms; calls under {ring['calls_under']}), wake-up {ring['wake_nanoseconds'] / max(ring['wakes'], 1) / 1e3:.0f} us, share now {ring['fraction']:.2f}; "
+                               f"level 2 {self.level2_store.counts}" + (f", Failure {status or ring['status']}" if status or ring['status'] else ""))
+                self._free_share()
                 pinned.retire(self.table_memory)
                 self.table = self.table_host = self.table_memory = None
                 self.table_views, self.table_dirty = {}, False

@@ -1012,10 +1012,28 @@ def _op_remake(doc, op, by, revision, base_revision):
 def _op_add_shots(doc, op, by, revision, base_revision):
     position, added = op.get("position"), []
     for offset, fields in enumerate(op.get("shots") or []):
-        shot = _new_shot(doc, dict(fields), by, revision)  # inserted at once: the next shot's id accounts for it
+        fields = dict(fields)
+        take = fields.pop("take", None)  # a shot made from a file of the user's arrives with it as its take
+        shot = _new_shot(doc, fields, by, revision)  # inserted at once: the next shot's id accounts for it
         doc["shots"].insert(len(doc["shots"]) if position is None else int(position) + offset, shot)
+        if take:
+            _add_take(shot, take, by)
         added.append(shot["id"])
     return {"shots": added}
+
+
+def media_shot(doc: dict[str, Any], media: dict[str, Any], position: int | None = None) -> tuple[int, dict[str, Any]]:
+    """Where a shot made from a video or a picture of the user's goes, and its fields with the file as its take: placed as Add a shot places one
+    (at the position given, else at the end, before a closing card), named after the file, in the part and with the model of the shot before it.
+    The showrunner then treats it as any shot with a take."""
+    shots, drawn = doc["shots"], lambda shot: (shot.get("generation") or {}).get("template") == "draw_svg"
+    position = (len(shots) - 1 if shots and drawn(shots[-1]) else len(shots)) if position is None else max(0, min(int(position), len(shots)))
+    pattern = next((shot for shot in reversed(shots[:position]) if not drawn(shot)), None) or next((shot for shot in shots if not drawn(shot)), None)
+    file = str(media.get("name") or media["path"]).replace("\\", "/").rsplit("/", 1)[-1]
+    name = re.sub(r"^\d{4}-\d\d-\d\d-\d\dh\d\dm\d\ds_seed\d+_|\.\w+$", "", file).replace("_", " ").strip()  # a generated file: the words of its prompt
+    return position, {"title": name[:60] or "Your shot", "section": shots[position - 1]["section"] if position else "",
+                      "duration_s": round(float(media["duration_s"]), 2) if media.get("kind") == "video" and media.get("duration_s") else 4.0,
+                      "generation": {"template": (pattern or {}).get("generation", {}).get("template") or "gen_video", "settings": {"prompt": ""}}, "take": {**media, "note": "Your file"}}
 
 
 def _op_replace_plan(doc, op, by, revision, base_revision):
@@ -1041,6 +1059,10 @@ def _op_remove_shot(doc, op, by, revision, base_revision):
     shot = find(doc["shots"], op.get("shot"), "shot")
     _check_shot_write(shot, by, set(), op.get("revision", base_revision))
     doc["shots"].remove(shot)
+    for number, take in enumerate(shot["takes"], 1):  # its takes wait in the bin, to come back as a shot or a take of another
+        if take.get("path") and not any(item["path"] == take["path"] for item in doc["bin"]):
+            doc["bin"].append({"id": _next_id("b", doc["bin"]), "created": now(), "by": take.get("by") or by, "name": f"{shot['title'] or shot['id']} T{number}",
+                               **{key: take.get(key) for key in ("path", "kind", "duration_s", "width", "height", "fps", "poster", "has_audio", "codec", "strip")}})
 
 
 def _op_move_shots(doc, op, by, revision, base_revision):
@@ -1185,7 +1207,7 @@ def _op_remove_overlay(doc, op, by, revision, base_revision):
 
 
 def _op_log(doc, op, by, revision, base_revision):
-    text = " ".join(str(op.get("text") or "").split())
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(" ".join(line.split()) for line in str(op.get("text") or "").strip().splitlines()))  # its lines kept: Deepy's tables and lists
     if text:
         doc["log"].append({"id": uuid.uuid4().hex[:8], "time": now(), "by": by, "text": text[:4000], **({"shot": op["shot"]} if op.get("shot") else {})})
         del doc["log"][:-500]
@@ -1431,10 +1453,38 @@ def _op_bin_remove(doc, op, by, revision, base_revision):
 
 def _op_bin_to_take(doc, op, by, revision, base_revision):
     item = find(doc["bin"], op.get("item"), "bin item")
+    if item.get("kind") == "audio":
+        raise OperationError("A sound is not a take: use bin_to_track to lay it over the edit from this shot.")
     result = _op_add_take(doc, {"shot": op.get("shot"), "take": {**item, "note": "From the bin"}}, by, revision, base_revision)
     if op.get("move", True):
         doc["bin"].remove(item)
     return result
+
+
+def _op_bin_to_track(doc, op, by, revision, base_revision):
+    """A sound from the bin over the edit, from the start of a shot (its whole file: the Timeline shortens it), then following that shot's
+    picture when the cut changes. A sound is never a shot's take."""
+    item = find(doc["bin"], op.get("item"), "bin item")
+    if item.get("kind") != "audio":
+        raise OperationError("Only a sound goes over the edit: a picture or a video becomes a take of a shot.")
+    start = next((part["start_s"] for part in timeline(doc) if part["shot"] == op.get("shot")), None)
+    if start is None:
+        raise OperationError(f"Shot {op.get('shot')} is not in the edit: include it first.")
+    doc["edit"]["audio_tracks"].append({"path": item["path"], "start_s": round(start, 3), "gain_db": 0.0})
+    if doc["edit"]["audio_mode"] == "song":  # the song keeps playing beside it
+        doc["edit"]["audio_mode"] = "mix"
+    doc["bin"].remove(item)
+    return {"track": len(doc["edit"]["audio_tracks"]) - 1, "start_s": round(start, 3)}
+
+
+def _op_bin_to_shot(doc, op, by, revision, base_revision):
+    """A video or a picture from the bin as a new shot of its own, its take (position: where it goes, else at the end)."""
+    item = find(doc["bin"], op.get("item"), "bin item")
+    if item.get("kind") == "audio":
+        raise OperationError("A sound is no shot: it plays over the edit from a shot (bin_to_track).")
+    position, fields = media_shot(doc, item, op.get("position"))
+    doc["bin"].remove(item)
+    return _op_add_shots(doc, {"position": position, "shots": [fields]}, by, revision, base_revision)
 
 
 _OPS = {"heard": _op_heard, "remake": _op_remake, "brief": _op_brief, "style": _op_style, "stage": _op_stage, "add_cast": _op_add_cast, "update_cast": _op_update_cast, "remove_cast": _op_remove_cast,
@@ -1442,4 +1492,4 @@ _OPS = {"heard": _op_heard, "remake": _op_remake, "brief": _op_brief, "style": _
         "reorder": _op_reorder, "add_take": _op_add_take, "verdict": _op_verdict, "remove_take": _op_remove_take, "edit": _op_edit, "log": _op_log,
         "director": _op_director, "line_audio": _op_line_audio, "bring_back": _op_bring_back, "restore_version": _op_restore_version, "outline": _op_outline, "add_overlay": _op_add_overlay, "update_overlay": _op_update_overlay,
         "remove_overlay": _op_remove_overlay, "deliverable": _op_deliverable, "budget": _op_budget, "audio": _op_audio, "lyrics": _op_lyrics, "review": _op_review, "bin_add": _op_bin_add, "bin_remove": _op_bin_remove,
-        "bin_to_take": _op_bin_to_take}
+        "bin_to_take": _op_bin_to_take, "bin_to_track": _op_bin_to_track, "bin_to_shot": _op_bin_to_shot}

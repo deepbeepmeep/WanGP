@@ -353,6 +353,21 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
+def _tool_arguments_as_mappings(messages: list[Any]) -> list[Any]:
+    """Sessions saved after a turn of an external engine hold its tool-call arguments as JSON text: the local engines' chat templates
+    read them as a mapping."""
+    for message in messages:
+        for call in (message.get("tool_calls") or []) if isinstance(message, dict) else []:
+            function = call.get("function") if isinstance(call, dict) else None
+            if isinstance(function, dict) and isinstance(function.get("arguments"), str):
+                try:
+                    arguments = json.loads(function["arguments"] or "{}")
+                except json.JSONDecodeError:
+                    arguments = None
+                function["arguments"] = arguments if isinstance(arguments, dict) else {}
+    return messages
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         # Windows cannot replace a file while another thread has it open.
@@ -1261,7 +1276,7 @@ def load_session(session, storage_id: str, deepy_type: str) -> dict[str, Any]:
     session.gallery_workspace_id = str(manifest.get("gallery_workspace_id", "") or "")
     session.session_environment = _json_safe(context.get("environment", {}))
     session.chat_session_id = storage_id
-    session.messages = list(chat.get("messages", []) or [])
+    session.messages = _tool_arguments_as_mappings(list(chat.get("messages", []) or []))
     session.chat_turn_durations = dict(durations)
     session.chat_transcript = list(chat.get("transcript", []) or [])
     for record_index, record in enumerate(session.chat_transcript):
