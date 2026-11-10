@@ -1,4 +1,9 @@
 {
+  "taeqi2_1": {
+    "url": "https://huggingface.co/madebyollin/taeqi2_1/resolve/5d62f11fee0068b4df7bd699ddab685e32174010/taeqi2_1.safetensors",
+    "sha256": "6578b31cc5e336233a2c842eba61b56425bbcac97c7088705f7c7db93291887e",
+    "filename": "taeqi2_1.safetensors"
+  },
   "taeltx_2": {
     "url": "https://raw.githubusercontent.com/madebyollin/taehv/011dfc2112197741c540e0bdd5b7b67bcc930771/safetensors/taeltx_2.safetensors",
     "sha256": "6e4cc0469134213d0101a46877ea2bce1dc7cf06ff5f5aefb9e4076c03542f7b",

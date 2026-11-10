@@ -79,6 +79,7 @@ class family_handler:
     def query_model_def(base_model_type, model_def):
         definition = {
             "image_outputs": True,
+            "tiny_vae_architecture": "qwen_image_21",
             "device_explicit": True,
             "cuda_graphs": ["transformer"],
             "resolution_budget": "2400x1792",
