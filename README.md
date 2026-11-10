@@ -83,7 +83,7 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 ## 🔥 Latest Updates : 
 
-## 10th of November 2026: WanGP v19.28 - Bonus Track
+## 10th of November 2026: WanGP v19.29 - Bonus Track
 - **Qwen Image 2.1 Viggle Image Swap**: a Qwen Image 2.1 variant and **Showrunner's default frame painter for Viggle Remake character swaps**. Replace one or several people in **6 steps**, keeping their poses, expressions and the scene's framing. Add the **source picture first**, then one **character sheet** per person; the picture's aspect ratio is preserved at about **1 megapixel**. Results can be slightly darker.
 
 - **H3 HyperFlow LoRA**: bring **8-step** generation to the standard and Pruned **Ref2VA** models with the new **HyperFlow Ref2VA 8 Steps** accelerator profile.
