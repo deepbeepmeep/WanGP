@@ -94,6 +94,18 @@ def load_lora_offsets(path, architecture, mtime):
     return LoraAdaLNOffsets(path, architecture)
 
 
+def checkpoint_lora_offsets(path, architecture):
+    """The offsets of `architecture` (the checkpoint's map name, None when unknown) or, when the file has none for it, the official ones
+    it has (WanGP's repack holds Ref2VA's only), with a warning."""
+    with safe_open(path, framework="pt", device="cpu") as stream:
+        available = sorted(key[len(LORA_ADALN_PREFIX):-len(".pairs")] for key in stream.keys() if key.startswith(LORA_ADALN_PREFIX) and key.endswith(".pairs"))
+    if available and architecture not in available:
+        tqdm.write(f"MiniMax H3 HyperFlow 8-step LoRA warning: it has no AdaLN offsets for this checkpoint ({architecture or 'unknown table'}). "
+                   f"Using its official {available[0]} ones: its timestep changes will be approximate.")
+        architecture = available[0]
+    return load_lora_offsets(path, architecture, os.path.getmtime(path))
+
+
 class LowRankWeight(torch.Tensor):
     """The weight of a low-rank linear as code inspecting linear modules sees it (shape, dtype, device); any operation on it works
     on the dense up @ down (a DoRA merge, for instance)."""
@@ -287,5 +299,5 @@ def convert_adaln_loras(model, model_type, state_dict, source_package=None):
 
 
 __all__ = ["DroppedBlock", "HYPERFLOW_DEFAULT_STEPS", "HYPERFLOW_STEPS", "HYPERFLOW_VIDEO_SHIFT", "LORA_ADALN_PREFIX", "LoraAdaLNOffsets",
-           "LowRankLinear", "SIGMA_GRIDS", "convert_adaln_loras", "grid_tail_sigmas", "load_lora_offsets", "replace_low_rank_linears",
+           "LowRankLinear", "SIGMA_GRIDS", "checkpoint_lora_offsets", "convert_adaln_loras", "grid_tail_sigmas", "load_lora_offsets", "replace_low_rank_linears",
            "row_runs", "two_time_rows", "video_sigmas"]

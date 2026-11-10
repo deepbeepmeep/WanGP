@@ -1,0 +1,39 @@
+{
+    "model": {
+        "name": "MiniMax H3-Image Pruned 20B",
+        "architecture": "minimax_h3_image_pruned",
+        "group": "h3_image",
+        "description": "Pruned H3-Image: generates a single image from text, or edits and combines up to 16 input images, in 6 steps without guidance, with nearly identical images to the full model for a smaller download and faster loading. Works best around 16 megapixels; no video or audio.",
+        "URLs": [
+            "https://huggingface.co/DeepBeepMeep/MiniMax-H3/resolve/main/MiniMax-H3-Image-pruned_rank8_bf16.safetensors",
+            "https://huggingface.co/DeepBeepMeep/MiniMax-H3/resolve/main/MiniMax-H3-Image-pruned_rank8_int8_convrot.safetensors"
+        ],
+        "lock_resolutions": false,
+        "resolutions": [
+            ["4096x4096 (1:1, 16 MP)", "4096x4096"],
+            ["4736x3552 (4:3, 16 MP)", "4736x3552"],
+            ["3552x4736 (3:4, 16 MP)", "3552x4736"],
+            ["5024x3360 (3:2, 16 MP)", "5024x3360"],
+            ["3360x5024 (2:3, 16 MP)", "3360x5024"],
+            ["5472x3072 (16:9, 16 MP)", "5472x3072"],
+            ["3072x5472 (9:16, 16 MP)", "3072x5472"],
+            ["6272x2688 (21:9, 16 MP)", "6272x2688"],
+            ["2688x6272 (9:21, 16 MP)", "2688x6272"],
+            ["2048x2048 (1:1, 4 MP)", "2048x2048"],
+            ["2368x1760 (4:3, 4 MP)", "2368x1760"],
+            ["1760x2368 (3:4, 4 MP)", "1760x2368"],
+            ["2496x1664 (3:2, 4 MP)", "2496x1664"],
+            ["1664x2496 (2:3, 4 MP)", "1664x2496"],
+            ["2720x1536 (16:9, 4 MP)", "2720x1536"],
+            ["1536x2720 (9:16, 4 MP)", "1536x2720"]
+        ]
+    },
+    "prompt": "The image is a documentary photograph of an elderly clockmaker at his workbench in a narrow Prague workshop, seen from a low three-quarter angle across the bench. He leans over a disassembled brass pocket watch, holding a fine screwdriver in his right hand while a jeweler's loupe sits in his left eye. In the foreground, a green felt mat holds tiny gears, springs and a pair of tweezers laid in a neat row. Behind him, a wall of wooden shelves carries dozens of antique clocks with pale enamel faces, their hands frozen at different times. A single articulated desk lamp at the left throws warm light across his hands and the brass parts, leaving the back of the room in soft amber shadow. A small hand-lettered card propped against a jar of oil reads \"OPRAVY HODIN\", no other text. Fine dust floats in the lamp beam, and the worn grain of the oak bench is visible.",
+    "image_mode": 1,
+    "resolution": "4096x4096",
+    "num_inference_steps": 6,
+    "guidance_phases": 1,
+    "guidance_scale": 1.0,
+    "sample_solver": "euler",
+    "batch_size": 1
+}

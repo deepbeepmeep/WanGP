@@ -12,6 +12,7 @@ SHAPE_PER_ROW = 0.45  # the time of a row against the first, for the sizes not m
 TOKENS_WEIGHT = 0.05
 CONFIDENCE_FADE = 0.995  # the acceptance of a drafter's confidences fades slowly
 CONFIDENCE_BUCKETS = 8
+PASS_START, PASS_WEIGHT, PASS_SPIKE = 8, 0.1, 1.5  # the time of a pass: the fastest of its first measures, then a new one weighs this, counted for at most this many times the time known (other work on the GPU)
 
 
 class SuffixDrafter:
@@ -82,6 +83,8 @@ class WindowCosts:
         self.draft_ms = 0.0  # a step of the drafter's chain
         self.held, self.offered = [0.0] * CONFIDENCE_BUCKETS, [0.0] * CONFIDENCE_BUCKETS  # by the drafter's confidence
         self.expected = self.chance = 1.0  # tokens and chance of the chain being built
+        self.passes = {}  # drafts of a drafter's window -> [passes, milliseconds of a whole pass: its draft chain and its verification]
+        self.verdict_recorded = False  # the long chain's verdict of this machine went to chain_verdicts (once per runner)
 
     def cost_of(self, rows):
         if self.seen[rows]:
@@ -137,6 +140,16 @@ class WindowCosts:
             bucket = min(CONFIDENCE_BUCKETS - 1, int(confidence * CONFIDENCE_BUCKETS))
             self.held[bucket] = CONFIDENCE_FADE * self.held[bucket] + (index < accepted)
             self.offered[bucket] = CONFIDENCE_FADE * self.offered[bucket] + 1.0
+
+    def observe_pass(self, drafts, milliseconds):
+        entry = self.passes.setdefault(drafts, [0, milliseconds])
+        entry[0] += 1
+        entry[1] = min(entry[1], milliseconds) if entry[0] <= PASS_START else entry[1] + PASS_WEIGHT * (min(milliseconds, PASS_SPIKE * entry[1]) - entry[1])
+
+    def pass_ratio(self, usual, long, samples):
+        """The time of a pass with `long` drafts against one with `usual`, None until both were measured `samples` times."""
+        short, longer = self.passes.get(usual), self.passes.get(long)
+        return None if short is None or longer is None or min(short[0], longer[0]) < samples else longer[1] / short[1]
 
     def observe_draft(self, milliseconds):
         self.draft_ms += COST_WEIGHT * (milliseconds - self.draft_ms) if self.draft_ms else milliseconds

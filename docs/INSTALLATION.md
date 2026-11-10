@@ -262,7 +262,9 @@ pip install flash-attn==2.8.3.post1 --no-build-isolation
 
 ## GGUF llama.cpp CUDA Kernels
 
-Version 1.0.28 accelerates GGUF models with packed MMVQ/MMQ, direct FP16/BF16 activation quantization, CUDA-graph-safe workspaces and quantized KV-cache attention.
+Version 1.0.30 accelerates GGUF models with packed MMVQ/MMQ, direct FP16/BF16 activation quantization, CUDA-graph-safe workspaces and quantized KV-cache attention.
+
+Deepy and the Prompt Enhancer write faster with this version when speculative decoding is on: about 5% for the Qwen3.8 27B Q4 checkpoint and 10-15% for its smaller Q3 and Q2 checkpoints, measured on an RTX 50 GPU (other NVIDIA GPUs have not been measured; for the Q3 and Q2 checkpoints WanGP times the new kernels on first use and keeps them only where they are faster). This version also fixes a rare wrong value or crash with a few GGUF layer shapes. The new kernels are prepared on your GPU the first time they are used, which takes a moment once; no compiler needs to be installed.
 
 Large linears, such as those of long video token sequences or long prompts, now run in a single kernel that quantizes the activations while other parts of the GPU multiply earlier rows, and adds the bias as it writes the result. On Q4_K/Q6_K layers this was 2-10% faster without bias and 5-19% faster with bias, used slightly less memory, and turned each linear into a single CUDA graph node instead of dozens, which lowers the memory kept by CUDA graphs. The first time each layer shape runs on a GPU, WanGP times the new kernel against the previous row slices and keeps the faster one; the choice is cached. With an older GGUF wheel, WanGP keeps using the previous row slices.
 
@@ -276,24 +278,24 @@ Install the wheel matching your Python, PyTorch and CUDA stack. `--no-deps` pres
 
 Windows:
 ```bash
-pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.29/llamacpp_gguf_cuda-1.0.29%2Btorch210cu130py311-cp311-cp311-win_amd64.whl
+pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.30/llamacpp_gguf_cuda-1.0.30%2Btorch210cu130py311-cp311-cp311-win_amd64.whl
 ```
 
 Linux:
 ```bash
-pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.29/llamacpp_gguf_cuda-1.0.29%2Btorch210cu130py311-cp311-cp311-linux_x86_64.whl
+pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.30/llamacpp_gguf_cuda-1.0.30%2Btorch210cu130py311-cp311-cp311-linux_x86_64.whl
 ```
 
 ### Python 3.10 / PyTorch 2.7.1 / CUDA 12.8
 
 Windows:
 ```bash
-pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.29/llamacpp_gguf_cuda-1.0.29%2Btorch271cu128py310-cp310-cp310-win_amd64.whl
+pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.30/llamacpp_gguf_cuda-1.0.30%2Btorch271cu128py310-cp310-cp310-win_amd64.whl
 ```
 
 Linux:
 ```bash
-pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.29/llamacpp_gguf_cuda-1.0.29%2Btorch271cu128py310-cp310-cp310-linux_x86_64.whl
+pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.30/llamacpp_gguf_cuda-1.0.30%2Btorch271cu128py310-cp310-cp310-linux_x86_64.whl
 ```
 
 The CUDA 13 builds contain native GPU code for SM75 through the architectures supported by CUDA 13.1. CUDA 12.8 builds additionally contain pre-SM75 code, subject to PyTorch's own support. Linux wheels need glibc 2.28 or newer. The release includes the exact architecture lists, source and build instructions.
@@ -304,12 +306,12 @@ For RDNA4 GPUs (`gfx1200`, `gfx1201`, RX 9060/9070 series), the WanGP installer 
 
 Windows:
 ```bash
-pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.29/llamacpp_gguf_cuda-1.0.29%2Btorch213rocm100py312-cp312-cp312-win_amd64.whl
+pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.30/llamacpp_gguf_cuda-1.0.30%2Btorch213rocm100py312-cp312-cp312-win_amd64.whl
 ```
 
 Linux:
 ```bash
-pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.29/llamacpp_gguf_cuda-1.0.29%2Btorch213rocm100py312-cp312-cp312-linux_x86_64.whl
+pip install --no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.30/llamacpp_gguf_cuda-1.0.30%2Btorch213rocm100py312-cp312-cp312-linux_x86_64.whl
 ```
 
 The HIP and CUDA wheels use the same package name; select the matching backend. The HIP wheel requires exactly PyTorch 2.13.0+rocm10.0.0 and rejects a different PyTorch build at import. It keeps the previous GGUF kernels: the new single-kernel row loop is CUDA only. Compilation and import checks do not establish AMD inference correctness: hardware validation remains pending.

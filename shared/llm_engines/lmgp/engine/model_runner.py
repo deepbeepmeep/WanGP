@@ -1,6 +1,7 @@
 # Adapted from nano-vllm (https://github.com/GeeeekExplorer/nano-vllm), Copyright (c) 2025 Xingkai Yu,
 # MIT License (see docs/third_party_licenses/MIT.txt). Modified for WanGP.
 # Modifications Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
+import functools
 import gc
 import os
 import time
@@ -11,6 +12,7 @@ from mmgp import cuda_graphs, transfer
 from ..config import Config
 from .sequence import Sequence
 from ..layers import kv_formats as kvf
+from . import chain_verdicts
 from .draft_sources import SuffixDrafter, WindowCosts
 from .speculative_sampling import bounded_support, capture_sampling_graph, draft_probabilities
 from ..layers import draft_chain
@@ -26,9 +28,37 @@ _CHAIN = "chain" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the d
 _DRAFT_COSTS = "draftcost" in os.environ.get("WGP_FN_ENABLE", "").split(",")  # a greedy window's drafts decided by what they bring at the measured costs, until proven
 _SINGLE_DECODE = "host_py" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # _prepare_single_decode and its kept sampling parameters, proven: the switch goes with the others at the end
 _GPU_CHAIN = "gpu_chain" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # a sampled window's drafts drawn on the GPU in one graph, no host wait per draft: MTP-4 on Deepy's prose 17.1 -> 16.75 ms per pass
-_LONG_CHAIN = "long_chain" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the model's long draft chain while its recent drafts are accepted (Qwen3.8 27B on Deepy's tool calls: 4.6 -> 6.2 tokens per pass, 231 -> 261 tok/s)
-_LONG_CHAIN_RATE = 0.7  # the acceptance from which the drafts beyond the usual chain bring more than their rows and drafter passes cost
-_LONG_CHAIN_FADE = 0.9  # what a verification weighs in that acceptance against the ones before it
+_LONG_CHAIN = "long_chain" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the model's long draft chain while its recent drafts are accepted (Qwen3.8 27B Q4_K_M on Deepy's tool calls: 4.6 -> 5.8 tokens per pass, 12% faster)
+# The acceptance from which the drafts beyond the usual chain bring more than they cost: their drafter passes, and from a sixth row a second
+# reading of the KV cache by the verification attention (32 query rows per program: 1.2 ms of a pass at 20K tokens, 3.6 ms at 60K on Qwen3.8 27B).
+_LONG_CHAIN_RATE = 0.9  # until the passes of both lengths are measured on this machine (_LONG_CHAIN_SAMPLES of each)
+_LONG_CHAIN_FADE = 0.8  # what the verifications before one weigh against it: a tool call takes the long chain three windows after the thought before it
+_LONG_CHAIN_SAMPLES = 8
+_LONG_CHAIN_MARGIN = 1.07  # the long chain has to bring this many times what it costs: the recent rate is that of the first drafts, the later ones hold less often
+_LONG_CHAIN_RATES = (0.85, 0.99)  # the rule's bounds; at the upper one the long chain runs on text accepted almost whole
+
+
+@functools.lru_cache(maxsize=256)
+def long_chain_rate(usual: int, long: int, cost_ratio: float) -> float:
+    """The acceptance rate of the recent drafts from which a window of `long` drafts brings more tokens per millisecond than one of `usual` drafts
+    when its pass costs cost_ratio times as much, as measured on the machine (GPU, kernels, weights in VRAM or streamed, length of the context):
+    at a rate p per draft a chain of n drafts brings (1 - p^(n+1)) / (1 - p) tokens. Qwen3.8 27B Q4_K_M on an RTX 5090 at 20K tokens of
+    context: 7 drafts cost 1.3 times 4 drafts, rate 0.9; where they cost 1.4 times, 0.96; from 1.5 times, the upper bound. Where the long pass
+    costs as much as its drafts can bring at best ((long + 1) / (usual + 1) times: no rate pays), 1.0: only a request whose every draft was
+    accepted so far takes it, which keeps its time measured."""
+    if cost_ratio * (usual + 1) >= long + 1:
+        return 1.0
+    low, high = _LONG_CHAIN_RATES
+    need = _LONG_CHAIN_MARGIN * cost_ratio
+    gain = lambda rate: (1 - rate ** (long + 1)) / (1 - rate ** (usual + 1))
+    if gain(low) >= need:
+        return low
+    if gain(high) <= need:
+        return high
+    for _ in range(24):
+        middle = (low + high) / 2
+        low, high = (middle, high) if gain(middle) < need else (low, middle)
+    return high
 _DRAFT_PREFETCH = "draft_prefetch" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the n-gram rows of a window read while its drafts are computed: Deepy's context 141 -> 147 tok/s, a short prompt 168 -> 184 (drive calm); the switch goes with the others at the end
 
 
@@ -390,7 +420,10 @@ class ModelRunner:
     def speculative_telemetry(self, seq_id: int, sequence_tokens: int) -> dict:
         stats = self.speculative_stats
         mtp_cache_tokens = self.model.mtp.get_cache_length()
+        usual, long_drafts = int(getattr(self.model, "_prompt_enhancer_speculative_tokens", 1)), min(self._max_speculative_draft_tokens, self._long_chain_tokens())
         return {
+            "pass_ms": {drafts: round(entry[1], 2) for drafts, entry in sorted(self._draft_costs().passes.items())},  # what a pass costs here, by its drafts
+            "long_chain_rate": round(self._long_chain_rate(usual, long_drafts), 3) if long_drafts > usual else None,  # the acceptance the long chain asks for
             "drafted": int(stats["drafted"]),
             "accepted": int(stats["accepted"]),
             "target_passes": int(stats["target_passes"]),
@@ -946,6 +979,7 @@ class ModelRunner:
                 continue
             module.k_scale, module.v_scale = self.kv_cache_scales[0, layer_id], self.kv_cache_scales[1, layer_id]
             module.kv_layout = layout
+            module.dense_prefill = bool(getattr(self.model, "_prompt_enhancer_dense_prefill", False))
             module.k_min = None if self.kv_min_views[0] is None else self.kv_min_views[0][layer_id]
             module.v_min = None if self.kv_min_views[1] is None else self.kv_min_views[1][layer_id]
             if layout.overlay:
@@ -1896,6 +1930,24 @@ class ModelRunner:
         costs.observe(rows, milliseconds, accepted, bool(lookup), lookup)
         costs.observe_confidences(getattr(self, "_window_confidences", ()), accepted)
 
+    def _long_chain_rate(self, usual: int, long: int) -> float:
+        ratio = self._draft_costs().pass_ratio(usual, long, _LONG_CHAIN_SAMPLES)
+        return _LONG_CHAIN_RATE if ratio is None else long_chain_rate(usual, long, round(ratio, 2))
+
+    def _record_long_chain(self, usual: int, long: int, context: int) -> None:
+        """Once both pass lengths are measured: whether the long chain can pay on this machine, for the next loads (chain_verdicts). A verdict
+        against it leaves it, and the graphs of its windows, out of them: it is taken from a short context only."""
+        costs = self._draft_costs()
+        if costs.verdict_recorded or not self.model._prompt_enhancer_long_chain_key:
+            return
+        ratio = costs.pass_ratio(usual, long, _LONG_CHAIN_SAMPLES)
+        if ratio is None:
+            return
+        costs.verdict_recorded = True
+        pays = ratio * (usual + 1) < long + 1
+        if pays or context <= chain_verdicts.SHORT_CONTEXT:
+            chain_verdicts.record(self.model._prompt_enhancer_long_chain_key, ratio, pays, context)
+
     def _chain_drafts(self, seq: Sequence, draft_state: dict, draft_count: int, start_position: int, cache_length: int, rejection_sampling: bool, threshold: float):
         """The drafts of a window read from mapped RAM (layers/draft_chain.py): a proposal that ignores the sampler's rules, which the verification of the window applies. threshold: the confidence a draft must reach to go out."""
         chain = self._draft_chain
@@ -2147,8 +2199,11 @@ class ModelRunner:
         if seq.top_k != 1:
             max_drafts = min(max_drafts, max(1, int(getattr(self.model, "_prompt_enhancer_speculative_sampling_tokens", max_drafts))))
         stats = self.speculative_stats
-        if stats["recent_accepted"] >= _LONG_CHAIN_RATE * stats["recent_verified"] > 0:  # predictable text (a tool call, code, a list): the drafts beyond the usual chain are accepted too
-            max_drafts = max(max_drafts, min(self._max_speculative_draft_tokens, self._long_chain_tokens()))
+        long_drafts = min(self._max_speculative_draft_tokens, self._long_chain_tokens())
+        if long_drafts > max_drafts:
+            self._record_long_chain(max_drafts, long_drafts, len(seq))
+            if stats["recent_accepted"] >= self._long_chain_rate(max_drafts, long_drafts) * stats["recent_verified"] > 0:
+                max_drafts = long_drafts  # predictable text (a tool call, code, a list): the drafts beyond the usual chain are accepted too, often enough for what they cost here
         tree = self._speculative_tree()
         if tree is not None and remaining_tokens > tree.depth and seq.last_block_num_tokens + tree.size - 1 <= self.block_size:
             return self._run_tree_pass(seq, sample_params)  # its rows fit the last KV page and its longest path the token budget
@@ -2158,7 +2213,7 @@ class ModelRunner:
 
         profile = self._start_mtp_stage_profile()
         start_position = len(seq) - 1 + int(getattr(seq, "position_offset", 0) or 0)
-        stage_started = time.perf_counter()
+        stage_started = pass_started = time.perf_counter()
         draft_tokens, mtp_cache_length, draft_distributions = self._build_mtp_drafts(seq, sample_params, draft_count, start_position, profile=profile)
         self._mark_mtp_stage_profile(profile, 1, "draft", stage_started)
         if len(draft_tokens) > 1 and not self._window_lookup:
@@ -2182,6 +2237,8 @@ class ModelRunner:
         self.speculative_stats["target_passes"] += 1
         emitted, accepted_count = self._sample_verified_block(seq, logits, draft_tokens, draft_distributions, sample_params, profile)
         self._observe_window(len(draft_tokens) + 1, window_started, accepted_count)
+        if not self._window_lookup:
+            self._draft_costs().observe_pass(len(draft_tokens), 1000.0 * (time.perf_counter() - pass_started))
         stage_started = time.perf_counter()
         self._commit_speculative_target_state(len(emitted), len(draft_tokens) + 1)
         self._mark_mtp_stage_profile(profile, 7, "commit", stage_started)

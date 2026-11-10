@@ -454,9 +454,9 @@ Choose a method and **Number of Tokens** on the row above **KV Cache Quantizatio
 
 **Number of Tokens** starts on **Auto** when you pick a method: you choose how Deepy predicts and WanGP chooses how far. Pick a number instead to use exactly that many draft tokens on every prediction.
 
-- **Auto** enables MTP on supported models when it speeds Deepy up: when the model fits in VRAM with it, or when part of the model has to stream from RAM anyway (MTP then predicts several tokens for each pass over the streamed weights). It stays off when MTP would push a model that otherwise fits in VRAM partly out of it, and on GPUs with 8 GB or less. From 13 to 16 GB, it enables MTP only when the whole model fits in VRAM with it. On Qwen3.8 27B, it uses 4 draft tokens from 24 GB of VRAM, or from 12 GB with Bonsai, and 2 below. With the Q4 checkpoint and 4 draft tokens, it predicts up to 7 while Deepy writes text that is easy to predict (tool calls, summaries, lists), which makes those parts faster, and keeps 4 on prose. For GGUF models, WanGP reads the checkpoint, context size and KV Cache Quantization to decide; for other quantizations Auto needs at least 12 GB for Qwen3.5 9B. The token count is automatic, and the console reports the choice Auto made.
+- **Auto** enables MTP on supported models when it speeds Deepy up: when the model fits in VRAM with it, or when part of the model has to stream from RAM anyway (MTP then predicts several tokens for each pass over the streamed weights). It stays off when MTP would push a model that otherwise fits in VRAM partly out of it, and on GPUs with 8 GB or less. From 13 to 16 GB, it enables MTP only when the whole model fits in VRAM with it. On Qwen3.8 27B, it uses 4 draft tokens from 24 GB of VRAM, or from 12 GB with Bonsai, and 2 below. With 4 draft tokens, it predicts up to 7 while Deepy writes text that is easy to predict (tool calls, summaries, lists), which makes those parts faster, and keeps 4 on the rest. How readily it does so follows what the longer prediction costs on your GPU, measured while Deepy runs. For GGUF models, WanGP reads the checkpoint, context size and KV Cache Quantization to decide; for other quantizations Auto needs at least 12 GB for Qwen3.5 9B. The token count is automatic, and the console reports the choice Auto made.
 - **Disabled** adds no draft-model VRAM and disables the token control. Use it when memory is tight or prediction is slower for your workload.
-- **MTP** keeps MTP on whatever the VRAM, on Qwen3.5 9B and Qwen3.8/Bonsai 27B. With **Number of Tokens** on **Auto** it uses the draft count Auto would choose for your model and GPU, including the longer prediction on easy text with the Q4 checkpoint, and the console reports that count. It also supports a fixed 1–8 draft tokens; more are not always faster.
+- **MTP** keeps MTP on whatever the VRAM, on Qwen3.5 9B and Qwen3.8/Bonsai 27B. With **Number of Tokens** on **Auto** it uses the draft count Auto would choose for your model and GPU, including the longer prediction on easy text, and the console reports that count. It also supports a fixed 1–8 draft tokens; more are not always faster.
 - **DSpark** supports 1–7 draft tokens on Qwen3.8/Bonsai 27B when Triton and FlashAttention 2 are installed. **Auto** uses its recommended count, as it does for DFlash2 and DSpine.
 - **DFlash2** supports 1–7 draft tokens on Qwen3.8 Q2, Q3 and Q4, and 1–5 on Bonsai PTQ1, when Triton and FlashAttention 2 are installed. WanGP selects the Qwen drafter for Q2/Q3/Q4 and the Bonsai-adapted drafter for PTQ1 automatically.
 
@@ -536,6 +536,13 @@ Compaction decides what happens when the live conversation no longer fits in the
 - **Summarize with Thinking** lets Deepy reason before creating the summary, improving preservation in complicated projects at the cost of more time and a minimum 48K context. **Recommended for:** long Prime workflows with many dependencies, not routine one-step requests.
 
 Summaries help but cannot guarantee perfect recall. Keep critical specifications in your request (one longer than about a fifth of the context window is summarized too) or in a workspace document when mistakes would be costly.
+
+### Faster Context Reading
+
+Available with the local Qwen models when **KV Cache Quantization** is INT8 or below. Before it can answer, Deepy reads everything new in the conversation: your message, tool results, documents, or a whole conversation you come back to. When enabled, that reading is up to twice as fast, and the gain grows with the length of the conversation.
+
+- **Disabled** reads with the most reproducible arithmetic and no extra memory. **Recommended for:** cards where graphics memory is tight during long conversations.
+- **Enabled** favors speed. It takes up to about 140 MB of graphics memory while reading, whatever the length of the conversation, released afterwards. The wording of answers can differ from what the disabled setting gives; quality measured the same in our tests. **Recommended for:** long conversations and work with many tool results.
 
 ### Skip Low-Ranked Experts
 

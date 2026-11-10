@@ -31,6 +31,12 @@ from . import kv_formats as kvf
 from . import attention_mixed
 
 _MIXED_KERNELS = True  # mixed layouts use the Triton kernels of attention_mixed where available (else the dense fallbacks)
+# The dense prefill (Attention.dense_prefill) serves chunks of this many tokens: below, a prefill lasts what its kernel launches take on the host,
+# and the check of the dense output would make each layer wait for the GPU (128 tokens at 8K of context: 129 ms exact, 140 ms dense).
+_DENSE_PREFILL_ROWS = 256
+# It reads a context of three slices or more by slices of this many tokens, merged by their softmax normalizations: what it takes in VRAM no longer
+# follows the context (27B, a 1,024-token chunk: 122 MiB at any length where 61K tokens at once took 282 MiB, for 1.7 % of the chunk's time).
+_DENSE_PREFILL_KEYS = 8192
 
 _DEFAULT_FLASH_ATTN_VARLEN_FUNC = flash_attn_varlen_func
 _DEFAULT_FLASH_ATTN_WITH_KVCACHE = flash_attn_with_kvcache
@@ -773,6 +779,7 @@ class Attention(nn.Module):
         self.k_min = self.v_min = None  # FP16 minimums of asymmetric body formats
         self.k_overlay = self.v_overlay = None  # exact Q8 overlays (sink and recent ring) of a mixed layout, [rows, H, D]
         self.k_overlay_scale = self.v_overlay_scale = None
+        self.dense_prefill = False  # opt-in (set by the runner): prefill by FlashAttention over the quantized cache dequantized to FP16
 
     def prepare_speculative_metadata(self, max_query_count: int, max_num_blocks: int) -> None:
         if self.k_cache.dtype != torch.int8 or not self.k_cache.is_cuda or _Q8_PAGED_ATTENTION is None:
@@ -813,6 +820,11 @@ class Attention(nn.Module):
             context_lens = context.cu_seqlens_k[1:] if context.speculative_verify else context.context_lens
             output = bf16_bits.q8_paged_attention(q, k_cache, v_cache, self.k_scale, self.v_scale, context.block_tables, context_lens, self.scale)
             return output if context.speculative_verify else output.unsqueeze(1)
+        if (self.dense_prefill and quantized_cache and context.is_prefill and not context.speculative_verify and context.block_tables is not None and q.shape[0] >= _DENSE_PREFILL_ROWS
+                and self.flash_attn_varlen_func is not None and use_triton and attention_mixed.available(q, self, prefill=True)):
+            output = self._dense_prefill(q, context)
+            if output is not None:
+                return output
         if mixed and _MIXED_KERNELS and (use_triton or bits) and attention_mixed.available(q, self, prefill=context.is_prefill and not context.speculative_verify):
             if context.speculative_verify or not context.is_prefill:
                 _log_kv_attention_backend_once("mixed_grouped", f"[Deepy][KV cache] decode/verification backend=grouped paged attention over the {self.kv_layout.value} cache (Triton, FP32 accumulation).")
@@ -924,6 +936,36 @@ class Attention(nn.Module):
                     attention_v_cache,
                 )
         return o
+
+    def _dense_prefill(self, q: torch.Tensor, context) -> torch.Tensor | None:
+        """Prefill attention of a chunk by FlashAttention over the keys and values of its context dequantized to FP16, about four times
+        faster than the exact kernels over the quantized cache. Costs: 2 x H_KV x D FP16 values per context token while the call lasts, and
+        operands rounded to FP16 (error of the output against an FP64 reference 1.73e-3 where the exact kernel's is 1.66e-3, the rounding of
+        a BF16 output). None when a value leaves FP16's range: the exact kernel then serves the call."""
+        _log_kv_attention_backend_once("dense_prefill", "[Deepy][KV cache] prefix prefill backend=FlashAttention over the cache dequantized to FP16 (faster prefill option).")
+        keys, slice_keys = int(context.max_seqlen_k), max(_DENSE_PREFILL_KEYS, q.shape[0])
+        if context.cu_seqlens_k.numel() != 2 or keys < 3 * slice_keys:  # several sequences, or a context that takes no more at once than by slices
+            dense_k, dense_v = context.dense_kv = attention_mixed.dense(self, context, torch.float16, context.dense_kv)
+            output = self.flash_attn_varlen_func(q.to(torch.float16), dense_k, dense_v, max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
+                                                 max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k, softmax_scale=self.scale, causal=True)
+            return output.to(q.dtype) if bool(torch.isfinite(output).all()) else None
+        if context.dense_slices is None:  # the last slice holds the chunk's own keys (causal); every query sees the earlier ones whole, in even slices
+            last = (keys - slice_keys) // 32 * 32
+            step = -(-last // (-(-last // slice_keys) * 32)) * 32
+            starts = [*range(0, last, step), last]
+            context.dense_slices = [(start, stop - start, torch.tensor([0, stop - start], dtype=torch.int32, device=q.device)) for start, stop in zip(starts, [*starts[1:], keys])]
+        q16, output, total, capacity = q.to(torch.float16), None, None, max(count for _, count, _ in context.dense_slices)
+        for start, count, bounds in context.dense_slices:
+            dense_k, dense_v = context.dense_kv = attention_mixed.dense(self, context, torch.float16, context.dense_kv, start, count, capacity)
+            part, normalization, _ = self.flash_attn_varlen_func(q16, dense_k[:count], dense_v[:count], max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q, max_seqlen_k=count,
+                                                                 cu_seqlens_k=bounds, softmax_scale=self.scale, causal=start + count == keys, return_attn_probs=True)
+            if output is None:
+                output, total = part.float(), normalization
+            else:  # softmax over both sets of keys: each part weighs its share of the summed exponentials
+                share = (normalization - total).transpose(0, 1).unsqueeze(-1)
+                output.mul_(torch.sigmoid(-share)).addcmul_(part, torch.sigmoid(share))
+                total = torch.logaddexp(total, normalization)
+        return output.to(q.dtype) if bool(torch.isfinite(output).all()) else None
 
     def _dense_caches(self, dtype: torch.dtype, context) -> tuple[torch.Tensor, torch.Tensor]:
         """The quantized cache as dense [pages, page, H, D] tensors for the SDPA / FlashAttention paths, exact overlays applied."""

@@ -202,7 +202,15 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, qwen_
             runtime.llm_model._prompt_enhancer_speculative_tokens = speculative_tokens
             runtime.llm_model._prompt_enhancer_speculative_sampling_tokens = speculative_tokens
             if auto_draft_count and speculative_decoding == 1:
-                runtime.llm_model._prompt_enhancer_speculative_long_tokens = mtp_auto_long_drafts(enhancer_enabled, qwen_backend, speculative_tokens)
+                long_tokens = mtp_auto_long_drafts(enhancer_enabled, qwen_backend, speculative_tokens)
+                if long_tokens and torch.cuda.is_available():  # what this GPU measured in an earlier session: a long pass that cannot pay is left out, with its graphs
+                    from shared.llm_engines.lmgp.engine import chain_verdicts
+                    verdict_key = runtime.llm_model._prompt_enhancer_long_chain_key = chain_verdicts.key(torch.device("cuda"), text_model_path or qwen35_variant, deepy_kv_cache_quantization, speculative_tokens, long_tokens)
+                    verdict = chain_verdicts.verdict(verdict_key)
+                    if verdict is not None and not verdict["pays"]:
+                        print(f"[Prompt Enhancer / Deepy] Long draft chain left out: on this GPU a pass with {long_tokens} draft tokens was measured at {verdict['ratio']:.2f} times one with {speculative_tokens} ({verdict['date']}).")
+                        long_tokens = 0
+                runtime.llm_model._prompt_enhancer_speculative_long_tokens = long_tokens
         runtime.llm_tokenizer = getattr(runtime.llm_model, "_prompt_enhancer_tokenizer", None)
         runtime.llm_model.eval()
         caption_embedding_model = alias_qwen35_text_embedding_for_mmgp(runtime.llm_model)

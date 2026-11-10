@@ -1,7 +1,7 @@
 {
     "settings_version": 2.82,
     "type": "P-H3-Image 8 Steps",
-    "model_type": "minimax_h3_image",
+    "model_type": "minimax_p_h3_image",
     "prompt": "",
     "image_mode": 1,
     "resolution": "2912x2912",

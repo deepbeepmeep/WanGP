@@ -1,0 +1,14 @@
+{
+    "settings_version": 2.82,
+    "type": "H3-Image Pruned 6 Steps",
+    "model_type": "minimax_h3_image_pruned",
+    "prompt": "",
+    "image_mode": 1,
+    "resolution": "4096x4096",
+    "num_inference_steps": 6,
+    "sample_solver": "euler",
+    "guidance_scale": 1.0,
+    "batch_size": 1,
+    "video_prompt_type": "KI",
+    "prompt_enhancer": "TI"
+}

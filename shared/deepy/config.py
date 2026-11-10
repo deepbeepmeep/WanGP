@@ -35,6 +35,7 @@ DEEPY_TOOL_EDIT_VIDEO_KEY = "deepy_tool_edit_video"
 DEEPY_CONTEXT_TOKENS_KEY = "deepy_context_tokens"
 DEEPY_KV_CACHE_QUANTIZATION_KEY = "deepy_kv_cache_quantization"
 DEEPY_KEPT_KV_CACHES_KEY = "deepy_kept_kv_caches"
+DEEPY_FAST_CONTEXT_READING_KEY = "deepy_fast_context_reading"  # local Qwen with a quantized KV cache: contexts are read through dense FP16 keys and values (faster, more VRAM while reading)
 DEEPY_ROUTE_TAIL_SKIP_KEY = "deepy_route_tail_skip"  # Qwen3.8 Flash-Next: low-ranked experts missing from VRAM are left out of decoding (faster, slightly less precise)
 DEEPY_COMPACTION_TYPE_KEY = "deepy_compaction_type"
 DEEPY_COMPACTION_THINKING_KEY = "deepy_compaction_thinking"
@@ -354,7 +355,7 @@ def get_gguf_kernels_version() -> str:
         return ""
 
 
-GGUF_KERNELS_VERSION = "1.0.29"  # the GGUF kernels of this WanGP release (docs/INSTALLATION.md), never looked up online
+GGUF_KERNELS_VERSION = "1.0.30"  # the GGUF kernels of this WanGP release (docs/INSTALLATION.md), never looked up online
 GGUF_KERNELS_RELEASE_URL = f"https://github.com/deepbeepmeep/kernels/releases/tag/gguf-v{GGUF_KERNELS_VERSION}"
 
 
@@ -750,6 +751,7 @@ def get_deepy_default_runtime_config() -> dict[str, Any]:
         DEEPY_REPETITION_PENALTY_KEY: DEEPY_REPETITION_PENALTY_DEFAULT,
         DEEPY_KEPT_KV_CACHES_KEY: DEEPY_KEPT_KV_CACHES_DEFAULT,
         DEEPY_ROUTE_TAIL_SKIP_KEY: False,
+        DEEPY_FAST_CONTEXT_READING_KEY: False,
         DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY: "",
         DEEPY_PRIME_CUSTOM_SYSTEM_PROMPT_KEY: DEEPY_PRIME_GUIDANCE_DEFAULT,
         DEEPY_MODEL_SPEED_KEY: "fast",

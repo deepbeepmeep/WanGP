@@ -1,22 +1,24 @@
 {
     "model": {
-        "name": "MiniMax H3 P-H3-Image 20B",
+        "name": "MiniMax H3-Image 33B",
         "architecture": "minimax_h3_image",
-        "description": "Generates a single image from text, or edits an image with up to 8 input images, in 8 steps without guidance, or in 2 to 4 steps with the pDMD accelerator profiles. Works best at 8 megapixels, and is strongest at photorealism, film and editorial looks and graphic styles with short quoted text. No video or audio; hands and dense text can break.",
-        "URLs": "minimax_h3_fl2va_pruned",
-        "loras": [
-            "https://huggingface.co/DeepBeepMeep/MiniMax-H3/resolve/main/loras/p-h3-image_lora_bf16.safetensors"
+        "group": "h3_image",
+        "description": "Generates a single image from text, or edits and combines up to 16 input images, in 6 steps without guidance. Works best around 16 megapixels and follows long, detailed descriptions. MiniMax's own image model on the H3 architecture; no video or audio.",
+        "URLs": [
+            "https://huggingface.co/DeepBeepMeep/MiniMax-H3/resolve/main/MiniMax-H3-Image_bf16.safetensors",
+            "https://huggingface.co/DeepBeepMeep/MiniMax-H3/resolve/main/MiniMax-H3-Image_int8_convrot.safetensors"
         ],
-        "loras_multipliers": ["1"],
         "lock_resolutions": false,
         "resolutions": [
-            ["2912x2912 (1:1, 8 MP)", "2912x2912"],
-            ["3360x2496 (4:3, 8 MP)", "3360x2496"],
-            ["2496x3360 (3:4, 8 MP)", "2496x3360"],
-            ["3552x2368 (3:2, 8 MP)", "3552x2368"],
-            ["2368x3552 (2:3, 8 MP)", "2368x3552"],
-            ["3872x2176 (16:9, 8 MP)", "3872x2176"],
-            ["2176x3872 (9:16, 8 MP)", "2176x3872"],
+            ["4096x4096 (1:1, 16 MP)", "4096x4096"],
+            ["4736x3552 (4:3, 16 MP)", "4736x3552"],
+            ["3552x4736 (3:4, 16 MP)", "3552x4736"],
+            ["5024x3360 (3:2, 16 MP)", "5024x3360"],
+            ["3360x5024 (2:3, 16 MP)", "3360x5024"],
+            ["5472x3072 (16:9, 16 MP)", "5472x3072"],
+            ["3072x5472 (9:16, 16 MP)", "3072x5472"],
+            ["6272x2688 (21:9, 16 MP)", "6272x2688"],
+            ["2688x6272 (9:21, 16 MP)", "2688x6272"],
             ["2048x2048 (1:1, 4 MP)", "2048x2048"],
             ["2368x1760 (4:3, 4 MP)", "2368x1760"],
             ["1760x2368 (3:4, 4 MP)", "1760x2368"],
@@ -26,10 +28,10 @@
             ["1536x2720 (9:16, 4 MP)", "1536x2720"]
         ]
     },
-    "prompt": "A photograph by an experienced documentary photographer of an old fishmonger in a Lisbon market, seen from counter height as she wraps a sardine in brown paper. Crates of ice stand behind her and a single hanging bulb lights her hands from the left, leaving the aisle behind in soft shadow. A hand-painted sign above her reads \"PEIXE FRESCO\", no other text.",
+    "prompt": "The image is a documentary photograph of an elderly clockmaker at his workbench in a narrow Prague workshop, seen from a low three-quarter angle across the bench. He leans over a disassembled brass pocket watch, holding a fine screwdriver in his right hand while a jeweler's loupe sits in his left eye. In the foreground, a green felt mat holds tiny gears, springs and a pair of tweezers laid in a neat row. Behind him, a wall of wooden shelves carries dozens of antique clocks with pale enamel faces, their hands frozen at different times. A single articulated desk lamp at the left throws warm light across his hands and the brass parts, leaving the back of the room in soft amber shadow. A small hand-lettered card propped against a jar of oil reads \"OPRAVY HODIN\", no other text. Fine dust floats in the lamp beam, and the worn grain of the oak bench is visible.",
     "image_mode": 1,
-    "resolution": "2912x2912",
-    "num_inference_steps": 8,
+    "resolution": "4096x4096",
+    "num_inference_steps": 6,
     "guidance_phases": 1,
     "guidance_scale": 1.0,
     "sample_solver": "euler",

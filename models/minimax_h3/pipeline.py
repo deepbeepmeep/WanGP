@@ -27,8 +27,10 @@ from .dialogue import H3_DIALOGUE_GENERATION, generate_dialogue, is_dialogue_pro
 from .excerpts import H3_AUDIO_EXCERPTS_SETTING, H3_VIDEO_EXCERPTS_SETTING, parse_excerpts, reference_video_frame_limit
 from .first_block_cache import MiniMaxH3FirstBlockCache
 from .interrupt import GenerationInterrupted
+from .h3_image import (H3_IMAGE_MAX_IMAGES, H3_IMAGE_MODEL, H3_IMAGE_PICTURE_LABEL, H3_IMAGE_REFERENCE_SHORT_EDGE, H3_IMAGE_VISION_SHORT_EDGE,
+                       bound_short_edge, canvas_size, h3_image_sigmas)
 from .p_h3_image import p_h3_image_sigmas, reference_size, size_at_area
-from .hyperflow import HYPERFLOW_STEPS, HYPERFLOW_VIDEO_SHIFT, grid_tail_sigmas, load_lora_offsets, video_sigmas as hyperflow_video_sigmas
+from .hyperflow import HYPERFLOW_STEPS, HYPERFLOW_VIDEO_SHIFT, checkpoint_lora_offsets, grid_tail_sigmas, video_sigmas as hyperflow_video_sigmas
 from .pdd import pdd_sampling_plans, pdd_sampling_plans_for_sigmas
 from .pika import PIKA_SOLVER, PIKA_STEPS, PIKA_VIDEO_SHIFT, noise as pika_noise, renoise_ as pika_renoise_, sigma_schedule as pika_sigma_schedule
 from .dmad import DMAD_AUDIO_SHIFT, DMAD_SOLVER, renoise_ as dmad_renoise_
@@ -422,8 +424,9 @@ def _pil_to_video(image):
 class MiniMaxH3Pipeline:
     refinement_api = "masked_video_sigma_v1"
 
-    def __init__(self, transformer, text_encoder, video_vae, audio_vae, latent_upscaler=None, reference_mode=False, audio_only=False, dtype=torch.bfloat16, fixed_prompt=None, image_model=False, remake_mode=None):
-        self.image_model = bool(image_model)
+    def __init__(self, transformer, text_encoder, video_vae, audio_vae, latent_upscaler=None, reference_mode=False, audio_only=False, dtype=torch.bfloat16, fixed_prompt=None, image_model=None, remake_mode=None):
+        self.image_model = image_model  # None, "p_h3_image" (Pruna's P-H3-Image) or H3_IMAGE_MODEL (MiniMax-H3-Image)
+        self.h3_image = image_model == H3_IMAGE_MODEL
         self.transformer = transformer
         self.text_encoder = text_encoder
         self.fixed_prompt = fixed_prompt
@@ -521,9 +524,9 @@ class MiniMaxH3Pipeline:
 
     def _hyperflow_lora_offsets(self, path):
         transformer, package = self.transformer, self.transformer.h3_lora_affine_package
-        if transformer.endpoint_gate is not None or transformer.control_layers or transformer.hybrid_ref2va_blocks is not None or transformer.pdd_num_steps or package is None:
+        if transformer.endpoint_gate is not None or transformer.control_layers or transformer.hybrid_ref2va_blocks is not None or transformer.pdd_num_steps:
             raise ValueError("The HyperFlow 8-step LoRA applies to the standard MiniMax H3 checkpoints, not to HyperFlow Flash, PDD, ControlNet or hybrid ones")
-        return load_lora_offsets(path, package.name.removesuffix("_rank8"), os.path.getmtime(path))
+        return checkpoint_lora_offsets(path, None if package is None else package.name.removesuffix("_rank8"))
 
     def _check_abort(self):
         inference_checkpoint()
@@ -571,11 +574,12 @@ class MiniMaxH3Pipeline:
     def _encode_prompt(self, prompt, presentation):
         if self.fixed_prompt is not None:
             return self.fixed_prompt.prompt_embeds.to(device=self.device, dtype=self.dtype), self.fixed_prompt.text_token_tags
-        if self.image_model and presentation and not prompt.lstrip().startswith(("Edit <Picture 1>.", "subject_definitions:")):
+        if self.image_model == "p_h3_image" and presentation and not prompt.lstrip().startswith(("Edit <Picture 1>.", "subject_definitions:")):
             prompt = f"Edit <Picture 1>. {prompt}"  # the edit form the image model was trained on
+        picture_label = H3_IMAGE_PICTURE_LABEL if self.h3_image else None  # H3-Image labels its references without angle brackets
 
         def encode_fn(prompts):
-            return [self.text_encoder.encode(prompts[0], presentation, self.device, self.dtype)]
+            return [self.text_encoder.encode(prompts[0], presentation, self.device, self.dtype, picture_label=picture_label)]
 
         cache_key = self._prompt_cache_key(prompt, presentation)
         return self.text_encoder_cache.encode(encode_fn, prompt, device=self.device, cache_keys=cache_key)[0]
@@ -677,7 +681,12 @@ class MiniMaxH3Pipeline:
         if image is None:
             return None
         image = _to_pil(image)
-        if self.image_model:
+        if self.h3_image:  # its own size, resized only when its short edge is outside 1024-2048, else cropped at the top left to whole patches
+            target_w, target_h = bound_short_edge(*image.size, *H3_IMAGE_REFERENCE_SHORT_EDGE)
+            if (target_w, target_h) == image.size:
+                image = image.crop((0, 0, image.width // 32 * 32, image.height // 32 * 32))
+                target_w, target_h = image.size
+        elif self.image_model:
             target_w, target_h = reference_size(*image.size)
         else:
             ratio = image.width / image.height
@@ -695,9 +704,9 @@ class MiniMaxH3Pipeline:
         if self.remake_mode:
             presentation.append({"type": "image"})
         elif self.fixed_prompt is None:
-            if self.image_model:  # the text encoder sees about one megapixel of the image as supplied
+            if self.image_model:  # the text encoder sees about one megapixel of the image as supplied (H3-Image: a 1024 px short edge)
                 source = _to_pil(image)
-                vision_size = size_at_area(*source.size)
+                vision_size = bound_short_edge(*source.size, H3_IMAGE_VISION_SHORT_EDGE, H3_IMAGE_VISION_SHORT_EDGE) if self.h3_image else size_at_area(*source.size)
                 video = _pil_to_video(source if source.size == vision_size else source.resize(vision_size, Image.Resampling.LANCZOS))
             presentation.append({"type": "image", "frames": _qwen_frames(video.clone())})
         visual_latents.append(latent)
@@ -854,7 +863,7 @@ class MiniMaxH3Pipeline:
                  guide_phases=1, switch_threshold=H3_PHASE_2_NOISE_LEVEL_START_DEFAULT, loras_slists=None, loras_selected=None, set_progress_status=None,
                  starting_sigma=None, preserve_input_mask_values=False, refinement_mode=False,
                  custom_settings=None, duration_seconds=None, verbose_level=0, dialogue_segment=False, image_mode=0,
-                 context_scale=None, overlapped_latents=None, window_start_frame_no=0, **kwargs):
+                 context_scale=None, overlapped_latents=None, window_start_frame_no=0, batch_size=1, **kwargs):
         if self.audio_only and H3_DIALOGUE_GENERATION and not dialogue_segment and is_dialogue_prompt(input_prompt):
             self._early_stop = False
             return generate_dialogue(
@@ -881,7 +890,11 @@ class MiniMaxH3Pipeline:
         hyperflow_steps = HYPERFLOW_STEPS if hyperflow else (8,)
         if hyperflow_phase_1 and (int(sampling_steps) not in hyperflow_steps or custom_sigmas and custom_sigmas[0] is not None):
             raise ValueError(f"HyperFlow runs {' or '.join(map(str, hyperflow_steps))} steps on its own schedule, without phase-1 custom sigmas")
-        phase_1_sigmas = (custom_sigmas[0] if custom_sigmas and custom_sigmas[0] is not None else p_h3_image_sigmas(int(sampling_steps)) if self.image_model else VIGGLE_REMAKE_SIGMAS[self.remake_mode] if self.remake_mode
+        if self.h3_image and (int(guide_phases) > 1 or any(sigmas is not None for sigmas in custom_sigmas or ()) or starting_sigma is not None
+                              or sample_solver != "euler" or self.transformer.cache is not None):
+            raise ValueError("H3-Image samples one phase of 6 Euler steps on its own schedule, without custom sigmas or step skipping")
+        phase_1_sigmas = (h3_image_sigmas() if self.h3_image else  # the transformer has one output head per step of this grid
+                          custom_sigmas[0] if custom_sigmas and custom_sigmas[0] is not None else p_h3_image_sigmas(int(sampling_steps)) if self.image_model else VIGGLE_REMAKE_SIGMAS[self.remake_mode] if self.remake_mode
                           else hyperflow_video_sigmas(sampling_steps) if hyperflow_phase_1 else None)
         phase_2_sigmas = (custom_sigmas[1] if custom_sigmas and len(custom_sigmas) > 1 and custom_sigmas[1] is not None
                           else grid_tail_sigmas(sampling_steps2) if hyperflow_phase_2 else None)  # HyperFlow phase 2: the last steps of its 8-step grid
@@ -1000,7 +1013,12 @@ class MiniMaxH3Pipeline:
         target_video_condition = None
         frozen_target_video = None if frozen_control_video is None else frozen_control_video[:, history_count:]
         target_height, target_width = int(height), int(width)
+        if self.h3_image:  # below 4 MP it generates on a larger canvas of the same proportions, resized back after decoding
+            width, height = canvas_size(target_width, target_height)
         two_phase = int(guide_phases) > 1 and frozen_target_video is None
+        batch = max(1, int(batch_size)) if image_outputs else 1  # several images of one prompt, denoised together in each transformer pass
+        if batch > 1 and (two_phase or pika or video_to_video):
+            raise ValueError("MiniMax H3 generates several images at once in one phase, without a source image to denoise")
         tiled_phase_2 = two_phase and H3_PHASE_2_TILING_FLAG in (video_prompt_type or "")
         if two_phase:
             if self.latent_upscaler is None:
@@ -1208,7 +1226,10 @@ class MiniMaxH3Pipeline:
             if not pika and not self.audio_only and audio_ref_count > visual_ref_count:
                 raise ValueError(f"MiniMax H3 requires at least as many image and video references as audio references (found {visual_ref_count} visual and {audio_ref_count} audio)")
             standalone_audio_count = sum(ref["kind"] == "audio" for ref in refs)
-            if len(refs) > 12 or sum(ref["kind"] == "image" for ref in refs) > 9 or sum(ref["kind"] in ("video", "video_audio") for ref in refs) > 3 or (standalone_audio_count if pika else audio_ref_count) > 3:
+            if self.h3_image:
+                if len(refs) > H3_IMAGE_MAX_IMAGES:
+                    raise ValueError(f"H3-Image edits with at most {H3_IMAGE_MAX_IMAGES} images")
+            elif len(refs) > 12 or sum(ref["kind"] == "image" for ref in refs) > 9 or sum(ref["kind"] in ("video", "video_audio") for ref in refs) > 3 or (standalone_audio_count if pika else audio_ref_count) > 3:
                 raise ValueError("MiniMax H3 supports at most 12 references: 9 images, 3 videos, and 3 audio clips")
 
         source_latents = editable_mask = None
@@ -1272,15 +1293,23 @@ class MiniMaxH3Pipeline:
         latent_t = video_latent_frames(aligned_target_frames)
         latent_h, latent_w = math.ceil(height / 16), math.ceil(width / 16)
         audio_tail_latents = 0 if pika or self.audio_only or image_outputs or self.remake_mode else H3_AUDIO_TAIL_LATENTS
-        audio_t = round(aligned_target_frames / fps * AUDIO_LATENT_FPS - audio_time_offset) + audio_tail_latents
+        audio_t = 0 if self.h3_image else round(aligned_target_frames / fps * AUDIO_LATENT_FPS - audio_time_offset) + audio_tail_latents  # H3-Image has no audio rows
         generator = torch.Generator(device=self.device if pika else "cpu").manual_seed(int(seed))
         condition_generator = torch.Generator(device=self.device).manual_seed(int(seed) + 7919) if pika else generator
         cond_video_rows, cond_audio_rows = self._prepare_condition_rows(visual_latents, audio_latents, condition_generator, keyframes, pika=pika)
         remake_keyframe_rows = sum(keyframe["latent_frame_count"] for keyframe in keyframes) * (latent_h // self.transformer.patch_size[1]) * (latent_w // self.transformer.patch_size[2]) if self.remake_mode else 0
         target_video_condition_frames = 0 if target_video_condition is None else target_video_condition.shape[2]
-        video = ((pika_noise((1, 24, latent_t, latent_h, latent_w), generator) if pika else
-                  torch.randn((1, 24, latent_t, latent_h, latent_w), generator=generator, dtype=torch.float32, device="cpu"))
-                 if target_video_condition is None else target_video_condition).to(self.device)
+        batch_audio = None
+        if batch > 1:  # each image draws its noise as a single run would: the first image of a batch is the image of its seed
+            noises = [(torch.randn((1, 24, latent_t, latent_h, latent_w), generator=generator, dtype=torch.float32, device="cpu"),
+                       torch.randn((audio_t * 2, 32), generator=generator, dtype=torch.float32, device="cpu")) for _ in range(batch)]
+            video = torch.cat([noise[0] for noise in noises]).to(self.device)
+            batch_audio = torch.cat([unpack_audio(noise[1]) for noise in noises]).to(self.device)
+            del noises
+        else:
+            video = ((pika_noise((1, 24, latent_t, latent_h, latent_w), generator) if pika else
+                      torch.randn((1, 24, latent_t, latent_h, latent_w), generator=generator, dtype=torch.float32, device="cpu"))
+                     if target_video_condition is None else target_video_condition).to(self.device)
         target_video_condition = None
         if control_anchor_indices is not None:
             control_anchor_indices = control_anchor_indices.to(video.device)
@@ -1293,8 +1322,9 @@ class MiniMaxH3Pipeline:
             editable_mask = editable_mask[:, :, :source_latents.shape[2]].to(video) if editable_mask is not None else None
         else:
             source_noise = source_buffer = None
-        audio = (pika_noise((1, 32, 2, audio_t), generator, audio=True) if pika else
+        audio = (batch_audio if batch_audio is not None else pika_noise((1, 32, 2, audio_t), generator, audio=True) if pika else
                  unpack_audio(torch.randn((audio_t * 2, 32), generator=generator, dtype=torch.float32, device="cpu")).to(self.device))
+        batch_audio = None
         target_audio_condition_latents = 0 if target_audio_condition is None else min(audio_t, target_audio_condition.shape[-1])
         if target_audio_condition_latents:
             audio[..., :target_audio_condition_latents].copy_(target_audio_condition[..., :target_audio_condition_latents].to(audio))
@@ -1418,6 +1448,8 @@ class MiniMaxH3Pipeline:
                     if pdd:
                         self.transformer.final_layer.video_out.set_plan(stage_pdd_video_plans[step:step + 1])
                         self.transformer.final_layer.audio_out.set_plan(stage_pdd_audio_plans[step:step + 1])
+                    elif self.transformer.step_heads:  # H3-Image: the output head of this step
+                        self.transformer.final_layer.video_out.set_plan(F.one_hot(torch.tensor([step]), self.transformer.step_heads).float())
                     if spectrum is not None:
                         spectrum.begin_step(step)
                     if first_block_cache is not None:
@@ -1944,7 +1976,9 @@ class MiniMaxH3Pipeline:
         if not self.audio_only and decoded_video is None:
             if frozen_target_video is None:
                 video = video.to(self.vae._model_dtype)
-                decoded_video = self.vae.decode(video, uint8_rounding)[0, :, :target_frames]
+                decoded = [self.vae.decode(video[item:item + 1], uint8_rounding)[0, :, :target_frames] for item in range(video.shape[0])]  # one image at a time
+                decoded_video = decoded[0] if len(decoded) == 1 else torch.cat(decoded, dim=1)
+                del decoded
                 if uint8_rounding is None:
                     decoded_video = decoded_video.clamp_(-1.0, 1.0)
             else:
@@ -1957,6 +1991,9 @@ class MiniMaxH3Pipeline:
             _keep_source_outside_mask(decoded_video, input_frames, input_masks, to_uint8)
         if image_outputs:
             audio = None
+            if self.h3_image and decoded_video.shape[-2:] != (target_height, target_width):  # a canvas larger than requested: 8-bit truncation then Lanczos, as released
+                images = [Image.fromarray(frame.add(1.0).mul_(127.5).clamp_(0, 255).to(torch.uint8).permute(1, 2, 0).numpy()) for frame in decoded_video.unbind(1)]
+                decoded_video = torch.cat([_pil_to_video(image.resize((target_width, target_height), Image.Resampling.LANCZOS)) for image in images], dim=1)
             self._check_abort()
             return {"x": decoded_video}
         if set_progress_status is not None:

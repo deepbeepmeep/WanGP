@@ -889,7 +889,7 @@ class Qwen35AssistantRuntime:
             f"by_position={position_rates} emitted={emitted} target_passes={target_passes} "
             f"tokens_per_pass={tokens_per_pass:.3f} sequence={current['sequence_tokens']} "
             f"mtp_cache={current['mtp_cache_tokens']} sync_delta={current['sync_delta']:+d} "
-            f"pending={current['pending']} draft={current['draft']}"
+            f"pending={current['pending']} draft={current['draft']} pass_ms={current['pass_ms']} long_chain_rate={current['long_chain_rate']}"
         )
         return current
 

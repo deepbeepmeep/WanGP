@@ -5,6 +5,7 @@ from pathlib import Path
 
 import torch
 from safetensors.torch import load_file
+from tqdm import tqdm
 
 
 FULL_TIME_DIM = 2688
@@ -22,7 +23,9 @@ _ARCHITECTURES = {
     "minimax_h3_tts_ref2va_pruned": "ref2va",
     "minimax_h3_vdn": "fl2va",
     "minimax_h3_vdn_pruned": "fl2va",
-    "minimax_h3_image": "fl2va",
+    "minimax_p_h3_image": "fl2va",
+    "minimax_h3_image": "h3_image",
+    "minimax_h3_image_pruned": "h3_image",
 }
 _LORA_SUFFIXES = (
     ("lora_A.weight", "lora_B.weight"),
@@ -56,7 +59,7 @@ def _load_affine_package(architecture, width=8):
     return table, affine
 
 
-def _aligned_affine_map(architecture, target_table, package=None):
+def _aligned_affine_map(architecture, target_table, package=None, strict=True):
     target_table = target_table.detach().to(device="cpu", dtype=torch.float64)
     if target_table.ndim != 2 or target_table.shape[1] not in _PRUNED_WIDTHS:
         raise ValueError(f"Unsupported MiniMax H3 {architecture} AdaLN target table shape {tuple(target_table.shape)}")
@@ -74,7 +77,7 @@ def _aligned_affine_map(architecture, target_table, package=None):
     if int(fit.rank) != target_h.shape[1]:
         raise ValueError(f"MiniMax H3 {architecture} checkpoint has a rank-deficient AdaLN table")
     relative_error = torch.linalg.vector_norm(target_h @ fit.solution - canonical_h) / torch.linalg.vector_norm(canonical_h)
-    if relative_error > 1e-5:
+    if strict and relative_error > 1e-5:
         raise ValueError(f"MiniMax H3 {architecture} checkpoint AdaLN table is incompatible with the canonical LoRA map (relative error {relative_error:.3g})")
     return (fit.solution @ canonical_affine.double()).float()
 
@@ -140,17 +143,23 @@ def convert_adaln_loras(model_type, state_dict, target_table=None, hybrid_ref2va
         raise ValueError(f"MiniMax H3 LoRA mixes AdaLN input widths: {sorted(source_widths)}")
     source_width = source_widths.pop()
     supported_widths = (*_PRUNED_WIDTHS, FULL_TIME_DIM)
-    from .lora_tables import detect_table
+    from .lora_tables import AffinePackage, detect_table
 
     if target_package is None and target_table is not None and hybrid_ref2va_blocks is None:
         target_package = detect_table(target_table)
+    if checkpoint_checked and target_package is None and target_width in _PRUNED_WIDTHS and hybrid_ref2va_blocks is None:
+        # Fine-tunes and merges keep timestep embeddings close to their official base; the nearest table is not the nearest model.
+        target_package = AffinePackage(f"{architecture}_rank{target_width}", target_table.detach().to(device="cpu", dtype=torch.float32),
+                                       _aligned_affine_map(architecture, target_table, strict=False))
+        tqdm.write(f"MiniMax H3 LoRA warning: the checkpoint's AdaLN table matches no known table, mix of tables or embedded map. Assuming the official "
+                   f"{architecture.upper()} timestep embedding: this LoRA's AdaLN adapters will be approximate.")
     canonical_target = target_package is not None and all(torch.equal(actual, expected) for actual, expected in
                          zip((target_package.table, target_package.affine), _load_affine_package(architecture, target_package.width)))
-    if source_width != FULL_TIME_DIM and source_package is None and (
+    if source_width in _PRUNED_WIDTHS and source_package is None and (
             target_package is not None and not canonical_target or checkpoint_checked and target_package is None):
-        raise ValueError("MiniMax H3 cannot identify this pruned LoRA's source table. Attach its source affine package; the target checkpoint does not identify the adapter's training basis.")
-    if checkpoint_checked and target_table is not None and target_package is None and hybrid_ref2va_blocks is None:
-        raise ValueError("MiniMax H3 checkpoint table is not registered, is not a mix of registered tables and has no embedded affine map")
+        source_package = AffinePackage(f"{architecture}_rank{source_width}", *_load_affine_package(architecture, source_width))
+        tqdm.write(f"MiniMax H3 LoRA warning: this LoRA does not say which pruned AdaLN table it was trained on. Assuming the official "
+                   f"{architecture.upper()} table: its AdaLN adapters will be approximate if it was trained on another pruned checkpoint.")
     same_basis = source_package is None or target_package is not None and torch.equal(source_package.table, target_package.table) and torch.equal(source_package.affine, target_package.affine)
     if source_width == target_width and hybrid_ref2va_blocks is None and same_basis:
         return 0, architecture, source_width, target_width

@@ -126,8 +126,9 @@ class MiniMaxH3TextEncoder(nn.Module):
             raise RuntimeError("The Qwen tokenizer has not been initialized")
         return self.tokenizer(text, add_special_tokens=False)["input_ids"]
 
-    def _presentation(self, prompt, items):
+    def _presentation(self, prompt, items, picture_label=None):
         entries = []
+        picture_label = picture_label or "<Picture {}>: "
         counters = {"image": 0, "audio": 0, "video": 0}
 
         def add_text(text):
@@ -140,7 +141,7 @@ class MiniMaxH3TextEncoder(nn.Module):
             kind = item["type"]
             counters[kind] += 1
             if kind == "image":
-                add_text(f"<Picture {counters[kind]}>: ")
+                add_text(picture_label.format(counters[kind]))
                 if "frames" in item:  # a text-only presentation has the labels alone
                     add_visual(item["frames"])
             elif kind == "audio":
@@ -165,8 +166,8 @@ class MiniMaxH3TextEncoder(nn.Module):
     def _conditioning(self, output, dtype):
         return output.last_hidden_state.to(dtype)
 
-    def encode(self, prompt, items, device, dtype):
-        entries = self._presentation(prompt, items)
+    def encode(self, prompt, items, device, dtype, picture_label=None):
+        entries = self._presentation(prompt, items, picture_label)
         token_ids = []
         visual_specs = []
         for entry in entries:

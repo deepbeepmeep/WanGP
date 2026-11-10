@@ -16,14 +16,14 @@ from mmgp import offload, runtime
 from tqdm.auto import tqdm
 
 from shared.llm_io import known_token_ids, llm_io_enabled, log_llm_io
-from shared.deepy.config import DEEPY_CONTEXT_TOKENS_KEY, DEEPY_REPETITION_PENALTY_DEFAULT, DEEPY_REPETITION_PENALTY_KEY, get_deepy_config_value, normalize_deepy_context_tokens, normalize_deepy_repetition_penalty
+from shared.deepy.config import DEEPY_CONTEXT_TOKENS_KEY, DEEPY_FAST_CONTEXT_READING_KEY, DEEPY_REPETITION_PENALTY_DEFAULT, DEEPY_REPETITION_PENALTY_KEY, get_deepy_config_value, normalize_deepy_context_tokens, normalize_deepy_repetition_penalty
 from shared.utils import files_locator as fl
 from shared.llm_engines.lmgp import SamplingParams
 from shared.llm_engines.lmgp.models.qwen3_5 import Qwen3_5ForCausalLM, clear_qwen35_runtime_caches
 from shared.llm_engines.lmgp.layers.attention import reset_attention_backend_logs
 from shared.llm_engines.lmgp.utils.context import reset_context
 from shared.llm_engines.lmgp.vllm_support import TextEngine, resolve_prompt_enhancer_lm_features
-from shared.qtypes.gguf import GGUFFirstRowsLinear, GGUFWeightTensor, materialize_module_source_tensors
+from shared.qtypes.gguf import GGUFCandidateRowsLinear, GGUFFirstRowsLinear, GGUFWeightTensor, draft_candidates_supported, materialize_module_source_tensors
 try:
     from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
 except Exception:  # pragma: no cover
@@ -1448,6 +1448,8 @@ def load_qwen35_text_prompt_enhancer(
         if prism_metadata:
             from shared.qtypes.prism import PrismFirstRowsLinear
             model.mtp.lm_head = PrismFirstRowsLinear(model.mtp.lm_head, mtp_draft_vocab_size)
+        elif draft_candidates_supported(model.mtp.lm_head, mtp_draft_vocab_size):
+            model.mtp.lm_head = GGUFCandidateRowsLinear(model.mtp.lm_head, mtp_draft_vocab_size)
         else:
             model.mtp.lm_head = GGUFFirstRowsLinear(model.mtp.lm_head, mtp_draft_vocab_size)
         model.mtp.draft_vocab_size = mtp_draft_vocab_size
@@ -1495,6 +1497,8 @@ def load_qwen35_text_prompt_enhancer(
     model._prompt_enhancer_speculative_confidence = spec.get("mtp_speculative_confidence", 0.30)
     model._prompt_enhancer_speculative_sampling_confidence = spec.get("mtp_speculative_sampling_confidence", 0.0)
     model._prompt_enhancer_speculative_long_tokens = 0  # Auto sets it (shared.prompt_enhancer.config.mtp_auto_long_drafts)
+    model._prompt_enhancer_long_chain_key = ""  # of this machine's verdict on the long chain (lmgp chain_verdicts), set with it
+    model._prompt_enhancer_dense_prefill = bool(get_deepy_config_value(DEEPY_FAST_CONTEXT_READING_KEY, False))  # the attention layers' opt-in dense prefill
     if block_draft_method is not None:
         from .block_draft import install_block_draft
         install_block_draft(model, block_draft_method, bonsai=bool(prism_metadata))

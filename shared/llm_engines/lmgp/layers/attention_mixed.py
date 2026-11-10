@@ -313,6 +313,39 @@ if triton is not None:
         tl.store(out_ptr + out_base + 16, acc_b * scale, mask=row_mask[None, :, None])
 
 
+    @triton.jit(do_not_specialize=["start", "count"])
+    def dense_kernel(data_ptr, scale_ptr, min_ptr, overlay_ptr, overlay_scale_ptr, tables_ptr, cu_k_ptr, base_ptr, ring_ptr, out_ptr, TABLE_WIDTH, start, count,
+                     H_KV: tl.constexpr, D: tl.constexpr, PAGE: tl.constexpr, N: tl.constexpr, BITS: tl.constexpr, ASYM: tl.constexpr,
+                     OVERLAY: tl.constexpr, SINK: tl.constexpr, RING: tl.constexpr):
+        """A tile of the positions start .. start + count of a sequence's keys or values dequantized to out [those positions of every sequence,
+        H_KV, D] in out's type: the body's codes with their scales (and minimums), the exact Q8 rows of the sink and of the ring where the
+        layout has them."""
+        sequence, kv_head, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+        QB: tl.constexpr = D // 32
+        WIDTH: tl.constexpr = QB * 4 * BITS
+        first = tl.load(cu_k_ptr + sequence) - start
+        length = tl.minimum(tl.load(cu_k_ptr + sequence + 1) - tl.load(cu_k_ptr + sequence), start + count)
+        columns = start + tile * N + tl.arange(0, N)
+        valid = columns < length
+        half = tl.arange(0, D // 2)
+        dims_a = (half // 16) * 32 + half % 16
+        page = tl.load(tables_ptr + sequence * TABLE_WIDTH + columns // PAGE, mask=valid, other=0)
+        records = (page * PAGE + columns % PAGE) * H_KV + kv_head
+        if OVERLAY:  # the other region's loads are masked out
+            base = tl.load(base_ptr + sequence)
+            exact = (base >= 0) & ((columns < SINK) | (columns >= tl.load(ring_ptr + sequence)))
+            rows = (base + tl.where(columns < SINK, columns, SINK + (columns & (RING - 1)))) * H_KV + kv_head
+            a, b = _grouped_halves(data_ptr, scale_ptr, min_ptr, records * WIDTH, records * QB, valid & (exact == 0), D, BITS, ASYM, False)
+            exact_a, exact_b = _grouped_halves(overlay_ptr, overlay_scale_ptr, overlay_scale_ptr, rows * D, rows * QB, valid & exact, D, 8, False, False)
+            a = tl.where(exact[:, None], exact_a, a)
+            b = tl.where(exact[:, None], exact_b, b)
+        else:
+            a, b = _grouped_halves(data_ptr, scale_ptr, min_ptr, records * WIDTH, records * QB, valid, D, BITS, ASYM, False)
+        out = ((first + columns) * H_KV + kv_head)[:, None] * D + dims_a[None, :]
+        tl.store(out_ptr + out, a, mask=valid[:, None])
+        tl.store(out_ptr + out + 16, b, mask=valid[:, None])
+
+
 def _operands(module):
     layout = module.kv_layout
     k_min = module.k_min if module.k_min is not None else module.k_scale
@@ -379,6 +412,25 @@ def prefill(q: torch.Tensor, module, context, softmax_scale: float, num_warps: i
         layout.k.bits, layout.k.asymmetric, layout.v.bits, layout.v.asymmetric, has_overlay, layout.sink_tokens(k_cache.shape[1]), max(layout.recent_tokens, 32),
         num_warps=num_warps, num_stages=num_stages)
     return output
+
+
+def dense(module, context, dtype: torch.dtype, out: tuple[torch.Tensor, torch.Tensor] | None = None, start: int = 0, count: int | None = None, capacity: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """The keys and values of every sequence's context dequantized to [tokens, H_KV, D] in dtype (cu_seqlens_k offsets), for an attention
+    over dense operands: 2 x H_KV x D values per context token, each rounded to dtype. out: a pair from an earlier call of the same pass.
+    start, count: only these positions of a single sequence, written from row 0 of out (capacity rows when it is allocated here)."""
+    layout, k_min, v_min, overlay = _operands(module)
+    k_cache = module.k_cache
+    kv_heads, head_dim, page = k_cache.shape[2], module.head_dim, k_cache.shape[1]
+    if count is None:
+        count = int(context.max_seqlen_k)
+    has_overlay, base, ring = _overlay_context(context, layout, k_cache.device)
+    grid = (context.cu_seqlens_k.numel() - 1, kv_heads, triton.cdiv(count, 32))
+    if out is None:
+        out = tuple(torch.empty((capacity or int(context.cu_seqlens_k[-1]), kv_heads, head_dim), dtype=dtype, device=k_cache.device) for _ in range(2))
+    for target, data, scale, minimum, rows, row_scale, fmt in ((out[0], k_cache, module.k_scale, k_min, overlay[0], overlay[2], layout.k), (out[1], module.v_cache, module.v_scale, v_min, overlay[1], overlay[3], layout.v)):
+        dense_kernel[grid](data, scale, minimum, rows, row_scale, context.block_tables, context.cu_seqlens_k, base, ring, target, context.block_tables.shape[1], start, count,
+                           kv_heads, head_dim, page, 32, fmt.bits, fmt.asymmetric, has_overlay, layout.sink_tokens(page), max(layout.recent_tokens, 32), num_warps=4)
+    return out
 
 
 def available(q: torch.Tensor, module, prefill: bool = False) -> bool:

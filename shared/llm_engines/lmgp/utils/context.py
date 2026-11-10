@@ -29,6 +29,9 @@ class Context:
     # the row of the flattened paths that computes it
     tree_paths: torch.Tensor | None = None
     tree_rows: torch.Tensor | None = None
+    # the dense prefill's key and value buffers (layers.attention_mixed.dense): one pair for the layers of a pass, released with its context
+    dense_kv: tuple | None = None
+    dense_slices: list | None = None  # of a long context read by slices: (first key, keys, the slice's cu_seqlens_k)
 
 _CONTEXT = Context()
 

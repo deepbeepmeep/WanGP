@@ -23,7 +23,7 @@ import torch
 from shared.utils.hf import build_hf_url
 
 
-P_H3_IMAGE_ARCHITECTURE = "minimax_h3_image"
+P_H3_IMAGE_ARCHITECTURE = "minimax_p_h3_image"
 P_H3_IMAGE_REPO_ID = "DeepBeepMeep/MiniMax-H3"
 P_H3_IMAGE_TEXT_ENCODER_FOLDER = "P-H3-Image-Qwen3-VL-4B"
 P_H3_IMAGE_TEXT_ENCODER_BF16 = "P-H3-Image-Qwen3-VL-4B_bf16.safetensors"
@@ -110,6 +110,10 @@ Both start phase 2 at 0.7: composition and style hold, people can change. A lowe
 
 This model shares the MiniMax H3 LoRA list. LoRAs made for FL2VA apply to it; Ref2VA LoRAs are listed too, but this model is built on FL2VA. For the same reason Open-H3 Regenerate 2K IC, a Ref2VA LoRA, is refused here: use the Regenerate 2K presets. Accelerators made for H3 video have not been checked on this model.
 
+### Several Images
+
+**Number of Images** generates several variations of the same prompt together, faster than one after the other; the first keeps the composition a single generation with the same seed gives, with slightly different fine details. It works with one phase: the two-phase Regenerate presets make one image at a time.
+
 ### Limits
 
 Hands and small people in the background can break, and rendering at 8 MP helps. Short quoted text renders well; small or dense text turns into pseudo-text, and longer passages can get single letters wrong.
@@ -144,7 +148,7 @@ With several images, name them: `Edit <Picture 1>. The woman wears the straw hat
 WanGP adds `Edit <Picture 1>.` when an edit prompt does not start with it.
 """
 
-P_H3_IMAGE_DEEPY_INFOS = """Single images from `prompt`, or edits with 1 to 8 ordered `image_refs`; no video or audio. Euler, no guidance or negative prompt. `num_inference_steps` defaults to 8 (the checkpoint's own schedule); other counts use H3's shift-12 schedule and need an accelerator: the `pDMD 2 Steps` / `pDMD 4 Steps` accelerator profiles add the pDMD LoRA to `activated_loras`. Whole image about 2.5x faster at 2 steps, 1.6x at 4; 2 steps can invent pseudo-text on graphic prompts, 4 steps is the choice for quoted text and flat graphics; both work for edits and change the composition against 8 steps at the same seed; without the LoRA, fewer than 8 steps gives blurred, unfinished images. Profile `P-H3-Image 8 Steps (Reset)` clears accelerators (`loras_multipliers` `|`), 8 steps, one phase. `guidance_phases` 2: phase 1 at half width and height, H3 latent upscaler x2, phase 2 at full size from `switch_threshold` (min 0.7) for `num_inference_steps2` steps; the built-in P-H3-Image LoRA applies to both phases; without a selected accelerator with a nonzero phase-2 multiplier, the FL2VA LoRA Accelerator (Lightx2v 4 Steps) is added at `0;1`; accelerators count only before `|` in `loras_multipliers` (profiles and presets store `1;0 0;1|`), so without the bar that accelerator stacks on Regenerate. Presets (not accelerator profiles) `pDMD 2 Steps + Regenerate 2K Detail` (pDMD `1;0`, `open_h3_regenerate_2k_lora.safetensors` `0;1`, 2 + 3 steps) and `Regenerate 2K Detail (8 + 3 Steps)` use `custom_sigmas` `; 0.7, 0.659794, 0.513173` (Regenerate's 0.909375 / 0.857143 / 0.666667 grid scaled to start 0.7; scale to 0.5 for portraits). `custom_sigmas`: commas between descending sigmas below 1, `;` between exactly `guidance_phases` slots, blank slot = default schedule. Best at 8 MP (`2912x2912`, `3360x2496`, `2496x3360`, `3552x2368`, `2368x3552`, `3872x2176`, `2176x3872`); edits at 4 or 8 MP; artifacts in faces and hands grow below that. `video_prompt_type`: empty = text to image; `KI` = edit, first image defines output proportions within `resolution` (usual choice); `I` = edit on the exact `resolution`. The first image is edited, the others are references `<Picture 2>` and so on. Each image is used at its own size between 1 and 8 MP, so many large images need much more memory and time. Prompt enhancer is off by default; short prompts render weakly, so write full prompts. Weak on hands, small background people and dense text; short quoted text renders well. `activated_loras` come from the MiniMax H3 list: use FL2VA LoRAs, since this model is built on FL2VA; `open_h3_regenerate_2k_ic_lora_bf16.safetensors` (Ref2VA) is refused; H3 video accelerators other than pDMD are unchecked here."""
+P_H3_IMAGE_DEEPY_INFOS = """Single images from `prompt`, or edits with 1 to 8 ordered `image_refs`; no video or audio. Euler, no guidance or negative prompt. `num_inference_steps` defaults to 8 (the checkpoint's own schedule); other counts use H3's shift-12 schedule and need an accelerator: the `pDMD 2 Steps` / `pDMD 4 Steps` accelerator profiles add the pDMD LoRA to `activated_loras`. Whole image about 2.5x faster at 2 steps, 1.6x at 4; 2 steps can invent pseudo-text on graphic prompts, 4 steps is the choice for quoted text and flat graphics; both work for edits and change the composition against 8 steps at the same seed; without the LoRA, fewer than 8 steps gives blurred, unfinished images. Profile `P-H3-Image 8 Steps (Reset)` clears accelerators (`loras_multipliers` `|`), 8 steps, one phase. `guidance_phases` 2: phase 1 at half width and height, H3 latent upscaler x2, phase 2 at full size from `switch_threshold` (min 0.7) for `num_inference_steps2` steps; the built-in P-H3-Image LoRA applies to both phases; without a selected accelerator with a nonzero phase-2 multiplier, the FL2VA LoRA Accelerator (Lightx2v 4 Steps) is added at `0;1`; accelerators count only before `|` in `loras_multipliers` (profiles and presets store `1;0 0;1|`), so without the bar that accelerator stacks on Regenerate. Presets (not accelerator profiles) `pDMD 2 Steps + Regenerate 2K Detail` (pDMD `1;0`, `open_h3_regenerate_2k_lora.safetensors` `0;1`, 2 + 3 steps) and `Regenerate 2K Detail (8 + 3 Steps)` use `custom_sigmas` `; 0.7, 0.659794, 0.513173` (Regenerate's 0.909375 / 0.857143 / 0.666667 grid scaled to start 0.7; scale to 0.5 for portraits). `custom_sigmas`: commas between descending sigmas below 1, `;` between exactly `guidance_phases` slots, blank slot = default schedule. Best at 8 MP (`2912x2912`, `3360x2496`, `2496x3360`, `3552x2368`, `2368x3552`, `3872x2176`, `2176x3872`); edits at 4 or 8 MP; artifacts in faces and hands grow below that. `video_prompt_type`: empty = text to image; `KI` = edit, first image defines output proportions within `resolution` (usual choice); `I` = edit on the exact `resolution`. The first image is edited, the others are references `<Picture 2>` and so on. Each image is used at its own size between 1 and 8 MP, so many large images need much more memory and time. Prompt enhancer is off by default; short prompts render weakly, so write full prompts. Weak on hands, small background people and dense text; short quoted text renders well. `activated_loras` come from the MiniMax H3 list: use FL2VA LoRAs, since this model is built on FL2VA; `open_h3_regenerate_2k_ic_lora_bf16.safetensors` (Ref2VA) is refused; H3 video accelerators other than pDMD are unchecked here. `batch_size` up to 16 images denoised together, with `guidance_phases` 1 only (image 0 has the composition of the single image of that seed, fine details differ slightly)."""
 
 P_H3_IMAGE_DEEPY_PROMPT_INFOS = """Text to image: open with one sentence naming what the image physically is (`A photograph by...`, `A frame from a Japanese anime TV series`, `A two-color risograph print`), then one scene: viewpoint, one subject in a moment, a few supporting elements, light with a source and direction. Quote every visible word, keep strings short, say where they sit, end with `no other text`; without text, do not mention signs or labels. No hype words (stunning, epic, cinematic, vibrant, 8k, masterpiece); no very long prompts. Edit: `Edit <Picture 1>. <the change as the finished result>. Keep <everything that must stay> exactly as it is.` Name the exact object and its place, give new things a size relative to something present, list faces, poses, background and light to keep, quote new text. Other images are `<Picture 2>`, `<Picture 3>`."""
 
@@ -183,6 +187,7 @@ def query_p_h3_image_def(denoising_priority_infos):
         "dtype": "bf16",
         "device_explicit": True,
         "image_outputs": True,
+        "profile_type": "image",
         "cuda_graphs": ["transformer"],
         "tiny_vae_architecture": "minimax_h3_ref2va",
         "accelerated": "native",
@@ -190,7 +195,6 @@ def query_p_h3_image_def(denoising_priority_infos):
             {"name": "8 megapixel images", "aliases": ["high resolution", "high resolution photorealism"], "description": "Renders 8 MP photographs, film frames and graphic styles in 8 steps, or 2 to 4 with the pDMD accelerator."},
             {"name": "multi-image editing", "aliases": ["image composition"], "description": "Edits one image and combines elements from up to 7 further images."},
         ],
-        "image_batch_size_max": 1,
         "block_size": 32,
         "vae_block_size": 32,
         "resolution_budget": "2912x2912",

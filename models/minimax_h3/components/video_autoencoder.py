@@ -570,6 +570,7 @@ class MiniMaxH3VideoViTDecoder3d(nn.Module):
         rope_theta: float = 100.0,
         rope_dim_ratio: float = 0.75,
         norm_eps: float = 1e-5,
+        rope_axes: int = 3,
     ) -> None:
         super().__init__()
         dim = num_attention_heads * attention_head_dim
@@ -577,8 +578,9 @@ class MiniMaxH3VideoViTDecoder3d(nn.Module):
         self.patch_size_t = patch_size_t
         self.out_channels = out_channels
         self.num_register_tokens = num_register_tokens
+        self.rope_axes = rope_axes  # 2: MiniMax-H3-Image's decoder, (h, w) coordinates only
 
-        self.rope = MiniMaxH3VideoRotaryPosEmbed(int(attention_head_dim * rope_dim_ratio), theta=rope_theta)
+        self.rope = MiniMaxH3VideoRotaryPosEmbed(int(attention_head_dim * rope_dim_ratio), theta=rope_theta, num_axes=rope_axes)
         self.x_embedder = nn.Linear(in_channels, dim)
         self.register_tokens = nn.Parameter(torch.zeros(1, num_register_tokens, dim))
         if patch_size_t > 1:
@@ -618,11 +620,13 @@ class MiniMaxH3VideoViTDecoder3d(nn.Module):
             2.0 * (torch.arange(0.5, size, dtype=torch.float32, device=hidden_states.device) / size) - 1.0
             for size in (num_frames, height, width)
         ]
-        if self.patch_size_t == 1:  # a single-frame decoder keeps the time of the first latent of a 7-latent clip
+        if self.rope_axes == 2:  # an image decoder: one frame, no time coordinate
+            grids = grids[1:]
+        elif self.patch_size_t == 1:  # a single-frame decoder keeps the time of the first latent of a 7-latent clip
             grids[0] = torch.full((1,), 2.0 * (0.5 / 7) - 1.0, dtype=torch.float32, device=hidden_states.device)
-        position_ids = torch.stack(torch.meshgrid(*grids, indexing="ij"), dim=-1).flatten(0, 2)
+        position_ids = torch.stack(torch.meshgrid(*grids, indexing="ij"), dim=-1).flatten(0, len(grids) - 1)
         position_ids = position_ids.unsqueeze(0).expand(batch_size, -1, -1)
-        suffix_ids = position_ids.new_zeros((batch_size, self.num_register_tokens + 1, 3))
+        suffix_ids = position_ids.new_zeros((batch_size, self.num_register_tokens + 1, self.rope_axes))
         position_ids = torch.cat([position_ids, suffix_ids], dim=1)
         rotary_emb = self.rope(position_ids)
 
@@ -701,6 +705,7 @@ class AutoencoderKLMiniMaxH3(ModelMixin, ConfigMixin, AttentionMixin, Autoencode
         decoder_rope_dim_ratio: float = 0.75,
         decoder_norm_eps: float = 1e-5,
         decoder_patch_size_t: int | None = None,
+        decoder_rope_axes: int = 3,
         clip_length: int = 17,
         token_drop: int = 3,
         latents_mean: tuple[float, ...] = (0.0,) * 24,
@@ -737,6 +742,7 @@ class AutoencoderKLMiniMaxH3(ModelMixin, ConfigMixin, AttentionMixin, Autoencode
             rope_theta=decoder_rope_theta,
             rope_dim_ratio=decoder_rope_dim_ratio,
             norm_eps=decoder_norm_eps,
+            rope_axes=decoder_rope_axes,
         )
 
         # Derived temporal-chunking geometry. `clip_length` pixel frames are encoded at a time; because

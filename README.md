@@ -83,7 +83,7 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 ## 🔥 Latest Updates : 
 
-## 9th of November 2026: WanGP v19.25 - Bonus Track
+## 10th of November 2026: WanGP v19.28 - Bonus Track
 - **Qwen Image 2.1 Viggle Image Swap**: a Qwen Image 2.1 variant and **Showrunner's default frame painter for Viggle Remake character swaps**. Replace one or several people in **6 steps**, keeping their poses, expressions and the scene's framing. Add the **source picture first**, then one **character sheet** per person; the picture's aspect ratio is preserved at about **1 megapixel**. Results can be slightly darker.
 
 - **H3 HyperFlow LoRA**: bring **8-step** generation to the standard and Pruned **Ref2VA** models with the new **HyperFlow Ref2VA 8 Steps** accelerator profile.
@@ -94,6 +94,9 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 - **H3 DMAD accelerators**: generate video with sound in **4 or 8 steps** on FL2VA and Ref2VA: choose 4 for speed or 8 for better quality. The profiles apply the matching LoRA and settings automatically. The new **DMAD Re-noise** sampler also supports **H3 Turbo Neat Prime**.
 
+- **Official H3-Image**: MiniMax's own image model generates from text, or edits and combines up to **16 reference images**, in **6 steps**. It works best around **16 megapixels** with detailed descriptions; dedicated prompt enhancers help expand short requests. Choose the full **33B** model or **Pruned 20B**, which produces nearly identical images with a smaller download and faster loading. H3 Image seems to be the **best image swapper** for Viggle.
+
+- **Faster Deepy and Prompt Enhancer on Qwen3.8 27B**: once **GGUF kernels 1.0.30** are installed, Deepy writes its answers, tool calls and image or video inspections faster with the same quality: **up to 19% faster** with the **Q3** and **Q2** checkpoints and about **4%** with **Q4**. The new optional **Faster Context Reading** setting lets Deepy read tool results, documents and restored conversations **up to twice as fast**, for about 140 MB of VRAM while reading.
 
 
 
@@ -218,7 +221,7 @@ Create a world, then walk through it with the keyboard in the new **Worlds galle
 
 - **Fast Quantized KV Cache**: **MOSS Image Edit**, **Qwen Image 2.1** and **Wan Animate 2** now support quantized KV caches that make generation from image or video references much faster, even with **memory profiles 4 and 5**.
 
-- **More Speed Boost and VRAM Savers**: update **WGPKernels to 1.4.3** and **GGUF kernels to 1.0.29** using the [installation guide](docs/INSTALLATION.md).
+- **More Speed Boost and VRAM Savers**: update **WGPKernels to 1.4.3** and **GGUF kernels to 1.0.30** using the [installation guide](docs/INSTALLATION.md).
 
 ### Deepy Prime — Twice the Context, More Ways to Create
 

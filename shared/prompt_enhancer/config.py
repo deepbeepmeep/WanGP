@@ -12,7 +12,8 @@ PROMPT_ENHANCER_SPECULATIVE_DECODING_VRAM_GB = {4: 12, 5: 24, 6: 8, 7: 12}  # Au
 MTP_AUTO_SLACK = 512 << 20  # Auto: MTP still pays when it leaves this much of the model out of VRAM (with the model in VRAM it decodes about twice as fast)
 MTP_AUTO_FOUR_DRAFTS_VRAM_GB = 24  # Auto on Qwen3.8 27B: 4 draft tokens from this size, from MTP_AUTO_FOUR_DRAFTS_BONSAI_VRAM_GB with Bonsai, 2 otherwise
 MTP_AUTO_FOUR_DRAFTS_BONSAI_VRAM_GB = 12
-MTP_AUTO_LONG_DRAFTS = 7  # an automatic draft count on Qwen3.8 27B Q4_K_M with 4 draft tokens: this many while the recent drafts are accepted (tool calls, code, lists), 4 on the rest (prose)
+MTP_AUTO_LONG_DRAFTS = 7  # an automatic draft count of 4 on Qwen3.8 27B: this many while the recent drafts are accepted (tool calls, summaries, lists), 4 on the rest
+MTP_AUTO_LONG_BACKENDS = ("gguf", "gguf_q3", "gguf_q2", "gguf_ptq1")  # where the long chain was measured faster
 MTP_AUTO_NO_OFFLOAD_VRAM_GB = range(13, 17)  # Auto on GPUs of these sizes: MTP only when the whole model stays in VRAM with it. Below, the fit rule: part of the model often streams there anyway
 PROMPT_ENHANCER_SPECULATIVE_DRAFT_COUNTS = (2, 3, 4)
 BLOCK_DRAFT_METHODS = ("dspark", "dflash2", "dspine")
@@ -81,9 +82,9 @@ def mtp_auto_drafts(enhancer_enabled, qwen_backend, total_vram_gb) -> int:
 
 
 def mtp_auto_long_drafts(enhancer_enabled, qwen_backend, drafts) -> int:
-    """The draft tokens of the long chain of an automatic draft count, 0 without one: where it was measured (Qwen3.8 27B Q4_K_M on Deepy's own passes: 3.6 -> 4.4 tokens per pass,
-    tool calls 4.6 -> 6.2 and 13% faster, summaries 4.4 -> 6.3 and 25% faster, prose unchanged)."""
-    return MTP_AUTO_LONG_DRAFTS if int(enhancer_enabled or 0) == 5 and qwen_backend == "gguf" and int(drafts or 0) == 4 else 0
+    """The draft tokens of the long chain of an automatic draft count, 0 without one: where it was measured on Deepy's own passes
+    (Qwen3.8 27B, RTX 5090: Q4_K_M 7% faster, tool calls 12% and summaries 17%; Q3 2.5%; Bonsai PTQ1 1.6%; prose unchanged)."""
+    return MTP_AUTO_LONG_DRAFTS if int(enhancer_enabled or 0) == 5 and qwen_backend in MTP_AUTO_LONG_BACKENDS and int(drafts or 0) == 4 else 0
 
 
 def speculative_decoding_runtime(value):

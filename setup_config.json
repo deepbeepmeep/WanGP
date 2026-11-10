@@ -161,22 +161,22 @@
             "gguf": {
                 "label": "GGUF llama.cpp CUDA Kernels (PyTorch 2.10 / CUDA 13)",
                 "cmd": {
-                    "win": "--no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.29/llamacpp_gguf_cuda-1.0.29%2Btorch210cu130py311-cp311-cp311-win_amd64.whl",
-                    "linux": "--no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.29/llamacpp_gguf_cuda-1.0.29%2Btorch210cu130py311-cp311-cp311-linux_x86_64.whl"
+                    "win": "--no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.30/llamacpp_gguf_cuda-1.0.30%2Btorch210cu130py311-cp311-cp311-win_amd64.whl",
+                    "linux": "--no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.30/llamacpp_gguf_cuda-1.0.30%2Btorch210cu130py311-cp311-cp311-linux_x86_64.whl"
                 }
             },
             "gguf_cu128": {
                 "label": "GGUF llama.cpp CUDA Kernels (PyTorch 2.7.1 / CUDA 12.8)",
                 "cmd": {
-                    "win": "--no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.29/llamacpp_gguf_cuda-1.0.29%2Btorch271cu128py310-cp310-cp310-win_amd64.whl",
-                    "linux": "--no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.29/llamacpp_gguf_cuda-1.0.29%2Btorch271cu128py310-cp310-cp310-linux_x86_64.whl"
+                    "win": "--no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.30/llamacpp_gguf_cuda-1.0.30%2Btorch271cu128py310-cp310-cp310-win_amd64.whl",
+                    "linux": "--no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.30/llamacpp_gguf_cuda-1.0.30%2Btorch271cu128py310-cp310-cp310-linux_x86_64.whl"
                 }
             },
             "gguf_rocm10": {
                 "label": "GGUF llama.cpp HIP Kernels (PyTorch 2.13 / ROCm 10, RDNA4, experimental)",
                 "cmd": {
-                    "win": "--no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.29/llamacpp_gguf_cuda-1.0.29%2Btorch213rocm100py312-cp312-cp312-win_amd64.whl",
-                    "linux": "--no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.29/llamacpp_gguf_cuda-1.0.29%2Btorch213rocm100py312-cp312-cp312-linux_x86_64.whl"
+                    "win": "--no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.30/llamacpp_gguf_cuda-1.0.30%2Btorch213rocm100py312-cp312-cp312-win_amd64.whl",
+                    "linux": "--no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.30/llamacpp_gguf_cuda-1.0.30%2Btorch213rocm100py312-cp312-cp312-linux_x86_64.whl"
                 }
             }
         }

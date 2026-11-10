@@ -29,9 +29,10 @@ PROMPT_RULES_NOTE = ("user_prompt_rules are the user's own rules for the prompts
 ROLES = (
     {"id": "images", "task": "gen_image", "hint": "Stills, illustrated pages and backgrounds"},
     {"id": "image_edits", "task": "edit_image", "hint": "The cast's reference pictures and looks, made from their photos"},
-    # Its own Auto: a model trained on character swaps (6/6 frames swapped with the sheet's build where Qwen 2.1 Turbo, Deepy's default editor, did 2/6: specs).
+    # Its own Auto, not Deepy's image editor: H3-Image keeps poses and expressions and handles several people with someone staying
+    # (12 draws of two remakes: 8 clean against Klein's 9, Viggle Image Swap's 2 and Qwen 2.1 Turbo's swaps that left people unchanged: specs).
     {"id": "frame_painter", "task": "edit_image", "label": "Frame Painter", "hint": "A remake's frames where people are replaced by the cast, painted before the video",
-     "auto_template": "edit_image/Qwen Image 2.1 Viggle Image Swap 6 Steps"},
+     "auto_template": "edit_image/H3-Image Pruned 6 Steps"},
     {"id": "shots_without_cast", "task": "gen_video", "hint": "Shots without the cast: landscapes, objects, crowds, inserts"},
     {"id": "cast_shots_lip_synced", "task": "gen_video_with_speech", "hint": "Shots where someone sings or speaks, lip-synced to the song or to their line"},
     {"id": "cast_shots", "task": "gen_video_with_refs", "hint": "Shots with the cast, keeping each person's face, hair and outfit from their pictures"},

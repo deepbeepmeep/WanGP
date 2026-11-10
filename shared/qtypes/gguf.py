@@ -948,18 +948,25 @@ def _llamacpp_cuda_linear(module, raw, qtype_name, shape, input_tensor, bias, ta
     return out.reshape(*input_tensor.shape[:-1], out_features)
 
 
-_IQ4_NL_OVERREAD_ROWS = 9  # beyond the short-batch kernels
+_OVERREAD_QTYPES = ("Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "IQ4_NL")  # blocks of 32 values
+_OVERREAD_ROWS = 2 if torch.version.hip else 9  # input rows from which the batched kernel serves these formats (CUDA: beyond the short-batch kernels)
 
 
-def _iq4_nl_linear_many_rows(module, weight_tensor, raw, shape, input_tensor, bias, target_dtype):
-    """llamacpp_gguf_cuda up to 1.0.29 at least: the kernel of IQ4_NL weights for many input rows reads past the end of the weight, so the memory beside it decides whether the last output
-    row is finite. The last output row is computed from its decoded weights here; its own short kernel is not concerned."""
+def _linear_many_rows_narrow(module, weight_tensor, raw, qtype_name, shape, input_tensor, bias, target_dtype):
+    """llamacpp_gguf_cuda up to 1.0.29: the batched kernel walks a weight row by 256 values, so for a format of 32-value blocks whose width is not a multiple of 256 it reads past the end
+    of the last rows, and the memory beside the weight decides whether the last output features are finite (or whether the read faults). Those features (one for a width of 224 or more)
+    are computed from their decoded weights here; the short-batch kernels are not concerned. Later packages serve these weights themselves (has_bounded_batched_reads)."""
     rows, columns = shape
-    head = _llamacpp_cuda_linear(module, raw[:rows - 1], "IQ4_NL", (rows - 1, columns), input_tensor, None if bias is None else bias[:rows - 1], target_dtype)
     values, size = _quantization_sizes(weight_tensor._tensor_type)
-    last = _DEQUANTIZE_FUNCTIONS[_quantization_type(weight_tensor._tensor_type)](raw[rows - 1:].reshape(-1, size), values, size, torch.float32).reshape(1, columns)
-    tail = torch.nn.functional.linear(input_tensor.float(), last, None if bias is None else bias[rows - 1:].float()).to(head.dtype)
-    return torch.cat((head, tail), -1)
+    blocks = columns // values
+    apart = min(rows, -(-(8 - blocks % 8) // blocks))
+    raw = raw.reshape(rows, -1)
+    last = _DEQUANTIZE_FUNCTIONS[_quantization_type(weight_tensor._tensor_type)](raw[rows - apart:].reshape(-1, size), values, size, torch.float32).reshape(apart, columns)
+    tail = torch.nn.functional.linear(input_tensor.float(), last, None if bias is None else bias[rows - apart:].float()).to(target_dtype)
+    if rows == apart:
+        return tail
+    head = _llamacpp_cuda_linear(module, raw[:rows - apart], qtype_name, (rows - apart, columns), input_tensor, None if bias is None else bias[:rows - apart], target_dtype)
+    return torch.cat((head, tail.to(head.dtype)), -1)
 
 
 def _try_llamacpp_cuda_linear(weight_tensor, input_tensor, bias, target_dtype):
@@ -983,8 +990,8 @@ def _try_llamacpp_cuda_linear(weight_tensor, input_tensor, bias, target_dtype):
         if flat_linear is None:
             return None
         return flat_linear(input_tensor, raw, list(shape), qtype_name, _maybe_cast_bias(bias, target_dtype), target_dtype)
-    if qtype_name == "IQ4_NL" and input_tensor.shape[0] >= _IQ4_NL_OVERREAD_ROWS and shape[0] > 1:
-        return _iq4_nl_linear_many_rows(gguf_llamacpp_cuda, weight_tensor, raw, shape, input_tensor, bias, target_dtype)
+    if qtype_name in _OVERREAD_QTYPES and shape[1] % 256 and input_tensor.numel() // shape[1] >= _OVERREAD_ROWS and not hasattr(gguf_llamacpp_cuda, "has_bounded_batched_reads"):
+        return _linear_many_rows_narrow(gguf_llamacpp_cuda, weight_tensor, raw, qtype_name, shape, input_tensor, bias, target_dtype)
     fast_out = _llamacpp_cuda_linear(gguf_llamacpp_cuda, raw, qtype_name, shape, input_tensor, bias, target_dtype)
     _gguf_log_once(f"llamacpp_cuda_linear_active_{qtype_name}", f"[GGUF][llama.cpp CUDA] linear fast path active for {qtype_name}.")
     return fast_out
@@ -1802,6 +1809,67 @@ class GGUFFirstRowsLinear(torch.nn.Module):
             object.__setattr__(self, "_cached_raw", source_raw)
             object.__setattr__(self, "_cached_weight", weight)
         return self._cached_weight.linear(input)
+
+
+_DRAFT_HEAD_GROUPS, _DRAFT_HEAD_KEEP = 256, 4  # the rows scored exactly at each draft: the 4 best of each of 256 groups of the head's one-bit copy
+_DRAFT_HEAD_FLOOR = -30000.0  # the logit of the other rows: no probability, and finite under every rule applied to logits
+_DRAFT_HEAD_DISABLED = "draft_candidates" in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the whole head at each draft, to compare
+
+
+def draft_candidates_supported(source: torch.nn.Module, row_count: int) -> bool:
+    """GGUFCandidateRowsLinear serves this head: the GGUF kernel package has its selection kernel for this GPU and the head's shape fits it."""
+    module = _gguf_cuda_module() if _gguf_cuda_kernels_enabled() and torch.cuda.is_available() else None
+    weight = getattr(source, "weight", None)
+    if _DRAFT_HEAD_DISABLED or module is None or not hasattr(module, "head_group_bits") or not module.has_head_candidates(torch.cuda.current_device()) or not isinstance(weight, GGUFWeightTensor):
+        return False
+    columns = int(weight._tensor_shape[1])
+    return row_count % _DRAFT_HEAD_GROUPS == 0 and _DRAFT_HEAD_KEEP <= row_count // _DRAFT_HEAD_GROUPS <= 1024 and columns % 128 == 0 and columns <= 8192
+
+
+class GGUFCandidateRowsLinear(GGUFFirstRowsLinear):
+    """A drafter's head over the first rows of a GGUF head, in two stages. A draft needs the head's few best tokens, and the head reads
+    its whole vocabulary for them at every draft (Qwen3.8 27B: 98,304 rows of Q6_K, 412 MB, 247 us on an RTX 5090). Here a one-bit copy
+    of those rows (their signs and a scale per row, 61 MB, dealt once into groups by a fixed shuffle) gives the 4 best rows of each of 256
+    groups, and the head's own kernel scores those 1,024 rows exactly: 69 us in all. The other tokens get a logit that leaves them no
+    probability. On 6,000 inputs of the drafter's head in real passes its best token is among the rows scored in 99.9 % of the cases, and
+    the tokens left out hold 0.1 % of its probability at a temperature of 0.6 (0.4 % at 1);
+    a token missed is a draft less likely to be accepted, never a different output: the verification does not depend on the drafts."""
+
+    def __init__(self, source: torch.nn.Module, row_count: int):
+        super().__init__(source, row_count)
+        weight = source.weight
+        values, size = _quantization_sizes(weight._tensor_type)
+        full_rows, columns = map(int, weight._tensor_shape)
+        raw = weight._data.reshape(full_rows, -1)
+        dequantize, module = _DEQUANTIZE_FUNCTIONS[_quantization_type(weight._tensor_type)], _gguf_cuda_module()
+        device = torch.device("cuda")  # built on the GPU by chunks of rows (about 100 MB at a time), kept as buffers that MMGP places with the model
+        bits, scales = [], []
+        for start in range(0, self.row_count, 1024):
+            dense = dequantize(raw[start:min(start + 1024, self.row_count)].to(device).reshape(-1, size), values, size, torch.float32).reshape(-1, columns)
+            chunk_bits, chunk_scale = module.head_sign_bits(dense)
+            bits.append(chunk_bits.cpu())
+            scales.append(chunk_scale.cpu())
+        shuffle = torch.randperm(self.row_count, generator=torch.Generator(device="cpu").manual_seed(0), device="cpu")
+        self.register_buffer("candidate_bits", module.head_group_bits(torch.cat(bits)[shuffle], _DRAFT_HEAD_GROUPS), persistent=False)  # by group and by part of a row: read as contiguous runs
+        self.register_buffer("candidate_scale", torch.cat(scales)[shuffle].contiguous().view(torch.int32), persistent=False)  # float32 kept as its bits: no dtype conversion touches it
+        self.register_buffer("candidate_ids", shuffle.to(torch.int32), persistent=False)
+        # the candidates' quantized rows, gathered at each draft: one buffer for every graph that drafts, instead of a temporary in each graph's own memory
+        self.register_buffer("candidate_rows", torch.empty((_DRAFT_HEAD_GROUPS * _DRAFT_HEAD_KEEP, raw.shape[1]), dtype=torch.uint8), persistent=False)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        source_weight, bits, gathered = self.weight, self.candidate_bits, self.candidate_rows
+        source_raw = source_weight._data
+        if not (input.is_cuda and bits.device == input.device and gathered.device == input.device and source_raw.device == input.device and input.numel() == input.shape[-1] and input.dtype in (torch.float16, torch.bfloat16, torch.float32)):
+            return super().forward(input)  # several rows at once, or weights not placed with the input: the whole head
+        module = _gguf_cuda_module()
+        full_rows, in_features = map(int, source_weight._tensor_shape)
+        count = _DRAFT_HEAD_GROUPS * _DRAFT_HEAD_KEEP
+        index = module.head_candidates(input, bits, self.candidate_scale.view(torch.float32), self.candidate_ids, _DRAFT_HEAD_GROUPS, _DRAFT_HEAD_KEEP)[0].long()
+        rows = GGUFWeightTensor.create(torch.index_select(source_raw.reshape(full_rows, -1), 0, index, out=gathered), (count, in_features), (in_features, 1), source_weight.dtype, tensor_type=source_weight._tensor_type, tensor_shape=(count, in_features))
+        exact = rows.linear(input)
+        _gguf_log_once("draft_candidates", f"[GGUF][llama.cpp CUDA] draft head: {count} candidate rows of {self.row_count} scored at each draft (one-bit copy of the head, {bits.numel() * 4 >> 20} MB).")
+        logits = torch.full((*input.shape[:-1], self.row_count), _DRAFT_HEAD_FLOOR, dtype=exact.dtype, device=exact.device)
+        return logits.scatter_(-1, index.view(*([1] * (input.dim() - 1)), -1), exact)
 
 
 @torch.library.custom_op("wangp_gguf::linear_fused", mutates_args=())

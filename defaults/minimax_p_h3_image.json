@@ -1,0 +1,38 @@
+{
+    "model": {
+        "name": "MiniMax H3 P-H3-Image 20B",
+        "architecture": "minimax_p_h3_image",
+        "group": "h3_image",
+        "description": "Generates a single image from text, or edits an image with up to 8 input images, in 8 steps without guidance, or in 2 to 4 steps with the pDMD accelerator profiles. Works best at 8 megapixels, and is strongest at photorealism, film and editorial looks and graphic styles with short quoted text. No video or audio; hands and dense text can break.",
+        "URLs": "minimax_h3_fl2va_pruned",
+        "loras": [
+            "https://huggingface.co/DeepBeepMeep/MiniMax-H3/resolve/main/loras/p-h3-image_lora_bf16.safetensors"
+        ],
+        "loras_multipliers": ["1"],
+        "lock_resolutions": false,
+        "resolutions": [
+            ["2912x2912 (1:1, 8 MP)", "2912x2912"],
+            ["3360x2496 (4:3, 8 MP)", "3360x2496"],
+            ["2496x3360 (3:4, 8 MP)", "2496x3360"],
+            ["3552x2368 (3:2, 8 MP)", "3552x2368"],
+            ["2368x3552 (2:3, 8 MP)", "2368x3552"],
+            ["3872x2176 (16:9, 8 MP)", "3872x2176"],
+            ["2176x3872 (9:16, 8 MP)", "2176x3872"],
+            ["2048x2048 (1:1, 4 MP)", "2048x2048"],
+            ["2368x1760 (4:3, 4 MP)", "2368x1760"],
+            ["1760x2368 (3:4, 4 MP)", "1760x2368"],
+            ["2496x1664 (3:2, 4 MP)", "2496x1664"],
+            ["1664x2496 (2:3, 4 MP)", "1664x2496"],
+            ["2720x1536 (16:9, 4 MP)", "2720x1536"],
+            ["1536x2720 (9:16, 4 MP)", "1536x2720"]
+        ]
+    },
+    "prompt": "A photograph by an experienced documentary photographer of an old fishmonger in a Lisbon market, seen from counter height as she wraps a sardine in brown paper. Crates of ice stand behind her and a single hanging bulb lights her hands from the left, leaving the aisle behind in soft shadow. A hand-painted sign above her reads \"PEIXE FRESCO\", no other text.",
+    "image_mode": 1,
+    "resolution": "2912x2912",
+    "num_inference_steps": 8,
+    "guidance_phases": 1,
+    "guidance_scale": 1.0,
+    "sample_solver": "euler",
+    "batch_size": 1
+}

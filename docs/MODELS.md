@@ -66,8 +66,6 @@ Acceleration choices have different trade-offs. **PDD** variants use a fixed eig
 
 **[Viggle Animate](modeltype:viggle_animate) is an H3-derived character-replacement model.** Supply the original control video and one frame from it in which an image editor has replaced the character. Preserve that frame's pose, background, framing and dimensions. Viggle follows the original motion in a fixed three-step workflow, using sliding windows for longer footage. Its text generation prompt is ignored: express the change in the edited frame. Large pose changes, interacting characters and cuts are more challenging.
 
-**[P-H3-Image](modeltype:minimax_h3_image) is an H3-derived image model**, listed with H3 although it makes no video or audio. It generates a single image from text, or edits an image with up to eight input images, in eight steps, or in two to four steps with its pDMD accelerator profiles. It works best at 8 megapixels and is strongest at photorealism, film and editorial looks and graphic styles with short quoted text. It renders full, specific prompts much better than short requests, so write them out or use the optional **Write** button.
-
 The family also provides an audio-only **[H3 Voice Clone](modeltype:minimax_h3_tts_ref2va_pruned)** preset and **H3 Face Refiner** for finishing video; these are related H3 workflows, not separate model families.
 
 <a id="ltx-2-and-ltx-23"></a>
@@ -154,6 +152,12 @@ The older 20B family remains useful:
 - **[Qwen Image Layered](modeltype:qwen_image_layered_20B)** for decomposing an image into editable RGBA layers.
 
 Selected 20B variants have Nunchaku checkpoints for supported hardware. Qwen 2.1 uses its own model and adapter formats: do not assume older Qwen Image LoRAs or VAEs are interchangeable.
+
+### H3
+
+**[MiniMax H3-Image 33B](modeltype:minimax_h3_image)** is MiniMax's image model on the H3 architecture. It generates a single image from text, or edits and combines up to 16 input images, in six steps without guidance. It works best around 16 megapixels and follows long, detailed descriptions much better than short requests: write them out or use the optional **Write** button, which produces the detailed captions and edit descriptions the model expects. **[H3-Image Pruned 20B](modeltype:minimax_h3_image_pruned)** is a smaller download that loads faster for nearly identical images. H3-Image has its own LoRA list: H3 video LoRAs do not apply to it.
+
+**[P-H3-Image](modeltype:minimax_p_h3_image)** is Pruna's image model derived from H3 FL2VA. It generates a single image from text, or edits an image with up to eight input images, in eight steps, or in two to four steps with its pDMD accelerator profiles. It works best at 8 megapixels and is strongest at photorealism, film and editorial looks and graphic styles with short quoted text. It also renders full, specific prompts much better than short requests. It shares the MiniMax H3 LoRA list.
 
 ### Ming Image
 
