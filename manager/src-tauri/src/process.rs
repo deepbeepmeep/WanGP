@@ -33,10 +33,59 @@ impl ProcessTree {
 impl Drop for ProcessTree {
     fn drop(&mut self) { unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0); } }
 }
-#[cfg(not(windows))]
-pub struct ProcessTree;
-#[cfg(not(windows))]
+
+/// The worker leads its own process group (`process_group(0)` at spawn) and starts each command in a session of its own.
+/// Terminating freezes the worker, lists its descendants from /proc and kills every process group they belong to, so
+/// processes a command left behind in its group go too. Dropping terminates, as closing a Windows job does.
+#[cfg(target_os = "linux")]
+pub struct ProcessTree { pid: i32, start: u64 }
+
+#[cfg(target_os = "linux")]
+fn stat(pid: i32) -> Option<(i32, i32, u64)> {
+    // Fields after the command name, which may hold spaces and parentheses: state ppid pgrp ... starttime (22nd field).
+    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields: Vec<&str> = text[text.rfind(')')? + 1..].split_whitespace().collect();
+    Some((fields.get(1)?.parse().ok()?, fields.get(2)?.parse().ok()?, fields.get(19)?.parse().ok()?))
+}
+
+#[cfg(target_os = "linux")]
 impl ProcessTree {
-    pub fn attach(_child: &Child) -> Result<Self, String> { Err("This preview currently supports Windows process supervision".into()) }
+    pub fn attach(child: &Child) -> Result<Self, String> {
+        let pid = child.id() as i32;
+        // An unwaited child keeps its PID; the start time also tells it apart from a later process given the same PID.
+        let (_, _, start) = stat(pid).ok_or("Could not read the worker process state")?;
+        Ok(Self { pid, start })
+    }
+    pub fn terminate(&self) {
+        if stat(self.pid).map(|(_, _, start)| start) != Some(self.start) { return; }
+        unsafe { libc::kill(self.pid, libc::SIGSTOP); }
+        let processes: Vec<(i32, i32, i32)> = std::fs::read_dir("/proc").into_iter().flatten().flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+            .filter_map(|pid| stat(pid).map(|(parent, group, _)| (pid, parent, group))).collect();
+        let mut tree = vec![self.pid];
+        let mut index = 0;
+        while index < tree.len() {
+            let parent = tree[index];
+            tree.extend(processes.iter().filter(|process| process.1 == parent).map(|process| process.0));
+            index += 1;
+        }
+        let own = unsafe { libc::getpgrp() };
+        let mut groups: Vec<i32> = processes.iter().filter(|process| tree.contains(&process.0)).map(|process| process.2).filter(|group| *group > 1 && *group != own).collect();
+        groups.sort_unstable();
+        groups.dedup();
+        for group in groups { unsafe { libc::killpg(group, libc::SIGKILL); } }
+        for pid in tree { unsafe { libc::kill(pid, libc::SIGKILL); } }
+    }
+}
+#[cfg(target_os = "linux")]
+impl Drop for ProcessTree {
+    fn drop(&mut self) { self.terminate(); }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub struct ProcessTree;
+#[cfg(not(any(windows, target_os = "linux")))]
+impl ProcessTree {
+    pub fn attach(_child: &Child) -> Result<Self, String> { Err("This preview currently supports Windows and Linux process supervision".into()) }
     pub fn terminate(&self) {}
 }

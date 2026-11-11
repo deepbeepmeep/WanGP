@@ -146,7 +146,8 @@ def run_action(action, args, data, runtime, cancelled, emit, request_id):
         tag = release["tag_name"]
         if not tag.startswith("manager-v"):
             raise InstallError("manager_release_unavailable", "The latest release is not a Manager release. Visit the download page")
-        return {"version": tag.removeprefix("manager-v"), "url": "https://github.com/deepbeepmeep/WanGP/releases/latest/download/WanGPManager.exe"}
+        asset = "WanGPManager-x86_64.AppImage" if sys.platform.startswith("linux") else "WanGPManager.exe"
+        return {"version": tag.removeprefix("manager-v"), "url": f"https://github.com/deepbeepmeep/WanGP/releases/latest/download/{asset}"}
     if action == "catalog":
         if args.get("repository"):
             config, version = remote_catalog(args["repository"], args["commit"], runner)
@@ -325,7 +326,9 @@ def main(argv=None):
                     pass
             cancelled.set()
         threading.Thread(target=controls, daemon=True).start()
-        runtime = UvRuntime(args.uv, data / "runtime", base_python=sys.executable)
+        # The Linux AppImage mounts the bundled runtime at a new path on each start: environments built on it would break,
+        # so they use uv's managed Python in the data folder, as other Python versions already do.
+        runtime = UvRuntime(args.uv, data / "runtime", base_python=sys.executable if os.name == "nt" else None)
         result = run_action(request["action"], request.get("args", {}), data, runtime, cancelled, emit, request_id)
         emit({"type": "finished", "result": result})
         return 0

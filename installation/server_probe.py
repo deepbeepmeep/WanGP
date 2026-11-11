@@ -1,10 +1,11 @@
-"""Bounded loopback readiness checks tied to the launched Windows process tree."""
+"""Bounded loopback readiness checks tied to the launched process tree."""
 
 import ctypes
 from http.client import HTTPConnection, HTTPException
 import os
 import socket
 import struct
+import sys
 import time
 
 from .state import InstallError
@@ -16,13 +17,55 @@ def require_free_port(port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         if os.name == "nt":
             probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        elif sys.platform.startswith("linux"):
+            # Connections the stopped server closed stay in TIME_WAIT for a minute; Linux still refuses a port that is listened on.
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             probe.bind(("127.0.0.1", port))
         except OSError as exc:
             raise InstallError("port_busy", f"Port {port} is already in use. Choose another port; the existing process was left alone") from exc
 
 
+def linux_owned_listener(root_pid, port):
+    """Same check as on Windows, from /proc: an IPv4 listener on the any or loopback address, held by the launched tree."""
+    sockets = set()
+    with open("/proc/net/tcp", encoding="ascii") as table:
+        for line in table.readlines()[1:]:
+            fields = line.split()
+            address, local_port = fields[1].split(":")
+            if fields[3] == "0A" and int(local_port, 16) == port and address in ("00000000", "0100007F"):
+                sockets.add(f"socket:[{fields[9]}]")
+    if not sockets:
+        return None
+    parents = {}
+    for entry in os.scandir("/proc"):
+        if entry.name.isdigit():
+            try:
+                with open(f"/proc/{entry.name}/stat", encoding="utf-8", errors="replace") as stat:
+                    parents[int(entry.name)] = int(stat.read().rpartition(")")[2].split()[1])
+            except (OSError, IndexError, ValueError):
+                continue
+    owned = {root_pid}
+    while additions := {pid for pid, parent in parents.items() if parent in owned} - owned:
+        owned.update(additions)
+    for pid in owned:
+        try:
+            descriptors = os.scandir(f"/proc/{pid}/fd")
+        except OSError:
+            continue
+        with descriptors:
+            for descriptor in descriptors:
+                try:
+                    if os.readlink(descriptor.path) in sockets:
+                        return pid
+                except OSError:
+                    continue
+    return None
+
+
 def owned_listener(root_pid, port):
+    if sys.platform.startswith("linux"):
+        return linux_owned_listener(root_pid, port)
     if os.name != "nt":
         return None
     from ctypes import wintypes

@@ -3,4 +3,6 @@
 mod process;
 mod secrets;
 mod backend;
+#[cfg(target_os = "linux")]
+mod file_drops;
 fn main() { backend::run(); }

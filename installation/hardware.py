@@ -3,6 +3,7 @@
 import csv
 import io
 import json
+from pathlib import Path
 import platform
 import re
 import subprocess
@@ -69,6 +70,27 @@ def parse_amd(text):
     return devices
 
 
+def parse_kfd(nodes="/sys/class/kfd/kfd/topology/nodes", drm="/sys/class/drm"):
+    """AMD GPUs listed by the amdgpu kernel driver, for Linux systems without OpenCL's tools."""
+    devices = []
+    for node in sorted(Path(nodes).glob("[0-9]*"), key=lambda path: int(path.name)):
+        try:
+            properties = dict(parts for parts in (line.split() for line in (node / "properties").read_text(encoding="ascii").splitlines()) if len(parts) == 2)
+        except OSError:
+            continue
+        version = int(properties.get("gfx_target_version", "0"))
+        if not version or properties.get("vendor_id") != "4098":
+            continue
+        architecture = f"gfx{version // 10000}{version // 100 % 100}{version % 100:x}"
+        integrated = int(properties.get("cpu_cores_count", "0")) > 0
+        try:
+            memory = None if integrated else int((Path(drm) / f"renderD{properties['drm_render_minor']}" / "device" / "mem_info_vram_total").read_text(encoding="ascii"))
+        except (KeyError, OSError, ValueError):
+            memory = None
+        devices.append({"id": f"amd-kfd-{node.name}", "stable_id": False, "name": f"AMD GPU ({architecture})", "vendor": "AMD", "architecture": architecture, "memory_bytes": memory, "memory_kind": "dedicated" if memory else "unknown"})
+    return devices
+
+
 def detect_hardware(timeout=8):
     devices, errors = [], []
 
@@ -99,6 +121,8 @@ def detect_hardware(timeout=8):
         text = probe("amd", ["clinfo"])
         if text is not None:
             devices.extend(parse_amd(text))
+        if system == "linux" and not any(device["vendor"] == "AMD" for device in devices):
+            devices.extend(parse_kfd())
         if system == "win":
             text = probe("display_adapters", ["powershell", "-NoProfile", "-Command", "Get-CimInstance Win32_VideoController | Select-Object Name,PNPDeviceID | ConvertTo-Json -Compress"])
             if text and text.strip():

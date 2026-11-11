@@ -294,7 +294,7 @@ function activity(){
     (active?.result?'<details><summary>Result details</summary><pre>'+pretty(active.result)+'</pre></details>':"")+'</section><p class="footer-note">The live view keeps recent events. Durable installation journals remain with each managed installation.</p>';
 }
 function savedLaunchOptions(){return {listen:false,verbose:false,authentication:false,password_mode:"generated",debug_deepy:false,telemetry:false,...state.preferences.launch_options,debug_directory:state.preferences.launch_options?.debug_directory||state.data_directory+"/logs/deepy",telemetry_file:state.preferences.launch_options?.telemetry_file||state.data_directory+"/logs/telemetry.log"};}
-function preferencesDirty(){return !!state.authenticationDraft.password||String(state.preferencesDraft?.port??state.preferences.port)!==String(state.preferences.port)||!!state.launchDraft&&Object.entries(savedLaunchOptions()).some(([key,value])=>state.launchDraft[key]!==value);}
+function preferencesDirty(){return !!state.authenticationDraft.password||String(state.preferencesDraft?.port??state.preferences.port)!==String(state.preferences.port)||(state.preferencesDraft?.app_without_gpu??!!state.preferences.app_without_gpu)!==!!state.preferences.app_without_gpu||!!state.launchDraft&&Object.entries(savedLaunchOptions()).some(([key,value])=>state.launchDraft[key]!==value);}
 function updatePreferenceStatus(){
   const dirty=preferencesDirty(),save=document.querySelector('[data-action="save-launch-options"]'),discard=document.querySelector('[data-action="discard-preferences"]'),status=document.getElementById('preferences-status');
   if(save)save.disabled=!dirty||state.savingPreferences;
@@ -303,15 +303,18 @@ function updatePreferenceStatus(){
 }
 function preferences(){
   state.launchDraft??=savedLaunchOptions();
-  state.preferencesDraft??={port:state.preferences.port};
+  state.preferencesDraft??={port:state.preferences.port,app_without_gpu:!!state.preferences.app_without_gpu};
   const draft=state.launchDraft;
   const launchOption=(key,label,help)=>'<div class="field"><label class="check" for="launch-'+key+'"><input id="launch-'+key+'" type="checkbox" data-group="launchDraft" data-key="'+key+'" '+(draft[key]?'checked':'')+'>'+label+'</label><p class="hint">'+help+'</p></div>';
   return heading("PREFERENCES","Make yourself at home.","Changes apply the next time you start WanGP.")+
     '<fieldset class="preferences-fields" '+disabled(state.savingPreferences)+'><section class="card"><h2>Launching</h2><p class="hint">Open in App and Open in Browser connect to the same running server.</p><div class="spacer"></div><div class="field"><label for="port">Server port</label><input id="port" type="number" min="1024" max="65535" data-group="preferencesDraft" data-key="port" value="'+esc(state.preferencesDraft.port)+'"></div>'+
     launchOption('listen','Accessible on the local network','Connect from another device on your network. Adds --listen.')+'</section>'+
+    '<section class="card"><h2>App window</h2><div class="field"><label class="check" for="app-without-gpu"><input id="app-without-gpu" type="checkbox" data-group="preferencesDraft" data-key="app_without_gpu" '+(state.preferencesDraft.app_without_gpu?'checked':'')+'>Run the App window without the graphics card</label>'+
+    '<p class="hint">Leaves the graphics memory the App window would use to WanGP. Pages and video previews are then drawn by the processor, so scrolling and playback can be less smooth. Open in Browser is not affected: your browser has its own setting.</p>'+
+    (!!state.preferences.app_without_gpu!==!!state.app_without_gpu_active?'<p class="hint" role="status"><strong>Restart Manager to apply this change.</strong></p>':'<p class="hint">Applies when Manager starts.</p>')+'</div></section>'+
     '<section class="card"><h2>Authentication</h2>'+launchOption('authentication','Require a password','Optional password protection for the WanGP web interface.')+
     (draft.authentication?'<div class="field"><label for="password-mode">Password</label><select id="password-mode" data-group="launchDraft" data-key="password_mode">'+option('generated','Generate a password at every launch',draft.password_mode)+option('custom','Use my own password',draft.password_mode)+'</select></div>'+
-    (draft.password_mode==='custom'?'<div class="field"><label for="custom-password">Custom password</label><input id="custom-password" type="password" autocomplete="new-password" data-group="authenticationDraft" data-key="password" value="'+esc(state.authenticationDraft.password)+'" placeholder="'+(state.preferences.password_saved?'Password saved — leave blank to keep it':'Enter your password')+'"><p class="hint">Saved with Windows protection for your user account.</p></div>':'<p class="hint">WanGP generates a fresh password and displays it in the launch console.</p>'):'')+'</section>'+
+    (draft.password_mode==='custom'?'<div class="field"><label for="custom-password">Custom password</label><input id="custom-password" type="password" autocomplete="new-password" data-group="authenticationDraft" data-key="password" value="'+esc(state.authenticationDraft.password)+'" placeholder="'+(state.preferences.password_saved?'Password saved — leave blank to keep it':'Enter your password')+'"><p class="hint">'+(state.platform==='linux'?'Saved in your desktop keyring.':'Saved with Windows protection for your user account.')+'</p></div>':'<p class="hint">WanGP generates a fresh password and displays it in the launch console.</p>'):'')+'</section>'+
     '<section class="card"><h2>Debug</h2>'+launchOption('verbose','Detailed console','Adds --verbose 2.')+
     launchOption('debug_deepy','Deepy debug logs','Adds --debug-deepy and enables verbose level 2.')+
     (draft.debug_deepy?field('launchDraft','debug_directory','Deepy log folder','Choose where Deepy saves its debug logs','folder'):'')+
@@ -518,8 +521,8 @@ document.addEventListener("click",async event=>{
       if(!Number.isInteger(port)||port<1024||port>65535)throw new Error("Choose a port between 1024 and 65535.");
       state.savingPreferences=true;render();
       try{
-        state.preferences=await invoke("set_launch_options",{options:{...state.launchDraft},password:state.authenticationDraft.password||null,port});
-        state.authenticationDraft.password="";state.launchDraft=savedLaunchOptions();state.preferencesDraft={port:state.preferences.port};
+        state.preferences=await invoke("set_launch_options",{options:{...state.launchDraft},password:state.authenticationDraft.password||null,port,appWithoutGpu:!!state.preferencesDraft.app_without_gpu});
+        state.authenticationDraft.password="";state.launchDraft=savedLaunchOptions();state.preferencesDraft={port:state.preferences.port,app_without_gpu:!!state.preferences.app_without_gpu};
         notify("Preferences saved. They will apply the next time you start WanGP.");
       }finally{state.savingPreferences=false;render();}
     }

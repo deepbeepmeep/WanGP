@@ -43,10 +43,17 @@ struct Preferences {
     launch_options: LaunchOptions,
     #[serde(default)]
     authentication_secret: Option<Vec<u8>>,
+    /// The App window's web engine draws without the graphics card, leaving its memory to WanGP.
+    #[serde(default)]
+    app_without_gpu: bool,
 }
 impl Default for Preferences {
-    fn default() -> Self { Self { schema_version: 1, installations: vec![], selected: None, port: 7860, launch_options: LaunchOptions::default(), authentication_secret: None } }
+    fn default() -> Self { Self { schema_version: 1, installations: vec![], selected: None, port: 7860, launch_options: LaunchOptions::default(), authentication_secret: None, app_without_gpu: false } }
 }
+/// WebView2 fixes its browser arguments for every window of the Manager when the first one opens: wry's defaults,
+/// plus software rendering when the App window should leave the graphics card to WanGP.
+#[cfg(windows)]
+const WITHOUT_GPU_ARGUMENTS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-gpu";
 fn preferences_view(preferences: &Preferences) -> Value {
     let mut view = serde_json::to_value(preferences).unwrap();
     view.as_object_mut().unwrap().remove("authentication_secret");
@@ -66,6 +73,8 @@ struct Job {
 struct AppState {
     data: PathBuf, runtime: PathBuf, runtime_error: Mutex<Option<String>>, runtime_ready: AtomicBool,
     preferences: Mutex<Preferences>, jobs: Mutex<BTreeMap<String, Arc<Job>>>, exiting: AtomicBool,
+    /// The setting read at start: the web engine keeps it until the Manager restarts.
+    app_without_gpu: bool,
 }
 
 fn authorize(window: &WebviewWindow) -> Result<(), String> {
@@ -167,12 +176,69 @@ fn send_control(job: &Arc<Job>) {
         if let Some(input) = job.input.lock().unwrap().as_mut() { let _ = input.write_all(b"{\"cancel\":true}\n").and_then(|_| input.flush()); }
     }
 }
+#[cfg(windows)]
+const RUNTIME_PYTHON: &str = "python/python.exe";
+#[cfg(windows)]
+const RUNTIME_UV: &str = "uv.exe";
+#[cfg(not(windows))]
+const RUNTIME_PYTHON: &str = "python/bin/python3";
+#[cfg(not(windows))]
+const RUNTIME_UV: &str = "uv";
+
+/// Linux counterpart of --disable-gpu, set before GTK starts when the App window should leave the graphics card to
+/// WanGP: Mesa's software rasterizer for EGL and GLX (glvnd passes over NVIDIA's libraries) and no DMA-BUF buffers, so
+/// no web process of the Manager opens the graphics device. The vendor file is used only where Mesa installed it.
+#[cfg(target_os = "linux")]
+const SOFTWARE_RENDERING: [(&str, &str); 4] = [("LIBGL_ALWAYS_SOFTWARE", "1"), ("__GLX_VENDOR_LIBRARY_NAME", "mesa"), ("WEBKIT_DISABLE_DMABUF_RENDERER", "1"), ("__EGL_VENDOR_LIBRARY_FILENAMES", "/usr/share/glvnd/egl_vendor.d/50_mesa.json")];
+/// The values these variables had before the Manager set them: the programs it starts get them back.
+#[cfg(target_os = "linux")]
+static HOST_GRAPHICS: std::sync::OnceLock<Vec<(&'static str, Option<std::ffi::OsString>)>> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "linux")]
+fn software_rendering(identifier: &str) {
+    let data = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()).map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")));
+    let preferences = data.and_then(|data| fs::read(data.join(identifier).join("preferences.json")).ok()).and_then(|bytes| serde_json::from_slice::<Preferences>(&bytes).ok());
+    if !preferences.is_some_and(|preferences| preferences.app_without_gpu) { return; }
+    let saved = SOFTWARE_RENDERING.iter().filter(|(_, value)| !value.starts_with('/') || Path::new(value).exists())
+        .map(|(key, value)| { let before = std::env::var_os(key); std::env::set_var(key, value); (*key, before) }).collect();
+    let _ = HOST_GRAPHICS.set(saved);
+}
+
+/// The AppImage launcher points library, GTK and GStreamer variables into the mounted image, and software rendering
+/// belongs to the Manager's own windows: the host programs the Manager starts (the worker's tools, WanGP, the browser)
+/// inherit neither.
+#[cfg(target_os = "linux")]
+fn host_environment(command: &mut Command) {
+    for (key, before) in HOST_GRAPHICS.get().into_iter().flatten() {
+        match before { Some(value) => { command.env(key, value); } None => { command.env_remove(key); } }
+    }
+    let Some(appdir) = std::env::var_os("APPDIR") else { return };
+    let appdir = appdir.to_string_lossy().into_owned();
+    for (key, value) in std::env::vars_os() {
+        let value = value.to_string_lossy();
+        if !value.contains(&appdir) { continue; }
+        let kept: Vec<&str> = value.split(':').filter(|part| !part.is_empty() && !part.starts_with(&appdir)).collect();
+        if kept.is_empty() { command.env_remove(&key); } else { command.env(&key, kept.join(":")); }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_url(url: &str) -> Result<(), String> {
+    let mut command = Command::new("xdg-open");
+    // The Manager's own directory may be inside the AppImage mount, which ends with the Manager.
+    command.arg(url).current_dir(std::env::var_os("HOME").ok_or("HOME is not set")?).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    host_environment(&mut command);
+    let mut child = command.spawn().map_err(|e| format!("Could not open the default browser: {e}"))?;
+    thread::spawn(move || { let _ = child.wait(); });
+    Ok(())
+}
+
 fn run_worker(app: tauri::AppHandle, job: Arc<Job>, action: Action, args: Value) {
     let state = app.state::<AppState>();
     let id = job.snapshot.lock().unwrap().id.clone();
-    let mut command = Command::new(state.runtime.join("python/python.exe"));
+    let mut command = Command::new(state.runtime.join(RUNTIME_PYTHON));
     command.args(["-I", "-B", "-u"]).arg(state.runtime.join("worker/entry.py"))
-        .arg("--data").arg(&state.data).arg("--uv").arg(state.runtime.join("uv.exe"))
+        .arg("--data").arg(&state.data).arg("--uv").arg(state.runtime.join(RUNTIME_UV))
         .current_dir(state.runtime.join("worker")).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     for (key, _) in std::env::vars() {
         let upper = key.to_uppercase();
@@ -180,6 +246,8 @@ fn run_worker(app: tauri::AppHandle, job: Arc<Job>, action: Action, args: Value)
     }
     #[cfg(windows)]
     { use std::os::windows::process::CommandExt; command.creation_flags(0x08000000); }
+    #[cfg(target_os = "linux")]
+    { use std::os::unix::process::CommandExt; command.process_group(0); host_environment(&mut command); }
     let outcome = (|| -> Result<Value, String> {
         let mut child = command.spawn().map_err(|e| format!("Could not start the bundled Python worker: {e}"))?;
         let tree = match ProcessTree::attach(&child) {
@@ -261,7 +329,7 @@ async fn get_state(window: WebviewWindow, state: tauri::State<'_, AppState>) -> 
     let mut destination = home.join("WanGP");
     let mut suffix = 2;
     while destination.exists() { destination = home.join(format!("WanGP-{suffix}")); suffix += 1; }
-    Ok(json!({"version":env!("CARGO_PKG_VERSION"), "preferences":preferences_view(&state.preferences.lock().unwrap()), "runtime_error":state.runtime_error.lock().unwrap().clone(), "data_directory":state.data, "default_installation":destination, "jobs":jobs}))
+    Ok(json!({"version":env!("CARGO_PKG_VERSION"), "platform":std::env::consts::OS, "preferences":preferences_view(&state.preferences.lock().unwrap()), "runtime_error":state.runtime_error.lock().unwrap().clone(), "app_without_gpu_active":state.app_without_gpu, "data_directory":state.data, "default_installation":destination, "jobs":jobs}))
 }
 #[tauri::command]
 fn start_job(window: WebviewWindow, app: tauri::AppHandle, state: tauri::State<AppState>, action: Action, mut args: Value) -> Result<String, String> {
@@ -323,7 +391,7 @@ async fn pick_path(window: WebviewWindow, app: tauri::AppHandle, kind: String) -
     authorize(&window)?;
     if kind != "folder" && kind != "python" && kind != "log" { return Err("Unsupported file picker".into()); }
     tauri::async_runtime::spawn_blocking(move || {
-        let selection = if kind == "folder" { app.dialog().file().blocking_pick_folder() } else if kind == "log" { app.dialog().file().set_file_name("wangp-telemetry.log").add_filter("Log", &["log", "txt"]).blocking_save_file() } else { app.dialog().file().add_filter("Python executable", &["exe"]).blocking_pick_file() };
+        let selection = if kind == "folder" { app.dialog().file().blocking_pick_folder() } else if kind == "log" { app.dialog().file().set_file_name("wangp-telemetry.log").add_filter("Log", &["log", "txt"]).blocking_save_file() } else if cfg!(windows) { app.dialog().file().add_filter("Python executable", &["exe"]).blocking_pick_file() } else { app.dialog().file().blocking_pick_file() };
         selection.map(|path| path.into_path().map(|p| p.to_string_lossy().to_string()).map_err(|e| e.to_string())).transpose()
     }).await.map_err(|e| e.to_string())?
 }
@@ -361,20 +429,21 @@ fn updated_launch_preferences(preferences: &Preferences, data: &Path, mut option
 }
 
 #[tauri::command]
-fn set_launch_options(window: WebviewWindow, state: tauri::State<AppState>, options: LaunchOptions, password: Option<String>, port: Option<u16>) -> Result<Value, String> {
+fn set_launch_options(window: WebviewWindow, state: tauri::State<AppState>, options: LaunchOptions, password: Option<String>, port: Option<u16>, app_without_gpu: Option<bool>) -> Result<Value, String> {
     authorize(&window)?;
     let mut preferences = state.preferences.lock().unwrap();
-    let next = updated_launch_preferences(&preferences, &state.data, options, password, port)?;
+    let mut next = updated_launch_preferences(&preferences, &state.data, options, password, port)?;
+    if let Some(value) = app_without_gpu { next.app_without_gpu = value; }
     save_preferences(&state, &next)?; *preferences = next;
     Ok(preferences_view(&preferences))
 }
 
-/// COM objects of the main thread, carried through the dialog's thread and used again only on the main thread.
-#[cfg(windows)]
+/// COM or GObject objects of the main thread, carried through the dialog's thread and used again only on the main thread.
+#[cfg(any(windows, target_os = "linux"))]
 struct MainThreadOnly<T>(T);
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 unsafe impl<T> Send for MainThreadOnly<T> {}
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl<T> MainThreadOnly<T> { fn take(self) -> T { self.0 } }
 
 // WebView2 saves to the Downloads folder without asking. The deferral holds the download while the dialog is open,
@@ -407,6 +476,50 @@ fn ask_where_to_save(webview: tauri::webview::PlatformWebview, window: WebviewWi
     unsafe { webview.controller().CoreWebView2()?.cast::<ICoreWebView2_4>()?.add_DownloadStarting(&handler, &mut 0) }
 }
 
+// WebKitGTK downloads ask for a destination with decide-destination. wry answers it on every download of its views,
+// saving into the Downloads folder without asking, and it connects after this handler: when the response arrives,
+// just before decide-destination, its handler is blocked and this one kept. Returning true holds the download until
+// a destination is set, so the dialog stays asynchronous as on Windows. App windows share one web context: each
+// handler serves its own view only and leaves with it.
+#[cfg(target_os = "linux")]
+fn ask_where_to_save(webview: tauri::webview::PlatformWebview, window: WebviewWindow) {
+    use webkit2gtk::{glib::{self, prelude::{ObjectExt, ObjectType, StaticType}, subclass::signal::SignalId, translate::IntoGlib}, Download, DownloadExt, WebContextExt, WebViewExt};
+    let view = webview.inner();
+    let Some(context) = view.context() else { return };
+    let owner = view.downgrade();
+    let handler = context.connect_download_started(move |_, download| {
+        if download.web_view() != owner.upgrade() { return; }
+        let window = window.clone();
+        let ours = download.connect_decide_destination(move |download, suggested| {
+            let suggested = PathBuf::from(suggested);
+            let extension = suggested.extension().unwrap_or_default().to_string_lossy().into_owned();
+            let mut dialog = window.dialog().file().set_parent(&window).set_file_name(suggested.file_name().unwrap_or_default().to_string_lossy());
+            if !extension.is_empty() { dialog = dialog.add_filter(extension.to_uppercase(), &[&extension]); }
+            let (app, pending) = (window.app_handle().clone(), MainThreadOnly(download.clone()));
+            dialog.save_file(move |choice| {
+                let _ = app.run_on_main_thread(move || {
+                    let download = pending.take();
+                    match choice.and_then(|file| file.into_path().ok()) {
+                        Some(path) => { download.set_allow_overwrite(true); download.set_destination(&path.to_string_lossy()); }
+                        None => download.cancel(),
+                    }
+                });
+            });
+            true
+        });
+        download.connect_notify_local(Some("response"), move |download, _| {
+            let Some(decide) = SignalId::lookup("decide-destination", Download::static_type()) else { return };
+            // Matching by signal alone: g_signal_handlers_block_matched needs a closure, function or data to match.
+            let unblocked = glib::gobject_ffi::G_SIGNAL_MATCH_ID | glib::gobject_ffi::G_SIGNAL_MATCH_UNBLOCKED;
+            while let id @ 1.. = unsafe { glib::gobject_ffi::g_signal_handler_find(download.as_ptr().cast(), unblocked, decide.into_glib(), 0, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) } {
+                unsafe { glib::gobject_ffi::g_signal_handler_block(download.as_ptr().cast(), id) };
+            }
+            download.unblock_signal(&ours);
+        });
+    });
+    view.add_weak_ref_notify_local(move || context.disconnect(handler));
+}
+
 #[tauri::command]
 async fn open_server(window: WebviewWindow, app: tauri::AppHandle, state: tauri::State<'_, AppState>, id: String, presentation: String) -> Result<(), String> {
     authorize(&window)?;
@@ -427,13 +540,28 @@ async fn open_server(window: WebviewWindow, app: tauri::AppHandle, state: tauri:
             }
             let origin = parsed.origin().ascii_serialization();
             let title = format!("WanGP App - {installation_name}");
-            let window = tauri::WebviewWindowBuilder::new(&app, label, WebviewUrl::External(parsed)).title(&title).inner_size(1280.0, 850.0)
-                .disable_drag_drop_handler()  // WebView2 keeps its own drag and drop: pages drag their items and take dropped files, as in a browser
-                .icon(tauri::include_image!("../assets/wangp.png")).map_err(|e| e.to_string())?
-                .on_document_title_changed(move |window, _| { let _ = window.set_title(&title); })
-                .on_navigation(move |url| url.origin().ascii_serialization() == origin).build().map_err(|e| e.to_string())?;
+            let builder = tauri::WebviewWindowBuilder::new(&app, label, WebviewUrl::External(parsed)).title(&title).inner_size(1280.0, 850.0)
+                .disable_drag_drop_handler();  // the web view keeps its own drag and drop: pages drag their items and take dropped files, as in a browser
             #[cfg(windows)]
+            let builder = if state.app_without_gpu { builder.additional_browser_args(WITHOUT_GPU_ARGUMENTS) } else { builder };
+            #[cfg(target_os = "linux")]
+            let builder = builder.initialization_script(crate::file_drops::SCRIPT);
+            let window = builder.icon(tauri::include_image!("../assets/wangp.png")).map_err(|e| e.to_string())?
+                .on_document_title_changed(move |window, _| { let _ = window.set_title(&title); })
+                // WebKitGTK also asks before a download link opens, and data: links (Motion Designer's background image)
+                // have no origin: they stay allowed there, and WebKit never shows them as a page.
+                .on_navigation(move |url| url.origin().ascii_serialization() == origin || cfg!(target_os = "linux") && url.scheme() == "data").build().map_err(|e| e.to_string())?;
+            #[cfg(any(windows, target_os = "linux"))]
             window.with_webview({ let window = window.clone(); move |webview| { let _ = ask_where_to_save(webview, window); } }).map_err(|e| e.to_string())?;
+            #[cfg(target_os = "linux")]
+            window.with_webview({ let window = window.clone(); move |webview| crate::file_drops::bridge(webview, window) }).map_err(|e| e.to_string())?;
+            #[cfg(target_os = "linux")]
+            if state.app_without_gpu {
+                window.with_webview(|webview| {
+                    use webkit2gtk::{HardwareAccelerationPolicy, SettingsExt, WebViewExt};
+                    if let Some(settings) = WebViewExt::settings(&webview.inner()) { settings.set_hardware_acceleration_policy(HardwareAccelerationPolicy::Never); }
+                }).map_err(|e| e.to_string())?;
+            }
             Ok(())
         }
         "browser" => {
@@ -445,7 +573,9 @@ async fn open_server(window: WebviewWindow, app: tauri::AppHandle, state: tauri:
                 if result as isize <= 32 { return Err("Could not open the default browser".into()); }
                 Ok(())
             }
-            #[cfg(not(windows))]
+            #[cfg(target_os = "linux")]
+            return open_url(&url);
+            #[cfg(not(any(windows, target_os = "linux")))]
             Err("Browser opening is not available on this preview target".into())
         }
         _ => Err("Unknown presentation".into()),
@@ -464,8 +594,10 @@ async fn open_manager_download(window: WebviewWindow) -> Result<(), String> {
         if result as isize <= 32 { return Err("Could not open the Manager download".into()); }
         Ok(())
     }
-    #[cfg(not(windows))]
-    Err("Manager installers are currently available for Windows".into())
+    #[cfg(target_os = "linux")]
+    return open_url("https://github.com/deepbeepmeep/WanGP/releases/latest/download/WanGPManager-x86_64.AppImage");
+    #[cfg(not(any(windows, target_os = "linux")))]
+    Err("Manager downloads are available for Windows and Linux".into())
 }
 
 #[cfg(test)]
@@ -591,6 +723,9 @@ fn stop_and_exit(window: WebviewWindow, app: tauri::AppHandle, state: tauri::Sta
     Ok(())
 }
 pub fn run() {
+    let context = tauri::generate_context!();
+    #[cfg(target_os = "linux")]
+    software_rendering(&context.config().identifier);
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             if let Some(window) = app.get_webview_window("main") { let _ = window.unminimize(); let _ = window.set_focus(); }
@@ -609,7 +744,15 @@ pub fn run() {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Preferences::default(),
                 Err(error) => { runtime_error = Some(format!("Cannot read Manager preferences: {error}")); Preferences::default() },
             };
-            app.manage(AppState { data, runtime, runtime_error:Mutex::new(runtime_error), runtime_ready:AtomicBool::new(false), preferences:Mutex::new(preferences), jobs:Mutex::new(BTreeMap::new()), exiting:AtomicBool::new(false) }); Ok(())
+            let app_without_gpu = preferences.app_without_gpu;
+            app.manage(AppState { data, runtime, runtime_error:Mutex::new(runtime_error), runtime_ready:AtomicBool::new(false), preferences:Mutex::new(preferences), jobs:Mutex::new(BTreeMap::new()), exiting:AtomicBool::new(false), app_without_gpu });
+            // Built here rather than from the configuration: its browser arguments depend on the preferences.
+            let config = app.config().app.windows.iter().find(|window| window.label == "main").ok_or("The main window is not configured")?.clone();
+            let builder = tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?;
+            #[cfg(windows)]
+            let builder = if app_without_gpu { builder.additional_browser_args(WITHOUT_GPU_ARGUMENTS) } else { builder };
+            builder.build()?;
+            Ok(())
         })
         .on_window_event(|window, event| {
             if window.label() == "main" {
@@ -622,5 +765,5 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![get_state, start_job, cancel_job, pick_path, select_installation, set_port, set_launch_options, open_server, open_manager_download, set_console_fullscreen, console_text, export_diagnostics, stop_and_exit])
-        .run(tauri::generate_context!()).expect("Unable to start WanGP Manager");
+        .run(context).expect("Unable to start WanGP Manager");
 }

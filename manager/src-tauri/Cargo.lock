@@ -4312,20 +4312,25 @@ dependencies = [
 
 [[package]]
 name = "wangp-manager"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
+ "gtk",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
+ "soup3",
  "tauri",
  "tauri-build",
  "tauri-plugin-clipboard-manager",
  "tauri-plugin-dialog",
  "tauri-plugin-single-instance",
  "uuid",
+ "webkit2gtk",
  "webview2-com",
  "windows-core",
  "windows-sys 0.61.2",
+ "zbus",
 ]
 
 [[package]]
