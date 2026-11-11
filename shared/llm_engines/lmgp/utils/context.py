@@ -44,6 +44,11 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0
     _CONTEXT = Context(is_prefill, bool(has_previous_state), cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables, bool(speculative_verify),
                        overlay_mapping, overlay_base, ring_start, tree_mask, tree_paths, tree_rows)
 
+def use_context(context):
+    # an existing context made current as is (its buffers kept), e.g. to switch between the sequences of a pass and back
+    global _CONTEXT
+    _CONTEXT = context
+
 def reset_context():
     global _CONTEXT
     _CONTEXT = Context()
