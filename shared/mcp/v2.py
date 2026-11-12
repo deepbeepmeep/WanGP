@@ -1120,7 +1120,7 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
            "Omitted resolution, video_length or duration_seconds, and seed use Deepy's standing defaults (world models keep their own resolution and length) before model factory settings; supplied values are preserved. ")  # Prime's system message states the defaults
         + wait_help)
     generation_settings = {"type": "object", "properties": {"template": {"type": "string", "description": 'Optional template to start from: "<task>" (such as "gen_video") for its configured default, or "<task>/<template name>". WanGP fills in its settings except its example prompt and alt_prompt; give only the keys you change.'},
-                                                            "model_type": {"type": "string", "description": "WanGP model type (from the template when one is named)."}, "prompt": {"type": "string", "description": "Complete prompt text or @file reference."}},
+                                                            "model_type": {"type": "string", "description": "WanGP model type (from the template when one is named)."}, "prompt": {"type": "string", "description": "Complete prompt text, or exactly @file(\"@documents/prompt.txt\") for a prompt kept in a file."}},
                            "required": ["prompt"], "additionalProperties": True}
     request_properties = {"request_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 200, "description": "Optional retry key: the same key and payload returns the original job, even after a restart; a different payload is rejected."}} if extended else {}
     if extended:

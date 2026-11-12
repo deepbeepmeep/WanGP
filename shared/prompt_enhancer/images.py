@@ -51,7 +51,7 @@ def resolve_continue_video(video_source, image_prompt_type, file_list, output_di
 def continuation_start_image(video_source, keep_frames, fps, max_frames):
     """Read only the last frame selected by generation's source resampler."""
     from PIL import Image
-    from shared.utils.video_decode import _resample_frame_indices, decode_video_frames_ffmpeg, probe_video_stream_metadata
+    from shared.utils.video_decode import _read_rate, _resample_frame_indices, decode_video_frames_ffmpeg, probe_video_stream_metadata
 
     metadata = probe_video_stream_metadata(video_source)
     if metadata is None:
@@ -59,8 +59,7 @@ def continuation_start_image(video_source, keep_frames, fps, max_frames):
     limit = int(keep_frames) if str(keep_frames or "") else max_frames
     if limit < 0:
         limit = int(max(metadata["frame_count"] / metadata["fps_float"] * fps + limit, 0)) if metadata["fps_float"] > 0 else 0
-    source_fps = metadata["fps"] if metadata["fps"] > 0 else max(1, round(metadata["fps_float"] or 0))
-    indices = _resample_frame_indices(source_fps, metadata["frame_count"], limit, fps, 0)
+    indices = _resample_frame_indices(_read_rate(metadata, fps), metadata["frame_count"], limit, fps, 0)  # the rate the generation's decoder counts the source at
     if not indices:
         raise ValueError("No frames remain in the continuation video after source trimming.")
     frames = decode_video_frames_ffmpeg(video_source, indices[-1], 1, bridge="numpy")

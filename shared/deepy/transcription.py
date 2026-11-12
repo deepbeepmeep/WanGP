@@ -16,6 +16,8 @@ from mmgp import offload
 
 from shared.deepy import video_tools as deepy_video_tools
 from shared.deepy.audio_inspection import speech_intervals
+from shared.utils.audio_video import extract_audio_track_to_wav
+from shared.utils.virtual_media import media_source_exists, parse_virtual_media_path
 from shared.deepy.assets import (
     WHISPER_MEDIUM_CONFIG_FILENAME,
     WHISPER_MEDIUM_DOWNLOAD_DEF,
@@ -171,8 +173,13 @@ def _make_temp_audio_path() -> Path:
 def _prepare_audio_input(source_path: str, audio_track_no: int | None = None, duration_seconds: float | None = None) -> tuple[str, list[Path]]:
     download_ffmpeg()
     temp_audio_path = _make_temp_audio_path()
-    deepy_video_tools.extract_audio(source_path, str(temp_audio_path), audio_track_no=audio_track_no, audio_codec="wav", duration=duration_seconds)
-    return str(temp_audio_path), [temp_audio_path]
+    if parse_virtual_media_path(source_path) is None:
+        deepy_video_tools.extract_audio(source_path, str(temp_audio_path), audio_track_no=audio_track_no, audio_codec="wav", duration=duration_seconds)
+        return str(temp_audio_path), [temp_audio_path]
+    part_path = _make_temp_audio_path()  # a part of a file (a view, or a |start_s=... suffix): its own sound first
+    extract_audio_track_to_wav(source_path, str(part_path))
+    deepy_video_tools.extract_audio(str(part_path), str(temp_audio_path), audio_codec="wav", duration=duration_seconds)
+    return str(temp_audio_path), [temp_audio_path, part_path]
 
 
 def _round_timestamp(value: Any) -> float | None:
@@ -230,7 +237,7 @@ def _serialize_segments(segments: list[dict[str, Any]], timestamp_type: str | No
 def transcribe_media(source_path: str, *, timestamp_type: str | None = None, audio_track_no: int | None = None, device: str | None = None, model_name: str | None = None, language: str | None = None, prepared_model: list | None = None, check_cancelled=lambda: None, duration_seconds: float | None = None, condition_on_previous_text: bool = True) -> dict[str, Any]:
     normalized_timestamp_type = normalize_timestamp_type(timestamp_type)
     source_path = str(source_path or "").strip()
-    if len(source_path) == 0 or not os.path.isfile(source_path):
+    if len(source_path) == 0 or not media_source_exists(source_path):
         raise FileNotFoundError(f"Media file not found: {source_path}")
     device = torch.device(device if device is not None else "cuda" if torch.cuda.is_available() else "cpu")
     model_name = model_name or whisper_model_name()

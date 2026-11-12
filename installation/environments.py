@@ -73,7 +73,8 @@ print(json.dumps({'python': sys.version.split()[0], 'executable': sys.executable
 
 
 def inspect_interpreter(interpreter, timeout=15):
-    interpreter = str(Path(interpreter).resolve())
+    # Outside Windows a venv's bin/python links to its base interpreter: run through the link, or the venv is lost.
+    interpreter = str(Path(interpreter).resolve()) if os.name == "nt" else os.path.abspath(interpreter)
     try:
         result = subprocess.run([interpreter, "-I", "-B", "-c", INSPECT_SCRIPT], stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout, env=clean_environment(), check=True, **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}))
         data = json.loads(result.stdout)

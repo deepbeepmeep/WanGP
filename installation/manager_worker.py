@@ -71,7 +71,9 @@ def installation_info(root, python=None, data=None):
         python = installation_environments(root)["python"]
         if not python:
             raise InstallError("python_required", "Choose the Python environment used by this WanGP installation. Use Detect environment to find env_uv, venv or the saved selection")
-    inspection = inspect_interpreter(plain_path(python))
+    python = Path(os.path.abspath(python))
+    # Its folders must be plain; outside Windows the interpreter itself may be a link (a venv's or Conda's bin/python).
+    inspection = inspect_interpreter(plain_path(python) if os.name == "nt" else plain_path(python.parent) / python.name)
     if inspection["status"] != "inspected":
         raise InstallError("python_unavailable", inspection["error"])
     demo = (root / "setup_config.json").is_file() and set(load_config(root / "setup_config.json")["gpu_profiles"]) == {"Demo"}

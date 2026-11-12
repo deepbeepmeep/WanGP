@@ -30,6 +30,7 @@ except ImportError:
     hc_kernels = None
 
 DRAFT = "draft" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the drafter's norm of the target's streams, one per stream
+SHARED_BESIDE = "shared_beside" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the shared expert of a decoding pass computed while the CPU computes the routed experts out of VRAM, until the switches go
 FUSED_HC = hc_kernels is not None and "hc" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # validated: a switch for the comparisons of the other work under way
 STATE_RING = 32  # the token ids and convolution inputs of the n-gram layer, by position: a verification pass and its history
 PROMPT_CHUNKS = (32768, 24576, 16384, 12288, 8192, 6144, 4096, 3072, 2048, 1024)  # the prompt chunks to choose from
@@ -158,9 +159,14 @@ class Qwen4ExpMoE(nn.Module):
         probabilities = payload[tokens * hidden:tokens * (hidden + self.top_k)].view(torch.float32).view(tokens, self.top_k)
         hc_kernels.softmax_topk(logits, self.top_k, ids, probabilities)
         logits = None
-        routed = routed_experts(self.experts, rows, ids, probabilities, payload)
+        if SHARED_BESIDE:  # the shared expert reads nothing of the routed ones: queued before the wait for the CPU's, it runs while the CPU works
+            beside = []
+            routed = routed_experts(self.experts, rows, ids, probabilities, payload, lambda: beside.append(self.shared_down(hc_kernels.silu_product(self.shared_gate(mixed), self.shared_up(mixed)))))
+            shared = beside[0]
+        else:
+            routed = routed_experts(self.experts, rows, ids, probabilities, payload)
+            shared = self.shared_down(hc_kernels.silu_product(self.shared_gate(mixed), self.shared_up(mixed)))
         rows = ids = probabilities = payload = None
-        shared = self.shared_down(hc_kernels.silu_product(self.shared_gate(mixed), self.shared_up(mixed)))
         return hc_kernels.combine_(state, routed, weights, hc.streams, hc.hidden, shared, gate)[None]
 
 

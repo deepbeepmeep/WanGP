@@ -22,7 +22,7 @@ import zlib
 import re
 from .hdr import hdr10_x265_params, hdr10_zscale_filter, iter_hdr_gbrpf32_frames, iter_video_chunks
 
-from .video_decode import probe_video_stream_metadata, resolve_media_binary
+from .video_decode import picture_duration, probe_video_stream_metadata, resolve_media_binary
 from .video_codecs import SUPPORTED_VIDEO_CONTAINERS, get_imageio_codec_params, get_video_encode_args, validate_video_output_settings
 from .virtual_media import get_virtual_media_entry, parse_virtual_media_path, strip_virtual_media_suffix
 
@@ -454,8 +454,14 @@ def _resolve_virtual_audio_segment(video_path: str) -> tuple[str, dict[str, Any]
     time_args: dict[str, Any] = {}
     if spec is None:
         return source_path, time_args, 0
-    metadata = probe_video_stream_metadata(video_path)
-    if metadata is not None and metadata.get("virtual_end_frame") is not None:
+    if spec.start_s is not None or spec.end_s is not None:  # named in seconds: the sound at those seconds (an audio file has no frames; a video's picture takes the nearest ones)
+        time_args["ss"] = spec.start_s or 0.0
+        if spec.end_s is not None:
+            time_args["to"] = max(time_args["ss"], spec.end_s)
+    elif (metadata := probe_video_stream_metadata(video_path)) is None:
+        if spec.start_frame or spec.end_frame is not None:
+            raise ValueError(f"An audio file has no frames: name its part in seconds (start_s, end_s): {video_path}")
+    elif metadata.get("virtual_end_frame") is not None:
         start_frame = int(metadata.get("virtual_start_frame") or 0)
         end_frame = int(metadata.get("virtual_end_frame") or start_frame)
         fps_float = float(metadata.get("fps_float") or metadata.get("fps") or 0.0)
@@ -650,10 +656,8 @@ def combine_and_concatenate_video_with_audio_tracks(
 
         maps += ['-map', f'[aout{i}]']
 
-    duration_args = ['-shortest']
-    if audio_tail_seconds > 0:
-        video_duration = float(next(s for s in ffmpeg.probe(video_path, cmd=_ffprobe_binary())['streams'] if s['codec_type'] == 'video')['duration'])
-        duration_args = ['-t', str(video_duration + audio_tail_seconds)]
+    # the sound ends with the picture, or with its tail: -shortest drops the last partial audio frame (AAC: up to 21 ms, a hole at each join of a merge)
+    duration_args = ['-t', f'{picture_duration(video_path) + audio_tail_seconds:.6f}']
     cmd = [_ffmpeg_binary(), '-y', *inputs,
            '-filter_complex', ';'.join(filters),  # ✅ Only change made
            *maps, *metadata_args,
@@ -777,6 +781,55 @@ def cleanup_temp_audio_files(audio_tracks, verbose=False):
     return deleted_count
 
 
+class FrameChunks:
+    """Frames given to save_video a few at a time: read(start, count) returns frames start to start + count - 1 as a (frames, H, W, C)
+    tensor. A long video is encoded without being held in memory."""
+    def __init__(self, read, frames_count, chunk_frames):
+        self.read, self.frames_count, self.chunk_frames = read, int(frames_count), max(1, int(chunk_frames))
+
+    def __iter__(self):
+        for start in range(0, self.frames_count, self.chunk_frames):
+            yield self.read(start, min(self.chunk_frames, self.frames_count - start))
+
+
+def video_stream_facts(video_path):
+    """What tells whether two files hold video streams encoded alike, so that one can follow the other without being encoded again:
+    codec, pixel format, size and the encoder's parameter sets; with them the number of pictures the file really holds (counted, not
+    announced) and when its picture starts inside the file (a sound track can shift it)."""
+    command = [_ffprobe_binary(), "-v", "error", "-select_streams", "v:0", "-count_packets", "-show_data_hash", "md5",
+               "-show_entries", "stream=codec_name,profile,pix_fmt,width,height,extradata_hash,nb_read_packets,start_time:format=start_time", "-of", "json", os.fspath(video_path)]
+    probe = json.loads(subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="ignore", check=True).stdout)
+    stream, start_times = probe["streams"][0], []
+    for value in (stream.get("start_time"), probe["format"].get("start_time")):
+        try:
+            start_times.append(float(value))
+        except (TypeError, ValueError):
+            start_times.append(0.0)
+    return {"encoding": tuple(stream.get(key) for key in ("codec_name", "profile", "pix_fmt", "width", "height", "extradata_hash")),
+            "frames": int(stream.get("nb_read_packets") or 0), "picture_start": start_times[0] - start_times[1]}
+
+
+def join_video_streams(video_paths, frame_counts, fps, output_path, picture_starts=None):
+    """Write to output_path the pictures of video_paths one after the other, copied as they are (nothing is encoded again; sound is left
+    out). The files must be encoded alike (video_stream_facts). Each file lasts its frame_counts frames at fps whatever length its
+    container states: a sound track running past the last picture does not open a gap before the next file."""
+    starts = [video_stream_facts(path)["picture_start"] for path in video_paths] if picture_starts is None else list(picture_starts)
+    listing = os.fspath(output_path) + ".txt"
+    with open(listing, "w", encoding="utf-8") as writer:
+        for no, (path, frames) in enumerate(zip(video_paths, frame_counts)):
+            duration = frames / fps + (starts[no] - starts[no + 1] if no + 1 < len(starts) else 0.0)
+            writer.write("file '" + os.path.abspath(path).replace("\\", "/").replace("'", "'\\''") + f"'\nduration {duration:.9f}\n")
+    try:
+        # auto_convert 0: the pictures keep their bytes (the demuxer would otherwise write the encoder's parameter sets again in each key frame)
+        result = subprocess.run([_ffmpeg_binary(), "-y", "-v", "error", "-f", "concat", "-safe", "0", "-auto_convert", "0", "-i", listing, "-map", "0:v:0", "-c", "copy", os.fspath(output_path)],
+                                capture_output=True, text=True, encoding="utf-8", errors="replace")
+    finally:
+        os.remove(listing)
+    if result.returncode != 0:
+        raise Exception(f"FFmpeg error: {result.stderr}")
+    return output_path
+
+
 def save_video(tensor,
                 save_file=None,
                 fps=30,
@@ -826,7 +879,7 @@ def save_video(tensor,
                             )
                             frame = grid.mul(255).type(torch.uint8).permute(1, 2, 0).cpu().numpy()
                             writer.append_data(frame)
-                elif isinstance(tensor, (list, tuple)) and tensor and torch.is_tensor(tensor[0]):
+                elif isinstance(tensor, FrameChunks) or isinstance(tensor, (list, tuple)) and tensor and torch.is_tensor(tensor[0]):
                     for chunk in tensor:
                         if chunk is None:
                             continue

@@ -63,7 +63,7 @@ def shared_elsewhere(root, candidate, registrations, locks):
         other = plain_path(item["root"])
         if other == root:
             continue
-        if item.get("python") and Path(item["python"]).resolve().is_relative_to(candidate):
+        if item.get("python") and Path(item["python"]).parent.resolve().is_relative_to(candidate):  # a venv's python may link outside it
             return True
         # An unavailable/busy installation may acquire or retain a reference.
         # Leave cleanup retryable until we can hold its lease through deletion.

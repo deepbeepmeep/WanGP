@@ -260,6 +260,22 @@ def whole_take(doc: dict[str, Any], catalog: list[dict[str, Any]], shot: dict[st
     return length if abs(length - planned) > 0.01 else 0.0
 
 
+def soundtrack_choice(model_def: dict[str, Any]) -> str:
+    """A model's audio choice that keeps an audio_guide as the soundtrack its picture follows: the one with S (H3, LTX-2), else A where the input
+    audio is the output's (Viggle); "" when it has none."""
+    choices = (model_def.get("audio_prompt_type_sources") or {}).get("selection") or []
+    return next((choice for choice in choices if "A" in choice and "S" in choice), "") or ("A" if model_def.get("output_audio_is_input_audio") and "A" in choices else "")
+
+
+def soundtrack_letters(shot: dict[str, Any], entry: dict[str, Any] | None, settings: dict[str, Any]) -> str:
+    """The audio choice a shot's settings take from its model, "" to keep theirs: the one that keeps the driving audio as the soundtrack,
+    always on a shot driven by the song (whatever a template or the director chose, its lips must follow the song the cut plays), and on a
+    reference template given audio with no audio choice."""
+    if entry is None or not entry["soundtrack"] or not settings.get("audio_guide"):
+        return ""
+    return entry["soundtrack"] if shot.get("audio_slice") or not entry["audio"] and not settings.get("audio_prompt_type") else ""
+
+
 def shot_entry(doc: dict[str, Any], shot: dict[str, Any], catalog: list[dict[str, Any]]) -> dict[str, Any] | None:
     """The template a shot renders with: one left on gen_video, nobody's choice, takes the brief's Models for what it shows and says."""
     template = shot["generation"].get("template")

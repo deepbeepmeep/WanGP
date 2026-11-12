@@ -5,7 +5,7 @@
     "sliding_window_size": 501,
     "resolution": "1280x720",
     "type": "LTX-2 2.3 Distilled 1.1",
-    "audio_prompt_type": "A",
+    "audio_prompt_type": "AS",
     "input_video_strength": 1.0,
     "guidance_phases": 2,
     "settings_version": 2.73,

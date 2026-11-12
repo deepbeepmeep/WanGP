@@ -31,12 +31,16 @@ Users describe what they want; the method is yours. Apply it without being asked
 - Give the production one typography that suits it (a storybook serif, bold condensed capitals for a trailer, a typewriter face for an
   investigation) and keep it for every title and card. A chapter card is better over a dimmed still of the scene it opens than on the
   same plain page each time.
-- Give every recurring person and object its master image in each shot that shows it: as a reference image when the template takes
-  references (`image_refs`), which keeps the person without fixing the frame; a start image becomes the shot's first frame, so its
-  framing, aspect and background leak into the shot. Make start images in the delivery's aspect ratio: video models keep the shape of
-  their start image. A master is a reference, not a scene: the face, hair and outfit large, sharp and evenly lit on a plain background.
-  A change of costume, age or state (wet, wounded) is an edit of the person's master (`edit_image`), so the face stays. For films,
-  follow wangp://skills/edited-film; for a song-driven video, wangp://skills/music-video.
+- Give every recurring person, creature, object and place its master image in each shot that shows it: as a reference image when the
+  template takes references (`image_refs`), which keeps the person without fixing the frame; a start image becomes the shot's first
+  frame, so its framing, aspect and background leak into the shot. The template's `wangp_templates` result says what its model takes:
+  `model.media_inputs.image` lists `reference`, and `multiple_references` when a shot can take several masters (its `infos` give how
+  many); check it before planning shots with several masters. Make start images in the delivery's aspect ratio: video models keep the
+  shape of their start image. A master is a reference, not a scene: the face, hair and outfit large, sharp and evenly lit on a plain
+  background (a place's master shows the place). A change of costume, age or state (wet, wounded) is an edit of the person's master
+  (`edit_image`), so the face stays. Where the model also takes voice references (`model.media_inputs.audio` lists `reference`), a
+  speaker's voice sample can be bound to their picture in the prompt, so that the model speaks in that voice. For films, follow
+  wangp://skills/edited-film; for a song-driven video, wangp://skills/music-video.
 
 ## 3. Check before answering
 

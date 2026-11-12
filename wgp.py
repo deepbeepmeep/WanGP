@@ -4,7 +4,7 @@ import os, sys
 for _stream in (sys.stdout, sys.stderr): _stream.reconfigure(encoding="utf-8", errors="replace")
 from tqdm import tqdm
 
-WanGP_version = "19.29"
+WanGP_version = "19.291"
 _welcome_message = f" WanGP v{WanGP_version} - Copyright (c) 2024-2026 DeepBeepMeep "
 tqdm.write(f"\033[1m\033[93m{_welcome_message:*^100}\033[0m")
 
@@ -96,6 +96,7 @@ from shared.utils.settings_bundle import is_wangp_settings_filename
 from shared.utils.video_decode import decode_video_frames_ffmpeg, probe_video_stream_metadata, read_frame_count, virtual_own_frames
 from shared.utils.video_metadata import extract_source_images  # also a plugin global (Queue Editor)
 from shared.utils.virtual_media import get_virtual_image, get_virtual_media_entry, get_virtual_media_vsource, media_source_exists, padded_virtual_media, parse_virtual_media_path, replace_virtual_media_source, strip_virtual_media_suffix
+from shared.utils import video_continuation
 from shared.utils.frame_scheduler import resolve_window_geometry, SLASH_BLOCK_RE, build_default_window_plan, build_extension_window, build_frame_scheduler, fit_video_length, floor_frame_count, has_slash_commands, normalize_frame_count, set_video_length_rounding, prepare_loras_mult_windows
 from shared.match_archi import match_nvidia_architecture
 from shared.attention import ATTENTION_MODE_AVAILABILITY, get_attention_modes, get_supported_attention_modes, get_default_attention_mode, get_override_attention_modes, get_supported_override_attention_modes
@@ -1672,6 +1673,14 @@ def validate_settings(state, model_type, single_prompt, inputs, silent=False):
             return err("Aligned Pose transfer requires a Start Image, a Source Video to continue or Background Ref Frame to be used")    
         if "A" in video_prompt_type and any_letters(video_prompt_type, "YWZ"):
             return err("Aligned Pose transfer supports only Inpainting process outside the masked area")    
+
+    if video_source is not None and "V" in image_prompt_type and image_start is None and image_mode == 0 and not is_edit_mode:
+        # a Source Video that cannot stay in its file is loaded whole with the new frames
+        predicted_frames = frame_scheduler["predicted_total_frames"] if frame_scheduler is not None and frame_scheduler["active"] else video_length
+        loaded_source_plan = video_continuation.loaded_source_plan(video_source, keep_frames_video_source, get_computed_fps(force_fps, model_type, video_guide, video_source), predicted_frames, max_source_video_frames, temporal_upsampling=temporal_upsampling, spatial_upsampling=spatial_upsampling, film_grain=float(inputs.get("film_grain_intensity", 0) or 0) > 0, hdr="&" in video_prompt_type)
+        loaded_frames_error = video_continuation.frames_limit_error(loaded_source_plan)
+        if loaded_frames_error:
+            return err(loaded_frames_error)
 
     if test_any_sliding_window(model_type) and image_mode == 0:
         if frame_scheduler is not None and frame_scheduler["active"]:
@@ -7214,6 +7223,11 @@ def usable_enhanced_prompts(enhanced, originals, label="prompt"):
         usable.append(value)
     return usable, True
 
+def enhancer_fallback_notice(failures, kept_all):
+    """The user's notice for prompts the enhancer gave back without a prompt, kept as they were (failures: why, as the enhancer reported it)."""
+    reason = failures[0] if failures else "returned no usable prompt"
+    return f"The Prompt Enhancer {reason}: your prompt was kept." if kept_all else f"For some prompts the Prompt Enhancer {reason}: they were kept as they were."
+
 def enhance_prompt(state, prompt, alt_prompt, prompt_enhancer, multi_images_gen_type, multi_prompts_gen_type, overrides, video_prompt_type, image_prompt_type, audio_prompt_type, progress=WangpProgress()):
     override_profile = generation_overrides.get_override(overrides, "memory_profile")
     model_type = get_state_model_type(state)
@@ -7325,8 +7339,9 @@ def enhance_prompt(state, prompt, alt_prompt, prompt_enhancer, multi_images_gen_
         if usable:
             prompt = prompt_parser.serialize_prompt_blocks_with_prefix(output_prompts, original_prompts)
         results.append(usable)
-    if not any(results):  # also a chain whose steps all came back unusable
-        gr.Info("The Prompt Enhancer returned no usable prompt: your prompt was kept.")
+    failures = enhancer_kwargs["generation_callbacks"]["enhancement_progress"].failures
+    if not any(results) or failures:  # also a chain whose steps all came back unusable
+        gr.Warning(enhancer_fallback_notice(failures, not any(results)))
     elif num_prompts > 1:
         gr.Info(f'{num_prompts} Prompts have been Enhanced')
     else:
@@ -7944,12 +7959,30 @@ def generate_media(
             except Exception as e:
                 print(f"Unable to extract Audio track from Control Video #{index + 1}: {e}")
         audio_guide, audio_guide2, audio_guide3 = extracted_guides
+    audio_inputs = [audio_guide, audio_guide2, audio_guide3, audio_source]
+    for index, audio_input in enumerate(audio_inputs):
+        if parse_virtual_media_path(audio_input) is not None:  # a part of a file (song.wav|start_s=...) or a view: its own file for what reads audio below, removed with the other temporary files
+            audio_inputs[index] = extract_audio_track_to_wav(audio_input, get_available_filename(save_path, audio_input, suffix="_part", force_extension=".wav"))
+            temp_filenames_list.append(audio_inputs[index])
+    audio_guide, audio_guide2, audio_guide3, audio_source = audio_inputs
     if video_source is not None:
         source_audio_tracks, source_audio_metadata = extract_audio_tracks(video_source, temp_format="wav")
         video_fps, _, _, video_frames_count = get_video_info(video_source)
         video_source_duration = video_frames_count / video_fps
     else:
         video_source_duration = 0
+    # A continued Source Video stays in its file, only its last frames being read, unless its frames are processed with the new ones
+    loaded_source_plan = continued_video = None
+    continued_source = video_source is not None and image_start is None and not (is_image or audio_only)
+    if continued_source:
+        loaded_source_plan =video_continuation.loaded_source_plan(video_source, keep_frames_video_source, fps, video_length, max_source_video_frames, temporal_upsampling=temporal_upsampling, spatial_upsampling=spatial_upsampling, film_grain=film_grain_intensity > 0, hdr="&" in video_prompt_type, frames_returned=api_return_video_uint8 or return_flashvsr_continue_cache)
+        if loaded_source_plan is not None:
+            loaded_frames_error = video_continuation.frames_limit_error(loaded_source_plan)
+            if loaded_frames_error: raise gr.Error(loaded_frames_error)
+            loaded_source_plan["window_frames"] = max(1, sliding_window_size - sliding_window_overlap - sliding_window_discard_last_frames) if test_any_sliding_window(model_type) else 0
+            if get_virtual_media_entry(video_source) is None:
+                tqdm.write(video_continuation.loading_notice(loaded_source_plan, video_source, width, height))
+    gen["loaded_source_plan"] = loaded_source_plan
 
     if "A" in audio_prompt_type and audio_guide is None:
         audio_guide = create_silent_wav_file(save_path, video_length / fps, audio_sampling_rate)
@@ -8165,6 +8198,9 @@ def generate_media(
             default_windows = [dict(window) for window in default_windows_template]
         src_video = src_video2 = src_video3 = src_mask = src_mask2 = src_faces = sparse_video_image = full_generated_audio =None
         prefix_video = pre_video_frame = None
+        source_stays_in_file = False # the Source Video is continued from its file: only its last frames are loaded
+        if continued_video is not None: continued_video.start_sample()
+        if loaded_source_plan is not None: loaded_source_plan["new_frames"] = video_length
         source_video_overlap_frames_count = 0 # number of frames overalapped in source video for first window
         source_video_frames_count = 0  # number of frames to use in source video (processing starts source_video_overlap_frames_count frames before )
         frames_already_processed = []
@@ -8237,15 +8273,18 @@ def generate_media(
             finally:
                 release_prompt_enhancer()
             if enhanced is not None:
+                results = []  # whether each enhanced field came back usable, as in enhance_prompt
                 if routed:
                     if enhanced.prompt_changed:
                         enhanced_prompts, usable = usable_enhanced_prompts([normalize_generated_prompt_lines(value, multi_prompts_gen_type, multi_prompt_output=multi_prompt_output) for value in enhanced.prompts], prompts)
+                        results.append(usable)
                         if usable:
                             prompts = enhanced_prompts
                             task["prompt"] = prompt_parser.ENHANCED_PROMPT_PREFIX + prompt_parser.serialize_prompt_units("", prompts, multi_prompts_gen_type)
                             prompt_was_enhanced = True
                     if enhanced.alt_prompt_changed:
                         enhanced_alt_prompts, usable = usable_enhanced_prompts([normalize_generated_prompt_lines(value, multi_prompts_gen_type) for value in enhanced.alt_prompts], alt_prompts, "alt prompt")
+                        results.append(usable)
                         if usable:
                             alt_prompts = enhanced_alt_prompts
                             task["alt_prompt"] = prompt_parser.serialize_prompt_blocks_with_prefix(alt_prompts, prompt_enhancer_chaining.originals_for_outputs(original_alt_prompts, len(alt_prompts)))
@@ -8260,11 +8299,15 @@ def generate_media(
                     else:
                         enhanced_prompts = [normalize_generated_prompt_lines(one_prompt, multi_prompts_gen_type) for one_prompt in enhanced_prompts]
                     enhanced_prompts, usable = usable_enhanced_prompts(enhanced_prompts, prompts)
+                    results.append(usable)
                     if usable:
                         # On-the-fly enhancement keeps task prompts clean; originals are saved in metadata.
                         task["prompt"] = prompt_parser.ENHANCED_PROMPT_PREFIX + prompt_parser.serialize_prompt_units("", enhanced_prompts, multi_prompts_gen_type)
                         prompts = enhanced_prompts
                         prompt_was_enhanced = True
+                failures = enhancer_kwargs["generation_callbacks"]["enhancement_progress"].failures
+                if not any(results) or failures:
+                    send_cmd("info", enhancer_fallback_notice(failures, not any(results)))
                 workspace_storage.recording_gallery(gen)["last_gallery_source"] = "audio" if audio_only else MESH.id if model_def.get("mesh_outputs", False) else WORLD.id if model_def.get("world_outputs", False) else VIDEO.id
                 send_cmd("output")
                 if scheduler_active:
@@ -8278,6 +8321,7 @@ def generate_media(
             with gen_lock:
                 new_extra_windows = gen.get("extra_windows",0)
                 gen["extra_windows"] = 0
+                if loaded_source_plan is not None: loaded_source_plan["new_frames"] += new_extra_windows * loaded_source_plan["window_frames"]
             extra_windows += new_extra_windows
             if scheduler_active:
                 for _ in range(new_extra_windows):
@@ -8341,10 +8385,18 @@ def generate_media(
                     pre_video_guide =  prefix_video = image_start_tensor.unsqueeze(1)
                 else:
                     prefix_video_is_hdr = "&" in video_prompt_type and _video_input_is_hdr(video_source)
-                    prefix_video  = preprocess_video(width=width, height=height,video_in=video_source, max_frames= parsed_keep_frames_video_source , start_frame = 0, fit_canvas= sample_fit_canvas, fit_crop = fit_crop, target_fps = fps, block_size = block_size, preserve_hdr=prefix_video_is_hdr )
+                    if continued_source and loaded_source_plan is None:  # the frames the model reads, at the place a whole read gives them; the others stay in the file
+                        read_source_frames = lambda start, count, fit_canvas=sample_fit_canvas: preprocess_video(width=width, height=height, video_in=video_source, max_frames=count, start_frame=start, fit_canvas=fit_canvas, fit_crop=fit_crop, target_fps=fps, block_size=block_size)
+                        prefix_video, source_video_frames_count = video_continuation.read_source_tail(read_source_frames, video_continuation.source_frames_count(video_source, keep_frames_video_source, fps), max(reuse_frames, 1) + 5)
+                        source_stays_in_file = source_video_frames_count > 1
+                    else:
+                        prefix_video  = preprocess_video(width=width, height=height,video_in=video_source, max_frames= parsed_keep_frames_video_source , start_frame = 0, fit_canvas= sample_fit_canvas, fit_crop = fit_crop, target_fps = fps, block_size = block_size, preserve_hdr=prefix_video_is_hdr )
                     prefix_video  = prefix_video.permute(3, 0, 1, 2)
+                    if source_stays_in_file and continued_video is None:
+                        encode_video_frames = lambda frames, path: save_video(tensor=frames, save_file=path, fps=fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type=server_config.get("video_output_codec", None), container=server_config.get("video_container", "mp4"))
+                        continued_video = video_continuation.ContinuedVideo(video_source, source_video_frames_count, fps, prefix_video.shape[-1], prefix_video.shape[-2], read_source_frames, encode_video_frames, save_path, server_config.get("video_container", "mp4"), temp_filenames_list, notify=tqdm.write)
 
-                    if fit_crop or "L" in image_prompt_type: refresh_preview["video_source"] = convert_tensor_to_image(prefix_video, 0) 
+                    if fit_crop or "L" in image_prompt_type: refresh_preview["video_source"] = convert_tensor_to_image(read_source_frames(0, 1).permute(3, 0, 1, 2) if source_stays_in_file else prefix_video, 0)
 
                     new_height, new_width = prefix_video.shape[-2:]
                     source_overlap = 0 if new_shot else min(prefix_video.shape[1], reuse_frames if reuse_frames > 0 else 1)
@@ -8356,12 +8408,12 @@ def generate_media(
                             pre_video_guide = pre_video_guide.div_(127.5).sub_(1.) # c, f, h, w
                 pre_video_frame = convert_tensor_to_image(prefix_video[:, -1])
                 source_video_overlap_frames_count = source_overlap if video_source is not None else pre_video_guide.shape[1]
-                source_video_frames_count = prefix_video.shape[1]
+                if not source_stays_in_file: source_video_frames_count = prefix_video.shape[1]
 
                 if sample_fit_canvas != None: 
                     image_size = (pre_video_guide if pre_video_guide is not None else prefix_video).shape[-2:]
                     sample_fit_canvas = None
-                guide_start_frame =  prefix_video.shape[1]
+                guide_start_frame = source_video_frames_count
                 if fake_start_image:
                     source_video_overlap_frames_count = source_video_frames_count = guide_start_frame = 0
             if image_end is not None and not (frame_window_options is not None and frame_window_options.get("no_end_image", False)):
@@ -8943,7 +8995,7 @@ def generate_media(
                     generated_audio = samples.get("audio", generated_audio)
                     overridden_inputs = samples.get("overridden_inputs", None)
                     output_audio_sampling_rate = samples.get("audio_sampling_rate", audio_sampling_rate)
-                    input_fills_window = input_waveform is not None and input_waveform.shape[0] >= int(round((current_video_length - automatic_trim_last_frames) * input_waveform_sample_rate / fps))  # the frames trimmed away need no sound
+                    input_fills_window = input_waveform is not None and input_waveform.shape[0] >= int(round((current_video_length - automatic_trim_last_frames) * input_waveform_sample_rate / fps)) - round(input_waveform_sample_rate / 2000)  # the frames trimmed away need no sound; a slice cut to a length rounded to the millisecond (up to 0.5 ms short) fills it
                     if generated_audio is not None:
                         if keep_input_audio and input_fills_window:
                             drop_generated_audio = True
@@ -9017,7 +9069,7 @@ def generate_media(
                     window_overlap_frames = source_video_overlap_frames_count if window_no == 1 else reuse_frames
                     trim_first_frames = min(sliding_window_trim_first_frames, max(0, sample.shape[1] - 1)) if window_overlap_frames == 0 else 0
                     if trim_first_frames > 0:
-                        audio_trim_start_frame = retained_video_frames + (prefix_video.shape[1] if prefix_video is not None and window_no == 1 else 0)
+                        audio_trim_start_frame = retained_video_frames + ((source_video_frames_count if source_stays_in_file else prefix_video.shape[1]) if prefix_video is not None and window_no == 1 else 0)
                         external_audio_trim_ranges.append((audio_trim_start_frame, trim_first_frames))
                         sample = sample[:, trim_first_frames:]
                         if generated_audio is not None:
@@ -9035,7 +9087,9 @@ def generate_media(
                     if video_source is not None and window_no == 1:
                         source_audio_repair_seconds = audio_repair_samples / output_audio_sampling_rate
                 if prefix_video != None and window_no == 1 :
-                    if sample_is_hdr:
+                    if source_stays_in_file:  # the Source Video's frames are in its file: as for a later window, only the new frames are kept
+                        sample = sample[: , source_video_overlap_frames_count:]
+                    elif sample_is_hdr:
                         prefix_was_uint8 = prefix_video.dtype == torch.uint8
                         prefix_video = prefix_video.float()
                         if prefix_was_uint8:
@@ -9048,7 +9102,7 @@ def generate_media(
                             prefix_video = convert_video_tensor_to_uint8_chunked(prefix_video)
                         elif prefix_video.dtype == torch.uint8:
                             prefix_video = prefix_video.float().div_(127.5).sub_(1.0)
-                    if prefix_video.shape[1] > 1:
+                    if prefix_video.shape[1] > 1 and not source_stays_in_file:
                         if prefix_video.shape[-2:] != sample.shape[-2:]: # a VAE upsampler enlarged the generated frames
                             prefix_video = resize_lanczos_spatial(prefix_video, None, size=sample.shape[-2:])
                         # remove sliding window overlapped frames at the beginning of the generation
@@ -9092,7 +9146,7 @@ def generate_media(
                         full_generated_audio = np.concatenate([full_generated_audio, generated_audio], axis=0)
                     output_new_audio_data = full_generated_audio
                 if not (audio_only or is_image):
-                    retained_video_frames += sample.shape[1]
+                    retained_video_frames += sample.shape[1] + (source_video_frames_count if source_stays_in_file and window_no == 1 else 0)
 
 
                 if len(temporal_upsampling) > 0 or len(spatial_upsampling) > 0 and not upsampler_api.is_vae_upsampling(spatial_upsampling):
@@ -9157,6 +9211,9 @@ def generate_media(
                     output_frame_count = None
                     any_soundtrack_processor = False
                 else:
+                    if source_stays_in_file:  # the frames before this window are in the continued video's file
+                        frames_already_processed = []
+                        if window_no == 1: frames_already_processed_count = source_video_frames_count
                     frames_already_processed.append(sample)
                     frames_already_processed_count += sample.shape[1]
                     output_video_frames = frames_already_processed
@@ -9240,7 +9297,9 @@ def generate_media(
                 elif len(control_audio_tracks) > 0 or len(source_audio_tracks) > 0 or output_new_audio_filepath is not None or any_soundtrack_processor or output_new_audio_data is not None or audio_source is not None:
                     video_path = os.path.join(save_path, file_name)
                     save_path_tmp = video_path.rsplit('.', 1)[0] + f"_tmp.{container}"
-                    if sample_is_hdr:
+                    if source_stays_in_file:  # the new frames are encoded alone and follow the video made so far, kept in a file of its own
+                        save_path_tmp = continued_video.append(output_video_frames)
+                    elif sample_is_hdr:
                         save_hdr_video(tensor=output_video_frames, save_file=save_path_tmp, fps=output_fps, codec_type=server_config.get("hdr_video_crf", 8), container=container)
                     else:
                         save_video( tensor=output_video_frames, save_file=save_path_tmp, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type = server_config.get("video_output_codec", None), container=container)
@@ -9305,6 +9364,8 @@ def generate_media(
                     if replace_voice_method and replace_voice_sample is not None and len(new_audio_tracks) > 0:
                         new_audio_tracks, replace_voice_temp_audio_tracks = audio_processor_api.replace_voice_tracks(replace_voice_method, new_audio_tracks, voice_sample=replace_voice_sample, output_dir=save_path, prefix=f"tmp{time_flag}", process_files=process_files_def, profile_no=server_config.get("audio_profile", 4), verbose_level=verbose_level, init_pipe=partial(init_pipe, output_type="audio", extension=audio_processor_api), voice_sample2=replace_voice_sample2, status_callback=lambda status: send_cmd("progress", [0, get_latest_status(state, status)]))
                     if generated_audio is not None: output_new_audio_filepath = None
+                    if full_generated_audio is None and output_new_audio_filepath is not None and model_def.get("audio_tail_ms"):  # a kept soundtrack runs on past the last frame as a generated one does: a cut there (a merge, a continuation) falls inside real sound
+                        saved_audio_tail_seconds = model_def["audio_tail_ms"] / 1000
                     mux_audio_sampling_rate = resolve_mux_audio_sampling_rate(output_audio_sampling_rate, source_audio_metadata, new_audio_tracks)
 
                     set_progress_status(saving_status)
@@ -9322,13 +9383,15 @@ def generate_media(
                         verbose=verbose_level >= 2,
                         audio_tail_seconds=saved_audio_tail_seconds,
                     )
-                    os.remove(save_path_tmp)
+                    if not source_stays_in_file: os.remove(save_path_tmp)
                     if output_new_audio_temp_filepath is not None: os.remove(output_new_audio_temp_filepath)
                     cleanup_temp_audio_files(trimmed_mux_audio_tracks)
                     cleanup_temp_audio_files(replace_voice_temp_audio_tracks)
 
                 else:
-                    if sample_is_hdr:
+                    if source_stays_in_file:
+                        shutil.copyfile(continued_video.append(output_video_frames), video_path)
+                    elif sample_is_hdr:
                         video_path = save_hdr_video(tensor=output_video_frames, save_file=video_path, fps=output_fps, codec_type=server_config.get("hdr_video_crf", 8), container=container)
                     else:
                         save_video( tensor=output_video_frames, save_file=video_path, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1),  codec_type= server_config.get("video_output_codec", None), container= container)
@@ -9401,6 +9464,7 @@ def generate_media(
 
         seed = set_seed(-1)
     gen_state = plugin_data = None
+    gen["loaded_source_plan"] = None
     clear_status(state)
     trans.cache = None
     offload.unload_loras_from_model(trans_lora)
@@ -9811,6 +9875,22 @@ def validate_task(task, state, skip_validate_settings=False):
     return inputs, ""
 
 
+class StatusLineStream:
+    """The headless console: its status line is rewritten in place (it starts with a carriage return and has no line end). Whatever
+    else is printed while it is shown, from any thread, starts on a line of its own."""
+    def __init__(self, stream):
+        self.stream, self.status_shown = stream, False
+
+    def write(self, text):
+        if text:
+            if self.status_shown and text[0] not in "\r\n": self.stream.write("\n")
+            self.status_shown = text[0] == "\r" and text[-1] != "\n"
+        return self.stream.write(text)
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
 def process_tasks_cli(queue, state):
     """Process queue tasks with console output for CLI mode. Returns True on success."""
     from shared.utils.thread_utils import AsyncStream, async_run_in
@@ -10030,10 +10110,15 @@ def one_more_sample(state):
 
 def one_more_window(state):
     gen = get_gen_info(state)
-    with gen_lock:
-        extra_windows = gen.get("extra_windows", 0) + 1
-        gen["extra_windows"] = extra_windows
     in_progress = gen.get("in_progress", False)
+    with gen_lock:
+        loaded_frames_error = video_continuation.frames_limit_error(gen.get("loaded_source_plan"), gen.get("extra_windows", 0) + 1) if in_progress else ""
+        if not loaded_frames_error:
+            extra_windows = gen.get("extra_windows", 0) + 1
+            gen["extra_windows"] = extra_windows
+    if loaded_frames_error:
+        gr.Info(loaded_frames_error)
+        return state
     if not in_progress :
         return state
     total_windows = gen.get("total_windows", 0) + extra_windows
@@ -15288,6 +15373,7 @@ if __name__ == "__main__":
         state["gen"]["queue"] = queue
 
         try:
+            sys.stdout = StatusLineStream(sys.stdout)
             success = process_tasks_cli(queue, state)
             sys.exit(0 if success else 1)
         except KeyboardInterrupt:

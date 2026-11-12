@@ -46,6 +46,8 @@ export const api = {
   resume: (id, message = '') => call('POST', `productions/${id}/director/resume`, { message }),
   rerun: (id, shot) => call('POST', `productions/${id}/shots/${shot}/rerun`),
   renderNow: (id, shots, final = false, newSeed = null) => call('POST', `productions/${id}/render`, { shots, final, new_seed: newSeed }),
+  songVoice: (id, singers) => call('POST', `productions/${id}/song-voice`, { singers }),
+  singerVoice: () => call('GET', 'singer-voice'),
   detachSound: (id, shot) => call('POST', `productions/${id}/shots/${shot}/detach-sound`),
   cancelRender: (id, shot) => call('POST', `productions/${id}/shots/${shot}/cancel`),
   assemble: id => call('POST', `productions/${id}/assemble`),

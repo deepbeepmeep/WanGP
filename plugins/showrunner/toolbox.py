@@ -35,6 +35,12 @@ GUIDE = """Read wangp://skills/showrunner/directing before directing a productio
 - A shot's settings hold only what the shot changes (prompt, media): its template brings the model, LoRAs and steps, the brief the resolution, its duration_s the length. `plan` validates them and returns what they will render at.
 - Paths are given as you can use them in settings."""
 FULL_DOCUMENT_CHARACTERS = 28000  # what Deepy can read of one call
+SHOT_ROLES = ("cast_shots", "shots_without_cast", "cast_shots_lip_synced", "lip_synced_without_cast", "people_edits", "scene_edits", "pages", "pages_with_cast")  # template_advice's templates for shots
+# How plan and add_shots name what render sends with each shot, beside the prompt format of its model.
+PICTURE_ORDER = ("Write each shot's prompt in the format its template's model has in prompt_guides. reference_pictures: the cast members whose "
+                 "picture render gives each shot, in this order, as reference images (a model that numbers images counts a start or end image "
+                 "first): bind each to its picture in the prompt. A song slice or recorded line render keeps as the shot's soundtrack is no audio "
+                 "reference: ask for the singer's or speaker's lips moving in sync instead.")
 
 
 def mistyped_words(doc: dict[str, Any], texts: list[str]) -> list[str]:
@@ -105,6 +111,8 @@ class ShowrunnerToolbox:
         plugin.register_deepy_action(self.verdict, uses_gpu=False, summary="Record your inspection of a take: ok or not, a short note and the measured values.")
         plugin.register_deepy_action(self.edit, paths={"song": "read"}, uses_gpu=False,
                                      summary="Set the edit's sound and subtitles: soundtrack mode, the production's song, narration or score tracks, SRT files.")
+        plugin.register_deepy_action(self.change_singer_voice, paths={"voices": "read"},
+                                     summary="Only when the user asks: the production's song sung in a cast member's voice or a voice sample (two for a duet), its music kept (SeedVC).")
         plugin.register_deepy_action(self.check_song, summary="Listen to the production's song: which lines of the lyrics it really sings, and when (the subtitles follow it).")
         plugin.register_deepy_action(self.deep_review, summary="Measure the last version against its script: words, subtitles, voices, lips, sound and picture, with the findings recorded on the version.")
         plugin.register_deepy_action(self.assemble, uses_gpu=False, summary="Render the edit (chosen takes in order, trims, transitions, soundtrack) as the production's deliverable.")
@@ -254,8 +262,8 @@ class ShowrunnerToolbox:
         song = target.snapshot()["brief"].get("song")
         if song and shot.get("audio_slice") and not settings.get("audio_guide") and entry is not None and (entry["audio"] or entry["soundtrack"]):  # a slice is of the song: render cuts it
             settings["audio_guide"] = ctx.virtualize(str(target.resolve(song)))
-        if entry is not None and entry["soundtrack"] and not entry["audio"] and settings.get("audio_guide") and not settings.get("audio_prompt_type"):
-            settings["audio_prompt_type"] = "AS"  # the driving audio as a kept soundtrack the picture follows, not a voice reference
+        if letters := templates.soundtrack_letters(shot, entry, settings):
+            settings["audio_prompt_type"] = letters  # the driving audio as a kept soundtrack the picture follows, not a voice reference
         if entry is not None and entry.get("video_edit") and settings.get("video_mask"):
             settings["video_prompt_type"] = settings.get("video_prompt_type", "IVU").replace("U", "A")  # WanGP ignores a mask beside U
         return settings
@@ -295,6 +303,7 @@ class ShowrunnerToolbox:
             errors = [item for item in validation.get("diagnostics", []) if item.get("severity") == "error"]
             errors += [{"message": validation.get("error")}] if validation.get("status") == "error" else []
             for task in validation.get("tasks", []):
+                task = {**validation.get("every_task", {}), **task}  # a batch states once what every shot shares
                 size = (task.get("resolution_assessment") or {}).get("aligned")
                 seconds = (task.get("window_plan") or {}).get("total_seconds") or (task.get("requested_video") or {}).get("duration_seconds")
                 if size:
@@ -341,6 +350,8 @@ class ShowrunnerToolbox:
                               for member, full in zip(result["cast"], doc["cast"])]
             catalog = self._catalog(doc)
             result["template_advice"] = templates.advice(doc, catalog, self.showrunner.host.settings()["any_shot_length"], self.showrunner.host.prompt_rules())
+            if not doc["shots"] and (guides := self._guides(catalog, [result["template_advice"][key] for key in SHOT_ROLES if key in result["template_advice"]])):
+                result["template_advice"]["prompt_guides"] = guides  # read before the first prompt is written; plan and add_shots repeat them
             warnings = templates.lint(doc, catalog) + templates.places_missing(doc, catalog) + model.cut_lines(doc) + model.singing_without_song(doc) + model.song_drift(doc) + model.song_words(doc) + self._length_warning(doc)
             if warnings:
                 result["warnings"] = warnings
@@ -471,14 +482,37 @@ class ShowrunnerToolbox:
                 response["warnings"] = response.get("warnings", []) + problems
             if renders:
                 response["renders"] = renders
-        target.apply([{"op": "stage", "stage": "review" if target.doc["stage"] in ("brief", "planning") else target.doc["stage"]}], by="system", record=False)
+        response.update(self._prompt_guides(target, added if shots is not None else [] if cast or style or outline else [shot["id"] for shot in target.snapshot()["shots"]]))
+        if target.doc["stage"] in ("brief", "planning"):  # a plan() that only reads leaves the revision as it was
+            target.apply([{"op": "stage", "stage": "review"}], by="system", record=False)
+            response["revision"] = target.doc["revision"]
         return response
+
+    def _prompt_guides(self, target, shot_ids: list[str]) -> dict[str, Any]:
+        """The prompt format of each model these shots use, and who the reference pictures render gives each shot are: a plain description leaves
+        out what such models are trained on (which reference to keep, the lip sync they are asked for)."""
+        doc = target.snapshot()
+        catalog = self._catalog(doc)
+        names, pictures = [], {}
+        for shot in doc["shots"]:
+            if shot["id"] not in shot_ids or (entry := templates.shot_entry(doc, shot, catalog)) is None:
+                continue
+            names.append(templates.entry_name(entry))
+            if entry["refs"] and entry["task"] not in templates.EDIT_TASKS and not shot["generation"].get("settings", {}).get("image_refs") and (shown := self._pictured_cast(doc, shot)):
+                pictures[shot["id"]] = [member["name"] for member, _ in shown]  # as _generation sends them
+        guides = self._guides(catalog, names)
+        return {"prompt_guides": guides, **({"reference_pictures": pictures, "reference_pictures_note": PICTURE_ORDER} if pictures else {})} if guides else {}
+
+    def _guides(self, catalog: list[dict[str, Any]], names: list[str]) -> dict[str, str]:
+        """{template: its model's prompt format} for these templates, those whose model has one."""
+        entries = {name: entry for name in dict.fromkeys(names) if (entry := templates.resolve(catalog, name)) is not None and entry["model_type"]}
+        return {name: guide for name, entry in entries.items() if (guide := self.showrunner.host.prompt_guide(entry["model_type"]))}
 
     def update_shot(self, ctx, production: str, shot: str, fields: dict[str, Any], revision: int | None = None) -> dict[str, Any]:
         """fields: any of title, section, intent, camera, cast, dialogue, duration_s, audio_slice, generation (settings are merged; null removes one), status, included, chosen_take,
         trim [start_s, end_s], speed (0.25 to 4, how fast the take plays in the edit; trim stays in seconds of the take), sound (false: the take plays silent),
-        transition {type: cut|crossfade|fade_black|fade_white, duration_s}, notes. revision: the one you read, which guards
-        against the user's edits since your read (your own writes never conflict). Changed settings or cast are validated again."""
+        transition {type: cut|crossfade|fade_black|fade_white, duration_s}, notes. revision: the one you last read, which guards
+        against the user's edits since then, never against your own or the system's writes: one revision serves a batch of calls. Changed settings or cast are validated again."""
         target = self._production(ctx, production)
         self._only_the_fix(ctx, target, [shot])
         if isinstance(fields.get("generation"), dict) and isinstance(fields["generation"].get("settings"), dict):
@@ -498,7 +532,7 @@ class ShowrunnerToolbox:
             target.apply([{"op": "director", "fields": {"shots": [*fixing, *result[0]["shots"]]}}], by="system", record=False)
         problems, renders = self._validate(ctx, target, result[0]["shots"])
         warnings = self._warnings(target, result[0]["shots"]) + problems + ([] if target.snapshot()["deliverables"] else self._script_warnings(ctx, target))  # a shot added to a finished film is about that shot
-        return {"revision": target.doc["revision"], **result[0], **({"warnings": warnings} if warnings else {}), **({"renders": renders} if renders else {})}
+        return {"revision": target.doc["revision"], **result[0], **({"warnings": warnings} if warnings else {}), **({"renders": renders} if renders else {}), **self._prompt_guides(target, result[0]["shots"])}
 
     def remove_shot(self, ctx, production: str, shot: str, revision: int | None = None) -> dict[str, Any]:
         target = self._production(ctx, production)
@@ -1050,7 +1084,9 @@ class ShowrunnerToolbox:
         doc = self._usable(ctx, target, target.snapshot())
         typed = [str(text) for item in overlays or [] for text in (item.get("text"), item.get("subtitle")) if text]
         misspelled = mistyped_words(doc, typed)
-        return {**({"check_spelling": misspelled} if misspelled else {}), **voices, "revision": doc["revision"], "edit": doc["edit"], "song": doc["brief"]["song"]}
+        sung = {"next": f"The brief asks the song sung by {model.song_singers(doc)}: call change_singer_voice(cast_ids={doc['brief']['song_voices']}) now, then check_song."
+                } if song and doc["brief"]["song_voices"] else {}
+        return {**({"check_spelling": misspelled} if misspelled else {}), **voices, **sung, "revision": doc["revision"], "edit": doc["edit"], "song": doc["brief"]["song"]}
 
     @staticmethod
     def _track(ctx, target, track: dict[str, Any]) -> dict[str, Any]:
@@ -1073,6 +1109,25 @@ class ShowrunnerToolbox:
             start = next((item["start_s"] for item in model.timeline(doc) if item["shot"] == shot["id"]), 0.0)
         return {"path": line["audio"], "start_s": float(start), "gain_db": gain, **cut}
 
+    def change_singer_voice(self, ctx, production: str, cast_ids: list[str] | None = None, voices: list[str] | None = None) -> dict[str, Any]:
+        """Only when the user asks: the song sung in other voices by WanGP's SeedVC, its music, words and timing as they are, so takes already shot
+        keep their lip sync. Who sings, in the order their voices are first heard in the song, one or two for a duet (SeedVC tells two voices
+        apart, not more): cast_ids (their voice sample, made from their voice description when they have none) or voices, voice samples (media id
+        or path). Requires SeedVC v1.0 Singing in Configuration > Extensions. The new version becomes the production's song, the former one goes to the bin."""
+        target = self._production(ctx, production)
+        self._only_the_fix(ctx, target, what="the song")
+        if unavailable := self.showrunner.host.singer_voice_unavailable():
+            raise ValueError(f"{unavailable} Tell the user.")
+        if bool(cast_ids) == bool(voices):
+            raise ValueError("Give cast_ids (the cast members who sing) or voices (voice samples), one of them.")
+        doc = target.snapshot()
+        members = [model.find(doc["cast"], cast_id, "cast") for cast_id in cast_ids or []]
+        self.showrunner.singers(doc, members or [None] * len(voices))
+        catalog = self._catalog(doc)
+        samples = [target.resolve(self._voice(ctx, target, member, catalog, templates.effective(doc, catalog))[0]) for member in members] or [ctx.resolve(voice) for voice in voices]
+        ctx.progress(text="Changing the singer's voice")
+        return self.showrunner.change_singer_voice(target, samples, by="deepy")
+
     def _song_stem(self, ctx, song: Path) -> Path | None:
         """The song's voice alone, isolated the first time."""
         stem = song.with_name(f"{song.stem}_post.wav")
@@ -1084,8 +1139,8 @@ class ShowrunnerToolbox:
 
     def check_song(self, ctx, production: str, lyrics: str | None = None) -> dict[str, Any]:
         """Listen to the production's song and compare it with the lyrics of the brief: which lines it really sings, and when. Run it on every new song, before shooting on it: a
-        transcript that cannot read a line while it reads the others means the line is not sung as written. Subtitles of a cut that plays the song follow these times, and lines
-        that are not sung get none. lyrics: the words the song was made from, when you wrote them yourself: they become the production's script, as written, section markers included."""
+        transcript that cannot read a line while it reads the others means the line is not sung as written. Subtitles of a cut that plays the song follow these times; lines
+        that are not sung get none, unless they are sung unclearly where they belong. lyrics: the words the song was made from, when you wrote them yourself: they become the production's script, as written, section markers included."""
         target = self._production(ctx, production)
         if lyrics:
             self._apply(target, [{"op": "brief", "fields": {"script": lyrics}}])
@@ -1095,13 +1150,14 @@ class ShowrunnerToolbox:
             raise ValueError("The production has no song: make one with edit(song=...).")
         if not lines:
             raise ValueError("The production has no lyrics to compare the song with: call check_song again with lyrics, the words the song was made from.")
+        stem = self._song_stem(ctx, song)  # the voice alone: a pitch means nothing on a full mix, and a transcript of the mix stretches words over the music between lines
         ctx.progress(text="Listening to the song")
-        measured = model.sung_lines(lines, self.showrunner.host.song_words(song, str(doc["brief"].get("language") or "") or None))
-        stem = self._song_stem(ctx, song)  # the voice alone: a pitch means nothing on a full mix
+        measured = model.sung_lines(lines, self.showrunner.host.song_words(stem or song, str(doc["brief"].get("language") or "") or None))
         voice_hz = self.showrunner.host.voice_pitch(stem) if stem else None
         self._apply(target, [{"op": "lyrics", "lyrics": {"song": song.name, "lines": measured, "voice_hz": voice_hz}}])
         missing = [line["line"] for line in measured if not line["sung"]]
-        return {"lines": len(measured), "sung": len(measured) - len(missing), "lead_voice_hz": voice_hz, **({"not_sung": missing} if missing else {}), "times": [f"{line['start_s']:.1f}-{line['end_s']:.1f} {line['line']}" for line in measured if line["sung"]],
+        return {"lines": len(measured), "sung": len(measured) - len(missing), "lead_voice_hz": voice_hz, **({"not_sung": missing} if missing else {}),
+                "times": [f"{line['start_s']:.1f}-{line['end_s']:.1f} {line['line']}" + (" (sung unclearly)" if line.get("unclear") else "") for line in measured if line["start_s"] is not None],
                 **({"warnings": warned} if (warned := model.song_words(target.snapshot())) else {})}
 
     def deep_review(self, ctx, production: str, add: list[dict[str, Any]] | None = None) -> dict[str, Any]:

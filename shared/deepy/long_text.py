@@ -30,6 +30,7 @@ _MAX_RG_OUTPUT_CHARS = 64000
 _MAX_TEXT_EDIT_CHARS = 1024 * 1024
 _MAX_PROMPT_FILE_BYTES = 4 * 1024 * 1024
 _PROMPT_FILE_RE = re.compile(r'^\s*@file\(\s*"([^"\r\n]+)"\s*\)\s*$')
+_BARE_PATH_RE = re.compile(r'^\s*@([^/\s"]+)/\S+\s*$')
 _PROMPT_FIELDS = {"prompt", "negative_prompt", "alt_prompt", "audio_prompt", "lyrics", "music_caption", "voice_description"}
 _RUNTIME_LOCK = threading.RLock()
 _WORKSPACES_PURGED = False
@@ -406,6 +407,9 @@ def resolve_prompt_file(value: Any, policy, *, read_only: bool = False) -> Any:
         return value
     match = _PROMPT_FILE_RE.fullmatch(value)
     if match is None:
+        bare = _BARE_PATH_RE.fullmatch(value)
+        if bare and any(alias.casefold() == bare.group(1).casefold() for alias, _root in policy.mounts):  # an agent's bare path would be generated as the literal prompt text
+            raise ValueError(f'The prompt is only the path {value.strip()}, not its content. To use the file as the prompt, set the field to exactly @file("{value.strip()}").')
         return value
     target = policy.require_read(match.group(1), file=True)
     if not (read_only or getattr(policy, "prompt_read_only", False)) and not policy.can_write(target):

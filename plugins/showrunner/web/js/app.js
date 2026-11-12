@@ -46,7 +46,7 @@ function applyTheme() {
   document.documentElement.dataset.theme = theme;
 }
 applyTheme();
-window.addEventListener('focus', applyTheme);
+window.addEventListener('focus', () => { applyTheme(); mounted?.refreshSingerVoice?.(); });
 
 export const actions = {
   async ops(ops, { quiet = false } = {}) {
@@ -268,6 +268,12 @@ function eventsFor(pid) {
       else state.renders[event.shot] = event.progress ?? 0;
       drawProgress();
     },
+    song_voice: event => {  // the song sung in another voice, changed from the Brief
+      state.songVoice = event.done ? null : { progress: event.progress, status: event.status };
+      if (event.error) toast(`The singer's voice could not be changed: ${event.error}`, 'error', 8000);
+      else if (event.done) toast('The song is sung in its new voice. The former version is in the bin.', 'ok');
+      mounted?.songVoice?.();
+    },
     assemble: event => {
       if (!state.userAssembling) {  // an assembly the user started reports on its own button
         if (event.state === 'done') toast('The edit is assembled: watch it in Deliver.', 'ok');
@@ -281,6 +287,7 @@ function eventsFor(pid) {
 // After events were missed (the page was hidden or the connection dropped): the production, its renders and the showrunner's state now.
 async function catchUp() {
   state.renders = {};  // a render still running reports again with its next progress
+  mounted?.refreshSingerVoice?.();  // the SeedVC choice may have changed while Configuration was open
   refreshDoc();
   let changed = true;
   try {

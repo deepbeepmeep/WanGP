@@ -59,13 +59,33 @@ def bound_short_edge(width, height, low, high, multiple=32):
     return _round(width * scale, multiple), _round(height * scale, multiple)
 
 
-def h3_image_sigmas():
-    return H3_IMAGE_SIGMAS
+H3_IMAGE_SHIFT = 12.0  # the grid of other step counts: H3's shift-12 linspace, the one few-step LoRAs such as pDMD are trained on
+
+
+def h3_image_sigmas(steps=H3_IMAGE_STEPS):
+    """The noise levels of ``steps`` denoising steps, terminal 0 left out: the checkpoint's own grid at 6 steps, otherwise H3's
+    ``linspace(1, 0, steps + 1)`` grid at shift 12."""
+    if steps == H3_IMAGE_STEPS:
+        return H3_IMAGE_SIGMAS
+    base = torch.linspace(1.0, 0.0, steps + 1, dtype=torch.float32, device="cpu")[:-1]
+    return tuple((H3_IMAGE_SHIFT * base / (1 + (H3_IMAGE_SHIFT - 1) * base)).tolist())
+
+
+def h3_image_head_plans(sigmas):
+    """(steps, 6) weights of the per-step output heads for a step schedule (sigmas with their terminal 0): a step mixes the heads of the
+    checkpoint's grid intervals it overlaps, in proportion to the overlap, which is one head per step on the checkpoint's own grid."""
+    grid = torch.tensor([*H3_IMAGE_SIGMAS, 0.0], dtype=torch.float64, device="cpu")
+    sigmas = torch.as_tensor(sigmas).flatten().to(device="cpu", dtype=torch.float64)
+    plans = []
+    for high, low in zip(sigmas[:-1], sigmas[1:]):
+        overlap = (torch.minimum(grid[:-1], high) - torch.maximum(grid[1:], low)).clamp_min_(0.0)
+        plans.append(overlap / overlap.sum())
+    return torch.stack(plans).float()
 
 
 H3_IMAGE_INFOS = """## MiniMax H3-Image
 
-Generates a single image from text, or edits and combines up to 16 input images, in 6 steps without guidance or a negative prompt. It is MiniMax's image model on the H3 architecture: no video or audio.
+Generates a single image from text, or edits and combines up to 16 input images, in 6 steps without guidance or a negative prompt, or in 2 to 4 steps with its pDMD accelerator profiles. It is MiniMax's image model on the H3 architecture: no video or audio.
 
 ### Text to Image
 
@@ -88,13 +108,22 @@ The model follows long, complete descriptions much better than short requests. T
 
 **H3-Image Pruned** is smaller (about 40 GB in BF16 instead of 66 GB) and loads faster, for nearly identical images.
 
+### Fewer Steps
+
+The **pDMD** accelerator profiles add a LoRA that finishes the image in fewer steps:
+
+- **pDMD 2 Steps:** the fastest: denoising takes less than half the time of 6 steps. Reading the prompt and decoding the image take as long as before, so a whole 4 MP image is about 25 % faster.
+- **pDMD 4 Steps:** crisper detail than 2 steps, for a little more time.
+
+For the same seed they give a different picture than 6 steps. Without the LoRA, fewer than 6 steps leaves the image soft and unfinished. At 6 steps the model uses its own tuned schedule; other step counts use the schedule the pDMD LoRA is trained on. **H3-Image 6 Steps (Reset)** goes back to the default settings and keeps your other LoRAs.
+
 ### Several Images
 
 **Number of Images** generates several variations of the same prompt together, faster than one after the other. The first image keeps the composition a single generation with the same seed gives, with slightly different fine details. Each extra image needs more memory during generation.
 
 ### LoRAs
 
-H3-Image has its own LoRA list. It was trained separately from the H3 video models, so their LoRAs and accelerators do not apply to it. The step count, sampler and guidance are fixed.
+H3-Image shares the MiniMax H3 LoRA list. It is a heavily retrained H3, so style, realism or character LoRAs made for the video models can carry over, often with a weaker or different effect: try them at a few strengths. LoRAs for video motion, control or fewer steps do not suit it, except the pDMD accelerator of its profiles. The sampler and guidance are fixed.
 """
 
 H3_IMAGE_PROMPT_INFOS = """### Text to Image
@@ -118,7 +147,7 @@ Name the parts of the images to keep, then the change, then describe the result.
 A plain instruction also works: `Keep everything in <Picture 1> as it is, but remove the headphones and have the two hosts fist bump.` With several images, say what each one supplies: `the straw hat from <Picture 2>`. Quote new text exactly.
 """
 
-H3_IMAGE_DEEPY_INFOS = """Single images from `prompt`, or edits with 1 to 16 ordered `image_refs` (`<Picture 1>`, `<Picture 2>` in the prompt); no video or audio. Fixed recipe: 6 steps on the checkpoint's own schedule, Euler, no guidance, no negative prompt, one phase, no step skipping. Best near 16 MP (`4096x4096`, `4736x3552`, `3552x4736`, `5024x3360`, `3360x5024`, `5472x3072`, `3072x5472`, `6272x2688`, `2688x6272`); requests below 4 MP are generated at 4 MP and resized (no time saved). `video_prompt_type`: empty = text to image; `KI` = edit, the first image sets the output proportions within `resolution` (usual choice); `I` = edit on the exact `resolution`. References keep their own size (resized only when the short side is outside 1024-2048 px), so many large references cost much more memory and time. Long, complete English descriptions work much better than short requests; the prompt enhancer is off by default. `minimax_h3_image_pruned` is the lighter variant (40 GB BF16 vs 66 GB) with nearly identical images. Own LoRA folder: H3 video LoRAs and accelerators do not apply. `batch_size` up to 16: several images of one prompt denoised together (faster than one by one; image 0 has the composition of the single image of that seed, fine details differ slightly; more VRAM)."""
+H3_IMAGE_DEEPY_INFOS = """Single images from `prompt`, or edits with 1 to 16 ordered `image_refs` (`<Picture 1>`, `<Picture 2>` in the prompt); no video or audio. Euler, no guidance, no negative prompt, one phase, no step skipping. `num_inference_steps` defaults to 6 (the checkpoint's own schedule); other counts use H3's shift-12 schedule and need the pDMD LoRA: accelerator profiles `pDMD 2 Steps` / `pDMD 4 Steps` add `minimax_h3_pdmd_2nfe_bf16.safetensors` to `activated_loras` (denoising more than 2x faster at 2 steps, a whole 4 MP image about 25 % faster; 4 steps is crisper; a different picture than 6 steps at the same seed; without the LoRA fewer than 6 steps is soft and unfinished). Profile `H3-Image 6 Steps (Reset)` clears accelerators (`loras_multipliers` `|`). Best near 16 MP (`4096x4096`, `4736x3552`, `3552x4736`, `5024x3360`, `3360x5024`, `5472x3072`, `3072x5472`, `6272x2688`, `2688x6272`); requests below 4 MP are generated at 4 MP and resized (no time saved). `video_prompt_type`: empty = text to image; `KI` = edit, the first image sets the output proportions within `resolution` (usual choice); `I` = edit on the exact `resolution`. References keep their own size (resized only when the short side is outside 1024-2048 px), so many large references cost much more memory and time. Long, complete English descriptions work much better than short requests; the prompt enhancer is off by default. `minimax_h3_image_pruned` is the lighter variant (40 GB BF16 vs 66 GB) with nearly identical images. Shares the MiniMax H3 LoRA folder: H3 video style, realism or character LoRAs may carry over with a weaker or different effect (heavily retrained H3; not validated); video motion, control and step LoRAs do not apply, except pDMD. `batch_size` up to 16: several images of one prompt denoised together (faster than one by one; image 0 has the composition of the single image of that seed, fine details differ slightly; more VRAM)."""
 
 H3_IMAGE_DEEPY_PROMPT_INFOS = """Text to image: one detailed English paragraph describing the whole image, usually starting `The image is a/an <medium>...`: subject identity, pose, positions (center, left, upper right), materials, light source and direction, lens or medium; quote every visible word in double quotes with its position; for posters, pages, charts and UIs describe each region in reading order with its exact text. No hype words. Edit: name kept source elements first (`The <cues> in <Picture 1> is <Subject 1>.`), then `The target image shows ...`, then one clause per subject (`<Subject N> is fully preserved.` or `<Subject N> is partially preserved; <what stays>, while <what changes>.`), then a concrete description of only the changed or new content; quote edited text exactly in single quotes. A plain instruction naming what to keep and what to change also works."""
 
@@ -182,7 +211,6 @@ def query_h3_image_def(pruned, text_encoder_def, denoising_priority_infos):
         "visible_phases": 0,
         "lora_multiplier_phases": 1,
         "inference_steps": True,
-        "lock_inference_steps": True,
         "flow_shift": False,
         "custom_sigmas": False,
         "spectrum_cache": False,
@@ -230,4 +258,4 @@ def query_h3_image_def(pruned, text_encoder_def, denoising_priority_infos):
 
 __all__ = ["H3_IMAGE_ARCHITECTURE", "H3_IMAGE_ARCHITECTURES", "H3_IMAGE_FAMILY", "H3_IMAGE_FOLDER", "H3_IMAGE_MAX_IMAGES", "H3_IMAGE_MIN_AREA", "H3_IMAGE_MODEL",
            "H3_IMAGE_PICTURE_LABEL", "H3_IMAGE_PRUNED_ARCHITECTURE", "H3_IMAGE_REFERENCE_SHORT_EDGE", "H3_IMAGE_SIGMAS", "H3_IMAGE_STEPS", "H3_IMAGE_VAE_FILE",
-           "H3_IMAGE_VISION_SHORT_EDGE", "bound_short_edge", "canvas_size", "h3_image_sigmas", "query_h3_image_def"]
+           "H3_IMAGE_SHIFT", "H3_IMAGE_VISION_SHORT_EDGE", "bound_short_edge", "canvas_size", "h3_image_head_plans", "h3_image_sigmas", "query_h3_image_def"]

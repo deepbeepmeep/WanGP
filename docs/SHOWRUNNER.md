@@ -55,6 +55,15 @@ The production opens on its **Brief**, which saves itself as you type:
 - **The song** (music videos) or a **soundtrack**: drop an audio file, or a video to use its sound. No song yet? Leave it empty: the
   showrunner composes one from your idea (and your lyrics, when you write them). Showrunner listens to the song and shows its
   waveform, tempo and parts (intro, verses, choruses, bridge). The showrunner cuts on these parts and bars.
+  **Change the voice** on the song card has the song sung in another voice, your own song or one the showrunner composed (song
+  models cannot sing in a voice you give them): a cast member's (the voice sample on their card, or one made from their voice
+  description) or a voice sample from your computer. **Two singers (a duet)** gives each of the song's two voices its own, in the
+  order they are first heard: pick two cast members, or voice samples you dropped in the media bin. The music, the words and their
+  timing stay, so the shots already made keep their lip sync; the former version waits in the bin. Asking the showrunner in the chat
+  does the same. With no song, **Sung by** under the song field chooses whose voice sings the song the showrunner composes (a cast
+  member with a voice, or two for a duet): it composes the song, then has it sung in that voice using SeedVC. Both actions require
+  **SeedVC Voice Replacement** set to **v1.0 Singing** in **Configuration > Extensions** (the default). Speech modes cannot be used
+  for changing a song's singer.
 - **References**: pictures or videos of looks, places, moods or movements.
 - **Cast**: drop a photo of each person or recurring object so that they look the same in every shot, and describe how each speaker
   sounds (or drop a recording of their voice) so that they sound the same in every line (see **The Cast**).

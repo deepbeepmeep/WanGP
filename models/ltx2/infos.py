@@ -170,7 +170,7 @@ LTX2_25_DEEPY_INFOS = """Generate video and synchronized sound from `prompt`. `i
 
 Control Video (`video_guide`) supplies raw frames or a selected pose/depth/edge guide; higher Control Video Strength follows it more closely. Inpainting uses source + mask: Control Video Strength 1 and Unmasked Area Strength 0 preserve unmasked content. Inject Frames places ordered `image_refs` at explicit positions (`1` = first frame, `L` = last in the window, `X` = skip a window without consuming an image). Ingredients uses one composite reference sheet for characters, objects and setting.
 
-`audio_prompt_type`: empty = generate soundtrack; `A` = condition on `audio_guide`; `K` = control video and its audio; `2` = generate audio for control frames. A complete input soundtrack is normally reused; a shorter one allows audio continuation. Make action and speech agree with soundtrack timing.
+`audio_prompt_type`: empty = generate soundtrack; `AS` = condition on `audio_guide`, kept as the soundtrack; `KS` = control video and its audio; `A` or `K` alone mean the same; `2` = generate audio for control frames. A complete input soundtrack is normally reused; a shorter one allows audio continuation. Make action and speech agree with soundtrack timing.
 
 For continuation, the alignment selector places controls/injected frames relative to source-video time zero or the new continuation. Use capabilities for window limits and `prompt_infos` for speech and timed prompting.
 

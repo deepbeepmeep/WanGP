@@ -37,39 +37,59 @@ def effective_settings(session, supplied):
     return model_def, effective
 
 
-def input_metadata(session, settings):
-    from .server import _MCP_MEDIA_SETTING_KEYS, _mcp_media_type
+def given_media(settings, explicit):
+    """(role, resolved value, the reference the caller gave) for every media input of a task: a media id, a path, a part of either."""
+    from .server import _MCP_MEDIA_SETTING_KEYS
+
+    for role in sorted(_MCP_MEDIA_SETTING_KEYS & settings.keys()):
+        value, given = settings[role], explicit.get(role)
+        items, given = (value if isinstance(value, list) else [value]), (given if isinstance(given, list) else [given])
+        for index, item in enumerate(items):
+            if item:
+                yield role, item, given[index] if index < len(given) and isinstance(given[index], str) else str(item)
+
+
+def input_metadata(session, settings, explicit):
+    """Each media input named by the reference the caller gave, with what a plan needs: size, rate, channels, the duration of its part."""
+    from .server import _mcp_media_type
     from PIL import Image
     from shared.deepy.image_channels import upright_size
+    from shared.utils.audio_video import _resolve_virtual_audio_segment
     from shared.utils.video_decode import resolve_media_binary
 
     result = []
     probe = resolve_media_binary("ffprobe")
-    for role in sorted(_MCP_MEDIA_SETTING_KEYS & settings.keys()):
-        value = settings[role]
-        for item in value if isinstance(value, list) else [value]:
-            if not item:
-                continue
-            path = Path(strip_virtual_media_suffix(item))
-            record = {"role": role, "path": str(item), "media_type": _mcp_media_type(str(path)), "size_bytes": path.stat().st_size}
-            if record["media_type"] == "image":
-                with Image.open(path) as image:
-                    record.update(zip(("width", "height"), upright_size(image)))
-            elif record["media_type"] in {"audio", "video"}:
-                if probe:
-                    process = subprocess.run([str(probe), "-v", "error", "-show_entries", "stream=codec_type,width,height,sample_rate,channels,avg_frame_rate:format=duration", "-of", "json", str(path)], capture_output=True, text=True, timeout=15)
-                    if process.returncode:
-                        record["metadata_unavailable"] = process.stderr[-500:]
-                    else:
-                        record["streams"] = json.loads(process.stdout)
+    for role, item, given in given_media(settings, explicit):
+        path = Path(strip_virtual_media_suffix(item))
+        record = {"role": role, "ref": given, "media_type": _mcp_media_type(str(path))}
+        if record["media_type"] == "image":
+            with Image.open(path) as image:
+                record.update(zip(("width", "height"), upright_size(image)))
+        elif record["media_type"] in {"audio", "video"}:
+            if probe:
+                process = subprocess.run([str(probe), "-v", "error", "-show_entries", "stream=codec_type,width,height,sample_rate,channels,avg_frame_rate:format=duration", "-of", "json", str(path)], capture_output=True, text=True, timeout=15)
+                if process.returncode:
+                    record["metadata_unavailable"] = process.stderr[-500:]
                 else:
-                    record["metadata_unavailable"] = "ffprobe is not installed in this runtime; preflight will not download it."
-            result.append(record)
+                    probed = json.loads(process.stdout)
+                    for stream in probed.get("streams", []):
+                        if stream.get("codec_type") == "video" and "width" not in record:
+                            numerator, _, denominator = str(stream.get("avg_frame_rate") or "0/1").partition("/")
+                            record.update(width=stream.get("width"), height=stream.get("height"), **({"fps": round(float(numerator) / float(denominator), 3)} if float(denominator or 0) and float(numerator) else {}))
+                        elif stream.get("codec_type") == "audio" and "sample_rate" not in record:
+                            record.update(sample_rate=int(stream.get("sample_rate") or 0), channels=stream.get("channels"))
+                    if (duration := (probed.get("format") or {}).get("duration")) not in (None, "N/A"):
+                        _, part, _ = _resolve_virtual_audio_segment(str(item))  # a part (a view, |start_s=...) lasts from its start to its end
+                        record["duration_s"] = round(part.get("to", float(duration)) - part.get("ss", 0.0), 3)
+            else:
+                record["metadata_unavailable"] = "ffprobe is not installed in this runtime; preflight will not download it."
+        result.append(record)
     return result
 
 
-def window_report(model_def, effective, fps, diagnostics, index, frames_maximum=None):
-    """Sliding windows of one video generation as WanGP plans them: frames, the pictures each window receives and its prompt head."""
+def window_report(model_def, effective, fps, diagnostics, index, frames_maximum=None, names=None):
+    """Sliding windows of one video generation as WanGP plans them: frames, the pictures each window receives (named by the caller's
+    references, names: resolved path -> reference) and, when there are several windows, the head of each one's prompt."""
     from shared.prompt_enhancer.images import window_contexts, window_plan
     from shared.utils import prompt_parser
 
@@ -87,7 +107,8 @@ def window_report(model_def, effective, fps, diagnostics, index, frames_maximum=
     contexts = window_contexts(windows, start, ends, refs, fps=fps, window_size=window_size, positions=effective.get("frames_positions", "") if "F" in video_prompt_type else "", reset_alignment="T" in video_prompt_type,
                                extract_from_window_start=model_def.get("extract_guide_from_window_start", False), discard_frames=discard, reuse_frames=default_overlap, main_reference="K" in video_prompt_type, picture_labels=model_def.get("prompt_enhancer_picture_labels", False))
     plan = [{"window": number, "generated_frames": window["frame_num"], "generated_seconds": round(window["frame_num"] / fps, 3), "new_frames": window["output_frames"], "seconds": round(window["output_frames"] / fps, 3), "overlap_frames": window["overlap_frames"],
-             **({"new_shot": True} if window.get("new_shot") else {}), "pictures": [f"{label} ({Path(str(image)).name})" for image, label in zip(context.images, context.labels)], "prompt": prompt[:100]}
+             **({"new_shot": True} if window.get("new_shot") else {}), "pictures": [f"{label} ({(names or {}).get(str(image), Path(str(image)).name)})" for image, label in zip(context.images, context.labels)],
+             **({"prompt": prompt[:100]} if len(windows) > 1 else {})}  # one window's prompt is the caller's own
             for number, (window, context, prompt) in enumerate(zip(windows, contexts, expanded), 1)]
     warning = prompt_parser.validate_sliding_window_prompt_boundaries(prompts, mode, ends)
     if "W" in mode and len(prompts) != len(windows):
@@ -116,9 +137,10 @@ def check_speech_length(model_def, effective, resolve_media):
     audio_prompt_type = effective.get("audio_prompt_type", "")
     if not (effective.get("audio_guide") and effective.get("video_length")) or "A" not in audio_prompt_type or "F" in audio_prompt_type or model_def.get("video_length_not_limited_by_audio"):
         return
-    from shared.utils.audio_video import get_media_duration_and_audio_layouts
+    from shared.utils.audio_video import _resolve_virtual_audio_segment, get_media_duration_and_audio_layouts
 
-    duration = get_media_duration_and_audio_layouts(resolve_media(effective["audio_guide"], "audio_guide"))[0]
+    source, part, _ = _resolve_virtual_audio_segment(resolve_media(effective["audio_guide"], "audio_guide"))  # a part of a file (|start_s=...) lasts from its start to its end
+    duration = part.get("to", get_media_duration_and_audio_layouts(source)[0]) - part.get("ss", 0.0)
     force = str(effective.get("force_fps") or "")
     fps = float(force) if force.isdigit() else float(model_def.get("fps", 16))
     minimum, step, offset = model_def.get("frames_minimum", 5), model_def.get("latent_size", model_def.get("frames_steps", 4)), model_def.get("frames_offset", 1)
@@ -200,7 +222,9 @@ def preflight(session, prepare_generation, prepare_postprocess, settings=None, m
                         "inactive_settings": inactive, "media_inputs": schema.get("media_inputs", {}),
                         "availability": session.get_model_availability(model_type),
                         "checks_unavailable": ["Ancillary/optional processor downloads and model-specific inference checks are not covered by checkpoint availability.", "Settings copied from profiles/templates are explicit inputs; their original source cannot be inferred."]}
-                task["inputs"] = input_metadata(session, supplied)
+                task["inputs"] = input_metadata(session, supplied, explicit)
+                names = {str(item): given for _, item, given in given_media(supplied, explicit)}
+                given_roles = {role for role, _, _ in given_media(supplied, explicit) if explicit.get(role) is not None}  # their only change is the reference resolved to a file
                 task["active_modes"] = {key: effective.get(key, "") for key in ("image_prompt_type", "video_prompt_type", "audio_prompt_type")}
                 task["declared_limits"] = {key: schema[key] for key in ("frames_minimum", "frames_maximum", "frames_steps", "sliding_window") if schema.get(key) is not None}
                 resolution = effective.get("resolution")
@@ -231,12 +255,12 @@ def preflight(session, prepare_generation, prepare_postprocess, settings=None, m
                     task["sizing"]["scope"] = "Initial canvas/input sizing, before model-specific processing or optional upscaling; later windows may use other inputs."
                 fps = float(effective.get("force_fps") or 0) or schema.get("fps")
                 if effective.get("video_length") and fps and not (model_def.get("audio_only") or model_def.get("image_outputs") or model_def.get("mesh_outputs")):
-                    task["requested_video"] = {"frames": int(effective["video_length"]), "fps": float(fps), "duration_seconds": int(effective["video_length"]) / float(fps)}
+                    task["requested_video"] = {"frames": int(effective["video_length"]), "fps": float(fps), "duration_seconds": round(int(effective["video_length"]) / float(fps), 3)}
                     if model_def.get("sliding_window") and effective.get("image_mode", 0) == 0:
                         if any(flag in effective.get("image_prompt_type", "") for flag in "VL"):
                             task["checks_unavailable"].append("The window plan of a continued video depends on its retained source frames and is resolved during generation.")
                         else:
-                            task["window_plan"] = window_report(model_def, effective, float(fps), report["diagnostics"], index, schema.get("frames_maximum"))
+                            task["window_plan"] = window_report(model_def, effective, float(fps), report["diagnostics"], index, schema.get("frames_maximum"), names)
                 if model_def.get("audio_only") and effective.get("duration_seconds"):
                     task["target_audio_duration_seconds"] = effective["duration_seconds"]
                 selected = effective.get("activated_loras") or []
@@ -266,7 +290,7 @@ def preflight(session, prepare_generation, prepare_postprocess, settings=None, m
                     task.pop("settings")
                     task.pop("sources")
                     # Show normalization and injected defaults, not a second copy of the request.
-                    task["adjustments"] = {key: value for key, value in effective.items() if (key in supplied or key in task["active_modes"] and value) and explicit.get(key) != value and key not in inactive}
+                    task["adjustments"] = {key: value for key, value in effective.items() if (key in supplied or key in task["active_modes"] and value) and explicit.get(key) != value and key not in inactive and key not in given_roles}
                     resolved_text = {key: len(task["adjustments"].pop(key)) for key in ("prompt", "alt_prompt", "negative_prompt") if isinstance(task["adjustments"].get(key), str)}
                     if resolved_text:
                         task["resolved_text_lengths"] = resolved_text
@@ -274,6 +298,9 @@ def preflight(session, prepare_generation, prepare_postprocess, settings=None, m
                         task["adjustments"]["custom_settings"] = {key: value for key, value in task["adjustments"]["custom_settings"].items() if f"custom_settings.{key}" not in inactive}
                     task["media_inputs"] = {kind: inputs if kind == "custom_file" else {key: value for key, value in inputs.items() if value} for kind, inputs in task["media_inputs"].items() if any(inputs.values())}
                     task["active_modes"] = {key: value for key, value in task["active_modes"].items() if value}
+                    task["availability"] = {key: task["availability"][key] for key in ("status", "available")}
+                    if "sizing" in task:  # the report's limitations say what sizing does not predict
+                        task["sizing"].pop("scope")
                 report["tasks"].append(task)
                 if not task["availability"]["available"]:
                     report["diagnostics"].append({"severity": "warning", "task": index, "message": "Model checkpoint availability is partial or missing; execution may require downloads."})
@@ -283,6 +310,14 @@ def preflight(session, prepare_generation, prepare_postprocess, settings=None, m
             from .server import _is_media_id
             task, details = prepare_postprocess(media_id=media if _is_media_id(media) else None, path=None if _is_media_id(media) else media, process=process, parameters=parameters)
             report["tasks"].append({**details, **({"settings": task} if detail == "full" else {}), "checks_unavailable": ["Processor weight/download availability and runtime memory requirements."]})
+        if detail == "summary" and len(report["tasks"]) > 1:  # a batch: what every task shares is said once, not once per task
+            first, others = report["tasks"][0], report["tasks"][1:]
+            shared = [key for key in first if key != "index" and all(key in task and task[key] == first[key] for task in others)]
+            if shared:
+                report["every_task"] = {key: first[key] for key in shared}
+                for task in report["tasks"]:
+                    for key in shared:
+                        task.pop(key)
         report["valid"] = not any(item["severity"] == "error" for item in report["diagnostics"])
     except (ValueError, TypeError, KeyError, OSError, subprocess.TimeoutExpired) as exc:
         report["diagnostics"].append({"severity": "error", "message": str(exc)})

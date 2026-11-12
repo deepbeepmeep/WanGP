@@ -67,7 +67,7 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 **Official WanGP Web Site**: https://wangp.ai/
 
 > [!IMPORTANT]
-> **WanGP is free to use locally.** The official project will never ask you to pay a license fee, subscription, or donation to run WanGP on your own computer (see the license for terms).
+> **WanGP is free to use locally, at home or at work.** The official project will never ask you to pay a license fee, subscription, or donation to run WanGP on your own computer (see the license for terms). If you like WanGP, a ⭐ [star on GitHub](https://github.com/deepbeepmeep/WanGP) is always appreciated: it helps others find the project.
 >
 > **Use only the official GitHub repository or wangp.ai / wan2gp.ai websites. WanGP is not affiliated to any other third-party service using the WanGP/Wan2GP names**, unless explicitly stated here.
 
@@ -83,7 +83,7 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 ## 🔥 Latest Updates : 
 
-## 10th of November 2026: WanGP v19.29 - Bonus Track
+## 12th of November 2026: WanGP v19.291 - Bonus Track
 - **Qwen Image 2.1 Viggle Image Swap**: a Qwen Image 2.1 variant and **Showrunner's default frame painter for Viggle Remake character swaps**. Replace one or several people in **6 steps**, keeping their poses, expressions and the scene's framing. Add the **source picture first**, then one **character sheet** per person; the picture's aspect ratio is preserved at about **1 megapixel**. Results can be slightly darker.
 
 - **H3 HyperFlow LoRA**: bring **8-step** generation to the standard and Pruned **Ref2VA** models with the new **HyperFlow Ref2VA 8 Steps** accelerator profile.
@@ -96,8 +96,13 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 - **Official H3-Image**: MiniMax's own image model generates from text, or edits and combines up to **16 reference images**, in **6 steps**. It works best around **16 megapixels** with detailed descriptions; dedicated prompt enhancers help expand short requests. Choose the full **33B** model or **Pruned 20B**, which produces nearly identical images with a smaller download and faster loading. H3 Image seems to be the **best image swapper** for Viggle.
 
+- **H3-Image: pDMD + LoRAs**: generate in **2 steps** for speed or **4 steps** for crisper detail. Two-step denoising takes less than half the time of the usual six steps; tested 4 MP images finish about **25% sooner** overall. H3-Image now shares the H3 LoRA list, so you can also try video style, realism and character LoRAs on stills, though their effect may be weaker or different.
+
 - **Faster Deepy and Prompt Enhancer on Qwen3.8 27B**: once **GGUF kernels 1.0.30** are installed, Deepy writes its answers, tool calls and image or video inspections faster with the same quality: **up to 19% faster** with the **Q3** and **Q2** checkpoints and about **4%** with **Q4**. The new optional **Faster Context Reading** setting lets Deepy read tool results, documents and restored conversations **up to twice as fast**, for about 140 MB of VRAM while reading.
 
+- **Showrunner: choose who sings**: have an uploaded or generated song sung by a cast member or a supplied voice sample, including **two voices for a duet**. Use **Change the voice** on an existing song or **Sung by** before composing. The music, lyrics and timing stay, so existing shots keep their lip sync. Requires **SeedVC v1.0 Singing** in **Configuration > Extensions**.
+
+- **Low RAM Continue Video**: extend a video without loading the whole source into RAM. WanGP reads the ending frames for generation. Then WanGP adds each new window without re-encoding the earlier one if resolution remains unchanged. Wont work if upscaling, film grain or HDR conversion is required. For long videos, the **Media Flow** app is still recommended.
 
 
 ## 8th of November 2026: WanGP v19.25 - Showrunner Makes and Remakes

@@ -70,6 +70,7 @@ class Showrunner:
         self.store, self.host = store, host
         self.director = Director(store, host, settle=self.settle)
         self._renders: dict[tuple[str, str], Any] = {}
+        self._voice_changes: set[str] = set()  # productions whose song is changing voice
         self._render_lock = threading.Lock()
         self._analysis_lock = threading.Lock()
 
@@ -211,6 +212,71 @@ class Showrunner:
                 cache.write_text(json.dumps(analysis), encoding="utf-8")
         production.apply([{"op": "audio", "analysis": analysis}], by="system", record=False)
         return analysis
+
+    def change_singer_voice(self, production, samples: list[Path], *, by: str, on_progress=None) -> dict[str, Any]:
+        """The production's song sung in other voices, by WanGP's SeedVC audio processor as it is (it takes the singing out of the music, converts
+        it and puts the music back). samples: one voice sample, or two for a duet in the order their voices are first heard. The new version
+        becomes the song, the former one goes to the bin."""
+        doc = production.snapshot()
+        song = production.resolve(doc["brief"].get("song"))
+        if song is None or not song.is_file():
+            raise ValueError("This production has no song yet.")
+        if not 1 <= len(samples) <= 2:
+            raise ValueError("One singer, or two for a duet: SeedVC tells two voices apart, not more.")
+        made = production.adopt(self.host.replace_singer_voice(song, samples, self.host.production_workspace(doc["title"], production.folder / "media"), on_progress=on_progress))
+        former = {**self.take_facts(production, song), "name": f"{song.stem} (former voice){song.suffix}"}
+        production.apply([{"op": "bin_add", "item": former}, {"op": "brief", "fields": {"song": made}}], by=by)
+        self.analysis(production.id, refresh=True)
+        return {"song": made, "former": doc["brief"]["song"]}
+
+    @staticmethod
+    def singers(doc: dict[str, Any], members: list[dict[str, Any] | None]) -> None:
+        """Checks who sings: one, or two for a duet, each a cast member with a voice (a sample or a description) or None for a voice sample."""
+        if not 1 <= len(members) <= 2:
+            raise ValueError("One singer, or two for a duet: SeedVC tells two voices apart, not more.")
+        for member in members:
+            if member is not None and not member.get("voice") and not str(member.get("voice_description") or "").strip():
+                raise ValueError(f"{member['name'] or member['id']} has no voice yet: give them a voice sample, or describe their voice, on the Cast page.")
+
+    def change_singer_voice_directly(self, production_id: str, singers: list[str]) -> dict[str, Any]:
+        """Change the song's singing voices without the showrunner, in the background. singers: one, or two for a duet, in the order their voices
+        are first heard in the song: cast ids (their voice sample, made first from their voice description when they have none) or voice samples
+        of the production (their paths)."""
+        production = self.store.get(production_id)
+        if self.director.status(production_id)["running"]:
+            raise RuntimeError("The showrunner is working on this production: this comes back when it finishes, or after Pause or Stop.")
+        doc = production.snapshot()
+        if not doc["brief"].get("song"):
+            raise ValueError("This production has no song yet.")
+        if unavailable := self.host.singer_voice_unavailable():
+            raise ValueError(unavailable)
+        cast = {member["id"]: member for member in doc["cast"]}
+        entries = [(cast.get(singer), None if singer in cast else singer) for singer in singers]
+        self.singers(doc, [member for member, _ in entries])
+        with self._render_lock:
+            if production_id in self._voice_changes:
+                raise RuntimeError("The singer's voice is already changing.")
+            self._voice_changes.add(production_id)
+        threading.Thread(target=self._change_singer_voice, args=(production, entries), daemon=True).start()
+        return {"status": "changing"}
+
+    def _change_singer_voice(self, production, entries):
+        publish = lambda **fields: self.store.publish({"type": "song_voice", "production": production.id, **fields})
+        context = _DirectContext(self, production)
+        try:
+            publish(progress=0, status="Waiting for the GPU")
+            with self.host.gpu_turn(context.cancelled):  # never beside a language model, after the showrunners at work
+                publish(progress=0, status="Changing the singer's voice")
+                toolbox, doc = ShowrunnerToolbox(self), production.snapshot()
+                catalog = self.catalog(doc)  # a voice made from its description is kept on the card, as the showrunner's are
+                samples = [production.resolve(toolbox._voice(context, production, member, catalog, templates.effective(doc, catalog))[0] if member else path) for member, path in entries]
+                self.change_singer_voice(production, samples, by="user", on_progress=lambda update: publish(progress=getattr(update, "progress", None), status=getattr(update, "status", "")))
+            publish(done=True)
+        except Exception as failure:
+            publish(done=True, error=str(failure))
+        finally:
+            with self._render_lock:
+                self._voice_changes.discard(production.id)
 
     @staticmethod
     def _delivered(shot: dict[str, Any], fps: float) -> tuple[int, int]:
@@ -522,8 +588,8 @@ class Showrunner:
             settings = {"template": template, **{key: value for key, value in settings.items() if key in CONTENT_SETTINGS}}
             if entry is not None and not entry["refs"]:
                 settings.pop("image_refs", None)
-            if entry is not None and entry["soundtrack"] and not entry["audio"] and settings.get("audio_guide"):
-                settings["audio_prompt_type"] = "AS"  # as render: a reference template follows the driving audio as its soundtrack
+        if letters := templates.soundtrack_letters(shot, entry, settings):
+            settings["audio_prompt_type"] = letters  # as render: the driving audio kept as the soundtrack the picture follows
         settings.update(templates.planned_length(doc, shot, entry))  # the shot as it is now, not its last take's length
         if not settings.get("audio_guide") and templates.model_speaks(doc, shot, entry) and settings.get("prompt"):
             settings["prompt"] = templates.with_spoken_lines(doc, shot, entry, settings["prompt"])  # the shot's prompt does not hold its lines

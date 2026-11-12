@@ -12,11 +12,11 @@ from shared.remote_llm.config import QWEN38_FLASH_NEXT_VISIBLE
 
 LEGACY_EXTENSIONS_DEFAULTS_MIGRATED_KEY = "_extensions_defaults_migrated"
 EXTENSIONS_DEFAULTS_VERSION_KEY = "extensions_defaults_version"
-EXTENSIONS_DEFAULTS_TARGET_VERSION = Decimal("1.31")
+EXTENSIONS_DEFAULTS_TARGET_VERSION = Decimal("1.32")
 EXTENSIONS_DEFAULTS_TARGET_VERSION_TEXT = str(EXTENSIONS_DEFAULTS_TARGET_VERSION)
 INSTALLED_REMOTE_PLUGINS_KEY = "installed_remote_plugins"
 
-SEEDVC_MODE_CHOICES = [("v1.0 Speech", 1), ("v1.0 Singing / F0 44k", 2), ("v2 Speech", 3)]
+SEEDVC_MODE_CHOICES = [("v1.0 Singing", 2), ("v1.0 Speech", 1), ("v2 Speech", 3)]
 PROMPT_ENHANCER_CHOICES = [
     ("Florence 2 (image captioning) + LLama 3.2 3B (text generation)", 1),
     ("Florence 2 (image captioning) + Llama Joy 8B (uncensored, richer)", 2),
@@ -167,6 +167,11 @@ def _migrate_audio_processors_config(server_config, version: Decimal) -> bool:
                 del server_config[key]
                 changed = True
         changed = True
+    if version < Decimal("1.32"):
+        seedvc_config = audio_processor_api.read_config_section(server_config, SeedVCProcessor)
+        if sections.get("seedvc") != seedvc_config:
+            sections["seedvc"] = seedvc_config  # the former Off choice now selects v1.0 Singing; keep speech choices
+            changed = True
     changed = audio_processor_api.migrate_audio_processor_config(server_config) or changed
     return changed
 

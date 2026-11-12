@@ -28,7 +28,7 @@ from .excerpts import H3_AUDIO_EXCERPTS_SETTING, H3_VIDEO_EXCERPTS_SETTING, pars
 from .first_block_cache import MiniMaxH3FirstBlockCache
 from .interrupt import GenerationInterrupted
 from .h3_image import (H3_IMAGE_MAX_IMAGES, H3_IMAGE_MODEL, H3_IMAGE_PICTURE_LABEL, H3_IMAGE_REFERENCE_SHORT_EDGE, H3_IMAGE_VISION_SHORT_EDGE,
-                       bound_short_edge, canvas_size, h3_image_sigmas)
+                       bound_short_edge, canvas_size, h3_image_head_plans, h3_image_sigmas)
 from .p_h3_image import p_h3_image_sigmas, reference_size, size_at_area
 from .hyperflow import HYPERFLOW_STEPS, HYPERFLOW_VIDEO_SHIFT, checkpoint_lora_offsets, grid_tail_sigmas, video_sigmas as hyperflow_video_sigmas
 from .pdd import pdd_sampling_plans, pdd_sampling_plans_for_sigmas
@@ -893,7 +893,7 @@ class MiniMaxH3Pipeline:
         if self.h3_image and (int(guide_phases) > 1 or any(sigmas is not None for sigmas in custom_sigmas or ()) or starting_sigma is not None
                               or sample_solver != "euler" or self.transformer.cache is not None):
             raise ValueError("H3-Image samples one phase of 6 Euler steps on its own schedule, without custom sigmas or step skipping")
-        phase_1_sigmas = (h3_image_sigmas() if self.h3_image else  # the transformer has one output head per step of this grid
+        phase_1_sigmas = (h3_image_sigmas(int(sampling_steps)) if self.h3_image else  # 6 steps: the grid of the output heads; others: the pDMD grid
                           custom_sigmas[0] if custom_sigmas and custom_sigmas[0] is not None else p_h3_image_sigmas(int(sampling_steps)) if self.image_model else VIGGLE_REMAKE_SIGMAS[self.remake_mode] if self.remake_mode
                           else hyperflow_video_sigmas(sampling_steps) if hyperflow_phase_1 else None)
         phase_2_sigmas = (custom_sigmas[1] if custom_sigmas and len(custom_sigmas) > 1 and custom_sigmas[1] is not None
@@ -1179,7 +1179,8 @@ class MiniMaxH3Pipeline:
             raise ValueError(f"MiniMax H3 reference videos must total at most {reference_video_frame_limit(1, fps)} frames (found {sum(video.shape[1] for video in video_sources)})")
         soundtrack = "S" in (audio_prompt_type or "")  # the audio is the soundtrack: condition on it rather than reference it
         soundtrack_excerpts = "1" in (audio_prompt_type or "")  # K1: soundtrack excerpts become independent audio references
-        soundtrack_sources = (audio_guide, audio_guide2, audio_guide3) if not self.source_edit and "K" in (audio_prompt_type or "") and not soundtrack and not soundtrack_excerpts else (None, None, None)
+        # FL2VA's KS (K before) also gives its In-Context video its own sound; Ref2VA's KS keeps that sound for the soundtrack only
+        soundtrack_sources = (audio_guide, audio_guide2, audio_guide3) if not self.source_edit and "K" in (audio_prompt_type or "") and (not soundtrack or not self.reference_mode) and not soundtrack_excerpts else (None, None, None)
         soundtracks = [self._load_audio_reference(soundtrack_sources[index]) if soundtrack_sources[index] is not None else None for index in range(len(video_sources))]
         soundtracks = [None if track is None else track[..., :round(video.shape[1] / fps * AUDIO_SAMPLE_RATE)] for track, video in zip(soundtracks, video_sources)]  # each soundtrack matches its video
         for index, source in enumerate(video_sources):
@@ -1407,6 +1408,7 @@ class MiniMaxH3Pipeline:
                                          if freeze_audio else pdd_sampling_plans_for_sigmas(stage_sigmas_audio, 3.0, self.transformer.pdd_num_steps, grid_max_t))
             else:
                 stage_pdd_video_plans = stage_pdd_audio_plans = None
+            stage_head_plans = h3_image_head_plans(stage_sigmas_video) if self.transformer.step_heads else None  # H3-Image: the heads each step spans
             tau_denominator = max(1, model_steps - 1)
             denoising_start_step = 0 if starting_sigma is not None else int(round(model_steps * (1.0 - float(denoising_strength)), 4))
             mask_end_step = min(model_steps, denoising_start_step + math.ceil(model_steps * float(masking_strength))) if editable_mask is not None else 0
@@ -1448,8 +1450,8 @@ class MiniMaxH3Pipeline:
                     if pdd:
                         self.transformer.final_layer.video_out.set_plan(stage_pdd_video_plans[step:step + 1])
                         self.transformer.final_layer.audio_out.set_plan(stage_pdd_audio_plans[step:step + 1])
-                    elif self.transformer.step_heads:  # H3-Image: the output head of this step
-                        self.transformer.final_layer.video_out.set_plan(F.one_hot(torch.tensor([step]), self.transformer.step_heads).float())
+                    elif stage_head_plans is not None:
+                        self.transformer.final_layer.video_out.set_plan(stage_head_plans[step:step + 1])
                     if spectrum is not None:
                         spectrum.begin_step(step)
                     if first_block_cache is not None:

@@ -2,7 +2,7 @@
 // Brief: what to make, from which material, in which format and style. Every change saves itself.
 import { state, actions } from './app.js';
 import { api } from './api.js';
-import { icon, esc, fieldSaver, drawWave, formatTime, formatDuration, sectionColor, pickFiles, toast, confirmDialog, promptDialog, availability, AUDIO_ACCEPT, personFields } from './ui.js';
+import { icon, esc, fieldSaver, drawWave, formatTime, formatDuration, sectionColor, pickFiles, toast, confirmDialog, promptDialog, availability, menu, AUDIO_ACCEPT, personFields } from './ui.js';
 import { kindTiles, KINDS } from './home.js';
 import { bindRules, modelRows, openDefaultModels } from './models.js';
 
@@ -24,10 +24,11 @@ export function mountBrief(container, doc) {
   const root = container.querySelector('#brief');
   const save = fieldSaver((_, fields) => actions.ops([{ op: 'brief', fields }], { quiet: true }).catch(() => {}), 450);
   const queue = fields => save('brief', fields);
-  let audio = null, analysisRequested = false;
+  let audio = null, audioSong = null, analysisRequested = false;
 
   function render() {
     const doc = state.doc, brief = doc.brief;
+    if (audio && audioSong !== brief.song) { audio.pause(); audio = null; }  // a new song (a new voice, another file) plays from its own file
     const kind = KINDS[brief.kind] || KINDS.free;
     const narrative = ['short_film', 'trailer', 'story', 'music_video'].includes(brief.kind), lyrics = brief.kind === 'music_video';  // a music video's script is its lyrics
     const analysis = doc.audio?.analysis;
@@ -47,7 +48,8 @@ export function mountBrief(container, doc) {
         <div class="field" style="margin-top:12px"><div class="label">${icon('clock')} Shots rendered together <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">short shots render with their neighbours: alone, the lips barely follow the speech</span></div>
           <div class="slider-row" style="justify-content:flex-start"><span class="muted">at least</span><input class="input" id="render-min" type="number" min="0" max="15" step="1" value="${brief.render_min_s ?? 0}" aria-label="Shortest render in seconds" title="Consecutive shots join until a render lasts this long; 0 renders every shot alone" style="width:76px;flex:none;padding:6px 8px"><span class="muted">to</span>
             <input class="input" id="render-max" type="number" min="1" max="15" step="1" value="${brief.render_max_s ?? ''}" placeholder="Auto" aria-label="Longest render in seconds" title="The longest render of shots together; Auto is the model's window" style="width:76px;flex:none;padding:6px 8px"><span class="muted">s</span></div></div></section>` : `<section class="panel"><div class="panel-head"><span class="num">3</span><h3>${brief.kind === 'music_video' ? 'The song' : 'Soundtrack'}</h3><span class="hint">${brief.kind === 'music_video' ? 'Drives timing, cuts and lip sync' : 'Optional: music the edit follows'}</span></div>
-        <div id="song">${brief.song ? songCard(doc, analysis) : dropzone('song', AUDIO_ACCEPT + ',video/*', 'Drop the song here', `or click to choose a file · WAV, MP3, FLAC, M4A, or a video to take its audio${brief.kind === 'music_video' ? '. No song yet? Leave this empty: the showrunner composes one from your idea and lyrics.' : ''}`)}</div></section>`}
+        <div id="song">${brief.song ? songCard(doc, analysis) : dropzone('song', AUDIO_ACCEPT + ',video/*', 'Drop the song here', `or click to choose a file · WAV, MP3, FLAC, M4A, or a video to take its audio${brief.kind === 'music_video' ? '. No song yet? Leave this empty: the showrunner composes one from your idea and lyrics.' : ''}`)}</div>
+        ${!brief.song && brief.kind === 'music_video' ? sungBy(doc) : ''}</section>`}
 
       <section class="panel"><div class="panel-head"><span class="num">4</span><h3>References</h3><span class="hint">Looks, places, moods, motion: images or videos</span></div>
         <div class="refs">${brief.references.map((path, index) => reference(path, index)).join('')}
@@ -106,10 +108,23 @@ export function mountBrief(container, doc) {
     bind();
     renderModels();
     if (brief.song) drawSong();
+    if ((brief.song || brief.kind === 'music_video') && state.singerVoice === undefined) {
+      state.singerVoice = null;
+      refreshSingerVoice();
+    }
     if (brief.song && !analysisRequested) {  // cheap when cached; recomputed when the song or the analysis changed
       analysisRequested = true;
       api.analysis(doc.id).catch(error => toast(error.message, 'error'));
     }
+  }
+
+  function refreshSingerVoice() {
+    if (!state.doc.brief.song && state.doc.brief.kind !== 'music_video') return;
+    api.singerVoice().then(data => {
+      const changed = state.singerVoice !== data.unavailable;
+      state.singerVoice = data.unavailable;
+      if (changed && root.isConnected) render();
+    }).catch(() => { state.singerVoice = undefined; });
   }
 
   function bind() {
@@ -180,6 +195,25 @@ export function mountBrief(container, doc) {
       actions.ops([{ op: 'brief', fields: { references } }]).then(render);
     });
     root.querySelector('#song-remove')?.addEventListener('click', () => { audio?.pause(); actions.ops([{ op: 'brief', fields: { song: null } }, { op: 'audio', analysis: null }]).then(render); });
+    root.querySelector('#song-voice')?.addEventListener('click', event => menu(event.currentTarget, [
+      ...state.doc.cast.filter(member => !isPlace(member)).map(member => ({
+        label: `${member.name || member.id}'s voice`, icon: 'users', action: () => changeVoice([member.id]),
+        unavailable: hasVoice(member) ? '' : 'Give them a voice sample, or describe their voice, on the Cast page' })),
+      { label: 'A voice sample from my computer…', icon: 'upload', action: async () => {
+        const files = await pickFiles(AUDIO_ACCEPT, false);
+        if (!files.length) return;
+        const [sample] = await actions.upload([...files].slice(0, 1), 'bin');
+        if (sample?.path) changeVoice([sample.path]);
+      } },
+      { label: 'Two singers (a duet)…', icon: 'users', action: () => duetDialog([...castSingers(),
+        ...state.doc.bin.filter(item => item.kind === 'audio' && item.path !== state.doc.brief.song).map(item => ({ value: item.path, label: `Media bin: ${item.name || item.path.split('/').pop()}` }))], changeVoice) },
+    ]));
+    root.querySelector('#song-voices')?.addEventListener('change', event => {  // who sings the song the showrunner composes
+      const setSingers = singers => actions.ops([{ op: 'brief', fields: { song_voices: singers } }]).then(render);
+      if (event.target.value !== 'duet') return setSingers(event.target.value ? event.target.value.split(',') : []);
+      render();  // the list shows the current choice again while the dialog asks for the duet
+      duetDialog(castSingers(), setSingers, 'Choose');
+    });
     root.querySelector('#song-play')?.addEventListener('click', togglePlay);
     root.querySelector('.song-wave')?.addEventListener('click', event => {
       const rect = event.currentTarget.getBoundingClientRect();
@@ -253,9 +287,49 @@ export function mountBrief(container, doc) {
     setTimeout(render, 150);
   }
 
+  // The song sung in other voices (SeedVC: the music, words and timing stay), in the background: its progress shows on the song card.
+  // singers: cast ids or voice samples of the production, first heard first (two for a duet).
+  async function changeVoice(singers) {
+    try { await api.songVoice(state.doc.id, singers); }  // its events show the progress, the first one at once
+    catch (error) { toast(error.message, 'error', 8000); }
+  }
+
+  const castSingers = () => state.doc.cast.filter(member => !isPlace(member) && hasVoice(member)).map(member => ({ value: member.id, label: member.name || member.id }));
+
+  // A duet: SeedVC tells the song's two voices apart and gives each its own, in the order they are first heard. singers: the choices
+  // ({value, label}); onChoose receives the two values chosen, first heard first; ok names what the button does.
+  function duetDialog(singers, onChoose, ok = 'Change the voices') {
+    if (singers.length < 2) { toast('A duet needs two voices: give two cast members a voice on the Cast page, or drop voice samples in the media bin.', 'error', 8000); return; }
+    const order = [], known = new Set(singers.map(singer => singer.value));  // the plan's singers as they first sing, else the list's order
+    [...state.doc.shots].filter(shot => shot.audio_slice).sort((a, b) => a.audio_slice[0] - b.audio_slice[0])
+      .forEach(shot => (shot.dialogue || []).forEach(line => { if (known.has(line.speaker) && !order.includes(line.speaker)) order.push(line.speaker); }));
+    singers.forEach(singer => { if (!order.includes(singer.value)) order.push(singer.value); });
+    const select = (id, chosen) => `<select class="select" id="${id}" style="width:100%">${singers.map(singer => `<option value="${esc(singer.value)}" ${singer.value === chosen ? 'selected' : ''}>${esc(singer.label)}</option>`).join('')}</select>`;
+    const back = document.createElement('div');
+    back.className = 'modal-back';
+    back.innerHTML = `<div class="modal" role="dialog" aria-modal="true"><h3>Two singers</h3><p>SeedVC tells the two voices of the song apart, in the order they are first heard, and gives each its new voice.</p>
+      <div class="field"><div class="label">First voice heard</div>${select('duet-first', order[0])}</div>
+      <div class="field"><div class="label">Second voice heard</div>${select('duet-second', order[1])}</div>
+      <div class="actions"><button class="btn ghost" data-r="0">Cancel</button><button class="btn primary" data-r="1">${esc(ok)}</button></div></div>`;
+    const close = () => { back.remove(); document.removeEventListener('keydown', keys); };
+    const keys = event => { if (event.key === 'Escape') { event.stopPropagation(); close(); } };
+    back.addEventListener('click', event => {
+      if (event.target === back) return close();
+      const button = event.target.closest('[data-r]');
+      if (!button) return;
+      const chosen = ['#duet-first', '#duet-second'].map(id => back.querySelector(id).value);
+      if (button.dataset.r === '1' && chosen[0] === chosen[1]) return toast('Choose two different voices.', 'error');
+      if (button.dataset.r === '1') onChoose(chosen);
+      close();
+    });
+    document.addEventListener('keydown', keys);
+    document.getElementById('overlay-root').append(back);
+  }
+
   function ensureAudio() {
     if (!audio) {
-      audio = new Audio(actions.file(state.doc.brief.song));
+      audioSong = state.doc.brief.song;
+      audio = new Audio(actions.file(audioSong));
       audio.ontimeupdate = () => drawSong();
       audio.onended = () => updatePlayButton();
     }
@@ -275,6 +349,7 @@ export function mountBrief(container, doc) {
 
   render();
   return {
+    refreshSingerVoice,
     update(doc) {
       const active = document.activeElement;
       if (active && root.contains(active) && active.matches('textarea, input')) return;  // keep what the user is typing
@@ -283,6 +358,11 @@ export function mountBrief(container, doc) {
     destroy() { audio?.pause(); save.flush(); },
     suspend() { audio?.pause(); updatePlayButton(); },
     theme: drawSong,
+    songVoice() {  // the song card shows how the new voice is coming along
+      const status = root.querySelector('#song-voice-status');
+      if (status && state.songVoice) status.innerHTML = songVoiceStatus();
+      else this.update(state.doc);
+    },
   };
 }
 
@@ -302,6 +382,27 @@ function dropzone(role, accept, title, text) {
   return `<div class="dropzone" data-drop="${role}"><span class="dz-icon">${icon(role === 'song' ? 'music' : 'upload')}</span><span><b>${esc(title)}</b>${esc(text)}</span></div>`;
 }
 
+const isPlace = member => ['place', 'location', 'set'].includes((member.role || '').trim().toLowerCase());
+const hasVoice = member => !!(member.voice || (member.voice_description || '').trim());
+
+// Who sings the song the showrunner composes: song models take no voice, so it composes the song, then has it sung in these voices.
+function sungBy(doc) {
+  const voiced = doc.cast.filter(member => !isPlace(member) && hasVoice(member)), chosen = doc.brief.song_voices || [];
+  const name = id => doc.cast.find(member => member.id === id)?.name || id;
+  const options = [`<option value="" ${chosen.length ? '' : 'selected'}>The song model's own voice</option>`,
+    ...voiced.map(member => `<option value="${esc(member.id)}" ${chosen.length === 1 && chosen[0] === member.id ? 'selected' : ''}>${esc(member.name || member.id)}</option>`),
+    ...(chosen.length === 2 ? [`<option value="${esc(chosen.join(','))}" selected>${esc(chosen.map(name).join(', then '))} (a duet)</option>`] : []),
+    ...(voiced.length >= 2 ? ['<option value="duet">Two singers (a duet)…</option>'] : [])];
+  return `<div class="row" style="gap:10px;margin-top:10px;flex-wrap:wrap;align-items:center"><span class="label" style="margin:0">${icon('audio')} Sung by</span>
+    <select class="select" id="song-voices" style="width:auto" ${availability(state.singerVoice, "The showrunner composes the song, then has it sung in this voice: song models cannot sing in a given voice. The music, the words and their timing stay.")}>${options.join('')}</select>
+    ${voiced.length ? '' : '<span class="muted" style="font-size:12.5px">Give a cast member a voice sample on the Cast page to have the song sung in it.</span>'}</div>`;
+}
+
+function songVoiceStatus() {
+  const { progress, status } = state.songVoice;
+  return `<span class="spinner"></span>${esc(status || 'Changing the voice')}${progress != null && progress > 0 ? ` ${Math.round(progress)}%` : '…'}`;
+}
+
 function songCard(doc, analysis) {
   const sections = analysis?.sections || [];
   const duration = analysis?.duration_s || 1;
@@ -311,6 +412,8 @@ function songCard(doc, analysis) {
       <div class="grow"><b>${esc(name)}</b><div class="muted mono" id="song-time">0:00 / ${formatTime(duration)}</div></div>
       ${analysis ? `<div class="song-stats"><span class="chip">${icon('music')}${analysis.bpm ? `${Math.round(analysis.bpm)} BPM` : 'Free tempo'}</span><span class="chip">${icon('layers')}${sections.length} ${sections.length === 1 ? 'section' : 'sections'}</span><span class="chip">${icon('clock')}${formatDuration(duration)}</span></div>`
         : `<span class="chip"><span class="spinner"></span>Listening to the song…</span>`}
+      ${state.songVoice ? `<span class="chip" id="song-voice-status">${songVoiceStatus()}</span>`
+        : `<button class="btn ghost small" id="song-voice" ${availability(state.singerVoice, "Have the song sung in another voice: a cast member's or a voice sample's. The music, the words and their timing stay, and the former version goes to the bin.")}>${icon('audio')} Change the voice</button>`}
       <button class="btn ghost small icon" id="song-remove" title="Remove the song">${icon('x')}</button></div>
     <div class="song-wave"><canvas id="song-canvas"></canvas>
       ${sections.map(section => `<div style="position:absolute;top:0;height:5px;left:${100 * section.start_s / duration}%;width:${100 * (section.end_s - section.start_s) / duration}%;background:${sectionColor(section.name)}"></div>`).join('')}</div>

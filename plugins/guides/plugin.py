@@ -50,6 +50,7 @@ class GuidesPlugin(WAN2GPPlugin):
         with open("docs/WORKSPACES.md", "r", encoding="utf-8") as reader:
             workspaces = reader.read()
 
+        gr.Markdown("⭐ **WanGP is free to use, at home or at work.** If you like it, please give it a [star on GitHub](https://github.com/deepbeepmeep/WanGP): it helps others find the project.")
         with gr.Tabs():
             with gr.Tab("Overview", id="overview"):
                 gr.Markdown(overview, elem_id="guides_overview_markdown")

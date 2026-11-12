@@ -269,7 +269,7 @@ The source part is defined by `model_def["audio_prompt_type_sources"]`. Common p
 | `P` | Treat two audio sources as parallel speaker/audio tracks. |
 | `K` | Use the control video's audio track as the audio prompt. Requires a control video mode. |
 | `O` | Output/generated-audio selector for models that otherwise reuse the input audio as the soundtrack. |
-| `S` | Keep the input audio (from `A` or `K`) as the output soundtrack: the video follows it and WanGP puts the original audio in the final file, in sync across sliding windows. Needed only where the audio would otherwise be imitated as a reference, for example H3 Ref2VA `AS` and `KS`; `O` still keeps the generated audio. |
+| `S` | Keep the input audio (from `A` or `K`) as the output soundtrack: the video follows it and WanGP puts the original audio in the final file, in sync across sliding windows. H3 Ref2VA `AS` and `KS` need it, as its `A` and `K` are references whose voice it imitates; H3 FL2VA and LTX-2 use `AS` and `KS` too, their earlier `A` and `K` alone still keeping the soundtrack. `O` still keeps the generated audio. |
 | `F` | Use the full audio guide instead of per-window audio slices. |
 | `0`, `1`, `2` | Model-specific source modes. For example, LTX-2 uses `1` inside `A1OF` for an ID-LoRA reference voice path and `2` for audio generation from control video plus text; DramaBox uses `0` to remove unexpected words. |
 | `T` | Recorded in saved media settings when a post-processing soundtrack used a separate audio source. Not a generation choice. |

@@ -52,6 +52,10 @@ class DirectorRequest(BaseModel):
     new_version: bool = True  # False: the task ends without assembling, the user makes the next version
 
 
+class SongVoiceRequest(BaseModel):
+    singers: list[str]  # who sings, first heard first (two for a duet): cast ids or voice samples of the production (their paths)
+
+
 class TemplatePick(BaseModel):
     role: str
     template: str | None = None
@@ -421,6 +425,15 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
     def rerun(production_id: str, shot_id: str):
         production(production_id)
         return showrunner.rerun(production_id, shot_id)
+
+    @app.get("/api/singer-voice")
+    def singer_voice():
+        return {"unavailable": showrunner.host.singer_voice_unavailable()}
+
+    @app.post("/api/productions/{production_id}/song-voice")
+    def song_voice(production_id: str, request: SongVoiceRequest):
+        production(production_id)
+        return showrunner.change_singer_voice_directly(production_id, request.singers)
 
     @app.post("/api/productions/{production_id}/render")
     def render_now(production_id: str, request: RenderRequest):

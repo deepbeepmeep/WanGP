@@ -274,10 +274,11 @@ class RoutedExperts(ExpertBank):
                 job.close()
             self._doorbell_jobs.clear()
 
-    def queue_forward(self, x, topk_ids, topk_weights, packed=None):
+    def queue_forward(self, x, topk_ids, topk_weights, packed=None, meanwhile=None):
         """Graph-safe forward on the current CUDA stream, so a captured graph replays the whole call without returning to Python: the CPU computes the selected experts in a job asked for by a kernel (the format's
         doorbell()), or else in a host function queued between the copy of the routing payload to pinned memory and the copy of its result back. With the Triton backend, the experts having GPU copies are computed
-        on the GPU instead, beside the CPU job; a placement change releases the graphs that read these copies. Failures are reported by raise_job_errors() once the stream has been synchronized."""
+        on the GPU instead, beside the CPU job; a placement change releases the graphs that read these copies. Failures are reported by raise_job_errors() once the stream has been synchronized.
+        meanwhile: called once the CPU has its request and the GPU its experts, before the wait for the answer: what the caller queues there runs while the CPU works."""
         shape = x.shape
         x = x.reshape(-1, self.hidden).contiguous()
         tokens, topk = topk_ids.shape
@@ -308,10 +309,14 @@ class RoutedExperts(ExpertBank):
                     self.format.gpu_forward(self, x, topk_ids, topk_weights, pointers, out=output, mid=mid)
             else:
                 output = torch.zeros(tokens, self.hidden, dtype=torch.float32, device=x.device)
+            if meanwhile is not None:
+                meanwhile()
             kernels.wait(job.ticket, job.result, output, True)
             if job.share is not None and not job.share[2]:  # the experts whose copies landed in VRAM while the CPU computed the others: the job wrote their rows before answering
                 self._share_forward(job, kernels, x, topk_ids, topk_weights, output, mid)
             return output.to(dtype=x.dtype).reshape(shape)
+        if meanwhile is not None:
+            meanwhile()
         if packed is None:
             packed = self.pack(x, topk_ids, topk_weights)
         if tokens not in self._jobs:

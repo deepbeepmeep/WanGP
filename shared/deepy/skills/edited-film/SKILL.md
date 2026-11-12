@@ -10,11 +10,13 @@ The timeline comes first: every shot, sound and subtitle is placed on it, and th
 ## 1. Timeline
 
 - Write the shot list in the plan document as a timeline: for each shot its source (generated clip, still, turntable, card), its length, what it shows and the words heard over it. An insert sits where the speech names its object.
-- Make one master image per recurring person and reuse it as the start image or reference of each of their shots.
+- Make one master image per recurring person and reuse it as the start image or reference of each of their shots. The shot template's
+  `wangp_templates` result says which one its model takes: `model.media_inputs.image` lists `reference` when it takes reference images,
+  `multiple_references` when it takes several (its `infos` give how many), and `start` for a start image.
 
 ## 2. Recurring objects
 
-- Anything designed elsewhere that a shot must show (an artifact in a display case, a product, a prop, a second character) goes into that shot's start image: edit it in from the person's master image and the object's image, then animate it. A video model told only the object's name invents another one, and the insert beside it then contradicts the shot.
+- Anything designed elsewhere that a shot must show (an artifact in a display case, a product, a prop, a second character) comes from its own image. With a model that takes several references (`multiple_references`), give that image beside the person's master in `image_refs` and bind each in the prompt: it keeps the object without fixing the frame. Otherwise it goes into that shot's start image: edit it in from the person's master image and the object's image, then animate it. A video model told only the object's name invents another one, and the insert beside it then contradicts the shot.
 - Compare the object in each shot with its own image before assembling, and the 3D model behind a turntable with the image it was built from.
 
 ## 3. Speech and sound
@@ -23,6 +25,11 @@ The timeline comes first: every shot, sound and subtitle is placed on it, and th
   or the user's recording) and speak every line with `gen_speech_from_sample` from it. Describing the voice again for each line gives
   another voice each time.
 - Drive each speaking shot by its own speech clip (`gen_video_with_speech`) with `video_length` set to the speech's duration in seconds (such as `"6.4s"`).
+- Two people talking in one shot: a model that takes audio references (`model.media_inputs.audio` lists `reference`; check the
+  `gen_video_with_speech` and the `gen_video_with_refs` defaults) can voice both. Give each speaker's voice sample (at least 2 s) as an audio reference (`audio_prompt_type` `AB`: `audio_guide`, `audio_guide2`),
+  bind it to that speaker's picture in the prompt (`<Subject 1> is the woman from <Picture 1>, speaking with the voice of <Audio 1>`),
+  and write the words the way its `prompt_infos` say. The model then says the words itself, less exactly than a spoken clip: keep one
+  speech clip per shot for a single speaker.
 - A line shorter than its shot: pad the clip with silence to the shot's length, and cut the shot about 0.35 s after the line ends. The
   model fills the silence with invented words, so the part after the line is not usable.
 - Describe a speaking shot as the person speaking to camera with natural lip movements synchronized, and nothing that competes with the mouth: no written line of dialogue, no language or audio mention, no smiling, waving or nodding. Written dialogue in the prompt leaves the lips still in about half of the shots.

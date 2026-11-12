@@ -1,7 +1,7 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 from threading import RLock
@@ -21,6 +21,8 @@ class VirtualMediaSpec:
     audio_track_no: int | None = None
     extras: tuple[tuple[str, str], ...] = ()
     pad_frames: int = 0
+    start_s: float | None = None  # a part in seconds: what an audio file has; a video's seconds are its frames at its real rate (in_frames)
+    end_s: float | None = None
 
     def as_suffix_items(self) -> list[tuple[str, str]]:
         items: list[tuple[str, str]] = []
@@ -28,6 +30,10 @@ class VirtualMediaSpec:
             items.append(("start_frame", str(int(self.start_frame))))
         if self.end_frame is not None:
             items.append(("end_frame", str(int(self.end_frame))))
+        if self.start_s is not None:
+            items.append(("start_s", _seconds_text(self.start_s)))
+        if self.end_s is not None:
+            items.append(("end_s", _seconds_text(self.end_s)))
         if self.audio_track_no is not None:
             items.append(("audio_track_no", str(int(self.audio_track_no))))
         if self.pad_frames:
@@ -99,10 +105,12 @@ def parse_virtual_media_path(value: Any) -> VirtualMediaSpec | None:
             extras.append((item, ""))
             continue
         value_text = raw_value.strip()
-        if key in ("start_frame", "end_frame", "audio_track_no", "pad_frames"):
+        if key in ("start_frame", "end_frame", "audio_track_no", "pad_frames", "start_s", "end_s"):
             values[key] = value_text
         else:
             extras.append((key, value_text))
+    if {"start_frame", "end_frame"} & values.keys() and {"start_s", "end_s"} & values.keys():
+        raise ValueError(f"Name a part in frames (start_frame, end_frame) or in seconds (start_s, end_s), not both: {text}")
     return VirtualMediaSpec(
         source_path=source_path,
         start_frame=_parse_int(values.get("start_frame"), 0),
@@ -110,7 +118,16 @@ def parse_virtual_media_path(value: Any) -> VirtualMediaSpec | None:
         audio_track_no=_parse_optional_int(values.get("audio_track_no")),
         extras=tuple(extras),
         pad_frames=_parse_int(values.get("pad_frames"), 0),
+        start_s=_parse_optional_seconds(values.get("start_s")),
+        end_s=_parse_optional_seconds(values.get("end_s")),
     )
+
+
+def in_frames(spec: VirtualMediaSpec, fps: float) -> VirtualMediaSpec:
+    """A part named in seconds as frames of a video at fps, its real rate: from the frame at start_s to the last one before end_s."""
+    if spec.start_s is None and spec.end_s is None:
+        return spec
+    return replace(spec, start_frame=0 if spec.start_s is None else round(spec.start_s * fps), end_frame=None if spec.end_s is None else round(spec.end_s * fps) - 1, start_s=None, end_s=None)
 
 
 def strip_virtual_media_suffix(value: Any) -> Any:
@@ -134,6 +151,8 @@ def build_virtual_media_path(
     audio_track_no: int | None = None,
     extras: dict[str, Any] | None = None,
     pad_frames: int = 0,
+    start_s: float | None = None,
+    end_s: float | None = None,
 ) -> str:
     base_path = str(source_path or "").strip()
     if len(base_path) == 0:
@@ -143,6 +162,10 @@ def build_virtual_media_path(
         parts.append(f"start_frame={int(start_frame)}")
     if end_frame is not None:
         parts.append(f"end_frame={int(end_frame)}")
+    if start_s is not None:
+        parts.append(f"start_s={_seconds_text(start_s)}")
+    if end_s is not None:
+        parts.append(f"end_s={_seconds_text(end_s)}")
     if audio_track_no is not None:
         parts.append(f"audio_track_no={int(audio_track_no)}")
     if pad_frames:
@@ -168,12 +191,17 @@ def replace_virtual_media_source(value: Any, source_path: str) -> Any:
         audio_track_no=spec.audio_track_no,
         extras=extras,
         pad_frames=spec.pad_frames,
+        start_s=spec.start_s,
+        end_s=spec.end_s,
     )
 
 
 def padded_virtual_media(value: Any, own_frames: int, total_frames: int) -> str:
     """A virtual video read as total_frames long, the frames past its own ones being those played backwards and forwards."""
     spec = parse_virtual_media_path(value)
+    if spec.start_s is not None or spec.end_s is not None:
+        from .video_decode import probe_video_stream_metadata
+        spec = in_frames(spec, probe_video_stream_metadata(spec.source_path)["fps_float"])
     return build_virtual_media_path(spec.source_path, start_frame=spec.start_frame, end_frame=spec.start_frame + own_frames - 1, audio_track_no=spec.audio_track_no, extras=dict(spec.extras), pad_frames=total_frames - own_frames)
 
 
@@ -269,6 +297,23 @@ def _parse_optional_int(value: Any) -> int | None:
         return int(text)
     except (TypeError, ValueError):
         return None
+
+
+def _parse_optional_seconds(value: Any) -> float | None:
+    text = str(value or "").strip()
+    if len(text) == 0:
+        return None
+    try:
+        seconds = float(text)
+    except ValueError:
+        raise ValueError(f"Seconds must be a number, not {text!r}") from None
+    if not seconds >= 0:
+        raise ValueError(f"Seconds cannot be negative: {text}")
+    return seconds
+
+
+def _seconds_text(seconds: float) -> str:
+    return f"{float(seconds):.6f}".rstrip("0").rstrip(".")
 
 
 def _resolve_relative_frame_index(value: int | None, total_frames: int, *, default_to_end: bool) -> int | None:

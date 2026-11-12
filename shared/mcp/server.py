@@ -26,7 +26,7 @@ from shared.mesh3d.glb import MESH_EXTENSIONS
 from shared.utils.gallery_sources import GALLERY_SOURCES, WORLD_EXTENSIONS, source_for_kind
 from shared.utils.gallery_media import disambiguate_gallery_media_ids, gallery_media_ids
 from shared.utils.setting_names import settings_error, split_settings
-from shared.utils.virtual_media import read_view
+from shared.utils.virtual_media import VIEW_FOLDER, parse_virtual_media_path, read_view
 from shared.deepy.video_tools import view_clip
 from shared.mcp.config import DEFAULT_PORT, server_port
 
@@ -786,8 +786,14 @@ def _is_media_id(value: Any) -> bool:
 
 
 def _resolve_mcp_media_reference(session, value: Any, label: str, allow_read_file_system: bool, file_access_policy=None, keep_view: bool = False) -> str:
-    """The file a reference names. A view (@views/...) comes as a real clip unless the caller reads views: keep_view."""
-    reference = str(value or "").strip()
+    """The file a reference names. A view (@views/...) or a part of a file (an id or a path followed by |start_s=..., |start_frame=...)
+    comes as a real clip, cut once, unless the caller reads them: keep_view."""
+    reference, _, part = str(value or "").strip().partition("|")
+    reference, part = reference.strip(), part.strip()
+    if part:
+        resolved = f"{_resolve_mcp_media_reference(session, reference, label, allow_read_file_system, file_access_policy, keep_view=True)}|{part}"
+        parse_virtual_media_path(resolved)  # a malformed part is refused here, not at generation
+        return resolved if keep_view else view_clip(resolved, Path(file_access_policy.output_roots[0]).resolve() / VIEW_FOLDER / ".cut")  # beside the views' own clips
     if not reference:
         raise ValueError(f"{label} is empty")
     if _is_media_id(reference):
@@ -1239,8 +1245,16 @@ def _resolve_toolbox_arguments(session, toolbox, action: str, arguments: dict[st
         value = value.strip()
         if not value or media_registry.get_media_record(toolbox.session, value) is not None:
             return value
-        media_path = _resolve_mcp_media_reference(session, value, parameter_name, allow_read_file_system, file_access_policy, keep_view=True)  # each action knows whether it reads views
-        record = media_registry.register_media(toolbox.session, media_path, source="gallery" if _is_media_id(value) else "filesystem")
+        base, _, part = value.partition("|")
+        base_record = media_registry.get_media_record(toolbox.session, base.strip()) if part.strip() else None
+        if base_record is not None:  # a part of the session's own media
+            media_path = f"{_resolve_existing_path(base_record['path'], parameter_name)}|{part.strip()}"
+            parse_virtual_media_path(media_path)
+        else:
+            media_path = _resolve_mcp_media_reference(session, value, parameter_name, allow_read_file_system, file_access_policy, keep_view=True)  # each action knows whether it reads views
+        if read_view(media_path) is None and parse_virtual_media_path(media_path) is not None:  # a part of a file: actions take it as a file of its own, cut once
+            media_path = view_clip(media_path, Path(file_access_policy.output_roots[0]).resolve() / VIEW_FOLDER / ".cut")
+        record = media_registry.register_media(toolbox.session, media_path, source="gallery" if _is_media_id(base.strip()) else "filesystem")
         if record is None:
             raise ValueError(f"Unsupported media file: {media_path}")
         return record["media_id"]
@@ -2290,10 +2304,14 @@ def _build_python_sandbox(session, toolbox, file_access_policy, call_tool=None):
         return _resolve_mcp_media_reference(session, reference, "ref", file_access_policy.read_enabled, file_access_policy)
 
     def resolve_part(reference):
-        """What wangp.video_frames reads: a video file, and the frames a view keeps of it."""
+        """What wangp.video_frames reads: a video file, and the frames a view or a part (|start_s=..., |start_frame=...) keeps of it."""
         record = media_registry.get_media_record(toolbox.session, reference)
         path = _resolve_existing_path(record["path"], "ref") if record is not None else _resolve_mcp_media_reference(session, reference, "ref", file_access_policy.read_enabled, file_access_policy, keep_view=True)
         view = read_view(path)
+        if view is None and (spec := parse_virtual_media_path(path)) is not None:
+            from shared.utils.video_decode import probe_video_stream_metadata
+            metadata = probe_video_stream_metadata(path)  # seconds read as frames at the file's real rate
+            return {"path": spec.source_path, "start_frame": metadata["virtual_start_frame"], "end_frame": metadata["virtual_end_frame"]}
         return {"path": path, "start_frame": 0, "end_frame": None} if view is None else {"path": view["source"], "start_frame": view["start_frame"], "end_frame": view["end_frame"]}
 
     def compact(record):

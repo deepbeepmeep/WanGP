@@ -331,8 +331,8 @@ def _srt(cues) -> str:
 
 def sung_srt(lines, song_start: float, total: float) -> str:
     """Subtitles of a cut that plays the song, from when its lines are really sung (check_song): a line stays until the next one when the pause between them is short; a line the song
-    does not sing gets no subtitle."""
-    sung = [(line["start_s"] - song_start, line["end_s"] - song_start, line["line"]) for line in lines if line["sung"] and 0.0 <= line["start_s"] - song_start < total]
+    does not sing gets no subtitle (one it sings unclearly keeps its place)."""
+    sung = [(line["start_s"] - song_start, line["end_s"] - song_start, line["line"]) for line in lines if line["start_s"] is not None and 0.0 <= line["start_s"] - song_start < total]
     cues = []
     for (start, end, text), following in zip(sung, sung[1:] + [None]):
         cues.append((start, following[0] - 0.05 if following and following[0] - end < 1.0 else min(end + 0.4, total), text))

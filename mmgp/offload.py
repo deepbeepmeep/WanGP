@@ -1590,12 +1590,12 @@ class _PinnedPool:
         registrations, device = [], torch.cuda.current_device()
         try:
             reserved, added = pinned.fits(plan.nbytes, cap), plan.copy_nbytes if plan.added is None else plan.added
-            if reserved and added and psutil.virtual_memory().available - added < POOL_RAM_FLOOR:
+            if reserved and psutil.virtual_memory().available - added < POOL_RAM_FLOOR:
                 self._drop_idle_pages(manager, POOL_RAM_FLOOR + added)
                 if psutil.virtual_memory().available - added < POOL_RAM_FLOOR: # the pages of its own experts in VRAM, before refusing
                     for residency in manager.expert_residency.values():
                         residency.release_copied_pages(wait=True)
-            if reserved and (not added or psutil.virtual_memory().available - added >= POOL_RAM_FLOOR):  # an entry taking no available RAM never makes it shorter
+            if reserved and psutil.virtual_memory().available - added >= POOL_RAM_FLOOR:  # also for an entry locked in place: under the floor its pages stay the system's to trim
                 for start, end, storages in plan.ranges:
                     registration = pinned.Registration(storages, start, end - start, device, kind="pool")
                     if int(registration.register()) != 0:

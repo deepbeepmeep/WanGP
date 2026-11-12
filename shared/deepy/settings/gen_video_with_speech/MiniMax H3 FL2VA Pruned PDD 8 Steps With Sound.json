@@ -8,7 +8,7 @@
     "flow_shift": 12,
     "prompt": "integrated_multimodal_description: [Shot 1] At blue hour, a tired bicycle courier in a yellow raincoat pedals through a narrow rain-soaked market street. The camera tracks beside her at wheel height, then rises smoothly into a medium close-up as she stops beneath a flickering awning. Water runs from her helmet while she catches her breath, looks toward the closed train station, and says (S1) <d>[English] I missed it again.</d> Neon reflections ripple across the pavement and the shot holds on her rueful smile.\noverall_soundscape: Steady rain on canvas and metal, bicycle-chain clicks, wet tires hissing over stone, distant traffic, and the courier's breath settling after the stop.\nnon_diegetic_music: N/A",
     "multi_prompts_gen_type": "PW",
-    "audio_prompt_type": "A",
+    "audio_prompt_type": "AS",
     "type": "MiniMax H3 FL2VA Pruned PDD 8 Steps With Sound",
     "settings_version": 2.73,
     "model_type": "minimax_h3_fl2va_pruned_pdd",

@@ -17,7 +17,7 @@ MAX_ENVELOPE_WINDOWS = 600
 _FRAME_LOG = re.compile(r"\bt:\s*([\d.]+)\s+TARGET:.*?\bM:\s*(-?[\d.]+|-?inf|nan)")
 
 
-def inspect_audio(path, *, audio_track_no=1, start_time=0.0, duration=None, silence_db=-50.0, min_silence=0.2, preview_path=None, preview_seconds=10.0, window_s=None):
+def inspect_audio(path, *, audio_track_no=1, start_time=0.0, duration=None, silence_db=-50.0, min_silence=0.2, preview_path=None, preview_seconds=10.0, window_s=None, window_peaks=False):
     numbers = [start_time, silence_db, min_silence, preview_seconds, *([] if duration is None else [duration]), *([] if window_s is None else [window_s])]
     if not all(math.isfinite(value) for value in numbers) or start_time < 0 or duration is not None and duration <= 0:
         raise ValueError("Times must be finite; start_time must be non-negative and duration positive.")
@@ -139,8 +139,11 @@ def inspect_audio(path, *, audio_track_no=1, start_time=0.0, duration=None, sile
                 index = min(int(max(float(time_text) - 0.05, 0) / window_s), max(envelope))
                 momentary[index] = max(momentary.get(index, -math.inf), loudness)
         windows = [envelope[index] for index in range(max(envelope) + 1)]  # contiguous: every window of the range holds samples
-        result["envelope"] = {"window_s": window_s, "start_s": start_time, "rms_dbfs": [None if (value := db(math.sqrt(total / count))) is None else round(value, 1) for total, count, _ in windows],
-                              "peak_dbfs": [None if (value := db(top)) is None else round(value, 1) for _, _, top in windows], "momentary_max_lufs": [momentary.get(index) for index in range(len(windows))]}
+        # whole dB: levels per window locate sections, gaps and balance (the overall figures above keep their decimals); peaks per window on request
+        result["envelope"] = {"window_s": window_s, "start_s": start_time, "rms_dbfs": [None if (value := db(math.sqrt(total / count))) is None else round(value) for total, count, _ in windows],
+                              "momentary_max_lufs": [None if (value := momentary.get(index)) is None else round(value) for index in range(len(windows))]}
+        if window_peaks:
+            result["envelope"]["peak_dbfs"] = [None if (value := db(top)) is None else round(value, 1) for _, _, top in windows]
     return result
 
 

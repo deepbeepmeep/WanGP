@@ -39,7 +39,7 @@ If a Video Mask is provided, the selected process can apply only to the masked a
 
 A Control Video keeps its timing. At a rate within 0.1 frames per second of the model's, such as 23.976 for a 24 fps model, WanGP reads every frame without repeating or dropping any, and it records the result and places the sound on the video's real rate, so they stay together however long the video is.
 
-A part of a video named without encoding it (a view, or a path ending in `|start_frame=...,end_frame=...`) can be any length, even one the model cannot render. WanGP fills the render by playing the part's last frames backwards, then trims the output back, so you get exactly its frames. Asking for clearly more than the part holds still extends it by temporal outpainting.
+A part of a video named without encoding it (a view, or a path ending in `|start_frame=...,end_frame=...` or `|start_s=...,end_s=...`) can be any length, even one the model cannot render. WanGP fills the render by playing the part's last frames backwards, then trims the output back, so you get exactly its frames. Asking for clearly more than the part holds still extends it by temporal outpainting.
 
 WanGP previews processed Control Video and Video Mask thumbnails before generation. Use `--save-masks` when you need to inspect the full generated control media.
 
@@ -132,6 +132,10 @@ When sliding windows are enabled, positional arguments such as injected-frame po
 
 If you continue from a Source Video, the Source Video is treated as the first window. The overlap size controls how many frames from that source or previous window are used to condition the next generated segment.
 
+A long Source Video does not need to fit in memory. WanGP reads only the last frames the first new window needs and leaves the rest in the file. If the Source Video already has the output's size, frame rate and video codec settings (for example a video WanGP generated with the same settings), its pictures are copied unchanged into the result; otherwise it is resized and encoded once. Each new window is then added to the result without encoding the previous frames again.
+
+Temporal Upsampling, Spatial Upsampling, Film Grain and HDR output process the frames of the Source Video together with the new ones. The whole Source Video is then loaded in memory: the console reports why and how much RAM this takes, and the generation (or an extra window) is refused when the Source Video and the new frames together exceed 3000 frames. Apply these steps afterwards in Post Processing, or keep fewer frames of the Source Video, to continue a very long video.
+
 How sliding windows work:
 
 - Each window uses the matching time segment of the Control Video.
@@ -181,6 +185,8 @@ Common postprocessing jobs:
 - Applying a system postprocessing model through MediaFlow.
 
 SeedVC voice replacement, also used by Scenema Audio for reference voices, is distributed separately under the GPL-3.0 license. WanGP downloads it automatically from https://github.com/deepbeepmeep/WanGP-SeedVC the first time you use it, so that first use needs internet access.
+
+**SeedVC Voice Replacement** in **Configuration > Extensions** defaults to **v1.0 Singing**, which Showrunner requires for changing a song's singer or duet voices. **v1.0 Speech** and **v2 Speech** remain available for spoken audio. There is no Off choice; existing Off selections become v1.0 Singing.
 
 Late postprocessing is useful when you want to improve existing media without regenerating the original scene.
 

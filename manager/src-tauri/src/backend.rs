@@ -46,10 +46,14 @@ struct Preferences {
     /// The App window's web engine draws without the graphics card, leaving its memory to WanGP.
     #[serde(default)]
     app_without_gpu: bool,
+    /// The one-time GitHub star suggestion was answered: it does not come back.
+    #[serde(default)]
+    star_prompt_answered: bool,
 }
 impl Default for Preferences {
-    fn default() -> Self { Self { schema_version: 1, installations: vec![], selected: None, port: 7860, launch_options: LaunchOptions::default(), authentication_secret: None, app_without_gpu: false } }
+    fn default() -> Self { Self { schema_version: 1, installations: vec![], selected: None, port: 7860, launch_options: LaunchOptions::default(), authentication_secret: None, app_without_gpu: false, star_prompt_answered: false } }
 }
+const PROJECT_PAGE: &str = "https://github.com/deepbeepmeep/WanGP";
 /// WebView2 fixes its browser arguments for every window of the Manager when the first one opens: wry's defaults,
 /// plus software rendering when the App window should leave the graphics card to WanGP.
 #[cfg(windows)]
@@ -222,6 +226,17 @@ fn host_environment(command: &mut Command) {
     }
 }
 
+/// Opens an address in the user's default browser, with their own sign-ins.
+#[cfg(windows)]
+fn open_url(url: &str) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = std::ffi::OsStr::new(url).encode_wide().chain(Some(0)).collect();
+    let result = unsafe { windows_sys::Win32::UI::Shell::ShellExecuteW(std::ptr::null_mut(), std::ptr::null(), wide.as_ptr(), std::ptr::null(), std::ptr::null(), 1) };
+    if result as isize <= 32 { return Err("Could not open the default browser".into()); }
+    Ok(())
+}
+#[cfg(not(any(windows, target_os = "linux")))]
+fn open_url(_url: &str) -> Result<(), String> { Err("Browser opening is not available on this preview target".into()) }
 #[cfg(target_os = "linux")]
 fn open_url(url: &str) -> Result<(), String> {
     let mut command = Command::new("xdg-open");
@@ -550,7 +565,12 @@ async fn open_server(window: WebviewWindow, app: tauri::AppHandle, state: tauri:
                 .on_document_title_changed(move |window, _| { let _ = window.set_title(&title); })
                 // WebKitGTK also asks before a download link opens, and data: links (Motion Designer's background image)
                 // have no origin: they stay allowed there, and WebKit never shows them as a page.
-                .on_navigation(move |url| url.origin().ascii_serialization() == origin || cfg!(target_os = "linux") && url.scheme() == "data").build().map_err(|e| e.to_string())?;
+                .on_navigation(move |url| url.origin().ascii_serialization() == origin || cfg!(target_os = "linux") && url.scheme() == "data")
+                // Links that open a new window (GitHub, Discord, model pages) go to the user's browser, with their sign-ins.
+                .on_new_window(|url, _| {
+                    if matches!(url.scheme(), "http" | "https") { let url = url.to_string(); thread::spawn(move || { let _ = open_url(&url); }); }
+                    tauri::webview::NewWindowResponse::Deny
+                }).build().map_err(|e| e.to_string())?;
             #[cfg(any(windows, target_os = "linux"))]
             window.with_webview({ let window = window.clone(); move |webview| { let _ = ask_where_to_save(webview, window); } }).map_err(|e| e.to_string())?;
             #[cfg(target_os = "linux")]
@@ -564,20 +584,7 @@ async fn open_server(window: WebviewWindow, app: tauri::AppHandle, state: tauri:
             }
             Ok(())
         }
-        "browser" => {
-            #[cfg(windows)]
-            {
-                use std::os::windows::ffi::OsStrExt;
-                let wide: Vec<u16> = std::ffi::OsStr::new(&url).encode_wide().chain(Some(0)).collect();
-                let result = unsafe { windows_sys::Win32::UI::Shell::ShellExecuteW(std::ptr::null_mut(), std::ptr::null(), wide.as_ptr(), std::ptr::null(), std::ptr::null(), 1) };
-                if result as isize <= 32 { return Err("Could not open the default browser".into()); }
-                Ok(())
-            }
-            #[cfg(target_os = "linux")]
-            return open_url(&url);
-            #[cfg(not(any(windows, target_os = "linux")))]
-            Err("Browser opening is not available on this preview target".into())
-        }
+        "browser" => open_url(&url),
         _ => Err("Unknown presentation".into()),
     }
 }
@@ -585,19 +592,21 @@ async fn open_server(window: WebviewWindow, app: tauri::AppHandle, state: tauri:
 #[tauri::command]
 async fn open_manager_download(window: WebviewWindow) -> Result<(), String> {
     authorize(&window)?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        let url = "https://github.com/deepbeepmeep/WanGP/releases/latest/download/WanGPManager.exe";
-        let wide: Vec<u16> = std::ffi::OsStr::new(url).encode_wide().chain(Some(0)).collect();
-        let result = unsafe { windows_sys::Win32::UI::Shell::ShellExecuteW(std::ptr::null_mut(), std::ptr::null(), wide.as_ptr(), std::ptr::null(), std::ptr::null(), 1) };
-        if result as isize <= 32 { return Err("Could not open the Manager download".into()); }
-        Ok(())
+    open_url(&format!("{PROJECT_PAGE}/releases/latest/download/{}", if cfg!(windows) { "WanGPManager.exe" } else { "WanGPManager-x86_64.AppImage" }))
+}
+
+/// Opens the project page in the user's browser, where they are signed in to GitHub: Manager never stars for them.
+/// Either answer to the one-time suggestion retires it.
+#[tauri::command]
+fn github_star(window: WebviewWindow, state: tauri::State<AppState>, open: bool) -> Result<Value, String> {
+    authorize(&window)?;
+    if open { open_url(PROJECT_PAGE)?; }
+    let mut preferences = state.preferences.lock().unwrap();
+    if !preferences.star_prompt_answered {
+        let mut next = preferences.clone(); next.star_prompt_answered = true;
+        save_preferences(&state, &next)?; *preferences = next;
     }
-    #[cfg(target_os = "linux")]
-    return open_url("https://github.com/deepbeepmeep/WanGP/releases/latest/download/WanGPManager-x86_64.AppImage");
-    #[cfg(not(any(windows, target_os = "linux")))]
-    Err("Manager downloads are available for Windows and Linux".into())
+    Ok(preferences_view(&preferences))
 }
 
 #[cfg(test)]
@@ -764,6 +773,6 @@ pub fn run() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![get_state, start_job, cancel_job, pick_path, select_installation, set_port, set_launch_options, open_server, open_manager_download, set_console_fullscreen, console_text, export_diagnostics, stop_and_exit])
+        .invoke_handler(tauri::generate_handler![get_state, start_job, cancel_job, pick_path, select_installation, set_port, set_launch_options, open_server, open_manager_download, github_star, set_console_fullscreen, console_text, export_diagnostics, stop_and_exit])
         .run(context).expect("Unable to start WanGP Manager");
 }

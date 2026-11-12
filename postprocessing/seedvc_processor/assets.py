@@ -41,7 +41,7 @@ SEEDVC_HUBERT_FILES = ["config.json", "preprocessor_config.json", "pytorch_model
 
 _MODE_DEFAULTS = {
     SEEDVC_MODE_SPEECH: {"label": "v1.0 Speech", "steps": 25, "cfg_rate": 0.5},
-    SEEDVC_MODE_SINGING: {"label": "v1.0 Singing / F0 44k", "steps": 10, "cfg_rate": 0.7},
+    SEEDVC_MODE_SINGING: {"label": "v1.0 Singing", "steps": 10, "cfg_rate": 0.7},
     SEEDVC_MODE_ACCENT: {"label": "v2 Speech", "steps": 30, "cfg_rate": 0.7},
 }
 

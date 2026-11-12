@@ -6,6 +6,7 @@ change it through the same operations (apply_ops), with lock and revision rules 
 from __future__ import annotations
 
 import copy
+import difflib
 import re
 import hashlib
 import json
@@ -62,7 +63,8 @@ def normalize(doc: dict[str, Any]) -> dict[str, Any]:
     for key, value in {"kind": "free", "text": "", "song": None, "script": "", "references": [], "duration_s": None, "aspect": "16:9", "resolution": "720p", "draft_resolution": None,
                        "style_tags": [], "style": "", "pacing": 0, "language": "en", "plan_first": True, "budget_minutes": None, "templates": {},
                        "read_other_productions": True, "review_before_edit": False, "shot_min_s": None, "shot_max_s": None, "voices_from_model": False,
-                       "group_renders": True, "render_min_s": RENDER_MIN_S, "render_max_s": None}.items():  # a remake's renders: shots join until one lasts render_min_s, up to render_max_s or its template's window
+                       "group_renders": True, "render_min_s": RENDER_MIN_S, "render_max_s": None,  # a remake's renders: shots join until one lasts render_min_s, up to render_max_s or its template's window
+                       "song_voices": []}.items():  # who sings the song the showrunner composes, first heard first: cast ids (song models take no voice)
         brief.setdefault(key, copy.deepcopy(value))
     if brief["kind"] not in KINDS:
         brief["kind"] = "free"
@@ -360,17 +362,56 @@ def sung_lines(lines: list[str], words: list[tuple[str, float, float]]) -> list[
     found = [[] for _ in lines]
     for row, column in _aligned(written, said):
         found[next(index for index in range(len(lines) - 1, -1, -1) if first_word[index] <= row)].append((row, column))
-    result, floor = [], 0.0
+    counts = [len(_lyric_words(line)) for line in lines]
+    sung = [bool(pairs) and len(pairs) * 2 >= count and words[pairs[-1][1]][2] - words[pairs[0][1]][1] <= 1.5 * count + 2.0 for pairs, count in zip(found, counts)]
+    result, floor, taken = [], 0.0, -1  # taken: the last word heard of the lines before
     for index, line in enumerate(lines):
-        count, pairs = len(_lyric_words(line)), found[index]
+        count, pairs = counts[index], found[index]
         item = {"line": line, "heard": len(pairs), "words": count, "sung": False, "start_s": None, "end_s": None}
-        if pairs and len(pairs) * 2 >= count and words[pairs[-1][1]][2] - words[pairs[0][1]][1] <= 1.5 * count + 2.0:
-            missed_before, missed_after = pairs[0][0] - first_word[index], first_word[index] + count - 1 - pairs[-1][0]  # about 0.3 s a word
-            start = max(floor, words[pairs[0][1]][1] - 0.3 * missed_before)
-            floor = words[pairs[-1][1]][2] + 0.3 * missed_after
+        if sung[index]:
+            following = next((found[later][0][1] for later in range(index + 1, len(lines)) if sung[later]), len(words))
+            first, before = _reach(words, pairs[0][1], -1, pairs[0][0] - first_word[index], taken)  # the words it misses are heard next to it, read otherwise
+            last, after = _reach(words, pairs[-1][1], 1, first_word[index] + count - 1 - pairs[-1][0], following)
+            start = max(floor, words[first][1] - 0.3 * before)  # about 0.3 s a word missed and not heard
+            floor, taken = words[last][2] + 0.3 * after, last
             item.update(sung=True, start_s=round(start, 2), end_s=round(floor, 2))
         result.append(item)
+    _place_unclear(result, words)
     return result
+
+
+def _reach(words: list[tuple[str, float, float]], column: int, step: int, missed: int, bound: int) -> tuple[int, int]:
+    """The heard word a line reaches from its word heard at `column`, going over at most `missed` neighbours sung on without a pause and never to `bound`;
+    with the number of missed words left over."""
+    while missed and bound != column + step and abs(words[column + step][1 if step > 0 else 2] - words[column][2 if step > 0 else 1]) <= 1.0:
+        column, missed = column + step, missed - 1
+    return column, missed
+
+
+def _place_unclear(result: list[dict[str, Any]], words: list[tuple[str, float, float]]) -> None:
+    """Lines a transcript cannot read, sung between two lines it reads: where the words heard between them read like these lines, they are these lines sung unclearly,
+    shared by their number of words. They get their times (and a subtitle) with unclear=True, and stay not sung as written."""
+    letters = lambda text: re.sub(r"[^a-z0-9]", "", text.lower())
+    index = 0
+    while index < len(result):
+        if result[index]["sung"]:
+            index += 1
+            continue
+        run = [index]
+        while run[-1] + 1 < len(result) and not result[run[-1] + 1]["sung"]:
+            run.append(run[-1] + 1)
+        index = run[-1] + 1
+        before = result[run[0] - 1]["end_s"] if run[0] else -1.0
+        after = result[index]["start_s"] if index < len(result) else float("inf")
+        heard = [word for word in words if before <= word[1] < after]
+        if not heard or difflib.SequenceMatcher(None, letters(" ".join(result[line]["line"] for line in run)), letters(" ".join(word for word, _, _ in heard)), autojunk=False).ratio() < 0.5:
+            continue
+        total, done = sum(result[line]["words"] for line in run), 0
+        for line in run:
+            share = heard[round(len(heard) * done / total):round(len(heard) * (done + result[line]["words"]) / total)]
+            done += result[line]["words"]
+            if share:
+                result[line].update(unclear=True, start_s=round(max(share[0][1], before), 2), end_s=round(share[-1][2], 2))
 
 
 WORD_CUT_MARGIN_S = 0.1  # a cut before a word heard: its start is known to about this much
@@ -436,7 +477,8 @@ def song_words(doc: dict[str, Any]) -> list[str]:
     if lines is None:
         return ["The song's words are not checked: check_song says which lines it really sings, and times the subtitles on them."]
     missing = [line["line"] for line in lines if not line["sung"]]
-    warnings = [f"The song does not sing {len(missing)} of its {len(lines)} lines as written, and they get no subtitle: " + " / ".join(f'"{line}"' for line in missing[:8]) + (" ..." if len(missing) > 8 else "") + ". Compose it again before shooting on it, with fewer lines or more length."] if missing else []
+    untimed = sum(line["start_s"] is None for line in lines)
+    warnings = [f"The song does not sing {len(missing)} of its {len(lines)} lines as written" + (", and they get no subtitle" if untimed == len(missing) else f" ({untimed} get no subtitle, the others are subtitled where they are sung unclearly)" if untimed else " (they are subtitled where they are sung unclearly)") + ": " + " / ".join(f'"{line}"' for line in missing[:8]) + (" ..." if len(missing) > 8 else "") + ". Compose it again before shooting on it, with fewer lines or more length."] if missing else []
     pitch, kinds = doc["audio"]["lyrics"].get("voice_hz"), singer_kinds(doc)
     if len(kinds) == 1 and voice_off(next(iter(kinds)), pitch):
         warnings.append(f"The song's lead voice measures {pitch:.0f} Hz, which reads as a {'man' if next(iter(kinds)) == 'woman' else 'woman'}, and the singer on screen is a {next(iter(kinds))}: compose it again, with the lead voice named first in its style.")
@@ -697,7 +739,7 @@ def summary(doc: dict[str, Any], sequence: str | None = None) -> dict[str, Any]:
 # Operations ---------------------------------------------------------------------------------------------------------------------------
 
 BRIEF_FIELDS = {"kind", "title", "text", "song", "source", "script", "references", "duration_s", "aspect", "resolution", "draft_resolution", "style_tags", "style", "pacing", "language", "plan_first", "budget_minutes",
-                "templates", "read_other_productions", "review_before_edit", "shot_min_s", "shot_max_s", "voices_from_model", "group_renders", "render_min_s", "render_max_s"}
+                "templates", "read_other_productions", "review_before_edit", "shot_min_s", "shot_max_s", "voices_from_model", "group_renders", "render_min_s", "render_max_s", "song_voices"}
 DEFAULT_LENGTH_S = 30.0  # what the Brief shows and plans for until the user sets a length
 RENDER_MIN_S = 8.0  # a remake's shorter renders lose the lips: Skate Queen s3 alone (5.8 s) did not follow the singing, with its neighbour (9.5 s) it did
 
@@ -916,6 +958,9 @@ def _op_brief(doc, op, by, revision, base_revision):
         raise OperationError(f"Unknown brief fields: {', '.join(sorted(unknown))}.")
     if "title" in fields:
         doc["title"] = str(fields.pop("title")).strip() or doc["title"]
+    singers = fields.get("song_voices", [])
+    if not isinstance(singers, list) or len(singers) > 2 or any(not any(member["id"] == singer for member in doc["cast"]) for singer in singers):
+        raise OperationError("song_voices: one or two cast ids, first heard first (SeedVC tells two voices apart, not more).")
     doc["brief"].update(copy.deepcopy(fields))
     normalize(doc)
 
@@ -960,6 +1005,12 @@ def singer_kinds(doc: dict[str, Any]) -> set[str]:
     return {kind for member in doc["cast"] if not is_place(member) and (not singing or member["id"] in singing) and (kind := voice_kind(member.get("voice_description") or member.get("description")))}
 
 
+def song_singers(doc: dict[str, Any]) -> str:
+    """Who the brief says sings the song the showrunner composes, in words ("" for the song model's own voice)."""
+    names = [f"{member['name'] or member['id']} ({member['id']})" for singer in doc["brief"]["song_voices"] for member in doc["cast"] if member["id"] == singer]
+    return " then ".join(names) + (", a duet in the order they are first heard" if len(names) == 2 else "")
+
+
 def is_place(member: dict[str, Any]) -> bool:
     """A location kept the same from shot to shot: a cast card whose picture shows the empty set."""
     return str(member.get("role") or "").strip().casefold() in ("place", "location", "set")
@@ -1002,6 +1053,7 @@ def _op_remove_cast(doc, op, by, revision, base_revision):
     doc["cast"].remove(member)
     for shot in doc["shots"]:
         shot["cast"] = [item for item in shot["cast"] if item != member["id"]]
+    doc["brief"]["song_voices"] = [singer for singer in doc["brief"]["song_voices"] if singer != member["id"]]  # they sing no more
 
 
 def _op_remake(doc, op, by, revision, base_revision):

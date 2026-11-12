@@ -152,6 +152,32 @@ class WanGPHost:
             settings = merged
         return session.submit_task(settings, callbacks=_Progress(on_progress))
 
+    def prompt_guide(self, model_type: str) -> str:
+        """How a model's prompts are written, for an agent (its sections, how it names references): its agent prompt help, "" when it has none."""
+        return (self.plugin.get_model_def(model_type) or {}).get("deepy_prompt_infos") or ""
+
+    def singer_voice_unavailable(self) -> str:
+        """Song voice replacement needs SeedVC's singing model; speech modes do not preserve the melody."""
+        from postprocessing import audio_processors
+        from postprocessing.seedvc_processor.bridge import SeedVCBridge
+        handler = audio_processors.find_processor(audio_processors.SEEDVC_ONE_SPEAKER_METHOD)
+        return "" if handler is not None and audio_processors.read_config_section(handler.server_config, handler)["mode"] == SeedVCBridge.MODE_SINGING else "Select SeedVC v1.0 Singing in Configuration > Extensions to change the singer's voice."
+
+    def replace_singer_voice(self, song, voice_samples, workspace: str, on_progress=None) -> Path:
+        """The song sung in other voices, by WanGP's SeedVC audio processor as it is: it takes the singing out of the music, converts it and puts
+        the music back. voice_samples: one, or two for a duet, in the order their voices are first heard (SeedVC tells the two apart with pyannote)."""
+        from postprocessing.audio_processors import SEEDVC_ONE_SPEAKER_METHOD, SEEDVC_TWO_SPEAKERS_METHOD
+        if unavailable := self.singer_voice_unavailable():
+            raise ValueError(unavailable)
+        first, *second = [str(sample) for sample in voice_samples]
+        session = self._client().web_session(workspace)
+        result = session.submit_audio_postprocessing(str(song), postprocess_audio=SEEDVC_TWO_SPEAKERS_METHOD if second else SEEDVC_ONE_SPEAKER_METHOD, replace_voice_sample=first,
+                                                     replace_voice_sample2=second[0] if second else None, callbacks=_Progress(on_progress)).result()
+        files = list(getattr(result, "generated_files", None) or [])
+        if not getattr(result, "success", False) or not files:
+            raise RuntimeError("; ".join(getattr(result, "errors", None) or []) or "SeedVC made no file.")
+        return Path(files[0])
+
     def template_catalog(self, keep=()) -> list[dict]:
         """Deepy's templates of the categories a production uses, as Deepy's settings list them (the built-in ones and the custom one selected
         there), plus the custom templates in `keep` ("category/name") that Showrunner still uses after Deepy's settings moved on; with what the
@@ -159,7 +185,7 @@ class WanGPHost:
         from shared import resolutions
         from shared.deepy import tool_settings
         from shared.deepy.ui_settings import get_persisted_assistant_tool_ui_settings
-        from .templates import EDIT_TASKS, ROLES, VIDEO_TASKS
+        from .templates import EDIT_TASKS, ROLES, VIDEO_TASKS, soundtrack_choice
         settings = get_persisted_assistant_tool_ui_settings(self.plugin.server_config)
         catalog = []
         for task in dict.fromkeys(role["task"] for role in ROLES):  # two roles draw on the image editor's templates
@@ -172,13 +198,12 @@ class WanGPHost:
                 model_def = (self.plugin.get_model_def(preset["model_type"]) or {}) if video or task == "edit_image" else {}  # an image editor may declare its trained swap sentences
                 if task in EDIT_TASKS and not model_def.get("video_edit"):  # a remake's shots take painted frames and pins: only a model made for that (Viggle Remake) is offered
                     continue
-                sources = model_def.get("audio_prompt_type_sources") or {}
                 refs = str((preset if task in (*VIDEO_TASKS, *EDIT_TASKS, "edit_image") else {}).get("video_prompt_type") or "")  # image edits take the cast's pictures too
                 catalog.append({"task": task, "category": tool_settings.TOOL_DISPLAY_NAMES[task], "name": variant, "label": label, "default": variant == default,
                                 "model_type": preset.get("model_type"), "refs": "I" in refs, "audio": "A" in str(video.get("audio_prompt_type") or ""),
                                 "video_edit": model_def.get("video_edit"), "needs_mask": task in EDIT_TASKS and "A" in refs,  # what a remake must prepare for it
                                 "pixels": resolutions.resolution_budget(model_def)["default"] if task in EDIT_TASKS else None,
-                                "soundtrack": "AS" in (sources.get("selection") or []),  # its model can follow an audio_guide kept as the soundtrack
+                                "soundtrack": soundtrack_choice(model_def),  # "" when its model cannot follow an audio_guide kept as the soundtrack
                                 "spoken_line": model_def.get("spoken_line_prompt"),  # how its model takes a line to voice, written in its prompt
                                 "swap_prompt": model_def.get("character_swap_prompt"),  # the sentences its model was trained on to replace people, filled by the frame painter
                                 "sized_by_ref": "K" in refs,  # its output takes the first reference's size, not the production's format

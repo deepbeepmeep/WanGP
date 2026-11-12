@@ -50,8 +50,11 @@ class SigmoidBiasRouter(nn.Module):
         return sigmoid_bias_topk(F.linear(x.float(), self.weight.float()), self.e_score_correction_bias, self.top_k, self.normalize, self.scaling)
 
 
-def routed_experts(experts, x, ids, weights, packed=None):
-    """[rows, hidden] sum of the selected experts in x's dtype (float32 accumulation)."""
+def routed_experts(experts, x, ids, weights, packed=None, meanwhile=None):
+    """[rows, hidden] sum of the selected experts in x's dtype (float32 accumulation). meanwhile: work of the caller that does not read the result, queued while the CPU computes its
+    experts (a decoding pass), else run first."""
     if x.is_cuda and x.shape[0] <= QUEUED_ROWS:
-        return experts.queue_forward(x, ids, weights, packed)
+        return experts.queue_forward(x, ids, weights, packed, meanwhile)
+    if meanwhile is not None:
+        meanwhile()
     return experts(x, ids, weights, packed)

@@ -653,16 +653,17 @@ class family_handler:
             if ltx25 and not (msr or editanything_ref):
                 extra_model_def.update({"deepy_infos": LTX2_25_DEEPY_INFOS, "deepy_prompt_infos": LTX2_25_DEEPY_PROMPT_INFOS})
 
+            # AS / KS keep the soundtrack, as in H3; A or K alone, saved before, still do (fix_settings adds S); A1OF is a reference voice
             if msr:
-                audio_prompt_selection = ["", "A"]
+                audio_prompt_selection = ["", "AS"]
             elif editanything_ref and not distilled:
-                audio_prompt_selection = ["", "A", "K"]
+                audio_prompt_selection = ["", "AS", "KS"]
             else:
-                audio_prompt_selection = ["", "A", "K", "2", "A1OF"]
+                audio_prompt_selection = ["", "AS", "KS", "2", "A1OF"]
             audio_prompt_labels = {
                 "": "Generate Video & Soundtrack based on Text Prompt",
-                "A": "Generate Video based on Soundtrack and Text Prompt",
-                "K": "Generate Video based on Control Video + its Audio Track and Text Prompt",
+                "AS": "Generate Video based on Soundtrack and Text Prompt",
+                "KS": "Generate Video based on Control Video + its Audio Track and Text Prompt",
                 "2": "Generate Audio based on Control Video and Text Prompt",
                 "A1OF": "Generate Video based on Reference Voice (ID-LoRA) and Text Prompt",
             }
@@ -685,9 +686,9 @@ class family_handler:
                             "1": "Reference Voice (ID-LoRA)",
                             "2": "Generate Audio based on Control Video and Text Prompt",
                         },
-                        "letters_filter": "A1OFK2",
+                        "letters_filter": "A1OFKS2",
                         "show_label": False,
-                        "default": "K" if editanything_ref else "",
+                        "default": "KS" if editanything_ref else "",
                     },
                     "prompt_infos": LTX2_PROMPT_INFOS,
                     "prompt_enhancer_def": {
@@ -1181,11 +1182,14 @@ class family_handler:
         if settings_version < 2.58 and pipeline_kind == "distilled":
             ui_defaults["guidance_phases"]=2
 
-        if settings_version < 2.65: 
+        if settings_version < 2.65:
             audio_prompt_type = ui_defaults.get("audio_prompt_type", None)
             if audio_prompt_type is not None and "L" in audio_prompt_type:
                 audio_prompt_type =audio_prompt_type.replace("L", "")
                 ui_defaults["audio_prompt_type"] = audio_prompt_type
+        audio_prompt_type = ui_defaults.get("audio_prompt_type", "") or ""
+        if any(letter in audio_prompt_type for letter in "AK") and not any(letter in audio_prompt_type for letter in "S1O"):
+            ui_defaults["audio_prompt_type"] = audio_prompt_type + "S"  # a kept soundtrack was A or K alone before AS / KS; A1OF (a reference voice) stays
 
             
     @staticmethod
@@ -1210,7 +1214,7 @@ class family_handler:
         if _is_editanything_model(model_def):
             ui_defaults.update(
                 {
-                    "audio_prompt_type": "K",
+                    "audio_prompt_type": "KS",
                     "video_prompt_type": "VGI",
                     "remove_background_images_ref": 1,
                 }

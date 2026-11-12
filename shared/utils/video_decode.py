@@ -9,7 +9,7 @@ from functools import lru_cache
 import numpy as np
 import torch
 
-from .virtual_media import bounced_frame, clamp_virtual_frame_range, get_virtual_media_entry, parse_virtual_media_path, strip_virtual_media_suffix
+from .virtual_media import bounced_frame, clamp_virtual_frame_range, get_virtual_media_entry, in_frames, parse_virtual_media_path, strip_virtual_media_suffix
 
 _ZSCALE_TRANSFER_MAP = {"smpte2084": "smpte2084", "arib-std-b67": "arib-std-b67", "bt709": "bt709", "bt2020-10": "2020_10", "bt2020-12": "2020_12"}
 _ZSCALE_PRIMARIES_MAP = {"bt2020": "2020", "bt709": "709", "smpte170m": "170m", "bt470bg": "470bg"}
@@ -102,10 +102,20 @@ def resolve_media_binary(binary_name: str):
     return _resolve_media_binary(binary_name)
 
 
+def picture_duration(video_path):
+    """Seconds a video's picture lasts: its sound may run past its last frame (a model's audio tail, codec padding). mkv/webm keep it
+    in a stream tag; a file stating neither gives only its whole length."""
+    command = [_resolve_media_binary("ffprobe"), "-v", "error", "-show_entries", "stream=codec_type,duration:stream_tags=DURATION:format=duration", "-of", "json", os.fspath(video_path)]
+    probe = json.loads(subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="ignore", check=True).stdout)
+    video = next((stream for stream in probe.get("streams", []) if stream.get("codec_type") == "video"), {})
+    return _parse_media_duration(video.get("duration") or (video.get("tags") or {}).get("DURATION") or (probe.get("format") or {}).get("duration"), 0.0) or None
+
+
 def _augment_virtual_metadata(video_path, metadata):
     spec = parse_virtual_media_path(video_path)
     if spec is None or metadata is None:
         return metadata
+    spec = in_frames(spec, float(metadata.get("fps_float") or metadata.get("fps") or 0))  # a part named in seconds: its frames at the file's real rate
     total_frames = int(metadata.get("frame_count") or 0)
     start_frame, end_frame = clamp_virtual_frame_range(spec, total_frames)
     virtual_metadata = dict(metadata)
@@ -183,17 +193,18 @@ def _probe_mkv_sparse_frame_count(source_path, ffprobe_path, duration, start_tim
     candidate = int(round(max(0.0, duration - max(0.0, start_time)) * fps_float))
     if candidate <= 0:
         return 0
-    tail_frames = 64
-    tail_start = max(0.0, start_time + max(0, candidate - tail_frames) / fps_float)
-    probe_cmd = [ffprobe_path, "-v", "error", "-select_streams", "v:0", "-read_intervals", f"{tail_start:.6f}%+#96", "-show_entries", "frame=best_effort_timestamp_time,pts_time,pkt_pts_time", "-of", "json", source_path]
+    # The time of the last picture tells the count. The file is read from its last pictures to its end, without decoding: the read
+    # starts at the key frame before them, any number of pictures earlier, so a fixed number of pictures would stop short of the end.
+    tail_start = max(0.0, start_time + max(0, candidate - 64) / fps_float)
+    probe_cmd = [ffprobe_path, "-v", "error", "-select_streams", "v:0", "-read_intervals", f"{tail_start:.6f}%", "-show_entries", "packet=pts_time", "-of", "json", source_path]
     probe = subprocess.run(probe_cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False)
     if probe.returncode != 0:
         return candidate
     try:
-        timestamps = [timestamp for timestamp in (_frame_timestamp(frame) for frame in (json.loads(probe.stdout).get("frames") or [])) if timestamp is not None]
+        timestamps = [timestamp for timestamp in (_frame_timestamp(packet) for packet in (json.loads(probe.stdout).get("packets") or [])) if timestamp is not None]
     except (json.JSONDecodeError, TypeError, ValueError):
         return candidate
-    if not timestamps or min(timestamps) < tail_start - tail_frames / fps_float:
+    if not timestamps:
         return candidate
     return max(1, int(round((max(timestamps) - start_time) * fps_float)) + 1)
 

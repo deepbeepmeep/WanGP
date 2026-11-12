@@ -8,16 +8,17 @@ from tqdm.auto import tqdm
 
 
 class EnhancementProgress:
-    def __init__(self, callback=None, stream_callback=None, prompt_offset=0, prompt_total=None):
+    def __init__(self, callback=None, stream_callback=None, prompt_offset=0, prompt_total=None, failures=None):
         self.callback = callback
         self.stream_callback = stream_callback
         self.prompt_offset = prompt_offset
         self.prompt_total = prompt_total
         self.title = "Enhancing Prompt"
         self.next_update = 0
+        self.failures = [] if failures is None else failures  # why enhanced prompts came back without a prompt, for the user's notice (shared by for_prompt)
 
     def for_prompt(self, index, total):
-        return EnhancementProgress(self.callback, self.stream_callback, index, total)
+        return EnhancementProgress(self.callback, self.stream_callback, index, total, self.failures)
 
     def start(self, title, index=0, count=1, *, steps=0, unit="tokens"):
         self.title = title + (f" {index + 1}/{count}" if count > 1 else "")

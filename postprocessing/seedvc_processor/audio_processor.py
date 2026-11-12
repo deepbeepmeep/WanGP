@@ -54,19 +54,19 @@ class SeedVCProcessor:
     def default_config(cls) -> dict[str, Any]:
         from postprocessing.seedvc_processor.bridge import SeedVCBridge
 
-        return {"mode": SeedVCBridge.MODE_OFF}
+        return {"mode": SeedVCBridge.MODE_SINGING}
 
     @classmethod
     def normalize_config_section(cls, config: dict[str, Any]) -> dict[str, Any]:
         from postprocessing.seedvc_processor.bridge import SeedVCBridge
 
-        mode = config.get("mode", SeedVCBridge.MODE_OFF)
+        mode = config.get("mode", SeedVCBridge.MODE_SINGING)
         try:
             mode = int(mode)
         except (TypeError, ValueError):
-            mode = SeedVCBridge.MODE_OFF
-        if mode not in SeedVCBridge._VERSIONS and mode != SeedVCBridge.MODE_OFF:
-            mode = SeedVCBridge.MODE_OFF
+            mode = SeedVCBridge.MODE_SINGING
+        if mode not in SeedVCBridge._VERSIONS:
+            mode = SeedVCBridge.MODE_SINGING
         return {"mode": mode}
 
     def _sync_bridge_config(self, config: dict[str, Any] | None = None) -> None:
@@ -87,8 +87,6 @@ class SeedVCProcessor:
         return label.replace("SeedVC", f"SeedVC {version}") if version else label
 
     def validate_method(self, method, voice_sample=None, voice_sample2=None, **_kwargs) -> str:
-        if not self.enabled():
-            return "SeedVC is disabled in Configuration > Extensions"
         if voice_sample is None:
             return "You must provide a voice sample"
         metadata = method_metadata(method)
@@ -129,10 +127,8 @@ class SeedVCProcessor:
 
     def create_config_ui(self, gr, config: dict[str, Any], *, lock_config: bool = False):
         from postprocessing.seedvc_processor.bridge import SeedVCBridge
-        from shared.utils.wgp_config_migration import SEEDVC_DEFAULT_MODE, enabled_choice_value
-
         config = self.normalize_config_section(config)
-        mode = gr.Dropdown(choices=SeedVCBridge.mode_choices(), value=enabled_choice_value(config.get("mode", SEEDVC_DEFAULT_MODE), SeedVCBridge.mode_choices(), SEEDVC_DEFAULT_MODE), label="SeedVC Voice Replacement", interactive=not lock_config)
+        mode = gr.Dropdown(choices=SeedVCBridge.mode_choices(), value=config["mode"], label="SeedVC Voice Replacement", info="Showrunner's singer replacement requires v1.0 Singing. Speech modes are for spoken audio.", interactive=not lock_config)
         return [("mode", mode)]
 
     def config_requires_release(self, old_config: dict[str, Any], new_config: dict[str, Any], changed_keys) -> bool:

@@ -28,7 +28,7 @@ from shared.llm_io import known_token_ids, llm_io_enabled, log_llm_io, media_des
 from shared.utils.audio_video import extract_audio_tracks
 from shared.utils.gallery_sources import GALLERY_SOURCES, gallery_source, source_for_kind
 from shared.utils.utils import get_video_info
-from shared.utils.virtual_media import read_view, write_view
+from shared.utils.virtual_media import VIEW_FOLDER, parse_virtual_media_path, read_view, write_view
 from shared.deepy.config import (
     DEEPY_AUTO_CANCEL_QUEUE_TASKS_DEFAULT,
     DEEPY_AUTO_CANCEL_QUEUE_TASKS_KEY,
@@ -152,6 +152,12 @@ _VIDEO_TOOL_RUNTIME_REINJECT_TOKENS = 2000
 _ASSISTANT_STREAM_INTERVAL_SECONDS = 0.25
 _TOOL_REQUEST_STREAM_INTERVAL_TOKENS = 64
 _LOOP_WARNING = "The same thought and action repeated 3 times. Do not repeat it again. Start a fresh reasoning approach, reuse established facts, and choose a different next action."
+_REPEATED_CALL_ERROR = ("Not run: this exact call already ran twice in this answer and returned the same result both times (see above), so running it again cannot return anything new. "
+                        "Use that result, or change the call: other arguments or another tool.")
+_REPEATED_CALL_STOP = "Deepy stopped because it made the same tool call again after being told it would return the same result."
+_RECENT_CALLS_WINDOW = 8  # the calls of a turn the repeated-call guard looks back on, so that a loop alternating two calls is caught too
+_REFUSED_CALL = "refused"  # a refused call in the recent calls, where results are JSON texts
+_WAITING_STATUSES = ("timeout", "running", "queued")  # a job not finished yet: the same answer later is progress, not a repeat
 _INJECT_LAST_SELECTED_MEDIA_RUNTIME_REFERENCES = False
 _INJECT_SELECTED_MEDIA_RUNTIME_UPDATES = False
 
@@ -2547,8 +2553,15 @@ class DeepyZeroTools:
         return ""
 
     def _resolve_media_record_input(self, value: str, keep_view: bool = False) -> dict[str, Any] | None:
-        """The media a tool argument names. A view (@views/...) comes as a real clip, cut once, unless the tool reads views: keep_view."""
-        record = self._find_media_record(value)
+        """The media a tool argument names. A view (@views/...) comes as a real clip, cut once, unless the tool reads views: keep_view.
+        A part of a file (a media id or a path followed by |start_s=..., |start_frame=...) always comes as a clip of that part, cut once."""
+        base, _, part = str(value or "").partition("|")
+        record = self._find_media_record(base if part.strip() else value)
+        if record is not None and part.strip():
+            part_path = f"{record['path']}|{part.strip()}"
+            parse_virtual_media_path(part_path)  # a malformed part is refused
+            cut_dir = Path(self._file_access_policy().output_roots[0]).resolve() / VIEW_FOLDER / ".cut"  # beside the views' own clips
+            return media_registry.register_media(self.session, deepy_video_tools.view_clip(part_path, cut_dir), source="filesystem", access="read")
         if record is None or keep_view or read_view(record["path"]) is None:
             return record
         return media_registry.register_media(self.session, deepy_video_tools.view_clip(record["path"]), source="filesystem", access="read")
@@ -4911,11 +4924,12 @@ class DeepyZeroTools:
             "pitch": {"type": "boolean", "description": "Optional, for an isolated voice (a vocal stem or speech, not a full mix): voice_pitch_hz, its median pitch; female voices mostly sit above about 165 Hz, male ones below.", "required": False},
             "beats": {"type": "boolean", "description": "Optional, for music: beats.tempo_bpm, beats.times (the beats, in seconds) and beats.bar_starts (first beats of 4-beat bars, when clear): the cut points for editing to the music.", "required": False},
             "preview_s": {"type": "number", "description": "Excerpt length, at most 30 seconds; default 10. Starts at start_s.", "required": False},
-            "window_s": {"type": "number", "description": "Optional envelope window in seconds (0.1..600, at most 600 windows): adds lists of RMS, peak and loudest momentary loudness per window (window i starts at start_s + i * window_s), for finding climaxes, gaps and balance in one call.", "required": False},
+            "window_s": {"type": "number", "description": "Optional envelope window in seconds (0.1..600, at most 600 windows): adds lists of RMS and loudest momentary loudness per window in whole dB (window i starts at start_s + i * window_s), for finding climaxes, gaps and balance in one call.", "required": False},
+            "window_peaks": {"type": "boolean", "description": "Optional, with window_s: also each window's peak level (envelope.peak_dbfs); the file's peak, true peak and clipping are always given.", "required": False},
         },
         pause_runtime=False,
     )
-    def inspect_audio(self, media_id: str, audio_track_no: int = 1, start_s: float = 0.0, duration_s: float | None = None, silence_db: float = -50.0, min_silence_s: float = 0.2, preview: bool = False, preview_s: float = 10.0, pitch: bool = False, window_s: float | None = None, beats: bool = False) -> dict[str, Any]:
+    def inspect_audio(self, media_id: str, audio_track_no: int = 1, start_s: float = 0.0, duration_s: float | None = None, silence_db: float = -50.0, min_silence_s: float = 0.2, preview: bool = False, preview_s: float = 10.0, pitch: bool = False, window_s: float | None = None, beats: bool = False, window_peaks: bool = False) -> dict[str, Any]:
         from shared.deepy.audio_inspection import inspect_audio, music_beats, voice_pitch
 
         self._sync_recent_media()
@@ -4924,7 +4938,7 @@ class DeepyZeroTools:
             raise ValueError("media_id must reference audio or video.")
         self._set_status("Inspecting Audio", kind="tool")
         output = self._resolve_direct_output_path(f"{Path(source['path']).stem}_preview.wav", False, True) if preview else None
-        result = inspect_audio(source["path"], audio_track_no=audio_track_no, start_time=start_s, duration=duration_s, silence_db=silence_db, min_silence=min_silence_s, preview_path=output, preview_seconds=preview_s, window_s=window_s)
+        result = inspect_audio(source["path"], audio_track_no=audio_track_no, start_time=start_s, duration=duration_s, silence_db=silence_db, min_silence=min_silence_s, preview_path=output, preview_seconds=preview_s, window_s=window_s, window_peaks=window_peaks)
         result["source_media_id"] = source["media_id"]
         if pitch:
             result["voice_pitch_hz"] = voice_pitch(source["path"], start_time=start_s, duration=duration_s)
@@ -9509,16 +9523,17 @@ class AssistantEngine:
         self._emit_chat_event(assistant_chat.update_tool_call(self.session, self._stream_tool_message_id, self._stream_tool_id, status="error", status_text="Interrupted", result=result, request_pending=False))
         self._clear_stream_tool_request()
 
-    def _execute_tool(self, tool_call: dict[str, Any]) -> dict[str, Any]:
+    def _execute_tool(self, tool_call: dict[str, Any], refusal: str = "") -> dict[str, Any]:
+        """refusal: why the call is answered with an error instead of being run (the repeated-call guard)."""
         tool_name = str(tool_call.get("name", "")).strip()
         arguments = dict(tool_call.get("arguments", {}) or {})
-        validation_error = self.tool_box.validate_tool_call(tool_name, arguments)
-        tool_label = self.tool_box.get_tool_transcript_label(tool_name, arguments) if not validation_error else self.tool_box.get_tool_display_name(tool_name)
+        validation_error = refusal or self.tool_box.validate_tool_call(tool_name, arguments)
+        tool_label = self.tool_box.get_tool_transcript_label(tool_name, arguments) if refusal or not validation_error else self.tool_box.get_tool_display_name(tool_name)
         self._log(f"Tool call: {tool_name} {arguments}")
         message_id, tool_id = self._start_tool_call_card(tool_name, arguments, tool_label)
         if len(validation_error) > 0:
             result = self._virtualize_tool_result(self._build_tool_error(tool_name, arguments, validation_error))
-            self._log(f"Tool validation error: {validation_error}")
+            self._log(f"Tool call refused: {refusal}" if refusal else f"Tool validation error: {validation_error}")
             self._set_status(f"{tool_label} failed: {validation_error}", kind="error")
             self._emit_chat_event(assistant_chat.complete_tool_call(self.session, message_id, tool_id, result))
             return result
@@ -9571,11 +9586,30 @@ class AssistantEngine:
         return previous_text + current_text
 
     @staticmethod
+    def _call_signature(tool_call: dict[str, Any]) -> tuple[str, str]:
+        return str(tool_call.get("name", "") or "").strip(), _json_dumps(dict(tool_call.get("arguments", {}) or {}))
+
+    @staticmethod
+    def _result_signature(result: dict[str, Any]) -> str | None:
+        """None for a job still running or queued (a wait that timed out included): polling it again is waiting, not a loop."""
+        return None if result.get("waiting_timed_out") or result.get("status") in _WAITING_STATUSES else _json_dumps(result)
+
+    @staticmethod
+    def _repeated_call(recent_calls: list[tuple[tuple[str, str], str | None]], signature: tuple[str, str]) -> str:
+        """Whatever the thoughts around them: "refuse" a call whose last two runs among the turn's recent calls returned the same result, "stop" one
+        refused twice already, or refused once with nothing run since (only refused calls: a loop, alone or alternating with other repeated calls)."""
+        refused = [index for index, (call, result) in enumerate(recent_calls) if call == signature and result == _REFUSED_CALL]
+        if len(refused) >= 2 or refused and all(result == _REFUSED_CALL for _call, result in recent_calls[refused[-1] + 1:]):
+            return "stop"
+        runs = [result for call, result in recent_calls if call == signature and result != _REFUSED_CALL]
+        return "refuse" if len(runs) >= 2 and runs[-1] is not None and runs[-1] == runs[-2] else ""
+
+    @staticmethod
     def _deduplicate_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
         unique_calls = []
         seen = set()
         for tool_call in list(tool_calls or []):
-            signature = (str(tool_call.get("name", "") or "").strip(), _json_dumps(dict(tool_call.get("arguments", {}) or {})))
+            signature = AssistantEngine._call_signature(tool_call)
             if signature in seen:
                 continue
             seen.add(signature)
@@ -9589,7 +9623,7 @@ class AssistantEngine:
         if not normalized_thinking:
             recent_steps.clear()
             return "", ""
-        action_signature = tuple((str(tool_call.get("name", "") or "").strip(), _json_dumps(dict(tool_call.get("arguments", {}) or {}))) for tool_call in tool_calls)
+        action_signature = tuple(AssistantEngine._call_signature(tool_call) for tool_call in tool_calls)
         recent_steps.append((normalized_thinking, action_signature))
         if len(recent_steps) > 5:
             del recent_steps[:-5]
@@ -10113,6 +10147,7 @@ class AssistantEngine:
             self.session.messages.append(self._build_pending_user_message(user_text))
             checkpoint_assistant_turn(self.session)
         recent_steps: list[tuple[str, tuple[tuple[str, str], ...]]] = [] if replay is None else [(str(item[0]), tuple((str(action[0]), str(action[1])) for action in item[1])) for item in replay["recent_steps"]]
+        recent_calls: list[tuple[tuple[str, str], str | None]] = []  # (call, result signature) of the turn's last tool calls, for the repeated-call guard
         pending_natural_thought = "" if replay is None else str(replay["pending_natural_thought"])
         loop_answer_checkpoint = "" if replay is None else str(replay["loop_answer_checkpoint"])
         model_passes = 0 if replay is None else int(replay["model_passes"])
@@ -10430,6 +10465,7 @@ class AssistantEngine:
                         incomplete_stop_retries += 1
                         current_seed = None if current_seed is None else int(current_seed) + incomplete_stop_retries
                         recent_steps.clear()
+                        recent_calls.clear()
                         pending_natural_thought = ""
                         loop_answer_checkpoint = ""
                         self._log("Detected an incomplete stop-token answer with no safe trimmed fallback; retrying the current turn once from the clean turn-start snapshot.")
@@ -10439,6 +10475,7 @@ class AssistantEngine:
                         incomplete_stop_retries += 1
                         current_seed = None if current_seed is None else int(current_seed) + incomplete_stop_retries
                         recent_steps.clear()
+                        recent_calls.clear()
                         pending_natural_thought = ""
                         loop_answer_checkpoint = ""
                         self._log("Detected an incomplete stop-token answer with no safe trimmed fallback; retrying the current turn once after canonicalized replay fallback.")
@@ -10479,12 +10516,18 @@ class AssistantEngine:
                             break
                         if self.session.pause_requested and not self._pause_for_request():
                             break
-                        tool_result = self._execute_tool(tool_call)
+                        signature = self._call_signature(tool_call)
+                        repeat = self._repeated_call(recent_calls, signature)
+                        tool_result = self._execute_tool(tool_call, refusal=_REPEATED_CALL_STOP if repeat == "stop" else _REPEATED_CALL_ERROR if repeat else "")
+                        recent_calls[:] = [*recent_calls, (signature, _REFUSED_CALL if repeat else self._result_signature(tool_result))][-_RECENT_CALLS_WINDOW:]
                         if loop_action == "warn" and tool_index == len(tool_calls) - 1:
                             tool_result["runtime_update"] = loop_message
                         self._append_tool_message(tool_result, stored_tool_call.get("id"))
                         completed_tool_calls += 1
                         checkpoint_assistant_turn(self.session)
+                        if repeat == "stop":
+                            self._commit_loop_stop(raw_text, _REPEATED_CALL_STOP)  # the interruption below closes the calls left in this response
+                            break
                         if self.session.pause_requested and not self._pause_for_request():
                             break
                         if self.session.steering_pending:
@@ -10492,7 +10535,8 @@ class AssistantEngine:
                     if self.session.interrupt_requested:
                         interruption_kind = str(self.session.current_turn.get("interruption_kind", "interrupted") or "interrupted").strip().lower() if isinstance(self.session.current_turn, dict) else "interrupted"
                         skipped_status = "steered" if interruption_kind == "steered" else "interrupted"
-                        skipped_error = "Tool call was not started because steering was inserted at the previous action boundary." if interruption_kind == "steered" else "Tool call was not started because the user stopped the turn."
+                        skipped_error = ("Tool call was not started because steering was inserted at the previous action boundary." if interruption_kind == "steered" else
+                                         "Tool call was not started because Deepy stopped repeating the same call." if interruption_kind == "loop_guard" else "Tool call was not started because the user stopped the turn.")
                         for tool_call, stored_tool_call in zip(tool_calls[completed_tool_calls:], stored_tool_calls[completed_tool_calls:]):
                             self._append_tool_message(
                                 {"status": skipped_status, "tool": str(tool_call.get("name", "") or ""), "cancelled": True, "error": skipped_error},

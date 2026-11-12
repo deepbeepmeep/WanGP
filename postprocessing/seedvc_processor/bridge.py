@@ -236,7 +236,6 @@ def _merge_audio_files_to_wav(audio_paths, output_path, masks=None, mask_sample_
 
 
 class SeedVCBridge:
-    MODE_OFF = 0
     MODE_V1 = 1
     MODE_SINGING = 2
     MODE_ACCENT = 3
@@ -245,8 +244,8 @@ class SeedVCBridge:
     CURRENT_VERSION_LABEL = "SeedVC"
 
     _VERSIONS = {
+        MODE_SINGING: "v1.0 Singing",
         MODE_V1: "v1.0 Speech",
-        MODE_SINGING: "v1.0 Singing / F0 44k",
         MODE_ACCENT: "v2 Speech",
     }
 
@@ -256,22 +255,22 @@ class SeedVCBridge:
 
     @classmethod
     def mode_choices(cls) -> list[tuple[str, int]]:
-        return [("Off", cls.MODE_OFF), *[(label, mode) for mode, label in cls._VERSIONS.items()]]
+        return [(label, mode) for mode, label in cls._VERSIONS.items()]
 
     def normalize_config(self, config: dict[str, Any] | None = None) -> tuple[int, int]:
         config = self.server_config if config is None else config
-        mode = config.get("seedvc_mode", self.MODE_OFF)
+        mode = config.get("seedvc_mode", self.MODE_SINGING)
         persistence = config.get("seedvc_persistence", self.PERSIST_UNLOAD)
         try:
             mode = int(mode)
         except (TypeError, ValueError):
-            mode = self.MODE_OFF
+            mode = self.MODE_SINGING
         try:
             persistence = int(persistence)
         except (TypeError, ValueError):
             persistence = self.PERSIST_UNLOAD
-        if mode not in self._VERSIONS and mode != self.MODE_OFF:
-            mode = self.MODE_OFF
+        if mode not in self._VERSIONS:
+            mode = self.MODE_SINGING
         if persistence not in (self.PERSIST_UNLOAD, self.PERSIST_RAM):
             persistence = self.PERSIST_UNLOAD
         config["seedvc_mode"] = mode
@@ -280,15 +279,13 @@ class SeedVCBridge:
 
     def settings(self, config: dict[str, Any] | None = None) -> tuple[bool, str | None, int]:
         mode, persistence = self.normalize_config(config)
-        return mode != self.MODE_OFF, self._VERSIONS.get(mode), persistence
+        return True, self._VERSIONS[mode], persistence
 
     def enabled(self) -> bool:
         return self.settings()[0]
 
     def query_download_def(self, enabled_only: bool = True) -> list[dict[str, Any]]:
         mode, _ = self.normalize_config()
-        if enabled_only and mode == self.MODE_OFF:
-            return []
         from postprocessing.seedvc_processor.assets import query_download_def
         return query_download_def(mode=mode)
 
@@ -353,8 +350,6 @@ class SeedVCBridge:
 
     def replace_audio_file(self, source_audio_path: str, voice_sample_path: str, output_path: str, *, process_files: Callable[..., Any], profile_no=4, verbose_level: int = 1, init_pipe: Callable[..., int] | None = None, voice_sample2_path: str | None = None, speaker_count: int = 1, prefix: str = "seedvc") -> str:
         mode, persistence = self.normalize_config()
-        if mode == self.MODE_OFF:
-            raise RuntimeError("SeedVC voice replacement is disabled in Configuration > Extensions.")
         self.download(process_files)
         output_dir = os.path.dirname(os.path.abspath(output_path)) or "."
         temp_tracks = []
