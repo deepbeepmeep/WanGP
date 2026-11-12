@@ -25,6 +25,7 @@ from .hdr import hdr10_x265_params, hdr10_zscale_filter, iter_hdr_gbrpf32_frames
 from .video_decode import picture_duration, probe_video_stream_metadata, resolve_media_binary
 from .video_codecs import SUPPORTED_VIDEO_CONTAINERS, get_imageio_codec_params, get_video_encode_args, validate_video_output_settings
 from .virtual_media import get_virtual_media_entry, parse_virtual_media_path, strip_virtual_media_suffix
+from shared.utils.subprocess_stdin import child_kwargs
 
 def _ffmpeg_binary():
     return resolve_media_binary("ffmpeg") or "ffmpeg"
@@ -418,7 +419,7 @@ def _run_ffmpeg_encode(input_path, output_path, codec, bitrate=None, sample_rate
     if sample_rate:
         cmd += ["-ar", str(int(sample_rate))]
     cmd.append(output_path)
-    subprocess.run(cmd, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    subprocess.run(cmd, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace", **child_kwargs())
 
 
 def save_audio_file(path, audio_data, sample_rate, codec_key="wav"):
@@ -670,7 +671,7 @@ def combine_and_concatenate_video_with_audio_tracks(
     if verbose:
         print(f"ffmpeg command: {cmd}")
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        subprocess.run(cmd, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace", **child_kwargs())
     except subprocess.CalledProcessError as e:
         raise Exception(f"FFmpeg error: {e.stderr}")
 
@@ -726,7 +727,7 @@ def combine_video_with_audio_tracks(target_video, audio_tracks, output_video,
         cmd += ['-b:a', audio_settings["bitrate"]]
     cmd += ['-t', str(dur), output_video]
 
-    result = subprocess.run(cmd, capture_output=not verbose, text=True, encoding="utf-8", errors="replace")
+    result = subprocess.run(cmd, capture_output=not verbose, text=True, encoding="utf-8", errors="replace", **child_kwargs())
     if result.returncode != 0:
         raise Exception(f"FFmpeg error:\n{result.stderr}")
     if verbose:
@@ -745,7 +746,7 @@ def add_subtitle_track(source_video, subtitles, output_video, title=None):
     shown by default (the source's own subtitle tracks are not kept)."""
     cmd = [_ffmpeg_binary(), '-y', '-v', 'error', '-i', source_video, '-i', subtitles, '-map', '0:V', '-map', '0:a?', '-map', '1:s', '-c:v', 'copy', '-c:a', 'copy',
            '-c:s', 'srt' if output_video.lower().endswith('.mkv') else 'mov_text', '-disposition:s:0', 'default', *(['-metadata:s:s:0', f'title={title}'] if title else []), output_video]
-    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", **child_kwargs())
     if result.returncode != 0:
         raise Exception(f"FFmpeg error:\n{result.stderr}")
 
@@ -798,7 +799,7 @@ def video_stream_facts(video_path):
     announced) and when its picture starts inside the file (a sound track can shift it)."""
     command = [_ffprobe_binary(), "-v", "error", "-select_streams", "v:0", "-count_packets", "-show_data_hash", "md5",
                "-show_entries", "stream=codec_name,profile,pix_fmt,width,height,extradata_hash,nb_read_packets,start_time:format=start_time", "-of", "json", os.fspath(video_path)]
-    probe = json.loads(subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="ignore", check=True).stdout)
+    probe = json.loads(subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="ignore", check=True, **child_kwargs()).stdout)
     stream, start_times = probe["streams"][0], []
     for value in (stream.get("start_time"), probe["format"].get("start_time")):
         try:
@@ -822,7 +823,7 @@ def join_video_streams(video_paths, frame_counts, fps, output_path, picture_star
     try:
         # auto_convert 0: the pictures keep their bytes (the demuxer would otherwise write the encoder's parameter sets again in each key frame)
         result = subprocess.run([_ffmpeg_binary(), "-y", "-v", "error", "-f", "concat", "-safe", "0", "-auto_convert", "0", "-i", listing, "-map", "0:v:0", "-c", "copy", os.fspath(output_path)],
-                                capture_output=True, text=True, encoding="utf-8", errors="replace")
+                                capture_output=True, text=True, encoding="utf-8", errors="replace", **child_kwargs())
     finally:
         os.remove(listing)
     if result.returncode != 0:

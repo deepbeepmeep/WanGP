@@ -14,6 +14,7 @@ from models.TTS.stable_audio3.interface.aeiou import audio_spectrogram_image
 from models.TTS.stable_audio3.inference.distribution_shift import LogSNRShift, FluxDistributionShift, DistributionShift, IdentityDistributionShift
 from models.TTS.stable_audio3.models.lora import has_lora
 from models.TTS.stable_audio3.interface.reprompt import reprompt as _reprompt_fn, get_model as _reprompt_get_model, is_model_cached as _reprompt_is_model_cached
+from shared.utils.subprocess_stdin import child_kwargs
 
 stable_audio_3_model = None
 sample_size = 5324800
@@ -220,7 +221,7 @@ def generate_cond(
         pass
     if cmd:
         cmd += " -loglevel error" # make output less verbose in the cmd window
-        subprocess.run(cmd, shell=True, check=True)
+        subprocess.run(cmd, shell=True, check=True, **child_kwargs())
 
     # Let's look at a nice spectrogram too
     audio_spectrogram = audio_spectrogram_image(audio, sample_rate=sample_rate)

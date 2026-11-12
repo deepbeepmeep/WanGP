@@ -16,6 +16,7 @@ import torch.nn.functional as F
 import torchvision
 
 import gc
+from shared.utils.subprocess_stdin import child_kwargs
 
 def torch_gc():
     gc.collect()
@@ -139,7 +140,7 @@ def get_audio_duration(audio_path):
         "-show_entries", "format=duration",
         audio_path,
     ]
-    out = subprocess.check_output(cmd)
+    out = subprocess.check_output(cmd, **child_kwargs())
     info = json.loads(out)
     return float(info["format"]["duration"])
 
@@ -174,7 +175,7 @@ def save_video_ffmpeg(gen_video_samples, save_path, audio_path, fps=25, quality=
         f'{duration}',
         save_path_crop_audio,
     ]
-    subprocess.run(final_command, check=True)
+    subprocess.run(final_command, check=True, **child_kwargs())
 
     # crop video according to audio length
     crop_audio_duration = get_audio_duration(save_path_crop_audio)
@@ -188,7 +189,7 @@ def save_video_ffmpeg(gen_video_samples, save_path, audio_path, fps=25, quality=
         "-c:a", "copy",
         save_path_crop_tmp,
     ]
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, **child_kwargs())
 
     # generate video with audio
     save_path = save_path + ".mp4"
@@ -205,7 +206,7 @@ def save_video_ffmpeg(gen_video_samples, save_path, audio_path, fps=25, quality=
             "-shortest",
             save_path,
         ]
-        subprocess.run(final_command, check=True)
+        subprocess.run(final_command, check=True, **child_kwargs())
     else:
         final_command = [
             "ffmpeg",
@@ -221,7 +222,7 @@ def save_video_ffmpeg(gen_video_samples, save_path, audio_path, fps=25, quality=
             "-shortest",
             save_path,
         ]
-        subprocess.run(final_command, check=True)
+        subprocess.run(final_command, check=True, **child_kwargs())
         
     os.remove(save_path_tmp)
     os.remove(save_path_crop_tmp)

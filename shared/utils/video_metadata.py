@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 from shared.utils.video_decode import resolve_media_binary
+from shared.utils.subprocess_stdin import child_kwargs
 
 DEFAULT_RESERVED_VIDEO_METADATA_BYTES = 50 * 1024
 _RESERVED_METADATA_KEY = "_wangp_metadata_reserved"
@@ -99,7 +100,7 @@ def write_reserved_video_ffmetadata(file_path, reserved_bytes=DEFAULT_RESERVED_V
 
 def _read_container_tags(file_path):
     ffprobe_path = _resolve_media_tool("ffprobe")
-    result = subprocess.run([ffprobe_path, "-v", "error", "-show_entries", "format_tags", "-of", "json", file_path], capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False)
+    result = subprocess.run([ffprobe_path, "-v", "error", "-show_entries", "format_tags", "-of", "json", file_path], capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False, **child_kwargs())
     if result.returncode != 0:
         return {}
     try:
@@ -277,7 +278,7 @@ def _copy_video_with_comment(file_path, metadata_text, source_images=None):
         for attachment_no, (attachment_path, attachment_filename, mimetype) in enumerate(_materialize_mkv_attachments(source_images, meta_dir)):
             command += ["-attach", attachment_path, f"-metadata:s:t:{attachment_no}", f"mimetype={mimetype}", f"-metadata:s:t:{attachment_no}", f"filename={attachment_filename}"]
         command += [temp_output_path]
-        result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False)
+        result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False, **child_kwargs())
         if result.returncode != 0 or not os.path.isfile(temp_output_path):
             if os.path.exists(temp_output_path):
                 os.remove(temp_output_path)
@@ -557,7 +558,7 @@ def _legacy_save_metadata_to_mkv(file_path, metadata_dict):
             temp_path
         ]
         
-        result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+        result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, **child_kwargs())
         
         if result.returncode == 0:
             # Replace original with metadata version
@@ -630,7 +631,7 @@ def _legacy_read_metadata_from_mkv(file_path):
         result = subprocess.run([
             'ffprobe', '-v', 'quiet', '-print_format', 'json', 
             '-show_format', file_path
-        ], capture_output=True, text=True)
+        ], capture_output=True, text=True, **child_kwargs())
         
         if result.returncode == 0:
             probe_data = json.loads(result.stdout)
@@ -740,7 +741,7 @@ def read_metadata_from_mp4(file_path):
 def read_metadata_from_mkv(file_path):
     try:
         ffprobe_path = _resolve_media_tool("ffprobe")
-        result = subprocess.run([ffprobe_path, "-v", "quiet", "-print_format", "json", "-show_format", file_path], capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False)
+        result = subprocess.run([ffprobe_path, "-v", "quiet", "-print_format", "json", "-show_format", file_path], capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False, **child_kwargs())
         if result.returncode == 0:
             probe_data = json.loads(result.stdout)
             format_tags = probe_data.get("format", {}).get("tags", {})
@@ -875,7 +876,7 @@ def extract_source_images(video_path, output_dir = None):
             '-show_streams', video_path
         ]
         
-        result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True, **child_kwargs())
         import json as json_module
         probe_data = json_module.loads(result.stdout)
         
@@ -947,7 +948,7 @@ def extract_source_images(video_path, output_dir = None):
             ]
             
             try:
-                subprocess.run(extract_cmd, capture_output=True, text=True, check=True)
+                subprocess.run(extract_cmd, capture_output=True, text=True, check=True, **child_kwargs())
                 if os.path.exists(output_file):
                     extracted_files.setdefault(img_tag, []).append(output_file)
             except subprocess.CalledProcessError as e:
