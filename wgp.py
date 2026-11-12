@@ -4,7 +4,7 @@ import os, sys
 for _stream in (sys.stdout, sys.stderr): _stream.reconfigure(encoding="utf-8", errors="replace")
 from tqdm import tqdm
 
-WanGP_version = "19.291"
+WanGP_version = "19.292"
 _welcome_message = f" WanGP v{WanGP_version} - Copyright (c) 2024-2026 DeepBeepMeep "
 tqdm.write(f"\033[1m\033[93m{_welcome_message:*^100}\033[0m")
 
@@ -184,6 +184,7 @@ from shared import settings_metadata
 from postprocessing import audio_processors as audio_processor_api
 from postprocessing import temporal_upsamplers as temporal_upsampler_api
 from postprocessing import spatial_upsamplers as upsampler_api
+from postprocessing import chunking
 from postprocessing import parameter_ui
 from shared.utils import mesh_postprocessing
 from postprocessing.lanczos import resize_lanczos_spatial
@@ -1677,7 +1678,7 @@ def validate_settings(state, model_type, single_prompt, inputs, silent=False):
     if video_source is not None and "V" in image_prompt_type and image_start is None and image_mode == 0 and not is_edit_mode:
         # a Source Video that cannot stay in its file is loaded whole with the new frames
         predicted_frames = frame_scheduler["predicted_total_frames"] if frame_scheduler is not None and frame_scheduler["active"] else video_length
-        loaded_source_plan = video_continuation.loaded_source_plan(video_source, keep_frames_video_source, get_computed_fps(force_fps, model_type, video_guide, video_source), predicted_frames, max_source_video_frames, temporal_upsampling=temporal_upsampling, spatial_upsampling=spatial_upsampling, film_grain=float(inputs.get("film_grain_intensity", 0) or 0) > 0, hdr="&" in video_prompt_type)
+        loaded_source_plan = video_continuation.loaded_source_plan(video_source, keep_frames_video_source, get_computed_fps(force_fps, model_type, video_guide, video_source), predicted_frames, max_source_video_frames, processing=chunking.whole_video_reasons(temporal_upsampling, spatial_upsampling), hdr="&" in video_prompt_type)
         loaded_frames_error = video_continuation.frames_limit_error(loaded_source_plan)
         if loaded_frames_error:
             return err(loaded_frames_error)
@@ -2930,6 +2931,7 @@ if not Path(config_load_filename).is_file():
         "prompt_enhancer_randomize_seed": True,
         "audio_save_path": "outputs",
         **notifications.default_config(),
+        "welcome_popup": {"new_user": True},
     }
     apply_first_launch_deepy_prime_defaults(server_config)
 
@@ -6403,6 +6405,30 @@ def perform_spatial_upsampling(sample, spatial_upsampling, seed=0, flashvsr_cont
     raise ValueError(f"No spatial upsampler registered for '{spatial_upsampling}'")
 
 
+def chunked_postprocessing(read_frames, frames_count, width, height, fps, temporal_upsampling, spatial_upsampling, film_grain_intensity, film_grain_saturation, spatial_options, gen, progress_callback, label=""):
+    """A video of frames_count frames gone through Temporal Upsampling, Spatial Upsampling and Film Grain a chunk at a time, as save_video
+    reads it (chunking.ProcessedVideo): it is never held whole in memory. Only for upsamplers without chunking.whole_video_reasons.
+    read_frames(start, count) gives its frames (frames, H, W, C) at fps; spatial_options: what perform_spatial_upsampling receives
+    beside the frames, their place in the video and the cache carried from chunk to chunk; label opens the progress texts."""
+    from postprocessing.film_grain import add_film_grain
+    chunk_label = [label]
+    abort_callback = lambda: media_abort_requested(gen)
+    def chunk_started(chunk_no, chunks):
+        chunk_label[0] = label + (f"Chunk {chunk_no}/{chunks} - " if chunks > 1 else "")
+    def chunk_progress(phase, current_step=None, total_steps=None, unit=None):
+        progress_callback(chunk_label[0] + str(phase), current_step, total_steps, unit)
+    def processed(frames, cache=None):
+        if gen.get("abort", False) or frames is None: return None, None
+        return (frames if frames.dtype == torch.uint8 else convert_video_tensor_to_uint8_chunked(frames)), cache
+    def run_temporal(frames, start_frame, cache, return_cache):
+        return processed(perform_temporal_upsampling(frames, None, temporal_upsampling, fps, abort_callback=abort_callback, progress_callback=chunk_progress)[0])
+    def run_spatial(frames, start_frame, cache, return_cache):
+        result = perform_spatial_upsampling(frames, spatial_upsampling, flashvsr_continue_cache=cache, return_flashvsr_continue_cache=return_cache, frame_offset=start_frame, abort_callback=abort_callback, progress_callback=chunk_progress, **spatial_options)
+        return processed(*result) if return_cache else processed(result)
+    return chunking.ProcessedVideo(read_frames, frames_count, width, height, temporal=(temporal_upsampling, run_temporal) if len(temporal_upsampling) > 0 else None, spatial=(spatial_upsampling, run_spatial) if len(spatial_upsampling) > 0 else None,
+                                   per_frame=(lambda frames: add_film_grain(frames, film_grain_intensity, film_grain_saturation)) if film_grain_intensity > 0 else None, progress=chunk_started)
+
+
 def perform_mesh_postprocessing(data, spatial_upsampling, temporal_upsampling, *, spatial_values=None, temporal_values=None, reference_image=None, seed=0, abort_callback=None, progress_callback=None):
     """A GLB (bytes) through the 3D refiner then the texturer: the processed GLB and its [C, H, W] preview."""
     wait_for_model_unload()
@@ -6624,19 +6650,23 @@ def edit_media(
         media_info = get_video_info_details(video_source)
         fps = float(media_info["fps_float"] or media_info["fps"])
         width, height, frames_count = media_info["display_width"], media_info["display_height"], media_info["frame_count"]
+    source_frames_count = frames_count
     frames_count = min(frames_count, max_source_video_frames)
-    sample = None
+    sample = chunked_video = None
 
     if mode == "edit_postprocessing":
+        by_chunks = False
         if len(temporal_upsampling) > 0 or len(spatial_upsampling) > 0 or film_grain_intensity > 0:
             spatial_status = upsampler_api.method_progress_label(spatial_upsampling)
             send_cmd("progress", [0, get_latest_status(state, spatial_status if len(temporal_upsampling) > 0 or len(spatial_upsampling) > 0 else "Adding Film Grain")])
+            # a video goes through its upsamplers a chunk at a time, unless one of them takes it in one piece or the caller makes the chunks itself
+            by_chunks = not (source_is_image or api_return_video_uint8 or return_flashvsr_continue_cache or flashvsr_continue_cache is not None or upsampler_frame_offset) and not chunking.whole_video_reasons(temporal_upsampling, spatial_upsampling)
             if source_is_image:
                 sample = torch.from_numpy(np.array(image).astype(np.uint8)).unsqueeze(0).permute(-1,0,1,2)
-            else:
+            elif not by_chunks:
                 sample = get_resampled_video(video_source, 0, max_source_video_frames, None)
                 sample = sample.permute(-1,0,1,2)
-            frames_count = sample.shape[1] 
+            if sample is not None: frames_count = sample.shape[1]
 
         output_fps = fps
         def upsampler_progress(phase, current_step=None, total_steps=None, unit=None):
@@ -6647,15 +6677,25 @@ def edit_media(
                 send_cmd("progress", [(int(current_step), int(total_steps)), status_msg, int(total_steps)] + ([unit] if unit else []))
             else:
                 send_cmd("progress", [0, status_msg])
+        if by_chunks:
+            frames_growth = chunking.growth(temporal_upsampling)[0]
+            output_fps = fps * frames_growth
+            spatial_options = dict(seed=seed, fps=output_fps, prompt=spatial_upsampling_prompt, negative_prompt=str(configs.get("negative_prompt", "")), source_audio_path=conditioning_audio_path, reference_images=reference_images, image_refs_relative_size=image_refs_relative_size, parameter_values=parameter_ui.runtime_values(spatial_postprocessing_parameters, postprocessing_reference_images))
+            process_video = lambda count: chunked_postprocessing(lambda start, frames: get_resampled_video(video_source, start, frames, None), count, width, height, fps, temporal_upsampling, spatial_upsampling, film_grain_intensity, film_grain_saturation, spatial_options, gen, upsampler_progress)
+            chunked_video = process_video(source_frames_count)
+            if len(chunked_video.plans) == 1 and source_frames_count > frames_count:  # in one piece: no more frames than a video loaded whole
+                chunked_video = process_video(frames_count)
+            frames_count = round((chunked_video.frames_count - 1) * frames_growth) + 1
         if len(temporal_upsampling) > 0:
-            sample, previous_last_frame, output_fps = perform_temporal_upsampling(sample, None, temporal_upsampling, fps, abort_callback=lambda: media_abort_requested(gen), progress_callback=upsampler_progress)
-            if gen.get("abort", False) or sample is None:
-                return
+            if sample is not None:
+                sample, previous_last_frame, output_fps = perform_temporal_upsampling(sample, None, temporal_upsampling, fps, abort_callback=lambda: media_abort_requested(gen), progress_callback=upsampler_progress)
+                if gen.get("abort", False) or sample is None:
+                    return
+                frames_count = sample.shape[1]
             configs.update(temporal_upsampling=temporal_upsampling, temporal_postprocessing_parameters=dict(temporal_postprocessing_parameters or {}))
-            frames_count = sample.shape[1] 
 
 
-        if len(spatial_upsampling) > 0:
+        if len(spatial_upsampling) > 0 and sample is not None:
             if source_is_image:
                 sample = perform_image_spatial_upsampling(sample, spatial_upsampling, seed=seed, fps=output_fps, prompt=spatial_upsampling_prompt, negative_prompt=str(configs.get("negative_prompt", "")), parameter_values=parameter_ui.runtime_values(spatial_postprocessing_parameters, postprocessing_reference_images), abort_callback=lambda: media_abort_requested(gen), progress_callback=upsampler_progress)
                 flashvsr_continue_cache = None
@@ -6665,12 +6705,14 @@ def edit_media(
                 sample, flashvsr_continue_cache = sample
             if gen.get("abort", False) or sample is None:
                 return
+        if len(spatial_upsampling) > 0:
             configs["spatial_upsampling"] = spatial_upsampling
             configs.update(spatial_postprocessing_parameters=dict(spatial_postprocessing_parameters or {}), postprocessing_reference_images=list(postprocessing_reference_images or []))
 
         if film_grain_intensity > 0:
-            from postprocessing.film_grain import add_film_grain
-            sample = add_film_grain(sample, film_grain_intensity, film_grain_saturation) 
+            if sample is not None:
+                from postprocessing.film_grain import add_film_grain
+                sample = add_film_grain(sample, film_grain_intensity, film_grain_saturation)
             configs["film_grain_intensity"] = film_grain_intensity
             configs["film_grain_saturation"] = film_grain_saturation
     else:
@@ -6688,7 +6730,7 @@ def edit_media(
     saved_video_duration = None
     any_change = False
     api_video_tensor = None
-    if sample != None:
+    if sample != None or chunked_video is not None:
         if source_is_image:
             image_extension = get_image_format(server_config.get("image_output_codec", None), rgba=sample.shape[0] == 4)["ext"]
             image_path = get_available_filename(image_save_path, video_source, "_post", force_extension=image_extension)
@@ -6708,8 +6750,13 @@ def edit_media(
             return
         video_path = get_available_filename(save_path, video_source, "_tmp", force_extension=video_extension) if any_soundtrack_processor or has_already_audio or has_subtitles else get_available_filename(save_path, video_source, "_post", force_extension=video_extension)
         set_saving_file_status(state, gen, send_cmd, video_path)
-        video_path = save_video( tensor=sample[None], save_file=video_path, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type= server_config.get("video_output_codec", None), container=server_config.get("video_container", "mp4"))
-        saved_video_duration = sample.shape[1] / output_fps
+        video_path = save_video( tensor=sample[None] if chunked_video is None else chunked_video, save_file=video_path, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type= server_config.get("video_output_codec", None), container=server_config.get("video_container", "mp4"))
+        if chunked_video is not None:  # the frames went from their file to the encoder a chunk at a time
+            if chunked_video.aborted or gen.get("abort", False):
+                if video_path is not None and os.path.isfile(video_path): os.remove(video_path)
+                return
+            frames_count = chunked_video.frames
+        saved_video_duration = frames_count / output_fps
         api_video_tensor = sample if api_return_video_uint8 else None
         if api_video_tensor is None:
             sample = None
@@ -7975,7 +8022,7 @@ def generate_media(
     loaded_source_plan = continued_video = None
     continued_source = video_source is not None and image_start is None and not (is_image or audio_only)
     if continued_source:
-        loaded_source_plan =video_continuation.loaded_source_plan(video_source, keep_frames_video_source, fps, video_length, max_source_video_frames, temporal_upsampling=temporal_upsampling, spatial_upsampling=spatial_upsampling, film_grain=film_grain_intensity > 0, hdr="&" in video_prompt_type, frames_returned=api_return_video_uint8 or return_flashvsr_continue_cache)
+        loaded_source_plan =video_continuation.loaded_source_plan(video_source, keep_frames_video_source, fps, video_length, max_source_video_frames, processing=chunking.whole_video_reasons(temporal_upsampling, spatial_upsampling), hdr="&" in video_prompt_type, frames_returned=api_return_video_uint8 or return_flashvsr_continue_cache)
         if loaded_source_plan is not None:
             loaded_frames_error = video_continuation.frames_limit_error(loaded_source_plan)
             if loaded_frames_error: raise gr.Error(loaded_frames_error)
@@ -8393,8 +8440,14 @@ def generate_media(
                         prefix_video  = preprocess_video(width=width, height=height,video_in=video_source, max_frames= parsed_keep_frames_video_source , start_frame = 0, fit_canvas= sample_fit_canvas, fit_crop = fit_crop, target_fps = fps, block_size = block_size, preserve_hdr=prefix_video_is_hdr )
                     prefix_video  = prefix_video.permute(3, 0, 1, 2)
                     if source_stays_in_file and continued_video is None:
-                        encode_video_frames = lambda frames, path: save_video(tensor=frames, save_file=path, fps=fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type=server_config.get("video_output_codec", None), container=server_config.get("video_container", "mp4"))
-                        continued_video = video_continuation.ContinuedVideo(video_source, source_video_frames_count, fps, prefix_video.shape[-1], prefix_video.shape[-2], read_source_frames, encode_video_frames, save_path, server_config.get("video_container", "mp4"), temp_filenames_list, notify=tqdm.write)
+                        frames_growth = chunking.growth(temporal_upsampling)[0]
+                        encode_video_frames = lambda frames, path: save_video(tensor=frames, save_file=path, fps=fps * frames_growth, nrow=1, normalize=True, value_range=(-1, 1), codec_type=server_config.get("video_output_codec", None), container=server_config.get("video_container", "mp4"))
+                        # the Source Video goes through the post-processing of the generation a chunk at a time, unless it already went through it
+                        process_source_video = lambda read_frames, frames_count, source_width=prefix_video.shape[-1], source_height=prefix_video.shape[-2]: chunked_postprocessing(read_frames, frames_count, source_width, source_height, fps, temporal_upsampling, spatial_upsampling, film_grain_intensity, film_grain_saturation,
+                            dict(seed=seed, vae_tile_size=VAE_tile_size, fps=fps * frames_growth, prompt=prompt, negative_prompt=negative_prompt, reference_images=original_image_refs[nb_frames_positions:] if original_image_refs is not None else None, image_refs_relative_size=image_refs_relative_size, parameter_values=parameter_ui.runtime_values(spatial_postprocessing_parameters, postprocessing_reference_images)),
+                            gen, upsampler_progress, label="Source Video - ")
+                        continued_video = video_continuation.ContinuedVideo(video_source, source_video_frames_count, fps * frames_growth, read_source_frames, encode_video_frames, save_path, server_config.get("video_container", "mp4"), temp_filenames_list, notify=tqdm.write,
+                                                                            process=process_source_video if len(temporal_upsampling) > 0 or len(spatial_upsampling) > 0 or film_grain_intensity > 0 else None, copied_frames=round((source_video_frames_count - 1) * frames_growth) + 1)
 
                     if fit_crop or "L" in image_prompt_type: refresh_preview["video_source"] = convert_tensor_to_image(read_source_frames(0, 1).permute(3, 0, 1, 2) if source_stays_in_file else prefix_video, 0)
 
@@ -9089,6 +9142,7 @@ def generate_media(
                 if prefix_video != None and window_no == 1 :
                     if source_stays_in_file:  # the Source Video's frames are in its file: as for a later window, only the new frames are kept
                         sample = sample[: , source_video_overlap_frames_count:]
+                        previous_last_frame = prefix_video[:, -1:]  # Temporal Upsampling goes on from the last frame of the Source Video
                     elif sample_is_hdr:
                         prefix_was_uint8 = prefix_video.dtype == torch.uint8
                         prefix_video = prefix_video.float()
@@ -9163,7 +9217,7 @@ def generate_media(
                     else:
                         send_cmd("progress", [0, status_msg])
                 if len(temporal_upsampling) > 0 and not mesh_outputs:
-                    sample, previous_last_frame, output_fps = perform_temporal_upsampling(sample, previous_last_frame if sliding_window and window_no > 1 else None, temporal_upsampling, fps, abort_callback=lambda: media_abort_requested(gen), progress_callback=upsampler_progress)
+                    sample, previous_last_frame, output_fps = perform_temporal_upsampling(sample, previous_last_frame if sliding_window and window_no > 1 or source_stays_in_file else None, temporal_upsampling, fps, abort_callback=lambda: media_abort_requested(gen), progress_callback=upsampler_progress)
                     if gen.get("abort", False) or sample is None:
                         abort = True
                         break
@@ -9213,7 +9267,7 @@ def generate_media(
                 else:
                     if source_stays_in_file:  # the frames before this window are in the continued video's file
                         frames_already_processed = []
-                        if window_no == 1: frames_already_processed_count = source_video_frames_count
+                        if window_no == 1: frames_already_processed_count = continued_video.copied_frames
                     frames_already_processed.append(sample)
                     frames_already_processed_count += sample.shape[1]
                     output_video_frames = frames_already_processed
@@ -9299,6 +9353,9 @@ def generate_media(
                     save_path_tmp = video_path.rsplit('.', 1)[0] + f"_tmp.{container}"
                     if source_stays_in_file:  # the new frames are encoded alone and follow the video made so far, kept in a file of its own
                         save_path_tmp = continued_video.append(output_video_frames)
+                        if save_path_tmp is None:  # stopped while the Source Video was post-processed
+                            abort = True
+                            break
                     elif sample_is_hdr:
                         save_hdr_video(tensor=output_video_frames, save_file=save_path_tmp, fps=output_fps, codec_type=server_config.get("hdr_video_crf", 8), container=container)
                     else:
@@ -9390,7 +9447,11 @@ def generate_media(
 
                 else:
                     if source_stays_in_file:
-                        shutil.copyfile(continued_video.append(output_video_frames), video_path)
+                        continued_video_path = continued_video.append(output_video_frames)
+                        if continued_video_path is None:  # stopped while the Source Video was post-processed
+                            abort = True
+                            break
+                        shutil.copyfile(continued_video_path, video_path)
                     elif sample_is_hdr:
                         video_path = save_hdr_video(tensor=output_video_frames, save_file=video_path, fps=output_fps, codec_type=server_config.get("hdr_video_crf", 8), container=container)
                     else:

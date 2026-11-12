@@ -25,7 +25,7 @@ import torch
 import triton
 import triton.language as tl
 
-_CACHE_VERSION = 2
+_CACHE_VERSION = 3
 _CACHE_PATH = Path(os.environ.get("WAN2GP_FP8_BLOCK_TRITON_CACHE", Path.home() / ".triton" / "autotune" / "wan2gp_fp8_block_cache.json")).expanduser()
 _TUNING = os.environ.get("WAN2GP_FP8_TRITON_AUTOTUNE", "1") != "0"
 DECODE_NATIVE, DECODE_BITS_F32, DECODE_BITS_F16 = 0, 1, 2
@@ -79,7 +79,7 @@ def _e4m3_bits_to_f16_scaled(bits):
 def _prepare_a16_kernel(x, q, sa, M, K, sxm, sxk, kblocks, BM: tl.constexpr, EVEN_K: tl.constexpr):
     """FP16 rows of BF16 x (bits) with one power-of-two scale per row and 128-element block, the block's maximum scaled into [2^14, 2^15)."""
     pid_m, kb = tl.program_id(0), tl.program_id(1)
-    rm = pid_m * BM + tl.arange(0, BM)
+    rm = (pid_m * BM + tl.arange(0, BM)).to(tl.int64)  # 64 bits: rows x width passes 2^31 on long high resolution videos
     rk = kb * 128 + tl.arange(0, 128)
     mask = rm[:, None] < M
     if not EVEN_K:
@@ -108,7 +108,7 @@ def _block_kernel(x, w, sa, sb, bias, out, M, N, K, kblocks, sxm, sxk, swn, swk,
     size_m = tl.minimum(tiles_m - first_m, GROUP_M)
     pid_m = first_m + (pid % group) % size_m
     pid_n = (pid % group) // size_m
-    rm = pid_m * BM + tl.arange(0, BM)
+    rm = (pid_m * BM + tl.arange(0, BM)).to(tl.int64)  # 64 bits: rows x width passes 2^31 on long high resolution videos
     rn = pid_n * BN + tl.arange(0, BN)
     rk = tl.arange(0, BK)
     m_mask, n_mask = rm < M, rn < N

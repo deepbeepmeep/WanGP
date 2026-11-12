@@ -96,6 +96,9 @@ class RelayVSRProcessHandler:
     def output_fps(self, source_fps: float, target_control: str) -> float:
         return float(source_fps)
 
+    def carries_cache(self, value) -> bool:
+        return True  # the stream each chunk hands to the next one
+
     def supports_continue_cache(self) -> bool:
         return False  # nothing to save beside the output: a resumed job rebuilds the keyframe memory
 

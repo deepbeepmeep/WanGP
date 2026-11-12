@@ -1,12 +1,13 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Tuple
 
 import torch
-from mmgp import offload
+from mmgp import allocator, offload
 from safetensors import safe_open
 from tqdm import tqdm
 from shared.utils import files_locator as fl
@@ -24,7 +25,7 @@ from .assets import (
     LLAMAJOY_FOLDER,
 )
 from shared.deepy.config import gguf_kernels_warning, resolve_deepy_kv_cache_quantization
-from .config import mtp_auto_long_drafts, resolve_prompt_enhancer_speculative_decoding, speculative_decoding_runtime, split_speculative_decoding
+from .config import mtp_auto_long_drafts, other_programs_vram_advice, resolve_prompt_enhancer_speculative_decoding, speculative_decoding_runtime, split_speculative_decoding
 
 
 @dataclass(slots=True)
@@ -176,12 +177,15 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, qwen_
         else:
             default_dtype = torch.bfloat16
         text_model_path = get_qwen35_text_gguf_path(assets_dir, variant=qwen35_variant, backend=quantization) if backend == enhancer_quantization_GGUF else None
-        fit = lambda: qwen35_mtp_fit(assets_dir, qwen35_variant, backend, text_model_path, deepy_kv_cache_quantization)
+        fit = functools.cache(lambda: qwen35_mtp_fit(assets_dir, qwen35_variant, backend, text_model_path, deepy_kv_cache_quantization))
         auto_draft_count = split_speculative_decoding(speculative_decoding)[1] is None  # Auto, or MTP with an automatic draft count
+        other_programs_advice = other_programs_vram_advice(enhancer_enabled, speculative_decoding, fit, allocator.other_programs(), qwen_backend=qwen_backend)
         speculative_decoding, speculative_decoding_message = resolve_prompt_enhancer_speculative_decoding(enhancer_enabled, speculative_decoding, qwen_backend=qwen_backend, fit=fit)
         speculative_decoding, speculative_tokens = speculative_decoding_runtime(speculative_decoding)
         if speculative_decoding_message:
             print(f"[Prompt Enhancer / Deepy] {speculative_decoding_message}")
+        if other_programs_advice:
+            tqdm.write(f"\033[91m[Prompt Enhancer / Deepy] {other_programs_advice}\033[0m")
         runtime.llm_model = load_qwen35_text_prompt_enhancer(
             model_path=text_model_path,
             assets_dir=assets_dir,

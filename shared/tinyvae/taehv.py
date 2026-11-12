@@ -11,9 +11,13 @@ runtime helpers.
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 from torch.nn import functional as F
+
+from shared.utils.conv_bands import BAND_BYTES
 
 
 def conv(n_in, n_out, **kwargs):
@@ -82,6 +86,43 @@ def _apply(model, x, parallel, output_indices=None, abort_check=None, output_tra
     memory = [None] * len(model)
     output = []
     output_no = 0
+    # The tail: the last upsampling and the layers after it, which keep nothing from the previous frame. It holds the largest activations
+    # (full-size frames of the widest layers): above BAND_BYTES it runs by bands of its input rows, each with the halo of rows that its 3x3
+    # convolutions read, so that every output value has the same inputs as with the whole frame and no full-size activation is allocated.
+    tail = max((index for index, block in enumerate(model) if isinstance(block, nn.Upsample)), default=len(model))
+    tail = tail if not any(isinstance(block, MemBlock) for block in model[tail:]) else len(model)
+    tail_convs = [conv for block in model[tail:] for conv in block.modules() if isinstance(conv, nn.Conv2d)]
+
+    def run_tail(value):
+        """The tail on value, the frames of its input: True when it ran by bands (its frames are in output), False when it fits whole."""
+        nonlocal output_no
+        scale = int(model[tail].scale_factor)
+        frames, _, height, width = value.shape
+        rows = max(1, BAND_BYTES // (frames * max(conv.out_channels for conv in tail_convs) * scale * scale * width * value.element_size()))
+        if rows >= height:
+            return False
+        grown = frames * math.prod(block.stride for block in model[tail:] if isinstance(block, TGrow))
+        produced = range(output_no, output_no + grown)
+        output_no += grown
+        keep = None if output_indices is None else [frame - produced.start for frame in produced if frame in output_indices]
+        if keep is not None and not keep:
+            return True
+        halo = math.ceil(sum(conv.kernel_size == (3, 3) for conv in tail_convs) / scale)
+        out = None
+        for start in range(0, height, rows):
+            stop = min(height, start + rows)
+            low = max(0, start - halo)
+            band = value[:, :, low:min(height, stop + halo)]
+            for index in range(tail, len(model)):
+                band = model[index](band)
+                if index == last_temporal and keep is not None:
+                    band = band[keep]
+            if out is None:
+                out = torch.empty((band.shape[0], band.shape[1], scale * height, band.shape[-1]), dtype=band.dtype, device=band.device)
+            out[:, :, scale * start:scale * stop].copy_(band[:, :, scale * (start - low):scale * (stop - low)])
+            del band
+        output.extend((frame if output_transform is None else output_transform(frame)).unsqueeze(1) for frame in out.split(1))
+        return True
 
     def run(value, start):
         nonlocal output_no
@@ -89,6 +130,8 @@ def _apply(model, x, parallel, output_indices=None, abort_check=None, output_tra
             if value.shape[0] > 1 and value.numel() > SEQUENTIAL_PIECE_ELEMENTS:
                 for piece in value.split(max(1, SEQUENTIAL_PIECE_ELEMENTS // value[0].numel())):
                     run(piece, index)
+                return
+            if index == tail and run_tail(value):
                 return
             block = model[index]
             if isinstance(block, MemBlock):

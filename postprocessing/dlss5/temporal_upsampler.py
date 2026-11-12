@@ -67,6 +67,11 @@ class DLSSGTemporalUpsampler(api.SimpleScaleSuffixMixin):
             "description": "NVIDIA DLSS Frame Generation using video motion estimation. Linux supports experimental x2 with the NVIDIA Vulkan driver and a compatible RTX GPU. Windows supports x2-x4 and capability-gated x5/x6 on RTX 50 series, and requires Windows 11, HAGS, and RTX 40 or newer.",
         }
 
+    def query_chunking(self, temporal_upsampling):
+        """How a long video goes through this upsampler a chunk at a time (postprocessing.chunking)."""
+        from postprocessing.system_upsampler_handler import DLSSG_HANDLER
+        return DLSSG_HANDLER
+
     def validate_upsampling(self, temporal_upsampling, *, source_is_image=False):
         split = self.split_value(temporal_upsampling)
         if split is None or split[1] not in self.MULTIPLIERS:

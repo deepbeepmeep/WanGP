@@ -58,6 +58,11 @@ class LanczosUpsampler(SimpleScaleSuffixMixin):
             "description": "A very fast CPU resize with negligible VRAM use. It is sharper than a basic resize, but cannot reconstruct lost detail and may add ringing or aliasing.",
         }
 
+    def query_chunking(self, spatial_upsampling):
+        """How a long video goes through this upsampler a chunk at a time (postprocessing.chunking)."""
+        from postprocessing.chunking import FRAME_BY_FRAME
+        return FRAME_BY_FRAME
+
     def validate_upsampling(self, spatial_upsampling, image_mode: int) -> str:
         return ""
 

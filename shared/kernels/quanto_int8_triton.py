@@ -38,7 +38,7 @@ _ENV_AUTOTUNE_LOCK_FUSED_BLOCK_K = "WAN2GP_QUANTO_INT8_AUTOTUNE_LOCK_FUSED_BLOCK
 _IS_AVAILABLE = {}
 _CONFIG_LEN = 5
 _CONVROT_KINDS = ("convrot", "convrot_bias")
-_AUTOTUNE_CACHE_VERSION = 2
+_AUTOTUNE_CACHE_VERSION = 3
 _AUTOTUNE_CACHE_LOADED = False
 _AUTOTUNE_CACHE_DIRTY = False
 _AUTOTUNE_CONFIG_CACHE: dict[str, tuple[int, int, int, int, int]] = {}
@@ -1075,7 +1075,7 @@ if _TRITON_AVAILABLE:
     ):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
-        offs_m = pid_m * block_m + tl.arange(0, block_m)
+        offs_m = (pid_m * block_m + tl.arange(0, block_m)).to(tl.int64)  # 64 bits: rows x width passes 2^31 on long high resolution videos
         offs_n = pid_n * block_n + tl.arange(0, block_n)
         offs_k = tl.arange(0, block_k)
 
@@ -1145,7 +1145,7 @@ if _TRITON_AVAILABLE:
     ):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
-        offs_m = pid_m * block_m + tl.arange(0, block_m)
+        offs_m = (pid_m * block_m + tl.arange(0, block_m)).to(tl.int64)  # 64 bits: rows x width passes 2^31 on long high resolution videos
         offs_n = pid_n * block_n + tl.arange(0, block_n)
         offs_k = tl.arange(0, block_k)
 
@@ -1203,7 +1203,7 @@ if _TRITON_AVAILABLE:
     ):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
-        offs_m = pid_m * block_m + tl.arange(0, block_m)
+        offs_m = (pid_m * block_m + tl.arange(0, block_m)).to(tl.int64)  # 64 bits: rows x width passes 2^31 on long high resolution videos
         offs_n = pid_n * block_n + tl.arange(0, block_n)
         offs_k = tl.arange(0, block_k)
 
@@ -1236,7 +1236,7 @@ if _TRITON_AVAILABLE:
 if _TRITON_AVAILABLE:
     @triton.jit
     def _prepare_blockscale_kernel(x, q, scales, m, k, blocks: tl.constexpr, stride_m, stride_k, bm: tl.constexpr, bk: tl.constexpr):
-        rows = tl.program_id(0) * bm + tl.arange(0, bm)
+        rows = (tl.program_id(0) * bm + tl.arange(0, bm)).to(tl.int64)
         block = tl.program_id(1)
         cols = block * bk + tl.arange(0, bk)
         values = tl.load(x + rows[:, None] * stride_m + cols[None, :] * stride_k,
@@ -1251,7 +1251,7 @@ if _TRITON_AVAILABLE:
     @triton.jit
     def _prepared_blockscale_gemm_kernel(q, b, scales, ws, out, m, n, k, blocks: tl.constexpr, stride_bn, stride_bk,
                                           bm: tl.constexpr, bn: tl.constexpr, bk: tl.constexpr):
-        rows = tl.program_id(0) * bm + tl.arange(0, bm)
+        rows = (tl.program_id(0) * bm + tl.arange(0, bm)).to(tl.int64)
         cols = tl.program_id(1) * bn + tl.arange(0, bn)
         offsets = tl.arange(0, bk)
         acc = tl.zeros((bm, bn), tl.float32)

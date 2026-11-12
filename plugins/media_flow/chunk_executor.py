@@ -13,6 +13,7 @@ from typing import Any, Callable
 import gradio as gr
 import torch
 
+from postprocessing import chunking
 from shared.utils.hdr import tonemap_hdr_tensor_to_uint8
 from shared.utils.virtual_media import build_virtual_media_path
 
@@ -33,24 +34,6 @@ USER_PROCESS_OUTPUT_KEYS = {
     "image_save_path",
     "audio_save_path",
 }
-
-
-def system_chunk_write_range(*, plan_overlap_frames: int, plan_requested_frames: int, next_overlap_frames: int, leading_overlap_already_written: bool) -> tuple[int, int]:
-    return (plan_overlap_frames if leading_overlap_already_written else 0), plan_requested_frames - next_overlap_frames
-
-
-def system_chunk_output_write_range(handler, returned_frame_count: int, *, source_write_start: int, source_write_end: int, next_overlap_frames: int) -> tuple[int, int]:
-    output_write_range = getattr(handler, "output_write_range", None)
-    if callable(output_write_range):
-        return output_write_range(returned_frame_count, source_write_start=source_write_start, source_write_end=source_write_end, next_overlap_frames=next_overlap_frames)
-    return source_write_start, source_write_end
-
-
-@torch.inference_mode()
-def crossfade_video_overlap(previous_tail: torch.Tensor, current_head: torch.Tensor) -> torch.Tensor:
-    overlap_frames = int(previous_tail.shape[1])
-    weights = torch.linspace(0.0, torch.pi, overlap_frames, device=previous_tail.device, dtype=torch.float32).cos_().mul_(-0.5).add_(0.5).view(1, overlap_frames, 1, 1)
-    return torch.lerp(previous_tail.float(), current_head.float(), weights).round_().to(current_head.dtype)
 
 
 def build_task_settings(process_settings: dict, *, is_user_process: bool) -> dict:
@@ -271,22 +254,15 @@ class ChunkExecutor:
                 remaining_unique_frames = context.requested_unique_frames - (context.resumed_unique_frames + progress.written_unique_frames)
                 next_overlap_frames = context.plans[chunk_index].overlap_frames if chunk_index < len(context.plans) else 0
                 leading_overlap_already_written = chunk_index == 1 and context.resumed_unique_frames > 0
-                crossfade_overlap_outputs = bool(getattr(context.system_handler, "crossfade_overlap_outputs", False))
-                overlap_output_split = getattr(context.system_handler, "overlap_output_split", None)
-                split_frames = overlap_output_split(plan_overlap_frames) if callable(overlap_output_split) else None
-                blended_overlap = None if not crossfade_overlap_outputs or progress.overlap_tail is None else crossfade_video_overlap(progress.overlap_tail, video_tensor_uint8[:, :plan_overlap_frames]) if split_frames is None else torch.cat((progress.overlap_tail[:, :split_frames], video_tensor_uint8[:, split_frames:plan_overlap_frames]), dim=1)
-                source_write_start, source_write_end = system_chunk_write_range(plan_overlap_frames=plan_overlap_frames, plan_requested_frames=plan_requested_frames, next_overlap_frames=next_overlap_frames, leading_overlap_already_written=leading_overlap_already_written)
-                source_frames_to_write = source_write_end - source_write_start
-                output_write_start, output_write_end = system_chunk_output_write_range(context.system_handler, returned_frame_count, source_write_start=source_write_start, source_write_end=source_write_end, next_overlap_frames=next_overlap_frames)
-                output_frames_to_write = output_write_end - output_write_start
-                if source_frames_to_write <= 0 or output_frames_to_write <= 0:
-                    raise gr.Error(f"Chunk {chunk_index} has no new frame to write after applying its overlap.")
+                try:  # joined to the previous chunk as the upsampler declares it, like WanGP's own chunks
+                    with torch.inference_mode():
+                        joined = chunking.join_chunk(context.system_handler, video_tensor_uint8, progress.overlap_tail, overlap_frames=plan_overlap_frames, source_frames=plan_requested_frames, next_overlap_frames=next_overlap_frames, leading_overlap_already_written=leading_overlap_already_written)
+                except chunking.FramePlanningError as exc:
+                    raise gr.Error(f"Chunk {chunk_index} {exc}") from exc
+                source_frames_to_write, output_frames_to_write = joined.source_frames, sum(int(piece.shape[1]) for piece in joined.pieces)
                 if source_frames_to_write > remaining_unique_frames:
                     raise gr.Error(f"Chunk {chunk_index} would consume {source_frames_to_write} source frame(s), but only {remaining_unique_frames} frame(s) remain.")
-                if output_write_start < 0 or output_write_end > returned_frame_count:
-                    raise gr.Error(f"Chunk {chunk_index} returned {returned_frame_count} frame(s), but output range [{output_write_start}..{output_write_end}) was required.")
-                with torch.inference_mode():
-                    progress.overlap_tail = video_tensor_uint8[:, -next_overlap_frames:].clone() if crossfade_overlap_outputs and next_overlap_frames > 0 else None
+                progress.overlap_tail = joined.left
 
                 output_fps = float(context.fps_float)
                 resolve_output_fps = getattr(context.system_handler, "output_fps", None)
@@ -311,12 +287,9 @@ class ChunkExecutor:
                 )
                 if context.continued_mode and progress.write_state.output_path_for_write != context.output_path and callable(getattr(context.system_handler, "move_continue_cache", None)):
                     context.system_handler.move_continue_cache(context.output_path, progress.write_state.mux_output_path)
-                if blended_overlap is not None:
-                    last_frame_tensor = progress.write_state.write_chunk(process_is_hdr=False, video_tensor_hdr=None, video_tensor_uint8=blended_overlap, start_frame=0, frame_count=plan_overlap_frames)
-                remaining_write_start = plan_overlap_frames if blended_overlap is not None else output_write_start
-                remaining_frames_to_write = output_frames_to_write - plan_overlap_frames if blended_overlap is not None else output_frames_to_write
-                if remaining_frames_to_write > 0:
-                    last_frame_tensor = progress.write_state.write_chunk(process_is_hdr=False, video_tensor_hdr=None, video_tensor_uint8=video_tensor_uint8, start_frame=remaining_write_start, frame_count=remaining_frames_to_write)
+                for piece in joined.pieces:
+                    if piece.shape[1] > 0:
+                        last_frame_tensor = progress.write_state.write_chunk(process_is_hdr=False, video_tensor_hdr=None, video_tensor_uint8=piece, start_frame=0, frame_count=int(piece.shape[1]))
                 progress.written_unique_frames += source_frames_to_write
                 if self._preview_enabled():
                     self.preview_state["image"] = video.frame_to_image(last_frame_tensor)
@@ -325,7 +298,7 @@ class ChunkExecutor:
                 release_output_payload = getattr(job, "release_output_payload", None)
                 if callable(release_output_payload):
                     release_output_payload()
-                video_tensor_uint8 = returned_video_item = result = job = None
+                video_tensor_uint8 = returned_video_item = result = job = joined = None
                 gc.collect()
 
                 progress.completed_chunks += 1

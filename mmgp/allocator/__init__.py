@@ -7,7 +7,7 @@ PyTorch 2.3+).
 
 install(spill=True) places what VRAM has no room for in system RAM instead of raising an out of memory error (slower). torch.cuda memory
 statistics and empty_cache are answered by the allocator. set_pressure_callback, mark_reset / mark_peak, room and stats serve the automatic
-VRAM preload; set_vram_limit emulates a smaller GPU for tests."""
+VRAM preload; other_programs tells the VRAM the other programs hold on the GPU; set_vram_limit emulates a smaller GPU for tests."""
 import ctypes
 import contextlib
 import os
@@ -99,6 +99,7 @@ def install(mode="vmm", large_mb=256, chunk_mb=32, spill=False):
     for name in ("vmm_mark_reset", "vmm_mark_peak", "vmm_room"):
         getattr(lib, name).argtypes = (ctypes.c_int,)
     lib.vmm_mark_peak.restype = lib.vmm_room.restype = ctypes.c_int64
+    lib.vmm_gpu_memory.argtypes = (ctypes.c_int, ctypes.POINTER(ctypes.c_int64))
     lib.vmm_configure(large_mb << 20, chunk_mb << 20, 3 if spill else 0)  # spill modes: pinned system RAM, then the driver's allocation
     lib.vmm_set_oom_thrower.argtypes = (ctypes.c_void_p,)
     lib.vmm_set_ram_release.argtypes = (ctypes.c_void_p,)
@@ -382,6 +383,20 @@ def room(device=None):
     """VRAM the allocator may still take, in bytes: this process' free budget (DXGI on Windows, the driver's free memory elsewhere), or NVML's
     free memory of the whole GPU if smaller."""
     return _lib.vmm_room(_device_index(device))
+
+
+def other_programs(device=None):
+    """VRAM the other programs hold on the GPU (the desktop, browsers, overlays, another WanGP), in bytes, read now: what NVML counts on the
+    whole GPU less this process' own (on Windows what DXGI counts for it, its CUDA context included; elsewhere the allocator's reservations,
+    so that its CUDA context counts among the others). On an emulated card (virtual_gpu), what they take of that card. None when unknown:
+    another allocator, no allocation made on the device yet, or no NVML."""
+    if active != "vmm":
+        return None
+    out = (ctypes.c_int64 * 3)()
+    if not _lib.vmm_gpu_memory(_device_index(device), out):
+        return None
+    total, free, own = out
+    return max(0, min(total, torch.cuda.mem_get_info(device)[1]) - free - own)
 
 
 def _redirect_torch_memory_functions():

@@ -78,20 +78,15 @@ def process_frames(model, device, frames, multiplier, *, previous_last_frame=Non
             I0 = I1
             I1 = prepare(frame)
             ssim = similarity(I0, I1)
-            break_flag = False
             if ssim > 0.996:
                 pos += 1
-                frame = read(pos)
-                if frame is None:
-                    break_flag = True
-                    frame = lastframe
-                else:
-                    temp = frame
-                I1 = model.inference(I0, prepare(frame), 0.5, 1)
-                if cancelled():
-                    return None
-                ssim = similarity(I0, I1)
-                frame = I1[0, :, :h, :w]
+                temp = read(pos)
+                if temp is not None:  # a still pair: its second frame is drawn halfway to the one after it. The last pair keeps its own frame: nothing follows it here, and whatever continues the video starts from that frame
+                    I1 = model.inference(I0, prepare(temp), 0.5, 1)
+                    if cancelled():
+                        return None
+                    ssim = similarity(I0, I1)
+                    frame = I1[0, :, :h, :w]
             add_frame(output, output_index, lastframe, h, w)
             output_index += 1
             for index in range(1, multiplier):
@@ -103,8 +98,6 @@ def process_frames(model, device, frames, multiplier, *, previous_last_frame=Non
                 del mid
             lastframe = frame
             progress.update(1)
-            if break_flag:
-                break
         if cancelled():
             return None
         add_frame(output, output_index, lastframe, h, w)

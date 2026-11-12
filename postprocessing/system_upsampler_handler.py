@@ -13,12 +13,12 @@ class SystemUpsamplerProcessHandler:
     method: str
     temporal: bool
     prompt: str
+    overlap_frames: int = 1  # source frames a chunk shares with the one before it
 
     model_type = "__system_flashvsr"
     model_label = "WanGP System Video Postprocessing"
     default_chunk_size_seconds = 3.0
     frame_step = 1
-    overlap_frames = 1
     hide_sliding_window_overlap = True
     hide_output_resolution = True
     hide_prompt = True
@@ -144,4 +144,6 @@ class SystemUpsamplerProcessHandler:
 
 RIFE_HANDLER = SystemUpsamplerProcessHandler("rife", "rife", True, "RIFE temporal upsampling")
 DLSSG_HANDLER = SystemUpsamplerProcessHandler("dlssg", "dlssg", True, "DLSS 5 Frame Generation")
-DLSS5_HANDLER = SystemUpsamplerProcessHandler("dlss5", "dlss5", False, "DLSS 5 Neural Rendering")
+# DLSS 5 builds each frame from the ones before it: a chunk starts cold, and fades in over 16 shared frames while it settles (with a single
+# shared frame the picture changed in one frame at every chunk start)
+DLSS5_HANDLER = SystemUpsamplerProcessHandler("dlss5", "dlss5", False, "DLSS 5 Neural Rendering", overlap_frames=16)

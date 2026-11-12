@@ -95,7 +95,7 @@
                 "label": "Sparge Attention 0.1.0 (CUDA 13 / Torch 2.9+ ABI)",
                 "cmd": {
                     "win": "https://github.com/woct0rdho/SpargeAttn/releases/download/v0.1.0-windows.post4/spas_sage_attn-0.1.0%2Bcu130torch2.9.0andhigher.post4-cp39-abi3-win_amd64.whl",
-                    "linux": "{pip} ninja wheel packaging && {pip} --no-build-isolation git+https://github.com/woct0rdho/SpargeAttn.git"
+                    "linux": "https://github.com/deepbeepmeep/kernels/releases/download/SpargeAttn/spas_sage_attn-0.1.0%2Bcu130torch2.10-cp311-cp311-linux_x86_64.whl"
                 }
             }
         },
@@ -104,7 +104,7 @@
                 "label": "Flash Attention 2.8.x",
                 "cmd": {
                     "win": "https://github.com/deepbeepmeep/kernels/releases/download/Flash2/flash_attn-2.8.3-cp311-cp311-win_amd64.whl",
-                    "linux": "--no-build-isolation flash-attn==2.8.3.post1"
+                    "linux": "https://github.com/deepbeepmeep/kernels/releases/download/Flash2/flash_attn-2.8.3%2Bcu130torch2.10-cp311-cp311-linux_x86_64.whl"
                 }
             },
             "v284_rocm": {

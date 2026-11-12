@@ -195,6 +195,8 @@ class LTXDetailRefinerProcessHandler:
     def supports_continue_cache_for_target(value: str | None) -> bool:
         return _chunk_mode() in ("fusion", "conditioning")
 
+    carries_cache = supports_continue_cache_for_target  # each chunk hands its refined shared frames to the next one
+
     @staticmethod
     def cache_sidecar_path(output_filename: str) -> str:
         output_path = Path(output_filename).resolve()

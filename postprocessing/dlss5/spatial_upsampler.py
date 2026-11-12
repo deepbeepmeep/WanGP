@@ -90,6 +90,11 @@ class DLSS5SpatialUpsampler(api.SimpleScaleSuffixMixin):
             ]},
         }
 
+    def query_chunking(self, spatial_upsampling):
+        """How a long video goes through this upsampler a chunk at a time (postprocessing.chunking)."""
+        from postprocessing.system_upsampler_handler import DLSS5_HANDLER
+        return DLSS5_HANDLER
+
     def validate_upsampling(self, spatial_upsampling, image_mode):
         split = self.split_value(spatial_upsampling)
         if split is None or split[1] not in NR_MODES:

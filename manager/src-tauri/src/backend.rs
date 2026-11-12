@@ -46,12 +46,13 @@ struct Preferences {
     /// The App window's web engine draws without the graphics card, leaving its memory to WanGP.
     #[serde(default)]
     app_without_gpu: bool,
-    /// The one-time GitHub star suggestion was answered: it does not come back.
-    #[serde(default)]
-    star_prompt_answered: bool,
+    /// The project page was opened from Manager: each launch tells WanGP, which then no longer asks for a star.
+    /// Also set by an answer to the star card of the first 0.1.16 files, either way, so that nobody is asked again.
+    #[serde(default, alias = "star_prompt_answered")]
+    github_opened: bool,
 }
 impl Default for Preferences {
-    fn default() -> Self { Self { schema_version: 1, installations: vec![], selected: None, port: 7860, launch_options: LaunchOptions::default(), authentication_secret: None, app_without_gpu: false, star_prompt_answered: false } }
+    fn default() -> Self { Self { schema_version: 1, installations: vec![], selected: None, port: 7860, launch_options: LaunchOptions::default(), authentication_secret: None, app_without_gpu: false, github_opened: false } }
 }
 const PROJECT_PAGE: &str = "https://github.com/deepbeepmeep/WanGP";
 /// WebView2 fixes its browser arguments for every window of the Manager when the first one opens: wry's defaults,
@@ -357,6 +358,7 @@ fn start_job(window: WebviewWindow, app: tauri::AppHandle, state: tauri::State<A
         let values = args.as_object_mut().ok_or("Invalid launch arguments")?;
         values.insert("launch_options".into(), serde_json::to_value(&preferences.launch_options).map_err(|e| e.to_string())?);
         values.insert("port".into(), json!(preferences.port));
+        values.insert("github_opened".into(), json!(preferences.github_opened));
         if preferences.launch_options.authentication && preferences.launch_options.password_mode == "custom" {
             let secret = preferences.authentication_secret.as_ref().ok_or("Set a custom password in Preferences")?;
             values.insert("auth_password".into(), json!(crate::secrets::reveal(secret)?));
@@ -598,12 +600,12 @@ async fn open_manager_download(window: WebviewWindow) -> Result<(), String> {
 /// Opens the project page in the user's browser, where they are signed in to GitHub: Manager never stars for them.
 /// Either answer to the one-time suggestion retires it.
 #[tauri::command]
-fn github_star(window: WebviewWindow, state: tauri::State<AppState>, open: bool) -> Result<Value, String> {
+fn github_star(window: WebviewWindow, state: tauri::State<AppState>) -> Result<Value, String> {
     authorize(&window)?;
-    if open { open_url(PROJECT_PAGE)?; }
+    open_url(PROJECT_PAGE)?;
     let mut preferences = state.preferences.lock().unwrap();
-    if !preferences.star_prompt_answered {
-        let mut next = preferences.clone(); next.star_prompt_answered = true;
+    if !preferences.github_opened {
+        let mut next = preferences.clone(); next.github_opened = true;
         save_preferences(&state, &next)?; *preferences = next;
     }
     Ok(preferences_view(&preferences))
@@ -622,6 +624,19 @@ mod tests {
         assert!(restored.launch_options.listen && restored.launch_options.verbose && restored.launch_options.authentication);
         assert!(serde_json::from_value::<LaunchOptions>(json!({"listen":"true"})).is_err());
         assert!(serde_json::from_value::<LaunchOptions>(json!({"extra":"--server-port 1"})).is_err());
+    }
+
+    #[test]
+    fn github_visit_survives_the_star_card_preference() {
+        let base = json!({"schema_version":1,"installations":[],"selected":null,"port":7860});
+        let fresh: Preferences = serde_json::from_value(base.clone()).unwrap();
+        assert!(!fresh.github_opened);
+        let mut answered = base.clone(); answered["star_prompt_answered"] = json!(true);
+        let migrated: Preferences = serde_json::from_value(answered).unwrap();
+        assert!(migrated.github_opened);
+        let saved = serde_json::to_value(&migrated).unwrap();
+        assert_eq!(saved["github_opened"], json!(true));
+        assert!(saved.get("star_prompt_answered").is_none());
     }
 
     #[test]

@@ -30,7 +30,7 @@ def _quantize_kernel(x_ptr, q_ptr, partial_ptr, scale_ptr, n, inv_maxv, maxv, mi
     if pid == 0:
         tl.store(scale_ptr, scale)
     scale_x = scale.to(X_DTYPE).to(tl.float32)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    offs = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)  # 64 bits: tensors of 2^31 elements and more
     mask = offs < n
     x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     y = tl.math.div_rn(x, scale_x).to(X_DTYPE).to(tl.float32)  # x / scale computed in float32 and rounded to x's dtype, as torch does

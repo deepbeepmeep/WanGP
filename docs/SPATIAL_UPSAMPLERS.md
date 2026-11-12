@@ -133,6 +133,7 @@ class MyUpsampler:
     def split_value(self, value): ...                      # -> (method, scale) or None
     def build_value(self, method, scale): ...              # -> value or None
     def validate_upsampling(self, value, image_mode): ...  # -> "" or error text
+    def query_chunking(self, value): ...                   # optional: how a long video is processed by chunks (see Long videos)
     # postprocessing type only:
     def upscale(self, sample, value, *, seed, ..., abort_callback, progress_callback): ...
     # progress_callback(phase, current=None, total=None, unit=None): unit (e.g. "tiles") labels the counter, default "steps"
@@ -201,6 +202,69 @@ not affect method lookup, metadata labels, API discovery or execution. Media
 compatibility, model exclusions and `method_available(method)` still apply;
 restoring a hidden choice never makes an unavailable method usable. Handlers
 without this hook show all their available methods.
+
+### Long videos: chunk rules
+
+A long video is upsampled a chunk at a time, so that it never has to fit in
+memory: in Late Post Processing, for the Source Video of a continued
+generation, and in Media Flow. WanGP does not know any upsampler: each one
+declares how its chunks are cut and joined through `query_chunking(value)`,
+which returns an object with the fields below. Every field is optional. An
+upsampler without `query_chunking` receives its video in one piece.
+
+| Field | Meaning |
+|---|---|
+| `get_chunk_frames(frames_count)` | Frames of a chunk when the model has a window of its own. Without it WanGP sizes the chunks by memory (Media Flow: the user's Chunk Size). |
+| `chunk_frame_step` | Chunks sized by WanGP hold `n * chunk_frame_step + 1` frames. Default 1. |
+| `minimum_requested_frames` | Fewest frames of a chunk. Default 1. |
+| `overlap_frames`, `get_overlap_frames(chunk_frames)` or `get_overlap_frames_for_target(chunk_frames, value)` | Source frames a chunk shares with the one before it. Default 0. |
+| `crossfade_overlap_outputs` | `True`: the shared frames fade from the previous chunk's output to this one's. `False` (default): they are this chunk's. |
+| `overlap_output_split(overlap_frames)` | With `crossfade_overlap_outputs`: how many shared frames are kept from the previous chunk, the others being this chunk's. `None` fades. |
+| `output_write_range(returned_frames, source_write_start=, source_write_end=, next_overlap_frames=)` | The output frames kept from a chunk, for an upsampler that does not return one frame per source frame. |
+| `carries_cache(value)` | `True`: `upscale()` is called with `return_continue_cache=True`, and what it returns beside the frames reaches the next chunk as `continue_cache`. |
+| `release_continue_cache()` | Called after the last chunk, or when the video is stopped. |
+
+Each chunk is one `upscale()` call, which also receives `frame_offset`, the
+place of its first frame in the video. Choose the join that matches the model:
+
+- **Frames that do not depend on their neighbours** (a resize): return
+  `postprocessing.chunking.FRAME_BY_FRAME`. Any chunk gives the frames of the
+  whole video.
+- **Independent runs that invent detail:** declare a few `overlap_frames` and
+  `crossfade_overlap_outputs = True`, so that the texture of one chunk turns
+  into the next one's over the shared frames instead of changing in one frame.
+- **A model that continues from its own state:** declare `carries_cache` and
+  hand that state from chunk to chunk. No fade is needed when the shared frames
+  come out the same in both chunks.
+- **A model that builds each frame from the ones before it, without a state to
+  hand over:** a chunk starts cold. Share enough frames for it to settle and
+  fade them (`crossfade_overlap_outputs = True`); DLSS 5 shares 16. One shared
+  frame leaves a visible change at every chunk start.
+
+Check a declaration on the real model: process a video by chunks and in one
+piece, then compare the change from frame to frame across each chunk start.
+
+A video that fits in memory is still processed in one call. Upsamplers that
+declare `source_audio_conditioning` also receive their video in one piece, and
+so does a video going through a frame interpolator and an upsampler that both
+need neighbouring frames.
+
+```python
+class MyChunkRules:
+    overlap_frames = 4
+    crossfade_overlap_outputs = True
+
+    def get_overlap_frames(self, chunk_frames):
+        return min(self.overlap_frames, chunk_frames - 1)
+
+class MyUpsampler:
+    def query_chunking(self, value):
+        return MyChunkRules()
+```
+
+The built-in upsamplers return the object that also describes their Media Flow
+process (`postprocessing/<name>/process_handler.py`), so both read the same
+rules.
 
 ### Borrowing the loaded generation model
 

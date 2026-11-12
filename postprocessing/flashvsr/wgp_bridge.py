@@ -275,6 +275,11 @@ class FlashVSRBridge:
     def is_upsampling(self, spatial_upsampling) -> bool:
         return self.scale_for_upsampling(spatial_upsampling) is not None
 
+    def query_chunking(self, spatial_upsampling):
+        """How a long video goes through this upsampler a chunk at a time (postprocessing.chunking)."""
+        from .process_handler import HANDLER
+        return HANDLER
+
     def validate_upsampling(self, spatial_upsampling, image_mode: int) -> str:
         if not self.is_upsampling(spatial_upsampling):
             return ""

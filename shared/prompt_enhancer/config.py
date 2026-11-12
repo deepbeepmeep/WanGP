@@ -1,6 +1,7 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 
@@ -15,6 +16,7 @@ MTP_AUTO_FOUR_DRAFTS_BONSAI_VRAM_GB = 12
 MTP_AUTO_LONG_DRAFTS = 7  # an automatic draft count of 4 on Qwen3.8 27B: this many while the recent drafts are accepted (tool calls, summaries, lists), 4 on the rest
 MTP_AUTO_LONG_BACKENDS = ("gguf", "gguf_q3", "gguf_q2", "gguf_ptq1")  # where the long chain was measured faster
 MTP_AUTO_NO_OFFLOAD_VRAM_GB = range(13, 17)  # Auto on GPUs of these sizes: MTP only when the whole model stays in VRAM with it. Below, the fit rule: part of the model often streams there anyway
+OTHER_PROGRAMS_VRAM_GIB = 1.5  # the VRAM the desktop and the other programs are expected to hold: Configuration's estimates count it, and a load that more than it slows down says so (other_programs_vram_advice)
 PROMPT_ENHANCER_SPECULATIVE_DRAFT_COUNTS = (2, 3, 4)
 BLOCK_DRAFT_METHODS = ("dspark", "dflash2", "dspine")
 SPECULATIVE_METHOD_LABELS = {"auto": "Auto", "disabled": "Disabled", "mtp": "MTP", "dspark": "DSpark", "dflash2": "DFlash2", "dspine": "DSpine"}
@@ -209,3 +211,28 @@ def resolve_prompt_enhancer_speculative_decoding(enhancer_enabled: Any, value: A
     if detected_vram_gb >= required_vram_gb:
         return enabled, f"{enabled_for}: {detected_vram_gb} GB VRAM detected (minimum {required_vram_gb} GB)."
     return 0, f"Speculative Decoding disabled automatically for {model_label}: {detected_vram_gb} GB VRAM detected (minimum {required_vram_gb} GB)."
+
+
+def other_programs_vram_advice(enhancer_enabled: Any, value: Any, fit, others: int | None, total_vram_gb: float | None = None, *, qwen_backend: str = "") -> str:
+    """What to tell the user when the VRAM the other programs hold costs speed, "" otherwise: with no more than OTHER_PROGRAMS_VRAM_GIB of
+    it, Auto would run MTP, or the model would stay whole in VRAM with the speculative decoding of the setting (a block drafter's own VRAM
+    is not counted). fit: as for resolve_prompt_enhancer_speculative_decoding; others: the VRAM they hold in bytes, None if unknown."""
+    freed = 0 if others is None else others - int(OTHER_PROGRAMS_VRAM_GIB * 2**30)
+    sizes = fit() if freed > 0 else None
+    if sizes is None:
+        return ""
+    needed, extra, available = sizes
+
+    def outcome(available):  # (MTP runs, the model stays whole in VRAM) with this much VRAM
+        mtp = speculative_decoding_runtime(resolve_prompt_enhancer_speculative_decoding(enhancer_enabled, value, total_vram_gb, qwen_backend=qwen_backend, fit=lambda: (needed, extra, available))[0])[0] == 1
+        return mtp, needed + (extra if mtp else 0) <= available
+    (mtp, whole), (expected_mtp, expected_whole) = outcome(available), outcome(available + freed)
+    if expected_mtp and not mtp:
+        gain = "Speculative Decoding would run, and the LLM would answer about twice as fast"
+    elif expected_whole and not whole:
+        gain = "the whole LLM would stay in VRAM, while part of it now runs from RAM, which is slower"
+    else:
+        return ""
+    tool = "scripts\\gpumem.cmd, in the WanGP folder," if sys.platform == "win32" else "nvidia-smi"
+    return (f"Other programs hold {others / 2**30:.1f} GiB of this GPU's VRAM, more than the {OTHER_PROGRAMS_VRAM_GIB:g} GiB expected: without the excess, {gain}. "
+            f"Run {tool} to see which programs hold VRAM, and close those you do not need.")

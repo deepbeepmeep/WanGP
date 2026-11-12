@@ -45,6 +45,11 @@ class RifeTemporalUpsampler(temporal_upsampler_api.SimpleScaleSuffixMixin):
         process_files(**download_def)
         return True
 
+    def query_chunking(self, temporal_upsampling):
+        """How a long video goes through this upsampler a chunk at a time (postprocessing.chunking)."""
+        from postprocessing.system_upsampler_handler import RIFE_HANDLER
+        return RIFE_HANDLER
+
     def validate_upsampling(self, temporal_upsampling, *, source_is_image: bool = False) -> str:
         split = self.split_value(temporal_upsampling)
         if split is None or split[1] not in self.query_temporal_upsampler_def()["multipliers"][self.METHOD]:

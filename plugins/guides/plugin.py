@@ -1,5 +1,31 @@
+import json
+import os
+from datetime import datetime, timedelta
+
 import gradio as gr
+from shared.utils.config_store import update_config
 from shared.utils.plugins import WAN2GPPlugin
+
+PROJECT_PAGE = "https://github.com/deepbeepmeep/WanGP"
+STAR_REQUEST = "WanGP is free to use, at home or at work. If you like it, please give it a star on GitHub: it helps others find the project."
+# wgp_config.json: {"new_user": true} in a config created at first launch, then {"github_opened": true} or
+# {"ask_later": "<date>", "later_count": n}. WanGP Manager sets WANGP_GITHUB_OPENED=1 once its own star link was clicked.
+WELCOME_KEY = "welcome_popup"
+# Three requests at most: at launch, then a week and a month after each Ask Me Again Later.
+ASK_AGAIN_AFTER = (timedelta(days=7), timedelta(days=30))
+WELCOME_TEXTS = {
+    "new": ("Welcome to WanGP!", "The Infos tab has guides to get you started: choosing a model, writing prompts, using LoRAs, Deepy and more."),
+    "returning": ("Thank You for Using WanGP!", "We hope you have had great fun using WanGP and found it useful."),
+}
+# Escape or a click outside counts as the first button. GitHub opens from the click itself, so that no popup blocker stops it.
+WELCOME_JS = """async (popup) => {
+    if (!popup) return "";
+    const {title, message, later} = JSON.parse(popup);
+    return await window.wangpConfirm({title, message, buttons: [
+        {text: later, value: "later", cancel: true},
+        {text: "Go to GitHub", value: "github", primary: true, action: () => { window.open(%s, "_blank", "noopener"); }},
+    ]});
+}""" % json.dumps(PROJECT_PAGE)
 
 class GuidesPlugin(WAN2GPPlugin):
     def __init__(self):
@@ -15,6 +41,8 @@ class GuidesPlugin(WAN2GPPlugin):
         self.request_component("main_tabs")
         self.request_component("model_choice_target")
         self.request_global("goto_model_type")
+        self.request_global("server_config")
+        self.request_global("server_config_filename")
         self.add_custom_js(self._script_block())
         self.add_tab(
             tab_id="info",
@@ -50,7 +78,10 @@ class GuidesPlugin(WAN2GPPlugin):
         with open("docs/WORKSPACES.md", "r", encoding="utf-8") as reader:
             workspaces = reader.read()
 
-        gr.Markdown("⭐ **WanGP is free to use, at home or at work.** If you like it, please give it a [star on GitHub](https://github.com/deepbeepmeep/WanGP): it helps others find the project.")
+        gr.Markdown(f"⭐ **WanGP is free to use, at home or at work.** If you like it, please give it a [star on GitHub]({PROJECT_PAGE}): it helps others find the project.")
+        welcome_popup = gr.Textbox(visible=False)
+        gr.context.get_blocks_context().root_block.load(self._welcome_popup, outputs=[welcome_popup], queue=False, show_progress="hidden").then(
+            self._record_welcome_choice, inputs=[welcome_popup], js=WELCOME_JS, queue=False, show_progress="hidden")
         with gr.Tabs():
             with gr.Tab("Overview", id="overview"):
                 gr.Markdown(overview, elem_id="guides_overview_markdown")
@@ -87,6 +118,24 @@ class GuidesPlugin(WAN2GPPlugin):
 
     def _apply_overview_selection(self, state, model_type):
         return model_type
+
+    def _welcome_popup(self):
+        """The welcome popup for this page load, empty when not due: never after Go to GitHub (here or in WanGP Manager), else three times at most."""
+        record = self.server_config.get(WELCOME_KEY, {})
+        if not record.get("github_opened") and os.environ.get("WANGP_GITHUB_OPENED") == "1":
+            self._record_welcome_choice("github")
+            return ""
+        later = record.get("later_count", 0)
+        if record.get("github_opened") or later > len(ASK_AGAIN_AFTER) or later and datetime.now() < datetime.fromisoformat(record["ask_later"]) + ASK_AGAIN_AFTER[later - 1]:
+            return ""
+        title, intro = WELCOME_TEXTS["new" if record.get("new_user") else "returning"]
+        # The last request does not promise another one.
+        return json.dumps({"title": title, "message": f"{intro}\n\n⭐ {STAR_REQUEST}", "later": "No Thanks" if later == len(ASK_AGAIN_AFTER) else "Ask Me Again Later"})
+
+    def _record_welcome_choice(self, choice):
+        if choice:
+            later = self.server_config.get(WELCOME_KEY, {}).get("later_count", 0) + 1
+            update_config(self.server_config, self.server_config_filename, {WELCOME_KEY: {"github_opened": True} if choice == "github" else {"ask_later": datetime.now().isoformat(timespec="seconds"), "later_count": later}})
 
     def _script_block(self) -> str:
         return """

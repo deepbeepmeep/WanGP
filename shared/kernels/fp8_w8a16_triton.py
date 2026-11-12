@@ -25,7 +25,7 @@ import torch
 import triton
 import triton.language as tl
 
-_CACHE_VERSION = 6  # bump when the kernel, the slots or the benchmark change: tuned configurations of other versions are ignored
+_CACHE_VERSION = 7  # bump when the kernel, the slots or the benchmark change: tuned configurations of other versions are ignored
 _CACHE_PATH = Path(os.environ.get("WAN2GP_FP8_TRITON_CACHE", Path.home() / ".triton" / "autotune" / "wan2gp_fp8_w8a16_cache.json")).expanduser()
 _DECODE = {"native": 0, torch.float8_e4m3fn: 1, torch.float8_e5m2: 2}
 # (BLOCK_M, BLOCK_N, BLOCK_K, warps, stages); the first one of each slot is its static configuration (the most frequent winner on
@@ -87,7 +87,7 @@ def _w8a16_kernel(x, w, scale, bias, out, M, N, K, sxm, sxk, swn, swk, som, son,
     size_m = tl.minimum(tiles_m - first_m, GROUP_M)
     pid_m = first_m + (pid % group) % size_m
     pid_n = (pid % group) // size_m
-    rm = pid_m * BM + tl.arange(0, BM)
+    rm = (pid_m * BM + tl.arange(0, BM)).to(tl.int64)  # 64 bits: rows x width passes 2^31 on long high resolution videos
     rn = pid_n * BN + tl.arange(0, BN)
     rk = tl.arange(0, BK)
     dtype = out.dtype.element_ty

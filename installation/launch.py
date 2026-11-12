@@ -72,9 +72,12 @@ def manager_arguments(options):
 
 
 @contextmanager
-def launch_context(runtime, python, options=None, auth_password=None, events=None):
+def launch_context(runtime, python, options=None, auth_password=None, events=None, github_opened=False):
     options = normalized_options(options)
     env = runtime.environment(python)
+    # The project page was opened from Manager: WanGP records it and no longer asks for a star.
+    if github_opened:
+        env["WANGP_GITHUB_OPENED"] = "1"
     # Gradio checks its own HTTP endpoint through httpx, which honors host proxies.
     # Keep external downloads proxied, but always reach the local server directly.
     bypass = next((value for key, value in env.items() if key.lower() == "no_proxy"), "")
@@ -134,7 +137,7 @@ def combined_arguments(app, arguments):
     return [*result, *arguments]
 
 
-def launch_managed(root, runtime, arguments=(), events=None, cancelled=None, on_start=None, launch_options=None, auth_password=None):
+def launch_managed(root, runtime, arguments=(), events=None, cancelled=None, on_start=None, launch_options=None, auth_password=None, github_opened=False):
     with InstallationLock(root):
         record = ready_record(root)
         app = inside(root, "app")
@@ -143,7 +146,7 @@ def launch_managed(root, runtime, arguments=(), events=None, cancelled=None, on_
             raise InstallError("missing_entrypoint", "Managed source does not contain wgp.py")
         python = interpreter_path(inside(root, record["active"]["environment"]))
         resolution = load_resolution(resolution_location(root, record["active"]["resolution"]), check_inputs=False)
-        with launch_context(runtime, python, launch_options, auth_password, events) as (env, output_events):
+        with launch_context(runtime, python, launch_options, auth_password, events, github_opened) as (env, output_events):
             arguments = combined_arguments(app, arguments)
             device = resolution["selected_device"]
             if device is not None:

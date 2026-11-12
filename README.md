@@ -83,7 +83,7 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 ## 🔥 Latest Updates : 
 
-## 12th of November 2026: WanGP v19.291 - Bonus Track
+## 12th of November 2026: WanGP v19.292 - Bonus Track
 - **Qwen Image 2.1 Viggle Image Swap**: a Qwen Image 2.1 variant and **Showrunner's default frame painter for Viggle Remake character swaps**. Replace one or several people in **6 steps**, keeping their poses, expressions and the scene's framing. Add the **source picture first**, then one **character sheet** per person; the picture's aspect ratio is preserved at about **1 megapixel**. Results can be slightly darker.
 
 - **H3 HyperFlow LoRA**: bring **8-step** generation to the standard and Pruned **Ref2VA** models with the new **HyperFlow Ref2VA 8 Steps** accelerator profile.
@@ -102,7 +102,7 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 - **Showrunner: choose who sings**: have an uploaded or generated song sung by a cast member or a supplied voice sample, including **two voices for a duet**. Use **Change the voice** on an existing song or **Sung by** before composing. The music, lyrics and timing stay, so existing shots keep their lip sync. Requires **SeedVC v1.0 Singing** in **Configuration > Extensions**.
 
-- **Low RAM Continue Video**: extend a video without loading the whole source into RAM. WanGP reads the ending frames for generation. Then WanGP adds each new window without re-encoding the earlier one if resolution remains unchanged. Wont work if upscaling, film grain or HDR conversion is required. For long videos, the **Media Flow** app is still recommended.
+- **Low RAM Continue Video & Late Post Processing**: extend or post-process long videos without loading them whole into RAM. Continue Video reads only the ending frames for generation and adds each new window without re-encoding earlier ones; a source needing conversion is processed once, in chunks. Now supports **Lanczos, FlashVSR, SeedVR2, RelayVSR and DLSS 5**, plus **RIFE / DLSS frame interpolation and Film Grain**. HDR continuation, LTX-2 upscalers / Detail Refiner, face refiners, and interpolation combined with an AI upscaler still need the whole video in memory. Use **Media Flow** which it still best suited for very long video as it supports pause/resume, manual chunk sizing and keep original audio not reencoded.
 
 
 ## 8th of November 2026: WanGP v19.25 - Showrunner Makes and Remakes

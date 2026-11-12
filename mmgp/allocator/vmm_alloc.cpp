@@ -380,6 +380,7 @@ struct Device {
     int64_t refused_need = 0, refused_headroom = 0;            // the new memory it needed, headroom included, and that headroom
     int refused_result = 0;                                    // the driver's error for an address range it refused or could not map
     bool spill_tried = false;                                  // the allocation running tried to spill into system RAM
+    int spill_mapping = 0;                                     // the driver's error when the RAM of its spill could not be mapped at GPU addresses
     std::unordered_map<CUdeviceptr, DebugEntry> debug_live;  // debug mode: the live allocations of the threshold and more
     std::map<int64_t, DebugSnapshot> debug_peaks;            // per phase
     std::map<int64_t, DebugSnapshot> debug_reserved_peaks;
@@ -571,6 +572,15 @@ size_t process_free(const Device& d) {  // VRAM this process may still take: its
 #endif
     cu.MemGetInfo(&free_bytes, &total);
     return free_bytes;
+}
+
+int64_t process_usage(const Device& d) {  // VRAM this process holds: on Windows what DXGI counts for it (its CUDA context included), otherwise the allocator's reservations
+#ifdef _WIN32
+    DXGI_QUERY_VIDEO_MEMORY_INFO info;
+    if (d.dxgi_adapter && SUCCEEDED(static_cast<IDXGIAdapter3*>(d.dxgi_adapter)->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)))
+        return static_cast<int64_t>(info.CurrentUsage);
+#endif
+    return reserved_now(d);
 }
 
 int64_t room_now(Device& d, int* bound = nullptr) {  // bound: the Refusal of the smallest of the limits
@@ -860,9 +870,16 @@ void* alloc_spilled(Device& d, size_t size, CUstream stream) {
         cu.MemRelease(handle);
         return nullptr;
     }
-    cu.MemMap(va, mapped, 0, handle, 0);
-    cu.MemRelease(handle);  // the memory is freed when the range is unmapped
-    cu.MemSetAccess(va, mapped, &d.access, 1);
+    const char* fault = std::getenv("MMGP_VRAM_FAIL_SPILL_MAPPING");  // tests: "access" refuses the access to the mapping, anything else the mapping
+    bool no_access = fault && !std::strcmp(fault, "access");
+    result = fault && *fault && !no_access ? CUDA_ERROR_OUT_OF_MEMORY : cu.MemMap(va, mapped, 0, handle, 0);
+    cu.MemRelease(handle);  // the memory is freed when the range is unmapped, or here when it could not be mapped
+    if (result == CUDA_SUCCESS && (result = no_access ? CUDA_ERROR_OUT_OF_MEMORY : cu.MemSetAccess(va, mapped, &d.access, 1)) != CUDA_SUCCESS) cu.MemUnmap(va, mapped);
+    if (result != CUDA_SUCCESS) {  // an address with nothing mapped would fail at its first use (an illegal memory access): the spill is refused
+        d.spill_mapping = static_cast<int>(result);
+        cu.MemAddressFree(va, mapped);
+        return nullptr;
+    }
     d.live_spilled[va] = {mapped, stream, nullptr};
     d.spilled_bytes += static_cast<int64_t>(mapped);
     return reinterpret_cast<void*>(va);
@@ -1565,9 +1582,13 @@ const char* format_size(double bytes, char* text) {  // as PyTorch's out of memo
     if (spill && d.spill_tried) {  // the allocation could not spill either
         unsigned long long ram_total, ram_available;
         ram_info(ram_total, ram_available);
-        length += snprintf(message + length, sizeof(message) - length, " Spilling into system RAM (%s spilled) stopped: %s of RAM available, %s kept "
-                           "free for the system.", format_size(static_cast<double>(d.spilled_bytes), spilled), format_size(static_cast<double>(ram_available), ram),
-                           format_size(static_cast<double>(ram_margin(ram_total)), margin));
+        if (d.spill_mapping)
+            length += snprintf(message + length, sizeof(message) - length, " Spilling into system RAM (%s spilled) stopped: the driver could not map that RAM "
+                               "at GPU addresses (CUDA error %d).", format_size(static_cast<double>(d.spilled_bytes), spilled), d.spill_mapping);
+        else
+            length += snprintf(message + length, sizeof(message) - length, " Spilling into system RAM (%s spilled) stopped: %s of RAM available, %s kept "
+                               "free for the system.", format_size(static_cast<double>(d.spilled_bytes), spilled), format_size(static_cast<double>(ram_available), ram),
+                               format_size(static_cast<double>(ram_margin(ram_total)), margin));
     }
     if (driver_spill && !to_pool && d.refusal != REFUSED_BY_LIMIT) {  // a graph's memory stays in its pool: never the driver's allocation
 #ifdef _WIN32
@@ -1922,7 +1943,7 @@ EXPORT void* vmm_alloc(size_t size, int device, CUstream stream) {
     std::unique_lock<std::mutex> guard(lock);
     Device& d = device_state(device);
     RelaxedCapture relaxed(any_capture());
-    if (!in_pressure_callback) d.refusal = 0, d.spill_tried = false;
+    if (!in_pressure_callback) d.refusal = 0, d.spill_tried = false, d.spill_mapping = 0;
     void* ptr = nullptr;
     bool to_pool = false;
     for (auto capture = d.captures.rbegin(); capture != d.captures.rend() && !to_pool; ++capture) {
@@ -2575,6 +2596,19 @@ EXPORT int64_t vmm_room(int device) {  // VRAM that new memory may still take (s
     bind_context(found->second);
     RelaxedCapture relaxed(any_capture());
     return room_now(found->second);
+}
+
+EXPORT int vmm_gpu_memory(int device, int64_t* out) {  // out: the whole GPU's total and free VRAM (NVML, read now), the VRAM this process holds (process_usage); 0 when NVML does not answer
+    std::lock_guard<std::mutex> guard(lock);
+    auto found = devices.find(device);
+    NvmlMemory gpu;
+    if (found == devices.end() || !found->second.nvml_device || nvml.DeviceGetMemoryInfo(found->second.nvml_device, &gpu) != 0) return 0;
+    bind_context(found->second);
+    RelaxedCapture relaxed(any_capture());
+    out[0] = static_cast<int64_t>(gpu.total);
+    out[1] = static_cast<int64_t>(gpu.free);
+    out[2] = process_usage(found->second);
+    return 1;
 }
 
 EXPORT void vmm_empty_cache() {  // on every device: the freed ranges, spare chunks, cached small blocks and freed spills are given back

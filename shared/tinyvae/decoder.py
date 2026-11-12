@@ -122,5 +122,6 @@ def load_decoder(name, path):
             state = net.patch_tgrow_layers({key: value for key, value in state.items() if key.startswith('decoder.')})
         return {'net.' + key: value for key, value in state.items()}
 
-    offload.load_model_data(model, path, preprocess_sd=decoder_weights, writable_tensors=False, default_dtype=None)
+    # 'dtype': a decoder validated in 16 bits (thumbnails within 3/255 of the 32-bit ones, a third of the VRAM); the others keep their file's dtype
+    offload.load_model_data(model, path, preprocess_sd=decoder_weights, writable_tensors=False, default_dtype=getattr(torch, config['dtype']) if 'dtype' in config else None)
     return model.eval().requires_grad_(False)

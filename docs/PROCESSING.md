@@ -134,7 +134,9 @@ If you continue from a Source Video, the Source Video is treated as the first wi
 
 A long Source Video does not need to fit in memory. WanGP reads only the last frames the first new window needs and leaves the rest in the file. If the Source Video already has the output's size, frame rate and video codec settings (for example a video WanGP generated with the same settings), its pictures are copied unchanged into the result; otherwise it is resized and encoded once. Each new window is then added to the result without encoding the previous frames again.
 
-Temporal Upsampling, Spatial Upsampling, Film Grain and HDR output process the frames of the Source Video together with the new ones. The whole Source Video is then loaded in memory: the console reports why and how much RAM this takes, and the generation (or an extra window) is refused when the Source Video and the new frames together exceed 3000 frames. Apply these steps afterwards in Post Processing, or keep fewer frames of the Source Video, to continue a very long video.
+Temporal Upsampling, Spatial Upsampling and Film Grain also apply to the Source Video. It goes through them once, a part at a time, so it still does not need to fit in memory, and each new window then processes only its own frames. A Source Video that already has the final size and frame rate (for example the result of an earlier generation with the same settings) is not processed again: its pictures are copied, so Film Grain is not added twice and nothing is upscaled a second time.
+
+A few choices still need the whole Source Video in memory: HDR output, an upsampler that works on the whole video at once (the LTX-2 upscalers and Detail Refiner, the face refiners), and frame interpolation combined with an AI upscaler. The console then reports why and how much RAM this takes, and the generation (or an extra window) is refused when the Source Video and the new frames together exceed 3000 frames. Apply these steps afterwards in Post Processing, or keep fewer frames of the Source Video, to continue a very long video.
 
 How sliding windows work:
 
@@ -175,6 +177,8 @@ Sliding-window settings:
 Postprocessing is applied after media exists. It can run immediately after generation or later from the Media Info / Late Post Processing area.
 
 Use postprocessing when the content is good but the final media needs a technical or finishing pass.
+
+A long video does not need to fit in memory: Late Post Processing reads, processes and saves it a part at a time, whatever its length. This applies to Lanczos, FlashVSR, SeedVR2, RelayVSR, DLSS 5, RIFE, DLSS frame generation and Film Grain. The exceptions listed under Continue Video (the LTX-2 upscalers and Detail Refiner, the face refiners, frame interpolation combined with an AI upscaler) load the video whole and keep its first 3000 frames. For pausing and resuming a long job, or choosing the length of the parts yourself, use Media Flow.
 
 Common postprocessing jobs:
 

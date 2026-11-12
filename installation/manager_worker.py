@@ -271,13 +271,13 @@ def run_action(action, args, data, runtime, cancelled, emit, request_id):
         arguments = [*manager_arguments(args.get("launch_options")), "--server-port", str(port)]
         try:
             if info["ownership"] == "managed":
-                return launch_managed(info["root"], runtime, arguments, emit, cancelled.is_set, started, args.get("launch_options"), args.get("auth_password"))
+                return launch_managed(info["root"], runtime, arguments, emit, cancelled.is_set, started, args.get("launch_options"), args.get("auth_password"), args.get("github_opened", False))
             # The lease is in Manager data, never inside an externally owned checkout.
             import hashlib
             lease = Path(info["root"]) if info.get("maintenance") in ("conda", "venv") else data / "external-leases" / hashlib.sha256(os.path.normcase(info["root"]).encode()).hexdigest()
             with InstallationLock(lease):
                 root = Path(info["root"])
-                with launch_context(runtime, info["python"], args.get("launch_options"), args.get("auth_password"), emit) as (env, output_events):
+                with launch_context(runtime, info["python"], args.get("launch_options"), args.get("auth_password"), emit, args.get("github_opened", False)) as (env, output_events):
                     runner.events = output_events
                     if info.get("maintenance") == "venv":
                         ensure_pip(info["python"], runtime, runner)

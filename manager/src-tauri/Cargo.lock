@@ -4312,7 +4312,7 @@ dependencies = [
 
 [[package]]
 name = "wangp-manager"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "gtk",
  "libc",

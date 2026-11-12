@@ -62,6 +62,11 @@ class RelayVSRBridge(SimpleScaleSuffixMixin):
             x2_model = gr.Dropdown(choices=self.X2_MODEL_CHOICES, value=config["x2_model"], label="RelayVSR Model For Upscaling Up To x2", info="RelayVSR X2 upscales natively by 2, with a quarter of the x4 model's work and memory for the same source; the x4 model upscales by 4, then the result is resized down. Ratios above x2 always use the x4 model. Each model downloads on its first use.", interactive=not lock_config)
         return [("x2_model", x2_model)]
 
+    def query_chunking(self, spatial_upsampling):
+        """How a long video goes through this upsampler a chunk at a time (postprocessing.chunking)."""
+        from .process_handler import HANDLER
+        return HANDLER
+
     def validate_upsampling(self, spatial_upsampling, image_mode: int) -> str:
         split = self.split_value(spatial_upsampling)
         if split is None or split[0] != METHOD or split[1] not in self.UPSAMPLING_RATIOS:

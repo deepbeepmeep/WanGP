@@ -4,7 +4,7 @@
 The model only reads the last frames of a Source Video. The frames before them stay in the file: the new frames of each window are
 encoded alone and joined to the video made so far by copying its pictures, so nothing is encoded twice and the video is never held in
 memory. A Source Video encoded like the new frames opens that file as it is; another one (other size, rate, codec, or shortened) is
-encoded once, a few frames at a time.
+encoded once, a few frames at a time, going through the upsamplers and Film Grain of the generation on the way when they are on.
 
 The whole Source Video is still loaded when something has to process its frames with the new ones (loading_reasons)."""
 from __future__ import annotations
@@ -34,16 +34,11 @@ def source_frames_count(video_source, keep_frames, fps, max_frames=None):
     return len(_resample_frame_indices(rate, metadata["frame_count"], keep, float(fps), 0)) if keep > 0 else 0
 
 
-def loading_reasons(video_source, *, temporal_upsampling="", spatial_upsampling="", film_grain=False, hdr=False, frames_returned=False):
+def loading_reasons(video_source, *, processing=(), hdr=False, frames_returned=False):
     """Why every frame of a Source Video has to be loaded in memory: what processes them with the new frames, or reads them back.
+    processing: why its upsamplers cannot take a video a chunk at a time (postprocessing.chunking.whole_video_reasons).
     Empty when the frames before the ones the next window reads can stay in their file."""
-    reasons = []
-    if temporal_upsampling:
-        reasons.append("Temporal Upsampling is on")
-    if spatial_upsampling:
-        reasons.append("Spatial Upsampling is on")
-    if film_grain:
-        reasons.append("Film Grain is on")
+    reasons = list(processing)
     if hdr:
         reasons.append("the output is HDR")
     if get_virtual_media_entry(video_source) is not None:
@@ -124,15 +119,20 @@ def copy_obstacles(video_source, source_frames, fps, width, height, segment_fact
 class ContinuedVideo:
     """The file a continued Source Video and its new windows are gathered in, for one generation.
 
-    read_frames(start, count) gives frames of the Source Video at the output size and rate, as a (frames, H, W, C) uint8 tensor;
-    encode(frames, path) writes frames (a list of tensors or FrameChunks) to a video file without sound and returns its path. Working
-    files go to work_dir and are listed in temp_files until they are removed."""
+    read_frames(start, count) gives frames_count frames of the Source Video at the size and rate of the generation, as a (frames, H, W, C)
+    uint8 tensor; encode(frames, path) writes frames (a list of tensors or FrameChunks) to a video file without sound and returns its
+    path; fps is the rate of the output. Working files go to work_dir and are listed in temp_files until they are removed.
 
-    def __init__(self, video_source, frames_count, fps, width, height, read_frames, encode, work_dir, container, temp_files, notify=print):
-        self.video_source, self.frames_count, self.fps, self.width, self.height = video_source, frames_count, fps, width, height
+    With post-processing on, process(read_frames, frames_count) gives the frames of the Source Video gone through it, as FrameChunks
+    whose aborted tells that the user stopped it, and copied_frames is the number of pictures a Source Video that already went
+    through it holds: such a file opens the output as it is."""
+
+    def __init__(self, video_source, frames_count, fps, read_frames, encode, work_dir, container, temp_files, notify=print, process=None, copied_frames=None):
+        self.video_source, self.frames_count, self.fps, self.process = video_source, frames_count, fps, process
+        self.copied_frames = frames_count if copied_frames is None else copied_frames
         self.read_frames, self.encode, self.notify, self.temp_files = read_frames, encode, notify, temp_files
         self.work_prefix, self.container, self.work_no = os.path.join(work_dir, f"tmp{uuid.uuid4().hex[:8]}_continue"), container, 0
-        self.source_file = None  # the Source Video as the new frames can follow it: itself or its encoded copy, kept for every sample
+        self.source_file, self.source_frames = None, 0  # the Source Video as the new frames can follow it (itself or its encoded copy) and its pictures, kept for every sample
         self.file, self.file_frames = None, 0  # the video made so far for the current sample
 
     def _work_path(self):
@@ -147,13 +147,22 @@ class ContinuedVideo:
             os.remove(path)
 
     def _resolve_source_file(self, segment_facts):
-        obstacles = copy_obstacles(self.video_source, self.frames_count, self.fps, self.width, self.height, segment_facts)
+        """The file the new frames follow and the number of its pictures; None when the user stopped its post-processing."""
+        width, height = segment_facts["encoding"][3:5]
+        obstacles = copy_obstacles(self.video_source, self.copied_frames, self.fps, width, height, segment_facts)
         if not obstacles:
-            return self.video_source
-        self.notify(f"[Continue Video] The Source Video is encoded again ({self.frames_count} frames, read a few at a time) because {_listed(obstacles)}.")
-        metadata = probe_video_stream_metadata(self.video_source)
-        chunk_frames = max(8, min(256, CHUNK_BYTES // (metadata["display_width"] * metadata["display_height"] * 3)))
-        return self.encode(FrameChunks(self.read_frames, self.frames_count, chunk_frames), self._work_path())
+            return self.video_source, self.copied_frames
+        self.notify(f"[Continue Video] The Source Video is {'post-processed and ' if self.process is not None else ''}encoded again ({self.frames_count} frames, read a few at a time) because {_listed(obstacles)}.")
+        if self.process is None:
+            metadata = probe_video_stream_metadata(self.video_source)
+            frames = FrameChunks(self.read_frames, self.frames_count, max(8, min(256, CHUNK_BYTES // (metadata["display_width"] * metadata["display_height"] * 3))))
+        else:
+            frames = self.process(self.read_frames, self.frames_count)
+        path = self.encode(frames, self._work_path())
+        if getattr(frames, "aborted", False):
+            self._remove(path)
+            return None
+        return path, video_stream_facts(path)["frames"]
 
     def start_sample(self):
         """A new sample continues the Source Video again: the video of the previous one is dropped."""
@@ -162,13 +171,18 @@ class ContinuedVideo:
         self.file, self.file_frames = None, 0
 
     def append(self, frames):
-        """Add the new frames of a window and return the file holding the whole video so far (pictures only), valid until the next call."""
+        """Add the new frames of a window and return the file holding the whole video so far (pictures only), valid until the next call.
+        None when the user stopped the post-processing of the Source Video."""
         segment = self.encode(frames, self._work_path())
         segment_facts = video_stream_facts(segment)
         if self.file is None:
             if self.source_file is None:
-                self.source_file = self._resolve_source_file(segment_facts)
-            previous, previous_frames = self.source_file, self.frames_count
+                resolved = self._resolve_source_file(segment_facts)
+                if resolved is None:
+                    self._remove(segment)
+                    return None
+                self.source_file, self.source_frames = resolved
+            previous, previous_frames = self.source_file, self.source_frames
         else:
             previous, previous_frames = self.file, self.file_frames
         joined = join_video_streams([previous, segment], [previous_frames, segment_facts["frames"]], self.fps, self._work_path())

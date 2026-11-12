@@ -22,6 +22,7 @@ from shared.deepy.config import (
     normalize_deepy_context_tokens,
 )
 from shared.prompt_enhancer.config import (
+    OTHER_PROGRAMS_VRAM_GIB,
     PROMPT_ENHANCER_SPECULATIVE_DECODING_AUTO,
     PROMPT_ENHANCER_SPECULATIVE_DECODING_DEFAULT,
     PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY,
@@ -38,7 +39,6 @@ BONSAI_MIN_GGUF_KERNELS_VERSION = "1.0.22"
 DEEPY_FULL_CONTEXT_TOKENS = 64000  # a production's conversation is long, and below this Deepy keeps condensing it
 DEEPY_FULL_CONTEXT_MIN_VRAM_GB = 10  # below, Bonsai no longer fits in VRAM with this context
 QWEN38_VRAM_GIB = {"gguf_ptq1": 6.3, "gguf_q2": 9.8, "gguf_q3": 12.1, "gguf": 15.8}  # each version without its KV cache: the weights the GPU holds, activations and margins
-OTHER_PROGRAMS_VRAM_GIB = 1.5
 MTP_WEIGHTS_VRAM_GIB = 0.42
 MTP_KV_VRAM_GIB_PER_TOKEN = 4 / 2**20  # its own BF16 KV cache
 BLOCK_DRAFTER_VRAM_GIB = 3.0  # DSpark, DFlash2 and DSpine at 32K context: weights, their window-capped cache (DSpark's grows 20 KiB per token) and buffers

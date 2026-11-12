@@ -433,6 +433,7 @@ def get_css() -> str:
     color: var(--body-text-color-subdued, #5d7787);
     font-size: 0.86rem;
     line-height: 1.35;
+    white-space: pre-line;
 }
 .wangp-confirm-actions {
     display: flex;

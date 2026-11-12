@@ -66,7 +66,9 @@ rembg==2.0.65; platform_system == "Darwin"
 onnxruntime-gpu==1.22.0; python_version < "3.11" and platform_system != "Darwin"
 onnxruntime-gpu==1.25.0.dev20260210001; python_version >= "3.11" and platform_system != "Darwin"
 onnxruntime>=1.22.0; platform_system == "Darwin"
-decord; sys_platform != "darwin"
+decord; sys_platform == "win32"
+# Same files as PyPI's decord 0.6.0 Linux wheel, whose metadata wrongly declares Python 3.6 only
+decord @ https://github.com/deepbeepmeep/kernels/releases/download/decord/decord-0.6.0%2Bwheeltag-py3-none-manylinux2010_x86_64.whl ; sys_platform == "linux"
 timm
 iopath>=0.1.10
 insightface @ https://github.com/deepbeepmeep/insightface/releases/download/insightface/insightface-0.7.3-cp310-cp310-win_amd64.whl ; sys_platform == "win32" and python_version == "3.10"

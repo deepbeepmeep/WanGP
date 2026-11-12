@@ -10,7 +10,7 @@ from triton.language.extra import libdevice
 
 from shared.kernels.triton_tuner import LaunchTuner
 
-_TUNER = LaunchTuner("wan2gp_lora_kernels", 1, "LoRA")
+_TUNER = LaunchTuner("wan2gp_lora_kernels", 2, "LoRA")
 BK = 32
 # (BLOCK_M, BLOCK_N, warps, stages); the first one is the static configuration
 _CANDIDATES = [(128, 64, 8, 3), (128, 64, 4, 3), (64, 64, 4, 3), (128, 128, 8, 3)]
@@ -19,7 +19,7 @@ _TUNE_ROWS = 1024
 
 @triton.jit(do_not_specialize=["M", "K", "SCALE"], do_not_specialize_on_alignment=["M", "K"])
 def _output_pass(Y, FACTOR, OUT, M, N, K, SY, SFN, SFK, SO, SCALE, RANK_FIRST: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-    rm = tl.program_id(0) * BM + tl.arange(0, BM)
+    rm = tl.program_id(0).to(tl.int64) * BM + tl.arange(0, BM)  # 64 bits: rows x outputs passes 2^31 on long high resolution videos
     rn = tl.program_id(1) * BN + tl.arange(0, BN)
     rk = tl.arange(0, BK)
     m_mask, n_mask = rm < M, rn < N
@@ -43,7 +43,7 @@ def _output_pass(Y, FACTOR, OUT, M, N, K, SY, SFN, SFK, SO, SCALE, RANK_FIRST: t
 def _output_swiglu(Y, FACTOR, OUT, M, N, K, SY, SFN, SFK, SO, SCALE, HAS_LORA: tl.constexpr, RANK_FIRST: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
     """Rows [gate | value] of N channels each, plus their LoRA, to silu(gate) * value over the gate half, with the roundings of the separate
     operations: out += scale * y @ factor, then F.silu(gate, inplace=True).mul_(value). One pass over the rows instead of three."""
-    rm = tl.program_id(0) * BM + tl.arange(0, BM)
+    rm = tl.program_id(0).to(tl.int64) * BM + tl.arange(0, BM)
     rn = tl.program_id(1) * BN + tl.arange(0, BN)
     m_mask, n_mask = rm < M, rn < N
     mask = m_mask[:, None] & n_mask[None, :]

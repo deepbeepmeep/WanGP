@@ -22,7 +22,7 @@ import triton.language as tl
 
 from shared.kernels.fp8_w8a16_triton import _decode_e4m3
 
-_CACHE_VERSION = 1
+_CACHE_VERSION = 2
 _CACHE_PATH = Path(os.environ.get("WAN2GP_NVFP4_TRITON_CACHE", Path.home() / ".triton" / "autotune" / "wan2gp_nvfp4_w4a16_cache.json")).expanduser()
 # (BLOCK_M, BLOCK_N, BLOCK_K, warps, stages); the first one of each slot is its static configuration
 _CANDIDATES = {
@@ -59,7 +59,7 @@ def _w4a16_kernel(x, w, scale, bias, out, M, N, K, k_tiles, sxm, sxk, swn, som, 
     size_m = tl.minimum(tiles_m - first_m, GROUP_M)
     pid_m = first_m + (pid % group) % size_m
     pid_n = (pid % group) // size_m
-    rm = pid_m * BM + tl.arange(0, BM)
+    rm = (pid_m * BM + tl.arange(0, BM)).to(tl.int64)  # 64 bits: rows x width passes 2^31 on long high resolution videos
     rn = pid_n * BN + tl.arange(0, BN)
     rk = tl.arange(0, BK)
     rkb = tl.arange(0, BK // 2)  # packed bytes of a k tile

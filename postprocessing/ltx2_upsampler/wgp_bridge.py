@@ -109,6 +109,11 @@ class LTXVideoUpsamplerBridge(SimpleScaleSuffixMixin):
     def enabled(self) -> bool:
         return True
 
+    def query_chunking(self, spatial_upsampling):
+        """How a long video goes through this upsampler a chunk at a time (postprocessing.chunking)."""
+        from .process_handler import HANDLER, REFINER_HANDLER
+        return REFINER_HANDLER if self.split_value(spatial_upsampling)[0] == REFINE_METHOD else HANDLER
+
     def validate_upsampling(self, spatial_upsampling, image_mode: int) -> str:
         split = self.split_value(spatial_upsampling)
         if image_mode:

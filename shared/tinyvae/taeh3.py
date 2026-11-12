@@ -6,6 +6,7 @@ from typing import Any
 def build_h3_decoder(state_dict: dict[str, Any]) -> Any:
     import torch
     import torch.nn as nn
+    from .taesd import Bands
 
     def conv(n_in: int, n_out: int, **kwargs: Any) -> nn.Conv2d:
         return nn.Conv2d(n_in, n_out, 3, padding=1, **kwargs)
@@ -45,5 +46,4 @@ def build_h3_decoder(state_dict: dict[str, Any]) -> Any:
         else:
             raise ValueError(f"unexpected taeh3 module keys at {index}: {sorted(entry)}")
 
-    decoder = nn.Sequential(*modules)
-    return decoder
+    return Bands(*modules)  # large frames by bands of rows (see taesd.Bands)

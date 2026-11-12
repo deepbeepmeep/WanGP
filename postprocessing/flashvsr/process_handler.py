@@ -140,6 +140,8 @@ class FlashVSRProcessHandler:
         value = self.normalize_target_control(value)
         return FlashVSRBridge.scale_for_upsampling(value) is not None
 
+    carries_cache = supports_continue_cache_for_target  # each chunk hands its last frames to the next one
+
     def cache_sidecar_path(self, output_filename: str) -> str:
         output_path = Path(output_filename).resolve()
         return str(output_path.with_suffix(output_path.suffix + ".flashvsr_cache.safetensors"))

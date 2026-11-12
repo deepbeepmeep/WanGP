@@ -45,6 +45,7 @@
       "patch": 1,
       "temporal": [],
       "kind": "image",
+      "dtype": "float16",
       "repo": "DeepBeepMeep/Flux",
       "sha256": "5283b341ac4358818690111b9c2e760ef1958888e32b03568c75f8006423c272"
     },
@@ -115,6 +116,7 @@
         false
       ],
       "kind": "h3",
+      "dtype": "float16",
       "repo": "DeepBeepMeep/MiniMax-H3",
       "sha256": "f0f60fa072089997f817402098c2fd90777cb2660dd79cf5df42fc1e3e08e527"
     }

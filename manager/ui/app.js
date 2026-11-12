@@ -150,10 +150,8 @@ function overview(){
     });
   const status=item.pending_operation?"Recovery needed":live?.stopping?"Stopping":live?.server_url?"Server ready":live?"Starting":"Stopped";
   return heading("YOUR INSTALLATIONS",item.test_workspace?"Your test installation.":"Ready when you are.","Launch WanGP here, or open it in your browser.")+html(
-    '<section class="card hero"><div class="hero-header"><div><div class="row"><span class="pill {statusClass}">{status}</span><span class="pill purple">{ownership}</span></div><div class="spacer"></div><h2>{name}</h2><p class="path">{root}</p></div><div class="hero-art">{box}</div></div><div class="actions">{actions}</div>{launching}{url}{console}</section><div class="cards">{cards}</div>{whatsNew}{star}{test}<section class="card"><div class="row"><div><h3>{heading}</h3><p class="hint">{description}</p></div>{manage}</div></section>',{
+    '<section class="card hero"><div class="hero-header"><div><div class="row"><span class="pill {statusClass}">{status}</span><span class="pill purple">{ownership}</span></div><div class="spacer"></div><h2>{name}</h2><p class="path">{root}</p></div><div class="hero-art">{box}</div></div><div class="actions">{actions}</div>{launching}{url}{console}</section><div class="cards">{cards}</div>{whatsNew}{test}<section class="card"><div class="row"><div><h3>{heading}</h3><p class="hint">{description}</p></div>{manage}</div></section>',{
       whatsNew:whatsNew(item),
-      // Asked once, after WanGP has started: either answer retires it, and the sidebar link stays.
-      star:live?.server_url&&!item.test_workspace&&!state.preferences.star_prompt_answered?html('<section class="card star-prompt"><div class="row"><div><h3>Enjoying WanGP?</h3><p class="hint">WanGP is free to use, at home or at work. If you like it, a star on GitHub helps other people find it. The project page opens in your browser.</p></div><div class="actions no-margin">{yes}{no}</div></div></section>',{yes:button("github-star","★ Star on GitHub","primary"),no:button("star-later","No thanks","quiet")}):"",
       statusClass:live?.server_url?"green":item.pending_operation?"amber":"",status,ownership:item.test_workspace?"Test installation":item.ownership==="managed"?"Managed installation":"Existing installation",name:esc(item.test_workspace?"Test installation":item.name),root:esc(item.root),box:svg("box"),
       actions:button("start",live&&!live.server_url?'<span class="spinner"></span> '+(live.stopping?"Stopping…":"Starting…"):"Start WanGP","primary",live||item.pending_operation||busyJob()||state.runtime_error)+button("navigate","Update WanGP","",live||busyJob()||!canMaintain(item),'data-page="maintenance"')+button("open-app","Open in App","",!live?.server_url)+button("open-browser","Open in Browser","",!live?.server_url)+(live?'<span class="separator"></span>'+button("stop",live.stopping?"Stopping…":"Stop","danger",live.stopping):"")+(item.pending_operation?button("recover","Recover installation","primary"):""),
       launching:live&&!live.server_url?'<div class="launch-progress" role="status"><p class="hint">'+(live.stopping?"Waiting for WanGP to stop…":"Starting WanGP. The opening buttons become available when the server is ready.")+'</p><div class="progress"></div></div>':"",
@@ -461,7 +459,8 @@ document.addEventListener("click",async event=>{
     else if(action==="detect-installation")await detectInstallation();
     else if(action==="manager-update"){state.managerUpdate=await run("manager_update");render();}
     else if(action==="manager-download")await invoke("open_manager_download");
-    else if(action==="github-star"||action==="star-later"){state.preferences=await invoke("github_star",{open:action==="github-star"});render();}
+    // WanGP asks for the star itself; the next launch tells it the project page was opened here.
+    else if(action==="github-star"){state.preferences=await invoke("github_star");render();}
     else if(action==="new-view"){state.registerView=false;render();}
     else if(action==="browse"){
       const value=await invoke("pick_path",{kind:el.dataset.kind});
