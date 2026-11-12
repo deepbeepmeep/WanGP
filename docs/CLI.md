@@ -483,6 +483,41 @@ python wgp.py --lora-preset anime_style.lset
 python wgp.py --loras /shared/loras --lora-preset mystyle.lset
 ```
 
+## Console Guard (`--console-guard`)
+
+WanGP hands the terminal back the way it received it. It starts helper programs -- ffmpeg, ffprobe,
+the TTS and other native runtimes -- and they inherit the terminal, keyboard included. A tool that
+reads the keyboard switches echo, line editing and Ctrl+C off on that shared terminal; WanGP's
+children live in their own process groups, so a Ctrl+C never reaches them and they are killed without
+a chance to clean up, leaving the terminal in that state. The shell prompt stops answering, typed keys
+make no sound, and `reset` is the only way back.
+
+The guard takes the terminal settings at startup and writes them back when the run ends: at exit, on
+Ctrl+C and SIGTERM, and from the app's own Save and Quit / Restart paths. A terminal that arrives
+broken -- an earlier run left it raw -- is repaired at startup, so WanGP starts on a console that can
+be typed in, and says so once. The guard is on by default, and a healthy run never notices it: no line
+is printed, nothing is written, and no key is ever sent. There is nothing to guard when the output is
+a pipe, a file, or the MCP server over stdio, and `--console-guard=off` leaves the terminal untouched.
+
+```bash
+# The default: the terminal is restored when the run ends, repaired if it arrives broken
+python wgp.py --process my_queue.zip
+
+# Leave the terminal alone (a wrapper that manages the terminal itself)
+python wgp.py --process my_queue.zip --console-guard=off
+
+# Log the terminal settings at the start and at the end, to see what changed them
+WAN2GP_CONSOLE_GUARD_LOG=1 python wgp.py --process my_queue.zip
+```
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--console-guard` (`on` / `off`) | on | Put the terminal back the way WanGP found it at exit, on Ctrl+C and SIGTERM, on Save and Quit and on Restart; repair a terminal left unusable. `off` leaves the terminal untouched |
+
+`restore_console()` is also what the app's shutdown paths call, so a restart through `os._exit` --
+which skips the exit handlers -- restores the terminal too. On Windows the same rule uses the console
+mode (`GetConsoleMode` / `SetConsoleMode`) instead of the terminal settings.
+
 ## Environment Variables
 
 While not command line options, these environment variables can affect behavior:
