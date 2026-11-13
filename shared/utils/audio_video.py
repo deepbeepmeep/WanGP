@@ -117,6 +117,18 @@ def source_audio_repair_ms(repair_ms, audio_path, codec, video_seconds):
     return 0 if info.frames / info.samplerate - video_seconds >= clear_ms / 1000 else repair_ms
 
 
+def source_audio_end_seconds(audio_path, picture_seconds):
+    """Where a kept soundtrack really ends: its own length when that is shorter than the picture it belongs to. Filling it out to the
+    picture length instead puts silence between the two sounds, and the video goes quiet for a moment in the middle. A soundtrack that
+    runs past its picture, and one whose length cannot be read, keep the picture length."""
+    try:
+        info, audio_seconds = sf.info(os.fspath(audio_path)), 0.0
+        if info.samplerate: audio_seconds = info.frames / info.samplerate
+    except Exception:
+        return picture_seconds
+    return audio_seconds if 0.0 < audio_seconds < picture_seconds else picture_seconds
+
+
 def audio_overlap_repair_seconds(overlap_frames, video_fps, repair_ms, overlap_audio=None, sample_rate=0):
     overlap_seconds = overlap_frames / video_fps
     shortfall = max(0.0, overlap_seconds - len(overlap_audio) / sample_rate) if overlap_audio is not None else 0.0
@@ -620,6 +632,9 @@ def combine_and_concatenate_video_with_audio_tracks(
             else:
                 filters.append(f'anullsrc=r={audio_sampling_rate}:cl={channel_layout},apad=pad_dur=100[aout{i}]')
         else:
+            # the new audio starts where the kept soundtrack really ends when that soundtrack is kept and the new
+            # audio shares the source timeline; otherwise the hand-over stays at the last frame of the source video
+            source_end = source_audio_end_seconds(s, source_audio_duration) if (s and n and not new_audio_from_start) else source_audio_duration
             if s:
                 inputs += ['-i', s]
                 needs_filter = (
@@ -631,10 +646,10 @@ def combine_and_concatenate_video_with_audio_tracks(
                 if needs_filter:
                     filters.append(
                         f'[{idx}:a]aresample={audio_sampling_rate},aformat=channel_layouts={channel_layout},'
-                        f'apad=pad_dur={source_audio_duration},atrim=0:{source_audio_duration},asetpts=PTS-STARTPTS[s{i}]')
+                        f'apad=pad_dur={source_end:.6f},atrim=0:{source_end:.6f},asetpts=PTS-STARTPTS[s{i}]')
                 else:
                     filters.append(
-                        f'[{idx}:a]apad=pad_dur={source_audio_duration},atrim=0:{source_audio_duration},asetpts=PTS-STARTPTS[s{i}]')
+                        f'[{idx}:a]apad=pad_dur={source_end:.6f},atrim=0:{source_end:.6f},asetpts=PTS-STARTPTS[s{i}]')
                 if lang := meta.get('language'):
                     metadata_args += ['-metadata:s:a:' + str(i), f'language={lang}']
                 idx += 1
@@ -644,7 +659,7 @@ def combine_and_concatenate_video_with_audio_tracks(
 
             if n:
                 inputs += ['-i', n]
-                start = '0' if new_audio_from_start else source_audio_duration
+                start = '0' if new_audio_from_start else f'{source_end:.6f}'
                 filters.append(
                     f'[{idx}:a]aresample={audio_sampling_rate},aformat=channel_layouts={channel_layout},'
                     f'atrim=start={start},asetpts=PTS-STARTPTS[n{i}]')
