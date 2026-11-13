@@ -166,8 +166,9 @@ class MiniMaxH3TextEncoder(nn.Module):
     def _conditioning(self, output, dtype):
         return output.last_hidden_state.to(dtype)
 
-    def encode(self, prompt, items, device, dtype, picture_label=None):
+    def encode(self, prompt, items, device, dtype, picture_label=None, min_tokens=0):
         entries = self._presentation(prompt, items, picture_label)
+        entries += [TEXT_PAD] * (min_tokens - len(entries))
         token_ids = []
         visual_specs = []
         for entry in entries:
