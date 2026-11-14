@@ -9,6 +9,8 @@ from typing import Any
 
 import numpy as np
 
+from shared.utils.subprocess_stdin import child_kwargs
+
 RATE = 16000
 SHORTEST_FRAMES = 36  # the lag is searched up to 12 frames either way
 LONGEST_S = 60.0  # a shot: correlating across cuts says nothing
@@ -17,7 +19,7 @@ LONGEST_S = 60.0  # a shot: correlating across cuts says nothing
 def decode_voice(path) -> np.ndarray:
     from shared.deepy.video_tools import _get_ffmpeg_path
 
-    raw = subprocess.run([_get_ffmpeg_path(), "-v", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", str(RATE), "-f", "f32le", "-"], capture_output=True).stdout
+    raw = subprocess.run([_get_ffmpeg_path(), "-v", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", str(RATE), "-f", "f32le", "-"], capture_output=True, **child_kwargs()).stdout
     return np.frombuffer(raw, dtype=np.float32).copy()
 
 

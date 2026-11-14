@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from .virtual_media import bounced_frame, clamp_virtual_frame_range, get_virtual_media_entry, in_frames, parse_virtual_media_path, strip_virtual_media_suffix
+from shared.utils.subprocess_stdin import child_kwargs
 
 _ZSCALE_TRANSFER_MAP = {"smpte2084": "smpte2084", "arib-std-b67": "arib-std-b67", "bt709": "bt709", "bt2020-10": "2020_10", "bt2020-12": "2020_12"}
 _ZSCALE_PRIMARIES_MAP = {"bt2020": "2020", "bt709": "709", "smpte170m": "170m", "bt470bg": "470bg"}
@@ -106,7 +107,7 @@ def picture_duration(video_path):
     """Seconds a video's picture lasts: its sound may run past its last frame (a model's audio tail, codec padding). mkv/webm keep it
     in a stream tag; a file stating neither gives only its whole length."""
     command = [_resolve_media_binary("ffprobe"), "-v", "error", "-show_entries", "stream=codec_type,duration:stream_tags=DURATION:format=duration", "-of", "json", os.fspath(video_path)]
-    probe = json.loads(subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="ignore", check=True).stdout)
+    probe = json.loads(subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="ignore", check=True, **child_kwargs()).stdout)
     video = next((stream for stream in probe.get("streams", []) if stream.get("codec_type") == "video"), {})
     return _parse_media_duration(video.get("duration") or (video.get("tags") or {}).get("DURATION") or (probe.get("format") or {}).get("duration"), 0.0) or None
 
@@ -197,7 +198,7 @@ def _probe_mkv_sparse_frame_count(source_path, ffprobe_path, duration, start_tim
     # starts at the key frame before them, any number of pictures earlier, so a fixed number of pictures would stop short of the end.
     tail_start = max(0.0, start_time + max(0, candidate - 64) / fps_float)
     probe_cmd = [ffprobe_path, "-v", "error", "-select_streams", "v:0", "-read_intervals", f"{tail_start:.6f}%", "-show_entries", "packet=pts_time", "-of", "json", source_path]
-    probe = subprocess.run(probe_cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False)
+    probe = subprocess.run(probe_cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False, **child_kwargs())
     if probe.returncode != 0:
         return candidate
     try:
@@ -220,7 +221,7 @@ def probe_video_stream_metadata(video_path, *, file_version=None):
     if ffprobe_path is None:
         return None
     probe_cmd = [ffprobe_path, "-v", "error", "-select_streams", "v:0", "-show_streams", "-show_format", "-of", "json", source_path]
-    probe = subprocess.run(probe_cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False)
+    probe = subprocess.run(probe_cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False, **child_kwargs())
     if probe.returncode != 0:
         return None
     try:
@@ -472,7 +473,7 @@ def _decode_contiguous_video_frames_ffmpeg(video_path, start_frame, max_frames, 
         cmd += ["-vf", video_filter]
     out_pix_fmt = "gbrpf32le" if hdr_linear else "rgb24"
     cmd += ["-fps_mode", "passthrough", "-frames:v", str(requested_frames), "-f", "rawvideo", "-pix_fmt", out_pix_fmt, "pipe:1"]
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**7)
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**7, **child_kwargs())
     frame_bytes = metadata["display_width"] * metadata["display_height"] * 3 * (4 if hdr_linear else 1)
     frame_dtype = np.float32 if hdr_linear else np.uint8
     frames_shape = (requested_frames, 3, metadata["display_height"], metadata["display_width"]) if hdr_linear else (requested_frames, metadata["display_height"], metadata["display_width"], 3)
@@ -555,7 +556,7 @@ def decode_video_frame_indices_ffmpeg(video_path, frame_indices, bridge="torch",
     cmd += ["-i", decode_path, "-an", "-sn", "-vf", video_filter]
     out_pix_fmt = "gbrpf32le" if hdr_linear else "rgb24"
     cmd += ["-fps_mode", "passthrough", "-frames:v", str(len(unique_indices)), "-f", "rawvideo", "-pix_fmt", out_pix_fmt, "pipe:1"]
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**7)
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**7, **child_kwargs())
     frame_bytes = metadata["display_width"] * metadata["display_height"] * 3 * (4 if hdr_linear else 1)
     frame_dtype = np.float32 if hdr_linear else np.uint8
     frames_shape = (len(unique_indices), 3, metadata["display_height"], metadata["display_width"]) if hdr_linear else (len(unique_indices), metadata["display_height"], metadata["display_width"], 3)

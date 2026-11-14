@@ -9,6 +9,7 @@ import subprocess
 import numpy as np
 import torch
 
+from shared.utils.subprocess_stdin import child_kwargs
 from shared.utils.video_decode import resolve_media_binary
 
 LOG_ZERO_GUARD_VALUE = 2**-24
@@ -19,7 +20,7 @@ def load_audio(path, sampling_rate=16000, start=None, duration=None) -> torch.Te
     """Decodes the first audio stream of any audio or video file to mono float32 samples at `sampling_rate` with WanGP's ffmpeg."""
     command = [resolve_media_binary("ffmpeg"), "-v", "error", "-nostdin", *(["-ss", str(start)] if start else []), "-i", str(path), *(["-t", str(duration)] if duration else []),
                "-vn", "-ac", "1", "-ar", str(sampling_rate), "-f", "f32le", "pipe:1"]
-    result = subprocess.run(command, capture_output=True)
+    result = subprocess.run(command, capture_output=True, **child_kwargs())
     if result.returncode:
         raise ValueError(f"Cannot decode the audio of {path}: " + result.stderr.decode(errors="replace")[-1200:])
     return torch.from_numpy(np.frombuffer(result.stdout, dtype="<f4").copy())

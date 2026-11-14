@@ -13,6 +13,7 @@ from pathlib import Path
 from shared import extra_settings, resolutions
 from shared.api import apply_media_flag_defaults, apply_video_length_duration
 from shared.utils.frame_scheduler import fit_video_length, has_slash_commands, normalize_frame_count
+from shared.utils.subprocess_stdin import child_kwargs
 from shared.utils.virtual_media import strip_virtual_media_suffix
 
 
@@ -67,7 +68,7 @@ def input_metadata(session, settings, explicit):
                 record.update(zip(("width", "height"), upright_size(image)))
         elif record["media_type"] in {"audio", "video"}:
             if probe:
-                process = subprocess.run([str(probe), "-v", "error", "-show_entries", "stream=codec_type,width,height,sample_rate,channels,avg_frame_rate:format=duration", "-of", "json", str(path)], capture_output=True, text=True, timeout=15)
+                process = subprocess.run([str(probe), "-v", "error", "-show_entries", "stream=codec_type,width,height,sample_rate,channels,avg_frame_rate:format=duration", "-of", "json", str(path)], capture_output=True, text=True, timeout=15, **child_kwargs())
                 if process.returncode:
                     record["metadata_unavailable"] = process.stderr[-500:]
                 else:

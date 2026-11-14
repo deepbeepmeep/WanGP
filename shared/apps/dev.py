@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from shared.apps import bundles, progression, server
+from shared.utils.subprocess_stdin import child_kwargs
 
 ASSET_IMAGE = {".png", ".jpg", ".jpeg", ".webp"}
 ASSET_AUDIO = {".ogg": ["-c:a", "libvorbis", "-q:a", "5"], ".mp3": ["-c:a", "libmp3lame", "-q:a", "3"], ".m4a": ["-c:a", "aac", "-b:a", "160k"], ".wav": ["-c:a", "pcm_s16le"]}
@@ -301,7 +302,7 @@ class AppWorkshop:
 
             scale = ["-vf", f"scale='min({int(max_size)},iw)':-2"] if max_size and suffix in ASSET_VIDEO else []
             command = [resolve_media_binary("ffmpeg"), "-v", "error", "-y", "-i", str(source), *(["-vn"] if suffix in ASSET_AUDIO else scale), *(ASSET_AUDIO.get(suffix) or ASSET_VIDEO[suffix]), str(target)]
-            completed = subprocess.run(command, capture_output=True, text=True, timeout=600)
+            completed = subprocess.run(command, capture_output=True, text=True, timeout=600, **child_kwargs())
             if completed.returncode != 0:
                 raise RuntimeError(f"ffmpeg could not convert {source.name}: {completed.stderr.strip()[-400:]}")
         elif suffix in ASSET_MESH:
