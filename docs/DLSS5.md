@@ -221,7 +221,7 @@ WanGP/
 |   |-- dlssg/
 |   |   |-- libnvidia-ngx-dlssg.so.310.9.16      # DLSS Frame Generation runtime (CUDA/Vulkan API)
 |   |   |-- LICENSE-NVIDIA-DLSS.txt
-|   |   |-- dlssg-worker                          # Linux Vulkan Frame Generation worker (built by scripts/build_dlssg_worker_linux.sh)
+|   |   |-- dlssg-worker                          # upstream Linux Vulkan Frame Generation worker (if installed from the archive)
 |   |-- sdk/
 |       |-- include/...                           # NVSDK NGX API headers (D3D/CUDA/Vulkan)
 |       |-- lib/libnvsdk_ngx.a                    # static import library
@@ -235,16 +235,16 @@ WanGP/
 - **DLSS Frame Generation: worker available (build required).** The official `libnvidia-ngx-dlssg.so` runtime is installed, and WanGP now ships a Linux (Vulkan) build of the MIT-licensed [`native/WanGP-Adapter/dlssg_worker.cpp`](https://github.com/DeepBeepMeep/dlss5-visual-enhancer/blob/wangp-v1.1.3/native/WanGP-Adapter/dlssg_worker.cpp) as [`scripts/dlssg_worker_linux/dlssg_worker_linux.cpp`](../scripts/dlssg_worker_linux/dlssg_worker_linux.cpp). It calls the documented NVSDK NGX Frame Generation Vulkan API from `dlss5/sdk`, keeps the Windows worker's stdin/stdout protocol byte-for-byte, and links the bundled runtime next to itself (`RUNPATH=$ORIGIN`). Build it with:
 
   ```bash
-  scripts/build_dlssg_worker_linux.sh    # -> dlss5/dlssg/dlssg-worker
+  scripts/build_dlssg_worker_linux.sh    # -> dlss5/dlssg-native/dlssg-worker
   ```
 
-  The build needs an NVIDIA Vulkan ICD (`/etc/vulkan/icd.d/`), the Vulkan loader (`libvulkan.so.1`), and g++; it uses the distro Vulkan headers (`libvulkan-dev`) or fetches the official [KhronosGroup/Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) of the loader's 1.3 series. Once the `dlss5/dlssg/dlssg-worker` binary exists (executable), WanGP detects it automatically, probes its capabilities, and enables x2–x4 (x5/x6 on RTX 50 when the runtime reports them). Until it is built, the mode is labelled `missing dlssg-worker`.
+  The build needs an NVIDIA Vulkan ICD (`/etc/vulkan/icd.d/`), the Vulkan loader (`libvulkan.so.1`), and g++; it uses the distro Vulkan headers (`libvulkan-dev`) or fetches the official [KhronosGroup/Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) of the loader's 1.3 series. Once the `dlss5/dlssg-native/dlssg-worker` binary exists (executable), WanGP detects it automatically, probes its capabilities, and enables x2–x4 (x5/x6 on RTX 50 when the runtime reports them). Until it is built, the mode is labelled `missing dlssg-worker`.
 
 ## Hardware and diagnostics
 
 Neural Rendering requires Windows 11 and GeForce RTX 30 or newer; RTX 30 is experimental, while RTX 40/50 are the primary targets. Frame Generation requires GeForce RTX 40 or newer, a compatible driver, and Hardware-accelerated GPU scheduling (HAGS). WanGP offers 2x through 4x on compatible RTX 40/50 GPUs and only offers 5x and 6x on RTX 50 GPUs when supported by the installed runtime.
 
-Restart WanGP after installing or replacing the runtime. Unavailable modes are labelled with the missing requirement in their dropdown. WanGP respects an explicitly disabled HAGS setting; if Windows does not expose that setting reliably, the native DLSS capability probe decides availability instead of reporting a false `HAGS disabled` (HAGS is a Windows concept; on Linux the probe decides availability from the runtime). For additional Frame Generation diagnostics, run `dlss5/dlssg/dlssg-worker.exe --probe` (Windows) or `dlss5/dlssg/dlssg-worker --probe` (Linux) from the `dlss5/dlssg` directory. Neural Rendering writes diagnostic information to `dlss5/host/ReShade.log` (Windows only); the Linux Frame Generation worker writes its diagnostics to stderr.
+Restart WanGP after installing or replacing the runtime. Unavailable modes are labelled with the missing requirement in their dropdown. WanGP respects an explicitly disabled HAGS setting; if Windows does not expose that setting reliably, the native DLSS capability probe decides availability instead of reporting a false `HAGS disabled` (HAGS is a Windows concept; on Linux the probe decides availability from the runtime). For additional Frame Generation diagnostics, run `dlss5/dlssg/dlssg-worker.exe --probe` (Windows) or `dlss5/dlssg-native/dlssg-worker --probe` (Linux native worker). Neural Rendering writes diagnostic information to `dlss5/host/ReShade.log` (Windows only); the Linux Frame Generation worker writes its diagnostics to stderr.
 
 `nr-depth-worker.exe` v1.1.2 or newer does not require network access while processing media and may safely be denied outbound access. Older workers appear to contact GitHub because ReShade performs an automatic version check inside the worker process; v1.1.2 disables that check.
 
