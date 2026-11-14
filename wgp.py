@@ -1134,6 +1134,20 @@ def parse_custom_sigmas(value, phases):
     return schedules
 
 
+def source_video_setting(video_source):
+    """The Source Video as a job reads it: a path, or None when the setting holds no file.
+
+    A task that reaches WanGP outside the interface says "no Source Video" with an empty string, and a media
+    picker can hand back a list holding that string. Taken for a path, both send a job looking up the frame
+    rate of nothing: the read returns 0 and the job then divides its frame count by it.
+    """
+    if isinstance(video_source, (list, tuple)):
+        video_source = video_source[0] if len(video_source) > 0 else None
+    if isinstance(video_source, str) and len(video_source.strip()) == 0:
+        video_source = None
+    return video_source
+
+
 def validate_settings(state, model_type, single_prompt, inputs, silent=False):
     def err(error=""):
         error = str(error or "")
@@ -1190,6 +1204,9 @@ def validate_settings(state, model_type, single_prompt, inputs, silent=False):
     validation_prompts = prompts
     frames_minimum, frames_steps, latent_size = get_model_min_frames_and_step(model_type)
     discard_step = model_def.get("sliding_window_defaults", {}).get("discard_step", latent_size)  # 1 for models that recycle no latents
+    # The window schedule read below and the job that runs both ask this setting what the Source Video is, so
+    # a blank answer is turned into no video once, here, before either of them takes it for a path.
+    inputs["video_source"] = source_video_setting(inputs.get("video_source"))
     inputs.pop("frame_scheduler", None)
     frame_scheduler = None
     scheduler_supported = frame_scheduler_supported(model_type, model_def, inputs.get("image_mode", 0), is_edit_mode)
