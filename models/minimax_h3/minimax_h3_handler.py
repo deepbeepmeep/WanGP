@@ -944,6 +944,7 @@ class family_handler:
             "spoken_line_prompt": {"line": "{speaker}{note} says ({id}) <d>[{language}] {line}</d>", "before": "overall_soundscape:"},  # a line for H3 to voice, and the section of a structured prompt it goes before
             "audio_window_alignment": True,
             "audio_overlap_repair_ms": 25,  # sources without an audio tail: one audio latent, plus the measured waveform shortfall
+            "audio_overlap_repair_frames": 1,  # native continuation regenerates the join frame's audio only
             "audio_tail_ms": 100,  # generate() returns audio running past the last frame (H3_AUDIO_TAIL_LATENTS)
             "end_image_before_discarded_frames": True,  # discarded last frames follow the end image of non-final windows
             "multimedia_generation": True,
