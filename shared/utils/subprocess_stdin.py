@@ -45,3 +45,29 @@ def child_kwargs(**overrides):
         kwargs["start_new_session"] = True
     kwargs.update(overrides)
     return kwargs
+
+
+def keeps_terminal(kwargs):
+    """True when the options a launch site already passes keep the terminal -- leave such a site alone."""
+    return any(name in kwargs for name in ("stdin", "preexec_fn", "start_new_session", "creationflags"))
+
+
+def no_stdin_args(*binaries):
+    """ffmpeg's own `-nostdin`, for the commands built as a list: ffprobe has no such option."""
+    args = []
+    for binary in binaries:
+        name = os.path.basename(str(binary)).strip().lower()
+        if name.startswith("ffmpeg"):
+            args.append("-nostdin")
+    return args
+
+
+def reads_stdin(command):
+    """True when a command list takes its input from a pipe (`pipe:0`, `-i -`): keep its stdin open."""
+    parts = [str(one) for one in (command or [])]
+    for index, part in enumerate(parts):
+        if part.startswith("pipe:") or part == "-":
+            return True
+        if part in ("-i", "--input") and index + 1 < len(parts) and parts[index + 1] in ("-", "pipe:0"):
+            return True
+    return False
