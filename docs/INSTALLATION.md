@@ -228,11 +228,28 @@ pip install https://github.com/woct0rdho/SpargeAttn/releases/download/v0.1.0-win
 ```
 
 #### Linux Install Sparge Attention
-Activate your WanGP Python environment before running these commands; SpargeAttn's build also invokes `python` from `PATH` to generate its kernels.
+For the recommended **Python 3.11 / PyTorch 2.10 / CUDA 13** environment the installer uses a prebuilt wheel, no compilation needed:
+```
+# run with WanGP's environment activated
+pip install https://github.com/deepbeepmeep/kernels/releases/download/SpargeAttn/spas_sage_attn-0.1.0%2Bcu130torch2.10-cp311-cp311-linux_x86_64.whl
+```
+The `cp311` part of the file name (it appears twice) is the Python version (3.11) and must match your environment's Python. On Python 3.10 or 3.12 no wheel exists and you have to build SpargeAttn yourself.
+
+Activate your WanGP Python environment before running the build commands; SpargeAttn compiles against that environment and invokes `python` from `PATH` to generate its kernels.
+
+A plain source build on CUDA 13 stops with `error: identifier "__assert_fail" is undefined` in `cuda_fp8.hpp`, `cuda_fp6.hpp` or `cuda_fp4.hpp`: CUDA 13 calls `assert()` inside `__forceinline__` host/device functions, `assert()` expands to `__assert_fail()`, and nvcc's device frontend does not know that symbol. Passing `-DNDEBUG` to nvcc disables the assert macro and the build completes:
 ```
 python -m pip install ninja wheel packaging
-python -m pip install --no-build-isolation git+https://github.com/woct0rdho/SpargeAttn.git
+NVCC_PREPEND_FLAGS='-DNDEBUG' python -m pip install --no-build-isolation git+https://github.com/woct0rdho/SpargeAttn.git
 ```
+
+`NVCC_PREPEND_FLAGS` is read by nvcc itself and prepended to every invocation, so the flag works with any torch version and nothing inside SpargeAttn has to be edited.
+
+`scripts/install-spargeattn.sh` runs the whole build for you: it exports `NVCC_PREPEND_FLAGS='-DNDEBUG'`, puts the build environment's `bin` directory first on `PATH`, patches the generator call and checks the installed kernels. The second problem is silent: SpargeAttn runs its kernel generators with a bare `python` and ignores their exit status, so when `python` is not the build interpreter (pyenv shim, unactivated virtual environment) the wheel ships without kernels and `_qattn_sm89` cannot be imported.
+```
+scripts/install-spargeattn.sh
+```
+To cut the build time, set `TORCH_CUDA_ARCH_LIST` to your GPU family only: `8.6` for RTX 30xx, `8.9` for RTX 40xx, `12.0` for RTX 50xx.
 
 
 ## Flash Attention
