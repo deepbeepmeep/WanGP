@@ -39,7 +39,7 @@ DLSSG_LINUX = sys.platform == "linux"
 NR_WSL = DLSSG_LINUX and "microsoft" in platform.release().lower()
 DLSSG_MULTIPLIERS = (2.0, 3.0, 4.0, 5.0, 6.0)
 DLSSG_LINUX_RUNTIME = "libnvidia-ngx-dlssg.so.310.9.16"
-DLSSG_LINUX_RUNTIME_DEV = "libnvidia-ngx-dlssg.so.310.7.0"
+DLSSG_LINUX_RUNTIME_DEV = "libnvidia-ngx-dlssg.so.310.9.16"
 DLSSG_NATIVE_METHOD = "dlssg_native"
 DLSSG_NATIVE_NAME = "DLSS FG Linux"
 

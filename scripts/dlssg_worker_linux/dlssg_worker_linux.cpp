@@ -148,7 +148,7 @@ std::string WorkerDir() {
 
 // Reports which NGX runtime version is installed next to the worker.
 std::string RuntimeVersion(const std::string &directory) {
-    // The worker directory holds e.g. libnvidia-ngx-dlssg.so.310.7.0.
+    // The worker directory holds e.g. libnvidia-ngx-dlssg.so.310.9.16.
     DIR *dir = opendir(directory.c_str());
     if (dir == nullptr) return "unknown";
     std::string version = "unknown";

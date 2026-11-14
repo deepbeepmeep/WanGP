@@ -39,8 +39,8 @@ command -v g++ >/dev/null 2>&1 || fail "g++ not found; install a C++17 toolchain
 [ -f "${core_lib}" ] || fail "NGX core library not found (${core_lib}); run 'python scripts/install_dlss5.py' first"
 [ -d "${dlssg_dir}" ] || fail "dlss5/dlssg/ not found; run 'python scripts/install_dlss5.py' first"
 
-runtime_so="$(ls "${dlssg_dir}"/libnvidia-ngx-dlssg.so.* 2>/dev/null | sort -V | tail -n 1 || true)"
-[ -n "${runtime_so}" ] || fail "NGX DLSSG runtime not found in ${dlssg_dir}; run 'python scripts/install_dlss5.py' first"
+runtime_so="${dlssg_dir}/libnvidia-ngx-dlssg.so.310.9.16"
+[ -f "${runtime_so}" ] || fail "NGX DLSSG runtime not found in ${dlssg_dir}; run 'python scripts/install_dlss5.py' first"
 # The feature runtime is dlopen'd by the NGX core at load time, from the
 # directory that holds the worker (see WorkerDir() in
 # scripts/dlssg_worker_linux/dlssg_worker_linux.cpp), so the versioned .so is

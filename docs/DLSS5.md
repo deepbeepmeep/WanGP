@@ -80,14 +80,14 @@ bash scripts/build_dlssg_worker_linux.sh
 ./dlss5/dlssg-native/dlssg-worker --probe
 ```
 
-The worker is installed in **`dlss5/dlssg-native/`**, next to a symlink of the newest installed NVIDIA runtime — the worker loads the runtime that sits in its own directory, so each worker keeps its own directory and `dlss5/dlssg/` stays exactly as upstream installs it. No environment variable and no restart is needed: WanGP probes every installed worker and lists them side by side in **Temporal Upsampling**, each label showing the multipliers its worker, runtime and GPU report.
+The worker is installed in **`dlss5/dlssg-native/`**, next to a symlink of the pinned `libnvidia-ngx-dlssg.so.310.9.16` runtime — the worker loads the runtime that sits in its own directory, so each worker keeps its own directory and `dlss5/dlssg/` stays exactly as upstream installs it. No environment variable and no restart is needed: WanGP probes every installed worker and lists them side by side in **Temporal Upsampling**, each label showing the multipliers its worker, runtime and GPU report.
 
 | Menu entry | Worker | Multipliers |
 |---|---|---|
 | `DLSS Frame Generation` | upstream `dlss5/dlssg/dlssg-worker` + pinned runtime | x2 on native Linux (x2-x4, capability-gated x5/x6 on RTX 50 series on Windows) |
-| `DLSS Frame Generation (x3-x6 supported)` | `dlss5/dlssg-native/dlssg-worker` (or a v2 worker in `dlss5/dlssg/`) + newest runtime | probe-driven: x2-x4, x5/x6 on RTX 50 series, capped by the reported `multi_frame_count_max` |
+| `DLSS Frame Generation (x3-x6 supported)` | `dlss5/dlssg-native/dlssg-worker` (or a v2 worker in `dlss5/dlssg/`) + pinned runtime | probe-driven: x2-x4, x5/x6 on RTX 50 series, capped by the reported `multi_frame_count_max` |
 
-The native entry is named by the multipliers it brings here. **`supported`** is the range the capability probe reported on this GPU; **`max`** is this GPU's ceiling, shown only while the worker cannot be probed at all (missing file, failed probe). **x2 is left out of the native range when a usable upstream entry already offers it** — the native Multiplier list keeps offering x2, so nothing is lost, the label just avoids claiming the same multiplier twice. An x2-only native worker is hidden from the *Temporal Upsampling* menus while the upstream x2 entry works, keeping its multipliers and its validation, so a saved selection asking for it is restored by the menus; it reappears on its own when it is the only path, reading `(x2 supported)`. A blocker follows after `; disabled: `, for instance `(x2-x6 max; disabled: missing libnvidia-ngx-dlssg.so.310.7.0)`, `(x2-x6 max; disabled: Linux probe failed, run dlssg-native/dlssg-worker --probe)` or `(x2-x6 supported; disabled: Vulkan/NGX initialization failed)`; the Multiplier list then only offers probe-verified values. Task status lines and video metadata use the compact form `DLSS Frame Generation x4`.
+The native entry is named by the multipliers it brings here. **`supported`** is the range the capability probe reported on this GPU; **`max`** is this GPU's ceiling, shown only while the worker cannot be probed at all (missing file, failed probe). **x2 is left out of the native range when a usable upstream entry already offers it** — the native Multiplier list keeps offering x2, so nothing is lost, the label just avoids claiming the same multiplier twice. An x2-only native worker is hidden from the *Temporal Upsampling* menus while the upstream x2 entry works, keeping its multipliers and its validation, so a saved selection asking for it is restored by the menus; it reappears on its own when it is the only path, reading `(x2 supported)`. A blocker follows after `; disabled: `, for instance `(x2-x6 max; disabled: missing libnvidia-ngx-dlssg.so.310.9.16)`, `(x2-x6 max; disabled: Linux probe failed, run dlssg-native/dlssg-worker --probe)` or `(x2-x6 supported; disabled: Vulkan/NGX initialization failed)`; the Multiplier list then only offers probe-verified values. Task status lines and video metadata use the compact form `DLSS Frame Generation x4`.
 
 **Multi-GPU hosts.** The range and the x5/x6 gate follow the GPU WanGP runs on, not the fastest card in the host. WanGP tiers every GPU it may use (`CUDA_VISIBLE_DEVICES`, which `--default-device-id` sets) and keeps the weakest, so a 5090 + 3090 host pinned to the 3090 with `CUDA_VISIBLE_DEVICES=1` reads `(x2-x4 supported)` and refuses x5/x6, while the same host with `CUDA_VISIBLE_DEVICES=0` reads `(x2-x6 supported)`. A host that pins nothing is capped by its oldest card, because WanGP is free to run the job on that one. The native worker is pinned to WanGP's GPU as well (`--gpu <index>`, resolved by name from the worker's own device listing), because the Vulkan ICD ignores `CUDA_VISIBLE_DEVICES` and would otherwise generate the frames on the fastest card; the Frame Generation log line and the probe report both name the GPU in use, the latter as `"gpu":"NVIDIA GeForce RTX 3090"`. Rebuild the worker with `scripts/build_dlssg_worker_linux.sh` to get the pinning and that `gpu` field; an older worker still gets the right range, it just keeps the GPU it picked for itself.
 
@@ -201,7 +201,7 @@ Before installation, scan the downloaded archives and the extracted directory wi
 
 ## Linux
 
-The Windows-only components of DLSS 5 — ReShade, the RenoDX add-on, the DLSSNR (Neural Rendering) runtime, and the D3D12 worker executables — have no Linux builds, so on Linux the installer installs the **official NVIDIA DLSS SDK Linux runtimes** instead. These come straight from the public [NVIDIA/DLSS](https://github.com/NVIDIA/DLSS) repository, pinned to tag `v310.7.0` and SHA-256 verified per file; no community mirrors are used and nothing is executed during installation. The files are governed by the NVIDIA RTX SDKs License (installed as `LICENSE-NVIDIA-DLSS.txt`): NVIDIA-GPU-only use, no standalone redistribution.
+The Windows-only components of DLSS 5 — ReShade, the RenoDX add-on, the DLSSNR (Neural Rendering) runtime, and the D3D12 worker executables — have no Linux builds, so on Linux the installer installs the **official NVIDIA DLSS SDK Linux runtimes** instead. These come straight from the public [NVIDIA/DLSS](https://github.com/NVIDIA/DLSS) repository, pinned to tag `v310.9.16` and SHA-256 verified per file; no community mirrors are used and nothing is executed during installation. The files are governed by the NVIDIA RTX SDKs License (installed as `LICENSE-NVIDIA-DLSS.txt`): NVIDIA-GPU-only use, no standalone redistribution.
 
 ```bash
 scripts/install_dlss5.sh              # uses the venv Python when present
@@ -216,16 +216,16 @@ WanGP/
 |   |-- LICENSE-NVIDIA-DLSS.txt
 |   |-- README-LINUX.txt
 |   |-- dlss/
-|   |   |-- libnvidia-ngx-dlss.so.310.7.0        # DLSS Super Resolution runtime (CUDA/Vulkan API)
+|   |   |-- libnvidia-ngx-dlss.so.310.9.16       # DLSS Super Resolution runtime (CUDA/Vulkan API)
 |   |   |-- LICENSE-NVIDIA-DLSS.txt
 |   |-- dlssg/
-|   |   |-- libnvidia-ngx-dlssg.so.310.7.0       # DLSS Frame Generation runtime (CUDA/Vulkan API)
+|   |   |-- libnvidia-ngx-dlssg.so.310.9.16      # DLSS Frame Generation runtime (CUDA/Vulkan API)
 |   |   |-- LICENSE-NVIDIA-DLSS.txt
 |   |   |-- dlssg-worker                          # Linux Vulkan Frame Generation worker (built by scripts/build_dlssg_worker_linux.sh)
 |   |-- sdk/
 |       |-- include/...                           # NVSDK NGX API headers (D3D/CUDA/Vulkan)
 |       |-- lib/libnvsdk_ngx.a                    # static import library
-|       |-- lib/libnvidia-ngx-dlssd.so.310.7.0    # legacy DLSS Dynamic feature library
+|       |-- lib/libnvidia-ngx-dlssd.so.310.9.16   # legacy DLSS Dynamic feature library
 |       |-- LICENSE-NVIDIA-DLSS.txt
 ```
 

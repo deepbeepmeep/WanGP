@@ -9,18 +9,18 @@ official resources that exist for Linux: the public NVIDIA DLSS SDK runtimes
 API headers, pinned to a repository tag and SHA-256 verified.
 
 All files are downloaded from NVIDIA's official public repository
-(https://github.com/NVIDIA/DLSS, tag v310.7.0). No community mirrors are
+(https://github.com/NVIDIA/DLSS, tag v310.9.16). No community mirrors are
 used. The files are governed by the NVIDIA RTX SDKs License: no standalone
 redistribution, NVIDIA-GPU-only use (see the installed
 LICENSE-NVIDIA-DLSS.txt).
 
 Installed layout under <WanGP root>/dlss5:
 
-  dlss/libnvidia-ngx-dlss.so.310.7.0      DLSS Super Resolution runtime
-  dlssg/libnvidia-ngx-dlssg.so.310.7.0    DLSS Frame Generation runtime
+  dlss/libnvidia-ngx-dlss.so.310.9.16      DLSS Super Resolution runtime
+  dlssg/libnvidia-ngx-dlssg.so.310.9.16    DLSS Frame Generation runtime
   sdk/include/...                          NVSDK NGX API headers
   sdk/lib/libnvsdk_ngx.a                   static import library
-  sdk/lib/libnvidia-ngx-dlssd.so.310.7.0  legacy DLSS Dynamic feature library
+  sdk/lib/libnvidia-ngx-dlssd.so.310.9.16  legacy DLSS Dynamic feature library
 
 Notes:
 - DLSS 5 Neural Rendering has no Linux runtime (DLSSNR/ReShade/RenoDX are
@@ -47,45 +47,45 @@ import urllib.request
 from pathlib import Path
 
 USER_AGENT = "WanGP-DLSS5-Installer"
-SDK_TAG = "v310.7.0"
+SDK_TAG = "v310.9.16"
 SDK_URL = f"https://raw.githubusercontent.com/NVIDIA/DLSS/{SDK_TAG}"
-RUNTIME_SO_SUFFIX = ".310.7.0"
+RUNTIME_SO_SUFFIX = ".310.9.16"
 
 # (repo path, destination relative to <root>/dlss5, pinned SHA-256). The
 # license text is downloaded once and copied into the runtime directories.
 SDK_DOWNLOADS = (
-    ("lib/Linux_x86_64/rel/libnvidia-ngx-dlss.so.310.7.0", "dlss/libnvidia-ngx-dlss.so.310.7.0",
-     "FC19B68CEFB4218E0954FAB812C782E0AA4D30526E0151C796E8887E0ECA3ACB"),
-    ("lib/Linux_x86_64/rel/libnvidia-ngx-dlssd.so.310.7.0", "sdk/lib/libnvidia-ngx-dlssd.so.310.7.0",
-     "EFD465933BF9A40B65F3C6D61AA079F4A4B188004E9C2B432E3375783B0029F3"),
-    ("lib/Linux_x86_64/rel/libnvidia-ngx-dlssg.so.310.7.0", "dlssg/libnvidia-ngx-dlssg.so.310.7.0",
-     "676CFEACE1BF675A281CF234DF619F24CEF16A1259F36119EBDF01138468A057"),
+    ("lib/Linux_x86_64/rel/libnvidia-ngx-dlss.so.310.9.16", "dlss/libnvidia-ngx-dlss.so.310.9.16",
+     "30982C937AFED85C96B8D313323DE9A650A2EEC6DE1BB0F714B21750F4CE98F6"),
+    ("lib/Linux_x86_64/rel/libnvidia-ngx-dlssd.so.310.9.16", "sdk/lib/libnvidia-ngx-dlssd.so.310.9.16",
+     "A5D59DE18841F15779039DDA567A15DD723BA737915F489271FDB5F109FBFB96"),
+    ("lib/Linux_x86_64/rel/libnvidia-ngx-dlssg.so.310.9.16", "dlssg/libnvidia-ngx-dlssg.so.310.9.16",
+     "574839CAE01C835DE4D5845C36CA9CF75361F8160BD52397142C36A24E29E6F7"),
     ("lib/Linux_x86_64/libnvsdk_ngx.a", "sdk/lib/libnvsdk_ngx.a",
-     "DAE18DCE6FDBAB45F7304B14901C93C41073D7CC31D555D6CB1FA145958937A6"),
+     "D3C50BB0D9624FC35E502A8E929B8FC1E2B505017EBDB84C0D5B627E11A235DF"),
     ("LICENSE.txt", "LICENSE-NVIDIA-DLSS.txt",
-     "21B5DAEC892B12BEA692E66BC8FE45CF5902CCAF3A7B831E78050D8859881C37"),
+     "D4216E39EBEF5F9B50A6712EBB37BEEB5379862A67733A9999C651F21592AAF0"),
     ("include/nvsdk_ngx.h", "sdk/include/nvsdk_ngx.h",
-     "F6014A256F9D75CCEC1278AC6E23D596B398A76CC3960048CA1A274B378B1989"),
+     "DC38E7467CF415379C9D12AE1B6E4A494C453ED92720FB53E92AECB523E7B848"),
     ("include/nvsdk_ngx_defs.h", "sdk/include/nvsdk_ngx_defs.h",
      "EA23F33497CD274860D1C25A97644FCE807DCB0037C594547203343103FAD03E"),
     ("include/nvsdk_ngx_defs_dlssd.h", "sdk/include/nvsdk_ngx_defs_dlssd.h",
-     "D2FDE340DB2189C89BCE093BC1EDD7B3579DF48DECAC329218A98A9C5FD46018"),
+     "2E97FE1595B1334F71B51724F2CB67496E8C296A7A2EEC5606DA53055882E716"),
     ("include/nvsdk_ngx_defs_dlssg.h", "sdk/include/nvsdk_ngx_defs_dlssg.h",
-     "5E76E5CF0397F0B093887D0392B427A6B3E3F722CEC5F5A4795357EDEB6DE4BA"),
+     "C29765AB9E0125F9D724AE9811CC2ABE03738D17486EC8EEE80D78A1504549E1"),
     ("include/nvsdk_ngx_defs_vk.h", "sdk/include/nvsdk_ngx_defs_vk.h",
      "0A24D0861ACE7D6B9362A67B7F08BEA1B33EA123C5CE730B19133DE8A891D031"),
-("include/nvsdk_ngx_helpers.h", "sdk/include/nvsdk_ngx_helpers.h",
-     "2D5661F8B5AB55E1223E485F24146274D48077E09051873826B653D4384FE7D8"),
+    ("include/nvsdk_ngx_helpers.h", "sdk/include/nvsdk_ngx_helpers.h",
+     "5BCBADFE7478B802CF6D3ACA4DC5DDD7D0889B99726E69C63F9E9BD555F44471"),
     ("include/nvsdk_ngx_helpers_dlssd.h", "sdk/include/nvsdk_ngx_helpers_dlssd.h",
-     "6DF9D02C6F47FEEE3AFC8D12340A9F554A7DDCE4DDACB1B6A13A42B26C2C6293"),
+     "A25FDDA925B479DFE869593AEBA311EF08793DA54E0391F2FE2FE756CBEF5532"),
     ("include/nvsdk_ngx_helpers_dlssd_cuda.h", "sdk/include/nvsdk_ngx_helpers_dlssd_cuda.h",
      "7E35CDE214D905346A487B9A28C05D35E1C55B480E237FE3DE69580A7E332730"),
     ("include/nvsdk_ngx_helpers_dlssd_vk.h", "sdk/include/nvsdk_ngx_helpers_dlssd_vk.h",
      "11DF8FBDA532A97FE867C8EF2B40058B49B7898183710F3468E55B1EEDB8F40B"),
     ("include/nvsdk_ngx_helpers_dlssg.h", "sdk/include/nvsdk_ngx_helpers_dlssg.h",
-     "85894E5F44C3D1ADD74B3997C80F8D6A25DCBEB4DF5D092138E71DA5629B60E8"),
+     "6881D21419C40C78EC948B326902ECE09FC112B0223144D51C4905F3FCED7A1F"),
     ("include/nvsdk_ngx_helpers_dlssg_vk.h", "sdk/include/nvsdk_ngx_helpers_dlssg_vk.h",
-     "B1B77DB963C6F1095EBC4A33E4DC06897C7EBECB5B582DC68B332E5EC85C01ED"),
+     "B371D90B9F4372B9A415E68A0AFBDC2F31B7B552E219A9637D848749BC965316"),
     ("include/nvsdk_ngx_helpers_vk.h", "sdk/include/nvsdk_ngx_helpers_vk.h",
      "C192BFF72138F12F770DB48E12C1D8F712DFC81EA0E8E055EBB27D8DD1B31623"),
     ("include/nvsdk_ngx_params.h", "sdk/include/nvsdk_ngx_params.h",
