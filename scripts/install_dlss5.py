@@ -29,7 +29,7 @@ Notes:
   WanGP DLSSG worker (MIT source:
   https://github.com/DeepBeepMeep/dlss5-visual-enhancer,
   native/WanGP-Adapter/dlssg_worker.cpp); place the resulting binary at
-  dlss5/dlssg/dlssg-worker.
+  dlss5/dlssg-native/dlssg-worker.
 
 Usage (via scripts/install_dlss5.sh, which selects the venv interpreter):
   scripts/install_dlss5.sh [--force] [--wan-gp-root DIR]
@@ -139,7 +139,7 @@ What this does and does not enable on Linux
   a Linux (Vulkan or CUDA) worker from the MIT-licensed source
   (https://github.com/DeepBeepMeep/dlss5-visual-enhancer,
   native/WanGP-Adapter/dlssg_worker.cpp) and place the binary at
-  dlss5/dlssg/dlssg-worker to enable it.
+  dlss5/dlssg-native/dlssg-worker to enable it.
 """
 def resolve_root(explicit: str | None) -> Path:
     if explicit:
