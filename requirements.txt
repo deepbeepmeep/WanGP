@@ -1,4 +1,9 @@
 --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/
+
+# Pin CUDA torch to prevent optimum-quanto's torch>=2.6.0 dep from pulling
+# the CPU-only version from PyPI and overwriting the CUDA build.
+torch==2.10.0+cu130 --extra-index-url https://download.pytorch.org/whl/cu130
+
 # mmgp is bundled in the mmgp folder; its dependencies:
 optimum-quanto==0.2.7
 safetensors
@@ -122,3 +127,7 @@ keyring==25.7.0
 # rembg==2.0.65         # non-GPU fallback
 huggingface_hub[hf_xet]
 hf_xet>=1.5.2  # Required for cancellable Xet downloads
+
+# Triton (required for WanGP's INT8 attention kernels)
+triton-windows>=3.6,<3.7; sys_platform == "win32"
+triton>=3.6,<3.7; sys_platform != "win32"
