@@ -604,6 +604,224 @@ async def upscale(scale: int, image: UploadFile = File(None)):
 
 
 @app.post(
+    "/api/v1/upscale/dlss5",
+    summary="DLSS5 Neural Rendering Upscale",
+    description="Upscale an image or video using NVIDIA DLSS 5 Neural Rendering. Accepts an image or video file, a scale factor, and optional DLSS5 parameters. Returns the upscaled file directly.",
+)
+async def upscale_dlss5(
+    scale: float = Form(1.0, ge=1.0, le=3.0, description="Upscale scale factor. 1.0 = native refinement, 1.5 = Quality, 2.0 = Performance, 3.0 = Ultra Performance"),
+    intensity: float = Form(1.0, ge=0.0, le=2.0, description="DLSS 5 Neural Rendering intensity (0.0-2.0, default 1.0)"),
+    depth_resolution: str = Form("half", description="Depth resolution: full, half, or quarter"),
+    motion_vector: str = Form("original", description="Motion vector method: original (faster) or raft (better quality)"),
+    file: UploadFile = File(..., description="Image (PNG/JPG) or video (MP4/MOV/WebM) file to upscale"),
+):
+    """Upscale an image or video using DLSS 5 Neural Rendering."""
+    import io
+    import tempfile
+    import os
+    import uuid
+    from pathlib import Path
+
+    from PIL import Image as PILImage
+    import numpy as np
+    import torch
+
+    # Validate scale factor
+    valid_scales = {1.0, 1.5, 1.724, 2.0, 3.0}
+    if scale not in valid_scales:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid scale {scale}. Must be one of: {sorted(valid_scales)}"
+        )
+
+    # Validate parameters
+    depth_resolution = depth_resolution.lower().strip()
+    if depth_resolution not in ("full", "half", "quarter"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid depth_resolution '{depth_resolution}'. Must be 'full', 'half', or 'quarter'."
+        )
+
+    motion_vector = motion_vector.lower().strip()
+    if motion_vector not in ("original", "raft"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid motion_vector '{motion_vector}'. Must be 'original' or 'raft'."
+        )
+
+    # Save uploaded file
+    content = await file.read()
+    filename = file.filename or "input"
+    ext = os.path.splitext(filename)[1].lower()
+
+    # Determine if image or video
+    image_extensions = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tiff"}
+    video_extensions = {".mp4", ".mov", ".webm", ".avi", ".mkv", ".m4v", ".gif"}
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+            tmp.write(content)
+            input_path = tmp.name
+
+        if ext in image_extensions:
+            # --- IMAGE UPSCALE ---
+            return await _dlss5_upscale_image(input_path, scale, intensity, depth_resolution, motion_vector)
+        elif ext in video_extensions:
+            # --- VIDEO UPSCALE ---
+            return await _dlss5_upscale_video(input_path, scale, intensity, depth_resolution, motion_vector)
+        else:
+            # Try to detect by content
+            try:
+                PILImage.open(io.BytesIO(content))
+                return await _dlss5_upscale_image(input_path, scale, intensity, depth_resolution, motion_vector)
+            except Exception:
+                # Assume video
+                return await _dlss5_upscale_video(input_path, scale, intensity, depth_resolution, motion_vector)
+    finally:
+        if os.path.exists(input_path):
+            os.unlink(input_path)
+
+
+async def _dlss5_upscale_image(image_path: str, scale: float, intensity: float, depth_resolution: str, motion_vector: str):
+    """Upscale a single image using DLSS 5 Neural Rendering."""
+    from postprocessing.dlss5.runtime import neural_render, unavailable_reason
+
+    reason = unavailable_reason(temporal=False)
+    if reason:
+        raise HTTPException(
+            status_code=503,
+            detail=f"DLSS 5 Neural Rendering is unavailable: {reason}. See docs/DLSS5.md."
+        )
+
+    # Load image
+    image = PILImage.open(image_path).convert("RGBA")
+    img_array = np.array(image, dtype=np.uint8)
+
+    # Convert to torch tensor [C, H, W] or [C+1, H, W]
+    if img_array.shape[2] == 4:
+        # RGBA
+        tensor = torch.from_numpy(img_array).permute(2, 0, 1).float()
+        tensor = tensor / 127.5 - 1.0  # normalize to [-1, 1]
+        tensor = tensor.unsqueeze(0)  # [1, C, H, W]
+    else:
+        # RGB
+        tensor = torch.from_numpy(img_array[:, :, :3]).permute(2, 0, 1).float()
+        tensor = tensor / 127.5 - 1.0
+        tensor = tensor.unsqueeze(0)
+
+    tensor = tensor.to("cuda") if torch.cuda.is_available() else tensor
+
+    # Process through DLSS5
+    result = neural_render(
+        sample=tensor,
+        scale=scale,
+        still_image=True,
+        depth_resolution=depth_resolution,
+        motion_vector=motion_vector,
+        intensity=intensity,
+    )
+
+    if result is None:
+        raise HTTPException(status_code=500, detail="DLSS 5 Neural Rendering returned None")
+
+    # Convert back to image
+    result = result.squeeze(0)
+    if result.shape[0] == 4:
+        result = result.clamp(-1, 1).add(1).mul(127.5).byte()
+        result = result.permute(1, 2, 0).cpu().numpy()
+        out_image = PILImage.fromarray(result, "RGBA")
+    else:
+        result = result.clamp(-1, 1).add(1).mul(127.5).byte()
+        result = result.permute(1, 2, 0).cpu().numpy()
+        out_image = PILImage.fromarray(result, "RGB")
+
+    # Save output
+    output_path = os.path.join(output_dir, f"dlss5-{uuid.uuid4()}.png")
+    os.makedirs(output_dir, exist_ok=True)
+    out_image.save(output_path, "PNG")
+
+    return FileResponse(output_path, media_type="image/png", filename=f"dlss5-upscaled.png")
+
+
+async def _dlss5_upscale_video(video_path: str, scale: float, intensity: float, depth_resolution: str, motion_vector: str):
+    """Upscale a video using DLSS 5 Neural Rendering."""
+    from postprocessing.dlss5.runtime import neural_render, unavailable_reason, _frame_to_rgba, _from_rgba_frames
+
+    reason = unavailable_reason(temporal=False)
+    if reason:
+        raise HTTPException(
+            status_code=503,
+            detail=f"DLSS 5 Neural Rendering is unavailable: {reason}. See docs/DLSS5.md."
+        )
+
+    # Read video frames
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise HTTPException(status_code=400, detail="Could not open video file")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    frames = []
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        # Convert BGR to RGBA
+        frame_rgba = cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA)
+        frames.append(frame_rgba)
+
+    cap.release()
+
+    if not frames:
+        raise HTTPException(status_code=400, detail="No frames found in video")
+
+    # Convert frames to tensor [C, frames, H, W]
+    frame_arrays = [np.array(f, dtype=np.uint8) for f in frames]
+    tensor = torch.from_numpy(np.stack(frame_arrays, axis=0)).permute(3, 0, 1, 2).float()
+    tensor = tensor / 127.5 - 1.0  # normalize
+    tensor = tensor.to("cuda") if torch.cuda.is_available() else tensor
+
+    # Process through DLSS5
+    result = neural_render(
+        sample=tensor,
+        scale=scale,
+        still_image=False,
+        depth_resolution=depth_resolution,
+        motion_vector=motion_vector,
+        intensity=intensity,
+    )
+
+    if result is None:
+        raise HTTPException(status_code=500, detail="DLSS 5 Neural Rendering returned None")
+
+    # Write output video
+    output_path = os.path.join(output_dir, f"dlss5-video-{uuid.uuid4()}.mp4")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Extract output dimensions from result
+    result_np = result.squeeze(0).clamp(-1, 1).add(1).mul(127.5).byte()
+    result_np = result_np.permute(1, 2, 3, 0).cpu().numpy()
+    out_h, out_w = result_np.shape[1:3]
+
+    # Use VHS-style video writing
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(output_path, fourcc, fps, (out_w, out_h))
+
+    for i in range(result_np.shape[0]):
+        # Convert RGBA to BGR for OpenCV
+        frame = result_np[i].astype(np.uint8)
+        bgr = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+        writer.write(bgr)
+
+    writer.release()
+
+    return FileResponse(output_path, media_type="video/mp4", filename="dlss5-upscaled.mp4")
+
+
+@app.post(
     "/api/v1/i2v",
     summary="Image to Video Generation",
     description="Generate videos from input images and text prompts. Only LTX 2 Video is supported. Returns task_id immediately - poll /api/v1/tasks/{task_id} for status.",
