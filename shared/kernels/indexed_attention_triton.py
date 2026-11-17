@@ -4,6 +4,8 @@
 # reduction. The launches do not depend on the context or the number of queries: a capture holds for any position.
 """Selection is deterministic: the largest scores, ties to the lowest block, in ascending block order. A query attends to its selected blocks and to the incomplete block at its end
 (the last entry of its list), so that the tokens of a selection are ascending: the sink, the body and the ring of a mixed KV layout (kv_formats) each hold a contiguous range of it."""
+import inspect
+
 import torch
 import triton
 import triton.language as tl
@@ -21,6 +23,7 @@ LIST_FACTOR = 8  # the scores above the bound a selection can keep, in budgets
 TILE_TOKENS = 32  # tokens of an attention tile
 MAX_CHUNKS = 64  # attention programs per query and KV head, at most: one tile each while the budget allows
 PRECISION = "tf32x3"  # FP32 operands on the tensor cores: keys, values and codes are exact in TF32; measured no less precise than the FP32 BLAS of the PyTorch path
+HISTOGRAM_MASK = tl.constexpr("mask" in inspect.signature(tl.histogram).parameters)  # Triton 3.4+
 SPLIT_BF16 = "bf16x2"  # prompts, approximate kernels allowed: queries and softmax weights as BF16 pairs (value, remainder), codes exact in BF16: a sixth of the products of tf32x3
 
 
@@ -172,7 +175,12 @@ def _radix_digit(source, stride, count, threshold, above, BUDGET, SHIFT: tl.cons
         index = start + tl.arange(0, C)
         valid = index < count
         keys = tl.load(source + index * stride, mask=valid, other=0) & 0x7fffffff
-        total += tl.histogram((keys >> SHIFT) & (BINS - 1), BINS, mask=valid & (keys >> (SHIFT + WIDTH) == threshold >> (SHIFT + WIDTH)))
+        counted = valid & (keys >> (SHIFT + WIDTH) == threshold >> (SHIFT + WIDTH))
+        if HISTOGRAM_MASK:
+            total += tl.histogram((keys >> SHIFT) & (BINS - 1), BINS, mask=counted)
+        else:  # Triton before 3.4 has no histogram mask: the keys not counted go to an upper half of bins, dropped (the same counts)
+            spread = tl.reshape(tl.histogram(tl.where(counted, (keys >> SHIFT) & (BINS - 1), BINS), 2 * BINS), (2, BINS))
+            total += tl.sum(tl.where(tl.arange(0, 2)[:, None] == 0, spread, 0), axis=0)
     digit = tl.max(tl.where(above + tl.cumsum(total, axis=0, reverse=True) >= BUDGET, bins, 0), axis=0)
     return threshold | (digit << SHIFT), above + tl.sum(tl.where(bins > digit, total, 0), axis=0)
 

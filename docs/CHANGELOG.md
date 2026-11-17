@@ -252,7 +252,7 @@ The base model works without an accelerator; optional LoRA profiles below offer 
 
 - **New H3 Grouped Row Denoising Mode for Inpainting**: available for both FL2VA & Ref2VA can be used for *Inpainting* in a *Masked Area*
 
-- **Deepy Prime for Everyone / Prompts Enhanced by Claude or ChatGPT**: use an OpenAI Codex or Anthropic Claude account, including supported free accounts, to power Deepy Prime and Prompt Enhancer without pausing a WanGP's generation. Open *Configuration / Prompt Enhancer / Deepy*, select *Codex* or *Claude Code* as the LLM engine, sign in, select *Deepy Prime*, and save. Choose models carefully and monitor the token usage shown in the chat footer; see the [Remote LLM guide](docs/REMOTE_LLMS.md) for details.
+- **Deepy Prime for Everyone / Prompts Enhanced by Claude or ChatGPT**: use an OpenAI Codex or Anthropic Claude account, including supported free accounts, to power Deepy Prime and Prompt Enhancer without pausing a WanGP's generation. Open *Configuration / Deepy / Prompt Enhancer*, select *Codex* or *Claude Code* as the LLM engine, sign in, select *Deepy Prime*, and save. Choose models carefully and monitor the token usage shown in the chat footer; see the [Remote LLM guide](docs/REMOTE_LLMS.md) for details.
 
 - **New Deepy Capabilities**: Deepy can now analyse the content of a video, compare frames and use the new H3 Head refiner. 
 

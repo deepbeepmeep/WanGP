@@ -2,12 +2,12 @@ from shared.utils.phase_progress import text_encoding_progress, generation_progr
 import json
 import math
 import os
-from typing import Optional, List
+from functools import wraps
 
 import numpy as np
 import torch
 from accelerate import init_empty_weights
-from mmgp import offload
+from mmgp import offload, runtime
 from tqdm import tqdm
 import librosa
 import pyloudnorm as pyln
@@ -19,11 +19,25 @@ from shared.utils import files_locator as fl
 from ..wan.modules.t5 import T5EncoderModel
 from .modules.longcat_video_dit import LongCatVideoTransformer3DModel
 from .modules.avatar.longcat_video_dit_avatar import LongCatVideoAvatarTransformer3DModel
-from .modules.autoencoder_kl_wan import AutoencoderKLWan
+from ..wan.modules.vae import WanVAE
 from .modules.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 from .audio_process.wav2vec2 import Wav2Vec2ModelWrapper
-from ..qwen.convert_diffusers_qwen_vae import convert_state_dict
 from shared.utils.text_encoder_cache import TextEncoderCache
+from shared import attention_kit
+from shared.utils.loras_mutipliers import update_loras_slists, expand_slist
+
+
+def release_execution_caches(method):
+    @wraps(method)
+    def run(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._clear_runtime_caches()
+            if self._interrupt:
+                self._audio_chunks.clear()
+                self._reference_latent = None
+    return run
 
 
 def _load_json_config(path):
@@ -34,20 +48,6 @@ def _load_json_config(path):
     cfg.pop("architectures", None)
     cfg.pop("model_max_length", None)
     return cfg
-
-
-def retrieve_latents(
-    encoder_output: torch.Tensor,
-    generator: Optional[torch.Generator] = None,
-    sample_mode: str = "sample",
-):
-    if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
-        return encoder_output.latent_dist.sample(generator)
-    if hasattr(encoder_output, "latent_dist") and sample_mode == "argmax":
-        return encoder_output.latent_dist.mode()
-    if hasattr(encoder_output, "latents"):
-        return encoder_output.latents
-    raise AttributeError("Could not access latents of provided encoder_output")
 
 
 def optimized_scale(positive_flat, negative_flat):
@@ -82,14 +82,18 @@ class LongCatModel:
         self.base_model_type = base_model_type
         self.is_avatar = base_model_type in LONGCAT_AVATAR_TYPES
         self.is_avatar_v1_5 = base_model_type == "longcat_avatar_v1_5"
+        self.is_avatar_v1_6 = self.model_def.get("avatar_version") == "1.6"
         self.audio_encoder_name = None
         self.sparse_attention_enabled = bool(self.model_def.get("sparse_attention", False))
         self._interrupt = False
         self._reference_image = None
+        self._reference_latent = None
+        self._kv_cache = None
+        self._audio_chunks = {}
 
-        text_encoder_path = text_encoder_filename or fl.locate_file(
-            "umt5-xxl/models_t5_umt5-xxl-enc-bf16.safetensors", True
-        )
+        text_encoder_path = text_encoder_filename
+        if text_encoder_path is None:
+            raise ValueError("Missing resolved LongCat text encoder weights path.")
         text_encoder_folder = self.model_def.get("text_encoder_folder")
         if text_encoder_folder:
             tokenizer_path = fl.locate_folder(text_encoder_folder)
@@ -126,10 +130,27 @@ class LongCatModel:
         )
         with init_empty_weights(include_buffers=True):
             transformer = transformer_cls(**transformer_cfg)
+            from .modules.prefix_attention import split_map
+            transformer.split_linear_modules_map = split_map(transformer.config.hidden_size)
         model_path = model_filename[0] if isinstance(model_filename, (list, tuple)) else model_filename
         if model_path is None:
             raise ValueError("Missing LongCat transformer weights path.")
-        offload.load_model_data(transformer, model_path, writable_tensors=False, default_dtype=torch.bfloat16)
+        def prepare_projections(state_dict, quantization_map):
+            # Let the shared handlers choose whether to split checkpoint tensors
+            # or loaded modules. Both layouts occur in released LongCat files.
+            from mmgp.quant_router import split_fused_weights
+            state_dict, quantization_map = split_fused_weights(
+                state_dict, quantization_map, transformer.split_linear_modules_map,
+                default_dtype=torch.bfloat16)
+            with init_empty_weights(include_buffers=True):
+                for index, block in enumerate(transformer.blocks):
+                    if any(key.startswith(f"blocks.{index}.attn.q.") for key in state_dict):
+                        offload.split_linear_modules(block, transformer.split_linear_modules_map)
+            return state_dict, quantization_map
+
+        offload.load_model_data(transformer, model_path, writable_tensors=False, default_dtype=torch.bfloat16,
+                               postprocess_sd=prepare_projections)
+        offload.split_linear_modules(transformer, transformer.split_linear_modules_map)
         transformer._model_dtype = dtype
         transformer.final_layer._lock_dtype = torch.float32  # holds no weights itself: keeps MMGP from rounding its FP32 AdaLN input to BF16
         transformer.eval().requires_grad_(False)
@@ -139,7 +160,6 @@ class LongCatModel:
 
             save_quantized_model(transformer, model_type, model_path, dtype, transformer_config_path)
 
-        vae_cfg_path = "models/longcat/configs/longcat_vae.json"
         vae_weights = self.model_def.get("vae_URL")
         if vae_weights:
             vae_weights = fl.locate_file(vae_weights)
@@ -150,21 +170,10 @@ class LongCatModel:
                     break
         if not vae_weights:
             raise FileNotFoundError("Unable to locate a compatible VAE weights file for LongCat.")
-        def preprocess_vae_sd(sd):
-            return convert_state_dict(sd)
-
-        self.vae = offload.fast_load_transformers_model(
-            vae_weights,
-            modelClass=AutoencoderKLWan,
-            defaultConfigPath=vae_cfg_path,
-            writable_tensors=False,
-            preprocess_sd=preprocess_vae_sd,
-            default_dtype=VAE_dtype,
-        )
-        self.vae = self.vae.to(dtype=VAE_dtype, device="cpu")
-        self.vae._model_dtype = VAE_dtype
-        self.vae._dtype = VAE_dtype
-        self.vae.eval().requires_grad_(False)
+        # the Wan 2.1 VAE of the Wan models: latents normalized by the class, exact tiles, decoded frames written to RAM as bytes
+        self.vae = WanVAE(vae_pth=vae_weights, dtype=VAE_dtype, device="cpu")
+        self.vae.device = self.device  # (its normalization tensors; the weights stay in RAM, managed by MMGP)
+        self.vae.model.requires_grad_(False)
 
         scheduler_cfg = _load_json_config(self.model_def.get("scheduler_config", "models/longcat/configs/longcat_scheduler.json"))
         self.scheduler = FlowMatchEulerDiscreteScheduler(**scheduler_cfg)
@@ -175,7 +184,7 @@ class LongCatModel:
             if self.is_avatar_v1_5:
                 whisper_folder_name = self.model_def.get("audio_encoder_folder", "whisper-large-v3")
                 whisper_folder = fl.locate_folder(whisper_folder_name)
-                whisper_model_path = fl.locate_file(os.path.join(whisper_folder_name, "model.safetensors"))
+                whisper_model_path = fl.locate_file(os.path.join(whisper_folder_name, self.model_def.get("audio_encoder_file", "model.safetensors")))
                 whisper_config_path = fl.locate_file(os.path.join(whisper_folder_name, "config.json"))
                 fl.locate_file(os.path.join(whisper_folder_name, "generation_config.json"))
                 fl.locate_file(os.path.join(whisper_folder_name, "preprocessor_config.json"))
@@ -188,17 +197,12 @@ class LongCatModel:
                     writable_tensors=False,
                     default_dtype=dtype,
                     ignore_unused_weights=True,
+                    pre_load_callback=lambda model: delattr(model, "decoder"),
                 )
-                if hasattr(self.audio_encoder, "decoder"):
-                    del self.audio_encoder.decoder
                 self.audio_encoder._model_dtype = dtype
                 self.audio_encoder.eval().requires_grad_(False)
                 self.audio_feature_extractor = AutoFeatureExtractor.from_pretrained(whisper_folder, local_files_only=True)
             else:
-                from models.wan.multitalk.assets import query_download_def
-                from shared.utils.download import process_files_def_if_needed
-
-                process_files_def_if_needed(query_download_def())
                 wav2vec_folder = fl.locate_folder("chinese-wav2vec2-base")
                 self.audio_encoder_name = "wav2vec2"
                 self.audio_encoder = Wav2Vec2ModelWrapper(wav2vec_folder)
@@ -210,8 +214,7 @@ class LongCatModel:
             self.audio_encoder = None
             self.audio_feature_extractor = None
 
-        self.vae_scale_factor_temporal = getattr(self.vae.config, "scale_factor_temporal", 4)
-        self.vae_scale_factor_spatial = getattr(self.vae.config, "scale_factor_spatial", 8)
+        self.vae_scale_factor_temporal, self.vae_scale_factor_spatial = 4, 8
         self.transformer._interrupt_check = lambda: self._interrupt
 
     def get_loras_transformer(self, get_model_recursive_prop, **kwargs):
@@ -222,6 +225,9 @@ class LongCatModel:
         return ([lora_url], ["1.0"]) if lora_url else ([], [])
 
     def _clear_runtime_caches(self):
+        if self._kv_cache is not None:
+            self._kv_cache.clear()
+            self._kv_cache = None
         clear = getattr(self.transformer, "clear_runtime_caches", None)
         if clear is not None:
             clear()
@@ -230,26 +236,6 @@ class LongCatModel:
         if not torch.is_tensor(latents):
             return None
         return {"latents": latents.float()}
-
-    def _apply_vae_tiling(self, VAE_tile_size):
-        if not hasattr(self.vae, "enable_tiling"):
-            return
-        if VAE_tile_size is None or VAE_tile_size == 0:
-            if hasattr(self.vae, "disable_tiling"):
-                self.vae.disable_tiling()
-            return
-        if isinstance(VAE_tile_size, dict):
-            tile = VAE_tile_size.get("tile_sample_min_size", None)
-        else:
-            tile = int(VAE_tile_size)
-        if tile and tile > 0:
-            stride = max(16, int(tile * 0.75))
-            self.vae.enable_tiling(
-                tile_sample_min_height=tile,
-                tile_sample_min_width=tile,
-                tile_sample_stride_height=stride,
-                tile_sample_stride_width=stride,
-            )
 
     def _validate_sparse_attention(self, latents):
         if not self.sparse_attention_enabled:
@@ -261,7 +247,7 @@ class LongCatModel:
         if not chunk_shape or latents.dim() != 5:
             self.transformer.disable_bsa()
             self.sparse_attention_enabled = False
-            print("Sparse attention disabled: missing BSA parameters.")
+            tqdm.write("Sparse attention disabled: missing BSA parameters.")
             return
         attn_mode = offload.shared_state.get("_attention", "auto")
         require_grid_divisible = False
@@ -283,7 +269,7 @@ class LongCatModel:
             if n_h % cp_split_hw[0] != 0 or n_w % cp_split_hw[1] != 0:
                 self.transformer.disable_bsa()
                 self.sparse_attention_enabled = False
-                print("Sparse attention disabled: cp_split_hw does not divide token grid.")
+                tqdm.write("Sparse attention disabled: cp_split_hw does not divide token grid.")
                 return
         if require_grid_divisible:
             shape_q = chunk_shape_q or chunk_shape
@@ -298,7 +284,7 @@ class LongCatModel:
             ):
                 self.transformer.disable_bsa()
                 self.sparse_attention_enabled = False
-                print("Sparse attention disabled: flash BSA needs token grid divisible by chunk shape.")
+                tqdm.write("Sparse attention disabled: flash BSA needs token grid divisible by chunk shape.")
 
     def _encode_prompt(
         self,
@@ -369,6 +355,7 @@ class LongCatModel:
         image=None,
         video=None,
         num_cond_frames=0,
+        tile_size=0,
     ):
         num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         if latents is None:
@@ -385,49 +372,11 @@ class LongCatModel:
 
         num_cond_latents = 0
         if image is not None or video is not None:
-            cond_latents = []
-            for i in range(batch_size):
-                if image is not None:
-                    encoded_input = image[i].unsqueeze(0).unsqueeze(2)
-                else:
-                    encoded_input = video[i][:, -num_cond_frames:].unsqueeze(0)
-                latent = retrieve_latents(
-                    self.vae.encode(encoded_input),
-                    generator,
-                    sample_mode="argmax",
-                )
-                cond_latents.append(latent)
-            cond_latents = torch.cat(cond_latents, dim=0).to(dtype)
-            cond_latents = self.normalize_latents(cond_latents)
+            inputs = [image[i].unsqueeze(1) if image is not None else video[i][:, -num_cond_frames:] for i in range(batch_size)]
+            cond_latents = torch.stack(self.vae.encode(inputs, tile_size)).to(dtype)
             num_cond_latents = 1 + (num_cond_frames - 1) // self.vae_scale_factor_temporal
             latents[:, :, :num_cond_latents] = cond_latents[:, :, :num_cond_latents]
         return latents, num_cond_latents
-
-    def normalize_latents(self, latents):
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean, device=latents.device)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        latents_std = (
-            torch.tensor(self.vae.config.latents_std, device=latents.device)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        return (latents - latents_mean) / latents_std
-
-    def denormalize_latents(self, latents):
-        latents_mean = (
-            torch.tensor(self.vae.config.latents_mean, device=latents.device)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        latents_std = (
-            torch.tensor(self.vae.config.latents_std, device=latents.device)
-            .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
-        )
-        return latents * latents_std + latents_mean
 
     def _loudness_norm(self, audio_array, sr=16000, lufs=-23, threshold=100):
         meter = pyln.Meter(sr)
@@ -529,6 +478,9 @@ class LongCatModel:
         return self._get_audio_embedding_wav2vec(speech_array, fps=fps, device=device, sample_rate=sample_rate)
 
     def _build_audio_windows(self, audio_path, frame_num, fps, window_start_frame_no, audio_stride):
+        if self.is_avatar_v1_6:
+            from .audio_process.whisper_windows import audio_windows
+            return audio_windows(self, audio_path, frame_num, fps, window_start_frame_no)
         speech_array, sr = librosa.load(audio_path, sr=16000)
         target_len = int((window_start_frame_no + frame_num) / fps * sr)
         if len(speech_array) < target_len:
@@ -591,8 +543,9 @@ class LongCatModel:
             sigmas = torch.linspace(1, 0.001, sampling_steps, dtype=torch.float32, device=self.device)
         return sigmas.to(dtype=torch.float32, device="cpu")
 
-    @torch.no_grad()
+    @torch.inference_mode()
     @generation_progress
+    @release_execution_caches
     def generate(
         self,
         seed=None,
@@ -627,10 +580,20 @@ class LongCatModel:
         window_no=None,
         offloadobj=None,
         set_progress_status=None,
+        custom_settings=None,
+        loras_slists=None,
         **kwargs,
     ):
         if self._interrupt:
             return None
+
+        if self.is_avatar_v1_6 and sampling_steps != 8:
+            raise ValueError("LongCat Avatar 1.6 requires eight distilled denoising steps.")
+
+        if window_no in (None, 1):
+            self._reference_image = None
+            self._reference_latent = None
+            self._audio_chunks.clear()
 
         if seed is None or seed == -1:
             seed = torch.seed() % (2**32 - 1)
@@ -678,7 +641,7 @@ class LongCatModel:
                 ref_list = input_ref_images if isinstance(input_ref_images, list) else [input_ref_images]
                 if len(ref_list) > 0:
                     ref_image = ref_list[0]
-            if window_no == 1:
+            if window_no in (None, 1):
                 if ref_image is not None:
                     self._reference_image = (
                         ref_image.detach().to("cpu") if torch.is_tensor(ref_image) else ref_image
@@ -694,7 +657,7 @@ class LongCatModel:
             cond_video = input_video
             num_cond_frames = max(int(prefix_frames_count or 0), 0)
 
-        self._apply_vae_tiling(VAE_tile_size)
+        VAE_tile_size = VAE_tile_size or 0
 
         if cond_video is not None:
             cond_video = cond_video.to(device=self.device, dtype=self.VAE_dtype)
@@ -710,7 +673,7 @@ class LongCatModel:
         if sample_solver not in ("auto", "default", "enhance_hf", "distill"):
             raise ValueError(f"Unsupported scheduler '{sample_solver}' for LongCat.")
         if self.model_def.get("distill_only", False) and sample_solver != "distill":
-            raise ValueError("LongCat Avatar 1.5 currently supports the distilled scheduler only.")
+            raise ValueError("This LongCat Avatar model requires the distilled scheduler.")
         use_distill = sample_solver == "distill"
         enhance_hf = sample_solver == "enhance_hf"
         if sample_solver == "auto":
@@ -738,9 +701,8 @@ class LongCatModel:
             if cond_video is None:
                 image_cond = ref_image
             else:
-                ref_image_5d = ref_image.unsqueeze(2)
-                ref_latent = retrieve_latents(self.vae.encode(ref_image_5d), generator, sample_mode="argmax")
-                ref_latent = self.normalize_latents(ref_latent).to(torch.float32)
+                ref_latent = (self._reference_latent.to(self.device) if self._reference_latent is not None else
+                              torch.stack(self.vae.encode([image.unsqueeze(1) for image in ref_image], VAE_tile_size)))
                 num_ref_latents = 1
 
         if torch.is_tensor(overlapped_latents):
@@ -787,17 +749,7 @@ class LongCatModel:
 
             cond_latents = None
             if cond_video is not None and overlap_latents.shape[2] < expected_num_cond_latents:
-                cond_latents_list = []
-                for i in range(batch_size):
-                    encoded_input = cond_video[i][:, -cond_image_frames:].unsqueeze(0)
-                    latent = retrieve_latents(
-                        self.vae.encode(encoded_input),
-                        generator,
-                        sample_mode="argmax",
-                    )
-                    cond_latents_list.append(latent)
-                cond_latents = torch.cat(cond_latents_list, dim=0).to(torch.float32)
-                cond_latents = self.normalize_latents(cond_latents)
+                cond_latents = torch.stack(self.vae.encode([cond_video[i][:, -cond_image_frames:] for i in range(batch_size)], VAE_tile_size))
                 overlap_len = min(overlap_latents.shape[2], cond_latents.shape[2])
                 if overlap_len > 0:
                     cond_latents[:, :, -overlap_len:] = overlap_latents[:, :, -overlap_len:]
@@ -821,9 +773,11 @@ class LongCatModel:
                 image=image_cond,
                 video=None if image_cond is not None else cond_video,
                 num_cond_frames=cond_image_frames,
+                tile_size=VAE_tile_size,
             )
         if reference_image_enabled and ref_latent is None and self.is_avatar and num_cond_latents > 1:
-            ref_latent = latents[:, :, :1].clone()
+            ref_latent = (self._reference_latent.to(self.device) if self._reference_latent is not None else
+                          latents[:, :, :1].clone())
             num_ref_latents = 1
         if ref_latent is not None:
             num_cond_latents += num_ref_latents
@@ -878,8 +832,6 @@ class LongCatModel:
                 ref_target_masks = self._build_ref_target_masks(height, width, speakers_bboxes)
             if ref_target_masks is not None:
                 ref_target_masks = ref_target_masks.to(self.device)
-            if self.is_avatar_v1_5 and offloadobj is not None:
-                offloadobj.unload_all()
             audio_emb = audio_emb.to(self.device, dtype=self.dtype)
 
         latents = latents.to(self.device, dtype=self.dtype)
@@ -900,12 +852,66 @@ class LongCatModel:
                 "mask_frame_range": mask_frame_range,
             }
 
-        callback(-1, None, True, override_num_inference_steps = len(timesteps))
+        cache_mode = (custom_settings or {}).get("longcat_kv_cache", "Disabled")
+        if cache_mode != "Disabled" and num_cond_latents:
+            self._kv_cache = attention_kit.PrefixCache(
+                self.transformer.blocks, quantize=True,
+                native=ref_target_masks is None and not (mask_frame_range or 0),
+                ram=cache_mode in ("INT8_RAM", "Q4_RAM"), name="LongCat KV Cache",
+                bits=4 if cache_mode in ("Q4", "Q4_RAM") else 8)
+        schedules = []
+        if loras_slists is not None:
+            update_loras_slists(self.transformer, loras_slists, len(timesteps))
+            schedules = [expand_slist(loras_slists, n, len(timesteps), len(timesteps), len(timesteps))
+                         for n in range(len(loras_slists["phase1"]))]
+        last_adapter_scales = None
+
+        def denoise(**inputs):
+            if not self.is_avatar:
+                inputs.pop("audio_embs", None)
+                inputs.pop("ref_target_masks", None)
+            cache = self._kv_cache
+            if cache is None:
+                return self.transformer(**inputs)
+            hidden = inputs["hidden_states"]
+            steps = inputs["timestep"]
+            joint = isinstance(hidden, list)
+            inputs["hidden_states"] = [value[:, :, num_cond_latents:] for value in hidden] if joint else hidden[:, :, num_cond_latents:]
+            inputs["timestep"] = [value[:, num_cond_latents:] for value in steps] if joint else steps[:, num_cond_latents:]
+            inputs["kv_cache_dict"] = cache
+            predictions = self.transformer(**inputs)
+            if predictions is None:
+                return None
+            def restore(value, original):
+                if value is None:
+                    return None
+                result = value.new_zeros(original.shape)
+                result[:, :, num_cond_latents:] = value
+                return result
+            return [restore(value, original) for value, original in zip(predictions, hidden)] if joint else restore(predictions, hidden)
+
+        if callback is not None:
+            callback(-1, None, True, override_num_inference_steps=len(timesteps))
 
         with tqdm(total=len(timesteps), desc="Denoising") as progress_bar:
             for i, t in enumerate(timesteps):
                 if self._interrupt:
                     return None
+                offload.set_step_no_for_lora(self.transformer, i)
+                adapter_scales = tuple(value[i] if isinstance(value, list) else value for value in schedules)
+                if self._kv_cache is not None:
+                    if adapter_scales != last_adapter_scales:
+                        self._kv_cache.clear(keep_ring=True)
+                    if self._kv_cache.empty():
+                        self.transformer(
+                            hidden_states=latents[:, :, :num_cond_latents],
+                            timestep=latents.new_zeros(latents.shape[0], num_cond_latents),
+                            encoder_hidden_states=prompt_embeds, encoder_attention_mask=prompt_mask,
+                            num_cond_latents=num_cond_latents, return_kv=True, skip_crs_attn=True,
+                            kv_cache_dict=self._kv_cache, **ref_kwargs)
+                        if self._interrupt:
+                            return None
+                    last_adapter_scales = adapter_scales
                 def _aborted(outputs):
                     if outputs is None:
                         return True
@@ -918,6 +924,8 @@ class LongCatModel:
                     timestep = timestep[:, None].expand(-1, latents.shape[2]).clone()
                     timestep[:, :num_cond_latents] = 0
 
+                predictions = 3 if self.is_avatar and audio_emb is not None else 2
+                boost = joint_pass and any_guidance and runtime.joint_pass_useful(self.transformer, math.prod(latents.shape[2:]) // math.prod(self.transformer.patch_size), self.transformer.blocks[0].hidden_size, predictions)
                 if self.is_avatar and audio_emb is not None and any_guidance:
                     audio_cond = audio_emb.to(self.device, dtype=self.dtype)
                     audio_uncond = torch.zeros_like(audio_cond)
@@ -926,8 +934,8 @@ class LongCatModel:
                     mask_list = [prompt_mask, neg_mask, neg_mask]
                     audio_list = [audio_cond, audio_cond, audio_uncond]
                     ref_list = [ref_target_masks, ref_target_masks, ref_target_masks]
-                    if joint_pass:
-                        outputs = self.transformer(
+                    if boost:
+                        outputs = denoise(
                             hidden_states=x_list,
                             timestep=[timestep] * len(x_list),
                             encoder_hidden_states=ctx_list,
@@ -944,7 +952,7 @@ class LongCatModel:
                         for x_i, ctx_i, mask_i, audio_i, ref_i in zip(
                             x_list, ctx_list, mask_list, audio_list, ref_list
                         ):
-                            output = self.transformer(
+                            output = denoise(
                                 hidden_states=x_i,
                                 timestep=timestep,
                                 encoder_hidden_states=ctx_i,
@@ -967,8 +975,8 @@ class LongCatModel:
                     x_list = [latents, latents]
                     ctx_list = [prompt_embeds, neg_embeds]
                     mask_list = [prompt_mask, neg_mask]
-                    if joint_pass:
-                        outputs = self.transformer(
+                    if boost:
+                        outputs = denoise(
                             hidden_states=x_list,
                             timestep=[timestep] * len(x_list),
                             encoder_hidden_states=ctx_list,
@@ -981,7 +989,7 @@ class LongCatModel:
                     else:
                         outputs = []
                         for x_i, ctx_i, mask_i in zip(x_list, ctx_list, mask_list):
-                            output = self.transformer(
+                            output = denoise(
                                 hidden_states=x_i,
                                 timestep=timestep,
                                 encoder_hidden_states=ctx_i,
@@ -1005,7 +1013,7 @@ class LongCatModel:
                     else:
                         noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
                 else:
-                    noise_pred = self.transformer(
+                    noise_pred = denoise(
                         hidden_states=latents,
                         timestep=timestep,
                         encoder_hidden_states=prompt_embeds,
@@ -1038,16 +1046,20 @@ class LongCatModel:
             latents = latents[:, :, num_ref_latents:]
             num_cond_latents -= num_ref_latents
 
+        if reference_image_enabled and self._reference_latent is None:
+            # Keep an explicit reference across windows, even when a different start
+            # image or source video supplies the opening frame. With reference-only
+            # input, the first clean frame already contains its encoded image.
+            anchor = ref_latent if ref_latent is not None else latents[:, :, :1]
+            self._reference_latent = anchor.detach().to("cpu").clone()
+            del anchor
+
         latent_slice = None
         if return_latent_slice is not None:
             latent_slice = latents[:, :, return_latent_slice].detach().to("cpu")
 
-        latents = latents.to(self.vae.dtype)
-        latents = self.denormalize_latents(latents)
-        video = self.vae.decode(latents, return_dict=False)[0].clamp(-1, 1)
-        if video.dim() == 5:
-            video = video[0]
         self._clear_runtime_caches()
+        video = self.vae.decode_to_cpu_uint8([latents[0]], VAE_tile_size)[0]  # bytes in RAM, frame chunk by frame chunk
 
         if latent_slice is not None:
             return {"x": video, "latent_slice": latent_slice}

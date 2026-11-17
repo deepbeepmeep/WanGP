@@ -6,7 +6,7 @@ you follow, review and change anything on a storyboard and a timeline.
 
 Showrunner comes enabled with WanGP. Open **Showrunner** in the app bar; on first use, choose **Keep It** in its introduction. If you removed it, restore it from **Available Locally** in **Apps & PlugIn Manager**. **Full Screen** at the top of the tab expands the editor in place; **WanGP** returns to the Showrunner tab with your production and view preserved. Open `/showrunner/` on the WanGP address to go directly to the fullscreen editor. Full screen keeps this folder URL, which you can bookmark or share. In the tab as in full screen, the address also names the production and the page you have open: a reload or a copied link opens them again.
 
-Showrunner needs **Deepy Prime**, with a local model or a remote agent (Configuration > Prompt Enhancer / Deepy): running a production takes a planner that
+Showrunner needs **Deepy Prime**, with a local model or a remote agent (Configuration > Deepy / Prompt Enhancer): running a production takes a planner that
 can follow a long plan. On first launch, WanGP sets it up on the Qwen3.8 version that suits your NVIDIA GPU, with nothing to configure. Everything you do yourself (writing shots, rendering them, reviewing, editing, assembling) works without Deepy: see Working Without the Showrunner.
 
 With a local model, Showrunner tells you when Deepy's settings hold a production back:
@@ -68,11 +68,11 @@ The production opens on its **Brief**, which saves itself as you type:
 - **Cast**: drop a photo of each person or recurring object so that they look the same in every shot, and describe how each speaker
   sounds (or drop a recording of their voice) so that they sound the same in every line (see **The Cast**).
 - **Look and format**: aspect ratio, resolution, total duration from 5 seconds to ten minutes (drag the slider, or type the seconds in
-  the field next to it; or **Match the song**), pacing from calm to frenetic, **Shot length** and style tags. Leave **Shot length** empty and the showrunner
+  the field next to it; or **Match the song**; until you set one, a script whose lines need more than 30 seconds sets it to about the time they take to say, with **Match the script** to come back to it), pacing from calm to frenetic, **Shot length** and style tags. Leave **Shot length** empty and the showrunner
   chooses, with most shots lasting about 4 to 7 seconds. Give a range to set it yourself, such as 8 to 15 seconds for long takes (or only one end of it): long shots take longer to render, and a shot lasts at most what its model makes in one go (about 15 seconds with MiniMax H3).
 - **Voices** (not for music videos and illustrated stories): how the lines get their sound.
   - **Recorded first** (the default) records each line in its speaker's voice, and the video follows the recording. A speaker keeps one voice for the whole production, which is what long dialogue needs.
-  - **From the video model** lets the model say the lines itself, with its own sound: nothing is recorded, and no speech model is needed. Choose the language of the lines beside it, or simply ask the showrunner in the chat ("use the video model's own voices"): it switches this choice and tells you. It suits short pieces and single speakers: a speaker's voice and level can change from shot to shot (**Even voices** on the Timeline evens out the level in the export), and a line's subtitle stays up for its whole shot. Give a shot about 0.4 seconds a word plus a second, no more: with time left, the model tends to add words of its own. Each take is then listened to. Words before the first line and after the last one are cut, with the sound fading out, while a shot that adds nothing plays to its end; turn off **Cut words that are not in these lines**, under the shot's dialogue, for a shot that should run on, and a trim you set yourself always stays. A line the take got wrong, or words added between two lines, are shown on the shot: **Reshoot** tries another take. This only reads words, so a mumble or a laugh stays, and a cut can leave a sliver of a word. The MiniMax H3 video models can do this. When none of your templates can, lines are recorded first, and the Brief says so.
+  - **From the video model** lets the model say the lines itself, with its own sound: nothing is recorded, and no speech model is needed. Choose the language of the lines beside it, or simply ask the showrunner in the chat ("use the video model's own voices"): it switches this choice and tells you. It suits short pieces and single speakers: a speaker's voice and level can change from shot to shot (**Even voices** on the Timeline evens out the level in the export), and a line's subtitle stays up for its whole shot. Give a shot about 0.4 seconds a word plus a second, no more: with time left, the model tends to add words of its own. Each take is then listened to. Words before the first line and after the last one are cut, with the sound fading out, while a shot that adds nothing plays to its end; turn off **Cut words that are not in these lines**, under the shot's dialogue, for a shot that should run on, and a trim you set yourself always stays. A line the take got wrong, or words added between two lines, are shown on the shot: **Render again** tries another take. This only reads words, so a mumble or a laugh stays, and a cut can leave a sliver of a word. The MiniMax H3 video models can do this. When none of your templates can, lines are recorded first, and the Brief says so.
 - **Review the plan before shooting** (on by default): the showrunner stops after planning so that you can edit the storyboard before any
   video is generated. Turn it off to let it plan and shoot in one go.
 - **Review the takes before the edit** (off by default): the showrunner shoots and checks the shots, then waits for you instead of
@@ -112,7 +112,7 @@ A **Viggle Remake** recasts the people of an existing video, or changes its obje
 4. Shoot. The showrunner measures each take against the source, for cuts that moved or disappeared and black bands at the edges, and looks at it.
 5. Assemble as usual, on the Deliver page. Your video's own soundtrack plays over the shots, at its own level. Remove a shot and its sound goes with it.
 
-**Shots rendered together**, beside your video in the Brief, joins short shots with their neighbours in one render (at least 8 seconds by default): rendered alone, a short shot's lips barely follow the speech or the singing. Each shot still gets its own take. When you render one shot again, its neighbours render with it and each gets a new take beside the one it uses, so nothing you chose changes; the shot's takes say what they were rendered with. Select shots that follow each other to render them together, up to the model's longest render (about 14 seconds): the panel says which shots render together, and **Reshoot N shots** on the toolbar, like **Reshoot them** in the panel, gives each a new take, at the size **Draft** / **Final** says. While shots render, the Showrunner button at the top says which ones and how far they are. Set it to 0, or turn off **Group rendering** on the Board's toolbar, to render every shot alone.
+**Shots rendered together**, beside your video in the Brief, joins short shots with their neighbours in one render (at least 8 seconds by default): rendered alone, a short shot's lips barely follow the speech or the singing. Each shot still gets its own take. When you render one shot again, its neighbours render with it and each gets a new take beside the one it uses, so nothing you chose changes; the shot's takes say what they were rendered with. Select shots that follow each other to render them together, up to the model's longest render (about 14 seconds): the panel says which shots render together, and **Render N shots again** on the toolbar, like **Render them again** in the panel, gives each a new take, at the size **Draft** / **Final** says. While shots render, the Showrunner button at the top says which ones and how far they are. Set it to 0, or turn off **Group rendering** on the Board's toolbar, to render every shot alone.
 
 Under **Models**, the **Frame Painter** paints the frames where people are replaced. Its Auto is H3-Image: it keeps each person's place, pose and expression, and handles several people in one frame, including someone who stays as they are. When a person becomes a character of another kind, such as a teddy bear, it sometimes paints only the head on the original body; the showrunner checks each painted frame and paints it again. Viggle Image Swap, also in the list, gives each new person the body of their character sheet rather than the original's, but loses moving poses and expressions, and dresses everyone in their sheet's outfit. The **Image Editor** paints the frames of other changes and makes the character sheets. Choose a **Draft resolution** of 480p in the Brief for a fast first version: a two-minute video with many cuts takes hours at 720p on one graphics card.
 
@@ -141,7 +141,7 @@ The **Cast** page holds the people, recurring things and places of the productio
 - **LoRA** (only with **LoRAs on cast cards** on, in **Settings** at the top of every page): a LoRA you trained for this person or thing,
   its strength and its trigger word. A LoRA only works with the family of models it was trained on, so the card lists those of the
   models this production uses and says how many of the member's shots can use it; the other shots are made without it. Shots already
-  made do not change: **Reshoot** or **Fix…** uses it. Turned off in Settings, no shot uses a LoRA from its card.
+  made do not change: **Render again** or **Fix…** uses it. Turned off in Settings, no shot uses a LoRA from its card.
 
 Every shot that shows a cast member is generated from that member's reference picture, so faces, hair and clothes stay the same over
 dozens of shots. Dropping a photo anywhere on the Cast page adds a new member.
@@ -225,7 +225,7 @@ Only you approve a shot, and you need to only when takes wait for your review be
 - **Redo…**, when takes wait for your review before the edit, marks a take for a new one with your note, so that you can go on reviewing: **Shoot** then takes every shot marked for a redo.
 - Click another take to use it in the edit. Right-click a take to **compare** it with the one in use: a split view with a handle to slide,
   played in sync; **Use B** keeps the other take, **Done** closes the comparison.
-- **Reshoot** renders another take at once from the shot's settings and prompt, without the showrunner and without any note: for a take that only needs another try, or after you edited the prompt yourself.
+- **Render again** renders another take at once from the shot's settings and prompt, without the showrunner and without any note: for a take that only needs another try, or after you edited the prompt yourself.
 - **+ Shot** adds a shot after the selected one, in its part (at the end when none is selected); drag its card to move it.
 - After changing someone on the **Cast** page, **Re-shoot N** on their card shoots again the shots showing them, with their new look and voice.
 
@@ -236,7 +236,7 @@ You can make a production by hand, with no language model at all: to keep every 
 1. In the **Brief**, choose the format and the **Models**. On the **Cast** page, drop a photo of each person and describe their voice.
 2. On the **Board**, press **+ Shot** for each shot, then write **What happens**, its camera and duration, who is in it and its dialogue.
 3. Press **Render now** in the shot's panel, or right-click it, or select several shots and press it in the panel. Without Deepy Prime, the Board's main button renders every shot still to shoot.
-4. Check each take yourself, use **Reshoot** for another try, then press **Assemble**.
+4. Check each take yourself, use **Render again** for another try, then press **Assemble**.
 
 A shot without a prompt gets one made from what you wrote (what happens, the camera, who is in it, the brief's look), word for word: open **Prompt** in the shot's panel to change it. A shot without a chosen model takes the brief's for what it shows. Lines of dialogue are recorded first in their speakers' voices, as when the showrunner shoots, unless **Voices** in the Brief is on **From the video model**: then they join the prompt when the shot renders, and a shot without a chosen model takes one that can say them. Nobody checks these takes, and nothing is retried or assembled by itself.
 
@@ -359,7 +359,7 @@ new versions) and the shots it touched glow for a moment on the board. Shots app
 During a long wait, the line above the input tells a slow step from a stuck one: what Deepy is doing now and how many tokens it is reading before it
 can answer. Rest the pointer on it for Deepy's speed in tokens per second and how full its context is; the Deepy tab shows them under its window.
 
-Deepy keeps your latest conversations ready in RAM, so that it answers quickly when you come back to a production (**KV Caches Kept in RAM** in Configuration > Prompt Enhancer / Deepy, 2 by default). When this production's is no longer there, Deepy reads the conversation again, which can take up to a minute, and a bar in the Showrunner tab shows how far it has got.
+Deepy keeps your latest conversations ready in RAM, so that it answers quickly when you come back to a production (**KV Caches Kept in RAM** in Configuration > Deepy / Prompt Enhancer, 2 by default). When this production's is no longer there, Deepy reads the conversation again, which can take up to a minute, and a bar in the Showrunner tab shows how far it has got.
 
 **Pause** stops the showrunner after its current step (the shot or voice it is generating is finished and kept) and frees the GPU for
 other work: WanGP's models and Deepy's leave the video memory. **Pause now** also stops what it is generating; that shot is generated
@@ -417,7 +417,7 @@ With **Keep everything else as it is** on, the showrunner cannot touch anything 
 
 **Make a new version when done** is on by default. Turn it off when you fix shot after shot before watching: the showrunner stops once the new takes are judged and makes no version, and you press **Assemble** when you are ready to watch the edit. The window keeps your choice for the next fixes until the page is reloaded. With **Review the takes before the edit** in the brief, a fix always ends on your review instead, so the window does not offer this choice.
 
-To try another take of a shot with the same prompt and a new seed, **Reshoot** on the Board or in the shot's panel renders it at once, without the showrunner and without a new version.
+To try another take of a shot with the same prompt and a new seed, **Render again** on the Board or in the shot's panel renders it at once, without the showrunner and without a new version.
 
 **On a film,** the rest moves along when a shot is inserted or changes length: each shot's sound, the voice-over lines, the cards and the subtitles (also those of an SRT file you added) stay on their pictures. A score keeps playing from where it starts, so its hits may no longer land on the same pictures; you are warned if the film outlasts it.
 
@@ -435,7 +435,7 @@ The showrunner also checks a song against its lyrics by itself before shooting o
 
 **Deep Review** in **Deliver** goes further than the checks made while shooting. It takes some minutes, changes nothing, and measures the latest version against its script: what is really said or sung and when, subtitles against the words, voices against their cards, lips against the voice, the sound's level and silences, black or frozen picture. The showrunner then looks at every shot against the pictures of its cast and place.
 
-Each finding gives the moment and the shot. A **Fault** is measured; a **Check** is a suspicion for your eyes, as lips on a small face are hard to measure. Click the time to go there, **Fix…** to open the fix window with that shot and that note, or **Fix these…** for all of them at once: remove what you want to keep before sending. With a Nemotron model chosen in **Configuration > Prompt Enhancer / Deepy > Transcription**, the review also compares who is heard with who the script says, and tells you when two characters sound alike.
+Each finding gives the moment and the shot. A **Fault** is measured; a **Check** is a suspicion for your eyes, as lips on a small face are hard to measure. Click the time to go there, **Fix…** to open the fix window with that shot and that note, or **Fix these…** for all of them at once: remove what you want to keep before sending. With a Nemotron model chosen in **Configuration > Deepy / Prompt Enhancer > Transcription**, the review also compares who is heard with who the script says, and tells you when two characters sound alike.
 
 ## Versions
 

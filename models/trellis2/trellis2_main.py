@@ -80,7 +80,7 @@ def preprocess_image(image, remove_background):
 
 def _rembg(image):
     set_phase_status("Removing Background")
-    from rembg import remove
+    from preprocessing.rembg.native import remove
     from preprocessing.rembg.assets import OBJECT_MODEL
     from shared.utils.utils import new_rembg_session
 
@@ -135,7 +135,8 @@ class model_factory:
                 "ss_decoder": self.ss_decoder, "shape_decoder": self.shape_decoder, "image_encoder": self.image_encoder}
 
     def _prepare_image(self, image):
-        digest = hashlib.sha1(image.tobytes() + repr((image.mode, image.size)).encode()).hexdigest()
+        from preprocessing.rembg.assets import OBJECT_MODEL, selected_model
+        digest = hashlib.sha1(image.tobytes() + repr((image.mode, image.size, selected_model(OBJECT_MODEL))).encode()).hexdigest()
         if self._prepared[0] != digest:
             set_phase_status("Preparing Image")
             self._prepared = (digest, preprocess_image(image, _rembg))

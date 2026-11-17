@@ -67,7 +67,7 @@ def _load(module, filename, **kwargs):
 
 def _remove_background(image):
     """RGB image with the BiRefNet General matte as its alpha (the colours are kept, as upstream's BiRefNet cutout)."""
-    from rembg import remove
+    from preprocessing.rembg.native import remove
     from preprocessing.rembg.assets import OBJECT_MODEL
     from shared.utils.utils import new_rembg_session
 
@@ -137,9 +137,10 @@ class model_factory:
 
     def _encode_image(self, image, margin):
         """DINOv3 features and FLUX.2 VAE posterior of the prepared object image, cached on the CPU by source image content."""
+        from preprocessing.rembg.assets import OBJECT_MODEL, selected_model
         config = self.config
         settings = (config["canvas_size"], margin, config["erode_radius"])
-        digest = hashlib.sha1(image.tobytes() + repr((image.mode, image.size, settings)).encode()).hexdigest()
+        digest = hashlib.sha1(image.tobytes() + repr((image.mode, image.size, settings, selected_model(OBJECT_MODEL))).encode()).hexdigest()
 
         def encode(_):
             prepared = prepare_image(image, *settings)

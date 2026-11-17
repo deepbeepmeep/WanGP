@@ -164,7 +164,7 @@ class LTXVideoUpsamplerBridge(SimpleScaleSuffixMixin):
 
         load_model(self.split_value(spatial_upsampling)[0])
 
-    def upscale(self, sample, spatial_upsampling, *, vae_config: int, vae_tile_size=None, seed=0, fps=24.0, frame_offset=0, prompt="", negative_prompt="", refine_prompt="", continue_cache=None, return_continue_cache=False, audio_waveform=None, audio_sample_rate=0, source_audio_path=None, still_image=False, abort_callback=None, progress_callback=None, **kwargs):
+    def upscale(self, sample, spatial_upsampling, *, vae_config: int, vae_tile_size=None, seed=0, fps=24.0, frame_offset=0, prompt="", negative_prompt="", refine_prompt="", continue_cache=None, return_continue_cache=False, audio_waveform=None, audio_sample_rate=0, source_audio_path=None, audio_frame_offset=0, still_image=False, abort_callback=None, progress_callback=None, **kwargs):
         if still_image:
             raise ValueError("LTX video upsampling is available for videos only")
         split = self.split_value(spatial_upsampling)
@@ -175,8 +175,13 @@ class LTXVideoUpsamplerBridge(SimpleScaleSuffixMixin):
 
             config = self.config()
             return refine_video(sample, scale=split[1], prompt=str(refine_prompt or "").strip() or DEFAULT_REFINE_PROMPT, seed=seed, fps=fps, window_frames=config["refiner_window_size"], window_overlap=config["window_overlap"], gentle=config["refiner_gentle"], vae_config=vae_config, tiles_per_call=config["refiner_tiles_per_call"], frame_offset=frame_offset, continue_cache=continue_cache, return_continue_cache=return_continue_cache, abort_callback=abort_callback, progress_callback=progress_callback)
-        from .runtime import RUNTIME, upscale_video
+        from .runtime import RUNTIME, slice_audio_for_window, upscale_video
 
+        # File streaming passes the full soundtrack and its chunk offset. Media Flow and generated windows already supply local audio;
+        # their global frame_offset addresses noise only. The runtime's inner windows always read from this chunk's audio start.
+        if audio_frame_offset:
+            audio_waveform, audio_sample_rate = slice_audio_for_window(audio_waveform, audio_sample_rate, source_audio_path, audio_frame_offset, sample.shape[1], sample.shape[1], fps)
+            source_audio_path = None
         if vae_tile_size is None:
             vae_tile_size = RUNTIME.vae_tile_size(vae_config, supported_spatial_size(sample.shape[-2]) * 2, supported_spatial_size(sample.shape[-1]) * 2)
         config = self.config()

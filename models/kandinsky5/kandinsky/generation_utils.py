@@ -2,8 +2,10 @@ from shared.utils.phase_progress import text_encoding_prompts
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "False"
 
+import math
 import torch
-from tqdm import tqdm 
+from mmgp import runtime
+from tqdm import tqdm
 
 from .models.utils import fast_sta_nabla
 import torchvision.transforms.functional as F
@@ -96,7 +98,7 @@ def get_velocity(
     joint_pass=False,
 ):
     with torch._dynamo.utils.disable_cache_limit():
-        if joint_pass and abs(guidance_weight - 1.0) > 1e-6:
+        if joint_pass and abs(guidance_weight - 1.0) > 1e-6 and runtime.joint_pass_useful(dit, x.numel() // x.shape[-1] // math.prod(dit.patch_size), dit.model_dim):
             outputs = dit(
                 [x, x],
                 [text_embeds["text_embeds"], null_text_embeds["text_embeds"]],
@@ -261,6 +263,12 @@ def encode_video(data, vae, image_vae): # batch, channels, time, h, w
     return data.permute(0, 2, 3, 4, 1) # batch, time, h, w, channels
 
 
+
+def _video_bytes(frames):
+    """Decoded frames as Kandinsky 5's bytes: ((x clamped to [-1, 1]) + 1) * 127.5, truncated, in the decoder's dtype."""
+    return ((frames.clamp(-1.0, 1.0) + 1.0) * 127.5).to(torch.uint8)
+
+
 def generate_sample(
     shape,
     caption,
@@ -358,8 +366,7 @@ def generate_sample(
             )
             images = images.to(device=vae_device)
             images = (images / vae.config.scaling_factor).permute(0, 4, 1, 2, 3)
-            images = vae.decode(images).sample
-            images = ((images.clamp(-1.0, 1.0) + 1.0) * 127.5).to(torch.uint8)
+            images = vae.decode(images, to_ram=_video_bytes).sample  # (the bytes, in RAM, piece by piece)
 
 
     return images
@@ -481,8 +488,10 @@ def generate_sample_ti2i(
             images = (images / vae.config.scaling_factor).permute(0, 4, 1, 2, 3)
             if image_vae:
                 images = images[:,:,0]
-            images = vae.decode(images).sample
-            images = ((images.clamp(-1.0, 1.0) + 1.0) * 127.5).to(torch.uint8)
+                images = vae.decode(images).sample
+                images = _video_bytes(images)
+            else:
+                images = vae.decode(images, to_ram=_video_bytes).sample  # (the bytes, in RAM, piece by piece)
 
 
     return images
@@ -591,8 +600,7 @@ def generate_sample_i2v(
             )
             images = images.to(device=vae_device)
             images = (images / vae.config.scaling_factor).permute(0, 4, 1, 2, 3)
-            images = vae.decode(images).sample
-            images = ((images.clamp(-1.0, 1.0) + 1.0) * 127.5).to(torch.uint8)
+            images = vae.decode(images, to_ram=_video_bytes).sample  # (the bytes, in RAM, piece by piece)
 
 
     return images

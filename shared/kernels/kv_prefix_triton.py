@@ -1,6 +1,6 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
-"""Kernels of the attention kit's cached prefixes (shared.attention_kit): q8 keys / values (int8 per token, head and 32 channels with
-FP16 scales, the LM engines' q8 format) dequantized through strides into a 16-bit buffer (a head group of a prefix into the joined keys
+"""Kernels of the attention kit's cached prefixes (shared.attention_kit): q8 / q4_0 keys / values (the LM engines' formats with
+FP16 scales per token, head and 32 channels) dequantized through strides into a 16-bit buffer (a head group of a prefix into the joined keys
 or values, a prefix of one batch item broadcast to all), and two attentions of the same queries over separate key sets merged in place by
 their base-2 log-sum-exp. The dequantization rounds the FP32 product once, as the PyTorch path; the merge computes in FP32 (precise
 division) and rounds once. BITS: BF16 tensors passed as int16 views and converted by the bit helpers of bf16_bits.py, for GPUs whose
@@ -20,13 +20,17 @@ _RUNTIME = ["TOKENS", "DB", "DT", "DH", "SB", "ST", "SH", "OB", "OT", "OH"]
 
 
 @triton.jit(do_not_specialize=_RUNTIME)
-def _dequantize_q8_kernel(DATA, SCALES, OUT, TOKENS, DB, DT, DH, SB, ST, SH, OB, OT, OH, D: tl.constexpr, BLOCK_T: tl.constexpr,
-                          BITS: tl.constexpr):
+def _dequantize_kernel(DATA, SCALES, OUT, TOKENS, DB, DT, DH, SB, ST, SH, OB, OT, OH, D: tl.constexpr, BLOCK_T: tl.constexpr,
+                      BITS: tl.constexpr, Q4: tl.constexpr):
     tokens = tl.program_id(0).to(tl.int64) * BLOCK_T + tl.arange(0, BLOCK_T)[:, None]
     head, batch = tl.program_id(1).to(tl.int64), tl.program_id(2).to(tl.int64)
     c = tl.arange(0, D)[None, :]
     valid = tokens < TOKENS
-    data = tl.load(DATA + batch * DB + tokens * DT + head * DH + c, valid, 0).to(tl.float32)
+    if Q4:
+        packed = tl.load(DATA + batch * DB + tokens * DT + head * DH + c // 32 * 16 + c % 16, valid, 0).to(tl.int32)
+        data = (((packed >> tl.where(c % 32 < 16, 0, 4)) & 15) - 8).to(tl.float32)
+    else:
+        data = tl.load(DATA + batch * DB + tokens * DT + head * DH + c, valid, 0).to(tl.float32)
     scale = tl.load(SCALES + batch * SB + tokens * ST + head * SH + c // 32, valid, 0.0).to(tl.float32)
     value = data * scale
     tl.store(OUT + batch * OB + tokens * OT + head * OH + c, fp32_to_bf16_bits(value) if BITS else value.to(OUT.dtype.element_ty), valid)
@@ -61,22 +65,31 @@ def _bits(x):
 def dequantize_q8_into(out, data, scales):
     """out (batch, tokens, heads, head_dim) 16-bit = data (batch or 1, tokens, heads, head_dim) int8 times scales (..., head_dim // 32)
     FP16, through their strides (last dimensions contiguous)."""
+    return _dequantize_into(out, data, scales, q4=False)
+
+
+def dequantize_q4_into(out, data, scales):
+    """As dequantize_q8_into, with q4_0 packed uint8 data (..., head_dim // 2)."""
+    return _dequantize_into(out, data, scales, q4=True)
+
+
+def _dequantize_into(out, data, scales, q4):
     batch, tokens, heads, dim = out.shape
     broadcast = data.shape[0] == 1 and batch > 1
     bits = _bits(out)
 
     def launch(target, source, source_scales, config):
         block, warps = config
-        _dequantize_q8_kernel[(triton.cdiv(target.shape[1], block), heads, batch)](
+        _dequantize_kernel[(triton.cdiv(target.shape[1], block), heads, batch)](
             source, source_scales, target.view(torch.int16) if bits else target, target.shape[1], 0 if broadcast else source.stride(0), source.stride(1),
             source.stride(2), 0 if broadcast else source_scales.stride(0), source_scales.stride(1), source_scales.stride(2), *target.stride()[:3], dim, block,
-            bits, num_warps=warps)
+            bits, q4, num_warps=warps)
 
     def scratch():
         target = torch.empty((batch, _TUNE_TOKENS, heads, dim), dtype=out.dtype, device=out.device)
         return lambda config: launch(target, data[:, :_TUNE_TOKENS], scales[:, :_TUNE_TOKENS], config)
 
-    config = _TUNER.config(f"dequantize_q8{'_bits' if bits else ''}", dim, out.device, ((32, 4), (16, 4), (64, 4), (64, 8)), scratch,
+    config = _TUNER.config(f"dequantize_q{4 if q4 else 8}{'_bits' if bits else ''}", dim, out.device, ((32, 4), (16, 4), (64, 4), (64, 8)), scratch,
                            tokens >= _TUNE_TOKENS)
     launch(out, data, scales, config)
     torch.autograd.graph.increment_version(out)

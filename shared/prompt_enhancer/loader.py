@@ -143,10 +143,10 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, qwen_
     if enhancer_enabled in (3, 4, 5, 6, 7):
         kernels_warning = gguf_kernels_warning() if torch.cuda.is_available() else ""  # the kernels exist for NVIDIA and AMD GPUs only
         if kernels_warning:
-            tqdm.write(f"\033[91m[Prompt Enhancer / Deepy] {kernels_warning}\033[0m")
+            tqdm.write(f"\033[91m[Deepy / Prompt Enhancer] {kernels_warning}\033[0m")
         deepy_kv_cache_quantization, kv_cache_message = resolve_deepy_kv_cache_quantization(deepy_kv_cache_quantization)
         if kv_cache_message:
-            print(f"[Prompt Enhancer / Deepy] {kv_cache_message}")
+            print(f"[Deepy / Prompt Enhancer] {kv_cache_message}")
         from .qwen35_text import load_qwen35_text_prompt_enhancer, qwen35_mtp_fit
         from .qwen35_vl import (
             enhancer_quantization_GGUF,
@@ -183,9 +183,9 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, qwen_
         speculative_decoding, speculative_decoding_message = resolve_prompt_enhancer_speculative_decoding(enhancer_enabled, speculative_decoding, qwen_backend=qwen_backend, fit=fit)
         speculative_decoding, speculative_tokens = speculative_decoding_runtime(speculative_decoding)
         if speculative_decoding_message:
-            print(f"[Prompt Enhancer / Deepy] {speculative_decoding_message}")
+            print(f"[Deepy / Prompt Enhancer] {speculative_decoding_message}")
         if other_programs_advice:
-            tqdm.write(f"\033[91m[Prompt Enhancer / Deepy] {other_programs_advice}\033[0m")
+            tqdm.write(f"\033[91m[Deepy / Prompt Enhancer] {other_programs_advice}\033[0m")
         runtime.llm_model = load_qwen35_text_prompt_enhancer(
             model_path=text_model_path,
             assets_dir=assets_dir,
@@ -212,7 +212,7 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, qwen_
                     verdict_key = runtime.llm_model._prompt_enhancer_long_chain_key = chain_verdicts.key(torch.device("cuda"), text_model_path or qwen35_variant, deepy_kv_cache_quantization, speculative_tokens, long_tokens)
                     verdict = chain_verdicts.verdict(verdict_key)
                     if verdict is not None and not verdict["pays"]:
-                        print(f"[Prompt Enhancer / Deepy] Long draft chain left out: on this GPU a pass with {long_tokens} draft tokens was measured at {verdict['ratio']:.2f} times one with {speculative_tokens} ({verdict['date']}).")
+                        print(f"[Deepy / Prompt Enhancer] Long draft chain left out: on this GPU a pass with {long_tokens} draft tokens was measured at {verdict['ratio']:.2f} times one with {speculative_tokens} ({verdict['date']}).")
                         long_tokens = 0
                 runtime.llm_model._prompt_enhancer_speculative_long_tokens = long_tokens
         runtime.llm_tokenizer = getattr(runtime.llm_model, "_prompt_enhancer_tokenizer", None)

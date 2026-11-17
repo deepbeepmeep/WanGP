@@ -13,7 +13,7 @@
 # limitations under the License.
 # Modifications Copyright (c) 2025-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 from shared.utils.phase_progress import text_encoding_prompts, text_encoding_progress
-from mmgp import offload
+from mmgp import offload, runtime
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -924,7 +924,7 @@ class QwenImagePipeline(): #DiffusionPipeline
                 if image_latents is not None:
                     latent_model_input = torch.cat([latent_model_input, image_latents], dim=1)
                 do_true_cfg = true_cfg_scale > 1
-                if do_true_cfg and joint_pass:
+                if do_true_cfg and joint_pass and runtime.joint_pass_useful(self.transformer, latent_model_input.shape[1] + prompt_embeds.shape[1], self.transformer.inner_dim):
                     noise_pred, neg_noise_pred = self.transformer(
                         hidden_states=latent_model_input,
                         timestep=timestep / 1000,

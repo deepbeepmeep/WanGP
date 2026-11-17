@@ -12,7 +12,7 @@ from mmgp import auto_preload, runtime
 
 from shared import attention_kit
 from shared.attention import pay_attention
-from models.wan.modules.model import WanAttentionBlock, WanModel, frame_modulation, modulate_frames, sinusoidal_embedding_1d
+from models.wan.modules.model import WanAttentionBlock, WanModel, frame_modulation, frame_segments, modulate_frames, sinusoidal_embedding_1d
 
 from .kernels import shifted_window_attention
 
@@ -148,11 +148,11 @@ class RelayWanBlock(WanAttentionBlock):
         attention_dtype = self.self_attn.q.weight.dtype
         x_list = [modulate_frames(x, self.norm1, e[0], e[1]).to(attention_dtype)]
         attention = self.self_attn
-        y = attention_kit.qkv_attention(x_list, attention.q, attention.k, attention.v, attention.num_heads, attention.head_dim,
-                                        lambda query, key, group: attention._norm_rope_(query, key, group, freqs), norm_spans_heads=True, attention_fn=attention_fn)
+        # the kit applies o as the attention's _project does (x += gate * o(attention) per latent frame)
+        attention_kit.qkv_attention(x_list, attention.q, attention.k, attention.v, attention.num_heads, attention.head_dim,
+                                    lambda query, key, group: attention._norm_rope_(query, key, group, freqs), norm_spans_heads=True, attention_fn=attention_fn,
+                                    out_proj=attention.o, residual=x.view(-1, x.shape[-1]), gate=e[2][0], segments=frame_segments(x.shape[0], x.shape[1], e[2][0].shape[0]))
         commit()
-        x = attention._project(y.flatten(2), x, e[2][0])
-        y = None
         y_list = [self.norm3(x).to(attention_dtype)]
         x += self.cross_attn(y_list, context, None).to(x.dtype)
         y_list = [modulate_frames(x, self.norm2, e[3], e[4]).to(attention_dtype)]

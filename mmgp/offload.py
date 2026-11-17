@@ -4089,30 +4089,204 @@ def linear_output_and_lora(module, x):
 class LinearInput:
     """Input prepared once for linear modules computed by ranges of output rows (prepare_linear_input, linear_rows)."""
     def __init__(self, shape, x, prepared, providers, lora):
-        self.shape, self.x, self.prepared, self.providers, self.lora = shape, x, prepared, providers, lora
+        self.shape, self.x, self.prepared, self.providers, self.lora, self.spare = shape, x, prepared, providers, lora, None
+
+
+ROW_SOURCE_BYTES = 64 << 20  # 16-bit rows of a RowSource made at a time by prepare_linear_input
+PREPARE_IN_PLACE = True  # comparison switch: False prepares every input apart from it (prepare_linear_input)
+
+
+class RowSource:
+    """An input of linear modules given by ranges of rows instead of a tensor, so that it is never whole in VRAM (a normalized and
+    modulated activation that only its projections read): shape (*, in_features), dtype and device as the tensor's would be, and
+    fill(start, stop) returning the rows [start, stop) of its (rows, in_features) view, a new contiguous tensor. prepare_linear_input
+    asks for each range once, in increasing order (side products of fill, such as gates read from the input, are then made once),
+    and prepares it range by range where every weight format of the modules can (its row projection's prepare_into), whole otherwise.
+    Its rows must not depend on the ranges asked (row-wise operations). fill_at(first, step, count), when given, is the same inside a
+    CUDA graph loop (cuda_graphs.loop): None, or a function(counter) making the rows [first + counter * step, + count) for the turn the
+    loop's counter gives, recorded in the loop's body."""
+    def __init__(self, shape, dtype, device, fill, fill_at=None):
+        self.shape, self.dtype, self.device, self.fill, self.fill_at = torch.Size(shape), dtype, device, fill, fill_at
+
+    def dim(self):
+        return len(self.shape)
+
+    def rows(self):
+        return math.prod(self.shape[:-1])
+
+    def chunk_rows(self):
+        return builtins.max(128, ROW_SOURCE_BYTES // (self.shape[-1] * self.dtype.itemsize) // 128 * 128)
+
+    def materialize(self):
+        """The whole input, as a tensor of its shape."""
+        rows, step = self.rows(), self.chunk_rows()
+        out = torch.empty((rows, self.shape[-1]), dtype=self.dtype, device=self.device)
+        for start in range(0, rows, step):
+            out[start:start + step] = self.fill(start, builtins.min(rows, start + step))
+        return out.view(self.shape)
 
 
 def linear_rows_supported(modules, x):
-    """True when every module can be computed by ranges of output rows from x (*, in_features), LoRAs included."""
-    x = x.reshape(-1, x.shape[-1])
+    """True when every module can be computed by ranges of output rows from x (*, in_features) or a RowSource, LoRAs included."""
+    x = x.fill(0, builtins.min(x.rows(), 128)) if isinstance(x, RowSource) else x.reshape(-1, x.shape[-1])
     return builtins.all(_row_projection(module, x) is not None and _row_lora_adapters(module) is not None for module in modules)
 
 
-def prepare_linear_input(x_list, modules):
+_row_store_at = None
+row_loop_refusals = collections.Counter()  # why RowSource preparations recorded in graphs ran without a loop (and the loops made)
+ROW_RANGE_LOOP_COST = 0.001  # share of a turn's ranges' time its pause may cost (cuda_graphs.loop_turn_size)
+ROW_RANGE_LOOP_PER_TURN = None  # a fixed number of ranges per turn instead (comparisons, tests)
+
+
+def register_row_store_at(kernel):
+    """kernel(target, rows, counter, first, step): target's rows from first + counter * step = rows, the counter on the device (a CUDA
+    graph loop's): what loops of row ranges (RowSource preparation) store their turn's results with."""
+    global _row_store_at
+    _row_store_at = kernel
+
+
+def _prepare_row_ranges_loop(source, providers, modules, prepared, products, rows, step):
+    """While a block is captured, the full ranges of rows after the first of _prepare_row_source as one CUDA graph loop (cuda_graphs.loop):
+    a turn fills its ranges (source.fill_at), prepares them into the prepared forms (the formats' prepare_into_at) and stores their LoRA
+    products, at the rows the loop's counter gives. Returns the first row it did not prepare (0: no loop: a short source, no fill_at,
+    a format or LoRA without a loop form, no graph pool for the body's allocations, the loops switched off)."""
+    from . import cuda_graphs
+    full = rows // step
+    if not torch.cuda.is_current_stream_capturing():
+        return 0
+    adapters = {module: _row_lora_adapters(module) for module in modules}
+    refusal = ("few ranges" if full < 3 else "no row store" if _row_store_at is None else "no fill_at" if source.fill_at is None
+               else "no loops" if not cuda_graphs.loop_available(source.device) else "no graph pool" if not cuda_graphs.loop_allocations()
+               else "format" if not builtins.all(hasattr(provider, "prepare_into_at") for provider in providers.values())
+               else "joined LoRA" if builtins.any((getattr(module, "_mm_lora_data", None) or {}).get("joined_GPU") is not None
+                                                  or builtins.any(data[5].get("joined") for _, data, _ in entries) for module, entries in adapters.items()) else None)
+    if refusal:
+        row_loop_refusals[refusal] += 1
+        return 0
+    owner = next(iter(modules))
+    per_turn = ROW_RANGE_LOOP_PER_TURN or cuda_graphs.loop_turn_size(source.device, cuda_graphs.loop_turn_ms(owner, ("row range", step)), full - 1, ROW_RANGE_LOOP_COST)
+    turns = (full - 1) // per_turn
+    if turns < 2:
+        row_loop_refusals["short ranges"] += 1
+        return 0
+    fills = [source.fill_at(step * (1 + index), per_turn * step, step) for index in range(per_turn)]
+    if None in fills:
+        row_loop_refusals["no fill_at form"] += 1
+        return 0
+    row_loop_refusals[f"looped, {per_turn} per turn"] += 1
+    counter = torch.empty(1, dtype=torch.int64, device=source.device)
+    with cuda_graphs.loop(turns, counter):
+        for index, fill in enumerate(fills):
+            first = step * (1 + index)
+            x = fill(counter)
+            done, made = set(), set()
+            for module, provider in providers.items():
+                key = provider.key(module)
+                if key not in done:
+                    provider.prepare_into_at(module, prepared[key], x, counter, first, per_turn * step)
+                    done.add(key)
+                for adapter, data, scaling in adapters[module]:
+                    if data[0] is None or id(data[0]) in made:
+                        continue
+                    made.add(id(data[0]))
+                    _row_store_at(products[id(data[0])], x @ data[0].to(x.dtype).T, counter, first, per_turn * step)
+            x = None
+    return step * (1 + turns * per_turn)
+
+
+def _prepare_row_source(source, modules):
+    """prepare_linear_input of a RowSource by ranges of rows: the first range chooses each module's row projection, which then fills
+    its prepared form range by range (prepare_into); the LoRA products are filled the same way. None, before any range is asked, when
+    a module keeps x (plain weights, diff adapters) or a format cannot prepare by ranges, or the source is one range: it is then made whole."""
+    rows, step = source.rows(), source.chunk_rows()
+    if rows <= step:
+        return None
+    x = source.fill(0, step)
+    providers = {module: _row_projection(module, x) for module in modules}
+    if builtins.any(provider.key(module) is None or not hasattr(provider, "prepare_into")
+                    or builtins.any(data[5].get("type", "lora") == "diff" for _, data, _ in _row_lora_adapters(module)) for module, provider in providers.items()):
+        return None
+    prepared, lora, products = {}, {}, {}
+    looped = 0  # ranges after the first done by a CUDA graph loop (_prepare_row_ranges_loop): the first chooses and allocates
+    for start in range(0, rows, step):
+        stop = builtins.min(rows, start + step)
+        if start and start < looped:
+            continue
+        timing = None
+        if start == step:
+            looped = _prepare_row_ranges_loop(source, providers, modules, prepared, products, rows, step)
+            if looped:
+                continue
+            from . import cuda_graphs
+            timing = cuda_graphs.loop_turn_begin(next(iter(modules)), ("row range", step))  # a block's warmup: the loop's turn timed
+        if start:
+            x = source.fill(start, stop)
+        done, made = set(), set()  # this range's prepared forms and LoRA products, shared by the modules
+        for module, provider in providers.items():
+            key = provider.key(module)
+            if key not in done:
+                prepared[key] = provider.prepare_into(module, prepared.get(key), x, start, rows)
+                done.add(key)
+            joined = (getattr(module, "_mm_lora_data", None) or {}).get("joined_GPU", None)
+            if joined is not None:
+                scales = _joined_lora_scales(module, joined)
+                key = (id(joined[0]), scales)
+                if key not in made:
+                    made.add(key)
+                    y, alpha = _joined_lora_product(joined, x, scales)
+                    if key not in products:
+                        products[key] = (None if y is None else y.new_empty((rows, y.shape[1])), alpha)
+                    if y is not None:
+                        products[key][0][start:stop] = y
+                lora[(module, "joined")] = products[key]
+            for adapter, data, scaling in _row_lora_adapters(module):
+                if data[5].get("joined") or data[0] is None:
+                    continue
+                key = id(data[0])
+                if key not in made:
+                    made.add(key)
+                    y = x @ data[0].to(x.dtype).T
+                    if key not in products:
+                        products[key] = y.new_empty((rows, y.shape[1]))
+                    products[key][start:stop] = y
+                lora[(module, adapter)] = products[key]
+        x = y = None
+        if timing is not None:
+            timing()
+    return LinearInput(source.shape[:-1], None, prepared, providers, lora)
+
+
+def prepare_linear_input(x_list, modules, in_place=False):
     """Prepares x, handed off in x_list, for modules computed by ranges of rows (check linear_rows_supported first): the activation of
     each weight format once, x @ A once per LoRA factor (q, k and v of a LoRA on a fused projection share one A). x itself is kept only for
-    plain weights and diff adapters."""
+    plain weights and diff adapters. x may be a RowSource: prepared by ranges of rows where its formats can, so that it is never whole.
+    in_place, for a caller that will use the bytes it frees: when x is the only activation format's input and nothing else holds it
+    (no other reference to it or to the tensor it views, and it covers its whole storage), a format that can prepares it into x's own
+    memory (prepare_in_place): its 16-bit values are then lost, and the bytes it leaves free are the result's `spare` (a 1-D uint8
+    tensor, else None). x's whole memory then stays held as long as the prepared input or anything in `spare` is: unused, `spare` costs
+    the memory a separate preparation frees."""
     x = x_list[0]
     x_list.clear()
+    if isinstance(x, RowSource):
+        linear_input = _prepare_row_source(x, modules)
+        if linear_input is not None:
+            return linear_input
+        x = x.materialize()
+    # the counts of x and of what it views: this frame's names, the calls' arguments, x's own reference to its base; its storage's
+    # users: x, its base, the storage object asked for (any other view of the memory, a slice kept for later, adds one)
+    base = x._base
+    owned = (sys.getrefcount(x) == 2 and (base is None or sys.getrefcount(base) == 3) and x.untyped_storage().nbytes() == x.numel() * x.element_size()
+             and hasattr(torch._C, "_storage_Use_Count") and torch._C._storage_Use_Count(x.untyped_storage()._cdata) == 2 + (base is not None))
+    base = None
     shape, x = x.shape[:-1], x.reshape(-1, x.shape[-1])
-    prepared, providers, lora, keep_x, products = {}, {}, {}, False, {}
+    prepared, providers, lora, keep_x, products, first = {}, {}, {}, False, {}, {}
     for module in modules:
         provider = providers[module] = _row_projection(module, x)
         key = provider.key(module)
         if key is None:
             keep_x = True
-        elif key not in prepared:
-            prepared[key] = provider.prepare(module, x)
+        elif key not in first:
+            first[key] = module
         joined = (getattr(module, "_mm_lora_data", None) or {}).get("joined_GPU", None)
         if joined is not None:
             scales = _joined_lora_scales(module, joined)
@@ -4131,7 +4305,13 @@ def prepare_linear_input(x_list, modules):
                 if product is None:
                     product = products[id(data[0])] = x @ data[0].to(x.dtype).T
                 lora[(module, adapter)] = product
-    return LinearInput(shape, x if keep_x else None, prepared, providers, lora)
+    in_place, spare = in_place and PREPARE_IN_PLACE and owned and not keep_x and len(first) == 1 and hasattr(providers[next(iter(first.values()))], "prepare_in_place"), None
+    for key, module in first.items():  # after the LoRA products, which read x
+        found = providers[module].prepare_in_place(module, x) if in_place else None
+        prepared[key], spare = found if found is not None else (providers[module].prepare(module, x), None)
+    linear_input = LinearInput(shape, x if keep_x else None, prepared, providers, lora)
+    linear_input.spare = spare
+    return linear_input
 
 
 def _prepare_joined_loras(loras_model_data):
@@ -4196,6 +4376,24 @@ class _AliasedLoraSlots:
             data[index] = value
 
 
+def linear_input_rows(linear_input, start, stop):
+    """The prepared input of rows [start, stop) of x (flattened to (rows, in_features)), for linear_rows: each weight format's prepared
+    form sliced by its row projection (slice_input(prepared, start, stop)), the kept x and the LoRA products sliced the same way. None
+    when a format of the input cannot slice its prepared form."""
+    prepared = {}
+    for module, provider in linear_input.providers.items():
+        key = provider.key(module)
+        if key is None or key in prepared:
+            continue
+        slicer = getattr(provider, "slice_input", None)
+        if slicer is None:
+            return None
+        prepared[key] = slicer(linear_input.prepared[key], start, stop)
+    part = lambda value: None if value is None else value[start:stop]
+    lora = {name: (part(value[0]), value[1]) if isinstance(value, tuple) else part(value) for name, value in linear_input.lora.items()}
+    return LinearInput((stop - start,), part(linear_input.x), prepared, linear_input.providers, lora)
+
+
 def linear_rows(module, linear_input, start, stop):
     """Output rows [start, stop) of module(x) for a prepared input, LoRAs included, shape (*x.shape[:-1], stop - start)."""
     provider = linear_input.providers[module]
@@ -4215,6 +4413,57 @@ def linear_rows(module, linear_input, start, stop):
         if diff_b is not None:
             out.add_(diff_b[start:stop].to(out.dtype), alpha=scaling)
     return out.view(*linear_input.shape, stop - start)
+
+
+def linear_columns_supported(module):
+    """True when module's active LoRAs can be applied to an input that comes by ranges of columns (LoraColumns): low-rank adapters only."""
+    adapters = _row_lora_adapters(module)
+    return adapters is not None and builtins.all(data[5].get("type", "lora") == "lora" for _, data, _ in adapters)
+
+
+class LoraColumns:
+    """The LoRAs of a linear module whose input comes by ranges of columns (an attention output by groups of heads) and is never whole
+    in 16 bits (check linear_columns_supported first): append() adds each range's x @ A, over the columns of A it covers, to an FP32
+    sum per adapter (the joined factors of several adapters as one), and add_to() adds the LoRA outputs to the module's base output as
+    its forward does. The sums are rank wide: a few MB."""
+    def __init__(self, module):
+        joined = module._mm_lora_data.get("joined_GPU", None)
+        scales = None if joined is None else _joined_lora_scales(module, joined)
+        self.joined = None if scales is None or builtins.max(scales, key=builtins.abs) == 0 else (joined, scales)
+        self.adapters = _row_lora_adapters(module)
+        self.factors = {} if self.joined is None else {"joined": joined[0]}
+        self.factors.update((adapter, data[0]) for adapter, data, _ in self.adapters if not data[5].get("joined") and data[0] is not None)
+        self.products, self.start = {}, 0
+
+    def append(self, x):
+        """x (rows, columns): the next columns of the module's input."""
+        stop = self.start + x.shape[1]
+        for name, factor in self.factors.items():
+            part = x @ factor[:, self.start:stop].to(x.dtype).T
+            if name in self.products:
+                self.products[name].add_(part)
+            else:
+                self.products[name] = part.float()
+        self.start = stop
+
+    def add_to(self, out, start=0, stop=None):
+        """out, rows [start, stop) of the module's base output (rows, out_features), += the LoRA outputs and bias differences."""
+        if self.joined is not None:
+            joined, scales = self.joined
+            alpha = builtins.max(scales, key=builtins.abs)
+            y = self.products["joined"][start:stop]
+            if builtins.any(scale != alpha for scale in scales):  # as _joined_lora_product, scaled before the rounding
+                y = y.clone()
+                for (first, last), scale in zip(joined[5]["ranges"].values(), scales):
+                    if scale != alpha:
+                        y[:, first:last].mul_(scale / alpha)
+            _add_lora_output(out, y.to(out.dtype), joined[1].to(out.dtype), alpha, True)
+        for adapter, data, scaling in self.adapters:
+            if adapter in self.products:
+                _add_lora_output(out, self.products[adapter][start:stop].to(out.dtype), data[1].to(out.dtype), scaling)
+            if data[2] is not None:
+                out.add_(data[2].to(out.dtype), alpha=scaling)
+        return out
 
 
 last_offload_obj = None
@@ -4541,7 +4790,8 @@ class offload:
         adopted = self.adopt_slot(model_id, nbytes) if slot is None and self.auto_preload is not None and self.auto_preload.keeps_all(model_id, block_name) else None
         self.transfers = self.transfers + 1
         timed = self.transfers % PCIE_TIMED_TRANSFERS == 0 and model_id in self.cpu_compute and not torch.cuda.is_current_stream_capturing()
-        with torch.cuda.stream(stream):
+        from . import allocator
+        with torch.cuda.stream(stream), allocator.weight_allocations():
             buffer = self.block_slots[model_id][slot][0] if slot is not None else adopted if adopted is not None else torch.empty(nbytes, dtype=torch.uint8, device="cuda")
             if timed:
                 start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
@@ -4584,7 +4834,8 @@ class offload:
                 if slot[0] is None:
                     # in the pool of the block buffers, whose memory it can then reuse; not an inference tensor, as blocks are also loaded
                     # outside inference mode
-                    with torch.inference_mode(False), torch.cuda.stream(self.transfer_stream):
+                    from . import allocator
+                    with torch.inference_mode(False), torch.cuda.stream(self.transfer_stream), allocator.weight_allocations():
                         slot[0] = torch.empty(slot[2], dtype=torch.uint8, device="cuda")
                 slot[1] = entry_name
                 return slot_no
@@ -5140,7 +5391,8 @@ class offload:
             else:
                 loras_model_data =  getattr(model, "_loras_model_data", None)
 
-            with torch.cuda.stream(stream_to_use):
+            from . import allocator
+            with torch.cuda.stream(stream_to_use), allocator.weight_allocations(): # weights: the attention kit's measures of VRAM leave them out
                 for i, param in enumerate(blocks_params):
                     parent_module, n, p, is_buffer, tied_param = param
 

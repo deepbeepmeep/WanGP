@@ -17,7 +17,7 @@ LONGEST_S = 60.0  # a shot: correlating across cuts says nothing
 def decode_voice(path) -> np.ndarray:
     from shared.deepy.video_tools import _get_ffmpeg_path
 
-    raw = subprocess.run([_get_ffmpeg_path(), "-v", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", str(RATE), "-f", "f32le", "-"], capture_output=True).stdout
+    raw = subprocess.run([_get_ffmpeg_path(), "-v", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", str(RATE), "-f", "f32le", "-"], stdin=subprocess.DEVNULL, capture_output=True).stdout
     return np.frombuffer(raw, dtype=np.float32).copy()
 
 

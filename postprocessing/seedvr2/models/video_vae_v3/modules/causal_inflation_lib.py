@@ -266,6 +266,9 @@ def init_causal_conv3d(
     return InflatedCausalConv3d(*args, inflation_mode=inflation_mode, **kwargs)
 
 
+NORM_CHUNK_BYTES = 256 << 20  # frames normalized per call in causal_norm_wrapper (one frame at least)
+
+
 def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
     if isinstance(norm_layer, (nn.LayerNorm, RMSNorm)):
         if x.ndim == 4:
@@ -282,45 +285,31 @@ def causal_norm_wrapper(norm_layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
         if x.ndim <= 4:
             return norm_layer(x)
         if x.ndim == 5:
-            t = x.size(2)
-            x = rearrange(x, "b c t h w -> (b t) c h w")
-            memory_occupy = x.numel() * x.element_size() / 1024**3
-            if isinstance(norm_layer, nn.GroupNorm) and memory_occupy > get_norm_limit():
-                num_chunks = min(4 if x.element_size() == 2 else 2, norm_layer.num_groups)
-                assert norm_layer.num_groups % num_chunks == 0
-                num_groups_per_chunk = norm_layer.num_groups // num_chunks
-
-                x = list(x.chunk(num_chunks, dim=1))
-                weights = norm_layer.weight.chunk(num_chunks, dim=0)
-                biases = norm_layer.bias.chunk(num_chunks, dim=0)
-                
-                for i, (w, b) in enumerate(zip(weights, biases)):
-                    def apply_group_norm():
-                        return F.group_norm(x[i], num_groups_per_chunk, w, b, norm_layer.eps)
-                    
-                    x[i] = retry_on_oom(
-                        apply_group_norm,
-                        debug=getattr(norm_layer, 'debug', None),
-                        operation_name=f"GroupNorm.chunk_{i}"
-                    )
-                    x[i] = x[i]
-                
-                x = retry_on_oom(
-                    torch.cat,
-                    x,
-                    dim=1,
-                    debug=getattr(norm_layer, 'debug', None),
-                    operation_name="GroupNorm.concat_chunks"
-                )
-            else:
-                x = retry_on_oom(
-                    norm_layer,
-                    x,
-                    debug=getattr(norm_layer, 'debug', None),
-                    operation_name="GroupNorm.direct"
-                )
-            x = rearrange(x, "(b t) c h w -> b c t h w", t=t)
-            return x
+            # The norm sees each frame alone: by chunks of frames (and of groups when a frame exceeds the norm memory limit) written
+            # into the output, each chunk's values computed as on the whole tensor. In VRAM, the input, the output and one chunk's
+            # copies, instead of the frames-first copy of the input, its normalized groups, their concatenation and the copy back.
+            out = torch.empty_like(x)
+            frame_bytes = x[:, :, :1].numel() * x.element_size()
+            frames = max(1, min(x.size(2), NORM_CHUNK_BYTES // frame_bytes))
+            group_chunks = 1
+            if isinstance(norm_layer, nn.GroupNorm) and frame_bytes / 1024**3 > get_norm_limit():
+                group_chunks = min(4 if x.element_size() == 2 else 2, norm_layer.num_groups)
+                assert norm_layer.num_groups % group_chunks == 0
+            channels = x.size(1) // group_chunks
+            for start in range(0, x.size(2), frames):
+                part = x[:, :, start:start + frames]
+                count = part.size(2)
+                part = rearrange(part, "b c t h w -> (b t) c h w")
+                for c0 in range(0, x.size(1), channels):
+                    if group_chunks == 1:
+                        y = norm_layer(part)
+                    else:
+                        c1 = c0 + channels
+                        y = F.group_norm(part[:, c0:c1], norm_layer.num_groups // group_chunks, norm_layer.weight[c0:c1], norm_layer.bias[c0:c1], norm_layer.eps)
+                    out[:, c0:c0 + y.size(1), start:start + count] = rearrange(y, "(b t) c h w -> b c t h w", t=count)
+                    del y
+                del part
+            return out
     raise NotImplementedError
 
 

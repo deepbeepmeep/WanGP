@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import difflib
+import math
 import re
 import hashlib
 import json
@@ -740,8 +741,26 @@ def summary(doc: dict[str, Any], sequence: str | None = None) -> dict[str, Any]:
 
 BRIEF_FIELDS = {"kind", "title", "text", "song", "source", "script", "references", "duration_s", "aspect", "resolution", "draft_resolution", "style_tags", "style", "pacing", "language", "plan_first", "budget_minutes",
                 "templates", "read_other_productions", "review_before_edit", "shot_min_s", "shot_max_s", "voices_from_model", "group_renders", "render_min_s", "render_max_s", "song_voices"}
-DEFAULT_LENGTH_S = 30.0  # what the Brief shows and plans for until the user sets a length
+DEFAULT_LENGTH_S = 30.0  # what the Brief shows and plans for until the user sets a length, longer when its script needs it
+SCRIPT_LINE_S = 0.8  # what a line of the script adds to the time its words take: the pause, a cut, a reaction
 RENDER_MIN_S = 8.0  # a remake's shorter renders lose the lips: Skate Queen s3 alone (5.8 s) did not follow the singing, with its neighbour (9.5 s) it did
+
+
+def script_length(doc: dict[str, Any]) -> float | None:
+    """About how long the brief's spoken script lasts, up to the next 5 s (0.37 s a word, as planned_length, and SCRIPT_LINE_S a line; brief.js
+    scriptLength counts it the same way); None without spoken lines, for lyrics (they are sung) and for a remake (it lasts as long as its source)."""
+    if doc["brief"].get("kind") in ("music_video", "remake"):
+        return None
+    lines = [words for line in script_speech(doc) if (words := _script_words(line))]
+    return 5.0 * math.ceil(sum(0.37 * len(words) + SCRIPT_LINE_S for words in lines) / 5.0) if lines else None
+
+
+def wanted_length(doc: dict[str, Any]) -> float | None:
+    """The length the production plans for: the user's, None when a song sets it, else the default or the time the script needs when longer."""
+    brief = doc["brief"]
+    if brief.get("duration_s") or brief.get("song"):
+        return brief.get("duration_s") or None
+    return max(DEFAULT_LENGTH_S, script_length(doc) or 0.0)
 
 
 def shot_range(doc: dict[str, Any]) -> tuple[float | None, float | None]:

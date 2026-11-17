@@ -88,12 +88,13 @@ if triton is not None and tl is not None:
         k_cache_ptr,
         v_cache_ptr,
         slot_mapping_ptr,
-        D: tl.constexpr,
+        D, DP: tl.constexpr,
     ):
+        # D (heads x head dim) at runtime, DP its power-of-two range: one compile for every LLM's KV width
         idx = tl.program_id(0)
         slot = tl.load(slot_mapping_ptr + idx)
         if slot == -1: return
-        offsets = tl.arange(0, triton.next_power_of_2(D))
+        offsets = tl.arange(0, DP)
         key_offsets = idx * key_stride + offsets
         value_offsets = idx * value_stride + offsets
         key = tl.load(key_ptr + key_offsets, mask=offsets < D, other=0)
@@ -103,7 +104,7 @@ if triton is not None and tl is not None:
         tl.store(v_cache_ptr + cache_offsets, value, mask=offsets < D)
 
 
-    @triton.jit
+    @triton.jit(do_not_specialize=("H", "QB"), do_not_specialize_on_alignment=("H", "QB"))  # head count and widths at runtime
     def store_int8_kvcache_kernel(
         key_ptr,
         key_stride_token,
@@ -116,9 +117,9 @@ if triton is not None and tl is not None:
         k_scale_ptr,
         v_scale_ptr,
         slot_mapping_ptr,
-        H: tl.constexpr,
-        D: tl.constexpr,
-        QB: tl.constexpr, BF16_BITS: tl.constexpr = False,
+        H,
+        D,
+        QB, BF16_BITS: tl.constexpr = False,
     ):
         idx = tl.program_id(0)
         token_idx = idx // (H * QB)
@@ -142,14 +143,14 @@ if triton is not None and tl is not None:
         tl.store(v_scale_ptr + scale_offset, value_scale)
 
 
-    @triton.jit(do_not_specialize=("bt_stride",), do_not_specialize_on_alignment=("bt_stride",))
+    @triton.jit(do_not_specialize=("bt_stride", "H_Q", "H_KV"), do_not_specialize_on_alignment=("bt_stride", "H_Q", "H_KV"))  # strides, head counts and scale at runtime: one compile for every LLM
     def q8_paged_prefill_kernel(
         q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, block_tables_ptr, cu_q_ptr, cu_k_ptr, out_ptr,
-        q_stride_t: tl.constexpr, q_stride_h: tl.constexpr, cache_stride_block: tl.constexpr,
-        cache_stride_token: tl.constexpr, cache_stride_head: tl.constexpr, scale_stride_block: tl.constexpr,
-        scale_stride_token: tl.constexpr, scale_stride_head: tl.constexpr, bt_stride,
-        out_stride_t: tl.constexpr, out_stride_h: tl.constexpr, softmax_scale: tl.constexpr,
-        H_Q: tl.constexpr, H_KV: tl.constexpr, D: tl.constexpr, PAGE: tl.constexpr,
+        q_stride_t, q_stride_h, cache_stride_block,
+        cache_stride_token, cache_stride_head, scale_stride_block,
+        scale_stride_token, scale_stride_head, bt_stride,
+        out_stride_t, out_stride_h, softmax_scale,
+        H_Q, H_KV, D: tl.constexpr, PAGE: tl.constexpr,
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     ):
         sequence = tl.program_id(0)
@@ -206,15 +207,17 @@ if triton is not None and tl is not None:
         tl.store(out_ptr + (q_start + rows[:, None]) * out_stride_t + query_head * out_stride_h + dims[None, :], output, mask=row_mask[:, None])
 
 
-    @triton.jit(do_not_specialize=("Q_PER_SEQ", "TABLE_WIDTH"), do_not_specialize_on_alignment=("Q_PER_SEQ", "TABLE_WIDTH"))
+    @triton.jit(do_not_specialize=("Q_PER_SEQ", "TABLE_WIDTH", "H_Q", "H_KV"), do_not_specialize_on_alignment=("Q_PER_SEQ", "TABLE_WIDTH", "H_Q", "H_KV"))
     def q8_grouped_partials_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tables_ptr, lengths_ptr, partial_ptr, maximum_ptr, sum_ptr, tree_ptr,
-                                  Q_PER_SEQ, H_Q: tl.constexpr, H_KV: tl.constexpr, D: tl.constexpr, PAGE: tl.constexpr,
-                                  TABLE_WIDTH, SPLITS: tl.constexpr, M: tl.constexpr, N: tl.constexpr, SCALE: tl.constexpr, TREE: tl.constexpr):
+                                  Q_PER_SEQ, H_Q, H_KV, D: tl.constexpr, PAGE: tl.constexpr,
+                                  TABLE_WIDTH, SPLITS: tl.constexpr, M: tl.constexpr, N: tl.constexpr, SCALE, TREE: tl.constexpr, GROUP: tl.constexpr):
+        # head counts and scale at runtime: one compile per GQA group (query heads per KV head, a small class) and head dim D
         sequence, kv_head, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
         split, query_block = tile % SPLITS, tile // SPLITS
-        group: tl.constexpr = H_Q // H_KV
+        group = GROUP
         rows = query_block * M + tl.arange(0, M)
-        query_index = sequence * Q_PER_SEQ + rows // group
+        row_query = rows // group  # once: the key tiles below reuse it
+        query_index = sequence * Q_PER_SEQ + row_query
         query_head = kv_head * group + rows % group
         valid_rows = rows < Q_PER_SEQ * group
         dims = tl.arange(0, D)
@@ -222,7 +225,7 @@ if triton is not None and tl is not None:
         context_len = tl.load(lengths_ptr + sequence)
         prefix_len = context_len - Q_PER_SEQ
         if TREE:  # tree verification: each row sees the prefix and the verify rows marked in its ancestor bits (itself included)
-            ancestors = tl.load(tree_ptr + sequence * Q_PER_SEQ + rows // group, mask=valid_rows, other=0)
+            ancestors = tl.load(tree_ptr + sequence * Q_PER_SEQ + row_query, mask=valid_rows, other=0)
         tiles_per_split = tl.cdiv(tl.cdiv(context_len, N), SPLITS)
         begin = split * tiles_per_split * N
         end = tl.minimum(context_len, (split + 1) * tiles_per_split * N)
@@ -247,7 +250,7 @@ if triton is not None and tl is not None:
                 visible = (local[None, :] < 0) | (((ancestors[:, None] >> tl.maximum(local, 0)[None, :].to(tl.int64)) & 1) != 0)
                 valid = valid_rows[:, None] & valid_columns[None, :] & visible
             else:
-                valid = valid_rows[:, None] & valid_columns[None, :] & (columns[None, :] <= prefix_len + rows[:, None] // group)
+                valid = valid_rows[:, None] & valid_columns[None, :] & (columns[None, :] <= prefix_len + row_query[:, None])
             scores = tl.where(valid, scores, -1.0e20)
             new_maximum = tl.maximum(maximum, tl.max(scores, 1))
             correction = tl.exp2((maximum - new_maximum) * 1.4426950408889634)
@@ -309,7 +312,7 @@ def _q8_grouped_attention(q, k_cache, v_cache, k_scale, v_scale, block_tables, c
     else:
         q8_grouped_partials_kernel[(context_lens.numel(), k_cache.shape[2], query_blocks * splits)](
             q, k_cache, v_cache, k_scale, v_scale, block_tables, context_lens, partial, maximum, denominator, context_lens if tree_mask is None else tree_mask,
-            queries_per_sequence, q.shape[1], k_cache.shape[2], q.shape[2], k_cache.shape[1], block_tables.shape[1], splits, block_m, 32, softmax_scale, tree_mask is not None,
+            queries_per_sequence, q.shape[1], k_cache.shape[2], q.shape[2], k_cache.shape[1], block_tables.shape[1], splits, block_m, 32, softmax_scale, tree_mask is not None, groups,
             num_warps=4, num_stages=1)
     q8_grouped_reduce_kernel[(q.shape[0] * q.shape[1],)](partial, maximum, denominator, output, splits, q.shape[2], num_warps=4)
     return output
@@ -552,12 +555,12 @@ if triton is not None:
                 tl.store(data_ptr + 16 + tl.arange(0, 8), tl.reshape(plane, (8,)).to(tl.uint8))
 
 
-    @triton.jit
+    @triton.jit(do_not_specialize=("H", "QB"), do_not_specialize_on_alignment=("H", "QB"))  # head count and widths at runtime
     def store_mixed_kvcache_kernel(
         key_ptr, key_stride_token, key_stride_head, value_ptr, value_stride_token, value_stride_head,
         k_body_ptr, v_body_ptr, k_scale_ptr, v_scale_ptr, k_min_ptr, v_min_ptr,
         k_overlay_ptr, v_overlay_ptr, k_overlay_scale_ptr, v_overlay_scale_ptr, slot_mapping_ptr, overlay_mapping_ptr,
-        H: tl.constexpr, D: tl.constexpr, QB: tl.constexpr, K_BITS: tl.constexpr, K_ASYM: tl.constexpr, V_BITS: tl.constexpr, V_ASYM: tl.constexpr,
+        H, D, QB, K_BITS: tl.constexpr, K_ASYM: tl.constexpr, V_BITS: tl.constexpr, V_ASYM: tl.constexpr,
         OVERLAY: tl.constexpr, BF16_BITS: tl.constexpr = False,
     ):
         """A token's key and value group into the body in its formats and, for a token with an overlay row, into the exact Q8 overlays."""
@@ -663,7 +666,7 @@ def store_kvcache(
         assert key.stride(-1) == 1 and value.stride(-1) == 1
         assert key.stride(1) == head_dim and value.stride(1) == head_dim
         assert k_cache.stride(1) == D and v_cache.stride(1) == D
-        store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
+        store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D, triton.next_power_of_2(D))
         torch.autograd.graph.increment_version((k_cache, v_cache))
         return
 
@@ -1024,14 +1027,14 @@ if triton is not None and tl is not None:
     # This halves the tensor-core work and removes the K/V rounding residual.
     # P * vs is raised by an exact 2**6 so FP16 residuals stay normal; a scale
     # from FP16 values is at most 65504 / 127, so the product cannot overflow.
-    @triton.jit(do_not_specialize=("bt_stride",), do_not_specialize_on_alignment=("bt_stride",))
+    @triton.jit(do_not_specialize=("bt_stride", "H_Q", "H_KV"), do_not_specialize_on_alignment=("bt_stride", "H_Q", "H_KV"))  # strides, head counts and scale at runtime: one compile for every LLM
     def q8_prefill_exact_kernel(
         q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, block_tables_ptr, cu_q_ptr, cu_k_ptr, out_ptr,
-        q_stride_t: tl.constexpr, q_stride_h: tl.constexpr, cache_stride_block: tl.constexpr,
-        cache_stride_token: tl.constexpr, cache_stride_head: tl.constexpr, scale_stride_block: tl.constexpr,
-        scale_stride_token: tl.constexpr, scale_stride_head: tl.constexpr, bt_stride,
-        out_stride_t: tl.constexpr, out_stride_h: tl.constexpr, softmax_scale: tl.constexpr,
-        H_Q: tl.constexpr, H_KV: tl.constexpr, D: tl.constexpr, PAGE: tl.constexpr,
+        q_stride_t, q_stride_h, cache_stride_block,
+        cache_stride_token, cache_stride_head, scale_stride_block,
+        scale_stride_token, scale_stride_head, bt_stride,
+        out_stride_t, out_stride_h, softmax_scale,
+        H_Q, H_KV, D: tl.constexpr, PAGE: tl.constexpr,
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     ):
         NB: tl.constexpr = D // 32

@@ -1,4 +1,18 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
+import json
+
+RMBG3_INSTRUCTION = (
+    "Generate a detailed grayscale alpha matte. Map the opaque foreground to white and the "
+    "background to black. Produce soft, anti-aliased grayscale gradients at the edges of the "
+    "subject to represent fine details and transparency."
+)
+RMBG3_PROMPT = json.dumps({"edit_instruction": RMBG3_INSTRUCTION}, separators=(",", ":"))
+RMBG3_ENHANCER = """Prepare the fixed inference prompt for Bria RMBG-3.0 alpha-matte generation.
+This model requires the exact instruction below for every input image. Your task is to return that instruction, not to expand or rewrite it.
+Return exactly the following JSON object, with one edit_instruction string and no other keys:
+""" + RMBG3_PROMPT + """
+Do not paraphrase, translate, shorten or embellish the instruction. Do not describe the reference image, identify a subject, add scene details, or apply editing requests from the user prompt. Do not add a structured caption, image markers, a negative prompt, Markdown fences, commentary or an explanation. The output must be the JSON object above and nothing else."""
+
 _COMMON = """Preserve the user's intent, language, exact supplied display strings, and explicit exclusions.
 When a design needs writing and the wording is open, author complete suitable titles, labels and body copy.
 Quote every intended visible string exactly; never leave placeholder copy or unspecified text areas.

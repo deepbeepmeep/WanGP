@@ -67,7 +67,7 @@ def input_metadata(session, settings, explicit):
                 record.update(zip(("width", "height"), upright_size(image)))
         elif record["media_type"] in {"audio", "video"}:
             if probe:
-                process = subprocess.run([str(probe), "-v", "error", "-show_entries", "stream=codec_type,width,height,sample_rate,channels,avg_frame_rate:format=duration", "-of", "json", str(path)], capture_output=True, text=True, timeout=15)
+                process = subprocess.run([str(probe), "-v", "error", "-show_entries", "stream=codec_type,width,height,sample_rate,channels,avg_frame_rate:format=duration", "-of", "json", str(path)], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
                 if process.returncode:
                     record["metadata_unavailable"] = process.stderr[-500:]
                 else:

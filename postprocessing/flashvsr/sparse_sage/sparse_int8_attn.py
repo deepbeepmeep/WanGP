@@ -80,14 +80,14 @@ def _attn_fwd_inner(acc, l_i, old_m, q, q_scale, kv_len,
         V_ptrs += BLOCK_N * stride_vn
     return acc, l_i, old_m
 
-@triton.jit
-def _attn_fwd(Q, K, K_blkid, V, Q_scale, K_scale, Out,  
+@triton.jit(do_not_specialize=["H", "num_kv_groups"])  # head counts at runtime: one kernel for every Head Split group size
+def _attn_fwd(Q, K, K_blkid, V, Q_scale, K_scale, Out,
               stride_qz, stride_qh, stride_qn,
-              stride_kz, stride_kh, stride_kn,  
-              stride_vz, stride_vh, stride_vn,  
-              stride_oz, stride_oh, stride_on,  
+              stride_kz, stride_kh, stride_kn,
+              stride_vz, stride_vh, stride_vn,
+              stride_oz, stride_oh, stride_on,
               stride_kbidq, stride_kbidk,
-              qo_len, kv_len, H:tl.constexpr, num_kv_groups:tl.constexpr, 
+              qo_len, kv_len, H, num_kv_groups,
               HEAD_DIM: tl.constexpr,  
               BLOCK_M: tl.constexpr,  
               BLOCK_N: tl.constexpr,

@@ -48,7 +48,6 @@ from .ltx_core.types import AudioLatentShape, VideoPixelShape
 from .ltx_audio_tts import LTXAudioTTSPipelineBase
 from .ltx_pipelines.utils.constants import AUDIO_SAMPLE_RATE, DISTILLED_SIGMA_VALUES
 from .ltx_pipelines.utils.helpers import (
-    _clear_phase_timestep_embedders,
     _prepare_conditioning_context,
     modality_from_latent_state,
     post_process_latent,

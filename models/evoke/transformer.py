@@ -103,9 +103,9 @@ class EvokeBlock(nn.Module):
         rows = x.view(-1, DIM)
         y = ops.norm_modulate([rows], self.norm1, shift, scale, spans).view(x.shape)
         attention = self.self_attn
-        y = attention_kit.qkv_attention([y], attention.q, attention.k, attention.v, HEADS, HEAD_DIM,
-                                        lambda query, key, group: attention._norm_rope_(query, key, group, rope), norm_spans_heads=True)
-        ops.gated_linear(attention.o, [y.view(-1, DIM)], rows, gate, spans)
+        attention_kit.qkv_attention([y], attention.q, attention.k, attention.v, HEADS, HEAD_DIM,
+                                    lambda query, key, group: attention._norm_rope_(query, key, group, rope), norm_spans_heads=True,
+                                    out_proj=attention.o, residual=rows, gate=gate, segments=spans)  # rows += gate * o(attention)
         del y
         noise = x[:, history:]  # the history skips the cross-attention (guidance_cross_attn)
         noise += self.cross_attn([self.norm3(noise)], context, None)

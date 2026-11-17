@@ -48,8 +48,8 @@ def _brief_text(doc: dict[str, Any]) -> str:
     if brief.get("references"):
         lines.append("Reference media: " + ", ".join(_name(path) for path in brief["references"]))
     format_parts = [f"aspect {brief['aspect']}", f"{brief['resolution']}" if not brief.get("draft_resolution") else f"{brief['draft_resolution']} draft for {brief['resolution']}"]
-    if brief["kind"] != "remake" and (brief.get("duration_s") or not brief.get("song")):  # a remake lasts as long as its source
-        format_parts.append(f"about {brief.get('duration_s') or model.DEFAULT_LENGTH_S:g} s in total")
+    if brief["kind"] != "remake" and (length := model.wanted_length(doc)):  # a remake lasts as long as its source, a song sets the length
+        format_parts.append(f"about {length:g} s in total" + ("" if brief.get("duration_s") or length == model.DEFAULT_LENGTH_S else ", the time its script takes to say"))
     lines.append("Format: " + ", ".join(format_parts) + ".")
     if brief.get("draft_resolution"):
         lines.append(f"Make every picture (cast, looks, places, cards) at {model.resolution(brief)}, the target: a draft and its final use the same pictures. render shoots video at the draft size by itself; the user shoots shots final when happy.")

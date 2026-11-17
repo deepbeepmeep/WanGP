@@ -29,6 +29,7 @@ from diffusers.utils import logging
 from diffusers.utils.accelerate_utils import apply_forward_hook
 
 from shared import attention_kit
+from shared.cuda_memory import mmgp_vram_allocator
 from shared.attention import pay_attention
 
 from ..interrupt import GenerationInterrupted
@@ -768,6 +769,10 @@ class AutoencoderKLMiniMaxH3(ModelMixin, ConfigMixin, AttentionMixin, Autoencode
         self.tile_sample_min_width = 256
         self.tile_sample_min_overlap_height = 64
         self.tile_sample_min_overlap_width = 64
+        # The VRAM a decode may use, weights (weights_bytes) included (None: no limit): it sets how many tiles of a clip go through
+        # the decoder per call (_tiles_per_call). The tile size is not a choice: the decoder only works on tiles of 256 pixels.
+        self.decode_vram = None
+        self.weights_bytes = 0
 
     def enable_tiling(
         self,
@@ -897,10 +902,33 @@ class AutoencoderKLMiniMaxH3(ModelMixin, ConfigMixin, AttentionMixin, Autoencode
         latent_x_overlaps = [overlap // self.spatial_compression_ratio for overlap in x_overlaps]
         return self._stitch_tiles(rows, latent_y_overlaps, latent_x_overlaps)
 
-    def _decode_clip(self, z: torch.Tensor) -> torch.Tensor:
-        r"""Decode one temporal clip, spatially tiled when tiling is enabled."""
+    # A decoder call takes at most MAX_CALL_ROWS token rows (16 tiles of a video clip): more is not faster (the decoder's work is per
+    # tile: 30 ms each on a RTX 5090 at any size) and holds TOKEN_ROW_BYTES more VRAM per row (measured, FP16 and INT8 decoders,
+    # + 10 %). decode_vram lowers it, down to MIN_CALL_ROWS (8 tiles of a video clip: + 1 % against 16): below, a call is bound by
+    # its launches (158 ms per INT8 call whatever its tiles: 5 tiles per call + 30 %, 4 + 40 %, 2 twice the time). Around the calls
+    # a decode holds PIXEL_SHARE of the pixels it works on (a row of tiles of the clip, and the frames kept for the cross-fade with
+    # the next clip) + FIXED_BYTES.
+    TOKEN_ROW_BYTES, MIN_CALL_ROWS, MAX_CALL_ROWS, PIXEL_SHARE, FIXED_BYTES = 28 << 10, 14336, 28752, 2.0, 56 << 20
+
+    def _tiles_per_call(self, count: int, rows: int, pixel_bytes: int) -> int:
+        """How many of the `count` tiles of a clip go through the decoder per call, in equal groups: MAX_CALL_ROWS token rows, fewer
+        when decode_vram requires it, at least MIN_CALL_ROWS. rows: token rows of a tile; pixel_bytes: a row of tiles of the clip and
+        the frames kept for the cross-fade."""
+        group = min(count, max(1, self.MAX_CALL_ROWS // rows))
+        if self.decode_vram is not None:
+            room = self.decode_vram - self.weights_bytes - self.PIXEL_SHARE * pixel_bytes - self.FIXED_BYTES
+            if not mmgp_vram_allocator():  # (PyTorch's allocator reserves more than it allocates)
+                room /= 2
+            group = min(group, max(int(room // (rows * self.TOKEN_ROW_BYTES)), -(-self.MIN_CALL_ROWS // rows)))
+        return -(-count // -(-count // group))
+
+    def _decode_clip_rows(self, z: torch.Tensor):
+        r"""Decode one temporal clip: yields `(row, pixels)`, the decoded pixel rows from `row` on. Without tiling, the whole clip;
+        else what each row of tiles completes, its tiles blended with their neighbours (the strip shared with the next row of tiles
+        is kept here), so that no clip-sized tensor is needed."""
         if not self.use_tiling:
-            return self.decoder(self.post_quant_conv(z))
+            yield 0, self.decoder(self.post_quant_conv(z))
+            return
 
         # Tiles are laid out in pixel space and then mapped back onto the latent grid.
         height = z.shape[-2] * self.spatial_compression_ratio
@@ -913,32 +941,35 @@ class AutoencoderKLMiniMaxH3(ModelMixin, ConfigMixin, AttentionMixin, Autoencode
         )
 
         ratio = self.spatial_compression_ratio
-        tiles = []
-        for i_pos, i_len in zip(y_indices, y_lengths):
-            for j_pos, j_len in zip(x_indices, x_lengths):
-                tiles.append(z[..., i_pos // ratio : i_pos // ratio + i_len // ratio,
-                               j_pos // ratio : j_pos // ratio + j_len // ratio])
+        tiles = [z[..., i_pos // ratio : i_pos // ratio + i_len // ratio, j_pos // ratio : j_pos // ratio + j_len // ratio]
+                 for i_pos, i_len in zip(y_indices, y_lengths) for j_pos, j_len in zip(x_indices, x_lengths)]
         batch_size = z.shape[0]
-        tile_batch = torch.cat(tiles, dim=0)
-        del tiles
-        hidden_states = self.post_quant_conv(tile_batch)
-        del tile_batch
-        tile_dims = hidden_states.shape[2:]
-        decoded = self.decoder(hidden_states, tokens=True)  # projected and unpatchified tile by tile below: no full-size output tensors
-        del hidden_states
+        frames, tile_height, tile_width = tiles[0].shape[2:]
+        frame_bytes = batch_size * self.decoder.out_channels * width * z.element_size()  # a pixel row of one frame
+        group = self._tiles_per_call(len(tiles), batch_size * (frames * tile_height * tile_width + self.decoder.num_register_tokens + 1),
+                                     frame_bytes * (frames * self.decoder.patch_size_t * y_lengths[0] + self.frame_overlap * height))
 
-        canvas = torch.empty(batch_size, self.decoder.out_channels, tile_dims[0] * self.decoder.patch_size_t, height, width,
-                             dtype=decoded.dtype, device=decoded.device)
+        def decoded_tiles():
+            """The tiles in order, decoded by groups (the decoder's VRAM follows the group) and projected and unpatchified one by one:
+            no full-size output tensors."""
+            for first in range(0, len(tiles), group):
+                hidden_states = self.post_quant_conv(torch.cat(tiles[first : first + group], dim=0))
+                tile_dims = hidden_states.shape[2:]
+                decoded = self.decoder(hidden_states, tokens=True)
+                del hidden_states
+                for index in range(0, decoded.shape[0], batch_size):
+                    yield self.decoder.unpatchify(self.decoder.proj_out(decoded[index : index + batch_size]), *tile_dims)
+                del decoded  # not kept through the next call
+
+        decoded = decoded_tiles()
         row_tails = []
         out_y = 0
-        tile_index = 0
         for i in range(len(y_indices)):
             new_tails = []
-            left_tail = None
+            left_tail = pixels = None
             out_x = 0
             for j in range(len(x_indices)):
-                tile = self.decoder.unpatchify(self.decoder.proj_out(decoded[tile_index * batch_size : (tile_index + 1) * batch_size]), *tile_dims)
-                tile_index += 1
+                tile = next(decoded)
                 if i > 0:
                     tile = self._blend(row_tails[j], tile, y_overlaps[i - 1], dim=-2)
                 if j > 0:
@@ -952,14 +983,14 @@ class AutoencoderKLMiniMaxH3(ModelMixin, ConfigMixin, AttentionMixin, Autoencode
                     tile = tile[..., : -y_overlaps[i], :]
                 if j < len(x_indices) - 1:
                     tile = tile[..., :, : -x_overlaps[j]]
-                if canvas is None:
-                    canvas = torch.empty(*tile.shape[:-2], height, width, dtype=tile.dtype, device=tile.device)
-                canvas[..., out_y : out_y + tile.shape[-2], out_x : out_x + tile.shape[-1]].copy_(tile)
+                if pixels is None:
+                    pixels = torch.empty(*tile.shape[:-1], width, dtype=tile.dtype, device=tile.device)
+                pixels[..., out_x : out_x + tile.shape[-1]].copy_(tile)
                 out_x += tile.shape[-1]
             row_tails = new_tails
-            out_y += tile.shape[-2]
-        del decoded
-        return canvas
+            del tile, left_tail
+            yield out_y, pixels
+            out_y += pixels.shape[-2]
 
     def _prepare_encoder_clip(self, clip: torch.Tensor, device: torch.device | None) -> torch.Tensor:
         """Convert a part of the video to encode (a row of tiles of one clip); the video itself may stay on CPU."""
@@ -1000,7 +1031,8 @@ class AutoencoderKLMiniMaxH3(ModelMixin, ConfigMixin, AttentionMixin, Autoencode
         `token_drop` removed the tail of every encoded chunk, so consecutive decoded chunks overlap by
         `frame_overlap` pixel frames and are linearly cross-faded. Latent frames are repeated at the end when the
         length is not a whole number of chunks; the extra pixel frames are cut off again at the end.
-        Finalized frames are accumulated on CPU; only the current clip and its overlap stay on GPU.
+        Finalized pixels go to the CPU output as each row of tiles is completed; only that row and the frames kept for the next
+        cross-fade stay on GPU.
         """
         tokens_chunk_size = self.tokens_chunk_size
         token_drop = self.config.token_drop
@@ -1036,47 +1068,60 @@ class AutoencoderKLMiniMaxH3(ModelMixin, ConfigMixin, AttentionMixin, Autoencode
             rows = self._split_tiles(height, self.tile_sample_min_height, self.tile_sample_min_overlap_height)[0]
             cols = self._split_tiles(width, self.tile_sample_min_width, self.tile_sample_min_overlap_width)[0]
             spatial_tiles = len(rows) * len(cols)
-        with PhaseProgress(max(1, num_chunks) * spatial_tiles) as progress, progress.track(self.decoder, spatial_tiles):
+        height, width = z.shape[-2] * self.spatial_compression_ratio, z.shape[-1] * self.spatial_compression_ratio
+        with (PhaseProgress(max(1, num_chunks) * spatial_tiles) as progress, progress.track(self.decoder, lambda inputs: inputs[0].shape[0] // z.shape[0]),
+              transfer.RamWriter("decoded video", depth=64, max_bytes=256 << 20) as writer):
             decoded = None
-            write_position = 0
-            overlap = None
+            overlap = None  # the last frames of the previous clip, which cross-fade with the next one: kept in the decoder's precision
 
-            def write_chunk(chunk):
-                # finalized pixels converted and copied to the CPU output by groups of frames (no full-clip conversion copies)
-                nonlocal decoded, write_position
-                copy_frames = min(chunk.shape[2], output_frames - write_position)
+            def write(pixels, row, position):
+                """Finalized pixels (pixel rows from `row` on, frames from output frame `position` on) converted and sent to the CPU
+                output by groups of frames (no clip-sized conversion copies); returns the number of frames."""
+                nonlocal decoded
+                copy_frames = min(pixels.shape[2], output_frames - position)
                 for start in range(0, copy_frames, 4):
-                    part = self._prepare_decoded_chunk(chunk[:, :, start : min(start + 4, copy_frames)], uint8_rounding)
+                    part = self._prepare_decoded_chunk(pixels[:, :, start : min(start + 4, copy_frames)], uint8_rounding)
+                    scale = part.shape[-2] // pixels.shape[-2]  # (2: a decoder that upsamples)
                     if decoded is None:
-                        decoded = torch.empty(*part.shape[:2], output_frames, *part.shape[3:], dtype=part.dtype, device="cpu")
-                    transfer.copy_(decoded[:, :, write_position : write_position + part.shape[2]], part)
-                    write_position += part.shape[2]
+                        decoded = torch.empty(*part.shape[:2], output_frames, height * scale, width * scale, dtype=part.dtype, device="cpu")
+                    target = decoded[:, :, position + start : position + start + part.shape[2], row * scale : row * scale + part.shape[-2]]
+                    if num_chunks:
+                        # neither the GPU nor this thread waits for the RAM: a wait in the middle of a clip would leave the GPU idle
+                        # while the next decoder call is issued
+                        writer.write(target, part)
+                    else:
+                        transfer.copy_(target, part)
                     del part
+                return copy_frames
 
             if num_chunks == 0:
-                # Short videos still need one decode, without an overlapping temporal chunk.
-                write_chunk(self._decode_clip(z)[:, :, frame_pre_padding : frame_pre_padding + output_frames])
+                # Short videos still need one decode, without an overlapping temporal chunk: a picture or a few frames, gathered on
+                # the GPU (the frames that are kept only) and copied at once.
+                frames = slice(frame_pre_padding, frame_pre_padding + output_frames)
+                write(torch.cat([pixels[:, :, frames].clone() for _, pixels in self._decode_clip_rows(z)], dim=-2), 0, 0)
                 return decoded
 
+            write_position = 0
             for i in range(num_chunks):
                 start = i * tokens_chunk_size
-                clip = self._decode_clip(z[:, :, start : start + tokens_chunk_size + self.token_overlap])
-                for j in range(int(token_drop > 0) + 1):
-                    frame_start = j * chunk_num_frames
-                    chunk = clip[:, :, frame_start : frame_start + chunk_num_frames]
-                    chunk = chunk[:, :, self.frame_pre_padding :]
-                    if j == 0:
-                        if overlap is not None:
-                            chunk = self._blend(overlap, chunk, self.frame_overlap, dim=-3)
-                        write_chunk(chunk)
-                    else:
-                        overlap = chunk.contiguous()
-                del chunk, clip
+                for row, pixels in self._decode_clip_rows(z[:, :, start : start + tokens_chunk_size + self.token_overlap]):
+                    rows = slice(row, row + pixels.shape[-2])
+                    chunk = pixels[:, :, self.frame_pre_padding : chunk_num_frames]
+                    if i > 0 and overlap is not None:
+                        chunk = self._blend(overlap[..., rows, :], chunk, self.frame_overlap, dim=-3)
+                    written = write(chunk, row, write_position)
+                    if token_drop > 0:  # what the next clip cross-fades with, written over the rows just read
+                        chunk = pixels[:, :, chunk_num_frames + self.frame_pre_padding : 2 * chunk_num_frames]
+                        if overlap is None:
+                            overlap = torch.empty(*chunk.shape[:3], height, width, dtype=chunk.dtype, device=chunk.device)
+                        overlap[..., rows, :].copy_(chunk)
+                    del chunk, pixels
+                write_position += written
             if overlap is not None:
-                write_chunk(overlap)
+                write_position += write(overlap, 0, write_position)
             if write_position != output_frames:
                 raise RuntimeError(f"MiniMax H3 VAE decoded {write_position} frames, expected {output_frames}")
-            return decoded
+        return decoded
 
     @apply_forward_hook
     def encode(self, x: torch.Tensor, return_dict: bool = True, device: torch.device | None = None) -> AutoencoderKLOutput | tuple[torch.Tensor]:

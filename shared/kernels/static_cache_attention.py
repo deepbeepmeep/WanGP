@@ -7,7 +7,8 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-_RUNTIME = ["COUNT", "SPLITS"]  # query rows of the call and key splits: one binary whatever their values
+_RUNTIME = ["COUNT", "SPLITS", "GROUPS", "KV_HEADS"]  # rows of the call, key splits and the head counts: one binary whatever their values (ROWS_PAD, always a
+# multiple of 16, keeps that single specialization)
 
 
 @triton.jit
@@ -18,8 +19,8 @@ def _load16(ptrs, mask, BF16: tl.constexpr):
 
 
 @triton.jit(do_not_specialize=_RUNTIME, do_not_specialize_on_alignment=_RUNTIME)
-def _static_decode(Q, K, V, SEQLENS, PM, PL, PACC, COUNT, SPLITS, scale, STRIDE_QC, STRIDE_KN, GROUPS: tl.constexpr, KV_HEADS: tl.constexpr,
-                   HEAD_DIM: tl.constexpr, ROWS_PAD: tl.constexpr, BF16: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_N: tl.constexpr):
+def _static_decode(Q, K, V, SEQLENS, PM, PL, PACC, COUNT, SPLITS, scale, STRIDE_QC, STRIDE_KN, GROUPS, KV_HEADS,
+                   HEAD_DIM: tl.constexpr, ROWS_PAD, BF16: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_N: tl.constexpr):
     kv, split, row_block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     seqlen = tl.load(SEQLENS)
     total = seqlen + COUNT  # the keys written so far, this call's included
@@ -57,8 +58,8 @@ def _static_decode(Q, K, V, SEQLENS, PM, PL, PACC, COUNT, SPLITS, scale, STRIDE_
 
 
 @triton.jit(do_not_specialize=_RUNTIME, do_not_specialize_on_alignment=_RUNTIME)
-def _static_decode_tensor(Q, K, V, SEQLENS, PM, PL, PACC, COUNT, SPLITS, scale, STRIDE_QC, STRIDE_KN, GROUPS: tl.constexpr, KV_HEADS: tl.constexpr,
-                          HEAD_DIM: tl.constexpr, ROWS_PAD: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_N: tl.constexpr):
+def _static_decode_tensor(Q, K, V, SEQLENS, PM, PL, PACC, COUNT, SPLITS, scale, STRIDE_QC, STRIDE_KN, GROUPS, KV_HEADS,
+                          HEAD_DIM: tl.constexpr, ROWS_PAD, BLOCK_R: tl.constexpr, BLOCK_N: tl.constexpr):
     """_static_decode on tensor cores, for a BF16 cache (sm_80 and newer, approximate kernels): BF16 scores and weights, as FlashAttention. About 6x faster at thousands of keys."""
     kv, split, row_block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     seqlen = tl.load(SEQLENS)
@@ -98,7 +99,7 @@ def _static_decode_tensor(Q, K, V, SEQLENS, PM, PL, PACC, COUNT, SPLITS, scale, 
 
 
 @triton.jit(do_not_specialize=_RUNTIME, do_not_specialize_on_alignment=_RUNTIME)
-def _static_merge(SEQLENS, PM, PL, PACC, OUT, COUNT, SPLITS, STRIDE_QC, GROUPS: tl.constexpr, KV_HEADS: tl.constexpr, HEAD_DIM: tl.constexpr, ROWS_PAD: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_N: tl.constexpr):
+def _static_merge(SEQLENS, PM, PL, PACC, OUT, COUNT, SPLITS, STRIDE_QC, GROUPS, KV_HEADS, HEAD_DIM: tl.constexpr, ROWS_PAD, BLOCK_R: tl.constexpr, BLOCK_N: tl.constexpr):
     """The splits of _static_decode_tensor that hold keys into BF16 attention outputs, in the layout of the query."""
     kv, row_block = tl.program_id(0), tl.program_id(1)
     total = tl.load(SEQLENS) + COUNT

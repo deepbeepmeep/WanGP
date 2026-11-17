@@ -79,7 +79,7 @@ if triton is not None:
 
     @triton.jit
     def _grouped_tile(q_a, q_b, k_ptr, v_ptr, ks_ptr, vs_ptr, km_ptr, vm_ptr, k_records, v_records, scale_records, columns, valid_rows, valid_columns, rows_limit,
-                      maximum, denominator, acc_a, acc_b, D: tl.constexpr, SCALE: tl.constexpr, K_BITS: tl.constexpr, K_ASYM: tl.constexpr, V_BITS: tl.constexpr, V_ASYM: tl.constexpr,
+                      maximum, denominator, acc_a, acc_b, D: tl.constexpr, SCALE, K_BITS: tl.constexpr, K_ASYM: tl.constexpr, V_BITS: tl.constexpr, V_ASYM: tl.constexpr,
                       IEEE: tl.constexpr = False):
         """One tile of the grouped kernel (the Q8 kernel's arithmetic: FP32 values, high/low BF16 pairs on the tensor cores; IEEE: FP32
         queries and FP32 products for GPUs without BF16 in Triton), the head dimension split in the two lane halves a and b."""
@@ -126,22 +126,23 @@ if triton is not None:
         return new_maximum, denominator, acc_a, acc_b
 
 
-    @triton.jit
+    @triton.jit(do_not_specialize=("Q_PER_SEQ", "TABLE_WIDTH", "H_Q", "H_KV"), do_not_specialize_on_alignment=("Q_PER_SEQ", "TABLE_WIDTH", "H_Q", "H_KV"))
     def mixed_grouped_partials_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, km_ptr, vm_ptr, ko_ptr, vo_ptr, kos_ptr, vos_ptr, tables_ptr, lengths_ptr, base_ptr, ring_ptr,
-                                      partial_ptr, maximum_ptr, sum_ptr, Q_PER_SEQ, H_Q: tl.constexpr, H_KV: tl.constexpr, D: tl.constexpr, PAGE: tl.constexpr, TABLE_WIDTH,
-                                      SPLITS: tl.constexpr, M: tl.constexpr, N: tl.constexpr, SCALE: tl.constexpr,
+                                      partial_ptr, maximum_ptr, sum_ptr, Q_PER_SEQ, H_Q, H_KV, D: tl.constexpr, PAGE: tl.constexpr, TABLE_WIDTH,
+                                      SPLITS: tl.constexpr, M: tl.constexpr, N: tl.constexpr, SCALE,
                                       K_BITS: tl.constexpr, K_ASYM: tl.constexpr, V_BITS: tl.constexpr, V_ASYM: tl.constexpr, OVERLAY: tl.constexpr, SINK: tl.constexpr, RING: tl.constexpr,
-                                      Q_BITS: tl.constexpr = False):
+                                      Q_BITS: tl.constexpr = False, GROUP: tl.constexpr = 1):
         """Decoding and verification: the queries of a sequence that share a KV head attend together; the context is split across programs.
         Q_BITS: BF16 queries read as bits (an int16 pointer), FP32 products (Turing)."""
         sequence, kv_head, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
         split, query_block = tile % SPLITS, tile // SPLITS
-        group: tl.constexpr = H_Q // H_KV
+        group = GROUP  # head counts at runtime, the GQA group (query heads per KV head) a small class: one compile per group ratio
         QB: tl.constexpr = D // 32
         K_WIDTH: tl.constexpr = QB * 4 * K_BITS
         V_WIDTH: tl.constexpr = QB * 4 * V_BITS
         rows = query_block * M + tl.arange(0, M)
-        query_index = sequence * Q_PER_SEQ + rows // group
+        row_query = rows // group
+        query_index = sequence * Q_PER_SEQ + row_query
         query_head = kv_head * group + rows % group
         valid_rows = rows < Q_PER_SEQ * group
         half = tl.arange(0, D // 2)
@@ -155,7 +156,7 @@ if triton is not None:
             q_b = tl.load(q_ptr + q_base + 16, mask=valid_rows[:, None], other=0.0)
         context_len = tl.load(lengths_ptr + sequence)
         prefix_len = context_len - Q_PER_SEQ
-        rows_limit = prefix_len + rows // group
+        rows_limit = prefix_len + row_query
         tiles_per_split = tl.cdiv(tl.cdiv(context_len, N), SPLITS)
         begin = split * tiles_per_split * N
         end = tl.minimum(context_len, (split + 1) * tiles_per_split * N)
@@ -202,7 +203,7 @@ if triton is not None:
 
     @triton.jit
     def _exact_tile(q_a, q_b, qsum, k_ptr, v_ptr, ks_ptr, vs_ptr, km_ptr, vm_ptr, k_records, v_records, scale_records, columns, row_mask, column_mask, rows_limit,
-                    maximum, denominator, acc_a, acc_b, dtype: tl.constexpr, QB: tl.constexpr, softmax_scale: tl.constexpr,
+                    maximum, denominator, acc_a, acc_b, dtype: tl.constexpr, QB: tl.constexpr, softmax_scale,
                     K_BITS: tl.constexpr, K_ASYM: tl.constexpr, V_BITS: tl.constexpr, V_ASYM: tl.constexpr):
         """One tile of the exact prefill kernel: integer codes on the tensor cores, per-block scales (and minimums) on the FP32 partial sums;
         the keys as [QB, 16, N] halves, the values as [QB, N, 16] halves."""
@@ -245,10 +246,10 @@ if triton is not None:
         return tile_maximum, denominator, acc_a, acc_b
 
 
-    @triton.jit
+    @triton.jit(do_not_specialize=("bt_stride", "H_Q", "H_KV"), do_not_specialize_on_alignment=("bt_stride", "H_Q", "H_KV"))  # strides, head counts, scale at runtime
     def mixed_prefill_exact_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, km_ptr, vm_ptr, ko_ptr, vo_ptr, kos_ptr, vos_ptr, block_tables_ptr, cu_q_ptr, cu_k_ptr, base_ptr, ring_ptr, out_ptr,
-                                   q_stride_t: tl.constexpr, q_stride_h: tl.constexpr, bt_stride, out_stride_t: tl.constexpr, out_stride_h: tl.constexpr, softmax_scale: tl.constexpr,
-                                   H_Q: tl.constexpr, H_KV: tl.constexpr, D: tl.constexpr, PAGE: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                                   q_stride_t, q_stride_h, bt_stride, out_stride_t, out_stride_h, softmax_scale,
+                                   H_Q, H_KV, D: tl.constexpr, PAGE: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
                                    K_BITS: tl.constexpr, K_ASYM: tl.constexpr, V_BITS: tl.constexpr, V_ASYM: tl.constexpr, OVERLAY: tl.constexpr, SINK: tl.constexpr, RING: tl.constexpr):
         """Prefill of a chunk over its sequence's pages: exact integer products with per-block scales, as q8_prefill_exact_kernel."""
         QB: tl.constexpr = D // 32
@@ -313,9 +314,9 @@ if triton is not None:
         tl.store(out_ptr + out_base + 16, acc_b * scale, mask=row_mask[None, :, None])
 
 
-    @triton.jit(do_not_specialize=["start", "count"])
+    @triton.jit(do_not_specialize=["start", "count", "TABLE_WIDTH", "H_KV"])  # the KV head count at runtime
     def dense_kernel(data_ptr, scale_ptr, min_ptr, overlay_ptr, overlay_scale_ptr, tables_ptr, cu_k_ptr, base_ptr, ring_ptr, out_ptr, TABLE_WIDTH, start, count,
-                     H_KV: tl.constexpr, D: tl.constexpr, PAGE: tl.constexpr, N: tl.constexpr, BITS: tl.constexpr, ASYM: tl.constexpr,
+                     H_KV, D: tl.constexpr, PAGE: tl.constexpr, N: tl.constexpr, BITS: tl.constexpr, ASYM: tl.constexpr,
                      OVERLAY: tl.constexpr, SINK: tl.constexpr, RING: tl.constexpr):
         """A tile of the positions start .. start + count of a sequence's keys or values dequantized to out [those positions of every sequence,
         H_KV, D] in out's type: the body's codes with their scales (and minimums), the exact Q8 rows of the sink and of the ring where the
@@ -389,7 +390,7 @@ def grouped_attention(q: torch.Tensor, module, context, softmax_scale: float, bl
         q.view(torch.int16) if bits else q, k_cache, v_cache, module.k_scale, module.v_scale, k_min, v_min, *overlay, context.block_tables, context_lens, base, ring, partial, maximum, denominator,
         queries_per_sequence, q.shape[1], kv_heads, head_dim, k_cache.shape[1], context.block_tables.shape[1], splits, block_m, 32, softmax_scale,
         layout.k.bits, layout.k.asymmetric, layout.v.bits, layout.v.asymmetric, has_overlay, layout.sink_tokens(k_cache.shape[1]), max(layout.recent_tokens, 32),
-        Q_BITS=bits, num_warps=num_warps, num_stages=num_stages)
+        Q_BITS=bits, GROUP=q.shape[1] // kv_heads, num_warps=num_warps, num_stages=num_stages)
     if bits:
         bf16_bits._q8_attention_reduce_kernel[(q.shape[0] * q.shape[1],)](partial, maximum, denominator, output.view(torch.int16), splits, head_dim, num_warps=4)
     else:

@@ -126,7 +126,7 @@ class ChainOfZoomRuntime:
             return
         self.release()
         from accelerate import init_empty_weights
-        from models.z_image.autoencoder_kl import AutoencoderKL  # diffusers' AutoencoderKL with lower VRAM peaks (large convolutions by bands of rows)
+        from shared.image_vae.autoencoder_kl import AutoencoderKL  # diffusers' AutoencoderKL with lower VRAM peaks (large convolutions by bands of rows)
         from transformers import AutoConfig, AutoProcessor, CLIPTextModelWithProjection, CLIPTokenizer, GenerationConfig, Qwen2_5_VLForConditionalGeneration, T5Tokenizer
         from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VisionTransformerPretrainedModel
         from shared.llm_engines.lmgp.models.qwen2_5_vl import Qwen2_5_VLForCausalLM

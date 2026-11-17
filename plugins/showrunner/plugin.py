@@ -34,7 +34,7 @@ def advice_for_deepy(context_tokens: int, kv_cache: str, lower_kv_cache: bool, r
     the model with the advised context; on a smaller one, following the advice would push the model out of VRAM."""
     short, large = room_for_context and context_tokens < ADVISED_CONTEXT, lower_kv_cache and kv_cache in ("", "int8")
     context, cache = f"Context Window Tokens to at least 64K (it is {context_tokens // 1000}K)", f"KV Cache Quantization to Q4 or lower (it is {'INT8' if kv_cache else 'BF16'})"
-    where = "In Configuration > Prompt Enhancer / Deepy."
+    where = "In Configuration > Deepy / Prompt Enhancer."
     if short and large:
         return f"For long productions, set Deepy's {context} and its {cache}, which fits that context in less VRAM. {where}"
     if short:
@@ -59,7 +59,7 @@ class WanGPHost:
         if client.unavailable_reason:
             return client.unavailable_reason
         if client.deepy_type != "prime":
-            return "Showrunner needs Deepy Prime (local or with a remote agent): Deepy Zero cannot plan long productions. Choose Prime in Configuration > Prompt Enhancer / Deepy, or make the shots yourself: + Shot, then Render now."
+            return "Showrunner needs Deepy Prime (local or with a remote agent): Deepy Zero cannot plan long productions. Choose Prime in Configuration > Deepy / Prompt Enhancer, or make the shots yourself: + Shot, then Render now."
         return ""
 
     def director_info(self) -> dict:

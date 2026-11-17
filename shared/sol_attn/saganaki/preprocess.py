@@ -22,13 +22,13 @@ HEAD_DIM = 128
 THRESHOLD_GROUP_SIZE = 64
 
 
-@triton.jit(do_not_specialize=['T', 's_b', 's_t', 's_h', 'N'], do_not_specialize_on_alignment=['T', 's_b', 's_t', 's_h', 'N'])
+@triton.jit(do_not_specialize=['T', 's_b', 's_t', 's_h', 'N', 'H'], do_not_specialize_on_alignment=['T', 's_b', 's_t', 's_h', 'N', 'H'])
 def _reduce_kc_kernel(
     k_ptr,
     kc,
     T,
     s_b, s_t, s_h,
-    H: tl.constexpr,
+    H,
     N,
     D: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -58,14 +58,14 @@ def _reduce_kc_kernel(
     )
 
 
-@triton.jit(do_not_specialize=['T', 's_b', 's_t', 's_h', 'N'], do_not_specialize_on_alignment=['T', 's_b', 's_t', 's_h', 'N'])
+@triton.jit(do_not_specialize=['T', 's_b', 's_t', 's_h', 'N', 'H'], do_not_specialize_on_alignment=['T', 's_b', 's_t', 's_h', 'N', 'H'])
 def _reduce_vc_kernel(
     v_ptr,
     vc,
     vamax,
     T,
     s_b, s_t, s_h,
-    H: tl.constexpr,
+    H,
     N,
     D: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -101,12 +101,12 @@ def _reduce_vc_kernel(
         )
 
 
-@triton.jit(do_not_specialize=['N'], do_not_specialize_on_alignment=['N'])
+@triton.jit(do_not_specialize=['N', 'H'], do_not_specialize_on_alignment=['N', 'H'])
 def _reduce_kc_stats_kernel(
     kc_ptr,
     kc_mean,
     kc_var_diag,
-    H: tl.constexpr,
+    H,
     N,
     D: tl.constexpr,
     TILE_D: tl.constexpr,
@@ -144,7 +144,7 @@ def _reduce_kc_stats_kernel(
     )
 
 
-@triton.jit(do_not_specialize=['T', 's_b', 's_t', 's_h', 'N'], do_not_specialize_on_alignment=['T', 's_b', 's_t', 's_h', 'N'])
+@triton.jit(do_not_specialize=['T', 's_b', 's_t', 's_h', 'N', 'H'], do_not_specialize_on_alignment=['T', 's_b', 's_t', 's_h', 'N', 'H'])
 def _diag_threshold_kernel(
     q_ptr,
     kc_mean,
@@ -153,7 +153,7 @@ def _diag_threshold_kernel(
     softmax_scale,
     T,
     s_b, s_t, s_h,
-    H: tl.constexpr,
+    H,
     N,
     D: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -195,13 +195,13 @@ def _diag_threshold_kernel(
     )
 
 
-@triton.jit(do_not_specialize=['T', 's_b', 's_t', 's_h', 'N'], do_not_specialize_on_alignment=['T', 's_b', 's_t', 's_h', 'N'])
+@triton.jit(do_not_specialize=['T', 's_b', 's_t', 's_h', 'N', 'H'], do_not_specialize_on_alignment=['T', 's_b', 's_t', 's_h', 'N', 'H'])
 def _pool_query_kernel(
     q_ptr,
     q_bar,
     T,
     s_b, s_t, s_h,
-    H: tl.constexpr,
+    H,
     N,
     D: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -226,14 +226,14 @@ def _pool_query_kernel(
     )
 
 
-@triton.jit(do_not_specialize=['N'], do_not_specialize_on_alignment=['N'])
+@triton.jit(do_not_specialize=['N', 'H'], do_not_specialize_on_alignment=['N', 'H'])
 def _exact_fused_threshold_kernel(
     q_bar,
     kc_mean,
     kc_second_moment,
     global_threshold,
     softmax_scale,
-    H: tl.constexpr,
+    H,
     N,
     D: tl.constexpr,
     BLOCK_M: tl.constexpr,

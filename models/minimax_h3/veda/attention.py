@@ -116,6 +116,7 @@ class VedaPolicy:
             raise ValueError("H3 Veda tile plans do not match the predictor's layers and heads")
         self.generated, self.reference = _budget(metadata, "target"), _budget(metadata, "ref")
         self.enabled = False
+        self.full_layers = frozenset()  # layers kept on full attention, set by each generation
         self.reset()
 
     def reset(self):
@@ -158,7 +159,8 @@ class VedaPolicy:
                 tiled.gather_index = tiled.perm.clamp_min(0)
                 tiled.scatter_index = torch.where(tiled.perm < 0, layout.sequence_length, tiled.perm)
             self.layouts[shape] = tiled
-        print(f"[MiniMax H3] Veda Triton Attention - {self.generated.describe()}, references {self.reference.describe()}; {choice.how}")
+        full = f"; full attention on layers {', '.join(map(str, sorted(self.full_layers)))}" if self.full_layers else ""
+        print(f"[MiniMax H3] Veda Triton Attention - {self.generated.describe()}, references {self.reference.describe()}; {choice.how}{full}")
 
     def groups(self, layer, heads, device):
         key = (layer, heads.start, heads.stop)

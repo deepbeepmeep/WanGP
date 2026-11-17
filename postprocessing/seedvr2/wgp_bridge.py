@@ -19,8 +19,6 @@ class SeedVR2Bridge(SimpleScaleSuffixMixin):
     TRANSFORMER_FILENAMES = {MODEL_3B: "SeedVR2_3B_bf16.safetensors", MODEL_7B: "SeedVR2_7B_int8_convrot.safetensors"}
     VAE_FILENAME = "SeedVR2_VAE_bf16.safetensors"
     POSITIVE_EMBEDDING_FILENAME = "SeedVR2_pos_emb_bf16.safetensors"
-    AUTO_VAE_TILE_SIZE = 256
-    MAX_VAE_TILE_SIZE = 512
     WINDOW_SIZE_AUTO = 0
     WINDOW_SIZE_UNLIMITED = -1
     WINDOW_SIZE_VALUES = (WINDOW_SIZE_AUTO, 60, 120, 180, 240, 300, *range(360, 1441, 120), WINDOW_SIZE_UNLIMITED)
@@ -179,11 +177,12 @@ class SeedVR2Bridge(SimpleScaleSuffixMixin):
         process_files(**self.query_download_def(spatial_upsampling=spatial_upsampling))
         return True
 
-    def vae_tile_size(self, vae_config: int, output_height: int, output_width: int) -> int:
+    def vae_tile_size(self, vae_config: int, output_height: int, output_width: int) -> tuple[int, int]:
+        """(encode tile, decode tile) of the SeedVR2 VAE for the VAE Tiling setting, from its own measured costs (0: whole frames)."""
         import torch
-        from models.wan.modules.vae import WanVAE
+        from .runtime import vae_tiles
         device_mem_capacity = torch.cuda.get_device_properties(0).total_memory / 1048576 if torch.cuda.is_available() else 0
-        return WanVAE.get_VAE_tile_size(vae_config, device_mem_capacity, False, output_height=output_height, output_width=output_width)
+        return vae_tiles(vae_config, device_mem_capacity, output_height, output_width)
 
     def load_upsampler(self, spatial_upsampling, *, process_files: Callable[..., Any], init_pipe: Callable[..., int], profile, progress_callback=None, **kwargs):
         if self.validate_upsampling(spatial_upsampling, 0):
@@ -199,8 +198,7 @@ class SeedVR2Bridge(SimpleScaleSuffixMixin):
             raise ValueError(f"Unknown SeedVR2 upsampling mode: {spatial_upsampling}")
         scale = split[1]
         output_height, output_width = int(sample.shape[-2] * scale), int(sample.shape[-1] * scale)
-        vae_tile_size = int(self.vae_tile_size(vae_config, output_height, output_width) or self.AUTO_VAE_TILE_SIZE)
-        vae_tile_size = min(vae_tile_size, self.AUTO_VAE_TILE_SIZE if int(vae_config) == 0 else self.MAX_VAE_TILE_SIZE)
+        vae_tile_size = self.vae_tile_size(vae_config, output_height, output_width)
         from .runtime import upscale_video
         if still_image:
             sample = sample.expand(-1, 5, -1, -1)

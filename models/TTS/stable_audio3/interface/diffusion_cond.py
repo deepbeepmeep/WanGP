@@ -220,7 +220,7 @@ def generate_cond(
         pass
     if cmd:
         cmd += " -loglevel error" # make output less verbose in the cmd window
-        subprocess.run(cmd, shell=True, check=True)
+        subprocess.run(cmd, stdin=subprocess.DEVNULL, shell=True, check=True)
 
     # Let's look at a nice spectrogram too
     audio_spectrogram = audio_spectrogram_image(audio, sample_rate=sample_rate)

@@ -179,6 +179,10 @@ class _LowRankRows:
     def rows(module, h, start, stop):
         return F.linear(h, module.up.weight[start:stop])
 
+    @staticmethod
+    def slice_input(h, start, stop):  # rows of the input (offload.linear_input_rows)
+        return h[start:stop]
+
 
 offload.register_row_projection(_LowRankRows())
 

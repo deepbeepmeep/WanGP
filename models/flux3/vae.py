@@ -1,6 +1,7 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import torch
 from models.flux.modules.autoencoder_flux2 import AutoencoderKLFlux2, AutoEncoderParamsFlux2
+from shared.image_vae import tiling
 from shared.utils.phase_progress import vae_decoding_progress, vae_encoding_progress
 
 
@@ -8,11 +9,16 @@ class Flux3VAE(AutoencoderKLFlux2):
     def __init__(self):
         super().__init__(AutoEncoderParamsFlux2())
 
+    # measured VRAM (shared.image_vae.tiling): BF16 autocast, the larger of the routes with and without the Triton convolutions, + 10 %
+    COSTS = {"weights": 0.16, "decode": [(1.05, 0.75), (4.2, 2.8)], "encode": [(1.05, 0.63), (4.2, 2.3)]}
+
     @staticmethod
-    def get_VAE_tile_size(vae_config, device_mem_capacity, mixed_precision):
-        if vae_config == 0:
-            vae_config = 1 if device_mem_capacity >= 16000 else 2 if device_mem_capacity >= 8000 else 3
-        return True, {1: 1024, 2: 512, 3: 256}[vae_config]
+    def get_VAE_tile_size(vae_config, device_mem_capacity, mixed_precision, output_height=None, output_width=None):
+        """(tiling, tile size in pixels): the largest tile within the VAE Tiling setting's share of the VRAM, no tiling when the whole
+        picture fits (tiling.choose_tile)."""
+        # (tiles of a GroupNorm VAE each take their own statistics: 4 levels off the untiled picture on average at 2048 and 1024, more below)
+        tile = tiling.choose_tile(vae_config, device_mem_capacity, Flux3VAE.COSTS, output_height, output_width, (2048, 1024, 512))
+        return tile > 0, tile
 
     def forward(self, x, encode=False, tile_size=1024):
         # Sizes are sample pixels; normalized Flux latents are downsampled by 16.

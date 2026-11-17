@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from shared.attention import sage_staged
 from shared.attention_kit import kv_first_attention
 from shared.kernels import dispatch, ops
+from mmgp import transfer
 from shared.utils.phase_progress import check_abort, vae_decoding_progress
 
 try:
@@ -223,6 +224,38 @@ class PixelUMMDecoder(nn.Module):
         if starts[-1] != length - WINDOW:
             starts.append(length - WINDOW)
         return starts
+
+    @torch.inference_mode()
+    def decode_to_ram(self, latent, to_ram, offset=0):
+        """decode(latent, offset), clamped, returned in RAM in its final form (to_ram: a function of a piece of the video on the GPU,
+        bytes for instance): the frames no later window overlaps go through to_ram and to their place in RAM as soon as their window is
+        blended, without waiting for the GPU; the GPU holds a window and the overlap it shares with the next one, not the video."""
+        frames = latent.shape[2]
+        starts, length = self.window_starts(frames), min(WINDOW, frames)
+        out, pending, first = None, None, 0  # pending: the pixels of frames [first, end) not yet final
+        with vae_decoding_progress(len(starts), self.head.linear), transfer.RamWriter("decoded video", depth=64, max_bytes=256 << 20) as writer:
+            for index, start in enumerate(starts):
+                part = self._predict(latent[:, :, start:start + length], self._noise(latent, offset + start, offset + start + length))[0]
+                pixel_start = start * TUBELET[0]
+                if pending is None:
+                    pending = part
+                else:
+                    end = first + pending.shape[1]
+                    overlap = end - pixel_start
+                    weight = (0.5 - 0.5 * torch.cos(math.pi * torch.arange(1, overlap + 1, device=part.device, dtype=torch.float32) / (overlap + 1)))
+                    weight = weight.view(1, -1, 1, 1).to(part.dtype)
+                    region = pending[:, pixel_start - first:]
+                    region.copy_(region * (1.0 - weight) + part[:, :overlap] * weight)
+                    pending = torch.cat([pending, part[:, overlap:]], dim=1)
+                del part
+                final = (starts[index + 1] if index + 1 < len(starts) else frames) * TUBELET[0]  # (the frames the next window does not touch)
+                piece = to_ram(pending[:, : final - first].clamp(-1, 1))
+                if out is None:
+                    out = torch.empty((piece.shape[0], frames * TUBELET[0], *piece.shape[2:]), dtype=piece.dtype, device="cpu")
+                writer.write(out[:, first:final], piece)
+                pending, first = pending[:, final - first:].clone(), final
+                del piece
+        return out
 
     @torch.inference_mode()
     def decode(self, latent, offset=0, head=None, clamp=True):

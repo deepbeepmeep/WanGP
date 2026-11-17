@@ -351,11 +351,17 @@ class FlashVSRBridge:
         )
 
     def vae_tile_size(self, vae_config: int, output_height: int | None = None, output_width: int | None = None) -> int:
+        """The decoder's tile for the VAE Tiling setting: the Wan VAE's for the full variant, else the TCDecoder's from its own costs
+        (exact tiles of any size: the largest the budget holds)."""
         import torch
         from models.wan.modules.vae import WanVAE
+        from postprocessing.flashvsr.runtime import TCDECODER_COSTS
+        from shared.image_vae import tiling
 
         device_mem_capacity = torch.cuda.get_device_properties(0).total_memory / 1048576 if torch.cuda.is_available() else 0
-        return WanVAE.get_VAE_tile_size(vae_config, device_mem_capacity, False, output_height=output_height, output_width=output_width)
+        if self.settings()[1] == "full":
+            return WanVAE.get_VAE_tile_size(vae_config, device_mem_capacity, False, output_height=output_height, output_width=output_width)
+        return tiling.largest_tile(vae_config, device_mem_capacity, TCDECODER_COSTS, output_height, output_width, step=64, minimum=256)
 
     def download(self, process_files: Callable[..., Any], send_cmd=None, status_text: str | None = None, spatial_upsampling=None) -> bool:
         from shared.utils.download import process_files_def_if_needed

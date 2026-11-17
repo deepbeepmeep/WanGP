@@ -208,6 +208,16 @@ class ProcessRunner:
         return sum(1 for item in list(state.get("items") or []) if str(item.get("status") or "") == "failed")
 
     @staticmethod
+    def _batch_completion_status(state: dict, media_kind: str, message: str):
+        items = state["items"]
+        elapsed_seconds = sum(item["elapsed_seconds"] for item in items)
+        if media_kind == "image":
+            return status_ui.render_process_status_html("Batch Completed", message, elapsed_seconds=elapsed_seconds, eta_seconds=0)
+        total = sum(item["chunks_total"] for item in items)
+        completed = sum(item["chunks_completed"] for item in items)
+        return status_ui.render_chunk_status_html(total, completed, total, "Batch Completed", message, elapsed_seconds=elapsed_seconds, eta_seconds=0)
+
+    @staticmethod
     def _batch_resume_index(state: dict, total_items: int) -> int:
         for index, item in enumerate(list(state.get("items") or [])[:total_items]):
             if str(item.get("status") or "") not in {"success", "failed"}:
@@ -522,7 +532,7 @@ class ProcessRunner:
             message = "Batch already completed. Nothing to do."
             gr.Info(message)
             yield self.ui_update(
-                status_ui.render_process_status_html("Batch Completed", message) if media_kind == "image" else status_ui.render_chunk_status_html(0, 0, 0, "Batch Completed", message),
+                self._batch_completion_status(batch_state, media_kind, message),
                 self.ui_skip,
                 self.ui_skip,
                 batch_status=status_ui.render_batch_status_html(len(items), completed_files, len(items), "", message, failed_files),
@@ -604,7 +614,7 @@ class ProcessRunner:
                     result = ProcessRunResult(source_path=item.source_path, output_path=item.output_path, success=False, message=common.get_error_message(exc) or str(exc))
                 elapsed_seconds = max(0.0, time.time() - file_started_at)
                 item_state["ended_at"] = batch_queue.now_iso()
-                item_state["elapsed_seconds"] = elapsed_seconds
+                item_state["elapsed_seconds"] += elapsed_seconds
                 item_state["actual_output_path"] = result.output_path
                 item_state["chunks_completed"] = int(result.chunks_completed)
                 item_state["chunks_total"] = int(result.chunks_total)
@@ -632,7 +642,7 @@ class ProcessRunner:
             batch_queue.write_state(files.state_path, batch_state)
             batch_queue.append_log(files.log_path, "completed", batch_name=batch_name, total_files=len(items), completed_files=completed_files, failed_files=failed_files)
             yield self.ui_update(
-                status_ui.render_process_status_html("Batch Completed", f"Batch completed. {completed_files} file(s) processed.") if media_kind == "image" else status_ui.render_chunk_status_html(0, 0, 0, "Batch Completed", f"Batch completed. {completed_files} file(s) processed."),
+                self._batch_completion_status(batch_state, media_kind, f"Batch completed. {completed_files} file(s) processed."),
                 self.ui_skip,
                 self.ui_skip,
                 batch_status=status_ui.render_batch_status_html(len(items), completed_files, len(items), "", "Completed.", failed_files),

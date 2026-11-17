@@ -15,6 +15,7 @@ from safetensors.torch import load_file
 from shared.utils import files_locator as fl
 from shared.utils.phase_progress import generation_progress
 from shared.cuda_memory import mmgp_vram_allocator
+from shared.image_vae import tiling
 from shared.utils.hdr import VIDEO_PROMPT_HDR_OUTPUT_FLAG, hdr_linear_to_vae_range, sdr_to_vae_range
 
 from .ltx_core.conditioning import AudioConditionByLatent, AudioConditionByLatentPrefix, AudioConditionByReferenceLatent
@@ -386,8 +387,23 @@ class LTX2SuperModel(torch.nn.Module):
 
 
 class _LTX2VAEHelper:
+    # Measured VRAM of the streamed decoding and encoding above the weights (shared.image_vae.tiling), BF16, the LTX-2, 2.3 and 2.5
+    # VAEs, + 10 %: GiB per latent pixel of a tile (overlaps included), GiB around it. A tile is as large as the VAE Tiling budget
+    # allows: a frame that fits is decoded or encoded whole (one exact tile), whatever its size.
+    DECODE_COSTS, ENCODE_COSTS = (1.46 / 1024, 0.08), (1.5 / 1024, 0.14)
+    # The NAD diffusion decoder (a model of its own, tiles with a halo blended in its trapezoids): GiB above its weights per
+    # megapixel of a spatial tile (clipped to the frame), at WanGP's temporal tile of 120 frames, + 10 % (2026-11-15, 1280x704 x 121,
+    # random latents: 19.5 GiB per megapixel, tiles of 256 pixels 28.7). Its tile is the largest the budget holds, the whole frame
+    # when it fits: each tile recomputes its halo (1280x704 x 121: tiles of 256 pixels 55.7 s, 512 17.8 s, 768 12.5 s, whole 11.3 s;
+    # it had the streamed VAE's tile of 512, or 256 on small cards).
+    NAD_COSTS = {"decode": [(0.0655, 2.07), (0.147, 3.48), (0.262, 6.18), (0.541, 12.74), (0.901, 21.2)]}
+    NAD_TILES = (2048, 1536, 1280, 1024, 768, 640, 512, 384, 256)
+
     def __init__(self, block_size: int = 64) -> None:
         self.block_size = block_size
+        self.weights = (0.0, 0.0)  # GiB of the decoder and of the encoder
+        self.tile_latents = None  # (decoding, encoding) latent pixels per tile within the VAE Tiling budget; None: from the tile size
+        self.diffusion_decoder = False  # the NAD diffusion decoder is loaded (its tile: tile_latents[2], pixels, 0 for whole frames)
 
     def get_VAE_tile_size(
         self,
@@ -397,36 +413,15 @@ class _LTX2VAEHelper:
         output_height: int | None = None,
         output_width: int | None = None,
     ) -> int | tuple[int, int]:
-        if mmgp_vram_allocator():  # no allocator fragmentation to guard against: Default and Low VRAM levels
-            return 256 if vae_config == 3 or device_mem_capacity < 8000 else 512
-        if vae_config >= 4:
-            vae_config = 0
-
-        if vae_config == 0:
-            if mixed_precision:
-                device_mem_capacity = device_mem_capacity / 1.5
-            if device_mem_capacity >= 24000:
-                use_vae_config = 1
-            elif device_mem_capacity >= 8000:
-                use_vae_config = 2
-            else:
-                use_vae_config = 3
-        else:
-            use_vae_config = vae_config
-
-        ref_size = output_height if output_height is not None else output_width
-        if ref_size is not None and ref_size > 480:
-            use_vae_config += 1
-
-        spatial_tile_size = 128
-        if use_vae_config <= 1:
-            spatial_tile_size = 0
-        elif use_vae_config == 2:
-            spatial_tile_size = 512
-        elif use_vae_config == 3:
-            spatial_tile_size = 256
-
-        return spatial_tile_size
+        """Tiles sized by the VRAM budget of the VAE Tiling setting (recorded in tile_latents; half the room above the weights
+        without the MMGP VRAM allocator: PyTorch's fragments, and nothing spills). The value returned sets the overlap of the tiles
+        and the diffusion decoder's own tiles."""
+        budget, room = tiling.vram_budget(vae_config, device_mem_capacity) / tiling.GIB, 1 if mmgp_vram_allocator() else 0.5
+        self.tile_latents = tuple(max(int(room * (budget - weights - around) / per_latent), 64) for weights, (per_latent, around) in zip(self.weights, (self.DECODE_COSTS, self.ENCODE_COSTS)))
+        if self.diffusion_decoder:
+            costs = dict(self.NAD_COSTS, weights=self.weights[0])
+            self.tile_latents += (tiling.choose_tile(vae_config, device_mem_capacity, costs, output_height, output_width, self.NAD_TILES),)
+        return 256 if vae_config == 3 or device_mem_capacity < 8000 else 512
 
 
 def _attach_lora_preprocessor(transformer: torch.nn.Module) -> None:
@@ -702,7 +697,9 @@ def _normalize_temporal_overlap(overlap_frames: int, tile_frames: int) -> int:
     return overlap_frames
 
 
-def _build_tiling_config(tile_size: int | tuple | list | None, fps: float | None) -> TilingConfig | None:
+def _build_tiling_config(tile_size: int | tuple | list | None, fps: float | None, tile_latents: tuple[int, int] | None = None) -> TilingConfig | None:
+    """tile_latents: (decoding, encoding) latent pixels a tile of the streamed VAE may cover (_LTX2VAEHelper.tile_latents), then the NAD
+    diffusion decoder's tile in pixels when it is loaded (0: whole frames)."""
     temporal_tiling_divisor = 1
     spatial_config = None
     if isinstance(tile_size, (tuple, list)):
@@ -719,7 +716,9 @@ def _build_tiling_config(tile_size: int | tuple | list | None, fps: float | None
             overlap = int(math.floor(overlap / 32) * 32)
             if overlap >= tile_size:
                 overlap = max(0, tile_size - 32)
-            spatial_config = SpatialTilingConfig(tile_size_in_pixels=tile_size, tile_overlap_in_pixels=overlap)
+            decode_latents, encode_latents, *diffusion_tile = tile_latents or (None, None)
+            spatial_config = SpatialTilingConfig(tile_size_in_pixels=tile_size, tile_overlap_in_pixels=overlap, decode_tile_latents=decode_latents, encode_tile_latents=encode_latents,
+                                                 diffusion_tile_in_pixels=diffusion_tile[0] if diffusion_tile else None)
 
     temporal_config = None
     if fps is not None and fps > 0:
@@ -1082,6 +1081,8 @@ class LTX2:
         self.audio_embeddings_connector = text_embeddings_connector.audio_embeddings_connector
         self.video_encoder = video_encoder
         self.video_decoder = video_decoder
+        self.vae.weights = tuple(sum(p.numel() * p.element_size() for p in module.parameters()) / tiling.GIB for module in (video_decoder, video_encoder))
+        self.vae.diffusion_decoder = getattr(video_decoder, "is_diffusion_decoder", False)
         self.audio_encoder = audio_encoder
         self.audio_decoder = audio_decoder
         self.vocoder = vocoder
@@ -1173,10 +1174,10 @@ class LTX2:
         source = source.div_(127.5).sub_(1.0) if was_uint8 else source.clamp_(-1.0, 1.0)
         source = source.unsqueeze(0)
         source = source.to(device=self.device, dtype=torch.bfloat16)
-        tiling_config = _build_tiling_config(VAE_tile_size, fps)
+        tiling_config = _build_tiling_config(VAE_tile_size, fps, self.vae.tile_latents)
         if set_progress_status is not None:
             set_progress_status("Audio VAE encoding")
-        waveform = torch.as_tensor(audio_waveform, dtype=torch.float32)
+        waveform = torch.as_tensor(audio_waveform, dtype=torch.float32, device=self.device)
         waveform = waveform.unsqueeze(1) if waveform.ndim == 1 else waveform
         waveform = waveform.T.unsqueeze(0)
         audio_encoder = self.pipeline._get_model("audio_encoder")
@@ -1268,7 +1269,7 @@ class LTX2:
             fusion_previous=fusion_previous,
             fusion_export=fusion_export,
             latent_frame_offset=int(pixel_frame_offset) // 8,
-            tiling_config=_build_tiling_config(VAE_tile_size, fps),
+            tiling_config=_build_tiling_config(VAE_tile_size, fps, self.vae.tile_latents),
             callback=callback,
             set_progress_status=set_progress_status,
             interrupt_check=interrupt_check,
@@ -1710,7 +1711,7 @@ class LTX2:
 
         _append_injected_ref_entries(guiding_images, guiding_images_stage2)
 
-        tiling_config = _build_tiling_config(VAE_tile_size, fps)
+        tiling_config = _build_tiling_config(VAE_tile_size, fps, self.vae.tile_latents)
         def interrupt_check():
             if callback is not None:
                 callback(-1, None, False, True)

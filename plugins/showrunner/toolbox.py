@@ -1011,7 +1011,7 @@ class ShowrunnerToolbox:
         """A plan far longer than the brief asks, or a finished cut short of it (a shorter plan may still be growing, sequence by sequence). A remake lasts as long as its source."""
         if doc["brief"].get("kind") == "remake":
             return []
-        wanted, cut = doc["brief"].get("duration_s") or (0.0 if doc["brief"].get("song") else model.DEFAULT_LENGTH_S), model.cut_length(doc)
+        wanted, cut = model.wanted_length(doc) or 0.0, model.cut_length(doc)
         if wanted and cut < wanted * 0.85 and all(shot["takes"] for shot in doc["shots"] if shot.get("included", True)):
             return [f"The cut lasts {cut:.0f} s and the brief asks for about {wanted:.0f} s. Bring it close (more room on the shots that need it, another shot); if you keep it, say plainly in your report how far it falls short."]
         if not wanted or cut <= wanted * 1.3:

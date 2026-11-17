@@ -2,6 +2,18 @@
 import os
 
 
+def use_selector_event_loop() -> None:
+    if os.name != "nt":
+        return
+    import asyncio
+    import uvicorn.loops.asyncio as uvicorn_asyncio
+
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    # Uvicorn 0.36+ creates its loop directly, bypassing the application's policy.
+    if hasattr(uvicorn_asyncio, "asyncio_loop_factory"):
+        uvicorn_asyncio.asyncio_loop_factory = lambda use_subprocess=False: asyncio.SelectorEventLoop
+
+
 def silence_proactor_connection_reset() -> None:
     if os.name != "nt":
         return

@@ -7,9 +7,12 @@ contracts are explicit: split-half RMS/RoPE rounds after normalization, matrix
 RoPE keeps FP32 until its final cast, and complex RoPE rounds before rotation.
 Whole-head normalization and compact rotary layouts remain model supplied.
 """
+import collections
+import weakref
+
 import torch
 import torch.nn.functional as F
-from mmgp import offload
+from mmgp import cuda_graphs, offload, quant_router
 from . import int8_backend, kernel_policy, native_ops
 from .dispatch import choose, cuda_inference, device_supported, packed_fma, take
 
@@ -69,6 +72,9 @@ def _lora_output(out, y, factor, scale, rank_first):
 
 
 offload.register_lora_output(_lora_output)
+if _triton is not None:  # the row stores of CUDA graph loops over row ranges (offload's RowSource preparation)
+    from . import row_loop_triton as _row_loop_triton
+    offload.register_row_store_at(_row_loop_triton.store_rows_at)
 
 
 def project_many(modules, x_list):
@@ -121,6 +127,57 @@ def norm_modulate(x_list, norm, shift, scale, segments, *, dtype=None):
     for start, stop, row in segments:
         x[start:stop].mul_(1.0 + scale[row]).add_(shift[row])
     return x
+
+
+def rms_norm_(x, eps, weight=None):
+    """x normalized in place over its last dimension by its RMS (times weight), in one Triton pass in FP32 rounded once (as precise as
+    the norm then the weight in 16 bits, two roundings, or more); None where it cannot run (no Triton, a layout whose rows are not one
+    stride apart, D above 16384): the caller keeps its own path."""
+    width = x.shape[-1]
+    if (_triton is None or not cuda_inference(x, dtypes=(torch.bfloat16, torch.float16)) or x.stride(-1) != 1 or width > 16384
+            or weight is not None and (weight.device != x.device or weight.numel() != width)):
+        return None
+    try:
+        rows = x.view(-1, width)
+    except RuntimeError:
+        return None
+    if not choose("RMSNorm", owned_triton=True):
+        return None
+    from . import row_loop_triton
+    row_loop_triton.rms_norm_rows_(rows, eps, None if weight is None else weight.contiguous())
+    return x
+
+
+def rms_norm_modulate_supported(rows, shift=None, scale=None):
+    """Whether rms_norm_modulate runs for these rows (R, D) and modulation rows: Triton, a 16-bit CUDA tensor, D at most 16384."""
+    return (_triton is not None and cuda_inference(rows, dtypes=(torch.bfloat16, torch.float16)) and rows.stride(-1) == 1 and rows.shape[-1] <= 16384
+            and (shift is None or shift.stride(-1) == 1 and scale.stride(-1) == 1 and shift.device == rows.device)
+            and bool(choose("RMSNorm + Modulation", owned_triton=True)))
+
+
+def rms_norm_modulate(rows, eps, count, first=0, shift=None, scale=None, span=0, counter=None, step=0):
+    """The weightless RMSNorm of `count` rows of rows (R, D) from first (+ counter * step, the counter on the device: a CUDA graph loop's),
+    with shift / scale (segments, D) x * (1 + scale[s]) + shift[s] for the segment s = row // span: one Triton pass in FP32, rounded once
+    (against FP64 at most the error of rms_norm then the modulation in 16 bits: tests/test_rms_norm_modulate_precision.py), a new tensor
+    (count, D). Check rms_norm_modulate_supported first."""
+    from . import row_loop_triton
+    return row_loop_triton.rms_norm_modulate(rows, eps, count, first, shift, scale, span, counter, step)
+
+
+def mean_square_scale_(rows, squares, eps, weight):
+    """rows.mul_(squares.add(eps).rsqrt_()).mul_(weight) in one pass, bit-identical (an RMSNorm over all heads applied to a group of
+    heads from statistics taken beforehand): rows (B, T, C), squares (B, T, 1) FP32, weight (C,)."""
+    if (_triton is not None and cuda_inference(rows, dtypes=_LORA_DTYPES) and rows.ndim == 3 and rows.stride(2) == 1 and squares.dtype == torch.float32
+            and squares.shape == (*rows.shape[:2], 1) and weight.shape == rows.shape[2:] and weight.is_contiguous() and choose("Mean-Square Scale", owned_triton=True)):
+        return _triton.mean_square_scale_(rows, squares, eps, weight)
+    return rows.mul_(squares.add(eps).rsqrt_()).mul_(weight)
+
+
+def square_div_(x, count):
+    """x.square_().div_(count) in one pass, bit-identical: x FP32 and contiguous (per-token mean squares from vector norms)."""
+    if _triton is not None and cuda_inference(x, dtypes=(torch.float32,)) and x.is_contiguous() and choose("Square / Divide", owned_triton=True):
+        return _triton.square_div_(x, count)
+    return x.square_().div_(count)
 
 
 def scale_shift(x_list, scale, shift=None, *, in_place=True, frames=False, fused_add=False):
@@ -225,6 +282,33 @@ def _swiglu_of_linear(layer, x):
     return swiglu([out])
 
 
+LORA_RESIDUAL_FUSION = True  # comparison switch
+
+
+_lora_residual_kernel = weakref.WeakKeyDictionary()  # layer -> whether its last _lora_linear_residual_ took lora_triton.residual_ (graph loops follow it)
+
+
+def _lora_linear_residual_(layer, x, residual, scale):
+    """residual += scale * layer(x) (scale: None or one value per output) for a layer whose LoRAs add one low-rank product: its
+    output pass and the residual update in one pass over the rows, with the roundings of layer(x) followed by add_ / addcmul_.
+    False where it does not apply: the caller runs them."""
+    if (not LORA_RESIDUAL_FUSION or _lora_triton is None or residual.dtype != x.dtype or residual.ndim != 2 or residual.stride(1) != 1
+            or not cuda_inference(x, dtypes=_LORA_DTYPES) or not choose("LoRA Output", owned_triton=True)):
+        return False
+    split = offload.linear_output_and_lora(layer, x)
+    if split is None:
+        _lora_residual_kernel[layer] = False
+        return False
+    out, (y, factor, lora_scale, rank_first) = split
+    _lora_residual_kernel[layer] = _lora_triton.supported(out, y, factor, rank_first)
+    if _lora_residual_kernel[layer]:
+        _lora_triton.residual_(residual, out, y, factor, lora_scale, rank_first, scale)
+        return True
+    out.addmm_(y, factor if rank_first else factor.T, beta=1, alpha=lora_scale)
+    residual.add_(out) if scale is None else residual.addcmul_(out, scale)
+    return True
+
+
 def gated_mlp(x_list, gate_proj, up_proj, down_proj, activation):
     """Separate projections with native activation rounding and module hooks.
 
@@ -295,11 +379,39 @@ def linear_residual_(layer, x_list, residual, scale=None):
     return residual.add_(y, alpha=scale) if isinstance(scale, (int, float)) else residual.addcmul_(y, scale.to(y.dtype))
 
 
+def column_input(layer, rows, dtype, device, segments=None, residual=None):
+    """For a layer whose input (rows, in_features) in dtype is computed by ranges of columns (an attention output by groups of
+    heads: attention_kit out_proj=) and then read by project(layer, [input], residual, gate, segments): an object that takes each
+    range as it is ready (append(x_list)) and keeps it as the layer's weight format reads it, smaller than the 16-bit input (INT8
+    layers: half), LoRAs included. The layer's weight format declares it (the column_input of its quantization handler, through
+    mmgp.quant_router.column_input); None when the layer cannot read its input that way."""
+    return quant_router.column_input(layer, rows, dtype, device, segments, residual)
+
+
+def project(layer, x_list, residual=None, gate=None, segments=None):
+    """layer(x), x (..., in_features) handed off in x_list or the layer's column_input(): returned, (..., out_features) ((rows,
+    out_features) from a column input); or, with residual (..., out_features), added to it and residual returned: linear_residual_
+    with gate as its scale, or with segments [(start, stop, row)] over the rows gated_linear with the gate table."""
+    x = take(x_list)
+    if not torch.is_tensor(x):  # a column_input(): its handler's own projection
+        return x.linear() if residual is None else x.linear_residual(residual, gate) if segments is None else x.gated_linear(residual, gate, segments)
+    if residual is None:
+        return layer(x)
+    x_list, x = [x.reshape(*residual.shape[:-1], x.shape[-1])], None
+    return linear_residual_(layer, x_list, residual, gate) if segments is None else gated_linear(layer, x_list, residual, gate, segments)
+
+
+SEGMENT_GATED_GEMM = True  # comparison switch: False runs one linear per segment
+
+
 def gated_linear(layer, x_list, residual, gate, segments):
     """residual[start:stop] += gate[row] * layer(x[start:stop]) for each segment (start, stop, row), written into residual: the INT8
     backend's residual epilogue (one rounding) where the layer supports it, else the layer's output scaled and added in place."""
     x = take(x_list)
     fused = can_linear(layer, x) and residual.dtype == x.dtype and residual.is_contiguous()
+    if fused and SEGMENT_GATED_GEMM and segments and x.dim() == 2 and int8_backend.segment_gated_linear_supported(layer, x):  # one GEMM per chunk of rows
+        from . import row_loop_triton
+        return int8_backend.segment_gated_linear_(layer, x, residual, gate, row_loop_triton.segment_runs(segments))
     for start, stop, row in segments:
         if stop > start:
             target = residual[start:stop]
@@ -336,6 +448,168 @@ def mlp_chunk_rows(tokens, expanded_row_bytes, device, double=False):
     return min(tokens, rows)
 
 
+MLP_PROBE = True  # comparison switch: False keeps mlp_chunk_rows' size
+MLP_PROBED_CHUNKS = 64  # per call with a probed size: a size faster per row may take more chunks than MLP_MAX_CHUNKS
+_mlp_probing = False
+
+
+def _probed_chunk_rows(x, out, fc1, fc2, act, up, residual, scale, rows):
+    """Rows per chunk of this FFN from the probe of its chunk sizes on this GPU (shared.kernels.chunk_rows: once per FFN and GPU, a
+    second or so, on scratch copies of the call's first rows): the size, of at most the rule's `rows` (so never a larger working set),
+    that computes the call's rows fastest, in at most MLP_PROBED_CHUNKS chunks. `rows` where nothing faster is known."""
+    global _mlp_probing
+    from . import chunk_rows
+
+    def kind(layer):  # what changes the kernels a layer runs
+        return f"{getattr(getattr(layer, 'weight_qtype', None), 'name', layer.weight.dtype)}{'+lora' if offload.lora_active(layer) else ''}"
+
+    identity = (f"mlp {act} {fc1.in_features}x{fc1.out_features}x{fc2.out_features} {kind(fc1)} {kind(fc2)}{'' if up is None else ' up ' + kind(up)} "
+                f"{str(x.dtype).rsplit('.', 1)[-1]} int8={int8_backend._backend} residual={'none' if residual is None else 'gated' if scale is not None else 'plain'}")
+
+    def prepare(most):
+        source = x.fill(0, most) if isinstance(x, offload.RowSource) else x[:most].clone()
+        target = None if residual is None else out[:most].clone()
+
+        def launch(count):
+            global _mlp_probing
+            _mlp_probing = True
+            try:
+                mlp([source[:count]], fc1, fc2, act, up=up, residual=None if target is None else target[:count], gate=scale)
+            finally:
+                _mlp_probing = False
+        return launch
+
+    total = x.rows() if isinstance(x, offload.RowSource) else x.shape[0]
+    times = chunk_rows.curve(identity, x.device, "FFN", prepare, min(rows, total))
+    return rows if times is None else chunk_rows.choose(times, total, rows, MLP_PROBED_CHUNKS) or rows
+
+
+MLP_LOOP_COST = 0.001  # share of a turn's chunks' time its pause (as probed: a real body pays somewhat more) may cost: chunks per turn follow (cuda_graphs.loop_turn_size; LTX-2.5 720p FFN, ~1 ms chunks, ConvRot Triton: 1 per turn +0.9 %, 2-3 +0.5 %, 8 +0.3 %)
+MLP_LOOP_CHUNKS_PER_TURN = None  # a fixed number of chunks per turn instead (comparisons, tests)
+_LOOP_ACTIVATIONS = {"gelu": lambda h: torch.ops.aten.gelu_(h, approximate="tanh"), "gelu_erf": lambda h: torch.ops.aten.gelu_(h, approximate="none"),
+                     "silu": torch.ops.aten.silu_}
+mlp_loop_refusals = collections.Counter()  # why mlp() calls recorded in graphs ran without a loop ("looped": those with one)
+cuda_graphs.register_key(lambda: (MLP_LOOP_COST, MLP_LOOP_CHUNKS_PER_TURN, SEGMENT_GATED_GEMM))  # (cuda_graphs.GRAPH_LOOPS is in the key: graphs with and without loops)
+def _chunk_ms(fc2, rows):
+    """The time of a chunk of `rows` rows of this FFN in its block's eager warmup (the call before its capture), None if not timed."""
+    return cuda_graphs.loop_turn_ms(fc2, ("mlp chunk", rows))
+
+
+def _mlp_graph_loop(x, out, fc1, fc2, act, residual, chunks, segments, up=None, chunk_fn=None):
+    """While a CUDA graph is captured, runs mlp()'s chunks as graph loops (mmgp.cuda_graphs.loop): the evenly spaced chunks of one size (a
+    position inside each frame when frames are cut in chunks of two sizes) take one loop, one turn of MLP_LOOP_CHUNKS_PER_TURN chunks recorded
+    once instead of the nodes of every chunk. Two routes, both with the usual path's chunks, kernels and order of operations (the same bits):
+    - kernels: the INT8 kernels find their rows through the loop's counter (ConvRot and Quanto INT8 linears on WGPKernels with row-offset
+      entry points or on the Triton backend, LoRAs through their counter forms), an activation in place, one fc2 fuses into its quantizer
+      (packed SwiGLU, WGPKernels) or a SwiGLU of a separate up projection: no copies (the Triton backend adds fc2's output to the
+      residual rows by the counter, as the usual path's own addition);
+    - generic (any other weight format and backend: Kitchen, FP8, 16-bit, GGUF): the turn's input rows, residual rows and segment
+      gate gathered at fixed addresses (row_loop_triton), mlp()'s own chunk (chunk_fn) run on them, the output rows stored back: three
+      copies of a chunk's rows; it needs the loop's allocations in the graph's pool (cuda_graphs.loop_allocations).
+    One gate, or one per segment of equal size from row 0. x may be an offload.RowSource with fill_at, whose rows each turn then makes in
+    the loop's body. Returns the chunks left for the usual path."""
+    source = None if isinstance(x, torch.Tensor) else x
+    sample = lambda rows, width: torch.empty((rows, width), dtype=x.dtype, device=x.device)  # shapes for the kernels' choices (no kernel runs)
+    refusal = "no loops" if not cuda_graphs.loop_available(x.device) else "gate without residual" if residual is None and segments[0][2] is not None else None
+    span, gate = 0, segments[0][2]
+    if refusal is None and len(segments) > 1:  # a gate per segment: the kernels read the vector of their rows' segment
+        span = segments[0][1] - segments[0][0]
+        if any(start != index * span or stop != start + span for index, (start, stop, _) in enumerate(segments)):
+            refusal = "uneven segments"
+        gate = torch.stack([scale for *_, scale in segments])
+    if refusal:
+        mlp_loop_refusals[refusal] += 1
+        return chunks
+    from . import row_loop_triton
+    generic = chunk_fn is not None and cuda_graphs.loop_allocations()
+    fusable = act if up is None and act in ("gelu", "swiglu") else None
+    fused = fusable if fusable and can_linear(fc2, sample(1, fc1.out_features), act=fusable) else None  # the usual path's choice
+    lora1, lora2, lora_up = offload.lora_active(fc1), offload.lora_active(fc2), up is not None and offload.lora_active(up)
+    kernel_refusal = ("SwiGLU of fc1's LoRA pass" if fusable == "swiglu" and fused is None
+                      else "activation" if fused is None and act not in _LOOP_ACTIVATIONS and not (act == "swiglu" and up is not None)
+                      else "LoRA without graph pool" if (lora1 or lora2 or lora_up) and not cuda_graphs.loop_allocations()
+                      else "LoRA output" if lora2 and (residual is None or not _lora_residual_kernel.get(fc2, False)) else None)
+    if kernel_refusal and not generic:
+        mlp_loop_refusals[kernel_refusal] += 1
+        return chunks
+    left, groups = [], {}
+    for chunk in chunks:
+        groups.setdefault(chunk[1] - chunk[0], []).append(chunk)
+    counter, activation = None, None if fused is not None or up is not None or act not in _LOOP_ACTIVATIONS else _LOOP_ACTIVATIONS[act]
+    for size, members in groups.items():
+        stride = members[1][0] - members[0][0] if len(members) > 1 else 0
+        if len(members) < 2 or any(first != members[0][0] + index * stride for index, (first, *_) in enumerate(members)):
+            left += members
+            continue
+        per_turn = (min(MLP_LOOP_CHUNKS_PER_TURN, len(members)) if MLP_LOOP_CHUNKS_PER_TURN
+                    else cuda_graphs.loop_turn_size(x.device, _chunk_ms(fc2, size), len(members), MLP_LOOP_COST))
+        turns = len(members) // per_turn
+        if turns == 1:  # chunks too short for their pauses: one turn would hold them all, as many nodes as without a loop
+            mlp_loop_refusals["short chunks"] += 1
+            left += members
+            continue
+        base, step = members[0][0], per_turn * stride
+        fills = None if source is None else [source.fill_at(base + index * stride, step, size) for index in range(per_turn)]
+        if fills is not None and None in fills:
+            mlp_loop_refusals["row source fill"] += 1
+            left += members
+            continue
+        linears = None
+        if kernel_refusal is None:
+            h, value = sample(size, fc1.out_features), None if up is None else sample(size, up.out_features)
+            # a linear with LoRAs runs as in the usual path (module hooks, cuBLAS) on rows at fixed addresses made in the body: fc1 (and up)
+            # on the turn's rows gathered or filled there, fc2 on h, its LoRA output and residual update by the counter form of lora_triton.residual_
+            x_rows = sample(size, fc1.in_features) if source is not None else x
+            first_linear = None if lora1 else int8_backend.row_loop_linear(fc1, x_rows, size)
+            up_linear = None if up is None or lora_up else int8_backend.row_loop_linear(up, x_rows, size)
+            second_linear = None if lora2 else int8_backend.row_loop_linear(fc2, h, size, act=fused, out_at=True)
+            if not (first_linear is None and not lora1 or second_linear is None and not lora2 or up is not None and up_linear is None and not lora_up):
+                linears = first_linear, up_linear, second_linear
+        if linears is None and not generic:
+            mlp_loop_refusals["linears"] += 1
+            left += members  # the groups looped already stay looped
+            continue
+        counter = torch.empty(1, dtype=torch.int64, device=x.device) if counter is None else counter
+
+        def project(linear, module, lora, rows, target):  # module(the turn's rows): rows gathered or filled at fixed addresses, else by the counter
+            if lora:
+                return module(rows)
+            linear(x, target, counter, x_at=(first, step)) if rows is None else linear(rows, target, counter)
+            return target
+        with cuda_graphs.loop(turns, counter):
+            for index in range(per_turn):
+                first = base + index * stride
+                rows = None
+                if linears is None:  # generic: mlp()'s own chunk on the turn's rows gathered at fixed addresses, its output rows stored back
+                    rows = fills[index](counter) if source is not None else row_loop_triton.copy_rows_at(x, counter, first, step, size)
+                    target = rows if residual is None else row_loop_triton.copy_rows_at(out, counter, first, step, size)  # out is x without residual
+                    scale = gate if not span else row_loop_triton.segment_row_at(gate, counter, first, step, span)
+                    chunk_fn(rows, target, scale)
+                    row_loop_triton.store_rows_at(out, target, counter, first, step)
+                    rows = target = scale = None
+                    continue
+                first_linear, up_linear, second_linear = linears
+                if source is not None or lora1 or lora_up:  # the turn's input rows, made in the body (from the graph's pool)
+                    rows = fills[index](counter) if source is not None else row_loop_triton.copy_rows_at(x, counter, first, step, size)
+                h = project(first_linear, fc1, lora1, rows, h)
+                if up is not None:  # silu(gate) * value in place on h, as the usual path
+                    h = swiglu([h, project(up_linear, up, lora_up, rows, value)], packed=False)
+                elif activation is not None:
+                    activation(h)
+                rows = None
+                if lora2:
+                    base_out, (y, factor, lora_scale, rank_first) = offload.linear_output_and_lora(fc2, h)
+                    row_loop_triton.lora_residual_at(out, base_out, y, factor, lora_scale, rank_first, gate, counter, first, step, span)
+                    del base_out, y
+                else:
+                    second_linear(h, out, counter, out_at=(first, step), residual=residual, residual_scale=gate, scale_span=span)
+        mlp_loop_refusals["looped"] += 1
+        mlp_loop_refusals["generic route" if linears is None else "kernel route"] += 1
+        mlp_loop_refusals[f"{per_turn} per turn ({_chunk_ms(fc2, size) or 0:.2f} ms chunks)"] += 1
+        left += members[turns * per_turn:]
+    return left
+
+
 def gate_segments(gate, batch, tokens):
     """mlp() segments for a gate of shape (batch or 1, groups, dim) over an input (batch, tokens, dim): groups is 1, or a number of
     frames that divides the tokens. A gate per token does not fit segments: apply it after mlp()."""
@@ -353,42 +627,73 @@ def mlp(x_list, fc1, fc2, act, *, up=None, prefix=None, residual=None, gate=None
     single-stream blocks of Flux, whose second linear takes the attention output and the MLP together). gate is one vector per channel
     for all tokens, or segments [(start, stop, vector)] over the flattened tokens (frames, spans, batch rows: gate_segments). Where
     the INT8 backend supports it, the activation is fused into fc2's kernel (gelu, packed swiglu, without prefix) and the gated residual
-    into its epilogue, rounded once; otherwise the activation runs in place and the residual update follows. Returns x, or residual."""
+    into its epilogue, rounded once; otherwise the activation runs in place and the residual update follows. Returns x, or residual.
+    x may be an mmgp offload.RowSource when residual is given: each chunk of rows is made (its fill) just before fc1 reads it, so that
+    the input is never whole (a normalized and modulated copy of the residual: a chunk reads its own rows before its output is added)."""
     x = take(x_list)
-    shape, x = x.shape, x.view(-1, x.shape[-1])
-    out = x if residual is None else residual.view(-1, x.shape[-1])
+    source = x if isinstance(x, offload.RowSource) else None
+    shape, dim = x.shape, x.shape[-1]
+    total = source.rows() if source is not None else x.numel() // dim
+    if source is None:
+        x = x.view(-1, dim)
+    out = x if residual is None else residual.view(-1, dim)
+    chunk_of = source.fill if source is not None else lambda first, last: x[first:last]
     prefix = None if prefix is None else prefix.view(-1, prefix.shape[-1])
     # working set per row: the fc1 (and up) output, plus the concatenated fc2 input that coexists with it for a prefix MLP
     width = fc1.out_features + (0 if up is None else up.out_features) + (0 if prefix is None else prefix.shape[-1] + fc1.out_features)
-    rows = mlp_chunk_rows(x.shape[0], width * x.element_size(), x.device, double=up is not None or prefix is not None)
+    rows = total if _mlp_probing else mlp_chunk_rows(total, width * x.dtype.itemsize, x.device, double=up is not None or prefix is not None)
+    if (MLP_PROBE and not _mlp_probing and prefix is None and rows < total
+            and cuda_inference(source.fill(0, 1) if source is not None else x, dtypes=_LORA_DTYPES)):
+        # a chunk size that this GPU computes faster per row than the rule's, when its probe knows one
+        rows = _probed_chunk_rows(x, out, fc1, fc2, act, up, residual, gate if segments is None else segments[0][2], rows)
     fusable = act if up is None and prefix is None and act in ("gelu", "swiglu") else None
-    for start, stop, scale in [(0, x.shape[0], gate)] if segments is None else segments:
-        scale = None if scale is None else scale.reshape(-1).to(out.dtype)
-        for first in range(start, stop, rows):
-            last = min(first + rows, stop)
-            # an activation that fc2's kernel cannot take (fc2 has a LoRA, whose product needs it) can still share fc1's pass over its rows
-            h = _swiglu_of_linear(fc1, x[first:last]) if fusable == "swiglu" and not can_linear(fc2, x, act=fusable) else None
-            activated = h is not None
-            h = h if activated else fc1(x[first:last])
-            fused = fusable if not activated and fusable and can_linear(fc2, h, act=fusable) else None
-            if fused is None and not activated:
-                h = (situ([h, up(x[first:last])], packed=False) if act == "situ" and up is not None else situ([h]) if act == "situ"
-                     else swiglu([h, up(x[first:last])], packed=False) if up is not None else swiglu([h]) if act == "swiglu"
-                     else torch.ops.aten.silu_(h) if act == "silu" else torch.ops.aten.gelu_(h, approximate="tanh" if act == "gelu" else "none"))
-            if prefix is not None:
-                h = torch.cat((prefix[first:last], h), dim=-1)
-            target = out[first:last]
-            if target.dtype == h.dtype and (fused is not None or (residual is not None and can_linear(fc2, h))):
-                linear(fc2, [h], input_act=fused, residual=None if residual is None else target, residual_scale=scale, out=target)
-                continue
-            y = linear(fc2, [h], input_act=fused) if fused is not None else fc2(h)
-            del h
-            if residual is None:
-                target.copy_(y)
-            elif scale is None:
-                target.add_(y)
+    segments = [(start, stop, None if scale is None else scale.reshape(-1).to(out.dtype)) for start, stop, scale in ([(0, total, gate)] if segments is None else segments)]
+    chunks = [(first, min(first + rows, stop), scale) for start, stop, scale in segments for first in range(start, stop, rows)]
+
+    def chunk(rows_in, target, scale, prefix_rows=None):
+        """One chunk: rows_in (the chunk's input rows) through the FFN into target (its output rows: residual rows updated, else written),
+        gated by scale. CUDA graph loops run it on rows at fixed addresses (_mlp_graph_loop's generic route): the same calls."""
+        # an activation that fc2's kernel cannot take (fc2 has a LoRA, whose product needs it) can still share fc1's pass over its rows
+        h = _swiglu_of_linear(fc1, rows_in) if fusable == "swiglu" and not can_linear(fc2, rows_in, act=fusable) else None
+        activated = h is not None
+        h = h if activated else fc1(rows_in)
+        fused = fusable if not activated and fusable and can_linear(fc2, h, act=fusable) else None
+        if fused is None and not activated:
+            h = (situ([h, up(rows_in)], packed=False) if act == "situ" and up is not None else situ([h]) if act == "situ"
+                 else swiglu([h, up(rows_in)], packed=False) if up is not None else swiglu([h]) if act == "swiglu"
+                 else torch.ops.aten.silu_(h) if act == "silu" else torch.ops.aten.gelu_(h, approximate="tanh" if act == "gelu" else "none"))
+        rows_in = None
+        if prefix_rows is not None:
+            h = torch.cat((prefix_rows, h), dim=-1)
+        if target.dtype == h.dtype and (fused is not None or (residual is not None and can_linear(fc2, h))):
+            linear(fc2, [h], input_act=fused, residual=None if residual is None else target, residual_scale=scale, out=target)
+            return
+        if fused is None and residual is not None and _lora_linear_residual_(fc2, h, target, scale):
+            return  # fc2's LoRA output and the residual update share one pass
+        y = linear(fc2, [h], input_act=fused) if fused is not None else fc2(h)
+        del h
+        if residual is None:
+            target.copy_(y)
+        elif scale is None:
+            target.add_(y)
+        else:
+            target.addcmul_(y, scale)
+
+    with int8_backend.chunked_rows():  # the chunks are sized here: the INT8 kernels take each one whole
+        loops = not _mlp_probing and cuda_graphs.recording() and cuda_graphs.loop_available(out.device)
+        if loops and torch.cuda.is_current_stream_capturing():
+            refusal = ("row source" if source is not None and (source.fill_at is None or not cuda_graphs.loop_allocations()) else "prefix" if prefix is not None
+                       else "up projection" if up is not None and act not in ("swiglu", "situ") else None)
+            if refusal:
+                mlp_loop_refusals[refusal] += 1
             else:
-                target.addcmul_(y, scale)
+                chunks = _mlp_graph_loop(source if source is not None else x, out, fc1, fc2, act, residual, chunks, segments, up, chunk)
+        timed = loops and not torch.cuda.is_current_stream_capturing()  # the eager warmup: every chunk timed (the shortest of a size is kept)
+        for first, last, scale in chunks:
+            end = cuda_graphs.loop_turn_begin(fc2, ("mlp chunk", last - first)) if timed else None
+            chunk(chunk_of(first, last), out[first:last], scale, None if prefix is None else prefix[first:last])
+            if end is not None:
+                end()
     return out.view(shape)
 
 
@@ -556,11 +861,13 @@ def sol_rms_rope_(x, weight, rope, eps):
     return x
 
 
-def compact_rope_(x, cache, layout, head_start=0, dim_head=None):
+def compact_rope_(x, cache, layout, head_start=0, dim_head=None, token0=0, counter=None, step=0):
     """Try compact split RoPE without materializing token-sized tables.
 
     False leaves x untouched for the model's layout-specific PyTorch fallback.
     Norm over all heads and its prepared statistics are deliberately external.
+    token0 (+ counter * step, a CUDA graph loop's turn: the native Triton kernel only): x's tokens are the layout's from that token,
+    rotated with the layout's whole tables in one launch.
     """
     native = _triton is not None and cuda_inference(x, approximate=True)
     bits = not native and _bf16_bits_eligible(x, approximate=True)  # below the BF16 floor: x and BF16 tables as bits
@@ -572,9 +879,12 @@ def compact_rope_(x, cache, layout, head_start=0, dim_head=None):
     dtype = torch.float32 if cache.use_fp32_freqs else x.dtype
     valid = valid and all(t.device == x.device and t.dtype == dtype and t.is_contiguous()
                           for t in (*layout.axis_cos, *layout.axis_sin))
-    if not choose("Compact Split RoPE", owned_triton=valid):
+    if (token0 or counter is not None) and bits or not choose("Compact Split RoPE", owned_triton=valid):
         return False
-    (_bits_triton if bits else _triton).split_rope(x, cache, layout, head_start, dim_head)
+    if token0 or counter is not None:
+        _triton.split_rope(x, cache, layout, head_start, dim_head, token0, counter, step)
+    else:
+        (_bits_triton if bits else _triton).split_rope(x, cache, layout, head_start, dim_head)
     torch.autograd.graph.increment_version(x)
     return True
 

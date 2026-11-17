@@ -62,9 +62,10 @@ class SelfAttention(nn.Module):
         self.k_rms_norm = MultiHeadRMSNorm(self.head_dim, heads)
         self.to_out = nn.Linear(channels, channels)
 
-    def attend(self, x_list, rope):
+    def attend(self, x_list, rope, residual=None, gate=None, segments=None):
         """Attention output (batch, tokens, heads, head_dim) before to_out. Upstream norm then RoPE: the norm output rounded, then
-        rotated in FP32 and rounded (or quantized for SageAttention)."""
+        rotated in FP32 and rounded (or quantized for SageAttention). With residual (rows, channels), gate and segments: residual +=
+        gate * to_out(attention) per segment (ops.gated_linear), returned."""
         def norm_rope(query, key, group):
             ops.interleaved_norm_rope_(query, key, rope, self.q_rms_norm.heads(group.q), self.k_rms_norm.heads(group.kv))
 
@@ -72,7 +73,8 @@ class SelfAttention(nn.Module):
             return ops.split_half_norm_rope_quant_(query, key, rope, self.q_rms_norm.heads(group.q), self.k_rms_norm.heads(group.kv), core, settings,
                                                    interleaved=True)
 
-        return attention_kit.qkv_attention(x_list, self.to_q, self.to_k, self.to_v, self.heads, self.head_dim, norm_rope, fused_quant=fused_quant)
+        return attention_kit.qkv_attention(x_list, self.to_q, self.to_k, self.to_v, self.heads, self.head_dim, norm_rope, fused_quant=fused_quant,
+                                           out_proj=None if residual is None else self.to_out, residual=residual, gate=gate, segments=segments)
 
 
 class CrossAttention(nn.Module):
@@ -123,8 +125,7 @@ class TransformerBlock(nn.Module):
         rows = x.view(-1, x.shape[-1])
         spans = [(0, rows.shape[0], 0)]
         # each attention input is handed off in its list: the attention releases it after its projections
-        y = self.self_attn.attend([ops.norm_modulate([rows], self.norm1, shift_msa, scale_msa, spans).view(x.shape)], rope)
-        ops.gated_linear(self.self_attn.to_out, [y.view(rows.shape)], rows, gate_msa, spans)
+        self.self_attn.attend([ops.norm_modulate([rows], self.norm1, shift_msa, scale_msa, spans).view(x.shape)], rope, rows, gate_msa, spans)  # rows += gate * to_out(attention)
         y = self.cross_attn.attend([self.norm2(x)], context)
         ops.linear_residual_(self.cross_attn.to_out, [y.view(rows.shape)], rows)
         del y

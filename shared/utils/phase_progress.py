@@ -159,11 +159,12 @@ class PhaseProgress:
 
     @contextmanager
     def track(self, module, count=1):
-        """Count completed module calls without changing its forward/offload contract."""
+        """Count completed module calls without changing its forward/offload contract. count: the units of one call, or a function of
+        the call's inputs (a batch of tiles)."""
         if self.state is None:
             yield
             return
-        handle = module.register_forward_hook(lambda *_: self.advance(count))
+        handle = module.register_forward_hook(lambda _module, inputs, _output: self.advance(count(inputs) if callable(count) else count))
         try:
             yield
         finally:

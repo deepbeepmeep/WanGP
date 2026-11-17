@@ -1,0 +1,4 @@
+{
+    "alt_prompt": "accent:british=1.5, authority=3, room=2",
+    "help": "A clear, authoritative British newsreader in a clean studio. Changes the voice itself (speaker-embedding conditioning)."
+}

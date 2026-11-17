@@ -19,6 +19,7 @@
 # Modifications Copyright (c) 2025-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 from shared.utils.phase_progress import text_encoding_prompts, text_encoding_progress
 import inspect
+import math
 from typing import Any, Callable, Dict, List, Optional, Union, Tuple
 import torch
 import torch.distributed as dist
@@ -48,9 +49,10 @@ from diffusers.utils import BaseOutput
 
 from ...constants import PRECISION_TO_TYPE
 from ...vae.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
+from shared.image_vae.output import float_to_video_bytes
 from ...text_encoder import TextEncoder
 from ...modules import HYVideoDiffusionTransformer
-from mmgp import offload
+from mmgp import offload, runtime
 from ...utils.data_utils import black_image
 from einops import rearrange
 from shared.utils.text_encoder_cache import TextEncoderCache
@@ -1663,7 +1665,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                     device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
                 ):
                     
-                    if self.do_classifier_free_guidance and multi_passes_free_guidance:
+                    if self.do_classifier_free_guidance and (multi_passes_free_guidance or not runtime.joint_pass_useful(self.transformer, math.prod(latents.shape[2:]) // math.prod(self.transformer.patch_size), self.transformer.hidden_size, latent_items)):
                         for j in range(len(latent_model_input)):
                             ret = self.transformer(  # For an input image (129, 192, 336) (1, 256, 256)
                                 latent_model_input[j].unsqueeze(0),  # [2, 16, 33, 24, 42]
@@ -1814,14 +1816,16 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             with torch.autocast(
                 device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
             ):
+                # decoded piece by piece into RAM in its final form: a video as the bytes WanGP makes of it, a picture in float32
+                to_ram = float_to_video_bytes if latents.shape[2] > 1 else torch.Tensor.float
                 if enable_tiling:
                     self.vae.enable_tiling()
                     image = self.vae.decode(
-                        latents, return_dict=False, generator=generator
+                        latents, return_dict=False, generator=generator, to_ram=to_ram
                     )[0]
                 else:
                     image = self.vae.decode(
-                        latents, return_dict=False, generator=generator
+                        latents, return_dict=False, generator=generator, to_ram=to_ram
                     )[0]
 
             if expand_temporal_dim or image.shape[2] == 1:
@@ -1831,7 +1835,8 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             image = latents
 
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
-        image = image.cpu().float()
+        if image.dtype != torch.uint8:
+            image = image.cpu().float()
 
         # if i2v_mode and i2v_condition_type == "latent_concat":
         #     image = image[:, :, 4:, :, :]

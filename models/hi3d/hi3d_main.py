@@ -113,12 +113,13 @@ class model_factory:
 
     def _object_image(self, image):
         """Upstream framing of the object; an image without transparency first goes through rembg BiRefNet General."""
-        digest = _image_digest(image)
+        from preprocessing.rembg.assets import OBJECT_MODEL, selected_model
+        digest = (_image_digest(image), selected_model(OBJECT_MODEL))
         if self._prepared[0] != digest:
             source = image
             if not (has_alpha(image) and image.convert("RGBA").getextrema()[3][0] < 255):
                 set_phase_status("Removing Background")
-                from rembg import remove
+                from preprocessing.rembg.native import remove
                 from preprocessing.rembg.assets import OBJECT_MODEL
                 from shared.utils.utils import new_rembg_session
                 source = remove(image.convert("RGB"), session=new_rembg_session(OBJECT_MODEL))

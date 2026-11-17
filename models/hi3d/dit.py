@@ -98,8 +98,9 @@ class SelfAttention(nn.Module):
         self.k_rms_norm = MultiHeadRMSNorm(self.head_dim, heads)
         self.to_out = nn.Linear(channels, channels)
 
-    def attend(self, x_list, rope):
-        """Upstream rotates q and k before their norms: rotation and norm in FP32, rounded once (or quantized for SageAttention)."""
+    def attend(self, x_list, rope, residual=None, gate=None, segments=None):
+        """Upstream rotates q and k before their norms: rotation and norm in FP32, rounded once (or quantized for SageAttention).
+        With residual (rows, channels), gate and segments: residual += gate * to_out(attention) per segment (ops.gated_linear), returned."""
         def rope_norm(query, key, group):
             ops.interleaved_norm_rope_(query, key, rope, self.q_rms_norm.heads(group.q), self.k_rms_norm.heads(group.kv), rope_first=True)
 
@@ -107,7 +108,8 @@ class SelfAttention(nn.Module):
             return ops.split_half_norm_rope_quant_(query, key, rope, self.q_rms_norm.heads(group.q), self.k_rms_norm.heads(group.kv), core, settings,
                                                    interleaved=True, rope_first=True)
 
-        return attention_kit.qkv_attention(x_list, self.to_q, self.to_k, self.to_v, self.heads, self.head_dim, rope_norm, fused_quant=fused_quant)
+        return attention_kit.qkv_attention(x_list, self.to_q, self.to_k, self.to_v, self.heads, self.head_dim, rope_norm, fused_quant=fused_quant,
+                                           out_proj=None if residual is None else self.to_out, residual=residual, gate=gate, segments=segments)
 
 
 class CrossAttention(nn.Module):
@@ -153,8 +155,7 @@ class TransformerBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (self.modulation.float() + mod.float()).chunk(6, dim=1)
         spans = [(0, x.shape[0], 0)]
         y = ops.norm_modulate([x], self.norm1, shift_msa, scale_msa, spans)
-        y = self.self_attn.attend([y.unsqueeze(0)], rope)
-        ops.gated_linear(self.self_attn.to_out, [y.reshape(x.shape)], x, gate_msa, spans)
+        y = self.self_attn.attend([y.unsqueeze(0)], rope, x, gate_msa, spans)  # x += gate * to_out(attention)
         if context is None:
             x.add_(self.cross_attn.null_output(x.dtype))
         else:

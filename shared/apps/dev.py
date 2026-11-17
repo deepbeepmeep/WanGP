@@ -84,15 +84,18 @@ HELPERS = {
 _REMBG = []
 
 
-def cut_out(picture):
-    """The subject of a picture with its background made transparent (WanGP's background remover, on the CPU), cropped to it with a margin."""
-    from rembg import remove
+def cut_out(picture, interrupted=None):
+    """Make the background transparent with the selected GPU model, then crop with a margin."""
+    from preprocessing.rembg.native import remove
 
     from shared.utils.utils import new_rembg_session
+    from preprocessing.rembg.assets import selected_model
 
+    if _REMBG and _REMBG[0].model_name != selected_model():
+        _REMBG.clear()
     if not _REMBG:
         _REMBG.append(new_rembg_session())
-    cut = remove(picture.convert("RGB"), session=_REMBG[0], alpha_matting=True)
+    cut = remove(picture.convert("RGB"), session=_REMBG[0], alpha_matting=_REMBG[0].model_name == "u2net", interrupted=interrupted)
     box = cut.getchannel("A").point(lambda value: 255 if value > 8 else 0).getbbox()
     if box is None:
         raise ValueError("No subject was found in the picture: nothing would remain once its background is removed.")
@@ -108,6 +111,7 @@ class AppWorkshop:
         self.sandbox = Path(sandbox_root).resolve()
         self.root = self.sandbox / "apps"
         self._resolve_path, self._publish_app, self._virtualize = resolve_path, publish_app, virtualize
+        self.interrupted = lambda: False
 
     def describe(self) -> dict[str, Any]:
         return {"templates": bundles.TEMPLATES, "import_map": sorted(bundles.import_map()["imports"]), "apps": self.names(), "rules": RULES, "helpers": HELPERS}
@@ -291,7 +295,7 @@ class AppWorkshop:
                 image.load()
                 picture = image.convert("RGBA" if suffix in (".png", ".webp") and ("A" in image.getbands() or "transparency" in image.info) else "RGB")
             if transparent:
-                picture = cut_out(picture)
+                picture = cut_out(picture, interrupted=self.interrupted)
             if max_size:
                 picture.thumbnail((int(max_size), int(max_size)), Image.LANCZOS)
             picture.save(target, **({"quality": 90} if suffix in (".jpg", ".jpeg", ".webp") else {"optimize": True}))

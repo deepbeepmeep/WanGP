@@ -21,7 +21,7 @@ from einops import rearrange
 from safetensors.torch import load_file
 from tqdm import tqdm
 
-from mmgp import offload
+from mmgp import offload, transfer
 from models.wan.modules.vae import WanVAE
 from postprocessing.memory import minimal_vram
 from shared.utils import offload_registry
@@ -42,6 +42,9 @@ FLASHVSR_PLUS_MODELS = (FLASHVSR_MODEL_PLUS_TURBO,)
 
 FLASHVSR_TOPK_RATIO = 0.0  # 0 = auto area-scaled ratio; >0 = fixed sparse attention ratio.
 FLASHVSR_FULL_MIN_AUTO_TOPK_RATIO = 1.5
+# The TCDecoder's VRAM (GiB; points: megapixels of a tile or a whole frame, peaks above the weights over a stream's steps, its memories
+# included, + 10 %): tcdecoder_lab of the VAE round of 2026-11-15
+TCDECODER_COSTS = {"weights": 0.08, "decode": [(0.0655, 0.23), (0.147, 0.44), (0.262, 0.74), (0.59, 1.47), (1.049, 2.63), (2.359, 5.61), (8.356, 16.8)]}
 FLASHVSR_KV_CACHE_WINDOWS = 1  # Stream cache windows kept between denoise chunks; each window is two latent frames.
 FLASHVSR_CONTINUE_CACHE_FRAMES = 11
 
@@ -252,6 +255,16 @@ def _decoded_frames_to_cpu(frames: torch.Tensor, frame_count: int, height: int, 
     frames_cpu = torch.empty(tuple(frames.shape), dtype=torch.float32, device="cpu")
     frames_cpu.copy_(frames)
     return frames_cpu
+
+
+def _frames_to_ram(frames: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    """Decoded frames (B, C, F, H, W) in [-1, 1] on the GPU: WanGP's bytes (those of _normalized_video_to_cpu_uint8), converted there
+    frame by frame and written to RAM as they come (into `out`, a RAM view of the same shape, or a new tensor)."""
+    out = torch.empty(frames.shape, dtype=torch.uint8, device="cpu") if out is None else out
+    with transfer.RamWriter("decoded video", depth=64, max_bytes=256 << 20) as writer:
+        for index in range(frames.shape[2]):
+            writer.write(out[:, :, index], frames[:, :, index].float().clamp_(-1.0, 1.0).add_(1.0).mul_(127.5).round_().clamp_(0, 255).to(torch.uint8))
+    return out
 
 
 def _normalized_video_to_cpu_uint8(frames: torch.Tensor) -> torch.Tensor:
@@ -631,8 +644,9 @@ class FlashVSRRuntime:
             cur_lq = cur_lq.to(self.device, dtype=self.dtype)
             frames = self.tcdecoder.decode_video(latents.transpose(1, 2), parallel=False, show_progress_bar=False, cond=cur_lq).transpose(1, 2).mul_(2).sub_(1)
             del cur_lq
+            frames = _frames_to_ram(frames)
             _report_progress(progress_callback, "TCDecoder Decoding", progress_step + 1 if progress_step is not None else None, progress_total)
-            return _normalized_video_to_cpu_uint8(frames), tile_mems
+            return frames, tile_mems
 
         # exact tiles (tile_plan): each decoder module computes only what the next ones need; per tile the MemBlock memory of its regions
         latent_tile = max(1, tile_size // 8)
@@ -667,9 +681,8 @@ class FlashVSRRuntime:
                 self.tcdecoder.clean_mem()
                 if frames_out is None:
                     frames_out = torch.empty((tile_frames.shape[0], tile_frames.shape[1], tile_frames.shape[2], output_height, output_width), dtype=torch.uint8, device="cpu")
-                tile_cpu = _normalized_video_to_cpu_uint8(tile_frames)
-                frames_out[:, :, :, write_y0:write_y1, write_x0:write_x1].copy_(tile_cpu)
-                del cur_lq_tile, cur_latents, tile_frames, tile_cpu
+                _frames_to_ram(tile_frames, frames_out[:, :, :, write_y0:write_y1, write_x0:write_x1])
+                del cur_lq_tile, cur_latents, tile_frames
         del cur_lq
         _report_progress(progress_callback, "TCDecoder Decoding", progress_step + 1 if progress_step is not None else None, progress_total)
         return frames_out, tile_mems

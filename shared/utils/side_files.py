@@ -33,6 +33,13 @@ def process_side_files(media_path, side_files, *, return_files=False):
     return named
 
 
+def remove_side_files(media_path):
+    """Delete the companions saved beside a media file, and their list."""
+    path = Path(media_path)
+    for target in [*saved_side_files(path).values(), path.with_name(path.name + '.wangp-files.json')]:
+        target.unlink(missing_ok=True)
+
+
 def saved_side_files(media_path):
     """suffix -> path of the companions saved beside a media file (listed in its .wangp-files.json), those still on disk."""
     path = Path(media_path)

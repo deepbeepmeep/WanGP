@@ -3,38 +3,17 @@ import triton
 import triton.language as tl
 
 
-@triton.jit(do_not_specialize=['N'], do_not_specialize_on_alignment=['N'])
-def _modulate(X, SCALE, SHIFT, N, D: tl.constexpr, BLOCK: tl.constexpr):
-    i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    valid = i < N
-    if D % BLOCK == 0:
-        col = (tl.program_id(0) % (D // BLOCK)) * BLOCK + tl.arange(0, BLOCK)
-    else:
-        col = i % D
-    x = tl.load(X + i, valid, 0).to(tl.float32)
-    scale = tl.load(SCALE + col, valid, 0).to(X.dtype.element_ty).to(tl.float32)
-    shift = tl.load(SHIFT + col, valid, 0).to(X.dtype.element_ty).to(tl.float32)
-    factor = (1.0 + scale).to(X.dtype.element_ty).to(tl.float32)
-    scaled = (x * factor).to(X.dtype.element_ty).to(tl.float32)
-    tl.store(X + i, scaled + shift, valid)
-
-
 def norm_modulate(x, norm, shift, scale, segments, dtype=None):
+    """norm(x) (cast to dtype when given), then per segment (start, stop, row) x * (1 + scale[row]) + shift[row] with the roundings of
+    the eager path in the output's dtype, one launch per run of consecutive segments (row_loop_triton.modulate_runs)."""
+    from shared.kernels import row_loop_triton
     output = norm(x)
     if dtype is not None:
         output = output.to(dtype)
-    width = x.shape[-1]
-    for start, stop, row in segments:
-        if stop > start:
-            size = (stop-start) * width
-            _modulate[(triton.cdiv(size, 1024),)](
-                output[start:stop], scale[row], shift[row], size, width, 1024,
-                enable_fp_fusion=False)
-    torch.autograd.graph.increment_version(output)
-    return output
+    return row_loop_triton.modulate_runs(output, shift, scale, segments, False)
 
 
-# Below the modulation kernel, whose line numbers are part of Triton's cache keys.
+# Line numbers of the kernels below are part of Triton's cache keys.
 import torch
 from triton.language.extra import libdevice
 from shared.kernels.triton_tuner import LaunchTuner
@@ -49,6 +28,8 @@ _ROPE_RUNTIME = ['ROWS', 'HEADS', 'SEQ', 'XB', 'XS', 'XH', 'RB', 'RS', 'RH', 'WH
 def _rms_rope(X, W, ROPE, ROWS, HEADS, SEQ, XB, XS, XH, RB, RS, RH, WH, EPS, RP: tl.constexpr, RC: tl.constexpr, D: tl.constexpr,
               PAIRS: tl.constexpr, BLOCK: tl.constexpr, INTERLEAVED: tl.constexpr, ROPE_FIRST: tl.constexpr, PER_HEAD: tl.constexpr,
               DP: tl.constexpr):
+    # D and PAIRS stay constexprs: head-dim classes shared by models (64, 128, ...); at runtime they cost 30 to 80 % (partner loads
+    # no longer vectorized, specs/TRITON_SHAPE_RANGE_AUDIT_20261116.md)
     """Rows (batch, token, head) of Q or K, loaded whole (DP: D rounded up to a power of two): weighted RMSNorm in FP32 rounded to the
     activation dtype (the norm output), then the rotation of the first 2 * PAIRS channels in FP32 with one final rounding (cos / sin
     pairs of ROPE): channel p with p + PAIRS (split halves) or, INTERLEAVED, 2p with 2p + 1 (a complex table viewed as real); the other
@@ -147,7 +128,7 @@ install_triton_compilation_logger()
 
 
 @triton.jit(do_not_specialize=['N', 'MOD_STRIDE'], do_not_specialize_on_alignment=['N', 'MOD_STRIDE'])
-def _scale_shift(X, SCALE, SHIFT, Y, N, MOD_STRIDE, D: tl.constexpr, PER_TOKEN: tl.constexpr, BLOCK: tl.constexpr):
+def _scale_shift(X, SCALE, SHIFT, Y, N, MOD_STRIDE, D, PER_TOKEN: tl.constexpr, BLOCK: tl.constexpr, DIVIDES: tl.constexpr):
     i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     # A grid row owns one conditioning row and all tokens that borrow it.
     # No runtime integer divisions are needed to recover batch/frame indices.
@@ -155,7 +136,7 @@ def _scale_shift(X, SCALE, SHIFT, Y, N, MOD_STRIDE, D: tl.constexpr, PER_TOKEN: 
     offset = group * N + i
     if PER_TOKEN:
         s = i
-    elif D % BLOCK == 0:
+    elif DIVIDES:  # BLOCK divides the width D (runtime): the program's columns, from its index alone
         s = group * MOD_STRIDE + (tl.program_id(0) % (D // BLOCK)) * BLOCK + tl.arange(0, BLOCK)
     else:
         s = group * MOD_STRIDE + i % D
@@ -172,8 +153,9 @@ def scale_shift(x, scale, shift, in_place):
     per_token = scale.shape[1] == x.shape[1] and scale.is_contiguous()  # strided per-token rows go through the row groups
     groups = 1 if per_token else scale.shape[0] * scale.shape[1]
     size = x.numel() // groups
-    _scale_shift[(triton.cdiv(size, 1024), groups)](
-        x, scale, shift, out, size, modulation_stride(scale), x.shape[2], per_token, 1024,
+    block, divides = scale_shift_block(x.shape[2], per_token)
+    _scale_shift[(triton.cdiv(size, block), groups)](
+        x, scale, shift, out, size, modulation_stride(scale), x.shape[2], per_token, block, divides,
         enable_fp_fusion=False)
     if in_place:
         torch.autograd.graph.increment_version(out)
@@ -197,23 +179,34 @@ def _axis_ids(rope_axes):
     return tuple(rope_axes) + (0,) * (3 - len(rope_axes))
 
 
+def scale_shift_block(width, per_token):
+    """(BLOCK, DIVIDES) of _scale_shift: the largest power of two up to 1024 dividing the width (a program's columns then come from its
+    index, no division per element), 1024 and a modulo per element for widths not divisible by 128."""
+    block = width & -width
+    return (1024, False) if per_token or block < 128 else (min(block, 1024), True)
+
+
 def modulation_stride(scale):
     """Elements between consecutive modulation rows: LTX hands unbind views of a (B, T, K, D) projection, stride K * D."""
     return scale.stride(1) if scale.shape[1] > 1 else scale.stride(0)
 
 
-@triton.jit(do_not_specialize=['N', 'TOKENS', 'WIDTH', 'G0', 'G1', 'G2', 'BATCH_STRIDE', 'HEAD_START'], do_not_specialize_on_alignment=['N', 'TOKENS', 'WIDTH', 'G0', 'G1', 'G2', 'BATCH_STRIDE', 'HEAD_START'])
+@triton.jit(do_not_specialize=['N', 'TOKENS', 'WIDTH', 'G0', 'G1', 'G2', 'BATCH_STRIDE', 'HEAD_START', 'TOKEN0', 'STEP', 'PAD', 'FREQ_WIDTH'], do_not_specialize_on_alignment=['N', 'TOKENS', 'WIDTH', 'G0', 'G1', 'G2', 'BATCH_STRIDE', 'HEAD_START', 'TOKEN0', 'STEP', 'PAD', 'FREQ_WIDTH'])
 def _split_rope(X, C0, S0, C1, S1, C2, S2, N, TOKENS,
-                WIDTH, HALF: tl.constexpr, PAD: tl.constexpr,
+                WIDTH, HALF: tl.constexpr, PAD,
                 AXES: tl.constexpr, G0, G1, G2, A0: tl.constexpr, A1: tl.constexpr, A2: tl.constexpr,
-                FREQ_WIDTH: tl.constexpr, BATCH_STRIDE, HEAD_START,
-                FP32: tl.constexpr, BLOCK: tl.constexpr):
+                FREQ_WIDTH, BATCH_STRIDE, HEAD_START,
+                FP32: tl.constexpr, BLOCK: tl.constexpr, COUNTER=None, TOKEN0=0, STEP=0, HAS_COUNTER: tl.constexpr = False):
+    # X's tokens are the layout's tokens from TOKEN0 (+ counter * STEP: a CUDA graph loop's turn), the tables the layout's own
     i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     f = i % (WIDTH // 2)
     token = i // (WIDTH // 2) % TOKENS
     batch = i // (WIDTH // 2) // TOKENS
     head, local = f // HALF, f % HALF
     offset = batch * BATCH_STRIDE + token * WIDTH + head * HALF * 2 + local
+    token = token + TOKEN0
+    if HAS_COUNTER:
+        token = token + tl.load(COUNTER) * STEP
     f = f + HEAD_START * HALF
     axis = (f - PAD) % AXES
     col = (f - PAD) // AXES
@@ -250,11 +243,52 @@ def _split_rope(X, C0, S0, C1, S1, C2, S2, N, TOKENS,
     tl.store(X + offset + HALF, libdevice.add_rn(b, libdevice.mul_rn(x0, s)), valid)
 
 
-def split_rope(x, cache, layout, head_start=0, dim_head=None):
+def split_rope(x, cache, layout, head_start=0, dim_head=None, token0=0, counter=None, step=0):
+    """x's tokens: the layout's from token0 (+ counter * step, the counter on the device: a CUDA graph loop's turn), its whole tables."""
     cos, sin = layout.axis_cos, layout.axis_sin
     pointers = tuple(value for a in range(3) for value in (cos[min(a, len(cos)-1)], sin[min(a, len(sin)-1)]))
     size = x.numel() // 2
     return _split_rope[(triton.cdiv(size, 256),)](
         x, *pointers, size, x.shape[1], x.shape[2], (dim_head or x.shape[2] // cache.num_attention_heads) // 2,
         cache.pad_size, len(cos), *(layout.grid_sizes + (1,) * (3 - len(layout.grid_sizes))), *_axis_ids(cache.rope_axes), cos[0].shape[1],
-        x.stride(0), head_start, cache.use_fp32_freqs, 256, enable_fp_fusion=False)
+        x.stride(0), head_start, cache.use_fp32_freqs, 256, counter, token0, step, counter is not None, enable_fp_fusion=False)
+
+@triton.jit(do_not_specialize=['TOKENS', 'WIDTH', 'X_BATCH', 'X_TOKEN', 'S_BATCH', 'S_TOKEN'],
+            do_not_specialize_on_alignment=['TOKENS', 'WIDTH', 'X_BATCH', 'X_TOKEN', 'S_BATCH', 'S_TOKEN'])
+def _mean_square_scale(X, SQUARES, WEIGHT, TOKENS, WIDTH, X_BATCH, X_TOKEN, S_BATCH, S_TOKEN, EPS, BLOCK: tl.constexpr):
+    # rows.mul_(squares.add(eps).rsqrt_()) then rows.mul_(weight): FP32 products, each rounded to the rows' dtype as PyTorch does
+    row = tl.program_id(0).to(tl.int64)
+    batch, token = row // TOKENS, row % TOKENS
+    column = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    valid = column < WIDTH
+    inverse = libdevice.rsqrt(tl.load(SQUARES + batch * S_BATCH + token * S_TOKEN) + EPS)
+    pointer = X + batch * X_BATCH + token * X_TOKEN + column
+    scaled = (tl.load(pointer, valid, 0).to(tl.float32) * inverse).to(X.dtype.element_ty).to(tl.float32)
+    tl.store(pointer, (scaled * tl.load(WEIGHT + column, valid, 0).to(tl.float32)).to(X.dtype.element_ty), valid)
+
+
+def mean_square_scale_(rows, squares, eps, weight):
+    """rows (B, T, C, channels contiguous) scaled in place by rsqrt(squares + eps) (squares (B, T, 1) FP32), then by weight (C)."""
+    block = min(1024, triton.next_power_of_2(rows.shape[2]))
+    _mean_square_scale[(rows.shape[0] * rows.shape[1], triton.cdiv(rows.shape[2], block))](
+        rows, squares, weight, rows.shape[1], rows.shape[2], rows.stride(0), rows.stride(1), squares.stride(0), squares.stride(1), eps, block,
+        enable_fp_fusion=False)
+    torch.autograd.graph.increment_version(rows)
+    return rows
+
+
+@triton.jit(do_not_specialize=['N'], do_not_specialize_on_alignment=['N'])
+def _square_scale(X, N, INVERSE, BLOCK: tl.constexpr):
+    i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(X + i, i < N, 0)
+    tl.store(X + i, (x * x) * INVERSE, i < N)
+
+
+def square_div_(x, count):
+    """x (FP32, contiguous) = x.square_().div_(count) in place, with PyTorch's roundings: its division by a number multiplies by the
+    FP32 reciprocal."""
+    inverse = float(torch.tensor(1.0, dtype=torch.float32) / torch.tensor(float(count), dtype=torch.float32))
+    _square_scale[(triton.cdiv(x.numel(), 1024),)](x, x.numel(), inverse, 1024, enable_fp_fusion=False)
+    torch.autograd.graph.increment_version(x)
+    return x
+

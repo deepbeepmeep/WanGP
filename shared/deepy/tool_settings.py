@@ -390,6 +390,7 @@ def _load_wangp_settings_payload(source_path: Path) -> dict[str, Any]:
             payload = json.load(reader)
     if not isinstance(payload, dict):
         raise TypeError(f"WanGP settings file '{Path(source_path).name}' must contain a JSON object.")
+    payload.pop("client_id", None)  # the id of the run the file was saved from: every task built on it would get that run's output back
     return payload
 
 
@@ -651,6 +652,7 @@ def _load_static_tool_preset(tool_name: str, variant: str) -> dict[str, Any]:
         payload = json.load(reader)
     if not isinstance(payload, dict):
         raise TypeError(f"Deepy preset '{preset_path.name}' must contain a JSON object.")
+    payload.pop("client_id", None)  # a saved run's id: tasks built on the template would get that run's output back
     return payload
 
 

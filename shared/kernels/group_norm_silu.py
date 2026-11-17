@@ -302,7 +302,7 @@ if triton is not None:
         batch = tl.program_id(1).to(tl.int64)
         index = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         valid = index < SIZE
-        address = batch * SN + FIRST * SH + index
+        address = batch * SN + (batch * 0 + FIRST) * SH + index  # FIRST * SH in 64 bits: past 2^31 elements from row 2048 of a 4096 x 256-channel image
         if GAPPED:
             address += index // (W * C) * (SH - W * C)
         affine = A + (batch * C + index % C) * 4

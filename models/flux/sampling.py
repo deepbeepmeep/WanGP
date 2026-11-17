@@ -649,7 +649,7 @@ def denoise(
     if loras_slists is not None:
         from shared.utils.loras_mutipliers import update_loras_slists
         update_loras_slists(model, loras_slists, len(original_timesteps))
-    from mmgp import offload
+    from mmgp import offload, runtime
     # this is ignored for schnell
     guidance_vec = torch.full((img.shape[0],), guidance, device=img.device, dtype=img.dtype)
     if is_piflow and len(timesteps) > 1:
@@ -690,7 +690,7 @@ def denoise(
                     img_input_ids = torch.cat((img_input_ids, img_cond_seq_ids), dim=1)
                 else:
                     kwargs.update(reference_latents=img_cond_seq, reference_ids=img_cond_seq_ids, kv_cache=kv_cache)
-            if not joint_pass or cfg_scale == 1:
+            if cfg_scale == 1 or not (joint_pass and runtime.joint_pass_useful(model, img_input.shape[1] + txt.shape[1], model.hidden_size)):
                 noise_pred = model(
                     img=img_input,
                     img_ids=img_input_ids,

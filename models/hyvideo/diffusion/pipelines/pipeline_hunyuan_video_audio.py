@@ -20,8 +20,10 @@
 from shared.utils.phase_progress import text_encoding_prompts
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Union, Tuple
+import math
 import numpy as np
 import torch
+from mmgp import runtime
 from packaging import version
 from diffusers.utils import BaseOutput
 from dataclasses import dataclass
@@ -1326,7 +1328,7 @@ class HunyuanVideoAudioPipeline(DiffusionPipeline):
                             "pipeline": self,
                             "step_no": i,
                         }
-                        if joint_pass:
+                        if joint_pass and (not self.do_classifier_free_guidance or runtime.joint_pass_useful(self.transformer, math.prod(latent_model_input.shape[2:]) // math.prod(self.transformer.patch_size), self.transformer.hidden_size, latent_items)):
                             additional_kwargs.update({
                                 "motion_exp": motion_exp_input,        
                                 "motion_pose": motion_pose_input,     

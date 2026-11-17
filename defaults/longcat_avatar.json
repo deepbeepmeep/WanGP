@@ -1,8 +1,8 @@
 {
     "model": {
-        "name": "LongCat Avatar Single 13.6B",
+        "name": "LongCat Avatar 1.0 Single 13.6B",
         "architecture": "longcat_avatar",
-        "description": "LongCat Avatar (single speaker) for audio-driven character video.",
+        "description": "LongCat Avatar 1.0 (single speaker) for audio-driven character video.",
 		"one_speaker_only": true,		
         "URLs": [
             "https://huggingface.co/DeepBeepMeep/LongCat/resolve/main/longcat_avatar_single_bf16.safetensors",

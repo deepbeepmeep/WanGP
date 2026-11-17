@@ -52,6 +52,12 @@ class TinyVAE(nn.Module):
     def forward(self, latents, image=False, abort_check=None, video=False, duration=None):
         # Input is WanGP's existing C,T,H,W preview contract. Image batches
         # occupy T; temporal video decoders must not mix those images.
+        # A preview runs in the decoder's own dtype, whatever autocast the generation runs under (Kandinsky 5 previews from inside a BF16
+        # autocast: its PyTorch layers then gave BF16 activations to the band kernels, whose weights are FP16).
+        with torch.autocast(latents.device.type, enabled=False):
+            return self._forward(latents, image, abort_check, video, duration)
+
+    def _forward(self, latents, image, abort_check, video, duration):
         value = latents.permute(1, 0, 2, 3).to(next(self.net.parameters()))
         video = video and not image
         count = (len(value) - 1) * self.net.t_upscale + 1 if self.config['kind'] == 'video' and not image else len(value)
@@ -73,10 +79,11 @@ class TinyVAE(nn.Module):
 
         if self.config['kind'] != 'video':
             frames = []
-            for index in indices:
-                if abort_check is not None and abort_check():
-                    return None
-                frames.append(to_pixels(self.net(value[index:index + 1])))
+            with self.net.kernels(value) as together:  # small frames are decoded several at a time
+                for first in range(0, len(indices), together):
+                    if abort_check is not None and abort_check():
+                        return None
+                    frames.append(to_pixels(self.net(value[indices[first:first + together]])))
             pixels = torch.cat(frames)
         elif image:
             frames = []

@@ -78,6 +78,7 @@ class _Recording:
         self.patched = []
         self.t0 = 0.0  # the library's recording clock starts with start()
         self.event_cursor = self.release_cursor = 0  # the MMGP events (events.py) and releases already reported
+        self.ranges, self.ranges_at = {}, None  # per phase: seconds spent in it and what the large address ranges did meanwhile (_range_marks)
 
 
 def _library():
@@ -285,11 +286,30 @@ def active():
     return _rec is not None
 
 
+_RANGE_COUNTERS = ("created", "created_bytes", "reserve_us", "reused", "released", "unmapped", "unmap_us")
+
+
+def _range_marks(rec):
+    """Adds to the phase that ends what the large address ranges did since the last mark, and the time spent in it."""
+    from . import range_stats
+    now, counters = time.perf_counter(), range_stats()
+    if counters is None:
+        return
+    if rec.ranges_at is not None and rec.phase is not None:
+        since, before = rec.ranges_at
+        totals = rec.ranges.setdefault(rec.phase, dict.fromkeys(("seconds",) + _RANGE_COUNTERS, 0))
+        totals["seconds"] += now - since
+        for key in _RANGE_COUNTERS:
+            totals[key] += counters[key] - before[key]
+    rec.ranges_at = (now, counters)
+
+
 def mark(name):
     """The allocations that follow count for the peak of phase `name` (a phase seen before continues its peak)."""
     rec = _rec
     if rec is None:
         return
+    _range_marks(rec)
     if name not in rec.phase_ids:
         rec.phase_ids[name] = len(rec.phase_names)
         rec.phase_names.append(name)
@@ -332,6 +352,7 @@ def reset():
     lib.vmm_debug_reset()
     lib.vmm_reset_peaks(_device())
     rec.phase = None
+    rec.ranges, rec.ranges_at = {}, None
     mark("start")
 
 
@@ -484,9 +505,16 @@ def report(path=None):
                          "files": {model_id: info["files"] for model_id, info in release["models"].items() if info["files"]},
                          "vram_still_held_gb": round(sum(group["mb"] for group in held) / 1024, 3), "groups": held})
     rec.release_cursor = len(_events.releases)
-    from . import stats
+    from . import stats, range_stats
+    _range_marks(rec)
+    now = range_stats()
+    ranges = None if now is None else {
+        "phases": [{"name": name, "seconds": round(totals["seconds"], 2), "created": totals["created"], "created_gb": round(totals["created_bytes"] / GB, 1), "reused": totals["reused"],
+                    "released": totals["released"], "reserve_ms": round(totals["reserve_us"] / 1000, 1), "unmapped": totals["unmapped"], "unmap_ms": round(totals["unmap_us"] / 1000, 1)}
+                   for name, totals in rec.ranges.items()],
+        "free_ranges": now["free_ranges"], "free_gb": round(now["free_bytes"] / GB, 1), "unmaps_pending": now["unmaps_pending"], "budget": None if now["budget"] < 0 else now["budget"]}
     allocator = {key: round(value / GB, 3) if key not in ("chunks", "live_large", "recoveries") else value for key, value in stats().items()}
-    result = {"created": time.strftime("%Y-%m-%d %H:%M:%S"), "threshold_mb": rec.min_mb, "allocator": allocator, "phases": phases, "reserved_peaks": reserved_peaks, "out_of_memory": oom, "live_now": live, "origins": origins[:200],
+    result = {"created": time.strftime("%Y-%m-%d %H:%M:%S"), "threshold_mb": rec.min_mb, "allocator": allocator, "address_ranges": ranges, "phases": phases, "reserved_peaks": reserved_peaks, "out_of_memory": oom, "live_now": live, "origins": origins[:200],
               "releases": releases, "events": _events.as_json(entries, rec.t0),
               "stacks": {str(stack_id): [_frame_text(code, line) for code, line in rec.stack_frames[stack_id][:40]] for stack_id in sorted(used) if stack_id >= 0}}
     if path:
@@ -546,6 +574,25 @@ def _coverage_warnings(result):
     return warnings
 
 
+def _ranges_summary(ranges):
+    """The address ranges of the tensors of 256 MiB and more, per phase: a freed one keeps its addresses for the next tensor of its size;
+    beyond a budget of free ranges the oldest are released by a background thread. Time spent reserving them is host time lost."""
+    lines = ["## Address ranges of large tensors (256 MiB and more)\n\n"]
+    budget = "no budget" if ranges["budget"] is None else f"budget {ranges['budget']} ranges per pool"
+    lines.append(f"Free ranges now: {ranges['free_ranges']} holding {ranges['free_gb']:.1f} GiB of addresses ({budget}); {ranges['unmaps_pending']} waiting to be unmapped.\n\n")
+    slow = [phase for phase in ranges["phases"] if phase["reserve_ms"] >= max(500, 50 * phase["seconds"])]
+    if slow:
+        lines.append("**Reserving and mapping address ranges took " + ", ".join(f"{phase['reserve_ms'] / 1000:.1f} s of the {phase['seconds']:.0f} s of {phase['name']}" for phase in slow)
+                     + "**: host time during which the GPU waits (expected: a few ms per range).\n\n")
+    lines.append("| phase | seconds | new ranges | GiB of addresses | reused | released | reserving + mapping (ms) | ms per new range | unmapped in the background | background (ms) |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+    for phase in ranges["phases"]:
+        each = f"{phase['reserve_ms'] / phase['created']:.2f}" if phase["created"] else "-"
+        lines.append(f"| {phase['name']} | {phase['seconds']:.1f} | {phase['created']} | {phase['created_gb']:.1f} | {phase['reused']} | {phase['released']} | {phase['reserve_ms']:.0f} | {each} | "
+                     f"{phase['unmapped']} | {phase['unmap_ms']:.0f} |\n")
+    lines.append("\n")
+    return "".join(lines)
+
+
 def summary(result):
     """Markdown summary of a report."""
     text = [f"# VRAM debug report, {result['created']}: allocations of {result['threshold_mb']} MB and more\n\n"]
@@ -562,6 +609,8 @@ def summary(result):
                     + (f"**{release['vram_still_held_gb']:.2f} GiB of recorded VRAM still held by their modules**:\n\n{_table(release['groups'], 15)}\n\n" if release["groups"]
                        else "no recorded VRAM left by their modules.\n\n"))
     text.extend(_coverage_warnings(result))
+    if result.get("address_ranges"):
+        text.append(_ranges_summary(result["address_ranges"]))
     for phase in result["phases"]:
         text.append(_phase_summary(phase, f"Peak of phase {phase['name']} ({phase['time_s']:.1f} s)"))
     for phase in result.get("reserved_peaks", []):

@@ -1,0 +1,4 @@
+{
+    "alt_prompt": "chatty=3, room=1, lively=4",
+    "help": "Spontaneous, lively conversational delivery in a slightly cleaner room. Changes the voice itself (speaker-embedding conditioning)."
+}

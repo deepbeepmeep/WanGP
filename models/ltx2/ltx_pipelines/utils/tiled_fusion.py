@@ -14,7 +14,7 @@ from shared.utils.tiled_fusion import TiledFusionPlan
 
 from ...ltx_core.components.patchifiers import VideoLatentPatchifier, get_pixel_coords
 from ...ltx_core.types import LatentState, LatentStateRuntimeCache, SpatioTemporalScaleFactors, VideoLatentShape
-from .helpers import _clear_phase_timestep_embedders, _prepare_conditioning_context, modality_from_latent_state
+from .helpers import _prepare_conditioning_context, modality_from_latent_state
 from .types import DenoisingFunc
 
 
@@ -85,7 +85,6 @@ def tiled_fusion_denoising_func(
     def _cleanup() -> None:
         nonlocal prepared_context
         prepared_context = None
-        _clear_phase_timestep_embedders(transformer)
 
     def tiled_fusion_step(video_state: LatentState, audio_state: LatentState | None, sigmas: torch.Tensor, step_index: int) -> tuple[torch.Tensor | None, None]:
         nonlocal done_tiles

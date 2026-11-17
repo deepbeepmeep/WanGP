@@ -2,6 +2,9 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from mmgp import cuda_graphs
+from shared.kernels import ops
+from shared.utils.lora_mapping import convert_lora_keys
 import torch.amp as amp
 
 import numpy as np 
@@ -93,22 +96,8 @@ class LongCatAvatarSingleStreamBlock(nn.Module):
         self.ffn_mult = self.ffn.ffn_mult
         self.ffn_chunk_min = 128
 
-    def _apply_ffn_chunked(self, ffn_in: torch.Tensor) -> torch.Tensor:
-        ffn_in = _take_tensor(ffn_in)
-        token_count = ffn_in.numel() // ffn_in.shape[-1]
-        dim = ffn_in.shape[-1]
-        if token_count < self.ffn_chunk_min:
-            return self.ffn(ffn_in)
-        ffn_in_flat = ffn_in.reshape(token_count, dim)
-        chunk_size = max(self.ffn_chunk_min, min(token_count, int(token_count / self.ffn_mult)))
-        if chunk_size >= token_count:
-            return self.ffn(ffn_in)
-        for start in range(0, token_count, chunk_size):
-            ffn_chunk = ffn_in_flat.narrow(0, start, min(chunk_size, token_count - start))
-            ffn_out = self.ffn(ffn_chunk)
-            ffn_chunk.copy_(ffn_out)
-            del ffn_chunk, ffn_out
-        return ffn_in
+    def _apply_ffn_chunked(self, x_list):
+        return ops.mlp(x_list, self.ffn.w1, self.ffn.w2, "swiglu", up=self.ffn.w3)
 
     def forward(
         self, 
@@ -128,6 +117,7 @@ class LongCatAvatarSingleStreamBlock(nn.Module):
         mask_frame_range=None,
         token_ref_target_masks=None,
         human_num=None,
+        rope=None,
     ):
         """
             x: [B, N, C]
@@ -152,18 +142,11 @@ class LongCatAvatarSingleStreamBlock(nn.Module):
         x_m_list = [x_m]
         x_m = None
 
-        if kv_cache is not None:
-            kv_cache = (kv_cache[0].to(x.device), kv_cache[1].to(x.device))
-            attn_outputs = self.attn.forward_with_kv_cache(x_m_list, shape=latent_shape, num_cond_latents=num_cond_latents, kv_cache=kv_cache, num_ref_latents=num_ref_latents, \
-                                                            ref_img_index=ref_img_index, mask_frame_range=mask_frame_range, ref_target_masks=token_ref_target_masks)
-        else:
-            attn_outputs = self.attn(x_m_list, shape=latent_shape, num_cond_latents=num_cond_latents, return_kv=return_kv, num_ref_latents=num_ref_latents, \
-                                                            ref_img_index=ref_img_index, mask_frame_range=mask_frame_range, ref_target_masks=token_ref_target_masks)
-        
-        if return_kv:
-            x_s, kv_cache, x_ref_attn_map = attn_outputs
-        else:
-            x_s, x_ref_attn_map = attn_outputs
+        x_s, x_ref_attn_map = self.attn(
+            x_m_list, shape=latent_shape, num_cond_latents=num_cond_latents, return_kv=return_kv,
+            layer_cache=kv_cache, rope=rope, num_ref_latents=num_ref_latents,
+            ref_img_index=ref_img_index, mask_frame_range=mask_frame_range,
+            ref_target_masks=token_ref_target_masks)
         x_m = None
 
         x.view(B, -1, N//T, C).addcmul_(x_s.view(B, -1, N//T, C), gate_msa)
@@ -220,10 +203,7 @@ class LongCatAvatarSingleStreamBlock(nn.Module):
         del x_s, gate_mlp, shift_mlp, scale_mlp
         x = x.to(x_dtype)
 
-        if return_kv:
-            return x, kv_cache
-        else:
-            return x
+        return x
 
 
 class LongCatVideoAvatarTransformer3DModel(
@@ -320,13 +300,18 @@ class LongCatVideoAvatarTransformer3DModel(
             adaln_tembed_dim,
         )
 
+        self._rope_cache = {}
         self.gradient_checkpointing = False
         self.text_tokens_zero_pad = text_tokens_zero_pad
 
         self._interrupt_check = None
 
     def preprocess_loras(self, model_type, state_dict):
-        if model_type != "longcat_avatar_v1_5" or not any(key.startswith("lora___lorahyphen___") for key in state_dict):
+        return convert_lora_keys(self._decode_upstream_lora(state_dict), dict(self.named_modules()),
+                                 split_linear_modules_map=getattr(self, "split_linear_modules_map", None))
+
+    def _decode_upstream_lora(self, state_dict):
+        if not any(key.startswith("lora___lorahyphen___") for key in state_dict):
             return state_dict
 
         def decode_module_name(prefix):
@@ -397,6 +382,7 @@ class LongCatVideoAvatarTransformer3DModel(
             block.attn.enable_bsa = False    
 
     def clear_runtime_caches(self):
+        self._rope_cache.clear()
         for block in self.blocks:
             block.attn.rope_3d.freqs_dict.clear()
 
@@ -410,7 +396,6 @@ class LongCatVideoAvatarTransformer3DModel(
         return_kv=False, 
         kv_cache_dict=None,
         skip_crs_attn=False, 
-        offload_kv_cache=False,
         # avatar related params
         audio_embs=None,
         num_ref_latents=None,
@@ -443,6 +428,7 @@ class LongCatVideoAvatarTransformer3DModel(
         enc_list = []
         y_seqlens_list = []
         latent_shapes = []
+        rope_tables = []
         audio_hidden_states_list = []
         token_ref_target_masks_list = []
         human_num_list = []
@@ -540,64 +526,31 @@ class LongCatVideoAvatarTransformer3DModel(
             enc_list.append(enc)
             y_seqlens_list.append(y_seqlens)
             latent_shapes.append((N_t, N_h, N_w))
+            total_t = N_t + (int(num_cond_latents[idx] or 0) if kv_cache_dict[idx] is not None and not return_kv else 0)
+            rope_key = (total_t, N_h, N_w, ref_img_index, num_ref_latents, x.device)
+            if rope_key not in self._rope_cache:
+                freqs = self.blocks[0].attn.rope_3d.precompute_freqs_cis_3d((total_t, N_h, N_w), ref_img_index, num_ref_latents).to(x.device)
+                self._rope_cache[rope_key] = torch.stack((freqs.cos(), freqs.sin()), dim=-1)[None, :, None]
+            rope_tables.append(self._rope_cache[rope_key])
             audio_hidden_states_list.append(audio_hidden_states)
             token_ref_target_masks_list.append(token_ref_target_masks)
             human_num_list.append(human_num)
 
-        kv_cache_dict_ret = [dict() for _ in x_list] if return_kv else None
-        for block_idx, block in enumerate(self.blocks):
-            if self._interrupt_check is not None and self._interrupt_check():
-                return [None] * len(x_list) if joint_pass else None
-            for i in range(len(x_list)):
-                if torch.is_grad_enabled() and self.gradient_checkpointing:
-                    block_outputs = self._gradient_checkpointing_func(
-                        block,
-                        x_list[i],
-                        enc_list[i],
-                        t_list[i],
-                        y_seqlens_list[i],
-                        latent_shapes[i],
-                        num_cond_latents[i],
-                        return_kv,
-                        kv_cache_dict[i].get(block_idx, None) if kv_cache_dict[i] is not None else None,
-                        skip_crs_attn,
-                        num_ref_latents,
-                        audio_hidden_states_list[i],
-                        ref_img_index,
-                        mask_frame_range,
-                        token_ref_target_masks_list[i],
-                        human_num_list[i],
-                    )
-                else:
-                    block_outputs = block(
-                        x_list[i],
-                        enc_list[i],
-                        t_list[i],
-                        y_seqlens_list[i],
-                        latent_shapes[i],
-                        num_cond_latents[i],
-                        return_kv,
-                        kv_cache_dict[i].get(block_idx, None) if kv_cache_dict[i] is not None else None,
-                        skip_crs_attn,
-                        num_ref_latents,
-                        audio_hidden_states_list[i],
-                        ref_img_index,
-                        mask_frame_range,
-                        token_ref_target_masks_list[i],
-                        human_num_list[i],
-                    )
-
-                if return_kv:
-                    x_list[i], kv_cache = block_outputs
-                    if offload_kv_cache:
-                        kv_cache_dict_ret[i][block_idx] = (kv_cache[0].cpu(), kv_cache[1].cpu())
-                    else:
-                        kv_cache_dict_ret[i][block_idx] = (kv_cache[0].contiguous(), kv_cache[1].contiguous())
-                else:
-                    x_list[i] = block_outputs
-
+        with cuda_graphs.scope(not return_kv):
+            for block_idx, block in enumerate(self.blocks):
                 if self._interrupt_check is not None and self._interrupt_check():
                     return [None] * len(x_list) if joint_pass else None
+                for i in range(len(x_list)):
+                    x_list[i] = block(
+                        x_list[i], enc_list[i], t_list[i], y_seqlens_list[i], latent_shapes[i],
+                        num_cond_latents[i], return_kv,
+                        kv_cache_dict[i][block_idx] if kv_cache_dict[i] is not None else None,
+                        skip_crs_attn, num_ref_latents, audio_hidden_states_list[i], ref_img_index,
+                        mask_frame_range, token_ref_target_masks_list[i], human_num_list[i], rope_tables[i])
+                    if self._interrupt_check is not None and self._interrupt_check():
+                        return [None] * len(x_list) if joint_pass else None
+        if return_kv:
+            return None  # Only the PrefixCache is kept; no final projection of clean latents.
 
         outputs = []
         for x, t, latent_shape in zip(x_list, t_list, latent_shapes):
@@ -605,8 +558,6 @@ class LongCatVideoAvatarTransformer3DModel(
             x = self.unpatchify(x, *latent_shape)
             outputs.append(x.to(torch.float32))
 
-        if return_kv:
-            return (outputs if joint_pass else outputs[0]), (kv_cache_dict_ret if joint_pass else kv_cache_dict_ret[0])
         return outputs if joint_pass else outputs[0]
     
 

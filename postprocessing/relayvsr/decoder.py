@@ -72,8 +72,8 @@ class Attention(nn.Module):
     def attend(self, x_list, rope, attention_fn, condition):
         """The attention output (1, tokens, DIM) of x (handed off): the queries and the keys / values of the condition or video projections."""
         key, value = (self.condition_key, self.condition_value) if condition else (self.key, self.value)
-        out = attention_kit.qkv_attention(x_list, self.query, key, value, HEADS, HEAD_DIM, self._norm_rope(rope), kv_heads=KV_HEADS, norm_v=self._norm_v, attention_fn=attention_fn)
-        return self.output(out.flatten(2))
+        return attention_kit.qkv_attention(x_list, self.query, key, value, HEADS, HEAD_DIM, self._norm_rope(rope), kv_heads=KV_HEADS, norm_v=self._norm_v, attention_fn=attention_fn,
+                                           out_proj=self.output)
 
 
 class SwiGLU(nn.Module):

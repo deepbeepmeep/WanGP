@@ -16,7 +16,7 @@ from .modules.t5 import T5EncoderModel
 from .ovi.modules.mmaudio.features_utils import FeaturesUtils
 from .ovi.modules.fusion import FusionModel
 import json
-from mmgp import offload
+from mmgp import offload, runtime
 from shared.utils.loras_mutipliers import update_loras_slists, get_model_switch_steps
 
 def init_fusion_score_model_ovi():
@@ -267,7 +267,7 @@ class OviFusionEngine:
                 computed_perturbation_layers = perturbation_layers if int(perturbation_start * sampling_steps) <= i < int(perturbation_end * sampling_steps) else None
                 any_guidance = not (guide_scale == 1 and audio_cfg_scale ==1)
 
-                if not (any_guidance and joint_pass):
+                if not (any_guidance and joint_pass and runtime.joint_pass_useful(self.model.video_model, max_seq_len_video, self.model.video_model.dim)):
                     pred_vid_pos, pred_audio_pos = self.model(
                         audio_context= [text_embeddings_audio_pos],
                         vid_context= [text_embeddings_video_pos],

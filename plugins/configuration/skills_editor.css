@@ -1,0 +1,64 @@
+/* Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt) */
+#deepy_skill_content .input-container { position: relative; }
+#deepy_skill_content textarea,
+#deepy_skill_content .skill-highlight {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 12px !important;
+    border: 1px solid var(--input-border-color, #aaa) !important;
+    border-radius: var(--input-radius, 6px);
+    font: 14px/1.6 var(--font-mono, monospace) !important;
+    font-variant-ligatures: none;
+    letter-spacing: normal;
+    tab-size: 4;
+    white-space: pre !important;
+    overflow-wrap: normal;
+    word-break: normal;
+    overflow: scroll !important;
+    scrollbar-gutter: stable;
+    scrollbar-width: auto !important;
+    scrollbar-color: var(--body-text-color-subdued, #888) var(--background-fill-secondary, #eee) !important;
+}
+#deepy_skill_content textarea {
+    height: 384px !important;
+    min-height: 200px !important;
+    max-height: 65vh !important;
+    resize: vertical;
+    caret-color: var(--body-text-color);
+}
+#deepy_skill_content textarea::-webkit-scrollbar { display: block !important; width: 12px; height: 12px; }
+#deepy_skill_content textarea::-webkit-scrollbar-track { background: var(--background-fill-secondary, #eee); }
+#deepy_skill_content textarea::-webkit-scrollbar-thumb { background: var(--body-text-color-subdued, #888); border: 3px solid var(--background-fill-secondary, #eee); border-radius: 8px; }
+#deepy_skill_content .skill-highlight {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background: var(--input-background-fill, white);
+    color: var(--body-text-color);
+}
+#deepy_skill_content .skill-highlight::-webkit-scrollbar { width: 12px; height: 12px; visibility: hidden; }
+/* Keep WanGP's disabled-field background from covering the syntax layer. */
+#deepy_skills_tab #deepy_skill_content textarea.skill-highlighted { color: transparent !important; -webkit-text-fill-color: transparent; background: transparent !important; }
+#deepy_skill_content .skill-highlighted::selection { background: #5599ee55; }
+#deepy_skill_content .skill-highlight span { font: inherit; }
+#deepy_skill_content .skill-highlight .skill-heading,
+#deepy_skill_content .skill-highlight .skill-strong { font-weight: 700; }
+#deepy_skill_content .skill-highlight .skill-em { font-style: italic; }
+#deepy_skill_content .skill-heading,
+#deepy_skill_content .skill-key { color: #075daf; }
+#deepy_skill_content .skill-code { color: #97521b; }
+#deepy_skill_content .skill-marker { color: #8762a7; }
+#deepy_skill_content .skill-strong { color: #8b2474; }
+#deepy_skill_content .skill-em { color: #277958; }
+#deepy_skill_content .skill-link { color: #006b85; text-decoration: underline; }
+.dark #deepy_skill_content .skill-heading,
+.dark #deepy_skill_content .skill-key { color: #82baff; }
+.dark #deepy_skill_content .skill-code { color: #eeb781; }
+.dark #deepy_skill_content .skill-marker { color: #bfa1df; }
+.dark #deepy_skill_content .skill-strong { color: #f3a8dc; }
+.dark #deepy_skill_content .skill-em { color: #86d4b1; }
+.dark #deepy_skill_content .skill-link { color: #85d5e8; }
+@media (forced-colors: active) {
+    #deepy_skill_content .skill-highlight { display: none; }
+    #deepy_skills_tab #deepy_skill_content textarea.skill-highlighted { color: CanvasText !important; -webkit-text-fill-color: CanvasText; }
+}

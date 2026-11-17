@@ -7,7 +7,7 @@ PyTorch 2.3+).
 
 install(spill=True) places what VRAM has no room for in system RAM instead of raising an out of memory error (slower). torch.cuda memory
 statistics and empty_cache are answered by the allocator. set_pressure_callback, mark_reset / mark_peak, room and stats serve the automatic
-VRAM preload; other_programs tells the VRAM the other programs hold on the GPU; set_vram_limit emulates a smaller GPU for tests."""
+VRAM preload; probe_reset / probe_peak measure a second phase apart from it, the weights of weight_allocations left out; other_programs tells the VRAM the other programs hold on the GPU; set_vram_limit emulates a smaller GPU for tests."""
 import ctypes
 import contextlib
 import os
@@ -96,9 +96,10 @@ def install(mode="vmm", large_mb=256, chunk_mb=32, spill=False):
     lib.vmm_reset_peaks.argtypes = (ctypes.c_int,)
     lib.vmm_set_pressure_callback.argtypes = (_PRESSURE_CALLBACK,)
     lib.vmm_set_vram_limit.argtypes = (ctypes.c_int64,)
-    for name in ("vmm_mark_reset", "vmm_mark_peak", "vmm_room"):
+    for name in ("vmm_mark_reset", "vmm_mark_peak", "vmm_probe_reset", "vmm_probe_peak", "vmm_probe_now", "vmm_weights", "vmm_room", "vmm_weights_scope"):
         getattr(lib, name).argtypes = (ctypes.c_int,)
-    lib.vmm_mark_peak.restype = lib.vmm_room.restype = ctypes.c_int64
+    lib.vmm_mark_peak.restype = lib.vmm_probe_peak.restype = lib.vmm_probe_now.restype = lib.vmm_weights.restype = lib.vmm_room.restype = ctypes.c_int64
+    lib.vmm_weights_scope.restype = ctypes.c_int
     lib.vmm_gpu_memory.argtypes = (ctypes.c_int, ctypes.POINTER(ctypes.c_int64))
     lib.vmm_configure(large_mb << 20, chunk_mb << 20, 3 if spill else 0)  # spill modes: pinned system RAM, then the driver's allocation
     lib.vmm_set_oom_thrower.argtypes = (ctypes.c_void_p,)
@@ -108,6 +109,13 @@ def install(mode="vmm", large_mb=256, chunk_mb=32, spill=False):
     lib.vmm_end_warmup.argtypes = (ctypes.c_int, ctypes.c_ulonglong, ctypes.c_ulonglong, ctypes.c_ulonglong)
     lib.vmm_pause_warmup.argtypes = (ctypes.c_int,)
     lib.vmm_pause_warmup.restype = ctypes.c_int
+    lib.vmm_drop_captures.argtypes = (ctypes.c_int, ctypes.c_ulonglong)
+    lib.vmm_capture_spill_later.argtypes = (ctypes.c_int,)
+    lib.vmm_capture_spill_later.restype = ctypes.c_int
+    lib.vmm_capture_running.argtypes = ()
+    lib.vmm_capture_running.restype = ctypes.c_int
+    lib.vmm_last_oom.argtypes = (ctypes.c_int,)
+    lib.vmm_last_oom.restype = ctypes.c_int64
     lib.vmm_prepare_reuse.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int)
     lib.vmm_prepare_reuse.restype = ctypes.c_int
     lib.vmm_lifetime_wrap.argtypes = (ctypes.c_void_p, ctypes.c_size_t)
@@ -181,7 +189,8 @@ def _device_index(device=None):
 
 
 def before_graph_warmup(callback, remove=False):
-    """callback() runs before each graph warmup, outside it: what a warmup and its capture allocate cannot make anything leave the VRAM (no pressure callback then)."""
+    """callback() runs before each graph warmup, outside it. The warmup runs eagerly and may make room as any call does (its allocations call
+    the pressure callback), its capture cannot: memory the callback makes room for ahead (an expert cache's copies) is not taken from it."""
     _warmup_callbacks.remove(callback) if remove else _warmup_callbacks.append(callback)
 
 
@@ -198,11 +207,46 @@ def graph_warmup(pool):
     stream = torch.cuda.current_stream(device)
     token = _lib.vmm_begin_warmup(device, *pool, stream.cuda_stream)
     _warmup.depth = getattr(_warmup, "depth", 0) + 1
+    tokens = _warmup.__dict__.setdefault("tokens", [])
+    tokens.append((device, token))
     try:
         yield
     finally:
+        tokens.pop()
         _warmup.depth -= 1
         _lib.vmm_end_warmup(device, *pool, token)
+
+
+@contextlib.contextmanager
+def capture_spill_later():
+    """This thread's captures do not spill into system RAM (spill mode): one that runs short fails instead, so that memory is freed and it is
+    made again; a graph whose scratch lies in system RAM reads it over the bus at every replay, slower than streaming a block of weights."""
+    if active != "vmm":
+        yield
+        return
+    previous = _lib.vmm_capture_spill_later(1)
+    try:
+        yield
+    finally:
+        _lib.vmm_capture_spill_later(previous)
+
+
+def capture_running():
+    """Whether a CUDA graph capture records on some device: memory can then be neither recovered nor released (a warmup alone runs eagerly)."""
+    return active == "vmm" and bool(_lib.vmm_capture_running())
+
+
+def last_oom(device=None):
+    """The size in bytes of the last allocation that failed on the device, 0 if none."""
+    return _lib.vmm_last_oom(_device_index(device)) if active == "vmm" else 0
+
+
+def end_failed_captures():
+    """After a capture that failed inside this thread's graph warmup: the allocator forgets what that capture left open (PyTorch does not end its
+    allocation to the pool when the capture was invalidated), so that the warmup recovers and releases memory again before its next attempt."""
+    tokens = getattr(_warmup, "tokens", None)
+    if active == "vmm" and tokens:
+        _lib.vmm_drop_captures(*tokens[-1])
 
 
 def no_graphs(device=None):
@@ -356,6 +400,22 @@ def stats(device=None):
     return dict(zip(STATS, out))
 
 
+RANGE_STATS = ("created", "created_bytes", "reserve_us", "reused", "released", "unmapped", "unmap_us", "free_ranges", "free_bytes", "unmaps_pending", "budget")
+
+
+def range_stats(device=None):
+    """The address ranges of the tensors of 256 MiB and more since the library loaded: `created` (reserved anew, `created_bytes` of
+    addresses, `reserve_us` microseconds spent reserving and mapping them in the allocating threads), `reused` as they were, `released`
+    beyond the `budget` of free ranges a pool keeps (-1: none); `unmapped`: the ranges the background thread unmapped, in
+    `unmap_us` microseconds; now: `free_ranges` holding `free_bytes` of addresses, `unmaps_pending`. None with another allocator or an
+    older library."""
+    if active != "vmm" or not hasattr(_lib, "vmm_range_stats"):
+        return None
+    out = (ctypes.c_int64 * len(RANGE_STATS))()
+    _lib.vmm_range_stats(_device_index(device), out)
+    return dict(zip(RANGE_STATS, out))
+
+
 def set_pressure_callback(fn):
     """fn(size, device) -> bytes it freed, None removes it. Called when an allocation finds the VRAM short, before it fails (or spills),
     from the allocating thread without the allocator's lock: fn may free tensors, then the allocation is tried again."""
@@ -377,6 +437,41 @@ def mark_reset(device=None):
 
 def mark_peak(device=None):
     return _lib.vmm_mark_peak(_device_index(device))
+
+
+def probe_reset(device=None):
+    """Starts a phase whose peak of allocated memory probe_peak returns, the models' weights left out (weight_allocations): a second
+    phase, independent of mark_reset's (the automatic preload and the state rings use that one), for code measuring its own phases (the
+    attention kit's Head Split) whatever weights are loaded meanwhile."""
+    _lib.vmm_probe_reset(_device_index(device))
+
+
+def probe_peak(device=None):
+    return _lib.vmm_probe_peak(_device_index(device))
+
+
+def probe_now(device=None):
+    """The allocated memory but the weights, as probe_peak counts it."""
+    return _lib.vmm_probe_now(_device_index(device))
+
+
+def weights(device=None):
+    """VRAM held by the allocations made in weight_allocations scopes (0 with another allocator)."""
+    return _lib.vmm_weights(_device_index(device)) if active == "vmm" else 0
+
+
+@contextlib.contextmanager
+def weight_allocations():
+    """For the model weights this thread moves to the GPU (MMGP's loads): counted apart, so that probe_peak / probe_now measure the
+    other allocations whatever weights are loaded or released between them. Graph pools' allocations are never counted as weights."""
+    if active != "vmm":
+        yield
+        return
+    previous = _lib.vmm_weights_scope(1)
+    try:
+        yield
+    finally:
+        _lib.vmm_weights_scope(previous)
 
 
 def room(device=None):

@@ -12,6 +12,28 @@ const PACING = ['Very calm', 'Calm', 'Balanced', 'Energetic', 'Frenetic'];
 const RESOLUTION_CHOICES = ['480p', '720p', '1080p'];
 const LANGUAGES = [['en', 'English'], ['fr', 'French'], ['es', 'Spanish'], ['de', 'German'], ['it', 'Italian'], ['pt', 'Portuguese'], ['nl', 'Dutch'], ['pl', 'Polish'], ['ru', 'Russian'], ['tr', 'Turkish'], ['ar', 'Arabic'], ['hi', 'Hindi'], ['zh', 'Chinese'], ['ja', 'Japanese'], ['ko', 'Korean']];
 
+// About how long a brief's spoken script lasts, up to the next 5 s, as production.py script_length counts it: the words after a speaker's label
+// (MIA: ..., MIA (softly): ...) or under a speaker's name in capitals, 0.37 s a word and 0.8 s a line; 0 without spoken lines, for lyrics and for a remake
+const SCRIPT_LABEL = /^[*_\s]*(\p{L}[^:()\d]{0,38}?)[*_\s]*(?:\([^)]*\))?[*_\s]*:[*_\s]*(\S.*)$/u;
+const SCRIPT_HEADINGS = new Set(['scene', 'act', 'shot', 'chapter', 'part', 'sequence', 'title', 'note', 'notes', 'setting', 'location', 'action', 'description', 'int', 'ext', 'fade', 'cut']);
+export function scriptLength(brief) {
+  if (['music_video', 'remake'].includes(brief.kind)) return 0;
+  let speaking = false, seconds = 0;
+  const say = text => { const words = text.replace(/\([^)]*\)|\[[^\]]*\]/g, ' ').match(/[\p{L}\p{N}]+(?:['\u2019][\p{L}\p{N}]+)*/gu); if (words) seconds += 0.37 * words.length + 0.8; };
+  for (const text of String(brief.script || '').split('\n').map(line => line.trim())) {
+    const label = SCRIPT_LABEL.exec(text), named = label?.[1].split(/\s+/).filter(Boolean), words = text.split(/\s+/);
+    if (!text) speaking = false;
+    else if (text.startsWith('[') || text.startsWith('#')) continue;
+    else if (label && named.length <= 3 && !SCRIPT_HEADINGS.has(named[0].toLowerCase().replace(/\.+$/, ''))) { say(label[2]); speaking = false; }
+    else if (text === text.toUpperCase() && text !== text.toLowerCase() && words.length <= 3 && !/[.:]$/.test(text) && !['INT', 'EXT'].includes(words[0].replace(/\.+$/, ''))) speaking = true;
+    else if (speaking) say(text);
+  }
+  return seconds && 5 * Math.ceil(seconds / 5);
+}
+
+// The length the production plans for: the user's, the song's, else 30 s or the time the script needs when longer (production.py wanted_length)
+const plannedLength = (brief, analysis) => brief.duration_s || (brief.song ? analysis?.duration_s || 30 : Math.max(30, scriptLength(brief)));
+
 // A format chosen after shooting changes nothing by itself: the note says so, with the button that does it.
 function formatNote(doc) {
   const latest = doc.deliverables.at(-1), [width, height] = doc.brief.aspect.split(':').map(Number);
@@ -67,9 +89,9 @@ export function mountBrief(container, doc) {
           <div class="three">
             <div class="field"><div class="label">${icon('image')} Target resolution</div><div class="seg" id="res" title="What the final shots and every picture are made at">${RESOLUTION_CHOICES.map(value => `<button class="${brief.resolution === value ? 'on' : ''}" data-res="${value}">${value}</button>`).join('')}</div></div>
             <div class="field"><div class="label">${icon('clock')} Draft resolution</div><div class="seg" id="draft-res" title="Try shots at this size first, then Shoot set to Final renders the ones you like at the target resolution. The pictures stay the same">${['', ...RESOLUTION_CHOICES.slice(0, RESOLUTION_CHOICES.indexOf(brief.resolution))].map(value => `<button class="${(brief.draft_resolution || '') === value ? 'on' : ''}" data-draft="${value}">${value || 'None'}</button>`).join('')}</div></div>
-            <div class="field"><div class="label">${icon('clock')} Duration ${brief.song && analysis ? `<button class="chip clickable ${!brief.duration_s ? 'on' : ''}" id="match-song" style="height:20px;margin-left:4px">${icon('music')}Match the song</button>` : ''}</div>
-              <div class="slider-row"><input type="range" class="range" id="duration" min="5" max="600" step="5" value="${brief.duration_s || analysis?.duration_s || 30}" aria-label="Duration">
-                <input class="input" id="duration-n" type="number" min="5" max="600" step="1" value="${Math.round(brief.duration_s || analysis?.duration_s || 30)}" aria-label="Duration in seconds" title="Seconds, from 5 to 600" style="width:76px;flex:none;padding:6px 8px"><span class="muted">s</span></div></div>
+            <div class="field"><div class="label">${icon('clock')} Duration ${brief.song && analysis ? `<button class="chip clickable ${!brief.duration_s ? 'on' : ''}" id="match-song" style="height:20px;margin-left:4px">${icon('music')}Match the song</button>` : ''}${brief.song ? '' : `<button class="chip clickable ${!brief.duration_s ? 'on' : ''}" id="match-script" style="height:20px;margin-left:4px" title="As long as the script takes to say: the length until you set one" ${scriptLength(brief) > 30 ? '' : 'hidden'}>${icon('note')}Match the script</button>`}</div>
+              <div class="slider-row"><input type="range" class="range" id="duration" min="5" max="600" step="5" value="${plannedLength(brief, analysis)}" aria-label="Duration">
+                <input class="input" id="duration-n" type="number" min="5" max="600" step="1" value="${Math.round(plannedLength(brief, analysis))}" aria-label="Duration in seconds" title="Seconds, from 5 to 600" style="width:76px;flex:none;padding:6px 8px"><span class="muted">s</span></div></div>
             <div class="field"><div class="label">${icon('gauge')} Pacing</div>
               <div class="slider-row"><input type="range" class="range" id="pacing" min="-2" max="2" step="1" value="${brief.pacing || 0}"><span class="value" id="pacing-v">${PACING[(brief.pacing || 0) + 2]}</span></div></div>
           </div>
@@ -99,7 +121,7 @@ export function mountBrief(container, doc) {
 
       ${state.doc.deliverables.length ? `<div class="muted" style="font-size:12.5px;margin:4px 2px 0">This brief is where the production started: later changes live in the shots, the cast and the edit, and it is not rewritten. To keep going from where the production is, talk to the showrunner.</div>` : ''}
       <div class="cta-bar">
-        <div class="grow"><b>${esc(kind.label)}</b> <span class="muted">· ${esc(brief.aspect)} · ${brief.draft_resolution ? `${brief.draft_resolution} draft, ` : ''}${brief.resolution} · <span id="brief-duration">${formatDuration(brief.duration_s || analysis?.duration_s || 30)}</span> · ${doc.cast.length} cast · ${brief.references.length} ${brief.references.length === 1 ? 'reference' : 'references'}</span>
+        <div class="grow"><b>${esc(kind.label)}</b> <span class="muted">· ${esc(brief.aspect)} · ${brief.draft_resolution ? `${brief.draft_resolution} draft, ` : ''}${brief.resolution} · <span id="brief-duration">${formatDuration(plannedLength(brief, analysis))}</span> · ${doc.cast.length} cast · ${brief.references.length} ${brief.references.length === 1 ? 'reference' : 'references'}</span>
           ${state.directorInfo.available === false && state.directorInfo.reason ? `<div class="muted" style="font-size:12px;color:var(--amber)">${esc(state.directorInfo.reason)}</div>` : ''}</div>
         ${doc.shots.length ? `<button class="btn" id="to-board">${icon('grid')} Storyboard (${doc.shots.length})</button>` : ''}
         ${!(brief.text || '').trim() && !(brief.script || '').trim() && !brief.song ? '<span class="muted" style="font-size:12.5px">Write your idea first</span>' : ''}
@@ -138,7 +160,7 @@ export function mountBrief(container, doc) {
       button.previousElementSibling?.classList.contains('muted') && (button.previousElementSibling.style.display = filled ? 'none' : '');
     };
     root.querySelector('#text').oninput = event => { queue({ text: event.target.value }); ready(); };
-    root.querySelector('#script')?.addEventListener('input', event => { queue({ script: event.target.value }); ready(); });
+    root.querySelector('#script')?.addEventListener('input', event => { queue({ script: event.target.value }); ready(); followScript(); });
     root.querySelector('#style').oninput = event => queue({ style: event.target.value });
     root.querySelectorAll('[data-aspect]').forEach(button => button.onclick = () => actions.ops([{ op: 'brief', fields: { aspect: button.dataset.aspect } }]).then(render));
     root.querySelector('#make-format')?.addEventListener('click', () => actions.makeFormat(state.doc.brief.aspect));
@@ -155,11 +177,19 @@ export function mountBrief(container, doc) {
     });
     // The slider (mouse or keys), the typed seconds and the summary bar show one length, whichever was changed
     const duration = root.querySelector('#duration'), typed = root.querySelector('#duration-n');
-    const setDuration = seconds => { root.querySelector('#brief-duration').textContent = formatDuration(seconds); root.querySelector('#match-song')?.classList.remove('on'); queue({ duration_s: seconds }); };
+    const setDuration = seconds => { root.querySelector('#brief-duration').textContent = formatDuration(seconds); root.querySelectorAll('#match-song, #match-script').forEach(chip => chip.classList.remove('on')); queue({ duration_s: seconds }); };
+    function followScript() {  // as the script is typed: the chip shows when it needs more than 30 s, and an unset length follows it
+      const brief = { ...state.doc.brief, ...save.pending('brief') }, chip = root.querySelector('#match-script');
+      if (!chip) return;  // a song sets the length
+      chip.hidden = scriptLength(brief) <= 30;
+      if (brief.duration_s) return;
+      typed.value = duration.value = plannedLength(brief);
+      root.querySelector('#brief-duration').textContent = formatDuration(plannedLength(brief));
+    }
     duration.oninput = () => { typed.value = duration.value; setDuration(+duration.value); };
     typed.oninput = () => { if (typed.value !== '' && +typed.value >= 5 && +typed.value <= 600) { duration.value = typed.value; setDuration(+typed.value); } };  // out of range: kept until the field is left
     typed.onchange = () => { const seconds = Math.min(600, Math.max(5, Math.round(+typed.value || +duration.value))); typed.value = duration.value = seconds; setDuration(seconds); };
-    root.querySelector('#match-song')?.addEventListener('click', () => actions.ops([{ op: 'brief', fields: { duration_s: null } }]).then(render));
+    root.querySelectorAll('#match-song, #match-script').forEach(chip => chip.addEventListener('click', () => { save.flush(); actions.ops([{ op: 'brief', fields: { duration_s: null } }]).then(render); }));
     const pacing = root.querySelector('#pacing');
     pacing.oninput = () => { root.querySelector('#pacing-v').textContent = PACING[+pacing.value + 2]; queue({ pacing: +pacing.value }); };
     [['#render-min', 'render_min_s', 0], ['#render-max', 'render_max_s', null]].forEach(([selector, field, empty]) => {  // a remake's shots rendered together

@@ -2,7 +2,7 @@ from collections.abc import Callable
 from enum import Enum
 
 import torch
-from mmgp import cuda_graphs
+from mmgp import cuda_graphs, runtime
 
 from ...guidance.perturbations import BatchedPerturbationConfig
 from .adaln import AdaLayerNormSingle, adaln_embedding_coefficient
@@ -494,6 +494,15 @@ class LTXModel(torch.nn.Module):
                 raise ValueError("Joint-pass inputs must have the same number of video and audio entries.")
             if isinstance(perturbations, list) and len(perturbations) != len(video_list):
                 raise ValueError("Perturbations list must match number of joint-pass conditions.")
+            first_video = next((v for v in video_list if v is not None), None)
+            tokens, width = (first_video.latent.shape[1], self.inner_dim) if first_video is not None else (next(a for a in audio_list if a is not None).latent.shape[1], self.audio_inner_dim)
+            if len(video_list) > 1 and not runtime.joint_pass_useful(self, tokens, width, len(video_list)):  # one prediction after the other
+                outputs = []
+                for index, (v, a) in enumerate(zip(video_list, audio_list)):
+                    outputs.append(self._forward(v, a, perturbations[index] if isinstance(perturbations, list) else perturbations))
+                    if self.interrupted:
+                        return [None] * len(video_list), [None] * len(audio_list)
+                return [output[0] for output in outputs], [output[1] for output in outputs]
 
             if self.model_type.is_video_enabled():
                 video_args_list = [
@@ -626,6 +635,10 @@ class X0Model(torch.nn.Module):
     Returns fully denoised outputs based on the velocities produced by the base model.
     Applies scaled denoising to the video and audio according to the timesteps = sigma * denoising_mask.
     """
+
+    # MMGP keeps the timestep embedders with the model's base: their weights are read outside their forward (transformer_args._embed_timestep_functional)
+    _offload_base_modules = tuple(f"velocity_model.{name}adaln_single.emb.timestep_embedder" for name in ("", "prompt_", "audio_", "audio_prompt_", "av_ca_video_scale_shift_",
+                                                                                                         "av_ca_audio_scale_shift_", "av_ca_a2v_gate_", "av_ca_v2a_gate_"))
 
     def __init__(self, velocity_model: LTXModel):
         super().__init__()

@@ -214,10 +214,10 @@ class model_factory():
             if isinstance(VAE_tile_size, int):
                 tiling_type = VAE_tile_size
                 VAE_tile_size = [False, 0] if tiling_type == 0 else [True, 256]  
-            self.vae.use_tiling  = VAE_tile_size[0] 
-            self.vae.tile_latent_min_height  = VAE_tile_size[1] 
-            self.vae.tile_latent_min_width  = VAE_tile_size[1]
-            tile_size  = VAE_tile_size[1]
+            tile_size = VAE_tile_size[1]
+            if VAE_tile_size[0]:  # tiles of that many pixels, a quarter of them shared with the next tile
+                self.vae.enable_tiling(tile_size, tile_size, tile_size * 3 // 4, tile_size * 3 // 4)
+            self.vae.use_tiling = VAE_tile_size[0]
         # tile_size = 256
         qwen_edit_plus = self.base_model_type in ["qwen_image_edit_plus_20B", "qwen_image_edit_plus2_20B"]
         qwen_layered = self.base_model_type in ["qwen_image_layered_20B"]

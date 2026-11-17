@@ -139,7 +139,7 @@ def performance_warnings(server_config: dict[str, Any], vram_gb: float | None = 
 
 def deepy_performance_warning(server_config: dict[str, Any], vram_gb: float | None = None, icons: bool = False) -> str:
     """The warnings as plain text, for Showrunner's notice and, with their icons, Deepy's chat."""
-    return " ".join(f"{icon + ' ' if icons else ''}{title}: {text} in Configuration > Prompt Enhancer / Deepy." for icon, title, text in performance_warnings(server_config, vram_gb))
+    return " ".join(f"{icon + ' ' if icons else ''}{title}: {text} in Configuration > Deepy / Prompt Enhancer." for icon, title, text in performance_warnings(server_config, vram_gb))
 
 
 def deepy_onboarding_notice(server_config: dict[str, Any], vram_gb: float | None = None) -> str:

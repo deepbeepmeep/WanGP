@@ -479,6 +479,8 @@ class LTXV:
         if pad_right == 0:
             pad_right = images.shape[4]
         images = images[:, :, :frame_num, pad_top:pad_bottom, pad_left:pad_right]
+        if images.dtype == torch.uint8:  # (the video as WanGP's bytes, already)
+            return images.squeeze(0)
         images = images.sub_(0.5).mul_(2).squeeze(0)
         return images
 

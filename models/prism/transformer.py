@@ -109,8 +109,8 @@ class Attention(nn.Module):
         holder = [x]
         del x
         attention_fn = None if sparse is None else partial(sparse_attention, layout=sparse[0], grid=sparse[1])
-        result = attention_kit.qkv_attention(holder, self.q, self.k, self.v, self.heads, 128, self.norm_rope(rope), norm_spans_heads=True, attention_fn=attention_fn)
-        return self.o(result.flatten(2))
+        return attention_kit.qkv_attention(holder, self.q, self.k, self.v, self.heads, 128, self.norm_rope(rope), norm_spans_heads=True, attention_fn=attention_fn,
+                                           out_proj=self.o)
 
     def cross(self, x, context, q_rope=None, k_rope=None, capture=None, cached=None):
         q = self.q(x).unflatten(-1, (self.heads, 128))

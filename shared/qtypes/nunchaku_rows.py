@@ -52,11 +52,27 @@ class NunchakuRowProjection:
         if ops:
             q, scales, lowrank = ops.svdq_quantize_w4a4_act_fuse_lora_cuda(x, lora_down=weight._proj_down,
                                                                        smooth=weight._smooth_factor, fp4=self.fp4, pad_size=256)
-            return ops, q, scales, lowrank, x.shape[0]
+            return ops, q, scales, lowrank, x.shape[0], 0
         smooth = handler._unpack_nunchaku_scale_vector(weight._smooth_factor, weight.shape[1])
         rotated = x / smooth.to(x.dtype) if torch.is_tensor(smooth) else x
         down = handler._unpack_lowrank_weight(weight._proj_down, down=True).to(x.dtype)
-        return None, rotated, None, x @ down.t(), x.shape[0]
+        return None, rotated, None, x @ down.t(), x.shape[0], 0
+
+    @staticmethod
+    def slice_input(prepared, start, stop):
+        """Rows of the input (offload.linear_input_rows). Nunchaku's kernels: quantized rows, their scales stored as flat tiles of 256
+        rows ((groups, rows) per tile) and the low-rank input, from the 256-row tile holding `start`, and the offset of `start` in it
+        (rows() trims its output to them). The CPU form: plain rows. An AWQ input is the 16-bit input itself."""
+        if torch.is_tensor(prepared):
+            return prepared[start:stop]
+        ops, q, scales, lowrank, tokens, offset = prepared
+        start, stop = start + offset, stop + offset
+        if ops is None:
+            return None, q[start:stop], None, lowrank[start:stop], stop - start, 0
+        first, last = start // 256 * 256, -(-stop // 256) * 256
+        groups = scales.shape[0]
+        tiles = scales.reshape(-1)[first * groups:last * groups].view(groups, last - first)
+        return ops, q[first:last], tiles, lowrank[first:last], stop - start, start - first
 
     def rows(self, module, prepared, start, stop):
         source, h = module.weight, self.handler
@@ -70,7 +86,7 @@ class NunchakuRowProjection:
         qweight = source._qweight[first:last]
         scales = source._wscales.reshape(source.shape[0] // 128, -1)[first // 128:last // 128].reshape(k // source._group_size, count)
         up = source._proj_up[first:last]
-        ops, q, act_scales, lowrank, tokens = prepared
+        ops, q, act_scales, lowrank, tokens, offset = prepared
         if ops:
             if self.fp4 and "_alpha" not in source.__dict__:
                 source._alpha = float(source._wtscale.item()) if torch.is_tensor(source._wtscale) else 1.0 if source._wtscale is None else float(source._wtscale)
@@ -79,7 +95,7 @@ class NunchakuRowProjection:
                 lora_act_in=lowrank, lora_up=up, bias=None if bias is None else bias.to(out.dtype), fp4=self.fp4,
                 alpha=source._alpha if self.fp4 else 1.0, wcscales=source._wcscales[first:last] if self.fp4 and source._wcscales is not None else None,
                 act_unsigned=False if self.fp4 else source._act_unsigned)
-            out = out[:tokens]
+            out = out[offset:offset + tokens]
         else:
             if self.fp4:
                 values = h._unpack_nunchaku_fp4_weight(qweight, count, k).to(torch.int64)

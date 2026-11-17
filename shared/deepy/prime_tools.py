@@ -835,6 +835,10 @@ class DeepyPrimeTools:
             return call_policy(call_arguments)
         if tool_name == "wangp_generate":
             return {"pause_runtime": isinstance(call_arguments.get("settings"), (dict, list, str)), "pause_reason": "tool"}
+        if tool_name == "wangp_python":
+            inner = call_arguments.get("arguments")
+            cutout = call_arguments.get("action") == "import_asset" and isinstance(inner, dict) and bool(inner.get("transparent"))
+            return {"pause_runtime": cutout, "pause_reason": "light"}
         if tool_name == "wangp_postprocess":
             return {"pause_runtime": bool(call_arguments.get("action")) and isinstance(call_arguments.get("arguments"), dict), "pause_reason": "tool"}
         if tool_name == "wangp_toolbox":

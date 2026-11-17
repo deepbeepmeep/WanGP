@@ -173,10 +173,9 @@ class BriaFibo2Attention(nn.Module):
                        fused_quant=lambda query, key, group, core, settings: ops.split_half_norm_rope_quant_(query, key, table, self.norm_q, self.norm_k, core, settings, interleaved=True))
         norm_rope = lambda query, key, group: ops.interleaved_norm_rope_(query, key, table, self.norm_q, self.norm_k)
         if encoder_hidden_states is None:
-            result = attention_kit.qkv_attention(hidden_list, self.to_q, self.to_k, self.to_v, self.heads, self.head_dim, norm_rope, **options)
-        else:
-            result = attention_kit.cross_qkv_attention(hidden_list, [encoder_hidden_states], self.to_q, self.to_k, self.to_v, self.heads, self.head_dim, norm_rope, **options)
-        return self.to_out[0](result.flatten(2))
+            return attention_kit.qkv_attention(hidden_list, self.to_q, self.to_k, self.to_v, self.heads, self.head_dim, norm_rope, out_proj=self.to_out[0], **options)
+        return attention_kit.cross_qkv_attention(hidden_list, [encoder_hidden_states], self.to_q, self.to_k, self.to_v, self.heads, self.head_dim, norm_rope,
+                                                 out_proj=self.to_out[0], **options)
 
 class BriaFibo2TransformerBlock(nn.Module):
     """Z-Image's block. With `cross_attention_dim` it becomes an injection block that also reads the text encoder."""

@@ -516,6 +516,11 @@ class _W4A8RowProjection:
     def rows(module, prepared, start, stop):
         return _w4a8_rows(prepared, module.weight, module.bias, start, stop)
 
+    @staticmethod
+    def slice_input(prepared, start, stop):  # rows of the input (offload.linear_input_rows): activations quantized per row
+        activation, activation_scale, correction_input, dtype = prepared
+        return activation[start:stop], activation_scale[start:stop], None if correction_input is None else correction_input[start:stop], dtype
+
 
 from mmgp import offload
 

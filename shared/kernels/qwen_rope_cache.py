@@ -6,10 +6,10 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 
-@triton.jit(do_not_specialize=("T", "QB", "QT", "QH", "KB", "KT", "KH", "VB", "VT", "VH", "CB", "CT"),
-            do_not_specialize_on_alignment=("T", "QB", "QT", "QH", "KB", "KT", "KH", "VB", "VT", "VH", "CB", "CT"))
+@triton.jit(do_not_specialize=("T", "QB", "QT", "QH", "KB", "KT", "KH", "VB", "VT", "VH", "CB", "CT", "HQ", "HK"),
+            do_not_specialize_on_alignment=("T", "QB", "QT", "QH", "KB", "KT", "KH", "VB", "VT", "VH", "CB", "CT", "HQ", "HK"))
 def _rope_cache_kernel(Q, K, V, COS, SIN, KC, VC, KS, VS, SLOTS,
-                       T, HQ: tl.constexpr, HK: tl.constexpr,
+                       T, HQ, HK,
                        D: tl.constexpr, R: tl.constexpr,
                        QB, QT, QH,
                        KB, KT, KH,

@@ -19,8 +19,8 @@ import triton.language as tl
 _NEG_INF = tl.constexpr(-3.0e38)
 
 
-@triton.jit(do_not_specialize=['t_size', 'h_size', 'w_size', 'num_heads', 's_b', 's_t', 's_h', 's_w', 's_n'],
-            do_not_specialize_on_alignment=['t_size', 'h_size', 'w_size', 'num_heads', 's_b', 's_t', 's_h', 's_w', 's_n'])
+@triton.jit(do_not_specialize=['t_size', 'h_size', 'w_size', 'num_heads', 's_b', 's_t', 's_h', 's_w', 's_n', 'kt', 'kh', 'kw'],
+            do_not_specialize_on_alignment=['t_size', 'h_size', 'w_size', 'num_heads', 's_b', 's_t', 's_h', 's_w', 's_n', 'kt', 'kh', 'kw'])
 def _na3d_kernel(
     q_ptr,
     k_ptr,
@@ -36,9 +36,9 @@ def _na3d_kernel(
     s_w,
     s_n,
     scale,
-    kt: tl.constexpr,
-    kh: tl.constexpr,
-    kw: tl.constexpr,
+    kt,
+    kh,
+    kw,
     causal_t: tl.constexpr,
     causal_h: tl.constexpr,
     causal_w: tl.constexpr,
@@ -156,8 +156,8 @@ def _fold_w_run(m_i, l_i, acc, q_blk, k_ptr, v_ptr, row_base, row_ok, w_lo, w_hi
     return m_i, l_i, acc
 
 
-@triton.jit(do_not_specialize=['own_t_size', 'h_size', 'w_size', 'num_heads', 'bn_count', 'own_s_b', 'other_s_b', 's_t', 's_h', 's_w', 's_n'],
-            do_not_specialize_on_alignment=['own_t_size', 'h_size', 'w_size', 'num_heads', 'bn_count', 'own_s_b', 'other_s_b', 's_t', 's_h', 's_w', 's_n'])
+@triton.jit(do_not_specialize=['own_t_size', 'h_size', 'w_size', 'num_heads', 'bn_count', 'own_s_b', 'other_s_b', 's_t', 's_h', 's_w', 's_n', 'kt', 'kh', 'kw'],
+            do_not_specialize_on_alignment=['own_t_size', 'h_size', 'w_size', 'num_heads', 'bn_count', 'own_s_b', 'other_s_b', 's_t', 's_h', 's_w', 's_n', 'kt', 'kh', 'kw'])
 def _joint_kernel(
     q_ptr,
     own_k_ptr,
@@ -177,9 +177,9 @@ def _joint_kernel(
     s_h,
     s_w,
     s_n,
-    kt: tl.constexpr,
-    kh: tl.constexpr,
-    kw: tl.constexpr,
+    kt,
+    kh,
+    kw,
     num_slots: tl.constexpr,
     hd: tl.constexpr,
     hd_pad: tl.constexpr,

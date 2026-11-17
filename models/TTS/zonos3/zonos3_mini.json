@@ -1,0 +1,641 @@
+{
+ "lm": {
+  "n_layers": 11,
+  "dim": 1024,
+  "head_dim": 32,
+  "n_heads": 16,
+  "n_kv_heads": 4,
+  "norm_eps": 1e-05,
+  "rope_theta": 10000.0,
+  "max_seqlen": 32768,
+  "loss_softcap": 15.0,
+  "global_period": 4,
+  "gdn_heads": 4,
+  "gdn_head_dim": 128,
+  "gdn_kernel": 4,
+  "ffn_hidden": 2048,
+  "moe_hidden": 1536,
+  "moe_routed_dim": 256,
+  "n_experts": 64,
+  "moe_topk": 2,
+  "n_codebooks": 10,
+  "codebook_size": 4096,
+  "eoa_id": 4096,
+  "audio_pad_id": 4097,
+  "text_vocab": 8196,
+  "text_rows": 8340,
+  "speaker_embedding_dim": 192,
+  "reference_max_seconds": 60.0,
+  "condition_names": [
+   "loudness",
+   "fmax",
+   "speaking_rate"
+  ],
+  "condition_bucket_counts": [
+   10,
+   10,
+   30
+  ],
+  "condition_edges": {
+   "loudness": [
+    -29.778,
+    -26.947,
+    -25.047,
+    -23.3,
+    -21.743,
+    -20.386,
+    -19.186,
+    -17.851,
+    -15.967
+   ],
+   "fmax": [
+    8437.5,
+    10242.2,
+    11507.8,
+    13359.4,
+    15164.1,
+    15585.9,
+    15750.0,
+    17765.6,
+    19945.3
+   ],
+   "speaking_rate": [
+    6.546,
+    8.182,
+    9.273,
+    10.31,
+    11.054,
+    11.667,
+    12.193,
+    12.656,
+    13.083,
+    13.476,
+    13.846,
+    14.196,
+    14.53,
+    14.887,
+    15.193,
+    15.517,
+    15.865,
+    16.208,
+    16.579,
+    16.972,
+    17.411,
+    17.898,
+    18.434,
+    19.069,
+    19.818,
+    20.816,
+    22.286,
+    24.722,
+    29.25
+   ]
+  },
+  "condition_units": {
+   "loudness": "LUFS",
+   "fmax": "Hz",
+   "speaking_rate": "utf-8 bytes per second"
+  }
+ },
+ "text": {
+  "tokenizer": "superbpe8192.json",
+  "offset": 4,
+  "bos": 2,
+  "eos": 3,
+  "phonemes": {
+   "open_id": 8197,
+   "close_id": 8198,
+   "open_marker": "\ue000",
+   "close_marker": "\ue001",
+   "symbols": [
+    "a",
+    "b",
+    "c",
+    "d",
+    "e",
+    "f",
+    "h",
+    "i",
+    "j",
+    "k",
+    "l",
+    "m",
+    "n",
+    "o",
+    "p",
+    "q",
+    "r",
+    "s",
+    "t",
+    "u",
+    "v",
+    "w",
+    "x",
+    "y",
+    "z",
+    "\u00b2",
+    "\u00b3",
+    "\u00b9",
+    "\u00e3",
+    "\u00e4",
+    "\u00e6",
+    "\u00e7",
+    "\u00ef",
+    "\u00f0",
+    "\u00f5",
+    "\u00f8",
+    "\u0127",
+    "\u0129",
+    "\u014b",
+    "\u0153",
+    "\u0169",
+    "\u0250",
+    "\u0251",
+    "\u0252",
+    "\u0253",
+    "\u0254",
+    "\u0255",
+    "\u0256",
+    "\u0257",
+    "\u0258",
+    "\u0259",
+    "\u025a",
+    "\u025b",
+    "\u025c",
+    "\u025d",
+    "\u025f",
+    "\u0261",
+    "\u0263",
+    "\u0264",
+    "\u0265",
+    "\u0266",
+    "\u0267",
+    "\u0268",
+    "\u026a",
+    "\u026b",
+    "\u026d",
+    "\u026f",
+    "\u0270",
+    "\u0271",
+    "\u0272",
+    "\u0273",
+    "\u0274",
+    "\u0275",
+    "\u0278",
+    "\u0279",
+    "\u027b",
+    "\u027d",
+    "\u027e",
+    "\u0280",
+    "\u0281",
+    "\u0282",
+    "\u0283",
+    "\u0288",
+    "\u0289",
+    "\u028a",
+    "\u028b",
+    "\u028c",
+    "\u028d",
+    "\u028e",
+    "\u028f",
+    "\u0290",
+    "\u0291",
+    "\u0292",
+    "\u0294",
+    "\u0295",
+    "\u029d",
+    "\u02b0",
+    "\u02b1",
+    "\u02b2",
+    "\u02b7",
+    "\u02bc",
+    "\u02c0",
+    "\u02d0",
+    "\u02e3",
+    "\u02e4",
+    "\u02e5",
+    "\u02e6",
+    "\u02e7",
+    "\u02e8",
+    "\u02e9",
+    "\u0303",
+    "\u030a",
+    "\u030d",
+    "\u031a",
+    "\u031d",
+    "\u031e",
+    "\u031f",
+    "\u0320",
+    "\u0325",
+    "\u0329",
+    "\u032a",
+    "\u032f",
+    "\u0339",
+    "\u0348",
+    "\u0361",
+    "\u03b2",
+    "\u03b8",
+    "\u03c7",
+    "\u1d5d",
+    "\u1ebd",
+    "\u1ef9",
+    "\u2074",
+    "\u2075",
+    "\u207b",
+    "\u207d",
+    "\u207e"
+   ]
+  },
+  "start": {
+   "id": 8335,
+   "marker": "\ue002"
+  },
+  "pauses": {
+   "ids": [
+    8336,
+    8337,
+    8338,
+    8339
+   ],
+   "markers": [
+    "\ue003",
+    "\ue004",
+    "\ue005",
+    "\ue006"
+   ],
+   "seconds": [
+    0.2475,
+    0.495,
+    0.9899,
+    1.9799
+   ]
+  }
+ },
+ "codec": {
+  "sample_rate": 44100,
+  "hop": 2940,
+  "frame_rate": 15.0,
+  "silence_frame": [
+   1918,
+   746,
+   3544,
+   234,
+   1267,
+   2914,
+   3944,
+   2849,
+   326,
+   1337
+  ],
+  "headroom_db": 3.0,
+  "output_limit_dbfs": -1.0,
+  "internal_sample_rate": 44160,
+  "semantic_head": {
+   "width": 768,
+   "hidden": 2048,
+   "depth": 4
+  },
+  "stages": [
+   {
+    "type": "transformer",
+    "input_dim": 1024,
+    "output_dim": 1280,
+    "dim": 1280,
+    "heads": 20,
+    "layers": 2,
+    "ffn": 5120,
+    "context": 150,
+    "layer_scale": 0.01
+   },
+   {
+    "type": "unpatch",
+    "size": 2
+   },
+   {
+    "type": "transformer",
+    "input_dim": 640,
+    "output_dim": 768,
+    "dim": 768,
+    "heads": 12,
+    "layers": 2,
+    "ffn": 3072,
+    "context": 300,
+    "layer_scale": 0.01
+   },
+   {
+    "type": "unpatch",
+    "size": 2
+   },
+   {
+    "type": "transformer",
+    "input_dim": 384,
+    "output_dim": 768,
+    "dim": 768,
+    "heads": 12,
+    "layers": 2,
+    "ffn": 3072,
+    "context": 480,
+    "layer_scale": 0.01
+   },
+   {
+    "type": "unpatch",
+    "size": 2
+   },
+   {
+    "type": "transformer",
+    "input_dim": 384,
+    "output_dim": 768,
+    "dim": 768,
+    "heads": 12,
+    "layers": 2,
+    "ffn": 3072,
+    "context": 480,
+    "layer_scale": 0.01
+   },
+   {
+    "type": "unpatch",
+    "size": 2
+   },
+   {
+    "type": "transformer",
+    "input_dim": 384,
+    "output_dim": null,
+    "dim": 768,
+    "heads": 12,
+    "layers": 2,
+    "ffn": 3072,
+    "context": 480,
+    "layer_scale": 0.01
+   }
+  ],
+  "head": {
+   "depth": 8,
+   "hidden": 2048,
+   "hop": 184,
+   "n_ffts": [
+    736,
+    2208
+   ],
+   "fir_kernel": 127
+  }
+ },
+ "generation": {
+  "sampling": {
+   "temperature": 0.75,
+   "topk": 80,
+   "top_p": 0.69,
+   "min_p": 0.0,
+   "repetition_penalty": 2.4,
+   "repetition_window": 96,
+   "repetition_codebooks": 6
+  },
+  "silence_prefill_frames": 3,
+  "reference_max_frames": 900
+ },
+ "speaker": {
+  "backbone_type": "MECT_B2",
+  "backbone_config": {
+   "moe_type": "token",
+   "num_experts_shard": 2,
+   "num_experts_token": 4,
+   "top_k_shard": null,
+   "top_k_token": null,
+   "shard_scale": 1.0
+  },
+  "pooling": "ASTP",
+  "embed_dim": 192,
+  "sample_rate": 16000,
+  "max_seconds": 60,
+  "fbank": {
+   "num_mel_bins": 80,
+   "frame_length": 25,
+   "frame_shift": 10,
+   "dither": 0.0,
+   "energy_floor": 0.0,
+   "window_type": "hamming",
+   "scale": 32768
+  }
+ },
+ "languages": [
+  {
+   "code": "en_us",
+   "label": "US English",
+   "nemo": "en"
+  },
+  {
+   "code": "en_gb",
+   "label": "UK English",
+   "nemo": "en"
+  },
+  {
+   "code": "fr_fr",
+   "label": "French",
+   "nemo": "fr"
+  },
+  {
+   "code": "de",
+   "label": "German",
+   "nemo": "de"
+  },
+  {
+   "code": "es",
+   "label": "Spanish",
+   "nemo": "es"
+  },
+  {
+   "code": "it",
+   "label": "Italian",
+   "nemo": "it"
+  },
+  {
+   "code": "pt_br",
+   "label": "Portuguese",
+   "nemo": "pt"
+  },
+  {
+   "code": "ja",
+   "label": "Japanese",
+   "nemo": "ja"
+  },
+  {
+   "code": "cmn",
+   "label": "Mandarin",
+   "nemo": "zh"
+  },
+  {
+   "code": "ko",
+   "label": "Korean",
+   "nemo": "ko"
+  },
+  {
+   "code": "ar",
+   "label": "Arabic",
+   "nemo": "ar"
+  },
+  {
+   "code": "bn",
+   "label": "Bengali",
+   "nemo": "bn"
+  },
+  {
+   "code": "bg",
+   "label": "Bulgarian",
+   "nemo": "bg"
+  },
+  {
+   "code": "cs",
+   "label": "Czech",
+   "nemo": "cs"
+  },
+  {
+   "code": "da",
+   "label": "Danish",
+   "nemo": "da"
+  },
+  {
+   "code": "nl",
+   "label": "Dutch",
+   "nemo": "nl"
+  },
+  {
+   "code": "fi",
+   "label": "Finnish",
+   "nemo": "fi"
+  },
+  {
+   "code": "ka",
+   "label": "Georgian",
+   "nemo": "ka"
+  },
+  {
+   "code": "el",
+   "label": "Greek",
+   "nemo": "el"
+  },
+  {
+   "code": "gu",
+   "label": "Gujarati",
+   "nemo": "gu"
+  },
+  {
+   "code": "he",
+   "label": "Hebrew",
+   "nemo": "he"
+  },
+  {
+   "code": "hi",
+   "label": "Hindi",
+   "nemo": "hi"
+  },
+  {
+   "code": "hu",
+   "label": "Hungarian",
+   "nemo": "hu"
+  },
+  {
+   "code": "id",
+   "label": "Indonesian",
+   "nemo": "id"
+  },
+  {
+   "code": "kn",
+   "label": "Kannada",
+   "nemo": "kn"
+  },
+  {
+   "code": "ms",
+   "label": "Malay",
+   "nemo": "ms"
+  },
+  {
+   "code": "ml",
+   "label": "Malayalam",
+   "nemo": "ml"
+  },
+  {
+   "code": "mr",
+   "label": "Marathi",
+   "nemo": "mr"
+  },
+  {
+   "code": "no",
+   "label": "Norwegian",
+   "nemo": "nb"
+  },
+  {
+   "code": "or",
+   "label": "Odia",
+   "nemo": "or"
+  },
+  {
+   "code": "pl",
+   "label": "Polish",
+   "nemo": "pl"
+  },
+  {
+   "code": "pa",
+   "label": "Punjabi",
+   "nemo": "pa"
+  },
+  {
+   "code": "ro",
+   "label": "Romanian",
+   "nemo": "ro"
+  },
+  {
+   "code": "ru",
+   "label": "Russian",
+   "nemo": "ru"
+  },
+  {
+   "code": "sk",
+   "label": "Slovak",
+   "nemo": "sk"
+  },
+  {
+   "code": "sv",
+   "label": "Swedish",
+   "nemo": "sv"
+  },
+  {
+   "code": "tl",
+   "label": "Tagalog",
+   "nemo": "tl"
+  },
+  {
+   "code": "ta",
+   "label": "Tamil",
+   "nemo": "ta"
+  },
+  {
+   "code": "te",
+   "label": "Telugu",
+   "nemo": "te"
+  },
+  {
+   "code": "th",
+   "label": "Thai",
+   "nemo": "th"
+  },
+  {
+   "code": "tr",
+   "label": "Turkish",
+   "nemo": "tr"
+  },
+  {
+   "code": "uk",
+   "label": "Ukrainian",
+   "nemo": "uk"
+  },
+  {
+   "code": "ur",
+   "label": "Urdu",
+   "nemo": "ur"
+  },
+  {
+   "code": "vi",
+   "label": "Vietnamese",
+   "nemo": "vi"
+  }
+ ]
+}

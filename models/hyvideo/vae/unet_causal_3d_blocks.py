@@ -27,10 +27,10 @@ from diffusers.models.attention_processor import Attention
 from diffusers.models.normalization import AdaGroupNorm
 from diffusers.models.normalization import RMSNorm
 
-from shared.kernels import kernel_policy
+from shared.kernels import kernel_policy, vae_ops
 
 try:
-    from . import triton_kernels as _fused
+    from shared.kernels import causal_group_norm_triton as _fused
 except (ImportError, OSError, RuntimeError):
     _fused = None
 
@@ -44,7 +44,7 @@ _SUBPIXEL_TAPS = ((1.0, 0.0, 0.0), (0.0, 1.0, 1.0)), ((1.0, 1.0, 0.0), (0.0, 0.0
 
 def fused_norm_silu(x):
     """Triton GroupNorm + SiLU + padding kernels for the convolution inputs ("fast" kernel precision, CUDA GPUs with Triton)."""
-    return _fused is not None and x.is_cuda and kernel_policy.allow_approximate() and _fused.supported(x.device)
+    return vae_ops.causal_norm_kernels(x)
 
 
 class CausalConv3d(nn.Module):
@@ -90,14 +90,14 @@ class CausalConv3d(nn.Module):
         frozen = norm in state["frozen"]
         cache = state.get(self)
         if cache is None:
-            padded = _fused.group_norm_silu_pad(x, norm, self.time_causal_padding, running=running, frozen=frozen, shared=shared)
+            padded = vae_ops.causal_group_norm_silu_pad(x, norm, self.time_causal_padding, running=running, frozen=frozen, shared=shared)
             state[self] = padded[:, :, -front:].clone()
         else:
             batch, channels, frames, height, width = x.shape
             padded = x.new_empty(batch, channels, front + frames, top + height + bottom, left + width + right)
             padded[:, :, :front] = cache
-            _fused.group_norm_silu_pad(x, norm, (left, right, top, bottom, 0, 0), running=running, frozen=frozen, shared=shared, out=padded,
-                                       out_frame=front)
+            vae_ops.causal_group_norm_silu_pad(x, norm, (left, right, top, bottom, 0, 0), running=running, frozen=frozen, shared=shared, out=padded,
+                                               out_frame=front)
             cache.copy_(padded[:, :, -front:])
         return self.conv(padded)
 
@@ -299,9 +299,47 @@ class UpsampleCausal3D(nn.Module):
         padded = F.pad(x, (1, 1, 1, 1, 1 if self.upsample_factor[0] == 2 else 2, 0), mode="replicate")
         return self._interleave(self._subpixel_conv(padded, self._subpixel_weights()), x.shape[3], x.shape[4], True)
 
+    def _stream_exact(self, x, state):
+        """forward of one chunk of frames of a streamed decode with the layer's own arithmetic (the nearest upsampling, then the causal
+        convolution): the upsampled frames are written straight into the padded input of the convolution, whose first two frames are
+        the previous chunk's last ones (the replicated first frame for the first chunk). The first frame of the clip is not doubled in
+        time."""
+        cache = state.get(self)
+        batch, channels, frames, height, width = x.shape
+        doubled = self.upsample_factor[0] == 2
+        first = doubled and cache is None
+        padded = x.new_empty(batch, channels, 2 + frames * (2 if doubled else 1) - first, 2 * height + 2, 2 * width + 2)
+        body = padded[:, :, 2:]
+        for py in range(2):
+            for px in range(2):
+                inner = body[:, :, :, 1 + py:1 + 2 * height:2, 1 + px:1 + 2 * width:2]
+                if not doubled:
+                    inner.copy_(x)
+                elif first:
+                    inner[:, :, :1] = x[:, :, :1]
+                    inner[:, :, 1::2] = x[:, :, 1:]
+                    inner[:, :, 2::2] = x[:, :, 1:]
+                else:
+                    inner[:, :, 0::2] = x
+                    inner[:, :, 1::2] = x
+        body[:, :, :, :1, 1:-1] = body[:, :, :, 1:2, 1:-1]
+        body[:, :, :, -1:, 1:-1] = body[:, :, :, -2:-1, 1:-1]
+        body[..., :1] = body[..., 1:2]
+        body[..., -1:] = body[..., -2:-1]
+        if cache is None:
+            padded[:, :, :2] = body[:, :, :1]
+            state[self] = padded[:, :, -2:].clone()
+        else:
+            padded[:, :, :2] = cache
+            cache.copy_(padded[:, :, -2:])
+        return self.conv.conv(padded)
+
     def stream(self, x, state):
-        """_subpixel_forward of one chunk of frames of a streamed decode: the previous chunk's last frames replace the replicate padding;
-        state["weights"] keeps the kernels for the whole decode."""
+        """One chunk of frames of a streamed decode. "fast" kernel precision: _subpixel_forward of the chunk, the previous chunk's last
+        frames replacing the replicate padding; state["weights"] keeps the kernels for the whole decode. Else _stream_exact (the summed
+        kernel taps of the sub-pixel form are rounded once more than the layer's own)."""
+        if not kernel_policy.allow_approximate():
+            return self._stream_exact(x, state)
         weights = state["weights"].get(self)
         if weights is None:
             weights = state["weights"][self] = self._subpixel_weights()
@@ -531,7 +569,7 @@ class ResnetBlockCausal3D(nn.Module):
         values without its whole padded copies, both convolution outputs alive at once and the workspace of whole-clip convolutions."""
         def frozen(norm, tensor):
             stats = tensor.new_zeros(tensor.shape[0] * norm.num_groups, 3, dtype=torch.float64)
-            _fused.group_norm_silu_pad(tensor, norm, running=stats, apply=False)
+            vae_ops.causal_group_norm_silu_pad(tensor, norm, running=stats, apply=False)
             return {norm: stats, "frozen": {norm}}
 
         frames = x.shape[2]

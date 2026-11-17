@@ -277,6 +277,20 @@ def cpu_compute_supported(tensor):
     the blocks that MMGP leaves on the CPU then compute it there (cpuCompute)."""
     return any(getattr(handler, "cpu_compute_supported", None) is not None and handler.cpu_compute_supported(tensor) for handler in _load_handlers())
 
+def column_input(module, rows, dtype, device, segments=None, residual=None):
+    """For a linear module whose input (rows, in_features) in dtype comes by ranges of columns and is then read once: the object of the
+    first registered handler that keeps such an input in its weight format's own, smaller form (its optional column_input(module, rows,
+    dtype, device, segments, residual), None for a module it cannot serve), or None. The object takes the ranges in order
+    (append(x_list): a (..., columns) tensor handed off) and gives linear(), (rows, out_features); linear_residual(residual, scale),
+    the output added to residual; gated_linear(residual, gate, segments), residual[start:stop] += gate[row] * output for each segment
+    (start, stop, row) over the rows. segments and residual announce the read that will follow."""
+    for handler in _load_handlers():
+        factory = getattr(handler, "column_input", None)
+        kept = None if factory is None else factory(module, rows, dtype, device, segments, residual)
+        if kept is not None:
+            return kept
+    return None
+
 _FILE_EXTENSION_HANDLERS = {}
 
 

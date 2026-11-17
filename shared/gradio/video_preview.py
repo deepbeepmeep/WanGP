@@ -243,7 +243,7 @@ def ensure_fast_video_preview(video_path, cache_dir=None):
             _remember_preview(source_path, preview_path)
             return str(preview_path)
         try:
-            result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False)
+            result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False)
         except OSError:
             result = None
         if result is None or result.returncode != 0 or not tmp_path.is_file():

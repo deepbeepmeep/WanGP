@@ -264,6 +264,19 @@ class ConditioningItem:
     media_y: Optional[int] = None
 
 
+
+def _video_bytes(frames, size=None):
+    """Decoded frames in [-1, 1] as the bytes WanGP made of them, in their dtype as before: the image processor's (x * 0.5 + 0.5)
+    clamped to [0, 1], the multi-scale pipeline's bilinear resize to size (height, width) when given, the pipeline's (y - 0.5) * 2, then
+    WanGP's conversion (shared.utils.utils.convert_video_tensor_to_uint8_chunked: in FP16, + 1, * 127.5, clamped, truncated)."""
+    frames = (frames * 0.5 + 0.5).clamp(0, 1)
+    if size is not None and tuple(frames.shape[-2:]) != tuple(size):
+        count = frames.shape[2]
+        frames = rearrange(F.interpolate(rearrange(frames, "b c f h w -> (b f) c h w"), size=size, mode="bilinear", align_corners=False), "(b f) c h w -> b c f h w", f=count)
+    frames = frames.sub_(0.5).mul_(2)
+    return frames.to(torch.float16).sub_(-1).mul_(127.5).clamp_(0, 255).to(torch.uint8)
+
+
 class LTXVideoPipeline(DiffusionPipeline):
     r"""
     Pipeline for text-to-image generation using LTX-Video.
@@ -1350,15 +1363,20 @@ class LTXVideoPipeline(DiffusionPipeline):
             # torch.save(latents, "lala.pt")
             # latents = torch.load("lala.pt")
             latents = self.tone_map_latents(latents, tone_map_compression_ratio, start = prefix_latent_frames)            
-            image = vae_decode(
-                latents,
-                self.vae,
-                is_video,
-                vae_per_channel_normalize=kwargs["vae_per_channel_normalize"],
-                timestep=decode_timestep,
-            )
+            if output_type == "pt" and is_video:  # the video as WanGP's bytes, in RAM, piece by piece (see _video_bytes)
+                size = kwargs.get("video_bytes_size")  # (the multi-scale pipeline's final size)
+                to_ram = _video_bytes if size is None else lambda frames: _video_bytes(frames, size)
+                image = vae_decode(latents, self.vae, is_video, vae_per_channel_normalize=kwargs["vae_per_channel_normalize"], timestep=decode_timestep, to_ram=to_ram)
+            else:
+                image = vae_decode(
+                    latents,
+                    self.vae,
+                    is_video,
+                    vae_per_channel_normalize=kwargs["vae_per_channel_normalize"],
+                    timestep=decode_timestep,
+                )
 
-            image = self.image_processor.postprocess(image, output_type=output_type)
+                image = self.image_processor.postprocess(image, output_type=output_type)
 
         else:
             image = latents
@@ -1954,6 +1972,8 @@ class LTXMultiScalePipeline:
         if hw_tile > 0: 
             self.vae.enable_hw_tiling()
             self.vae.set_tiling_params(hw_tile)
+        else:  # (the choice now follows the output's size: a kept pipeline must not keep the tiles of its previous generation)
+            self.vae.disable_hw_tiling()
   
         ltxv_model = kwargs["ltxv_model"]
         text_encoder_max_tokens = 256
@@ -2023,12 +2043,13 @@ class LTXMultiScalePipeline:
         kwargs["pass_no"] = 2
 
         kwargs.update(**second_pass)
-        kwargs["num_inference_steps"] = kwargs["num_inference_steps2"] 
+        kwargs["num_inference_steps"] = kwargs["num_inference_steps2"]
+        kwargs["video_bytes_size"] = (original_height, original_width)  # (the bytes path resizes each decoded piece)
 
         result = video_pipeline(*args, **kwargs)
         if result == None:
             return None
-        if original_output_type != "latent":
+        if original_output_type != "latent" and result.dtype != torch.uint8:
             num_frames = result.shape[2]
             videos = rearrange(result, "b c f h w -> (b f) c h w")
 

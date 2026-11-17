@@ -1,0 +1,23 @@
+{
+    "model": {
+        "name": "Fibo 2.0 RMBG-3.0",
+        "architecture": "fibo2_edit_turbo",
+        "parent_model_type": "fibo2_rmbg3",
+        "matting": true,
+        "description": "Bria RMBG-3.0: four-step grayscale alpha-matte generation from a reference image. White is foreground, black is background, and gray preserves soft edges and transparency. Weights: CC BY-NC 4.0; commercial use requires a separate Bria license.",
+        "URLs": [
+            "https://huggingface.co/DeepBeepMeep/Fibo2/resolve/main/Fibo_RMBG_3.0_bf16.safetensors",
+            "https://huggingface.co/DeepBeepMeep/Fibo2/resolve/main/Fibo_RMBG_3.0_int8_convrot.safetensors"
+        ]
+    },
+    "prompt": "{\"edit_instruction\":\"Generate a detailed grayscale alpha matte. Map the opaque foreground to white and the background to black. Produce soft, anti-aliased grayscale gradients at the edges of the subject to represent fine details and transparency.\"}",
+    "negative_prompt": "",
+    "image_mode": 1,
+    "resolution": "1024x1024",
+    "num_inference_steps": 4,
+    "guidance_scale": 1.0,
+    "batch_size": 1,
+    "prompt_enhancer": "",
+    "video_prompt_type": "KI",
+    "multi_prompts_gen_type": "FG"
+}

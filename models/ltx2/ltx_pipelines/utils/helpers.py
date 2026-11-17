@@ -1336,17 +1336,6 @@ def _prepare_conditioning_context(
     return preprocessor.build_prepared_conditioning(seed_modality)
 
 
-def _clear_phase_timestep_embedders(transformer: X0Model | None) -> None:
-    if transformer is None:
-        return
-    velocity_model = getattr(transformer, "velocity_model", transformer)
-    for preprocessor_name in ("video_args_preprocessor", "audio_args_preprocessor"):
-        preprocessor = getattr(velocity_model, preprocessor_name, None)
-        clear_fn = None if preprocessor is None else getattr(preprocessor, "clear_phase_timestep_embedders", None)
-        if callable(clear_fn):
-            clear_fn()
-
-
 def _get_audio_reference_token_count(audio_state: LatentState) -> int:
     positions = audio_state.positions
     if positions is None or positions.ndim < 4 or positions.shape[1] < 1:
@@ -1417,7 +1406,6 @@ def simple_denoising_func(
         prepared_audio_context = None
         prepared_audio_context_n = None
         prepared_audio_context_id = None
-        _clear_phase_timestep_embedders(transformer)
 
     def simple_denoising_step(
         video_state: LatentState, audio_state: LatentState, sigmas: torch.Tensor, step_index: int
@@ -1654,7 +1642,6 @@ def guider_denoising_func(
         nonlocal prepared_v_context_p, prepared_v_context_n, prepared_a_context_p, prepared_a_context_n, prepared_a_context_id
         prepared_v_context_p = prepared_v_context_n = None
         prepared_a_context_p = prepared_a_context_n = prepared_a_context_id = None
-        _clear_phase_timestep_embedders(transformer)
 
     def guider_denoising_step(
         video_state: LatentState, audio_state: LatentState, sigmas: torch.Tensor, step_index: int
@@ -1969,7 +1956,6 @@ def multi_modal_guider_denoising_func(
         nonlocal prepared_v_context_p, prepared_v_context_n, prepared_a_context_p, prepared_a_context_n, prepared_a_context_id
         prepared_v_context_p = prepared_v_context_n = None
         prepared_a_context_p = prepared_a_context_n = prepared_a_context_id = None
-        _clear_phase_timestep_embedders(transformer)
 
     def guider_denoising_step(
         video_state: LatentState, audio_state: LatentState, sigmas: torch.Tensor, step_index: int

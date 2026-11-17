@@ -225,7 +225,13 @@ upsampler without `query_chunking` receives its video in one piece.
 | `release_continue_cache()` | Called after the last chunk, or when the video is stopped. |
 
 Each chunk is one `upscale()` call, which also receives `frame_offset`, the
-place of its first frame in the video. Choose the join that matches the model:
+place of its first frame in the video. `audio_frame_offset` locates its first
+frame in the supplied `source_audio_path` or `audio_waveform`, at `fps`.
+The wrapper selects the matching audio segment using this offset. It defaults
+to zero for audio already trimmed to the supplied video, as in Media Flow and
+generated windows; their global `frame_offset` still addresses the original
+video. LTX-2 reuses its native audio-window slicer for both cases; its Detail
+Refiner ignores audio. Choose the join that matches the model:
 
 - **Frames that do not depend on their neighbours** (a resize): return
   `postprocessing.chunking.FRAME_BY_FRAME`. Any chunk gives the frames of the
@@ -244,10 +250,11 @@ place of its first frame in the video. Choose the join that matches the model:
 Check a declaration on the real model: process a video by chunks and in one
 piece, then compare the change from frame to frame across each chunk start.
 
-A video that fits in memory is still processed in one call. Upsamplers that
-declare `source_audio_conditioning` also receive their video in one piece, and
-so does a video going through a frame interpolator and an upsampler that both
-need neighbouring frames.
+A video that fits in memory is still processed in one call. Declaring
+`source_audio_conditioning` does not prevent chunking: an upsampler declaring
+chunk rules must handle the supplied audio offset. A video going through a
+frame interpolator and an upsampler that both need neighbouring frames still
+receives processing in one piece.
 
 ```python
 class MyChunkRules:

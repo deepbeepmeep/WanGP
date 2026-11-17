@@ -73,13 +73,18 @@ sam3_click_session = None
 SAM3_MATANYONE_FILL_HOLE_AREA = 2
 MATANYONE_MASK_TYPE_CHOICES = [
     ("Grey with Alpha (used by WanGP)", "wangp"),
-    ("Green Screen", "greenscreen"),
+    ("Matted Video", "greenscreen"),
     ("RGB With Alpha Channel (local Zip file)", "alpha"),
 ]
 SAM3_MASK_TYPE_CHOICES = [
     ("B & W (used by WanGP)", "wangp"),
-    ("Green Screen", "greenscreen"),
+    ("Matted Video", "greenscreen"),
 ]
+MATTE_COLORS = {
+    "Green": (0, 255, 0), "Red": (255, 0, 0), "Orange": (255, 165, 0),
+    "Yellow": (255, 255, 0), "Cyan": (0, 255, 255), "Blue": (0, 0, 255),
+    "Indigo": (75, 0, 130), "Violet": (143, 0, 255), "White": (255, 255, 255), "Black": (0, 0, 0),
+}
 
 # SAM generator
 import copy
@@ -161,14 +166,26 @@ def _matanyone_morphology_visibility():
     return gr.update(visible=not is_sam3_selected())
 
 
-def _matanyone_mask_type_choices():
-    return SAM3_MASK_TYPE_CHOICES if is_sam3_selected() else MATANYONE_MASK_TYPE_CHOICES
+def _matanyone_mask_type_choices(media_type="Video"):
+    choices = SAM3_MASK_TYPE_CHOICES if is_sam3_selected() else MATANYONE_MASK_TYPE_CHOICES
+    return [(f"Matted {media_type}" if value == "greenscreen" else label, value) for label, value in choices]
 
 
-def _matanyone_mask_type_update(mask_type):
-    choices = _matanyone_mask_type_choices()
+def _matanyone_background_color_update(mask_type):
+    return gr.update(visible=mask_type == "greenscreen")
+
+
+def _matanyone_mask_type_update(mask_type, media_type="Video"):
+    choices = _matanyone_mask_type_choices(media_type)
     values = [value for _, value in choices]
-    return gr.update(choices=choices, value=mask_type if mask_type in values else "wangp")
+    mask_type = mask_type if mask_type in values else "wangp"
+    return gr.update(choices=choices, value=mask_type), _matanyone_background_color_update(mask_type)
+
+
+def _matte_frame(frame, alpha, background_color):
+    alpha = alpha.astype(np.uint16)
+    color = np.asarray(MATTE_COLORS[background_color], dtype=np.uint16)
+    return ((frame.astype(np.uint16) * (255 - alpha) + color * alpha) // 255).astype(np.uint8)
 
 
 def _matanyone_mask_output_button_label():
@@ -853,7 +870,7 @@ def get_dim_file_suffix(new_dim):
 
 # image matting
 @mask_action
-def image_matting(state, video_state, interactive_state, mask_type, matting_type, new_new_dim, mask_dropdown, erode_kernel_size, dilate_kernel_size, refine_iter):
+def image_matting(state, video_state, interactive_state, mask_type, matting_type, new_new_dim, mask_dropdown, erode_kernel_size, dilate_kernel_size, refine_iter, background_color="Green"):
     if video_state["masks"] is None:
         gr.Info("Matanyone Session Lost. Please reload an Image")
         return [gr.update(visible=False)]*12
@@ -917,18 +934,11 @@ def image_matting(state, video_state, interactive_state, mask_type, matting_type
         control_output = following_frames[-1]
         tab_label = "Control Image & Mask"
     elif mask_type == "greenscreen":
-        green_image = np.zeros_like(following_frames[-1], dtype=np.uint8)
-        green_image[:, :, 1] = 255          
         alpha_output = alpha[-1] if foreground_mat else 255 - alpha[-1] 
-
-        output_frame = (following_frames[-1].astype(np.uint16) * (255 - alpha_output.astype(np.uint16)) + 
-                        green_image.astype(np.uint16) * alpha_output.astype(np.uint16))
-        output_frame = output_frame // 255
-        output_frame = output_frame.astype(np.uint8)
-        control_output = output_frame    
+        control_output = _matte_frame(following_frames[-1], alpha_output, background_color)
         alpha_output = alpha_output[:,:,0]                
-        control_title = "Green Screen Output"
-        tab_label = "Green Screen"
+        control_title = "Matted Image"
+        tab_label = "Matted Image"
         allow_export = False
     elif mask_type == "alpha":
         alpha_output = alpha[-1] if foreground_mat else 255 - alpha[-1] 
@@ -958,7 +968,7 @@ def image_matting(state, video_state, interactive_state, mask_type, matting_type
 
 # video matting
 @mask_action
-def video_matting(state, video_state, mask_type, video_input, end_slider, matting_type, new_new_dim, interactive_state, mask_dropdown, erode_kernel_size, dilate_kernel_size):
+def video_matting(state, video_state, mask_type, video_input, end_slider, matting_type, new_new_dim, interactive_state, mask_dropdown, erode_kernel_size, dilate_kernel_size, background_color="Green"):
     if video_state["masks"] is None:
         gr.Info("Matanyone Session Lost. Please reload a Video")
         return [gr.update(visible=False)]*6
@@ -968,8 +978,9 @@ def video_matting(state, video_state, mask_type, video_input, end_slider, mattin
     # if interactive_state["track_end_number"]:
     #     following_frames = video_state["origin_images"][video_state["select_frame_number"]:interactive_state["track_end_number"]]
     # else:
-    end_slider = max(video_state["select_frame_number"] +1, end_slider)
-    following_frames = video_state["origin_images"][video_state["select_frame_number"]: end_slider]
+    start_frame = video_state["select_frame_number"]
+    end_slider = max(start_frame + 1, end_slider)
+    following_frames = video_state["origin_images"][start_frame: end_slider]
 
     if interactive_state["multi_mask"]["masks"]:
         if len(mask_dropdown) == 0:
@@ -986,7 +997,6 @@ def video_matting(state, video_state, mask_type, video_input, end_slider, mattin
     new_dim = video_state.get("new_dim", "")
     if new_new_dim != new_dim:
         gr.Info(f"You have changed the Input / Output Dimensions after loading the Video into Matanyone. The output dimension will be the ones when loading the video ({'original' if len(new_dim) == 0 else new_dim})")
-    audio_path = video_state["audio"]
 
     if is_sam3_selected():
         prompts = _selected_sam3_prompts(interactive_state, mask_dropdown)
@@ -1022,21 +1032,14 @@ def video_matting(state, video_state, mask_type, video_input, end_slider, mattin
         foreground_suffix = ""
         allow_export = True
     elif mask_type == "greenscreen":
-        green_image = np.zeros_like(following_frames[0], dtype=np.uint8)
-        green_image[:, :, 1] = 255          
         for frame_origin, frame_alpha in zip(following_frames, alpha):
             if not foreground_mat:
                 frame_alpha = 255 - frame_alpha 
-
-            output_frame = (frame_origin.astype(np.uint16) * (255 - frame_alpha.astype(np.uint16)) + 
-                            green_image.astype(np.uint16) * frame_alpha.astype(np.uint16))
-            output_frame = output_frame // 255
-            output_frame = output_frame.astype(np.uint8)            
-            output_frames.append(output_frame)
+            output_frames.append(_matte_frame(frame_origin, frame_alpha, background_color))
             new_alpha.append(frame_alpha)
         alpha = new_alpha 
-        foreground_title = "Green Screen Output"
-        foreground_suffix = "_greenscreen"
+        foreground_title = "Matted Video"
+        foreground_suffix = f"_matted_{background_color.lower()}"
         allow_export = False
     elif mask_type == "alpha":
         if not foreground_mat:
@@ -1056,17 +1059,19 @@ def video_matting(state, video_state, mask_type, video_input, end_slider, mattin
     file_name = f"{file_name}_{time_flag}"
     if len(new_dim) > 0: file_name += "_" + get_dim_file_suffix(new_dim) 
  
-    from shared.utils.audio_video import extract_audio_tracks, combine_video_with_audio_tracks, cleanup_temp_audio_files    
-    source_audio_tracks, audio_metadata  = extract_audio_tracks(video_input, verbose= offload.default_verboseLevel )
+    from shared.utils.audio_video import extract_audio_tracks, combine_video_with_audio_tracks
     output_fg_path =  f"./mask_outputs/{file_name}{foreground_suffix}.mp4"
     output_fg_temp_path =  f"./mask_outputs/{file_name}{foreground_suffix}_tmp.mp4"
-    if len(source_audio_tracks) == 0:
+    if extract_audio_tracks(video_input, query_only=True) == 0:
         foreground_output = save_video(output_frames, output_fg_path , fps=fps, codec_type= video_output_codec)
     else:
-        foreground_output_tmp = save_video(output_frames, output_fg_temp_path , fps=fps,  codec_type= video_output_codec)
-        combine_video_with_audio_tracks(output_fg_temp_path, source_audio_tracks, output_fg_path, audio_metadata=audio_metadata)
-        cleanup_temp_audio_files(source_audio_tracks)
-        os.remove(foreground_output_tmp)
+        try:
+            save_video(output_frames, output_fg_temp_path, fps=fps, codec_type=video_output_codec)
+            # Copy an unchanged beginning; later starts need sample-accurate seeking and one audio encode.
+            combine_video_with_audio_tracks(output_fg_temp_path, [video_input], output_fg_path, audio_codec_key="copy" if start_frame == 0 else "aac_128", audio_start_time=start_frame / fps)
+        finally:
+            if os.path.exists(output_fg_temp_path):
+                os.remove(output_fg_temp_path)
         foreground_output = output_fg_path
 
     alpha_output = save_video(alpha, f"./mask_outputs/{file_name}{alpha_suffix}.mp4", fps=fps, codec_type= video_output_codec)
@@ -1348,9 +1353,10 @@ def display(tabs, tab_state, state, refresh_form_trigger, server_config, get_cur
 
     # download assets
 
-    # Keep progress events wired without showing a panel that shifts the editor.
-    with gr.Column(visible=False):
-        mask_progress = WangpProgress.component(stop=True)
+    gr.HTML('''<style>
+        .matanyone-media-tab:has(.wangp-progress:not(.finished)),
+        .matanyone-media-tab:has(.wangp-progress:not(.finished)) * { cursor: progress !important; }
+    </style>''', visible=False)
     matanyone_title_md = gr.Markdown(get_title_markdown())
     refresh_form_trigger.change(fn=get_title_markdown, inputs=[], outputs=[matanyone_title_md], show_progress="hidden")
     gr.Markdown("If you have some trouble creating the perfect mask, be aware of these tips:")
@@ -1389,7 +1395,10 @@ def display(tabs, tab_state, state, refresh_form_trigger, server_config, get_cur
             mask_type= gr.Dropdown(
                 choices=_matanyone_mask_type_choices(), label = "Mask Type", value = "wangp"
             ) 
-            refresh_form_trigger.change(fn=_matanyone_mask_type_update, inputs=[mask_type], outputs=[mask_type], show_progress="hidden")
+            media_type = gr.State("Video")
+            background_color = gr.Dropdown(choices=list(MATTE_COLORS), value="Green", label="Background Color", visible=False)
+            mask_type.input(fn=_matanyone_background_color_update, inputs=[mask_type], outputs=[background_color], queue=False, show_progress="hidden")
+            refresh_form_trigger.change(fn=_matanyone_mask_type_update, inputs=[mask_type, media_type], outputs=[mask_type, background_color], queue=False, show_progress="hidden")
 
             matting_type = gr.Radio(
                 choices=["Foreground", "Background"],
@@ -1402,7 +1411,11 @@ def display(tabs, tab_state, state, refresh_form_trigger, server_config, get_cur
             dummy = gr.Text()        
 
         with gr.Tabs():
-            with gr.TabItem("Video"):
+            with gr.TabItem("Video", elem_classes="matanyone-media-tab") as video_tab:
+                video_tab.select(fn=lambda mask: ("Video", *_matanyone_mask_type_update(mask, "Video")), inputs=[mask_type], outputs=[media_type, mask_type, background_color], queue=False, show_progress="hidden")
+                # The hidden progress still drives the cursor; leaving this tab restores the normal pointer.
+                with gr.Column(visible=False):
+                    mask_progress = WangpProgress.component(stop=True)
 
                 click_state = gr.State([[],[]])
 
@@ -1499,10 +1512,10 @@ def display(tabs, tab_state, state, refresh_form_trigger, server_config, get_cur
                     with gr.Column() as output_row: #equal_height=True
                         with gr.Row():
                             with gr.Column(scale=2):
-                                foreground_video_output = gr.Video(label="Original Video Input", visible=False, elem_classes="video")
+                                foreground_video_output = gr.Video(label="Original Video Input", visible=False, interactive=False, elem_classes="video")
                                 foreground_output_button = gr.Button(value="Black & White Video Output", visible=False, elem_classes="new_button")
                             with gr.Column(scale=2):
-                                alpha_video_output = gr.Video(label="Mask Video Output", visible=False, elem_classes="video")
+                                alpha_video_output = gr.Video(label="Mask Video Output", visible=False, interactive=False, elem_classes="video")
                                 export_image_mask_btn = gr.Button(value=_matanyone_mask_output_button_label(), visible=False, elem_classes="new_button")
                         with gr.Row():
                             with gr.Row(visible= False):
@@ -1517,7 +1530,7 @@ def display(tabs, tab_state, state, refresh_form_trigger, server_config, get_cur
 
                 # first step: get the video information     
                 WangpProgress.bind(extract_frames_button.click,
-                    component=mask_progress,
+                    component=mask_progress, concurrency_id="matanyone",
                     fn=get_frames_from_video,
                     inputs=[
                         state, video_input, video_state, new_dim
@@ -1537,7 +1550,7 @@ def display(tabs, tab_state, state, refresh_form_trigger, server_config, get_cur
                 
                 # click select image to get mask using sam
                 WangpProgress.bind(template_frame.select,
-                    component=mask_progress,
+                    component=mask_progress, concurrency_id="matanyone",
                     fn=sam_refine,
                     inputs=[state, video_state, point_prompt, click_state, interactive_state],
                     outputs=[template_frame, video_state, interactive_state]
@@ -1561,9 +1574,9 @@ def display(tabs, tab_state, state, refresh_form_trigger, server_config, get_cur
                     fn=show_outputs,
                     inputs=[],
                     outputs=[foreground_video_output, alpha_video_output]).then,
-                    component=mask_progress,
+                    component=mask_progress, concurrency_id="matanyone",
                     fn=video_matting,
-                    inputs=[state, video_state, mask_type, video_input, end_selection_slider, matting_type, new_dim, interactive_state, mask_dropdown, erode_kernel_size, dilate_kernel_size],
+                    inputs=[state, video_state, mask_type, video_input, end_selection_slider, matting_type, new_dim, interactive_state, mask_dropdown, erode_kernel_size, dilate_kernel_size, background_color],
                     outputs=[foreground_video_output, alpha_video_output,foreground_video_output, alpha_video_output, export_to_vace_video_14B_btn, export_to_current_video_engine_btn]
                 )
 
@@ -1577,7 +1590,7 @@ def display(tabs, tab_state, state, refresh_form_trigger, server_config, get_cur
                 refresh_form_trigger.change(fn=lambda video_state: gr.update(visible=is_sam3_selected() and video_state.get("origin_images") is not None), inputs=[video_state], outputs=[sam3_keyword_row], show_progress="hidden")
 
                 WangpProgress.bind(sam3_keyword_button.click,
-                    component=mask_progress,
+                    component=mask_progress, concurrency_id="matanyone",
                     fn=add_sam3_keyword_masks,
                     inputs=[state, video_state, interactive_state, sam3_keyword_text, mask_dropdown],
                     outputs=[interactive_state, mask_dropdown, template_frame]
@@ -1625,7 +1638,10 @@ def display(tabs, tab_state, state, refresh_form_trigger, server_config, get_cur
 
 
 
-            with gr.TabItem("Image"):
+            with gr.TabItem("Image", elem_classes="matanyone-media-tab") as image_tab:
+                image_tab.select(fn=lambda mask: ("Image", *_matanyone_mask_type_update(mask, "Image")), inputs=[mask_type], outputs=[media_type, mask_type, background_color], queue=False, show_progress="hidden")
+                with gr.Column(visible=False):
+                    mask_progress = WangpProgress.component(stop=True)
                 click_state = gr.State([[],[]])
 
                 interactive_state = gr.State({
@@ -1719,13 +1735,13 @@ def display(tabs, tab_state, state, refresh_form_trigger, server_config, get_cur
                     with gr.Tabs(visible = False) as image_tabs:
                         with gr.TabItem("Control Image & Mask", visible = False) as image_first_tab:
                             with gr.Row(equal_height=True):
-                                control_image_output = gr.Image(type="pil", label="Control Image", visible=False, elem_classes="image")
-                                alpha_image_output = gr.Image(type="pil", label="Mask", visible=False, elem_classes="image")
+                                control_image_output = gr.Image(type="pil", label="Control Image", visible=False, interactive=False, elem_classes="image")
+                                alpha_image_output = gr.Image(type="pil", label="Mask", visible=False, interactive=False, elem_classes="image")
                             with gr.Row():
                                 export_image_mask_btn = gr.Button(value="Set to Control Image & Mask", visible=False, elem_classes="new_button")
                         with gr.TabItem("Reference Image", visible = False) as image_second_tab:
                             with gr.Row():
-                                foreground_image_output = gr.Image(type="pil", label="Foreground Output", visible=False, elem_classes="image")
+                                foreground_image_output = gr.Image(type="pil", label="Foreground Output", visible=False, interactive=False, elem_classes="image")
                             with gr.Row():
                                 export_image_btn = gr.Button(value="Add to current Reference Images", visible=False, elem_classes="new_button")
 
@@ -1739,7 +1755,7 @@ def display(tabs, tab_state, state, refresh_form_trigger, server_config, get_cur
 
                 # first step: get the image information 
                 WangpProgress.bind(extract_frames_button.click,
-                    component=mask_progress,
+                    component=mask_progress, concurrency_id="matanyone",
                     fn=get_frames_from_image,
                     inputs=[
                         state, image_input, image_state, new_dim
@@ -1767,7 +1783,7 @@ def display(tabs, tab_state, state, refresh_form_trigger, server_config, get_cur
                 
                 # click select image to get mask using sam
                 WangpProgress.bind(template_frame.select,
-                    component=mask_progress,
+                    component=mask_progress, concurrency_id="matanyone",
                     fn=sam_refine,
                     inputs=[state, image_state, point_prompt, click_state, interactive_state],
                     outputs=[template_frame, image_state, interactive_state]
@@ -1787,7 +1803,7 @@ def display(tabs, tab_state, state, refresh_form_trigger, server_config, get_cur
                 )
 
                 WangpProgress.bind(image_sam3_keyword_button.click,
-                    component=mask_progress,
+                    component=mask_progress, concurrency_id="matanyone",
                     fn=add_sam3_keyword_masks,
                     inputs=[state, image_state, interactive_state, image_sam3_keyword_text, mask_dropdown],
                     outputs=[interactive_state, mask_dropdown, template_frame]
@@ -1795,9 +1811,9 @@ def display(tabs, tab_state, state, refresh_form_trigger, server_config, get_cur
 
                 # image matting
                 WangpProgress.bind(matting_button.click,
-                    component=mask_progress,
+                    component=mask_progress, concurrency_id="matanyone",
                     fn=image_matting,
-                    inputs=[state, image_state, interactive_state, mask_type, matting_type, new_dim, mask_dropdown, erode_kernel_size, dilate_kernel_size, image_selection_slider],
+                    inputs=[state, image_state, interactive_state, mask_type, matting_type, new_dim, mask_dropdown, erode_kernel_size, dilate_kernel_size, image_selection_slider, background_color],
                     outputs=[image_tabs, image_first_tab, image_second_tab, foreground_image_output, control_image_output, alpha_image_output, foreground_image_output, control_image_output, alpha_image_output, bbox_info, export_image_btn, export_image_mask_btn]
                 )
 

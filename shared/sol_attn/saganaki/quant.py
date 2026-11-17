@@ -26,7 +26,7 @@ def _round_to_int8(x):
     return tl.where(x >= 0, (x + 0.5).to(tl.int32), (x - 0.5).to(tl.int32)).to(tl.int8)
 
 
-@triton.jit(do_not_specialize=['T', 's_b', 's_t', 's_h', 'NB'], do_not_specialize_on_alignment=['T', 's_b', 's_t', 's_h', 'NB'])
+@triton.jit(do_not_specialize=['T', 's_b', 's_t', 's_h', 'NB', 'H'], do_not_specialize_on_alignment=['T', 's_b', 's_t', 's_h', 'NB', 'H'])
 def _reduce_quant_k_kernel(
     k_ptr,
     kc_ptr,
@@ -34,7 +34,7 @@ def _reduce_quant_k_kernel(
     k_scale,
     T,
     s_b, s_t, s_h,
-    H: tl.constexpr,
+    H,
     NB,
     D: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -80,7 +80,7 @@ def _reduce_quant_k_kernel(
         tl.store(k_scale + (batch * T + rows) * H + head, scale, mask=valid)
 
 
-@triton.jit(do_not_specialize=['T', 's_b', 's_t', 's_h', 'NB'], do_not_specialize_on_alignment=['T', 's_b', 's_t', 's_h', 'NB'])
+@triton.jit(do_not_specialize=['T', 's_b', 's_t', 's_h', 'NB', 'H'], do_not_specialize_on_alignment=['T', 's_b', 's_t', 's_h', 'NB', 'H'])
 def _quantize_k_kernel(
     k_ptr,
     kc_ptr,
@@ -88,7 +88,7 @@ def _quantize_k_kernel(
     k_scale,
     T,
     s_b, s_t, s_h,
-    H: tl.constexpr,
+    H,
     NB,
     D: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -116,7 +116,7 @@ def _quantize_k_kernel(
     tl.store(k_scale + (batch * T + rows) * H + head, scale, mask=valid)
 
 
-@triton.jit(do_not_specialize=['T', 's_b', 's_t', 's_h', 'N'], do_not_specialize_on_alignment=['T', 's_b', 's_t', 's_h', 'N'])
+@triton.jit(do_not_specialize=['T', 's_b', 's_t', 's_h', 'N', 'H'], do_not_specialize_on_alignment=['T', 's_b', 's_t', 's_h', 'N', 'H'])
 def _q_quant_threshold_kernel(
     q_ptr,
     kc_mean_ptr,
@@ -127,7 +127,7 @@ def _q_quant_threshold_kernel(
     softmax_scale,
     T,
     s_b, s_t, s_h,
-    H: tl.constexpr,
+    H,
     N,
     D: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -253,14 +253,14 @@ def quantize_q_with_threshold(q, kc_mean, kc_var, *, scale, tau):
     return q8, q_scale, threshold
 
 
-@triton.jit(do_not_specialize=['T', 's_b', 's_t', 's_h'], do_not_specialize_on_alignment=['T', 's_b', 's_t', 's_h'])
+@triton.jit(do_not_specialize=['T', 's_b', 's_t', 's_h', 'H'], do_not_specialize_on_alignment=['T', 's_b', 's_t', 's_h', 'H'])
 def _quantize_v_kernel(
     v_ptr,
     scale_ptr,
     vi_ptr,
     T,
     s_b, s_t, s_h,
-    H: tl.constexpr,
+    H,
     D: tl.constexpr,
     ROWS: tl.constexpr,
 ):

@@ -11,7 +11,7 @@ import imageio
 import torch
 from PIL import Image
 import numpy as np
-from rembg import remove
+from preprocessing.rembg.native import remove
 import random
 import ffmpeg
 import os
@@ -405,30 +405,16 @@ def resolve_rembg_home():
         rembg_home = fl.get_smart_download_location(force_path="rembg")
     return os.path.abspath(rembg_home)
 
-REMBG_ON_CPU = True  # CPU: ~1.3 s per image like a warm GPU (alpha matting runs on the CPU anyway), no 10-15 s CUDA provider start, no VRAM
-
-
 def new_rembg_session(model_name="u2net"):
-    from preprocessing.rembg.assets import MODELS, ensure_assets
-    model_path = ensure_assets(model_name=model_name) if model_name in MODELS else None  # checked at download: no rehash of the file
-    os.environ["U2NET_HOME"] = resolve_rembg_home()
-    import onnxruntime as ort
-    from rembg.sessions import sessions_class
-    # rembg 2.0.65 hard-codes its providers, so the session is built here. On the GPU, onnxruntime's default exhaustive
-    # cuDNN search costs ~10 s on the first image; the heuristic choice gives the same masks.
-    session_class = next(cls for cls in sessions_class if cls.name() == model_name)
-    session = session_class.__new__(session_class)
-    session.model_name = model_name
-    cuda = not REMBG_ON_CPU and "CUDAExecutionProvider" in ort.get_available_providers()
-    providers = [("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"}), "CPUExecutionProvider"] if cuda else ["CPUExecutionProvider"]
-    session.inner_session = ort.InferenceSession(str(model_path or session_class.download_models()), sess_options=ort.SessionOptions(), providers=providers)
-    return session
+    from preprocessing.rembg.native import NativeSession
+    return NativeSession(model_name)
+
 
 def remove_background(img, session=None):
     if session ==None:
         session = new_rembg_session() 
     img = Image.fromarray(np.clip(255. * img.movedim(0, -1).cpu().numpy(), 0, 255).astype(np.uint8))
-    img = remove(img, session=session, alpha_matting = True, bgcolor=[255, 255, 255, 0]).convert('RGB')
+    img = remove(img, session=session, alpha_matting=session.model_name == "u2net", bgcolor=[255, 255, 255, 0]).convert('RGB')
     return torch.from_numpy(np.array(img).astype(np.float32) / 255.0).movedim(-1, 0)
 
 
@@ -717,7 +703,7 @@ def resize_and_remove_background(img_list, budget_width, budget_height, rm_backg
         budget_height, budget_width = calculate_new_dimensions(budget_height, budget_width, budget_height, budget_width, 0, block_size=block_size, max_width=max_width, max_height=max_height)
     if rm_background:
         session = new_rembg_session(rembg_model)
-        matting = rembg_model == "u2net"  # BiRefNet's matte is already soft
+        matting = session.model_name == "u2net"  # BiRefNet and Bria already produce soft masks
 
     output_list =[]
     output_mask_list =[]

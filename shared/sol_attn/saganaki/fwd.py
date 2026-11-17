@@ -114,7 +114,7 @@ def _use_pointer_arch(arch):
 
 
 @_tuned(_TMA_CONFIGS)
-@triton.jit(do_not_specialize=['T', 'NT', 'sink_start', 'sink_end', 'sink_q_start', 'sink_q_end'], do_not_specialize_on_alignment=['T', 'NT', 'sink_start', 'sink_end', 'sink_q_start', 'sink_q_end'])
+@triton.jit(do_not_specialize=['T', 'NT', 'sink_start', 'sink_end', 'sink_q_start', 'sink_q_end', 'H'], do_not_specialize_on_alignment=['T', 'NT', 'sink_start', 'sink_end', 'sink_q_start', 'sink_q_end', 'H'])
 def _forward(
     q_desc,
     k_desc,
@@ -129,7 +129,7 @@ def _forward(
     sink_q_start,
     sink_q_end,
     T,
-    H: tl.constexpr,
+    H,
     D: tl.constexpr,
     NT,
     BV: tl.constexpr,
@@ -236,7 +236,7 @@ def _forward(
 
 
 @_tuned(_TMA_CONFIGS)
-@triton.jit(do_not_specialize=['T', 'NT', 'sink_start', 'sink_end', 'sink_q_start', 'sink_q_end', 'sv_b', 'sv_t', 'sv_h'], do_not_specialize_on_alignment=['T', 'NT', 'sink_start', 'sink_end', 'sink_q_start', 'sink_q_end', 'sv_b', 'sv_t', 'sv_h'])
+@triton.jit(do_not_specialize=['T', 'NT', 'sink_start', 'sink_end', 'sink_q_start', 'sink_q_end', 'sv_b', 'sv_t', 'sv_h', 'H'], do_not_specialize_on_alignment=['T', 'NT', 'sink_start', 'sink_end', 'sink_q_start', 'sink_q_end', 'sv_b', 'sv_t', 'sv_h', 'H'])
 def _forward_int8(
     q_desc,
     kc_desc,
@@ -257,7 +257,7 @@ def _forward_int8(
     sink_q_end,
     T,
     sv_b, sv_t, sv_h,
-    H: tl.constexpr,
+    H,
     D: tl.constexpr,
     NT,
     BV: tl.constexpr,
@@ -420,7 +420,7 @@ def _forward_int8(
 
 
 @_tuned(_PTR_CONFIGS)
-@triton.jit(do_not_specialize=['T', 'NT', 'sink_start', 'sink_end', 'sink_q_start', 'sink_q_end', 'sq_b', 'sq_t', 'sq_h', 'sk_b', 'sk_t', 'sk_h', 'sv_b', 'sv_t', 'sv_h'], do_not_specialize_on_alignment=['T', 'NT', 'sink_start', 'sink_end', 'sink_q_start', 'sink_q_end', 'sq_b', 'sq_t', 'sq_h', 'sk_b', 'sk_t', 'sk_h', 'sv_b', 'sv_t', 'sv_h'])
+@triton.jit(do_not_specialize=['T', 'NT', 'sink_start', 'sink_end', 'sink_q_start', 'sink_q_end', 'sq_b', 'sq_t', 'sq_h', 'sk_b', 'sk_t', 'sk_h', 'sv_b', 'sv_t', 'sv_h', 'H'], do_not_specialize_on_alignment=['T', 'NT', 'sink_start', 'sink_end', 'sink_q_start', 'sink_q_end', 'sq_b', 'sq_t', 'sq_h', 'sk_b', 'sk_t', 'sk_h', 'sv_b', 'sv_t', 'sv_h', 'H'])
 def _forward_ptr(
     q_ptr, k_ptr, v_ptr, kc_ptr, vc_ptr, threshold, o_ptr,
     scale,
@@ -432,7 +432,7 @@ def _forward_ptr(
     sq_b, sq_t, sq_h,
     sk_b, sk_t, sk_h,
     sv_b, sv_t, sv_h,
-    H: tl.constexpr,
+    H,
     D: tl.constexpr,
     NT,
     BV: tl.constexpr,
@@ -557,7 +557,7 @@ def _forward_ptr(
 
 
 @_tuned(_PTR_CONFIGS, restore_value=["q_ptr"])  # sol_attn_prepared writes its output into q
-@triton.jit(do_not_specialize=['T', 'NT', 'sink_start', 'sink_end', 'sink_q_start', 'sink_q_end', 'sq_b', 'sq_t', 'sq_h', 'sv_b', 'sv_t', 'sv_h'], do_not_specialize_on_alignment=['T', 'NT', 'sink_start', 'sink_end', 'sink_q_start', 'sink_q_end', 'sq_b', 'sq_t', 'sq_h', 'sv_b', 'sv_t', 'sv_h'])
+@triton.jit(do_not_specialize=['T', 'NT', 'sink_start', 'sink_end', 'sink_q_start', 'sink_q_end', 'sq_b', 'sq_t', 'sq_h', 'sv_b', 'sv_t', 'sv_h', 'H'], do_not_specialize_on_alignment=['T', 'NT', 'sink_start', 'sink_end', 'sink_q_start', 'sink_q_end', 'sq_b', 'sq_t', 'sq_h', 'sv_b', 'sv_t', 'sv_h', 'H'])
 def _forward_int8_ptr(
     q_ptr, v_ptr, kc_ptr, vc_ptr, qi_ptr, ki_ptr, q_scale, k_scale,
     vi_ptr, vsc_ptr, threshold, kc_mean_ptr, kc_var_ptr, o_ptr,
@@ -570,7 +570,7 @@ def _forward_int8_ptr(
     T,
     sq_b, sq_t, sq_h,
     sv_b, sv_t, sv_h,
-    H: tl.constexpr,
+    H,
     D: tl.constexpr,
     NT,
     BV: tl.constexpr,

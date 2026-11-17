@@ -13,6 +13,9 @@
 # limitations under the License.
 # Modified for WanGP.
 
+from mmgp import runtime, transfer
+from shared.image_vae.output import blend_edge_
+from shared.image_vae.tiles import halo_plan
 from shared.utils.phase_progress import vae_decoding_progress
 from typing import Optional, Tuple, Union
 
@@ -859,7 +862,7 @@ class TurboVAED(ModelMixin, ConfigMixin):
                 -0.0667,
             ],
             dtype=torch.float32,
-            device="cuda",
+            device="cuda" if torch.cuda.is_available() else "cpu",
         )
         self.std = torch.tensor(
             [
@@ -913,14 +916,21 @@ class TurboVAED(ModelMixin, ConfigMixin):
                 0.7744,
             ],
             dtype=torch.float32,
-            device="cuda",
+            device="cuda" if torch.cuda.is_available() else "cpu",
         )
         self.scale = [self.mean, 1.0 / self.std]
 
     def _sliding_window_decode(self, z, output_offload=False, temporal_chunk_size: int = 0):
+        """The decoded clip of z: its windows (_decode_windows) concatenated, in RAM with output_offload."""
+        return torch.cat([piece.cpu() if output_offload else piece for piece in self._decode_windows(z, temporal_chunk_size)], dim=2)
+
+    def _decode_windows(self, z, temporal_chunk_size: int = 0, decode=None):
+        """The decoded clip of z window after window, in order, on z's device: each window is decoded with the latent frame before
+        it and the one after it, whose pixel frames are dropped; the frames decoded from the padding of the last window as well.
+        decode: the function of (window, is_first_chunk) that decodes a window (the decoder by default)."""
+        decode = self.decoder if decode is None else decode
         z_dtype = z.dtype
-        z_device = z.device
-        scale = self.scale
+        scale = [value.to(z.device) for value in self.scale]
         assert isinstance(scale[0], torch.Tensor), "scale[0] must be a tensor"
         z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(1, self.z_dim, 1, 1, 1)
         z = z.to(z_dtype)
@@ -952,20 +962,17 @@ class TurboVAED(ModelMixin, ConfigMixin):
             z = torch.cat([z, z[:, :, -1:].repeat(1, 1, num_padding_frames, 1, 1)], dim=2)
             num_frames = num_frames + num_padding_frames
 
-        # 2. Decode with overlapping windows
-        # Collect chunks on CPU to avoid GPU OOM for high resolution (e.g., 1080P) when output_offload=True
-        out_chunks = []
+        # 2. Decode with overlapping windows; 3. the frames of the padding (fewer than a window's) are dropped from the last one
+        padded_pixel_frames = num_padding_frames * self.temporal_compression_ratio
+        unpadded = lambda out: out[:, :, : out.shape[2] - padded_pixel_frames]
 
         if num_frames == first_chunk_size:
             # if only one chunk, decode directly
-            out = self.decoder(z, is_first_chunk=True)
-            out_chunks.append(out.cpu() if output_offload else out)
-            del out
+            yield unpadded(decode(z, is_first_chunk=True))
         else:
             # first chunk: attach the right frame
-            out = self.decoder(z[:, :, 0 : first_chunk_size + 1, :, :], is_first_chunk=True)
-            out = out[:, :, :-num_overlap_pixel_frames]
-            out_chunks.append(out.cpu() if output_offload else out)
+            out = decode(z[:, :, 0 : first_chunk_size + 1, :, :], is_first_chunk=True)
+            yield out[:, :, :-num_overlap_pixel_frames]
             del out
 
             # middle chunk: attach the left and right frames
@@ -977,24 +984,135 @@ class TurboVAED(ModelMixin, ConfigMixin):
 
                 assert left >= 0 and right <= num_frames, f"left: {left}, right: {right}, num_frames: {num_frames}"
 
-                out_ = self.decoder(z[:, :, left:right, :, :], is_first_chunk=False)
+                out_ = decode(z[:, :, left:right, :, :], is_first_chunk=False)
 
                 if is_last_chunk:
-                    out_ = out_[:, :, num_overlap_pixel_frames:]
+                    yield unpadded(out_[:, :, num_overlap_pixel_frames:])
                 else:
-                    out_ = out_[:, :, num_overlap_pixel_frames:-num_overlap_pixel_frames]
-
-                out_chunks.append(out_.cpu() if output_offload else out_)
+                    yield out_[:, :, num_overlap_pixel_frames:-num_overlap_pixel_frames]
                 del out_
 
-        # Concatenate chunks (on CPU if output_offload, otherwise on GPU)
-        out = torch.cat(out_chunks, dim=2)
-        del out_chunks
+    def _exact_steps(self):
+        """The decoder's layers in forward order as (function of (x, is_first_chunk), halo_plan step): every layer is local in space
+        (norms per pixel, no attention), so a window decodes exactly by tiles with their halo."""
+        decoder = self.decoder
+        reach = lambda conv: conv.kernel_size[1] // 2 if len(conv.kernel_size) == 3 else conv.kernel_size[0] // 2
+        block = lambda resnet: max(reach(resnet.conv1) + reach(resnet.conv2), 0 if resnet.conv_shortcut is None else reach(resnet.conv_shortcut))
+        steps = [(lambda x, first: decoder.conv_in(x), ("same", reach(decoder.conv_in)))]
+        steps += [(lambda x, first, resnet=resnet: resnet(x), ("same", block(resnet))) for resnet in decoder.mid_block.resnets]
+        for up in decoder.up_blocks:
+            if up.conv_in is not None:
+                steps.append((lambda x, first, resnet=up.conv_in: resnet(x), ("same", block(up.conv_in))))
+            for upsampler in up.upsamplers or ():  # nearest x2 then a 3x3 convolution (its time convolution is 3x1x1)
+                steps.append((lambda x, first, upsampler=upsampler: upsampler(x, is_first_chunk=first), ("nearest2",)))
+            steps += [(lambda x, first, resnet=resnet: resnet(x), ("same", block(resnet))) for resnet in up.resnets]
+        assert decoder.use_unpatchify
 
-        # 3. Remove padded frames
-        if num_padding_frames > 0:
-            out = out[:, :, : -num_padding_frames * self.temporal_compression_ratio]
+        def head(x, first):
+            variance = x.to(torch.float32).pow(2).mean(1, keepdim=True)  # (the decoder's own RMS norm and output layers)
+            return decoder.conv_out(decoder.conv_act((x * torch.rsqrt(variance + 1e-8)).to(x.dtype)))
 
+        steps.append((head, ("same", reach(decoder.conv_out))))
+        steps.append((lambda x, first: unpatchify(x, decoder.patch_size), ("expand", decoder.patch_size)))
+        return steps
+
+    def _exact_tiles(self, x, is_first_chunk, tile):
+        """decoder(x, is_first_chunk) by tiles of `tile` latent pixels: each tile computed on its region plus the receptive field still
+        ahead of every layer (halo_plan), cropped after each one: the untiled result with the memory of a tile."""
+        steps = self._exact_steps()
+        plan = [step for _, step in steps]
+        scale = self.spatial_compression_ratio
+        height, width = x.shape[-2:]
+        out = None
+        for y0 in range(0, height, tile):
+            (ya, yb), y_crops = halo_plan(plan, y0 * scale, min(y0 + tile, height) * scale, height)
+            for x0 in range(0, width, tile):
+                (xa, xb), x_crops = halo_plan(plan, x0 * scale, min(x0 + tile, width) * scale, width)
+                h = x[..., ya:yb, xa:xb]
+                for (step, _), rows, columns in zip(steps, y_crops, x_crops):
+                    h = step(h, is_first_chunk)[..., slice(*rows), slice(*columns)]
+                if out is None:
+                    out = h.new_empty(*h.shape[:3], height * scale, width * scale)
+                out[..., y0 * scale : y0 * scale + h.shape[-2], x0 * scale : x0 * scale + h.shape[-1]] = h
+                del h
+        return out
+
+    def decode_to_ram(self, z, to_ram, tile_size: int = 0, temporal_chunk_size: int = 0, exact: bool = True):
+        """The decoded video in RAM in its final form (to_ram: a function of a decoded piece on the GPU, a dtype conversion or bytes),
+        each piece written to its place without waiting for the GPU. exact (with a tile_size): every window decoded by exact tiles
+        (_exact_tiles: the untiled result, no seam); else the video decode(z, tile_size, auto_tile=False) gives, tiles blended as
+        _spatial_tiled_decode blends them, each window of each tile once blended with the edges kept from the tiles above it and on
+        its left. VRAM holds one decoded window (and the edges of a row of blended tiles); RAM holds the video in its final form only
+        (decode keeps every decoded tile of the clip in RAM, in 16 bits, to blend them there)."""
+        runtime.ensure_loaded(self)  # (an entry point of its own: the hooked forwards are not all called)
+        if exact and int(tile_size) > 0:
+            frames = 1 + (z.shape[2] - 1) * self.temporal_compression_ratio
+            tile = max(1, int(tile_size) // self.spatial_compression_ratio)
+            first = int(temporal_chunk_size) if int(temporal_chunk_size) > 0 else self.first_chunk_size
+            step = int(temporal_chunk_size) if int(temporal_chunk_size) > 0 else self.step_size
+            windows = 1 + max(0, (z.shape[2] - first + step - 1) // step)
+            pieces = windows * -(-z.shape[-2] // tile) * -(-z.shape[-1] // tile)
+            out, position = None, 0
+            with vae_decoding_progress(pieces, self.decoder.conv_out), transfer.RamWriter("decoded video", depth=64, max_bytes=256 << 20) as writer:
+                for piece in self._decode_windows(z, temporal_chunk_size, decode=lambda x, is_first_chunk: self._exact_tiles(x, is_first_chunk, tile)):
+                    final = to_ram(piece)
+                    if out is None:
+                        with torch.inference_mode(False):
+                            out = torch.empty((*final.shape[:2], frames, *final.shape[3:]), dtype=final.dtype, device="cpu")
+                    writer.write(out[:, :, position : position + final.shape[2]], final)
+                    position += final.shape[2]
+                    del piece, final
+            if position != frames:
+                raise RuntimeError(f"TurboVAED decoded {position} frames, {frames} expected")
+            return out
+        frames = 1 + (z.shape[2] - 1) * self.temporal_compression_ratio
+        height, width = z.shape[-2] * self.spatial_compression_ratio, z.shape[-1] * self.spatial_compression_ratio
+        tiled = int(tile_size) > 0
+        latent_tile = max(1, int(tile_size) // 16) if tiled else max(z.shape[-2:])
+        stride = max(1, int(latent_tile * 0.75)) if tiled else latent_tile
+        extent, limit = (int(tile_size * 0.25), tile_size - int(tile_size * 0.25)) if tiled else (0, max(height, width))
+        rows, columns = list(range(0, z.shape[-2], stride)), list(range(0, z.shape[-1], stride))
+        first = int(temporal_chunk_size) if int(temporal_chunk_size) > 0 else self.first_chunk_size
+        step = int(temporal_chunk_size) if int(temporal_chunk_size) > 0 else self.step_size
+        windows = 1 + max(0, (z.shape[2] - first + step - 1) // step)
+        out, bottoms, y = None, [None] * len(columns), 0
+        with vae_decoding_progress(windows * len(rows) * len(columns), self.decoder), transfer.RamWriter("decoded video", depth=64, max_bytes=256 << 20) as writer:
+            for i, r0 in enumerate(rows):
+                left, x = None, 0
+                for j, c0 in enumerate(columns):
+                    bottom = right = None
+                    frame = 0
+                    for piece in self._decode_windows(z[:, :, :, r0 : r0 + latent_tile, c0 : c0 + latent_tile], temporal_chunk_size):
+                        count = piece.shape[2]
+                        if i > 0:
+                            e = min(bottoms[j].shape[-2], piece.shape[-2], extent)
+                            blend_edge_(piece[:, :, :, :e], bottoms[j][:, :, frame : frame + count, bottoms[j].shape[-2] - e :], 3)
+                        if j > 0:
+                            e = min(left.shape[-1], piece.shape[-1], extent)
+                            blend_edge_(piece[..., :e], left[:, :, frame : frame + count, :, left.shape[-1] - e :], 4)
+                        if tiled:  # the edges the next tiles blend with (rows below, columns on the right), as blended here
+                            if i < len(rows) - 1:
+                                if bottom is None:
+                                    bottom = piece.new_empty(*piece.shape[:2], frames, min(extent, piece.shape[-2]), piece.shape[-1])
+                                bottom[:, :, frame : frame + count] = piece[:, :, :, piece.shape[-2] - bottom.shape[-2] :]
+                            if j < len(columns) - 1:
+                                if right is None:
+                                    right = piece.new_empty(*piece.shape[:2], frames, piece.shape[-2], min(extent, piece.shape[-1]))
+                                right[:, :, frame : frame + count] = piece[..., piece.shape[-1] - right.shape[-1] :]
+                            piece = piece[:, :, :, :limit, :limit]
+                        tile_height, tile_width = piece.shape[-2:]
+                        final = to_ram(piece)
+                        if out is None:
+                            with torch.inference_mode(False):  # (an ordinary tensor: the caller may edit the video in place)
+                                out = torch.empty((*final.shape[:2], frames, height, width), dtype=final.dtype, device="cpu")
+                        writer.write(out[:, :, frame : frame + count, y : y + tile_height, x : x + tile_width], final)
+                        frame += count
+                        del piece, final
+                    if frame != frames:
+                        raise RuntimeError(f"TurboVAED decoded {frame} frames, {frames} expected")
+                    left, bottoms[j] = right, bottom
+                    x += tile_width
+                y += tile_height
         return out
 
     def blend_v(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
@@ -1053,9 +1171,10 @@ class TurboVAED(ModelMixin, ConfigMixin):
             return 256
         return 0
 
-    def decode(self, z: torch.Tensor, output_offload: bool = False, tile_size: int = 0, temporal_chunk_size: int = 0):
+    def decode(self, z: torch.Tensor, output_offload: bool = False, tile_size: int = 0, temporal_chunk_size: int = 0, auto_tile: bool = True):
+        """auto_tile: without a tile_size, tiles from the frame size (_resolve_spatial_tile_size); False: no tiles then."""
         requested_tile_size = int(tile_size or 0)
-        tile_size = self._resolve_spatial_tile_size(z, requested_tile_size)
+        tile_size = self._resolve_spatial_tile_size(z, requested_tile_size) if auto_tile else requested_tile_size
         if z.shape[-2] * z.shape[-1] >= 68 * 120 or tile_size > 0 or int(temporal_chunk_size) > 0:
             spatial_grid = None
             if tile_size > 0:

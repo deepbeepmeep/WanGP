@@ -30,7 +30,7 @@ from fla.ops.utils.op import exp
 
 @triton.jit(do_not_specialize=("B", "T"), do_not_specialize_on_alignment=("B", "T"))
 def conv_verify_kernel(x, state, weight, bias, output, snapshots,
-                       B, T, C: tl.constexpr, W: tl.constexpr,
+                       B, T, C, W: tl.constexpr,
                        HAS_BIAS: tl.constexpr, BC: tl.constexpr, BW: tl.constexpr):
     channel = tl.program_id(0) * BC + tl.arange(0, BC)
     batch = tl.program_id(1)
@@ -61,9 +61,9 @@ def conv_verify(x, state, weight, bias, snapshots):
     return output, state
 
 
-@triton.jit(do_not_specialize=("B", "T"), do_not_specialize_on_alignment=("B", "T"))
+@triton.jit(do_not_specialize=("B", "T", "H", "HV"), do_not_specialize_on_alignment=("B", "T", "H", "HV"))
 def recurrent_verify_kernel(q, k, v, g, beta, initial, output, snapshots,
-                            B, T, H: tl.constexpr, HV: tl.constexpr,
+                            B, T, H, HV,
                             K: tl.constexpr, V: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
                             SAVE_PREFIX: tl.constexpr):
     vblock, batch_head = tl.program_id(0), tl.program_id(1)

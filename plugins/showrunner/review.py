@@ -47,7 +47,7 @@ def speaking_shots(doc: dict[str, Any], moving: set[str]) -> set[str]:
 
 
 def decode(path) -> np.ndarray:
-    raw = subprocess.run([media.ffmpeg(), "-v", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", str(RATE), "-f", "f32le", "-"], capture_output=True).stdout
+    raw = subprocess.run([media.ffmpeg(), "-v", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", str(RATE), "-f", "f32le", "-"], stdin=subprocess.DEVNULL, capture_output=True).stdout
     return np.frombuffer(raw, dtype=np.float32).copy()
 
 
@@ -194,7 +194,7 @@ def sound_findings(audio: np.ndarray, places: list[dict[str, Any]], talking: set
 
 def picture_findings(path, places: list[dict[str, Any]], moving: set[str]) -> list[dict[str, Any]]:
     """Black or frozen picture in shots that should move (a card or a still is meant to hold)."""
-    report = subprocess.run([media.ffmpeg(), "-hide_banner", "-nostats", "-v", "info", "-i", str(path), "-an", "-sn", "-vf", "fps=8,scale=320:-2,blackdetect=d=0.3:pic_th=0.97,freezedetect=n=0.002:d=1.2", "-f", "null", "-"], capture_output=True).stderr.decode("utf-8", "replace")
+    report = subprocess.run([media.ffmpeg(), "-hide_banner", "-nostats", "-v", "info", "-i", str(path), "-an", "-sn", "-vf", "fps=8,scale=320:-2,blackdetect=d=0.3:pic_th=0.97,freezedetect=n=0.002:d=1.2", "-f", "null", "-"], stdin=subprocess.DEVNULL, capture_output=True).stderr.decode("utf-8", "replace")
     found = []
     for start, end in re.findall(r"black_start:([\d.]+) black_end:([\d.]+)", report):
         shots = [shot for shot in shots_between(places, float(start), float(end)) if shot in moving]

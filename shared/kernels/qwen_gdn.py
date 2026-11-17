@@ -25,11 +25,11 @@ class GDNShortConvolution(ShortConvolution):
         return y, cache
 
 
-@triton.jit
+@triton.jit(do_not_specialize=("HEADS", "REPEAT"), do_not_specialize_on_alignment=("HEADS", "REPEAT"))  # strides, head counts at runtime
 def _prepare_kernel(Q, K, A, B, SSM_A, SSM_DT, Q_OUT, K_OUT, G, BETA,
-                    Q_BATCH: tl.constexpr, Q_HEAD: tl.constexpr,
-                    A_BATCH: tl.constexpr, B_BATCH: tl.constexpr,
-                    HEADS: tl.constexpr, REPEAT: tl.constexpr, DIM: tl.constexpr,
+                    Q_BATCH, Q_HEAD,
+                    A_BATCH, B_BATCH,
+                    HEADS, REPEAT, DIM: tl.constexpr,
                     BLOCK: tl.constexpr):
     head = tl.program_id(0)
     batch = tl.program_id(1)
@@ -108,11 +108,11 @@ def install_gdn_decode(model):
 from fla.ops.utils.op import exp
 
 
-@triton.jit(do_not_specialize=("T", "BATCH", "QS0", "QS1", "QS2", "KS0", "KS1", "KS2", "VS0", "VS1", "VS2", "AS0", "AS1", "BS0", "BS1", "SAVE_TOKENS"),
+@triton.jit(do_not_specialize=("T", "BATCH", "QS0", "QS1", "QS2", "KS0", "KS1", "KS2", "VS0", "VS1", "VS2", "AS0", "AS1", "BS0", "BS1", "SAVE_TOKENS", "H", "HV"),
             do_not_specialize_on_alignment=("T", "BATCH", "QS0", "QS1", "QS2", "KS0", "KS1", "KS2", "VS0", "VS1", "VS2", "AS0", "AS1", "BS0", "BS1", "SAVE_TOKENS"))
 def _recurrent_raw_kernel(Q, K, V, A, BETA_IN, SSM_A, DT, STATE, STATE_OUT, OUT, SNAPSHOTS,
                           PRE, K_SAVE, V_SAVE, A_SAVE, B_SAVE,
-                          T, H: tl.constexpr, HV: tl.constexpr,
+                          T, H, HV,
                           DK: tl.constexpr, DV: tl.constexpr,
                           QS0, QS1, QS2,
                           KS0, KS1, KS2,
@@ -493,10 +493,10 @@ def _store_fp32(pointer, value, mask, BITS: tl.constexpr):
         tl.store(pointer, value.to(pointer.dtype.element_ty), mask)
 
 
-@triton.jit(do_not_specialize=("T", "BATCH", "QS0", "QS1", "QS2", "QS3", "KS0", "KS1", "KS2", "KS3", "VS0", "VS1", "VS2", "VS3", "AS0", "AS1", "BS0", "BS1"),
+@triton.jit(do_not_specialize=("T", "BATCH", "QS0", "QS1", "QS2", "QS3", "KS0", "KS1", "KS2", "KS3", "VS0", "VS1", "VS2", "VS3", "AS0", "AS1", "BS0", "BS1", "H", "HV"),
             do_not_specialize_on_alignment=("T", "BATCH", "QS0", "QS1", "QS2", "QS3", "KS0", "KS1", "KS2", "KS3", "VS0", "VS1", "VS2", "VS3", "AS0", "AS1", "BS0", "BS1"))
 def _recurrent_ieee_kernel(Q, K, V, A, BETA_IN, SSM_A, DT, STATE, OUT, SNAPSHOTS,
-                           T, H: tl.constexpr, HV: tl.constexpr, DK: tl.constexpr, DV: tl.constexpr,
+                           T, H, HV, DK: tl.constexpr, DV: tl.constexpr,
                            QS0, QS1, QS2, QS3, KS0, KS1, KS2, KS3, VS0, VS1, VS2, VS3, AS0, AS1, BS0, BS1,
                            BATCH, BK: tl.constexpr, BV: tl.constexpr, SAVE_PREFIX: tl.constexpr,
                            V_HEADS_TILED: tl.constexpr, SSM_PARAMS_TILED: tl.constexpr, INTERLEAVE_AB: tl.constexpr,

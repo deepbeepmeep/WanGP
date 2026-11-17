@@ -27,8 +27,9 @@ def _fence(value):
     return tl.inline_asm_elementwise("membar.sys; mov.u32 $0, $1;", "=r,r", [value], dtype=tl.int32, is_pure=False, pack=1)
 
 
-@triton.jit(do_not_specialize=("temperature",), do_not_specialize_on_alignment=("LOGITS",))
-def _block_top(LOGITS, VALUES, IDS, SUMS, temperature, VOCAB: tl.constexpr, BLOCK_SIZE: tl.constexpr, KEPT: tl.constexpr):
+# Vocabulary sizes, block counts and widths are runtime arguments in these kernels: one compile for every drafter and target model.
+@triton.jit(do_not_specialize=("temperature", "VOCAB"), do_not_specialize_on_alignment=("LOGITS", "VOCAB"))
+def _block_top(LOGITS, VALUES, IDS, SUMS, temperature, VOCAB, BLOCK_SIZE: tl.constexpr, KEPT: tl.constexpr):
     """Per block of tokens: its KEPT largest logits and the mass of its tokens relative to its largest."""
     block = tl.program_id(0)
     rows = tl.arange(0, BLOCK_SIZE)
@@ -44,8 +45,8 @@ def _block_top(LOGITS, VALUES, IDS, SUMS, temperature, VOCAB: tl.constexpr, BLOC
         x = tl.where(rows == index, _LOWEST, x)
 
 
-@triton.jit(do_not_specialize=("temperature", "top_p", "stamp"), do_not_specialize_on_alignment=("OUT_IDS", "OUT_PROBS", "OUT_COUNT", "OUT_STAMP"))
-def _select(VALUES, IDS, SUMS, OUT_IDS, OUT_PROBS, OUT_COUNT, OUT_STAMP, temperature, top_p, stamp, BLOCKS: tl.constexpr, KEPT: tl.constexpr, TILE: tl.constexpr, OUT: tl.constexpr):
+@triton.jit(do_not_specialize=("temperature", "top_p", "stamp", "BLOCKS"), do_not_specialize_on_alignment=("OUT_IDS", "OUT_PROBS", "OUT_COUNT", "OUT_STAMP", "BLOCKS"))
+def _select(VALUES, IDS, SUMS, OUT_IDS, OUT_PROBS, OUT_COUNT, OUT_STAMP, temperature, top_p, stamp, BLOCKS, KEPT: tl.constexpr, TILE: tl.constexpr, OUT: tl.constexpr):
     """The likeliest tokens of all the blocks with their probabilities, until they hold top_p of the mass or OUT tokens, to mapped RAM; the stamp comes last."""
     index = tl.arange(0, TILE)
     present = index < BLOCKS * KEPT
@@ -71,8 +72,8 @@ def _select(VALUES, IDS, SUMS, OUT_IDS, OUT_PROBS, OUT_COUNT, OUT_STAMP, tempera
     _fence(stamp)  # on its way to the host now
 
 
-@triton.jit(do_not_specialize_on_alignment=("CONTEXT", "SOURCE"))
-def _feed(CONTEXT, INPUT_IDS, POSITIONS, SEQLENS, SOURCE, HIDDEN, WIDTH: tl.constexpr, TILE: tl.constexpr):
+@triton.jit(do_not_specialize=("WIDTH",), do_not_specialize_on_alignment=("CONTEXT", "SOURCE", "WIDTH"))
+def _feed(CONTEXT, INPUT_IDS, POSITIONS, SEQLENS, SOURCE, HIDDEN, WIDTH, TILE: tl.constexpr):
     """The inputs of the drafter's next pass: its token, position and place in its cache from mapped RAM, the streams of the pass before."""
     program = tl.program_id(0)
     if program == 0:
@@ -84,8 +85,8 @@ def _feed(CONTEXT, INPUT_IDS, POSITIONS, SEQLENS, SOURCE, HIDDEN, WIDTH: tl.cons
     tl.store(HIDDEN + offsets, tl.load(SOURCE + offsets, mask=inside, other=0.0).to(HIDDEN.dtype.element_ty), mask=inside)
 
 
-@triton.jit
-def _load_q(Q, IDS, PROBS, COUNTS, OLD_IDS, OLD_COUNTS, VOCAB: tl.constexpr, OUT: tl.constexpr):
+@triton.jit(do_not_specialize=("VOCAB",), do_not_specialize_on_alignment=("VOCAB",))
+def _load_q(Q, IDS, PROBS, COUNTS, OLD_IDS, OLD_COUNTS, VOCAB, OUT: tl.constexpr):
     """Rows of the draft distributions that the acceptance reads: the entries of the last proposal cleared, those of this one written."""
     row = tl.program_id(0)
     index = tl.arange(0, OUT)
@@ -98,9 +99,9 @@ def _load_q(Q, IDS, PROBS, COUNTS, OLD_IDS, OLD_COUNTS, VOCAB: tl.constexpr, OUT
     tl.store(OLD_COUNTS + row, tl.load(COUNTS + row))
 
 
-@triton.jit(do_not_specialize=("temperature", "top_p", "slot"))
+@triton.jit(do_not_specialize=("temperature", "top_p", "slot", "BLOCKS"))
 def _select_draw(VALUES, IDS, SUMS, OUT_IDS, OUT_PROBS, OUT_COUNT, DRAFT_IDS, UNIFORMS, BASES, NEXT_INPUT, NEXT_POSITION, NEXT_SEQLEN, temperature, top_p, slot,
-                 BLOCKS: tl.constexpr, KEPT: tl.constexpr, TILE: tl.constexpr, OUT: tl.constexpr, FEED: tl.constexpr):
+                 BLOCKS, KEPT: tl.constexpr, TILE: tl.constexpr, OUT: tl.constexpr, FEED: tl.constexpr):
     """_select into device memory, then the draw of the host chain (DraftChain.draw) on the GPU: the proposal normalized in place, the token
     the first whose cumulative probability reaches the slot's uniform. FEED: the drafter's next pass reads its token, position (BASES[0] + slot)
     and cache length (BASES[1] + slot)."""

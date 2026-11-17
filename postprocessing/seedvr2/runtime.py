@@ -12,6 +12,7 @@ from mmgp import offload, transfer
 from safetensors.torch import load_file
 from tqdm import tqdm
 
+from shared.image_vae import tiling
 from shared.utils import offload_registry
 from .models.dit import NaDiT
 from .models.dit.nablocks.attention.mmattn import qkv_split_map
@@ -90,7 +91,30 @@ VAE_CONFIG = {
     "force_upcast": False,
 }
 
-VAE_TEMPORAL_TILE_SIZE = 8
+# Frames per slice of the causal stream (a latent frame): its norms and attention see one frame at a time, so the slice length changes
+# only the activations held, not the result (shorter slices: rounding-level differences, cuDNN choosing by shape). 1280x720 x 21:
+# 4 frames 7.2 GiB to encode, 12.7 to decode, 8 frames 10.4 and 18.0, the same time; the causal memories (two frames of every
+# convolution's input) are the rest.
+VAE_TEMPORAL_TILE_SIZE = 4
+# Measured VRAM of the VAE (BF16, 2026-11-17, slices of 4 frames, footage at 1280x720 and 1920x1088 x 45), GiB above the weights per
+# megapixel of a tile (clipped to the frame) or of a whole frame, + 10 %. At whole frames 60 % of the decode is the causal memories.
+# A GroupNorm VAE whose norms and attention see the frame it is given: each tile is a picture of its own, so the largest tile the VAE
+# Tiling budget holds is both the closest to the untiled result and the fastest (1920x1088 x 45, encode + decode: whole frames 34.1 s,
+# tiles of 1536 34.9 s, 1024 36.5 s, 768 38.1 s, 512 44.9 s). Encode and decode choose apart. No tile below 512: the decoder's tiles
+# of 384 lose 1.2 dB to the source at 1280x720 (256: 3.4 dB); tiles of 512 0.5 dB, and 0.1 dB in a real upscale (3B, x2 to 1280x720:
+# 31.49 dB to the 720p original against 31.59 untiled; the encoder's tiles, whose latents differ more, none). Below what tiles of 512
+# need (2.7 GiB to encode, 4.7 to decode), the excess spills to RAM.
+VAE_COSTS = {"weights": 0.47,
+             "decode": [(0.0655, 1.56), (0.147, 3.0), (0.262, 4.66), (0.553, 8.83), (0.737, 11.46), (1.049, 16.24), (1.671, 24.87), (2.089, 30.54)],
+             "encode": [(0.0655, 0.79), (0.147, 1.77), (0.262, 2.74), (0.553, 4.97), (0.737, 6.44), (0.922, 7.89), (1.049, 8.88), (1.671, 13.68), (2.089, 16.52)]}
+VAE_TILES = (2048, 1536, 1280, 1024, 896, 768, 640, 512)
+
+
+def vae_tiles(vae_config: int, device_mem_capacity: float, height: int, width: int) -> tuple[int, int]:
+    """(encode tile, decode tile) in output pixels for a height x width output (0: whole frames), each the largest the VAE Tiling
+    budget holds for that stage (tiling.choose_tile)."""
+    choose = lambda stage: tiling.choose_tile(vae_config, device_mem_capacity, {"weights": VAE_COSTS["weights"], stage: VAE_COSTS[stage]}, height, width, VAE_TILES)
+    return choose("encode"), choose("decode")
 OUTPUT_FRAME_BATCH_SIZE = 4
 
 
@@ -239,15 +263,18 @@ class SeedVR2Runtime:
             torch.cuda.empty_cache()
 
     @torch.inference_mode()
-    def _upscale_window(self, sample: torch.Tensor, scale: float, *, seed: int = 0, vae_tile_size: int | None = None, abort_callback=None, progress_callback=None):
+    def _upscale_window(self, sample: torch.Tensor, scale: float, *, seed: int = 0, vae_tile_size=None, abort_callback=None, progress_callback=None):
+        """vae_tile_size: (encode tile, decode tile) in output pixels (0: whole frames), or one tile for both."""
         if self.dit is None or self.vae is None:
             raise RuntimeError("SeedVR2 models are not loaded.")
         input_frames = sample.shape[1]
         output_height = max(1, int(sample.shape[-2] * scale))
         output_width = max(1, int(sample.shape[-1] * scale))
-        tile_size = int(vae_tile_size or 512)
+        encode_tile, decode_tile = (vae_tile_size, vae_tile_size) if not isinstance(vae_tile_size, (tuple, list)) else vae_tile_size
+        whole = (output_height + 15) // 16 * 16, (output_width + 15) // 16 * 16
+        encode_tile, decode_tile = ((int(tile), int(tile)) if tile else whole for tile in (encode_tile, decode_tile))
         tiled = True
-        overlap = min(128, tile_size // 4)
+        overlap = lambda tile: (min(128, tile[0] // 4), min(128, tile[1] // 4))
         self.vae.encoder.abort_callback = abort_callback
         self.vae.decoder.abort_callback = abort_callback
 
@@ -261,7 +288,7 @@ class SeedVR2Runtime:
                 progress.update()
 
                 encode_progress = lambda current, total: _report(progress_callback, "SeedVR2 VAE encoding chunks", current, total)
-                latent = self.vae.encode(conditioning, tiled=tiled, tile_size=(tile_size, tile_size), tile_overlap=(overlap, overlap), progress_callback=encode_progress).latent
+                latent = self.vae.encode(conditioning, tiled=tiled, tile_size=encode_tile, tile_overlap=overlap(encode_tile), progress_callback=encode_progress).latent
                 if latent.ndim == 4:
                     latent = latent.unsqueeze(2)
                 latent = latent.mul_(0.9152).permute(0, 2, 3, 4, 1)[0].contiguous()
@@ -288,7 +315,7 @@ class SeedVR2Runtime:
 
                 decode_progress = lambda current, total: _report(progress_callback, "SeedVR2 VAE decoding chunks", current, total)
                 latent = latent.permute(3, 0, 1, 2).unsqueeze(0).div_(0.9152)
-                decoded = self.vae.decode(latent, tiled=tiled, tile_size=(tile_size, tile_size), tile_overlap=(overlap, overlap), progress_callback=decode_progress).sample
+                decoded = self.vae.decode(latent, tiled=tiled, tile_size=decode_tile, tile_overlap=overlap(decode_tile), progress_callback=decode_progress).sample
                 if decoded.ndim == 4:
                     decoded = decoded.unsqueeze(2)
                 decoded = decoded[:, :, :input_frames, :output_height, :output_width]

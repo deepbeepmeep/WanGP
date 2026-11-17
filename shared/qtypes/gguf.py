@@ -1765,6 +1765,10 @@ class _GGUFRowProjection:
         return module.prism_transform(x)
 
     @staticmethod
+    def slice_input(prepared, start, stop):  # rows of the input (offload.linear_input_rows): the transform is per row
+        return prepared[start:stop]
+
+    @staticmethod
     def rows(module, x, start, stop):
         source = module.weight
         k = source.shape[1]

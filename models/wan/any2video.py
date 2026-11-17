@@ -11,7 +11,7 @@ import types
 import math
 from contextlib import contextmanager
 from functools import partial
-from mmgp import offload, transfer
+from mmgp import offload, runtime, transfer
 import torch
 import torch.nn as nn
 import torch.cuda.amp as amp
@@ -1698,7 +1698,11 @@ class WanAny2V:
                     }
 
                 latent_model_input = None
-                run_joint_pass = joint_pass or animate2 and any_guidance
+                # Boost only while it saves time with this model's residency (transfers not hidden behind a prediction's compute): else the
+                # predictions run one after the other, without holding all their activations at once
+                predictions = len(gen_args["x"]) if any_guidance else 1
+                boost = joint_pass and runtime.joint_pass_useful(trans, math.prod(target_shape[1:]) // math.prod(trans.patch_size), trans.dim, predictions)
+                run_joint_pass = boost or animate2 and any_guidance
                 if run_joint_pass and any_guidance:
                     ret_values = trans( **gen_args , **kwargs)
                     if self._interrupt:

@@ -33,7 +33,7 @@ from shared.kernels.bf16_bits import bf16_bits_to_fp32, fp32_to_bf16_bits
 def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, qo_len,
                     K_ptrs, K_scale_ptr, V_ptrs, M_ptrs, stride_kn, stride_vn, stride_mk,
                     start_m,
-                    H: tl.constexpr,
+                    H,
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr, V_BITS: tl.constexpr, MASK_MODE: tl.constexpr,
                     ):
@@ -79,7 +79,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, qo_len,
     return acc, l_i, m_i
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["H", "num_kv_groups"])  # head counts at runtime: one kernel for every Head Split group size
 def _attn_fwd(Q, K, V,
               cu_seqlens_q, cu_seqlens_k,
               Q_scale, K_scale, cu_seqlens_q_scale, cu_seqlens_k_scale,
@@ -89,7 +89,7 @@ def _attn_fwd(Q, K, V,
               stride_vh, stride_vn,
               stride_oh, stride_on,
               stride_mz, stride_mh, stride_mq, stride_mk,
-              H: tl.constexpr, num_kv_groups: tl.constexpr,
+              H, num_kv_groups,
               HEAD_DIM: tl.constexpr,
               BLOCK_M: tl.constexpr,
               BLOCK_N: tl.constexpr,
@@ -153,13 +153,13 @@ def _attn_fwd(Q, K, V,
         tl.store(Lse + (off_z * H + off_h) * qo_len + offs_m, m_i + tl.math.log2(l_i), mask=offs_m < qo_len)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["H"])
 def quant_per_block_int8_bits_kernel(Input, Output, Scale, Mean,
                                      cu_seqlens_input, cu_seqlens_scale,
                                      stride_ih, stride_in,
                                      stride_oh, stride_on,
                                      sm_scale,
-                                     H: tl.constexpr,
+                                     H,
                                      C: tl.constexpr, BLK: tl.constexpr, HAS_MEAN: tl.constexpr):
     """quant_per_block_int8_kernel of quant_per_block_varlen.py reading a BF16 input as bits (int16 pointer): no FP16 copy on GPUs without
     BF16 conversions. With HAS_MEAN, Mean (heads, C) in FP32 is subtracted first (SageAttention's key smoothing), so k itself is neither

@@ -1,0 +1,22 @@
+{
+    "model_type": "longcat_avatar_v1_6",
+    "image_mode": 0,
+    "prompt": "A person speaking naturally with expressive eye contact and relaxed gestures, steady framing and consistent lighting.",
+    "resolution": "832x480",
+    "video_length": 173,
+    "num_inference_steps": 8,
+    "guidance_scale": 1,
+    "audio_guidance_scale": 1,
+    "sample_solver": "distill",
+    "seed": -1,
+    "prompt_enhancer": "",
+    "audio_prompt_type": "A",
+    "video_prompt_type": "KI",
+    "sliding_window_size": 93,
+    "sliding_window_overlap": 13,
+    "sliding_window_discard_last_frames": 0,
+    "custom_settings": {
+        "longcat_kv_cache": "Disabled"
+    },
+    "settings_version": 2.83
+}

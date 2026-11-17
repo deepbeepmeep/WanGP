@@ -16,6 +16,13 @@
 # Modified for WanGP.
 
 from shared.utils.phase_progress import vae_decoding_progress, set_phase_status
+from mmgp import transfer
+from shared.cuda_memory import mmgp_vram_allocator
+from shared.image_vae import tiling
+from shared.image_vae.output import blend_edge_
+from shared.image_vae.tiles import halo_plan
+from shared.kernels import vae_ops
+from shared.utils.phase_progress import check_abort
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
@@ -159,6 +166,12 @@ class CausalConv3d(nn.Module):
         x = F.pad(x, self.time_causal_padding, mode=self.pad_mode)
         return self.conv(x)
 
+    def stream(self, x, state, residual=None, norm=None):
+        """forward of one chunk of frames of a streamed clip, of swish(norm(x)) with norm, plus residual: the last input frames of the
+        previous chunk (kept in state) replace the replicate padding of the first frame."""
+        out, state[self] = vae_ops.replicate_padded_conv3d(x, self.conv, self.time_causal_padding[:5], state.get(self), residual, norm)
+        return out
+
 
 def prepare_causal_attention_mask(n_frame: int, n_hw: int, dtype, device, batch_size: int = None):
     """Prepare a causal attention mask for 3D videos.
@@ -212,8 +225,34 @@ class AttnBlock(nn.Module):
 
         return rearrange(h_, "b 1 (f h w) c -> b c f h w", f=f, h=h, w=w, c=c, b=b)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, by_frames: bool = False) -> Tensor:
+        if by_frames:
+            return self.causal_frames_(x)
         return x + self.proj_out(self.attention(x))
+
+    def causal_frames_(self, x, chunk_bytes=32 << 20):
+        """forward on a whole clip, in place: the keys and values of all the frames, then the queries of one frame at a time attending
+        to that frame and the earlier ones (the mask of attention(), without its tokens x tokens tensor nor its loop over the tokens),
+        each frame's result added to x. The 1x1x1 projections are matrix products on the tokens: cuDNN's 3D convolution reserves a
+        workspace of 0.9 GiB for them on a 1280x720 x 65 clip, 7 times the clip at this resolution."""
+        batch, channels, frames, height, width = x.shape
+        tokens = height * width
+        step = max(1, chunk_bytes // (batch * channels * tokens * x.element_size()))
+        project = lambda conv, rows: F.linear(rows, conv.weight.flatten(1), conv.bias)
+        normed = lambda first, last: self.norm(x[:, :, first:last]).flatten(2).transpose(1, 2)  # (batch, frames * tokens, channels)
+        key, value = x.new_empty(batch, 1, frames * tokens, channels), x.new_empty(batch, 1, frames * tokens, channels)
+        for start in range(0, frames, step):
+            rows = normed(start, start + step)
+            span = slice(start * tokens, start * tokens + rows.shape[1])
+            key[:, 0, span], value[:, 0, span] = project(self.k, rows), project(self.v, rows)
+            del rows
+        for frame in range(frames):
+            visible = (frame + 1) * tokens
+            out = vae_ops.attention(project(self.q, normed(frame, frame + 1)).unsqueeze(1), key[:, :, :visible], value[:, :, :visible])[:, 0]
+            x[:, :, frame:frame + 1] += project(self.proj_out, out).transpose(1, 2).unflatten(2, (1, height, width))
+            del out
+            check_abort()
+        return x
 
 
 class ResnetBlock(nn.Module):
@@ -233,9 +272,13 @@ class ResnetBlock(nn.Module):
         if self.in_channels != self.out_channels:
             self.nin_shortcut = Conv3d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
 
-    def forward(self, x_list):
+    def forward(self, x_list, state=None):
+        """state: the causal caches of a streamed clip, of which x is one chunk of frames (see CausalConv3d.stream)."""
         x = x_list[0]
         x_list.clear()
+        if state is not None:
+            h = self.conv1.stream(x, state, norm=self.norm1)
+            return self.conv2.stream(h, state, self.nin_shortcut(x) if self.in_channels != self.out_channels else x, self.norm2)
         dtype = x.dtype
         h = x
         h = self.norm1(h).to(dtype)
@@ -262,12 +305,15 @@ class Downsample(nn.Module):
         self.add_temporal_downsample = add_temporal_downsample
         self.group_size = factor * in_channels // out_channels
 
-    def forward(self, x_list):
+    def forward(self, x_list, state=None):
+        """state: the causal caches of a streamed clip, of which x is one chunk of frames: only the first frame of the clip (the first
+        chunk's) is not paired in time; the other frames of a chunk go by pairs."""
         x = x_list[0]
         x_list.clear()
         r1 = 2 if self.add_temporal_downsample else 1
-        h = self.conv(x)
-        if self.add_temporal_downsample:
+        first = state is None or self.conv not in state
+        h = self.conv(x) if state is None else self.conv.stream(x, state)
+        if self.add_temporal_downsample and first:
             h_first = h[:, :, :1, :, :]
             h_first = rearrange(h_first, "b c f (h r2) (w r3) -> b (r2 r3 c) f h w", r2=2, r3=2)
             h_first = torch.cat([h_first, h_first], dim=1)
@@ -308,12 +354,15 @@ class Upsample(nn.Module):
         self.add_temporal_upsample = add_temporal_upsample
         self.repeats = factor * out_channels // in_channels
 
-    def forward(self, x_list: Tensor):
+    def forward(self, x_list: Tensor, state=None):
+        """state: the causal caches of a streamed clip, of which x is one chunk of frames: only the first frame of the clip (the first
+        chunk's) is not doubled in time."""
         x = x_list[0]
         x_list.clear()
         r1 = 2 if self.add_temporal_upsample else 1
-        h = self.conv(x)
-        if self.add_temporal_upsample:
+        first = state is None or self.conv not in state
+        h = self.conv(x) if state is None else self.conv.stream(x, state)
+        if self.add_temporal_upsample and first:
             h_first = h[:, :, :1, :, :]
             h_first = rearrange(h_first, "b (r2 r3 c) f h w -> b c f (h r2) (w r3)", r2=2, r3=2)
             h_first = h_first[:, : h_first.shape[1] // 2]
@@ -396,8 +445,60 @@ class Encoder(nn.Module):
 
         self.gradient_checkpointing = False
 
-    def forward(self, x: Tensor) -> Tensor:
-        """Forward pass through the encoder."""
+    def stream(self, x, tile, chunk_frames):
+        """Encodes x exactly, as forward() does it (no tile overlap, no blending), with the memory of one tile: conv_in and the levels
+        that reduce the frame are local (norms per pixel) and causal, so each tile of the reduced frame (side `tile` latent pixels)
+        goes through all the frames alone by chunks of chunk_frames latent frames with its own causal caches, every layer on the
+        tile's region plus the receptive field still ahead of it, its output cropped to what the later layers need; then the layers at
+        the latent resolution, whose attention spans the frames, on the whole clip by chunks of frames, in place."""
+        modules = [module for level in self.down for module in (*level.block, *([level.downsample] if hasattr(level, "downsample") else []))]
+        local = max(index for index, module in enumerate(modules) if isinstance(module, Downsample)) + 1
+        steps = [("same", 1)] + [("unshuffle2",) if isinstance(module, Downsample) else ("same", 2) for module in modules[:local]]
+        spatial = 2 ** sum(isinstance(module, Downsample) for module in modules)
+        temporal = 2 ** sum(isinstance(module, Downsample) and module.add_temporal_downsample for module in modules)
+        batch, _, frames, height, width = x.shape
+        latent_frames, latent_height, latent_width = 1 + (frames - 1) // temporal, height // spatial, width // spatial
+        h = None
+        for y0 in range(0, latent_height, tile):
+            (ya, yb), y_crops = halo_plan(steps, y0, min(y0 + tile, latent_height), height)
+            for x0 in range(0, latent_width, tile):
+                (xa, xb), x_crops = halo_plan(steps, x0, min(x0 + tile, latent_width), width)
+                crops = [(slice(*rows), slice(*columns)) for rows, columns in zip(y_crops, x_crops)]
+                state = {}
+                for start in range(0, latent_frames, chunk_frames):
+                    stop = min(start + chunk_frames, latent_frames)
+                    part = x[:, :, (0 if start == 0 else 1 + (start - 1) * temporal):1 + (stop - 1) * temporal, ya:yb, xa:xb]
+                    rows, columns = crops[0]
+                    part = self.conv_in.stream(part, state)[..., rows, columns]
+                    for module, (rows, columns) in zip(modules, crops[1:]):
+                        part = module([part], state=state)[..., rows, columns]
+                        check_abort()
+                    if h is None:
+                        h = part.new_empty(batch, part.shape[1], latent_frames, latent_height, latent_width)
+                    h[:, :, start:stop, y0:y0 + part.shape[3], x0:x0 + part.shape[4]] = part
+                    del part
+                del state
+        step = max(1, (32 << 20) // (h[:, :, 0].numel() * h.element_size()))
+        for block in (*modules[local:], self.mid.block_1, self.mid.attn_1, self.mid.block_2):
+            if block is self.mid.attn_1:
+                h = block(h, by_frames=True)
+                continue
+            state = {}
+            for start in range(0, latent_frames, step):
+                h[:, :, start:start + step] = block([h[:, :, start:start + step]], state=state)
+                check_abort()
+        out, state = h.new_empty(batch, 2 * self.z_channels, latent_frames, latent_height, latent_width), {}
+        for start in range(0, latent_frames, step):
+            part = h[:, :, start:start + step]
+            shortcut = part.unflatten(1, (2 * self.z_channels, -1)).mean(dim=2)
+            out[:, :, start:start + step] = self.conv_out.stream(part, state, shortcut, self.norm_out)
+        return out
+
+    def forward(self, x: Tensor, stream=None) -> Tensor:
+        """Forward pass through the encoder. stream: (tile, chunk_frames) of a streamed encode (see stream), run through forward so
+        that the offload hooks load the weights first."""
+        if stream is not None:
+            return self.stream(x, *stream)
         use_checkpointing = bool(self.training and self.gradient_checkpointing)
 
         # downsampling
@@ -486,8 +587,70 @@ class Decoder(nn.Module):
 
         self.gradient_checkpointing = False
 
-    def forward(self, z: Tensor) -> Tensor:
-        """Forward pass through the decoder."""
+    def _stream_start(self, z, chunk_bytes=32 << 20):
+        """The part of the decoder that sees the whole clip, at the latent resolution: conv_in and the mid block, whose attention spans
+        the frames (each frame attends to itself and to the earlier ones). Its residual blocks run by chunks of frames with their
+        causal caches, in place: the values of forward(), with the clip itself as the largest tensor."""
+        h = self.conv_in(z)
+        h.unflatten(1, (self.z_channels, -1)).add_(z.unsqueeze(2))  # (+ z.repeat_interleave(repeats), without the repeated copy)
+        step = max(1, chunk_bytes // (h[:, :, 0].numel() * h.element_size()))
+        for block in (self.mid.block_1, self.mid.attn_1, self.mid.block_2):
+            if block is self.mid.attn_1:
+                h = block(h, by_frames=True)
+                continue
+            state = {}
+            for start in range(0, h.shape[2], step):
+                h[:, :, start:start + step] = block([h[:, :, start:start + step]], state=state)
+                check_abort()
+        return h
+
+    def _stream_modules(self):
+        """The layers after the mid block, in order, and their halo_plan steps (then the output layers')."""
+        modules = [module for level in self.up for module in (*level.block, *([level.upsample] if hasattr(level, "upsample") else []))]
+        return modules, [("shuffle2",) if isinstance(module, Upsample) else ("same", 2) for module in modules] + [("same", 1)]
+
+    def stream_shape(self, z):
+        """(frames, height, width) of the video decoded from the latent z."""
+        levels = [level.upsample for level in self.up if hasattr(level, "upsample")]
+        temporal = 2 ** sum(upsample.add_temporal_upsample for upsample in levels)
+        return 1 + (z.shape[2] - 1) * temporal, z.shape[3] * 2 ** len(levels), z.shape[4] * 2 ** len(levels)
+
+    def stream(self, z, tile, chunk_frames, sink):
+        """Decodes z exactly, as forward() does it (no tile overlap, no blending), with the memory of one tile: the start that sees the
+        whole clip (_stream_start) at the latent resolution, kept in RAM; then every other layer is local (norms per pixel) and causal,
+        so each output tile (side `tile` latent pixels) goes through all the frames alone by chunks of chunk_frames latent frames with
+        its own causal caches, every layer on the tile's region plus the receptive field still ahead of it, its output cropped to what
+        the later layers need. sink(first frame, rows, columns, pixels) receives each tile's chunk of frames as it is decoded."""
+        sample = self._stream_start(z)
+        device, sample = sample.device, sample.cpu()
+        batch, _, frames, height, width = sample.shape
+        modules, steps = self._stream_modules()
+        spatial = 2 ** sum(isinstance(module, Upsample) for module in modules)
+        temporal = 2 ** sum(isinstance(module, Upsample) and module.add_temporal_upsample for module in modules)
+        for y0 in range(0, height, tile):
+            (ya, yb), y_crops = halo_plan(steps, y0 * spatial, min(y0 + tile, height) * spatial, height)
+            for x0 in range(0, width, tile):
+                (xa, xb), x_crops = halo_plan(steps, x0 * spatial, min(x0 + tile, width) * spatial, width)
+                crops = [(slice(*rows), slice(*columns)) for rows, columns in zip(y_crops, x_crops)]
+                region = transfer.from_ram(sample[:, :, :, ya:yb, xa:xb], device)
+                state = {}
+                for start in range(0, frames, chunk_frames):
+                    h = region[:, :, start:start + chunk_frames]
+                    for module, (rows, columns) in zip(modules, crops):
+                        h = module([h], state=state)[..., rows, columns]
+                        check_abort()
+                    rows, columns = crops[-1]
+                    h = self.conv_out.stream(h, state, norm=self.norm_out)[..., rows, columns]
+                    first_frame = 0 if start == 0 else 1 + (start - 1) * temporal
+                    sink(first_frame, slice(y0 * spatial, y0 * spatial + h.shape[3]), slice(x0 * spatial, x0 * spatial + h.shape[4]), h)
+                    del h
+                del region, state
+
+    def forward(self, z: Tensor, stream=None) -> Tensor:
+        """Forward pass through the decoder. stream: (tile, chunk_frames, sink) of a streamed decode (see stream), run through forward
+        so that the offload hooks load the weights first."""
+        if stream is not None:
+            return self.stream(z, *stream)
 
         # z to block_in
         repeats = self.block_out_channels[0] // (self.z_channels)
@@ -520,6 +683,18 @@ class Decoder(nn.Module):
         h = swish(h, inplace=True)
         h = self.conv_out(h)
         return h
+
+
+def _stream_tile(vae_config, device_mem_capacity, costs, stage, height, width, minimum, ratio):
+    """Latent pixels of the largest streamed tile of `stage` ("decode", "encode") that the VAE Tiling budget holds, by steps of 64
+    pixels: 0 for the whole height x width frame (costs["whole_" + stage]: GiB per megapixel), None when not even a tile of `minimum`
+    pixels fits. Half the room above the weights without the MMGP VRAM allocator."""
+    room = (tiling.vram_budget(vae_config, device_mem_capacity) - costs["weights"] * tiling.GIB) / (1 if mmgp_vram_allocator() else 2)
+    if height and width and costs["whole_" + stage] * height * width / 1e6 * tiling.GIB <= room:
+        return 0
+    if tiling.estimate(costs[stage], minimum * minimum) > room:
+        return None
+    return tiling.largest_tile(vae_config, device_mem_capacity, {"weights": costs["weights"], stage: costs[stage]}, height, width, step=64, minimum=minimum) // ratio
 
 
 class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
@@ -865,9 +1040,110 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
         dec = torch.cat(result_row, dim=-3)
         return dec
 
+    _blend_ = staticmethod(blend_edge_)  # (the values of blend_v / blend_h / blend_t)
+
+    def decode_to_ram(self, z: torch.Tensor, to_ram):
+        """The tiled decode of z (temporal tiles, each by spatial tiles, blended as temporal_tiled_decode and spatial_tiled_decode
+        blend them) returned in RAM: each tile, once blended with the edges kept from its neighbours, goes through to_ram (a function of
+        a decoded piece on the GPU: its final form, a dtype conversion or bytes) and is written to its place without waiting for the
+        GPU. VRAM holds one decoded tile, the edges of a row of tiles and the frames shared with the next temporal tile, instead of
+        every decoded tile and the assembled clip."""
+        B, C, T, H, W = z.shape
+        fs, ft = self.ffactor_spatial, self.ffactor_temporal
+        temporal = self.use_temporal_tiling and T > self.tile_latent_min_tsize
+        spatial = self.use_spatial_tiling and (W > self.tile_latent_min_size or H > self.tile_latent_min_size)
+        t_stride = int(self.tile_latent_min_tsize * (1 - self.tile_overlap_factor))
+        t_extent = int(self.tile_sample_min_tsize * self.tile_overlap_factor)
+        t_limit = self.tile_sample_min_tsize - t_extent
+        stride = int(self.tile_latent_min_size * (1 - self.tile_overlap_factor))
+        extent = int(self.tile_sample_min_size * self.tile_overlap_factor)
+        row_limit = self.tile_sample_min_size - extent
+        t_starts = list(range(0, T, t_stride)) if temporal else [0]
+        rows, columns = (list(range(0, H, stride)), list(range(0, W, stride))) if spatial else ([0], [0])
+        out = previous = current = None
+        position = previous_frames = 0
+        with vae_decoding_progress(len(t_starts) * len(rows) * len(columns), self.decoder), transfer.RamWriter("decoded video", depth=64, max_bytes=256 << 20) as writer:
+            for k, t0 in enumerate(t_starts):
+                part = z[:, :, t0 : t0 + self.tile_latent_min_tsize + 1] if temporal else z
+                bottoms, y, kept = [None] * len(columns), 0, 0
+                for i, r0 in enumerate(rows):
+                    left, x = None, 0
+                    for j, c0 in enumerate(columns):
+                        tile = self.decoder(part[:, :, :, r0 : r0 + self.tile_latent_min_size, c0 : c0 + self.tile_latent_min_size] if spatial else part)
+                        if k > 0:
+                            tile = tile[:, :, 1:]
+                        if i > 0:
+                            e = min(bottoms[j].shape[-2], tile.shape[-2], extent)
+                            self._blend_(tile[:, :, :, :e], bottoms[j][:, :, :, bottoms[j].shape[-2] - e :], 3)
+                        if j > 0:
+                            e = min(left.shape[-1], tile.shape[-1], extent)
+                            self._blend_(tile[..., :e], left[..., left.shape[-1] - e :], 4)
+                        if spatial:  # the edges the next tiles blend with (rows below, columns on the right), as blended here
+                            bottoms[j] = tile[:, :, :, -extent:].clone() if i < len(rows) - 1 else None
+                            left = tile[..., -extent:].clone() if j < len(columns) - 1 else None
+                            tile = tile[:, :, :, :row_limit, :row_limit]
+                        frames, height, width = tile.shape[2:]
+                        if k > 0:  # the first frames blended with the last ones of the temporal tile before
+                            e = min(previous_frames, frames, t_extent)
+                            self._blend_(tile[:, :, :e], previous[:, :, previous.shape[2] - e :, y : y + height, x : x + width], 2)
+                        if temporal and k < len(t_starts) - 1:
+                            if current is None:
+                                current = torch.empty((*tile.shape[:2], min(frames, t_extent), H * fs, W * fs), dtype=tile.dtype, device=tile.device)
+                            current[:, :, :, y : y + height, x : x + width].copy_(tile[:, :, frames - current.shape[2] :])
+                        kept = min(frames, t_limit + (1 if k == 0 else 0)) if temporal else frames
+                        piece = to_ram(tile[:, :, :kept])
+                        if out is None:
+                            total = sum(min((min(self.tile_latent_min_tsize + 1, T - start) - 1) * ft + (1 if n == 0 else 0), t_limit + (1 if n == 0 else 0))
+                                        for n, start in enumerate(t_starts)) if temporal else frames
+                            out = torch.empty((*piece.shape[:2], total, H * fs, W * fs), dtype=piece.dtype, device="cpu")
+                        writer.write(out[:, :, position : position + kept, y : y + height, x : x + width], piece)
+                        x += width
+                        del tile, piece
+                    y += height
+                position += kept
+                previous, current, previous_frames = current, None, frames
+        return out
+
+    def streamed_decode(self, z, tile, chunk_frames, to_ram=None):
+        """The exact decode of z (Decoder.stream: no tile overlap, no blending) by tiles of `tile` latent pixels and chunks of
+        chunk_frames latent frames. to_ram: a function of each decoded piece on the GPU (its final form: a dtype conversion, bytes); the
+        video is then returned in RAM, each piece written to its place as it is decoded, without the caller waiting for the GPU."""
+        frames, height, width = self.decoder.stream_shape(z)
+        out = None
+
+        def sink(frame, rows, columns, pixels):
+            nonlocal out
+            piece = pixels if to_ram is None else to_ram(pixels)
+            if out is None:
+                out = torch.empty((*piece.shape[:2], frames, height, width), dtype=piece.dtype, device="cpu" if to_ram is not None else piece.device)
+            if to_ram is None:
+                out[:, :, frame:frame + piece.shape[2], rows, columns] = piece
+            else:
+                writer.write(out[:, :, frame:frame + piece.shape[2], rows, columns], piece)
+
+        pieces = -(-z.shape[3] // tile) * -(-z.shape[4] // tile) * -(-z.shape[2] // chunk_frames)
+        with vae_decoding_progress(pieces, self.decoder.conv_out.conv), transfer.RamWriter("decoded video", depth=64, max_bytes=256 << 20) as writer:
+            self.decoder(z, stream=(tile, chunk_frames, sink))
+        return out
+
+    def streamed_encode(self, x, tile, chunk_frames):
+        """The exact encode of x (Encoder.stream: no tile overlap, no blending) by tiles of `tile` latent pixels and chunks of
+        chunk_frames latent frames: the moments of the latent distribution."""
+        return self.encoder(x, stream=(tile, chunk_frames))
+
     def encode(self, x: Tensor, return_dict: bool = True):
 
         set_phase_status("VAE Encoding")
+        fs, ft = self.ffactor_spatial, self.ffactor_temporal
+        tile = self.picture_tile if x.shape[2] == 1 else self.encode_tile
+        if ((self.use_spatial_tiling or self.use_temporal_tiling) and x.is_cuda and tile is not None and (x.shape[2] - 1) % ft == 0
+                and x.shape[3] % fs == 0 and x.shape[4] % fs == 0):
+            # the exact streamed encode, by tiles of the size the VAE Tiling budget holds (0: the whole frame)
+            tile = tile or max(x.shape[3:]) // fs
+            h = torch.cat([self.streamed_encode(part, tile, self.STREAM_CHUNK) for part in (x.split(1) if self.use_slicing and x.shape[0] > 1 else [x])])
+            posterior = DiagonalGaussianDistribution(h)
+            return AutoencoderKLOutput(latent_dist=posterior) if return_dict else (posterior,)
+
         def _encode(x):
             if self.use_temporal_tiling and x.shape[-3] > self.tile_sample_min_tsize:
                 return self.temporal_tiled_encode(x)
@@ -889,7 +1165,18 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
 
         return AutoencoderKLOutput(latent_dist=posterior)
 
-    def decode(self, z: Tensor, return_dict: bool = True, generator=None):
+    def decode(self, z: Tensor, return_dict: bool = True, generator=None, to_ram=None):
+        """to_ram: a function of a decoded piece on the GPU (its final form); the video is then returned in RAM, written piece by piece
+        as it is decoded. With tiling on a CUDA device: the exact streamed decode (streamed_decode), by tiles of the size the VAE Tiling
+        budget holds (stream_tile, 0: the whole frame) and chunks of STREAM_CHUNK latent frames; elsewhere blended tiles."""
+        if (self.use_spatial_tiling or self.use_temporal_tiling) and z.is_cuda and not self._tile_parallelism_enabled:
+            tile = self.tile_latent_min_size if self.stream_tile is None else self.stream_tile or max(z.shape[3:])
+            pieces = [self.streamed_decode(part, tile, self.STREAM_CHUNK, to_ram) for part in (z.split(1) if self.use_slicing and z.shape[0] > 1 else [z])]
+            decoded = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
+            return DecoderOutput(sample=decoded) if return_dict else (decoded,)
+        if to_ram is not None and not self._tile_parallelism_enabled and not (self.use_slicing and z.shape[0] > 1):
+            decoded = self.decode_to_ram(z, to_ram)
+            return DecoderOutput(sample=decoded) if return_dict else (decoded,)
 
         tiles = z.shape[0] if self.use_slicing else 1
         if self.use_temporal_tiling and z.shape[2] > self.tile_latent_min_tsize:
@@ -910,6 +1197,8 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
                 decoded = torch.cat(decoded_slices)
             else:
                 decoded = _decode(z)
+            if to_ram is not None:
+                decoded = to_ram(decoded).cpu()
 
             if not return_dict:
                 return (decoded,)
@@ -933,37 +1222,42 @@ class AutoencoderKLConv3D(ModelMixin, ConfigMixin):
 
 
 
-    def get_VAE_tile_size(self, vae_config, device_mem_capacity, mixed_precision):
-        if mixed_precision:
-            device_mem_capacity /= 1.5
-        if vae_config == 0:
-            if device_mem_capacity >= 24000:
-                use_vae_config = 1            
-            elif device_mem_capacity >= 12000:
-                use_vae_config = 2      
-            else:
-                use_vae_config = 3
-        else:
-            use_vae_config = vae_config
+    # CUDA devices: exact streamed tiles, to decode and to encode. Their result does not depend on their size (70 dB between sizes:
+    # FP16 rounding), their time does: each tile computes a halo of its own (wider for the encoder), so the largest tile the VAE
+    # Tiling budget holds is the fastest, the whole frame when it fits (_stream_tile). 1280x720 x 65, tiles of 192 / 256 / 384 / 512
+    # pixels / whole frames: decode 20.1 / 15.7 / 12.7 / 11.7 / 9.0 s (blended tiles of 128:48: 29.2 s), encode 14.2 / 10.5 / 8.4 /
+    # 7.5 / 5.0 s (17.3 s). Tiles of 128 pixels are slower than the blended ones (30.2 and 22.0 s): the decoder starts at
+    # 192 pixels, whose VRAM is that of the blended tiles of 128:32; the encoder keeps its blended tiles (TILES) below 192.
+    # STREAM_COSTS, with the Triton kernels (True) and with PyTorch's layers (False): megapixels of a tile and GiB above the weights
+    # (+ 10 %), then GiB per megapixel of a whole frame (no halo), chunks of STREAM_CHUNK latent frames (more frames per chunk: the
+    # same time, more VRAM). A single picture (a start image) holds PICTURE of a chunk of 4 frames (measured 0.25 to 0.38: tiles of
+    # 192 pixels 0.37 GiB, 0.64 with PyTorch's layers; blended tiles: 0.06 GiB but 2.5 times the time and latents 38 to 43 dB from
+    # the untiled encode's, where the stream is at 68 to 70): it always streams, at 192 pixels when nothing larger fits.
+    # Blended tiles (the encoder of videos on small budgets; devices without CUDA), measured on footage (832x480 x 65 and 1280x720 x 33, FP16):
+    # the size of a tile in pixels changes neither the quality (0.2 dB) nor the time (a few %), its frames do: tiles of 32 frames
+    # lose 1 to 2 dB against 48 or 64. TILES: (tile pixels, frames): GiB above the weights (+ 10 %), the first that the budget
+    # holds; WEIGHTS: encoder and decoder, GiB.
+    STREAM_COSTS = {True: {"weights": 2.35, "decode": [(0.0369, 0.96), (0.0655, 1.25), (0.147, 2.3), (0.262, 3.95), (0.553, 7.65), (0.737, 10.15)], "whole_decode": 13.6,
+                           "encode": [(0.0369, 1.62), (0.0655, 2.2), (0.147, 3.06), (0.262, 4.72), (0.553, 7.05)], "whole_encode": 10.4},
+                    False: {"weights": 2.35, "decode": [(0.0369, 1.0), (0.0655, 1.4), (0.262, 4.65)], "whole_decode": 16.1,
+                            "encode": [(0.0369, 1.95), (0.0655, 2.65), (0.262, 5.75)], "whole_encode": 14.0}}
+    STREAM_CHUNK, STREAM_MINIMUM, PICTURE = 1, 192, 0.4
+    stream_tile = None  # latent pixels of a streamed decode tile, chosen by get_VAE_tile_size (0: the whole frame; None: not chosen)
+    encode_tile = None  # the same for the streamed encode of a video (None: blended tiles)
+    picture_tile = None  # the same for the streamed encode of a single picture (None: not chosen, blended tiles)
+    TILES, WEIGHTS = (((128, 48), 1.35), ((128, 32), 0.95)), 2.35
 
-        if use_vae_config == 1:
-            sample_size = 256
-            sample_tsize = 64
-            tile_overlap_factor = 0.25
-        elif use_vae_config == 2:
-            sample_size = 192
-            sample_tsize = 48
-            tile_overlap_factor = 0.25
-        else:
-            sample_size = 128
-            sample_tsize = 32
-            tile_overlap_factor = 0.25
-
-        VAE_tiling = {
-            "tile_sample_min_size" : sample_size,
-            "tile_sample_min_tsize" : sample_tsize,
-            "tile_latent_min_size" : sample_size // self.ffactor_spatial,
-            "tile_latent_min_tsize" : sample_tsize // self.ffactor_temporal,
-            "tile_overlap_factor" : tile_overlap_factor
-        }
-        return VAE_tiling
+    def get_VAE_tile_size(self, vae_config, device_mem_capacity, mixed_precision, output_height=None, output_width=None):
+        self.stream_tile = self.encode_tile = self.picture_tile = None
+        if torch.cuda.is_available():
+            costs = self.STREAM_COSTS[vae_ops.replicate_conv_kernels(torch.device("cuda", torch.cuda.current_device()))]
+            picture = dict(costs, encode=[(megapixels, need * self.PICTURE) for megapixels, need in costs["encode"]], whole_encode=costs["whole_encode"] * self.PICTURE)
+            choose = lambda costs, stage: _stream_tile(vae_config, device_mem_capacity, costs, stage, output_height, output_width, self.STREAM_MINIMUM, self.ffactor_spatial)
+            floor = lambda tile: self.STREAM_MINIMUM // self.ffactor_spatial if tile is None else tile
+            self.encode_tile, self.picture_tile, self.stream_tile = choose(costs, "encode"), floor(choose(picture, "encode")), floor(choose(costs, "decode"))
+        room = tiling.vram_budget(vae_config, device_mem_capacity) / tiling.GIB - self.WEIGHTS
+        if not mmgp_vram_allocator():  # (PyTorch's allocator reserves more than it allocates)
+            room /= 2
+        sample_size, sample_tsize = next((tile for tile, need in self.TILES if need <= room), self.TILES[-1][0])
+        return {"tile_sample_min_size": sample_size, "tile_sample_min_tsize": sample_tsize, "tile_latent_min_size": sample_size // self.ffactor_spatial,
+                "tile_latent_min_tsize": sample_tsize // self.ffactor_temporal, "tile_overlap_factor": 0.25}

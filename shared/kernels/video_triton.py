@@ -39,25 +39,46 @@ def _cast_rope(X, OUT, C, S, ROWS, TOKENS, HEADS,
     tl.store(out + rows[:, None] * D + cols[None, :], x, rows[:, None] < ROWS)
 
 
-@triton.jit(do_not_specialize=['N'], do_not_specialize_on_alignment=['N'])
-def _swiglu(X, N, D: tl.constexpr, BLOCK: tl.constexpr):
-    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    offset = (i // D) * (2 * D) + i % D
-    gate = tl.load(X + offset, i < N, 0).to(tl.float32)
-    value = tl.load(X + offset + D, i < N, 0).to(tl.float32)
+# The elementwise kernels below take the width D at runtime on a grid of (R rows, BLOCK columns) tiles: one compile per tile shape
+# for every channel width, no division per element.
+_ROW_INTS = ["ROWS"]  # D keeps its divisible-by-16 specialization (vector loads)
+
+
+@triton.jit
+def _row_tile(ROWS, D, R: tl.constexpr, BLOCK: tl.constexpr):
+    rows = tl.program_id(0).to(tl.int64) * R + tl.arange(0, R)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    return rows[:, None], cols[None, :], (rows < ROWS)[:, None] & (cols < D)[None, :]
+
+
+@triton.jit(do_not_specialize=_ROW_INTS, do_not_specialize_on_alignment=["ROWS"])
+def _swiglu(X, ROWS, D, R: tl.constexpr, BLOCK: tl.constexpr):
+    row, col, valid = _row_tile(ROWS, D, R, BLOCK)
+    offset = row * (2 * D) + col
+    gate = tl.load(X + offset, valid, 0).to(tl.float32)
+    value = tl.load(X + offset + D, valid, 0).to(tl.float32)
     activated = (gate / (1.0 + tl.exp(-gate))).to(X.dtype.element_ty).to(tl.float32)
-    tl.store(X + offset, activated * value, i < N)
+    tl.store(X + offset, activated * value, valid)
 
 
-@triton.jit(do_not_specialize=['N'], do_not_specialize_on_alignment=['N'])
-def _residual(X, SCALE, RESIDUAL, N, D: tl.constexpr, BLOCK: tl.constexpr):
+@triton.jit(do_not_specialize=_ROW_INTS, do_not_specialize_on_alignment=["ROWS"])
+def _residual(X, SCALE, RESIDUAL, ROWS, D, R: tl.constexpr, BLOCK: tl.constexpr):
     """branch * scale + residual with the two roundings of branch.mul_(scale).add_(residual): bit-identical."""
-    i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    x = tl.load(X + i, i < N, 0).to(tl.float32)
-    scale = tl.load(SCALE + i % D).to(tl.float32)
-    residual = tl.load(RESIDUAL + i, i < N, 0).to(tl.float32)
+    row, col, valid = _row_tile(ROWS, D, R, BLOCK)
+    i = row * D + col
+    x = tl.load(X + i, valid, 0).to(tl.float32)
+    scale = tl.load(SCALE + col, valid, 0).to(tl.float32)
+    residual = tl.load(RESIDUAL + i, valid, 0).to(tl.float32)
     scaled = (x * scale).to(X.dtype.element_ty).to(tl.float32)
-    tl.store(X + i, scaled + residual, i < N)
+    tl.store(X + i, scaled + residual, valid)
+
+
+def row_tiles(rows, width):
+    """(grid, R, BLOCK) of the row-tile kernels: BLOCK a power of two up to 1024 columns, R rows so that a tile holds 1024 elements
+    (narrow rows: programs of several rows)."""
+    block = min(1024, triton.next_power_of_2(width))
+    tile_rows = 1024 // block
+    return (triton.cdiv(rows, tile_rows), triton.cdiv(width, block)), tile_rows, block
 
 
 CAST_ROPE_SUPPORTED = hasattr(tl, "gather")  # _cast_rope gathers the rotation partners: Triton 3.3+ (3.2 of the PyTorch 2.7 stack has no tl.gather)
@@ -74,47 +95,51 @@ def cast_rope(q, rotary):
 
 def swiglu_(expanded):
     dim = expanded.shape[-1] // 2
-    n = expanded.numel() // 2
-    _swiglu[(triton.cdiv(n, 512),)](expanded, n, dim, 512, enable_fp_fusion=False)
+    rows = expanded.numel() // (2 * dim)
+    grid, tile_rows, block = row_tiles(rows, dim)
+    _swiglu[grid](expanded, rows, dim, tile_rows, block, enable_fp_fusion=False)
     torch.autograd.graph.increment_version(expanded)
     return expanded[..., :dim]
 
 
 def residual_(branch, scale, residual):
-    n = branch.numel()
-    _residual[(triton.cdiv(n, 512),)](branch, scale, residual, n, branch.shape[-1], 512, enable_fp_fusion=False)
+    width = branch.shape[-1]
+    rows = branch.numel() // width
+    grid, tile_rows, block = row_tiles(rows, width)
+    _residual[grid](branch, scale, residual, rows, width, tile_rows, block, enable_fp_fusion=False)
     torch.autograd.graph.increment_version(branch)
     return branch
 
 
-@triton.jit(do_not_specialize=['N'], do_not_specialize_on_alignment=['N'])
-def _swiglu_contiguous(X, OUT, N, D: tl.constexpr, BLOCK: tl.constexpr):
-    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    offset = (i // D) * (2 * D) + i % D
-    gate = tl.load(X + offset, i < N, 0).to(tl.float32)
-    value = tl.load(X + offset + D, i < N, 0).to(tl.float32)
+@triton.jit(do_not_specialize=_ROW_INTS, do_not_specialize_on_alignment=["ROWS"])
+def _swiglu_contiguous(X, OUT, ROWS, D, R: tl.constexpr, BLOCK: tl.constexpr):
+    row, col, valid = _row_tile(ROWS, D, R, BLOCK)
+    offset = row * (2 * D) + col
+    gate = tl.load(X + offset, valid, 0).to(tl.float32)
+    value = tl.load(X + offset + D, valid, 0).to(tl.float32)
     activated = (gate / (1.0 + tl.exp(-gate))).to(X.dtype.element_ty).to(tl.float32)
-    tl.store(OUT + i, activated * value, i < N)
+    tl.store(OUT + row * D + col, activated * value, valid)
 
 
-@triton.jit(do_not_specialize=['N'], do_not_specialize_on_alignment=['N'])
-def _swiglu_rn(X, OUT, N, D: tl.constexpr, BLOCK: tl.constexpr):
+@triton.jit(do_not_specialize=_ROW_INTS, do_not_specialize_on_alignment=["ROWS"])
+def _swiglu_rn(X, OUT, ROWS, D, R: tl.constexpr, BLOCK: tl.constexpr):
     """silu(gate) rounded to the activation dtype, then times the value: F.silu(gate).mul_(value) bit for bit (IEEE division and
     expf as PyTorch's kernel)."""
-    i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    offset = (i // D) * (2 * D) + i % D
-    gate = tl.load(X + offset, i < N, 0).to(tl.float32)
-    value = tl.load(X + offset + D, i < N, 0).to(tl.float32)
+    row, col, valid = _row_tile(ROWS, D, R, BLOCK)
+    offset = row * (2 * D) + col
+    gate = tl.load(X + offset, valid, 0).to(tl.float32)
+    value = tl.load(X + offset + D, valid, 0).to(tl.float32)
     activated = tl.div_rn(gate, 1.0 + libdevice.exp(-gate)).to(X.dtype.element_ty).to(tl.float32)
-    tl.store(OUT + i, activated * value, i < N)
+    tl.store(OUT + row * D + col, activated * value, valid)
 
 
 def swiglu_rn(expanded):
     """Rows of [gate | value] to silu(gate) * value in a new contiguous tensor (the twice-wide projection can be released)."""
     dim = expanded.shape[-1] // 2
     out = torch.empty((*expanded.shape[:-1], dim), device=expanded.device, dtype=expanded.dtype)
-    n = out.numel()
-    _swiglu_rn[(triton.cdiv(n, 1024),)](expanded, out, n, dim, 1024, enable_fp_fusion=False)
+    rows = out.numel() // dim
+    grid, tile_rows, block = row_tiles(rows, dim)
+    _swiglu_rn[grid](expanded, out, rows, dim, tile_rows, block, enable_fp_fusion=False)
     return out
 
 
@@ -211,39 +236,44 @@ def swiglu(expanded):
     """Release the twice-wide projection before the following linear operation."""
     dim = expanded.shape[-1] // 2
     out = torch.empty((*expanded.shape[:-1], dim), device=expanded.device, dtype=expanded.dtype)
-    n = out.numel()
-    _swiglu_contiguous[(triton.cdiv(n, 512),)](expanded, out, n, dim, 512, enable_fp_fusion=False)
+    rows = out.numel() // dim
+    grid, tile_rows, block = row_tiles(rows, dim)
+    _swiglu_contiguous[grid](expanded, out, rows, dim, tile_rows, block, enable_fp_fusion=False)
     return out
 
 
-@triton.jit(do_not_specialize=['N', 'T', 'H', 'W'], do_not_specialize_on_alignment=['N', 'T', 'H', 'W'])
-def _silu_pad_frames(X, OUT, N, C: tl.constexpr, T,
+@triton.jit(do_not_specialize=['C', 'T', 'H', 'W'], do_not_specialize_on_alignment=['C', 'T', 'H', 'W'])
+def _silu_pad_frames(X, OUT, C, T,
                      H, W, P: tl.constexpr,
                      FRONT: tl.constexpr, BLOCK: tl.constexpr):
-    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    # one program row per output plane (batch, channel, padded frame): the plane's indices once per program, the channel count at
+    # runtime (one compile for every VAE width), only the position in the plane split per element
+    plane = tl.program_id(0).to(tl.int64)
+    i = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    t = plane % (T + FRONT) - FRONT
+    c = plane // (T + FRONT) % C
+    b = plane // ((T + FRONT) * C)
     col = i % (W + 2 * P) - P
-    row = i // (W + 2 * P) % (H + 2 * P) - P
-    t = i // ((W + 2 * P) * (H + 2 * P)) % (T + FRONT) - FRONT
-    c = i // ((W + 2 * P) * (H + 2 * P) * (T + FRONT)) % C
-    b = i // (C * (W + 2 * P) * (H + 2 * P) * (T + FRONT))
+    row = i // (W + 2 * P) - P
+    inside = row < H + P
     col = tl.where(col < 0, -col, tl.where(col >= W, 2 * W - 2 - col, col))
     row = tl.where(row < 0, -row, tl.where(row >= H, 2 * H - 2 - row, row))
     offset = (((b * T + t) * C + c) * H + row) * W + col
-    x = tl.load(X + offset, (i < N) & (t >= 0), 0).to(tl.float32)
+    x = tl.load(X + offset, inside & (t >= 0), 0).to(tl.float32)
     if X.dtype.element_ty == tl.float16:
         value = tl.div_rn(x, 1.0 + libdevice.exp(-x))
     else:
         value = x / (1.0 + tl.exp(-x))
-    tl.store(OUT + i, value, i < N)
+    tl.store(OUT + plane * ((H + 2 * P) * (W + 2 * P)) + i, value, inside)
 
 
 def silu_pad_frames(normalized, batch, frames, padding, front):
     _, channels, _, height, width = normalized.shape
     out = torch.empty((batch, channels, frames + front, height + 2 * padding, width + 2 * padding),
                       device=normalized.device, dtype=normalized.dtype)
-    n = out.numel()
-    _silu_pad_frames[(triton.cdiv(n, 256),)](normalized, out, n, channels, frames, height, width,
-                                        padding, front, 256, enable_fp_fusion=False)
+    plane = out.shape[3] * out.shape[4]
+    _silu_pad_frames[(batch * channels * (frames + front), triton.cdiv(plane, 256))](normalized, out, channels, frames, height, width,
+                                                                                    padding, front, 256, enable_fp_fusion=False)
     return out
 
 

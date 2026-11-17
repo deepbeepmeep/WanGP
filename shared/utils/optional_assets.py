@@ -30,8 +30,8 @@ def _builtin_entries():
     for version, label in MATANYONE_VERSION_LABELS.items():
         model = {"name": "MatAnyone", "variant": label.removeprefix("MatAnyone ")} if label.startswith("MatAnyone ") else {"name": label}
         yield {"family": "Video Preprocessors", **model, "download_defs": [query_matanyone_download_def({MATANYONE_SETTINGS_KEY: version})]}
-    for name in rembg.MODELS:
-        yield {"family": "Image Preprocessors", "name": "Background Removal", "variant": name, "files": [rembg.query_download_def(name)["filename"]]}
+    for entry in rembg.query_checkpoint_inventory():
+        yield {"family": "Image Preprocessors", **entry}
     for name, defs in [("Vocals Separation", [roformer()]), ("Speaker Separation", query_speaker_separator_download_def())]:
         yield {"family": "Audio Preprocessors", "name": name, "download_defs": defs}
     for variant, definition in [("Standard", wav2vec()), ("Chinese", chinese_wav2vec())]:

@@ -20,10 +20,11 @@ from shared.utils.generation_overrides import get_override, set_override
 from .excerpts import H3_AUDIO_EXCERPTS_SETTING, H3_EXCERPT_SETTINGS, H3_VIDEO_EXCERPTS_SETTING, parse_excerpts, reference_video_frame_limit
 from .constants import (H3_AUDIO_REFINEMENT_SETTING, H3_CONTROL_LATENT_CONTINUATION, H3_MASK_MODE_DEFAULT, H3_MASK_MODE_GROUPED_ROWS,
                         H3_MASK_MODE_SHARED_TIMESTEP, H3_MASK_MODE_SETTING, H3_PHASE_2_NOISE_LEVEL_START_DEFAULT, H3_REGENERATE_LORA,
-                        h3_grouped_masking_enabled)
+                        H3_VEDA_FULL_LAYERS_CHOICES, H3_VEDA_FULL_LAYERS_SETTING, h3_grouped_masking_enabled, h3_veda_full_layers)
 from .dialogue import H3_DIALOGUE_GENERATION, H3_DIALOGUE_MAX_TOTAL_SECONDS, H3_DIALOGUE_PROMPT_INFOS, load_dialogue_whisper
 from .minimax_h3_main import (AUDIO_VAE_FILE, LATENT_UPSCALER_FILE, LATENT_UPSCALER_FOLDER, TEXT_ENCODER_FOLDER,
-                              VIDEO_VAE_FILE, VIDEO_VAE_FP8MIX_FILE, VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_FILE, VIDEO_VAE_LIGHT_INT8_FILE)
+                              VIDEO_VAE_FILE, VIDEO_VAE_FP8MIX_FILE, VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_FILE, VIDEO_VAE_LIGHT_INT8_FILE,
+                              VIDEO_VAE_SOL_INT8_FILE)
 from .p_h3_image import (P_H3_IMAGE_ARCHITECTURE, P_H3_IMAGE_FOLDER, P_H3_IMAGE_MAX_IMAGES, P_H3_IMAGE_REPO_ID, P_H3_IMAGE_STEPS, P_H3_IMAGE_SWITCH_THRESHOLD,
                          P_H3_IMAGE_TEXT_ENCODER_BF16, P_H3_IMAGE_TEXT_ENCODER_FOLDER,
                          P_H3_IMAGE_TEXT_ENCODER_INT8, P_H3_IMAGE_VAE_FILE, P_H3_IMAGE_VAE_INT8_FILE, query_p_h3_image_def)
@@ -200,7 +201,7 @@ H3 is designed for 24 FPS, although WanGP can generate at another frame rate. Mi
 
 REF2VA_DEEPY_INFOS = """Generate video and 32 kHz stereo audio from `prompt` and references. Ordered `image_refs` guide identity, objects or setting; reference flags in `video_prompt_type`: `I` preserves chosen output dimensions, `KI` derives them from the first image. `image_start` / `image_end` are timeline anchors shown before general image references. `FI` injects the first `image_refs` at `frames_positions` (`1` = first frame, `L` = window end, `X` = skip a window); remaining images are references; not with `GV`. Per window, pictures are numbered: start or continued frame (`<Picture 1>`), end image, that window's injected frames by time, then references. `video_source` and sliding windows provide continuation. A window may jump onto an end image its action did not reach; `sliding_window_discard_last_frames` about 5 hides it: the end image of every window but the last is generated after the discarded frames (steers, not shown); the last window ends on its end image.
 
-`video_guide`, `video_guide2` and `video_guide3` supply up to three reference videos for appearance, motion or camera; choose the corresponding video mode. `V1-U` instead takes up to three excerpts from `video_guide` at `custom_settings.h3_video_excerpt_positions`: frame numbers or seconds such as `5.2s`, each optionally followed by `/duration` (default 3s), for example `3 5.2s/4s 12s`. Reference videos preserve the chosen output size and are given whole to every sliding window. Control videos (`VU`, `GV`) use the control video's aspect ratio and are split across sliding windows, each window receiving its own section. Use Reference Video for motion transfer to image-reference characters; for depth, pose or edge control use the MiniMax H3 FL2VA ControlNet-Union model. `VU` supplies the control video's unchanged frames as `<Video 1>`: an in-context guide for LoRAs that transform a source video, such as character swap; name it `<Video 1>` in the prompt and state what to do with it. `GV` (Denoise Control Video) edits through denoising: lower strength preserves more source content; at strength 1 without a mask, the source supplies no visual conditioning. `GV` does not supply a video reference.
+`video_guide`, `video_guide2` and `video_guide3` supply up to three reference videos for appearance, motion or camera; choose the corresponding video mode. `V1-U` instead takes up to three excerpts from `video_guide` at `custom_settings.h3_video_excerpt_positions`: frame numbers or seconds such as `5.2s`, each optionally followed by `/duration` (default 3s), for example `3 5.2s/4s 12s`. Reference videos preserve the chosen output size and are given whole to every sliding window. Control videos (`VU`, `VU2`, `GV`) use the control video's aspect ratio and are split across sliding windows, each window receiving its own section. `VU2` is the aligned guide (ComfyUI Add Guide at frame 0): control frame i guides output frame i, not shown to the prompt encoder; only for LoRAs trained with it (BFS Character Swap / Head Swap / Motion Transfer Guide Latents), otherwise H3 tends to copy the control video. Use Reference Video for motion transfer to image-reference characters; for depth, pose or edge control use the MiniMax H3 FL2VA ControlNet-Union model. `VU` supplies the control video's unchanged frames as `<Video 1>`: an in-context guide for LoRAs that transform a source video, such as character swap; name it `<Video 1>` in the prompt and state what to do with it. `GV` (Denoise Control Video) edits through denoising: lower strength preserves more source content; at strength 1 without a mask, the source supplies no visual conditioning. `GV` does not supply a video reference.
 
 `audio_prompt_type`: empty = no audio input. References, whose voice or sound H3 reuses in newly generated audio: `A` = `audio_guide`, `AB` = two audio guides, `ABD` = three audio guides, `K` = reference-video soundtracks (not with excerpts);  `K1` = up to three soundtrack excerpts at `custom_settings.h3_audio_excerpt_positions`, same syntax, independent of the video excerpts; the prompt defines each reference's role. Soundtrack, kept as the output audio and followed by the video across sliding windows: `AS` = `audio_guide`, `KS` = the whole audio track of the reference video or of a control video (`GV`, `VU`). `K` / `K1` need reference videos (`K1` a single one or excerpts from one); `KS` also accepts a control video. A kept soundtrack is not a reference: give it no <Audio N> label.
 
@@ -244,6 +245,7 @@ Each excerpt lasts at least 2 seconds, the excerpts total at most 15 seconds, an
 
 - **Reference Video:** reuse subjects, appearance, or motion without changing the selected output resolution. Choose this mode to transfer motion from a video to characters supplied in reference images; describe the subject replacements in the prompt. Reference videos do not use Denoising Strength.
 - **Use Control Video as In-Context Guide:** H3 receives the control video's unchanged frames as `<Video 1>` and generates a new video from them. Choose this mode for LoRAs that transform a source video, such as a character swap: name the video `<Video 1>` in the prompt and say what to change and what to keep. Without such a LoRA, it behaves like a Reference Video that follows the control video section by section.
+- **Use Control Video as Aligned Guide (for LoRAs trained with it):** each frame of the control video guides the same frame of the output, as ComfyUI's **Add Guide** node does. Choose it only for LoRAs trained this way, such as the BFS Character Swap, Head Swap and Motion Transfer (Guide Latents) LoRAs: with them the result keeps the control video's scene, framing and performance and changes what the LoRA and prompt ask. Write the prompt as the LoRA's author recommends. Without such a LoRA, H3 tends to reproduce the control video. The control video is not numbered among the reference videos.
 - **Denoise Control Video (Video-to-Video Edit):** edit the source video using the prompt and **Denoising Strength**. Lower strength preserves more source content. At `1.0` with **Whole Frame** selected, the source video supplies no visual conditioning. Choose **Masked Area** or **Non Masked Area** to edit part of the frame. This mode does not supply the video as a motion/appearance reference.
 
 Reference videos adapt to your chosen output size and guide the result creatively, without guaranteeing exact motion reproduction. Each sliding window receives the whole reference video (up to its first 15 seconds).
@@ -431,6 +433,9 @@ H3_TEXT_ENCODER_INFOS = """Choose how much system RAM to use for interpreting pr
 More aggressive quantization can slightly affect prompt interpretation.
 """
 
+H3_VEDA_FULL_LAYERS = {"id": H3_VEDA_FULL_LAYERS_SETTING, "name": "Veda Full Attention Layers", "label": "Veda Full Attention Layers", "type": "dropdown",
+                       "default": "none", "choices": H3_VEDA_FULL_LAYERS_CHOICES}
+
 H3_VIDEO_VAE_INFOS = """Choose the decoder used to turn generated video into frames.
 
 - **Auto:** follows Transformer Quantization: INT8 selects INT8 ConvRot Decoder, FP8 selects FP8 Mixed Precision, and other choices select BF16.
@@ -438,6 +443,7 @@ H3_VIDEO_VAE_INFOS = """Choose the decoder used to turn generated video into fra
 - **FP8 Mixed Precision:** use the mixed-precision version of the full H3 VAE.
 - **INT8 ConvRot Decoder:** use the quantized full decoder.
 - **LightVAE Lite BF16** and **LightVAE Lite INT8 ConvRot:** use a smaller 12-layer decoder. Both keep the original H3 encoder for first/last frames and references. Decoded detail can differ from the full VAE.
+- **Sol VAE INT8 ConvRot:** a 24-layer decoder distilled from the full one, which decodes whole frames instead of small tiles: about four times faster than the full VAE and, from 720p, faster than LightVAE, with almost the full VAE's detail. It keeps the original H3 encoder. Its decoding memory grows with the resolution and length of the video: about 4.3 GB for 5 seconds at 1080p, 1 GB more than the INT8 ConvRot Decoder.
 
 Selecting **MiniMax H3 VAE** spatial upsampling replaces the selected decoder, including LightVAE, with the X2 decoder.
 """
@@ -1005,6 +1011,7 @@ class family_handler:
                 "int8_convrot": {"name": "INT8 ConvRot Decoder", "video_vae_file": VIDEO_VAE_INT8_FILE, "x2_vae_file": X2_VAE_INT8_FILE},
                 "lightvae": {"name": "LightVAE Lite BF16", "video_vae_file": VIDEO_VAE_LIGHT_FILE, "x2_vae_file": X2_VAE_FILE},
                 "lightvae_int8": {"name": "LightVAE Lite INT8 ConvRot", "video_vae_file": VIDEO_VAE_LIGHT_INT8_FILE, "x2_vae_file": X2_VAE_INT8_FILE},
+                "sol_int8": {"name": "Sol VAE INT8 ConvRot", "video_vae_file": VIDEO_VAE_SOL_INT8_FILE, "x2_vae_file": X2_VAE_INT8_FILE},
             },
             "system_configs3": {
                 "_name": "DiT Denoising Priority",
@@ -1051,8 +1058,9 @@ class family_handler:
                                 # ("Transfer Depth Map From Control Video", "DV"),  # superseded by the FL2VA ControlNet-Union model
                                 # ("Transfer Edges Map From Control Video", "EV"),
                                 ("Denoise Control Video (Video-to-Video Edit)", "GV"),
-                                ("Use Control Video as In-Context Guide", "VU")],
-                    "letters_filter": "GPDEV+*-U1",
+                                ("Use Control Video as In-Context Guide", "VU"),
+                                ("Use Control Video as Aligned Guide (for LoRAs trained with it)", "VU2")],
+                    "letters_filter": "GPDEV+*-U12",
                     "default": "",
                     "label": "Reference / Control Video",
                 },
@@ -1164,7 +1172,13 @@ class family_handler:
             result["deepy_infos"] += " `custom_sigmas` defaults to empty. Commas separate positive descending sigmas below 1; semicolons separate exactly `guidance_phases` slots. Blank slots use normal schedules; trailing zero is ignored. Explicit schedules override that phase's steps and starting sigma without another flow shift. FL2VA and Ref2VA share the H3 presets. Open-H3 Regenerate uses `;0.909375,0.8571428571428571,0.6666666666666666` and `open_h3_regenerate_2k_lora.safetensors` at `0;1` before `|`; it uses phase-1 audio as frozen phase-2 conditioning and retains phase-1 output audio. Tiling is experimental. The presets replace accelerator LoRAs while preserving additional LoRAs and their multipliers. Original Phase 2 and Vanilla Phase 1 reset presets clear custom sigmas."
         if veda:
             result["compile"] = False
+            result["custom_settings"] = result["custom_settings"] + [H3_VEDA_FULL_LAYERS]
             help_text = " Veda variants always use learned sparse attention in the H3 transformer; the attention override is locked to Veda. Other attention operations use the application attention backend. It reuses the standard H3 settings, LoRAs and step counts. The predictor follows Transformer Quantization (BF16 or INT8 ConvRot). Sparsity can change fine detail or motion; compare with a standard H3 variant at the same seed. Speed benefits are greatest for large videos. Requires Triton and an NVIDIA SM80+ GPU. Veda runs without CUDA graphs or transformer compilation."
+            result["infos"] += ("\n\n**Veda Full Attention Layers:** if white or overexposed frames flash in your Veda videos, choose **Full Attention on the First "
+                                "Two and Last Layers**. These three layers then use full attention instead of Veda, which ComfyUI users reported removes the "
+                                "flashes, for a little of Veda's speed gain. **Veda on Every Layer**, the default, keeps the full speed gain.")
+            result["deepy_infos"] += (f" `custom_settings.{H3_VEDA_FULL_LAYERS_SETTING}`: `none` (default, Veda on all 50 layers) or `0,1,49` (layers 0, 1 and 49 on "
+                                      "full attention, reported to remove white flash frames, slightly slower).")
             result["infos"] += "\n\n### Veda Sparse Attention\n\n" + help_text.strip()
             result["deepy_infos"] += help_text
         if pika_supported:
@@ -1176,7 +1190,7 @@ class family_handler:
         result["deepy_infos"] += still_infos + " Set `image_mode` to `1`."
         result["infos"] += "\n\n**MiniMax H3 VAE:** " + X2_VAE_DESCRIPTION
         result["deepy_infos"] += " MiniMax H3 VAE replaces the default VAE and handles decoding and upsampling together. Choose `h3_vae*2` to double the output width and height, `h3_vae*1.5` to enlarge them by half, or `h3_vae*1` to keep the original size."
-        result["deepy_infos"] += " Video VAE configs `lightvae` and `lightvae_int8` select LightVAE's 12-layer decoder with the original H3 encoder; decoding may change detail. VAE upsampling overrides this choice with the X2 decoder."
+        result["deepy_infos"] += " Video VAE configs `lightvae` and `lightvae_int8` select LightVAE's 12-layer decoder with the original H3 encoder; decoding may change detail. `sol_int8` selects Sol-H3-VAE's 24-layer decoder distilled from the full one (whole frames, no tiles): about 4x faster than the full VAE, faster than LightVAE from 720p, much closer to the full VAE than LightVAE; decode VRAM grows with resolution and length (about 4.3 GB for 5 s at 1080p, 1 GB more than `int8_convrot`). VAE upsampling overrides this choice with the X2 decoder."
         result["prompt_infos"] += still_prompt_infos
         result["deepy_prompt_infos"] += still_prompt_infos
         if ptd:
@@ -1321,6 +1335,11 @@ class family_handler:
         inputs["sliding_window_overlap"] = min(overlap, 107) if H3_CONTROL_LATENT_CONTINUATION and base_model_type in CONTROL_ARCHITECTURES else overlap
         from shared.utils.utils import get_outpainting_dims
 
+        if model_def.get("veda", False):
+            try:
+                h3_veda_full_layers(inputs.get("custom_settings"))
+            except ValueError as error:
+                return str(error)
         grouped_masking = base_model_type not in CONTROL_ARCHITECTURES and h3_grouped_masking_enabled(inputs.get("custom_settings"))
         outpainting = get_outpainting_dims(inputs.get("video_guide_outpainting"), inputs.get("video_guide_outpainting_ratio", "")) is not None
         if outpainting and base_model_type not in CONTROL_ARCHITECTURES and not grouped_masking:
@@ -1517,8 +1536,8 @@ class family_handler:
                      "fileList": [[H3_IMAGE_VAE_FILE.rsplit("/", 1)[-1]], ["config.json", "tokenizer.json", "tokenizer_config.json", "preprocessor_config.json", "vocab.json"]]}]
         if base_model_type == P_H3_IMAGE_ARCHITECTURE:
             vae_file = model_def.get("video_vae_file", P_H3_IMAGE_VAE_FILE)
-            return [{"repoId": P_H3_IMAGE_REPO_ID, "sourceFolderList": [P_H3_IMAGE_FOLDER, P_H3_IMAGE_TEXT_ENCODER_FOLDER],
-                     "fileList": [[vae_file.rsplit("/", 1)[-1]], ["config.json", "tokenizer.json", "tokenizer_config.json"]]}]
+            return [{"repoId": P_H3_IMAGE_REPO_ID, "sourceFolderList": [P_H3_IMAGE_FOLDER, P_H3_IMAGE_TEXT_ENCODER_FOLDER, LATENT_UPSCALER_FOLDER],
+                     "fileList": [[vae_file.rsplit("/", 1)[-1]], ["config.json", "tokenizer.json", "tokenizer_config.json"], [LATENT_UPSCALER_FILE]]}]
         source_folders = []
         file_lists = []
         if model_def.get("ptd", False):
@@ -1528,7 +1547,7 @@ class family_handler:
         video_vae_file = model_def.get("video_vae_file", VIDEO_VAE_FILE)
         if video_vae_file in (VIDEO_VAE_FILE, VIDEO_VAE_FP8MIX_FILE):
             vae_files.append(video_vae_file)
-        if video_vae_file in (VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_FILE, VIDEO_VAE_LIGHT_INT8_FILE):
+        if video_vae_file in (VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_FILE, VIDEO_VAE_LIGHT_INT8_FILE, VIDEO_VAE_SOL_INT8_FILE):
             source_folders.append("minimax_h3")
             file_lists.append([video_vae_file.rsplit("/", 1)[-1]])
         if "audio_vae_file" not in model_def:

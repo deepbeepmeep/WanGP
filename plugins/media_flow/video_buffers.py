@@ -82,7 +82,7 @@ def _extract_exact_frame_image(video_path: str, frame_no: int) -> Image.Image:
     with tempfile.TemporaryDirectory(prefix="wangp_tail_frame_") as temp_dir:
         output_path = os.path.join(temp_dir, "frame.png")
         command = [ffmpeg_path, "-v", "error", "-y", "-i", video_path, "-an", "-sn", "-vf", f"select=eq(n\\,{int(frame_no)})", "-frames:v", "1", output_path]
-        result = subprocess.run(command, capture_output=True, text=True)
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True)
         if result.returncode != 0 or not os.path.isfile(output_path):
             raise gr.Error(f"Unable to decode frame {frame_no} from {video_path}")
         with Image.open(output_path) as frame_image:

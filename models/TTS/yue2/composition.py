@@ -13,6 +13,9 @@ SOURCE_LABELS = {
 
 def resolve_source(source, custom_guide=None, custom_guide_used=False, custom_settings=None):
     source = str(source) if source is not None else ""
+    source = source.replace("N", "").replace("V", "")
+    if source and set(source) <= set("01A2"):
+        source = "".join(flag for flag in "01A2" if flag in source)
     if not source:
         source = "1" if custom_guide or custom_guide_used else "0"
     if source not in SOURCE_LABELS:
@@ -22,10 +25,16 @@ def resolve_source(source, custom_guide=None, custom_guide_used=False, custom_se
     return source
 
 
-def migrate_source(settings):
-    settings["audio_prompt_type"] = resolve_source(settings.get("audio_prompt_type"), settings.get("custom_guide"), settings.get("custom_guide_used", False), settings.get("custom_settings"))
+def migrate_source(settings, settings_version=None):
+    flags = settings.get("audio_prompt_type") or ""
+    # Older releases could retain the letter choices beside the new numeric flags.
+    if settings_version is not None and settings_version < 2.81:
+        flags = flags.translate(str.maketrans("SQE", "012"))
+    source = resolve_source(flags, settings.get("custom_guide"), settings.get("custom_guide_used", False), settings.get("custom_settings"))
+    settings["audio_prompt_type"] = source + "".join(flag for flag in "NV" if flag in flags)
     if settings.get("custom_settings") is not None:
         settings["custom_settings"] = {key: value for key, value in settings["custom_settings"].items() if key != "extend_score"}
+    return source
 
 
 def validate_source(source, model_mode, custom_guide, audio_guide):

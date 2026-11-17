@@ -40,7 +40,6 @@ from .ltx_core.text_encoders.gemma.feature_extractor import GemmaFeaturesExtract
 from .ltx_core.tools import AudioLatentTools
 from .ltx_core.types import AudioLatentShape, VideoPixelShape
 from .ltx_pipelines.utils.helpers import (
-    _clear_phase_timestep_embedders,
     _prepare_conditioning_context,
     modality_from_latent_state,
     post_process_latent,
@@ -432,7 +431,6 @@ class LTXAudioTTSPipelineBase:
                 self._callback_step(callback, step_idx, status_extra)
         finally:
             velocity_model.interrupt_check = None
-            _clear_phase_timestep_embedders(self.model)
 
         if self._interrupt or self._early_stop_requested():
             return None

@@ -1,0 +1,35 @@
+{
+    "model": {
+        "name": "LongCat Avatar 1.6 Distilled 13.6B",
+        "architecture": "longcat_avatar_v1_5",
+        "parent_model_type": "longcat_avatar_v1_6",
+        "avatar_version": "1.6",
+        "description": "Animate one or two characters from a voice recording and an optional image. Eight-step generation and anchored sliding windows support longer performances; inspect transitions and identity drift when extending a clip.",
+        "URLs": [
+            "https://huggingface.co/DeepBeepMeep/LongCat/resolve/main/longcat_avatar_v1_6_bf16.safetensors",
+            "https://huggingface.co/DeepBeepMeep/LongCat/resolve/main/longcat_avatar_v1_6_int8_convrot.safetensors"
+        ],
+        "loras": [
+            "https://huggingface.co/DeepBeepMeep/LongCat/resolve/main/longcat_avatar_v1_6/longcat_avatar_v1_6_dmd_bf16.safetensors",
+            "https://huggingface.co/DeepBeepMeep/LongCat/resolve/main/longcat_avatar_v1_6/longcat_avatar_v1_6_opsd_bf16.safetensors"
+        ],
+        "loras_multipliers": ["1,1,1,1,0,0,0,0", "0,0,0,0,1,1,1,1"],
+        "distill_lora_URL": null,
+        "reference_image_enabled": true,
+        "ref_img_index": 10,
+        "mask_frame_range": 0,
+        "sample_solver": "distill",
+        "accelerated": "native"
+    },
+    "prompt": "A person speaking naturally with expressive eye contact and relaxed gestures, steady framing and consistent lighting.",
+    "negative_prompt": "",
+    "num_inference_steps": 8,
+    "guidance_scale": 1.0,
+    "audio_guidance_scale": 1.0,
+    "video_length": 93,
+    "sliding_window_size": 93,
+    "sliding_window_overlap": 13,
+    "sliding_window_discard_last_frames": 0,
+    "sample_solver": "distill",
+    "prompt_enhancer": ""
+}

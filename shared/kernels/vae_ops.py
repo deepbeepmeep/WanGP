@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from . import kernel_policy, ops, native_ops, video_kitchen as _kitchen
 from .dispatch import choose, cuda_inference, take
+from shared.utils.conv_bands import is_banded
 
 try:
     from . import video_triton as _video
@@ -29,6 +30,14 @@ try:
     from . import sparse_conv_triton as _sparse
 except (ImportError, OSError, RuntimeError):
     _sparse = None
+try:
+    from . import causal_group_norm_triton as _causal
+except (ImportError, OSError, RuntimeError):
+    _causal = None
+try:
+    from . import causal_pad_triton as _causal_pad
+except (ImportError, OSError, RuntimeError):
+    _causal_pad = None
 
 _AUDIO_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
@@ -176,11 +185,14 @@ def image_norm_conv_is_banded(x, band_bytes=IMAGE_BAND_BYTES):
     return x.numel() * 2 > band_bytes
 
 
-def image_norm_conv_bands(x, norm, conv, band_bytes=IMAGE_BAND_BYTES):
+def image_norm_conv_bands(x, norm, conv, band_bytes=IMAGE_BAND_BYTES, out=None, add=False):
     """Yield (first,last,conv_band) with global GN + SiLU before a 3x3, stride-1, padding-1 convolution.
     x is borrowed. Eligibility is checked by the caller. All statistics are read before the first yield; a one-row halo on each
     side gives every convolution its original inputs. Call the module itself so MMGP still owns its weight loading and hooks.
-    A caller overwriting x must retain its last written row until the following band has consumed that row's halo."""
+    A caller overwriting x must retain its last written row until the following band has consumed that row's halo.
+    A convolution prepared by band_convs computes the band's own rows only (no halo output rows) and, with out, writes them into
+    out's rows first..last (added to them with add): the yielded band is then that view of out."""
+    windows = is_banded(conv)
     n, c, height, width = x.shape
     dtype = torch.get_autocast_dtype(x.device.type)
     row_bytes = n * c * width * 2  # eligible output types are both 16-bit
@@ -190,7 +202,11 @@ def image_norm_conv_bands(x, norm, conv, band_bytes=IMAGE_BAND_BYTES):
         stop = min(height, start + rows)
         lo, hi = max(0, start - 1), min(height, stop + 1)
         band = _norm_silu.image_rows(x, affine, lo, hi, dtype)
-        band = conv(band)[:, :, start-lo:stop-lo]
+        if windows:
+            band = conv(band, window=(start - lo, stop - start), out=out, out_row=0 if out is None else start, add=add)
+            band = band if out is None else out[:, :, start:stop]
+        else:
+            band = conv(band)[:, :, start-lo:stop-lo]
         yield start, stop, band
         del band
 
@@ -198,6 +214,13 @@ def image_norm_conv_bands(x, norm, conv, band_bytes=IMAGE_BAND_BYTES):
 def image_norm_conv(x_list, norm, conv, *, out=None, add=False):
     """Consume x_list through image_norm_conv_bands. out is borrowed, disjoint from x, optionally a residual updated in place."""
     x = take(x_list)
+    if is_banded(conv):  # the convolution writes (or adds) each band's rows in place: neither band copies nor a separate add
+        if out is None and image_norm_conv_is_banded(x):
+            out = torch.empty((x.shape[0], conv.out_channels, x.shape[2], x.shape[3]), dtype=torch.get_autocast_dtype(x.device.type),
+                              device=x.device, memory_format=torch.channels_last)
+        for _, _, band in image_norm_conv_bands(x, norm, conv, out=out, add=add):
+            pass
+        return band if out is None else out
     for start, stop, band in image_norm_conv_bands(x, norm, conv):
         if out is None:
             if start == 0 and stop == x.shape[2]:
@@ -273,6 +296,144 @@ def channel_moments(x):
         sums[1] += part.square().sum(0, dtype=torch.float64)  # not in place: part is x itself for FP32 features
         del part
     return sums
+
+
+def replicate_conv_kernels(device):
+    """The Triton kernels of replicate_padded_conv3d serve 16-bit activations on device ("fast" kernel precision, compute capability
+    8.0+); else PyTorch's layers."""
+    device = torch.device(device)
+    return _causal_pad is not None and device.type == "cuda" and kernel_policy.allow_approximate() and _causal_pad.supported(device)
+
+
+def replicate_padded_conv3d(x, conv, pad, head=None, residual=None, norm=None):
+    """conv (stride 1, no padding of its own) of x (batch, channels, frames, height, width), or of silu(norm(x)) with an RMS norm over
+    the channels (a module with gamma and scale, no bias), replicate-padded in space by pad = (left, right, top, bottom, front) and
+    before its first frame by `front` copies of it, or preceded by `head` instead: the tail of the previous chunk of a streamed clip (a
+    causal convolution). residual (the output's shape) is added to the output. Returns (output, tail): tail = the last frames of the
+    convolution's input, at most `front`, without the spatial padding, for the next chunk.
+    "fast" kernel precision: the norm, SiLU, padding and tail in one pass written channels last (causal_pad_triton), and the Triton
+    convolution where it is the faster one (conv3d_triton.conv_eligible): the output is then channels last. Else PyTorch's layers, the
+    chunk written once into the padded input (no F.pad copy, no concatenation). x and residual are borrowed."""
+    left, right, top, bottom, front = pad
+    batch, channels, frames, height, width = x.shape
+    fast = cuda_inference(x, dtypes=_DTYPES, approximate=True)
+    pad_kernel = (fast and _causal_pad is not None and _causal_pad.supported(x.device) and left == right and top == bottom
+                  and (norm is None or not isinstance(norm.bias, torch.Tensor)))
+    conv_kernel = (fast and _conv is not None and batch * frames * height * width >= _conv._CONV_MIN_PIXELS
+                   and conv.groups == 1 and conv.dilation == (1, 1, 1) and conv.padding == (0, 0, 0) and conv.stride == (1, 1, 1)
+                   and conv.kernel_size == (front + 1, top + bottom + 1, left + right + 1) and channels % 32 == 0 and conv.out_channels % 32 == 0
+                   and conv.bias is not None and conv.weight.dtype == x.dtype and conv.weight.device == x.device and _conv.conv_supported(x.device))
+    conv_family = choose("Streamed Conv3D", triton=conv_kernel)
+    if choose("Causal Norm + SiLU + Pad", owned_triton=pad_kernel) is not None:
+        padded, tail = _causal_pad.causal_pad(x, (left, right, top, bottom, front, 0), head, norm, front, replicate=True)
+    else:
+        if norm is not None:
+            x = F.silu(norm(x).to(x.dtype), inplace=True)
+        padded = torch.empty((batch, channels, front + frames, top + height + bottom, left + width + right), dtype=x.dtype, device=x.device,
+                             memory_format=torch.channels_last_3d if conv_family is not None else torch.contiguous_format)
+        inner = padded[:, :, :, top:top + height, left:left + width]
+        inner[:, :, front:] = x
+        kept = 0 if head is None else head.shape[2]
+        if kept:
+            inner[:, :, front - kept:front] = head
+        if kept < front:
+            inner[:, :, :front - kept] = inner[:, :, front - kept:front - kept + 1]
+        if top:
+            padded[:, :, :, :top, left:left + width] = padded[:, :, :, top:top + 1, left:left + width]
+        if bottom:
+            padded[:, :, :, top + height:, left:left + width] = padded[:, :, :, top + height - 1:top + height, left:left + width]
+        if left:
+            padded[..., :left] = padded[..., left:left + 1]
+        if right:
+            padded[..., left + width:] = padded[..., left + width - 1:left + width]
+        tail = inner[:, :, padded.shape[2] - front:].clone() if front else None
+    if conv_family is not None:
+        return _conv.conv(padded, conv.weight, conv.bias, residual), tail
+    out = conv(padded)
+    return (out if residual is None else out.add_(residual)), tail
+
+
+CAUSAL_NORM_BYTES = 64 << 20  # FP32 working copy of causal_group_norm_silu_pad's PyTorch route, per slice of channels
+
+
+def causal_norm_kernels(x):
+    """The Triton kernels of causal_group_norm_silu_pad serve x ("fast" kernel precision, CUDA compute capability 8.0+)."""
+    return _causal is not None and x.is_cuda and kernel_policy.allow_approximate() and _causal.supported(x.device)
+
+
+def _causal_moments(x, groups, shared):
+    """FP64 (rows, 3) count, mean and sum of squared deviations of each group of x (batch, channels, frames, height, width), rows =
+    batch * groups, or groups when shared (the batch items are parts of one video). Each channel is summed in FP32 by the reduction
+    kernels (no copy of x), the channels of a group in FP64."""
+    batch, channels = x.shape[:2]
+    total = x.sum((2, 3, 4), dtype=torch.float32).double().view(batch, groups, -1).sum(2)
+    squares = torch.linalg.vector_norm(x, 2, (2, 3, 4), dtype=torch.float32).double().square_().view(batch, groups, -1).sum(2)
+    if shared:
+        total, squares = total.sum(0), squares.sum(0)
+    count = x.numel() // total.numel()
+    mean = total / count
+    return torch.stack((torch.full_like(mean, count), mean, (squares - total * mean).clamp_(min=0)), -1).view(-1, 3)
+
+
+def causal_group_norm_silu_pad(x, norm, pad=(0, 0, 0, 0, 0, 0), silu=True, running=None, frozen=False, shared=False, out=None, out_frame=0, apply=True):
+    """silu(norm(x)) of x (batch, channels, frames, height, width), replicate-padded by pad = (left, right, top, bottom, front, back) as
+    F.pad: the input of a causal 3x3x3 convolution of the GroupNorm video VAEs, as a new tensor of x's dtype or written from frame
+    out_frame of out. running: FP64 (batch * groups, 3) count, mean and sum of squared deviations of the previous chunks of a streamed
+    decode, merged with x's statistics (and updated) before normalizing, or used as given when frozen. shared: the batch items are parts
+    of one video, normalized with statistics merged over all of them (running: (groups, 3)). apply=False only merges x's statistics
+    into running. x is borrowed.
+    PyTorch route: the per-channel affine a * x + b in FP32 by slices of channels of at most CAUSAL_NORM_BYTES, rounded once to x's
+    dtype, PyTorch's SiLU in place, the padding written into the output (no padded copy)."""
+    if causal_norm_kernels(x):
+        return _causal.group_norm_silu_pad(x, norm, pad, silu, running, frozen, shared, out, out_frame, apply)
+    batch, channels, frames, height, width = x.shape
+    groups = norm.num_groups
+    if frozen:
+        stats = running
+    else:
+        stats = _causal_moments(x, groups, shared)
+        if running is not None:  # merged into the statistics of the chunks so far (Chan)
+            count, mean, m2 = stats.unbind(1)
+            total = running[:, 0] + count
+            delta = mean - running[:, 1]
+            running[:, 2] += m2 + delta * delta * (running[:, 0] * count / total)
+            running[:, 1] += delta * (count / total)
+            running[:, 0] = total
+            stats = running
+    if not apply:
+        return None
+    mean = stats[:, 1].float().to(x.dtype).float()  # the mean and 1 / std rounded to the activation dtype, as PyTorch stores them
+    rstd = (stats[:, 2] / stats[:, 0]).float().clamp_(min=0).add_(norm.eps).rsqrt_().to(x.dtype).float()
+    a = rstd.repeat_interleave(channels // groups).view(-1, channels) * norm.weight.float()
+    b = norm.bias.float() - a * mean.repeat_interleave(channels // groups).view(-1, channels)
+    a, b = a[:, :, None, None, None], b[:, :, None, None, None]
+    left, right, top, bottom, front, back = pad
+    if out is None:
+        out = x.new_empty(batch, channels, frames + front + back, height + top + bottom, width + left + right)
+    target = out[:, :, out_frame:out_frame + front + frames + back]
+    body = target[:, :, front:front + frames]
+    inner = body[:, :, :, top:top + height, left:left + width]
+    step = max(1, CAUSAL_NORM_BYTES // (4 * batch * frames * height * width))
+    for start in range(0, channels, step):
+        part = slice(start, start + step)
+        y = x[:, part].to(torch.float32, copy=True).mul_(a[:, part]).add_(b[:, part])
+        inner[:, part] = y
+        del y
+        if silu:
+            F.silu(inner[:, part], inplace=True)
+    if top:
+        body[:, :, :, :top, left:left + width] = body[:, :, :, top:top + 1, left:left + width]
+    if bottom:
+        body[:, :, :, top + height:, left:left + width] = body[:, :, :, top + height - 1:top + height, left:left + width]
+    if left:
+        body[..., :left] = body[..., left:left + 1]
+    if right:
+        body[..., left + width:] = body[..., left + width - 1:left + width]
+    if front:
+        target[:, :, :front] = body[:, :, :1]
+    if back:
+        target[:, :, front + frames:] = body[:, :, -1:]
+    return out
 
 
 def attention(q, k, v, chunk_bytes=64 << 20):

@@ -58,7 +58,7 @@ def _restore_q(kwargs, exception):
     pre_hook=_save_q,
     post_hook=_restore_q,
 )
-@triton.jit(do_not_specialize=['T', 'query_start_block', 'sink_start_block', 'sink_end_block', 'NT'], do_not_specialize_on_alignment=['T', 'query_start_block', 'sink_start_block', 'sink_end_block', 'NT'])
+@triton.jit(do_not_specialize=['T', 'query_start_block', 'sink_start_block', 'sink_end_block', 'NT', 'H'], do_not_specialize_on_alignment=['T', 'query_start_block', 'sink_start_block', 'sink_end_block', 'NT', 'H'])
 def _forward_tma(
     q_desc,
     k_desc,
@@ -73,7 +73,7 @@ def _forward_tma(
     sink_start_block,
     sink_end_block,
     HAS_SINK: tl.constexpr,
-    H: tl.constexpr,
+    H,
     D: tl.constexpr,
     NT,
     BV: tl.constexpr,
@@ -204,7 +204,7 @@ def _forward_tma(
     configs=[triton.Config({"BV": 128}, num_warps=4, num_stages=1)],
     key=["T"],
 )
-@triton.jit(do_not_specialize=['T', 'query_start_block', 'sink_start_block', 'sink_end_block', 'NT'], do_not_specialize_on_alignment=['T', 'query_start_block', 'sink_start_block', 'sink_end_block', 'NT'])
+@triton.jit(do_not_specialize=['T', 'query_start_block', 'sink_start_block', 'sink_end_block', 'NT', 'H'], do_not_specialize_on_alignment=['T', 'query_start_block', 'sink_start_block', 'sink_end_block', 'NT', 'H'])
 def _forward_ptr(
     q_ptr,
     k_ptr,
@@ -232,7 +232,7 @@ def _forward_ptr(
     sink_start_block,
     sink_end_block,
     HAS_SINK: tl.constexpr,
-    H: tl.constexpr,
+    H,
     D: tl.constexpr,
     NT,
     BV: tl.constexpr,

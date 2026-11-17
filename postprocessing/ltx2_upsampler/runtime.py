@@ -99,7 +99,7 @@ def refine_window_frames(padded_frames: int, window_frames: int) -> int:
 
 def refine_overlap_frames(window_overlap: int, chunk_frames: int) -> int:
     """Media Flow chunk overlap, also the number of refined frames carried to the next chunk: 8n+1, at most half the chunk."""
-    return max(0, min(int(window_overlap), (int(chunk_frames) - 1) // (2 * TEMPORAL_STRIDE) * TEMPORAL_STRIDE + 1, int(chunk_frames) - 1))
+    return max(0, min(int(window_overlap), (int(chunk_frames) - 2) // (2 * TEMPORAL_STRIDE) * TEMPORAL_STRIDE + 1, int(chunk_frames) - 1))
 
 
 def refine_fusion_overlap_latents(window_overlap: int, chunk_frames: int) -> int:

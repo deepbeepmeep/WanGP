@@ -53,10 +53,17 @@ class SpatialTilingConfig:
     Args:
         tile_size_in_pixels (int): Size of each tile in pixels. Must be at least 64 and divisible by 32.
         tile_overlap_in_pixels (int, optional): Overlap between tiles in pixels. Must be divisible by 32. Defaults to 0.
+        decode_tile_latents / encode_tile_latents (int, optional): latent pixels a tile of the streamed decoding / encoding may cover,
+            overlaps included (from the VAE Tiling VRAM budget). Defaults to the area derived from the tile size.
+        diffusion_tile_in_pixels (int, optional): the NAD diffusion decoder's tile (from its own costs and the budget; 0: whole frames).
+            Defaults to tile_size_in_pixels.
     """
 
     tile_size_in_pixels: int
     tile_overlap_in_pixels: int = 0
+    decode_tile_latents: int | None = None
+    encode_tile_latents: int | None = None
+    diffusion_tile_in_pixels: int | None = None
 
     def __post_init__(self) -> None:
         if self.tile_size_in_pixels < 64:

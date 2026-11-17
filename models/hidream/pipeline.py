@@ -1,6 +1,7 @@
 from shared.utils.phase_progress import set_phase_status
 import torch
 import einops
+from mmgp import runtime
 import numpy as np
 import tqdm
 from PIL import Image
@@ -372,7 +373,7 @@ def generate_image(
             return x_pred[0, sample['vinput_mask'][0]][:tgt_image_len].unsqueeze(0)
 
     def forward_samples(sample_list, z_in, t_pixeldit):
-        if not (joint_pass and len(sample_list) > 1):
+        if not (joint_pass and runtime.joint_pass_useful(model, sample_list[0]["input_ids"].shape[-1], model_config.text_config.hidden_size, len(sample_list))):
             return [forward_once(sample, z_in, t_pixeldit) for sample in sample_list]
 
         timestep = t_pixeldit.reshape(1).expand(z_in.shape[0]).to(device)

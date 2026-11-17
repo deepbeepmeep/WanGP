@@ -98,7 +98,9 @@ def vae_decode(
     split_size: int = 1,
     vae_per_channel_normalize=False,
     timestep=None,
+    to_ram=None,
 ) -> Tensor:
+    """to_ram (causal video VAEs): a function of each decoded piece on the GPU; the video is then returned in RAM in that form."""
     is_video_shaped = latents.dim() == 5
     batch_size = latents.shape[0]
 
@@ -121,7 +123,7 @@ def vae_decode(
         images = torch.cat(image_batch, dim=0)
     else:
         images = _run_decoder(
-            latents, vae, is_video, vae_per_channel_normalize, timestep
+            latents, vae, is_video, vae_per_channel_normalize, timestep, to_ram
         )
 
     if is_video_shaped and not isinstance(
@@ -137,6 +139,7 @@ def _run_decoder(
     is_video: bool,
     vae_per_channel_normalize=False,
     timestep=None,
+    to_ram=None,
 ) -> Tensor:
     if isinstance(vae, (VideoAutoencoder, CausalVideoAutoencoder)):
         *_, fl, hl, wl = latents.shape
@@ -145,6 +148,8 @@ def _run_decoder(
         vae_decode_kwargs = {}
         if timestep is not None:
             vae_decode_kwargs["timestep"] = timestep
+        if to_ram is not None:
+            vae_decode_kwargs["to_ram"] = to_ram
         image = vae.decode(
             un_normalize_latents(latents, vae, vae_per_channel_normalize),
             return_dict=False,

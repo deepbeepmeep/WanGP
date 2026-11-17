@@ -12,7 +12,7 @@ from shared.utils import files_locator as fl
 from shared.utils.gguf_mapping import has_standard_gguf_tensor_names, remap_state_dict_triplet
 from transformers import AutoConfig, AutoTokenizer, Qwen3ForCausalLM
 
-from .autoencoder_kl import AutoencoderKL
+from shared.image_vae.autoencoder_kl import AutoencoderKL
 from .pipeline_z_image import ZImagePipeline
 from .z_image_transformer2d import ZImageTransformer2DModel
 
@@ -276,8 +276,8 @@ class model_factory:
                 tiling = bool(VAE_tile_size[0])
                 tile_size = VAE_tile_size[1] if len(VAE_tile_size) > 1 else 0
             self.vae.use_tiling = tiling
-            self.vae.tile_latent_min_height = tile_size
-            self.vae.tile_latent_min_width = tile_size
+            if tiling and tile_size:  # tiles of that many pixels (the VAE Tiling budget), a quarter shared with the next
+                self.vae.tile_sample_min_size, self.vae.tile_latent_min_size = tile_size, tile_size // 8
 
         unified_solver = self.model_def.get("unified_solver", False)
         if unified_solver:

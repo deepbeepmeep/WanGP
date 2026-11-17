@@ -294,6 +294,13 @@ def cpu_compute_supported(tensor):
     return isinstance(tensor, WeightQBytesTensor) and tensor._data.dtype == torch.int8 and cpu_linear.supported(tensor)
 
 
+def column_input(module, rows, dtype, device, segments=None, residual=None):
+    """An INT8 linear's input taken by ranges of columns (quant_router.column_input: INT8 ConvRot or Quanto qint8), each range kept as
+    the INT8 kernels quantize it, half the 16-bit input; None for other modules and where the selected INT8 backend reads 16-bit rows."""
+    from shared.kernels import int8_backend
+    return int8_backend.column_input(module, rows, dtype, device, segments, residual)
+
+
 def detect(state_dict, verboseLevel=1, metadata=None):
     specs = _collect_specs(state_dict, metadata)
     if not specs:

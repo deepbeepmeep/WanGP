@@ -8,6 +8,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from .skills import USER_SKILL_PREFIX
+
 WORKFLOWS_URI = "wangp://guides/workflows"
 GUIDE_PATH = Path(__file__).parents[1] / "deepy" / "prime_guide.md"
 INDEXED_DOCUMENTS = {WORKFLOWS_URI: GUIDE_PATH}  # index resources whose searches and section reads cover the whole document
@@ -68,6 +70,14 @@ def plugin_skill_record(uri: str) -> dict[str, Any] | None:
     return {"server": "wangp", "uri": uri, "name": skill.name, "title": skill.name.replace("-", " ").title(), "description": skill.description, "mime_type": "text/markdown"}
 
 
+def user_skill_file_record(uri: str, resources) -> dict[str, Any] | None:
+    """The record of a file in a listed user skill (wangp://skills/user/<name>/<path>): its SKILL.md names it, listings do not."""
+    name, _, relative = uri.removeprefix(USER_SKILL_PREFIX).partition("/")
+    if not uri.startswith(USER_SKILL_PREFIX) or not relative or not any(resource["server"] == "wangp" and resource["uri"] == USER_SKILL_PREFIX + name for resource in resources):
+        return None
+    return {"server": "wangp", "uri": uri, "name": relative, "title": f"{name}/{relative}", "description": f"A file of the {name} skill.", "mime_type": "text/markdown" if relative.lower().endswith(".md") else "text/plain"}
+
+
 def resource_record(item, server="wangp"):
     return {"server": server, "uri": str(item.uri), "name": item.name, "title": item.title or item.name, "description": item.description or "", "mime_type": item.mimeType or ""}
 
@@ -95,7 +105,7 @@ async def query_resources(pages, resources, read_resource, arguments, *, servers
         page = pages.page(["resources", server, query], records, key="resources", limit=arguments.get("limit", 20), cursor=arguments.get("cursor"), metadata={"unavailable_servers": dict(unavailable_servers or {})})
     else:
         matches = [resource for resource in resources if resource["uri"] == uri and (not server or resource["server"] == server)]
-        if not matches and (not server or server == "wangp") and (section_record := indexed_section_record(uri) or plugin_skill_record(uri)) is not None:
+        if not matches and (not server or server == "wangp") and (section_record := indexed_section_record(uri) or plugin_skill_record(uri) or user_skill_file_record(uri, resources)) is not None:
             matches = [section_record]
         if not matches:
             prefix = uri.rsplit("/", 1)[0] + "/" if "/" in uri.removeprefix("wangp://") else ""
@@ -115,7 +125,7 @@ async def query_resources(pages, resources, read_resource, arguments, *, servers
             indexed = INDEXED_DOCUMENTS.get(uri) if server == "wangp" and (query or section) else None
             contents = [{"uri": uri, "mime_type": "text/markdown", "text": indexed.read_text(encoding="utf-8")}] if indexed else await read_resource(server, uri)
             metadata = {"server": server, "uri": uri}
-            if server == "wangp" and uri.startswith("wangp://skills/user/"):
+            if server == "wangp" and uri.startswith(USER_SKILL_PREFIX) and "/" not in uri.removeprefix(USER_SKILL_PREFIX):
                 metadata["revision"] = hashlib.sha256(contents[0]["text"].encode("utf-8")).hexdigest()
             if server == "wangp" and uri.startswith("wangp://docs/"):
                 metadata["applicability"] = matches[0]["description"]

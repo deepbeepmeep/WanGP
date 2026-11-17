@@ -24,7 +24,8 @@ from diffusers.models.activations import get_activation
 from diffusers.utils import logging
 from shared.utils.phase_progress import check_abort
 from shared.attention import pay_attention
-from shared.utils.conv_bands import conv_bands
+from shared.image_vae import blocks, tiling
+from shared.utils.conv_bands import BAND_BYTES, band_convs, band_rows, conv_bands, conv2d_weights, downsample_bands, kernel_layout
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -50,7 +51,7 @@ class QwenImage21AvgDown3D(nn.Module):
         pad = (0, 0, 0, 0, pad_t, 0)
         x = F.pad(x, pad)
         B, C, T, H, W = x.shape
-        x = x.view(B, C, T // self.factor_t, self.factor_t, H // self.factor_s, self.factor_s, W // self.factor_s, self.factor_s)
+        x = x.reshape(B, C, T // self.factor_t, self.factor_t, H // self.factor_s, self.factor_s, W // self.factor_s, self.factor_s)  # channels-last or not
         x = x.permute(0, 1, 3, 5, 7, 2, 4, 6).contiguous()
         x = x.view(B, C * self.factor, T // self.factor_t, H // self.factor_s, W // self.factor_s)
         x = x.view(B, self.out_channels, self.group_size, T // self.factor_t, H // self.factor_s, W // self.factor_s)
@@ -71,12 +72,22 @@ class QwenImage21DupUp3D(nn.Module):
 
     def forward(self, x: torch.Tensor, first_chunk=False) -> torch.Tensor:
         x = x.repeat_interleave(self.repeats, dim=1)
-        x = x.view(x.size(0), self.out_channels, self.factor_t, self.factor_s, self.factor_s, x.size(2), x.size(3), x.size(4))
+        x = x.reshape(x.size(0), self.out_channels, self.factor_t, self.factor_s, self.factor_s, x.size(2), x.size(3), x.size(4))  # channels-last or not
         x = x.permute(0, 1, 5, 2, 6, 3, 7, 4).contiguous()
         x = x.view(x.size(0), self.out_channels, x.size(2) * self.factor_t, x.size(4) * self.factor_s, x.size(6) * self.factor_s)
         if first_chunk:
             x = x[:, :, self.factor_t - 1:, :, :]
         return x
+
+    def add_(self, x, source, first_chunk=False):
+        """x + self(source, first_chunk), added into x (the caller's own tensor) for one frame of a spatial x2: no duplicated or rearranged
+        copy of source, no new sum."""
+        if x.numel() * x.element_size() <= BAND_BYTES:  # small: fewer operations than position by position
+            return x.add_(self(source, first_chunk=first_chunk))
+        if self.factor_s == 2 and source.shape[2] == 1 and (self.factor_t == 1 or first_chunk):
+            blocks.add_channel_shortcut_(x.squeeze(2), source.squeeze(2), self.repeats, 4 * self.factor_t, 4 * (self.factor_t - 1))
+            return x
+        return x + self(source, first_chunk=first_chunk)
 
 class QwenImage21CausalConv3d(nn.Conv2d):
 
@@ -85,14 +96,23 @@ class QwenImage21CausalConv3d(nn.Conv2d):
         self._padding = (self.padding[1], self.padding[1], self.padding[0], self.padding[0])
         self.padding = (0, 0)
 
-    def forward(self, x, cache_x=None):
+    def forward(self, x, cache_x=None, window=None, out=None, out_row=0, add=False):
+        """x: one frame (batch, channels, 1, height, width), or rows of it (batch, channels, rows, width) with the same result layout.
+        3x3 convolutions also take window = (first, count), the only output rows wanted, and out, written into its rows from out_row
+        (added to them with add) instead of a new tensor."""
         check_abort()
         padding = list(self._padding)
         if cache_x is not None:
             raise ValueError("This convolution is the image specialization of Wan's causal 3D one: it folds the single frame away and has no temporal context to prepend, so it cannot take a feature cache.")
+        frame = x.dim() == 5
+        rows = x.squeeze(2) if frame else x
         # zero padding by the convolution itself (no padded copy), by bands of rows (no full-image cuDNN workspace)
         conv = functools.partial(F.conv2d, weight=self.weight, bias=self.bias, stride=self.stride, padding=(padding[2], padding[0]))
-        return conv_bands(x.squeeze(2), conv).unsqueeze(2)
+        if self.kernel_size == (3, 3) and self.stride == (1, 1) and padding[0] == padding[2] == 1:
+            y = conv2d_weights(rows, self.weight, self.bias, conv, window, out, out_row, add)  # the row-window kernel where it is the faster one
+        else:
+            y = conv_bands(rows, conv)
+        return y.unsqueeze(2) if frame else y
 
 class QwenImage21RMS_norm(nn.Module):
 
@@ -105,7 +125,22 @@ class QwenImage21RMS_norm(nn.Module):
         self.gamma = nn.Parameter(torch.ones(shape, device="cpu"))
         self.bias = nn.Parameter(torch.zeros(shape, device="cpu")) if bias else 0.0
 
-    def forward(self, x):
+    def forward(self, x, rows=False, out=None):
+        """rows: x is a band of rows (batch, channels, rows, width) of one frame and the result is silu(norm(x)), in a new tensor or
+        written into out (x itself: in place). The norm is per pixel: the arithmetic below on the band, its float32 temporaries
+        included, instead of on the whole frame."""
+        if rows:
+            # x.float().norm() without the float32 copy, then the float32 quotient rounded once, straight into out: the same values in
+            # fewer operations (a band is bound by how fast they are issued). PyTorch sums a pixel's channels in one order whatever
+            # the number of rows when x is channels-last; for planes the order can follow the shape (1152 channels at 128 x 128): such
+            # a band's norms then round as PyTorch rounds that band, not the frame.
+            if out is None:
+                out = torch.empty(x.shape, dtype=x.dtype, device=x.device, memory_format=torch.channels_last if x.stride(1) == 1 else torch.contiguous_format)
+            torch.div(x, torch.linalg.vector_norm(x, 2.0, dim=1, keepdim=True, dtype=torch.float32 if x.dtype in (torch.float16, torch.bfloat16) else None).clamp_min_(1e-12), out=out)
+            out.mul_(self.scale).mul_(self.gamma.view(-1, 1, 1))
+            if not isinstance(self.bias, float):  # (without a bias it is the number 0.0)
+                out.add_(self.bias.view(-1, 1, 1))
+            return F.silu(out, inplace=True)
         dim = 1 if self.channel_first else -1
         if x.dtype in (torch.float16, torch.bfloat16):
             # F.normalize(x.float()).to(x.dtype) with the same float32 norm, then the division by chunks of rows: no full-size float32 result
@@ -172,6 +207,8 @@ class QwenImage21Resample(nn.Module):
         x = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
         if self.mode in ('upsample2d', 'upsample3d'):  # nearest x2 + conv by bands of rows: no full-size upsampled input
             x = conv_bands(x, self.resample[1], upsample=True, mode='nearest-exact')
+        elif self.mode in ('downsample2d', 'downsample3d'):  # the padded stride-2 convolution by bands of rows: no padded copy of the input
+            x = downsample_bands(x, self.resample[1])
         else:
             x = self.resample(x)
         x = x.view(b, t, x.size(1), x.size(2), x.size(3)).permute(0, 2, 1, 3, 4)
@@ -202,9 +239,20 @@ class QwenImage21ResidualBlock(nn.Module):
         self.conv2 = QwenImage21CausalConv3d(out_dim, out_dim, 3, padding=1)
         self.conv_shortcut = QwenImage21CausalConv3d(in_dim, out_dim, 1) if in_dim != out_dim else nn.Identity()
 
+    def _ops(self):
+        return (functools.partial(self.norm1, rows=True), self.conv1, functools.partial(self.norm2, rows=True), self.conv2,
+                None if isinstance(self.conv_shortcut, nn.Identity) else self.conv_shortcut)
+
+    def rows(self, x):
+        """This block on the rows of one frame, x a tensor (batch, channels, height, width) or blocks.Rows: its output as rows
+        computed when read."""
+        return blocks.ResnetRows(x, *self._ops())
+
     def forward(self, x, feat_cache=None, feat_idx=None):
         if feat_idx is None:
             feat_idx = [0]
+        if feat_cache is None and x.shape[2] == 1:  # a picture: by bands of rows, with only x and the result at full size
+            return blocks.pixel_resnet_block(x.squeeze(2), *self._ops()).unsqueeze(2)
         h = self.conv_shortcut(x)
         x = self.norm1(x)
         x = self.nonlinearity(x)
@@ -312,8 +360,16 @@ class QwenImage21ResidualDownBlock(nn.Module):
             self.downsampler = None
 
     def forward(self, x, feat_cache=None, feat_idx=None):
+        """x as blocks.Rows (a picture's level computed by rows when read; this level must downsample): its blocks and its
+        downsampling are rows in turn, and none of their activations exists whole."""
         if feat_idx is None:
             feat_idx = [0]
+        if isinstance(x, blocks.Rows):
+            rows = x
+            for resnet in self.resnets:
+                rows = resnet.rows(rows)
+            x.retain = 2 * len(self.resnets) + 2  # the shortcut reads x again, that many rows behind the main path at most
+            return blocks.DownsampledRows(rows, self.downsampler.resample[1], x, lambda source: self.avg_shortcut(source.unsqueeze(2)).squeeze(2))
         x_copy = x
         for resnet in self.resnets:
             x = resnet(x, feat_cache=feat_cache, feat_idx=feat_idx)
@@ -322,6 +378,20 @@ class QwenImage21ResidualDownBlock(nn.Module):
         return x + self.avg_shortcut(x_copy)
 
 class QwenImage21Encoder3d(nn.Module):
+
+    def _chain(self, x):
+        """(number of first levels computed as a chain of rows, rows per band of the input) for the picture x: the levels that
+        downsample, from the first on, while their activation takes more than blocks.CHAIN_MIN_BANDS bands and their share of a band
+        keeps the size from which the row-window convolution is used (blocks.chain_levels' rule)."""
+        n, _, _, height, width = x.shape
+        count = band_rows(height, n * self.conv_in.out_channels * width * x.element_size())
+        chain, channels = 0, self.conv_in.out_channels
+        for block in self.down_blocks:
+            if not (isinstance(block, QwenImage21ResidualDownBlock) and block.downsampler is not None and height % 2 == 0 and width % 2 == 0
+                    and n * channels * height * width * x.element_size() > blocks.CHAIN_MIN_BANDS * BAND_BYTES and (count >> chain) * width >= blocks.CHAIN_MIN_PIXELS):
+                break
+            chain, channels, height, width = chain + 1, block.downsampler.dim, height // 2, width // 2
+        return chain, count
 
     def __init__(self, in_channels: int=3, dim=128, z_dim=4, dim_mult=[1, 2, 4, 4], num_res_blocks=2, attn_scales=[], temperal_downsample=[True, True, False], dropout=0.0, is_residual: bool=False):
         super().__init__()
@@ -357,6 +427,8 @@ class QwenImage21Encoder3d(nn.Module):
     def forward(self, x, feat_cache=None, feat_idx=None):
         if feat_idx is None:
             feat_idx = [0]
+        x = kernel_layout(x)
+        chain, count = self._chain(x) if feat_cache is None and x.shape[2] == 1 else (0, 0)
         if feat_cache is not None:
             idx = feat_idx[0]
             cache_x = x[:, :, -CACHE_T:, :, :].clone()
@@ -365,9 +437,15 @@ class QwenImage21Encoder3d(nn.Module):
             x = self.conv_in(x, feat_cache[idx])
             feat_cache[idx] = cache_x
             feat_idx[0] += 1
+        elif chain:  # a large picture: the first convolution and the large levels as rows, whole from the first small level on
+            rows = blocks.ConvRows(x.squeeze(2), self.conv_in)
+            for layer in self.down_blocks[:chain]:
+                rows = layer(rows)
+            x = blocks.collect(rows, max(1, count >> chain)).unsqueeze(2)
+            del rows
         else:
             x = self.conv_in(x)
-        for layer in self.down_blocks:
+        for layer in self.down_blocks[chain:]:
             if feat_cache is not None:
                 x = layer(x, feat_cache=feat_cache, feat_idx=feat_idx)
             else:
@@ -385,7 +463,7 @@ class QwenImage21Encoder3d(nn.Module):
             feat_idx[0] += 1
         else:
             x = self.conv_out(x)
-        return x
+        return x.contiguous()  # the callers' layout, whatever the convolutions ran in
 
 class QwenImage21ResidualUpBlock(nn.Module):
 
@@ -410,22 +488,46 @@ class QwenImage21ResidualUpBlock(nn.Module):
             self.upsampler = None
         self.gradient_checkpointing = False
 
-    def forward(self, x, feat_cache=None, feat_idx=None, first_chunk=False):
+    def chainable(self, first_chunk):
+        """Whether this level's output can be rows computed when read (blocks.Rows): one frame of a spatial x2, or no upsampling."""
+        shortcut = self.avg_shortcut
+        return self.upsampler is None or shortcut.factor_s == 2 and (shortcut.factor_t == 1 or first_chunk)
+
+    def _upsampled_rows(self, x, source):
+        shortcut = self.avg_shortcut
+        return blocks.UpsampledRows(x, self.upsampler.resample[1], 'nearest-exact', source, shortcut.repeats, 4 * shortcut.factor_t, 4 * (shortcut.factor_t - 1))
+
+    def forward(self, x_list, feat_cache=None, feat_idx=None, first_chunk=False, lazy=False):
+        """x_list: [input], emptied so that the caller holds no reference to it (released once the first block has read it).
+        lazy (a picture, a chainable level): the upsampling and its shortcut are returned as rows to compute when read
+        (blocks.Rows) instead of the x2 activation. A level that receives such rows continues the chain: its blocks and its own
+        upsampling are rows in turn, and none of their activations exists whole."""
         if feat_idx is None:
             feat_idx = [0]
-        x_copy = x
+        x = x_list.pop()
+        if isinstance(x, blocks.Rows):
+            rows = x
+            for resnet in self.resnets:
+                rows = resnet.rows(rows)
+            if self.upsampler is None:
+                return rows
+            x.retain = 2 * len(self.resnets) + 2  # the shortcut reads x again, that many rows behind the main path at most
+            return self._upsampled_rows(rows, x)
+        x_copy = x if self.avg_shortcut is not None else None
         for resnet in self.resnets:
             if feat_cache is not None:
                 x = resnet(x, feat_cache=feat_cache, feat_idx=feat_idx)
             else:
                 x = resnet(x)
         if self.upsampler is not None:
+            if lazy:
+                return self._upsampled_rows(x.squeeze(2), x_copy.squeeze(2))
             if feat_cache is not None:
                 x = self.upsampler(x, feat_cache=feat_cache, feat_idx=feat_idx)
             else:
                 x = self.upsampler(x)
         if self.avg_shortcut is not None:
-            x = x + self.avg_shortcut(x_copy, first_chunk=first_chunk)
+            x = self.avg_shortcut.add_(x, x_copy, first_chunk)  # into the upsampler's output
         return x
 
 class QwenImage21UpBlock(nn.Module):
@@ -445,9 +547,11 @@ class QwenImage21UpBlock(nn.Module):
             self.upsamplers = nn.ModuleList([QwenImage21Resample(out_dim, mode=upsample_mode)])
         self.gradient_checkpointing = False
 
-    def forward(self, x, feat_cache=None, feat_idx=None, first_chunk=None):
+    def forward(self, x_list, feat_cache=None, feat_idx=None, first_chunk=None):
+        """x_list: [input], emptied so that the caller holds no reference to it."""
         if feat_idx is None:
             feat_idx = [0]
+        x = x_list.pop()
         for resnet in self.resnets:
             if feat_cache is not None:
                 x = resnet(x, feat_cache=feat_cache, feat_idx=feat_idx)
@@ -493,7 +597,23 @@ class QwenImage21Decoder3d(nn.Module):
         self.conv_out = QwenImage21CausalConv3d(out_dim, out_channels, 3, padding=1)
         self.gradient_checkpointing = False
 
-    def forward(self, x, feat_cache=None, feat_idx=None, first_chunk=False):
+    def _chain(self, x, first_chunk):
+        """(first level computed as a chain of rows, rows per band of the output) for the picture x entering the levels; no level:
+        len(up_blocks) (blocks.chain_levels)."""
+        n, _, _, height, width = x.shape
+        levels, size, widest = [], None, 0
+        for index, block in enumerate(self.up_blocks):  # a level and those after it must be chainable, and so the one before it
+            levels.append(size if all(isinstance(b, QwenImage21ResidualUpBlock) and b.chainable(first_chunk) for b in self.up_blocks[max(index - 1, 0):]) else None)
+            if getattr(block, "upsampler", None) is not None:
+                height, width, widest = 2 * height, 2 * width, block.out_dim
+                size = (height, width, widest)
+            else:
+                size = None
+        return blocks.chain_levels(levels, (height, width, widest), n, x.element_size())
+
+    def forward(self, x, feat_cache=None, feat_idx=None, first_chunk=False, sink=None):
+        """sink (a picture): called with (first row, rows (batch, channels, 1, rows, width)) for the output, band after band down the
+        image where the last levels run as a chain of rows, else once with the whole output; nothing is returned then."""
         if feat_idx is None:
             feat_idx = [0]
         if feat_cache is not None:
@@ -507,8 +627,22 @@ class QwenImage21Decoder3d(nn.Module):
         else:
             x = self.conv_in(x)
         x = self.mid_block(x, feat_cache=feat_cache, feat_idx=feat_idx)
-        for up_block in self.up_blocks:
-            x = up_block(x, feat_cache=feat_cache, feat_idx=feat_idx, first_chunk=first_chunk)
+        picture = feat_cache is None and x.shape[2] == 1
+        chain, count = self._chain(x, first_chunk) if picture else (len(self.up_blocks), 0)
+        for level, up_block in enumerate(self.up_blocks):
+            x_list, x = [x], None
+            x = up_block(x_list, feat_cache=feat_cache, feat_idx=feat_idx, first_chunk=first_chunk, **({"lazy": True} if level + 1 == chain else {}))
+        if isinstance(x, blocks.Rows):  # the large levels as rows: the output convolution reads them band after band
+            rows = blocks.NormConvRows(x, functools.partial(self.norm_out, rows=True), self.conv_out)
+            x = None
+            if sink is None:
+                return blocks.collect(rows, count).unsqueeze(2)
+            for first, _, band in blocks.bands(rows, count):
+                sink(first, band.unsqueeze(2))
+            return None
+        if picture:  # the output convolution by bands of rows, no normalized copy
+            x = blocks.pixel_norm_conv(x.squeeze(2), functools.partial(self.norm_out, rows=True), self.conv_out).unsqueeze(2)
+            return x if sink is None else sink(0, x)
         x = self.norm_out(x)
         x = self.nonlinearity(x)
         if feat_cache is not None:
@@ -543,23 +677,27 @@ def _unpatchify(x, patch_size):
         raise ValueError(f'Invalid input shape: {x.shape}')
     batch_size, c_patches, frames, height, width = x.shape
     channels = c_patches // (patch_size * patch_size)
-    x = x.view(batch_size, channels, patch_size, patch_size, frames, height, width)
+    x = x.reshape(batch_size, channels, patch_size, patch_size, frames, height, width)  # channels-last or not
     x = x.permute(0, 1, 4, 5, 3, 6, 2).contiguous()
     x = x.view(batch_size, channels, frames, height * patch_size, width * patch_size)
     return x
 
 class AutoencoderKLQwenImage21(ModelMixin, ConfigMixin, AutoencoderMixin):
 
+    # measured VRAM (shared.image_vae.tiling): one frame, BF16, the larger of the routes with and without the Triton convolutions, + 10 %
+    COSTS = {"weights": 0.63, "decode": [(0.065, 0.2), (0.26, 0.45), (1.05, 0.8), (4.2, 1.45)], "encode": [(1.05, 0.8), (4.2, 1.15)]}
+
     @staticmethod
-    def get_VAE_tile_size(vae_config, device_mem_capacity, mixed_precision):
-        if vae_config == 0:
-            vae_config = 1 if device_mem_capacity >= 16000 else 2 if device_mem_capacity >= 8000 else 3
-        return True, {1: 1024, 2: 512, 3: 256}[vae_config]
+    def get_VAE_tile_size(vae_config, device_mem_capacity, mixed_precision, output_height=None, output_width=None):
+        """(tiling, tile size in pixels): the largest tile within the VAE Tiling setting's share of the VRAM, no tiling when the whole
+        picture fits (tiling.choose_tile)."""
+        tile = tiling.choose_tile(vae_config, device_mem_capacity, AutoencoderKLQwenImage21.COSTS, output_height, output_width, (2048, 1024, 512, 256))
+        return tile > 0, tile or 256
 
     def configure_tiling(self, tile_setting, width, height, batch_size=1, reference_pixels=0):
         if tile_setting is None or (isinstance(tile_setting, int) and not isinstance(tile_setting, bool)):
             capacity = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / 1048576 if torch.cuda.is_available() else 0
-            enabled, size = self.get_VAE_tile_size(tile_setting or 0, capacity, False)
+            enabled, size = self.get_VAE_tile_size(tile_setting or 0, capacity, False, height, width)
         elif isinstance(tile_setting, bool):
             enabled, size = tile_setting, 256
         else:
@@ -588,6 +726,7 @@ class AutoencoderKLQwenImage21(ModelMixin, ConfigMixin, AutoencoderMixin):
         for module in self.modules():  # every activation follows a normalization (a fresh tensor): in place, without a second full-size tensor
             if isinstance(module, nn.SiLU):
                 module.inplace = True
+        band_convs(self)  # the upsampling convolutions: by rows, or the row-window kernel
         self.spatial_compression_ratio = scale_factor_spatial
         self.use_slicing = False
         self.use_tiling = False
@@ -833,6 +972,20 @@ class AutoencoderKLQwenImage21(ModelMixin, ConfigMixin, AutoencoderMixin):
                         self.clear_cache()
                         tile_latents = source[batch_index:batch_index + 1, :, :, y:y + tile_h, x:x + tile_w].to(device=device)
                         tile = self.post_quant_conv(tile_latents)
+                        if not tiled:
+                            # no blending: the decoder hands its rows over as they are decoded and they become bytes at once, a quarter of
+                            # the output's 16-bit size (16 MB at 2048 x 2048), which reach RAM in one transfer: a copy per band waits for
+                            # the GPU each time (13 % slower), and asynchronous ones cost more to set up than one picture's bands gain
+                            pixels = torch.empty((1, output_channels, 1, full_height, full_width), dtype=torch.uint8, device=device)
+
+                            def sink(first, rows):
+                                rows = _unpatchify(rows, patch_size=patch) if patch != 1 else rows
+                                pixels[:, :, :, first * patch:first * patch + rows.shape[3]].copy_(rows[:, :output_channels].float().add_(1).mul_(127.5).clamp_(0, 255))
+
+                            self.decoder(tile, feat_cache=None, feat_idx=self._conv_idx, first_chunk=True, sink=sink)
+                            output[batch_index:batch_index + 1].copy_(pixels)
+                            del tile, tile_latents, pixels
+                            continue
                         tile = self.decoder(tile, feat_cache=None, feat_idx=self._conv_idx, first_chunk=True)
                         del tile_latents
                         if row_index:

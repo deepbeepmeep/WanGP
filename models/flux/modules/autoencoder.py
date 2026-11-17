@@ -2,7 +2,8 @@ from shared.utils.phase_progress import vae_decoding_progress, set_phase_status
 from dataclasses import dataclass
 
 import torch
-from shared.utils.conv_bands import band_convs, conv_bands
+from shared.image_vae import blocks, tiles, tiling
+from shared.utils.conv_bands import band_convs, downsample_bands
 from shared.kernels import vae_ops
 from einops import rearrange
 from torch import Tensor, nn
@@ -19,14 +20,6 @@ class AutoEncoderParams:
     z_channels: int
     scale_factor: float
     shift_factor: float
-
-
-def norm_swish(norm: nn.GroupNorm, x: Tensor) -> Tensor:
-    """swish(norm(x)) for a convolution. Under autocast, GroupNorm computes in float32 and the convolution casts its input to the autocast dtype:
-    the shared operation rounds once to that dtype without float32 tensors in full (vae_ops.group_norm_silu)."""
-    if not torch.is_autocast_enabled(x.device.type):
-        return vae_ops.silu_(norm(x))
-    return vae_ops.group_norm_silu(x, norm, torch.get_autocast_dtype(x.device.type))
 
 
 class AttnBlock(nn.Module):
@@ -73,16 +66,10 @@ class ResnetBlock(nn.Module):
         if self.in_channels != self.out_channels:
             self.nin_shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
 
-    def forward(self, x_list):
-        """x_list: [input], emptied so that the input can be released once read (its shortcut projection is taken first)."""
-        x = x_list.pop()
-        h = norm_swish(self.norm1, x)
-        if self.in_channels != self.out_channels:
-            x = self.nin_shortcut(x)
-        h = self.conv1(h)
-        h = norm_swish(self.norm2, h)
-        h = self.conv2(h)
-        return x + h
+    def forward(self, x_list, scratch=None):
+        """Consume [input]; scratch: see shared.image_vae.blocks.resnet_block."""
+        shortcut = self.nin_shortcut if self.in_channels != self.out_channels else None
+        return blocks.resnet_block(x_list, self.norm1, self.conv1, self.norm2, self.conv2, shortcut, scratch)
 
 
 class Downsample(nn.Module):
@@ -92,10 +79,7 @@ class Downsample(nn.Module):
         self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=2, padding=0)
 
     def forward(self, x: Tensor):
-        pad = (0, 1, 0, 1)
-        x = nn.functional.pad(x, pad, mode="constant", value=0)
-        x = self.conv(x)
-        return x
+        return downsample_bands(x, self.conv)
 
 
 class Upsample(nn.Module):
@@ -103,8 +87,8 @@ class Upsample(nn.Module):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1)
 
-    def forward(self, x: Tensor):
-        return conv_bands(x, self.conv, upsample=True)  # by bands of rows: no full-size upsampled input
+    def forward(self, x_list):
+        return blocks.upsample(x_list, self.conv)
 
 
 class Encoder(nn.Module):
@@ -159,6 +143,8 @@ class Encoder(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         # downsampling (only the current activation is kept: each block releases its input once read)
+        if torch.is_autocast_enabled(x.device.type) and x.is_cuda:
+            x = x.contiguous(memory_format=torch.channels_last)
         h = self.conv_in(x)
         for i_level in range(self.num_resolutions):
             for i_block in range(self.num_res_blocks):
@@ -174,8 +160,8 @@ class Encoder(nn.Module):
         h = self.mid.attn_1(h)
         h = self.mid.block_2([h])
         # end
-        h = norm_swish(self.norm_out, h)
-        h = self.conv_out(h)
+        h_list, h = [h], None
+        h = blocks.norm_conv(h_list, self.norm_out, self.conv_out)
         return h
 
 
@@ -248,18 +234,22 @@ class Decoder(nn.Module):
         # cast to proper dtype
         h = h.to(upscale_dtype)
         # upsampling
+        scratch = []  # the hidden half of a channel-reducing block's storage, reused by the following equal-width blocks
         for i_level in reversed(range(self.num_resolutions)):
             for i_block in range(self.num_res_blocks + 1):
                 block_input, h = [h], None  # handoff: the block releases its input once read
-                h = self.up[i_level].block[i_block](block_input)
+                h = self.up[i_level].block[i_block](block_input, scratch=scratch)
                 if len(self.up[i_level].attn) > 0:
                     h = self.up[i_level].attn[i_block](h)
             if i_level != 0:
-                h = self.up[i_level].upsample(h)
+                scratch.clear()
+                h_list, h = [h], None
+                h = self.up[i_level].upsample(h_list)
 
         # end
-        h = norm_swish(self.norm_out, h)
-        h = self.conv_out(h)
+        scratch.clear()
+        h_list, h = [h], None
+        h = blocks.norm_conv(h_list, self.norm_out, self.conv_out)
         return h
 
 
@@ -305,18 +295,27 @@ class AutoEncoder(nn.Module):
         self.scale_factor = params.scale_factor
         self.shift_factor = params.shift_factor
 
-    def get_VAE_tile_size(*args, **kwargs):
-        return []
+    # measured VRAM (shared.image_vae.tiling): BF16 autocast, the larger of the routes with and without the Triton convolutions, + 10 %
+    COSTS = {"weights": 0.16, "decode": [(1.05, 0.75), (4.2, 2.8)]}
+
+    @staticmethod
+    def get_VAE_tile_size(vae_config, device_mem_capacity, mixed_precision, output_height=None, output_width=None):
+        """The decoding tile size in pixels (0: no tiling): the largest within the VAE Tiling setting's VRAM budget, no tiling when
+        the whole picture fits (tiling.choose_tile). Reference pictures are encoded whole."""
+        # (tiles of a GroupNorm VAE each take their own statistics: 4 levels off the untiled picture on average at 2048 and 1024, more below)
+        return tiling.choose_tile(vae_config, device_mem_capacity, AutoEncoder.COSTS, output_height, output_width, (2048, 1024))
+
     def encode(self, x: Tensor) -> Tensor:
         set_phase_status("VAE Encoding")
         z = self.reg(self.encoder(x))
         z = self.scale_factor * (z - self.shift_factor)
         return z
 
-    def decode(self, z: Tensor) -> Tensor:
-        with vae_decoding_progress(1, self.decoder):
+    def decode(self, z: Tensor, tile_size=0) -> Tensor:
+        """tile_size (pixels, 0: none): the picture by blended tiles of that size when it is larger (shared.image_vae.tiles)."""
+        with vae_decoding_progress(tiles.count(*z.shape[-2:], tile_size // 8), self.decoder):
             z = z / self.scale_factor + self.shift_factor
-            return self.decoder(z)
+            return tiles.tiled(self.decoder, z, tile_size // 8, 8)
 
     def forward(self, x: Tensor) -> Tensor:
         return self.decode(self.encode(x))

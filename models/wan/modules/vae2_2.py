@@ -5,12 +5,15 @@ import logging
 import torch
 from shared.utils.phase_progress import vae_encoding_progress, PhaseProgress, check_abort, set_phase_status
 from shared.cuda_memory import mmgp_vram_allocator
-from shared.kernels import vae_ops
+from shared.kernels import kernel_policy, vae_ops
+from shared.image_vae import tiling
 import torch.cuda.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from .vae import _blend_h_edge_, _blend_v_edge_, _vae_float_to_cpu_uint8, _kernels, _use_fast, _causal_input, _residual_fast, _resample_fast, _run_part, _exact_segments, _exact_calls, _exact_decode, _exact_encode, _attention_fast, ExactStream
+from mmgp import transfer
+from shared.image_vae.output import blend_h_edge_ as _blend_h_edge_, blend_v_edge_ as _blend_v_edge_, float_to_cpu_uint8 as _vae_float_to_cpu_uint8, float_to_uint8 as _vae_float_to_uint8
+from .vae import _kernels, _use_fast, _causal_input, _residual_fast, _resample_fast, _run_part, _exact_segments, _exact_calls, _exact_decode, _exact_encode, _attention_fast, ExactStream
 
 __all__ = [
     "Wan2_2_VAE",
@@ -1110,14 +1113,21 @@ class WanVAE_(nn.Module):
                         (r0, r1), (c0, c1) = ((lo * 2, min(hi * 2, limit)) for (lo, hi), limit in zip(region, (target_height, target_width)))
                         b = min(offset + y.shape[2], target_frames)
                         if offset < b and r0 < r1 and c0 < c1:
-                            decoded[:, :, offset:b, r0:r1, c0:c1] = _vae_float_to_cpu_uint8(unpatchify(y[:, :, :b - offset].contiguous(), patch_size=2)[..., :r1 - r0, :c1 - c0])
-                    _exact_decode(self, z, segments, any_end_frame, sink)
+                            writer.write(decoded[:, :, offset:b, r0:r1, c0:c1], _vae_float_to_uint8(unpatchify(y[:, :, :b - offset].contiguous(), patch_size=2)[..., :r1 - r0, :c1 - c0]))
+                    with transfer.RamWriter() as writer:  # each tile's bytes reach RAM while the next one is decoded
+                        _exact_decode(self, z, segments, any_end_frame, sink)
                     return decoded
-                if tile_size <= 0:
+                if tile_size <= 0:  # each chunk of frames goes to RAM as it is decoded: no clip-long output in VRAM
                     z = latent_source.to(device=device, dtype=dtype)
-                    frames = self.decode(z, scale, any_end_frame=any_end_frame)[:, :, :target_frames, :target_height, :target_width]
-                    decoded = _vae_float_to_cpu_uint8(frames)
-                    del z, frames
+                    if scale is not None:
+                        z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(1, self.z_dim, 1, 1, 1) if isinstance(scale[0], torch.Tensor) else z / scale[1] + scale[0]
+                    decoded = torch.empty((latent_source.shape[0], 3, target_frames, target_height, target_width), dtype=torch.uint8, device="cpu")
+                    with transfer.RamWriter() as writer:  # (without waiting for the GPU: the next chunk is decoded meanwhile)
+                        for start, frames in self.decode_tile_chunks(z, any_end_frame=any_end_frame):
+                            b = min(start + frames.shape[2], target_frames)
+                            if start < b:
+                                writer.write(decoded[:, :, start:b], _vae_float_to_uint8(frames[:, :, :b - start, :target_height, :target_width]))
+                    del z
                     return decoded
 
                 tile_sample_min_size = tile_size
@@ -1382,42 +1392,33 @@ class Wan2_2_VAE:
         self.model._model_dtype = dtype
 
 
+    # measured VRAM (shared.image_vae.tiling), FP16, + 10 %. With the Triton kernels ("fast" kernel precision: regions with halos, the
+    # untiled result): per megapixel of the largest region, halos included, for regions that fill their tile (7.1 to 7.7 GiB per
+    # megapixel to decode, 3.9 to 8.1 to encode; whole frames need a little less). On the PyTorch path: tiles of 256 and 512 pixels,
+    # then whole frames of 832x480, 1280x704 and 1024x1024; it encodes frames whole whatever the tile: its encode points are those of
+    # whole frames
+    COSTS = {True: {"weights": 1.31, "decode": [(0.065, 0.55), (0.262, 2.1), (0.59, 4.6), (0.9, 7.0), (1.05, 8.2)], "encode": [(0.065, 0.57), (0.147, 0.87), (0.262, 1.33), (0.59, 2.5), (0.9, 3.9)]},
+             False: {"weights": 1.31, "decode": [(0.065, 0.8), (0.26, 3.2), (0.4, 4.9), (0.9, 10.9), (1.05, 12.8)], "encode": [(0.065, 1.8), (0.4, 1.8), (0.9, 4.4), (1.05, 4.7)]}}
+
     @staticmethod
-    def get_VAE_tile_size(vae_config, device_mem_capacity, mixed_precision):
-        if mmgp_vram_allocator():  # no allocator fragmentation to guard against: Default and Low VRAM levels
-            return 256 if vae_config == 3 or device_mem_capacity < 8000 else 512
-        # VAE Tiling
-        if vae_config == 0:
-            if mixed_precision:
-                device_mem_capacity = device_mem_capacity / 2
-            if device_mem_capacity >= 24000:
-                use_vae_config = 1            
-            elif device_mem_capacity >= 8000:
-                use_vae_config = 2
-            else:          
-                use_vae_config = 3
-        else:
-            use_vae_config = vae_config
-
-        if use_vae_config == 1:
-            VAE_tile_size = 0  
-        elif use_vae_config == 2:
-            VAE_tile_size = 256  
-        else: 
-            VAE_tile_size = 128  
-
-        return  VAE_tile_size
+    def get_VAE_tile_size(vae_config, device_mem_capacity, mixed_precision, output_height=None, output_width=None):
+        """The tile size in pixels (0: no tiling, whenever the whole frames fit the VAE Tiling setting's VRAM budget), from this VAE's
+        measured costs with the kernels in use. With the Triton kernels a tile is a budget of tile x tile pixels per region, of any
+        size (tiling.largest_tile: what the budget allows, in the fewest regions); else the largest preset that fits."""
+        fast = _kernels is not None and kernel_policy.allow_approximate() and torch.cuda.is_available() and _kernels.supported(torch.device("cuda", torch.cuda.current_device()))
+        if fast:
+            return tiling.largest_tile(vae_config, device_mem_capacity, Wan2_2_VAE.COSTS[True], output_height, output_width, minimum=256)  # (below: many regions, 2 to 3 times the time)
+        return tiling.choose_tile(vae_config, device_mem_capacity, Wan2_2_VAE.COSTS[False], output_height, output_width, (1024, 512, 256, 128))
 
     def encode(self, videos, tile_size = 256, any_end_frame = False):
         """
         videos: A list of videos each with shape [C, T, H, W].
         """
         set_phase_status("VAE Encoding")
-        # tiles with halos (the untiled result) only with the MMGP allocator: Low VRAM (256) always, Default (512) for frames large for the GPU
-        # (untiled up to 1280x720 from 12 GB, up to 1920x1088 from 24 GB); PyTorch's allocator: untiled as before
+        # tiles with halos (the untiled result) with the MMGP allocator and the Triton kernels; else untiled, as before. The tile size
+        # comes from the VAE Tiling budget for the output (get_VAE_tile_size): a frame no larger than a tile is encoded whole.
         fast = tile_size > 0 and mmgp_vram_allocator() and _use_fast(torch.empty(0, dtype=self.dtype, device=self.device))
-        memory = torch.cuda.get_device_properties(self.device).total_memory if fast else 0
-        tiling = [0 if not fast or tile_size > 256 and (memory >= 12e9 and u.shape[-2] * u.shape[-1] <= 1280 * 720 or memory >= 24e9 and u.shape[-2] * u.shape[-1] <= 1920 * 1088) else tile_size for u in videos]
+        tiling = [tile_size if fast and u.shape[-2] * u.shape[-1] > tile_size * tile_size else 0 for u in videos]
         tiles = 0
         for video, tile in zip(videos, tiling):
             temporal_tiles = 2 + (video.shape[1] - 2) // 4 if any_end_frame else 1 + (video.shape[1] - 1) // 4
@@ -1438,12 +1439,11 @@ class Wan2_2_VAE:
             return [ self.model.decode(u.to(self.dtype).unsqueeze(0), scale, any_end_frame=any_end_frame).clamp_(-1, 1).float().squeeze(0) for u in zs ]
 
     def _exact_stream(self, net, decoder, frame_size, tile_size):
-        """Exact tiles for a stream of frames of frame_size in pixels, where encode and decode would tile them (Low VRAM level, or a frame large for the GPU when encoding)."""
+        """Exact tiles for a stream of frames of frame_size in pixels, where encode and decode would tile them (a tile size from the VAE Tiling budget, frames larger than a tile)."""
         size = tuple(s // 16 for s in frame_size) if decoder else tuple(s // 2 for s in frame_size)
         if not (tile_size > 0 and mmgp_vram_allocator() and _use_fast(torch.empty(0, dtype=self.dtype, device=self.device))):
             return None
-        memory = torch.cuda.get_device_properties(self.device).total_memory
-        if not decoder and tile_size > 256 and (memory >= 12e9 and frame_size[0] * frame_size[1] <= 1280 * 720 or memory >= 24e9 and frame_size[0] * frame_size[1] <= 1920 * 1088):
+        if not decoder and frame_size[0] * frame_size[1] <= tile_size * tile_size:
             return None
         return ExactStream(net, _exact_segments(net, size, tile_size // 2, decoder), size)
 

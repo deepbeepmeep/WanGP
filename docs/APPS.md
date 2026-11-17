@@ -6,7 +6,7 @@ Deepy Prime can build small web apps for you: interactive animations, games, exp
 
 Web apps are an advanced option, off by default:
 
-1. Use **Deepy Prime** with the **Python Sandbox** enabled (**Configuration > Prompt Enhancer / Deepy > Python**).
+1. Use **Deepy Prime** with the **Python Sandbox** enabled (**Configuration > Deepy / Prompt Enhancer > Python**).
 2. Set **App Development (Advanced)** to **Web Apps** in the same tab, then save. Deepy starts a new conversation with its app tools, and the **Apps** gallery appears beside the other galleries.
 
 Set it back to **Off** to hide apps again: Deepy no longer offers to build them, apps no longer start, and the Apps gallery is hidden. The app files stay where they are.

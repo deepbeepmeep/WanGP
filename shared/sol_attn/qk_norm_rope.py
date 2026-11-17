@@ -14,7 +14,7 @@ def _round_bf16(value):
     return tl.inline_asm_elementwise("cvt.rn.bf16.f32 $0, $1;", "=h,f", [value], dtype=tl.bfloat16, is_pure=True, pack=1)
 
 
-@triton.jit(do_not_specialize=['SXB', 'SXT', 'SXH', 'SRB', 'SRT', 'SRP', 'SRC', 'T'], do_not_specialize_on_alignment=['SXB', 'SXT', 'SXH', 'SRB', 'SRT', 'SRP', 'SRC', 'T'])
+@triton.jit(do_not_specialize=['SXB', 'SXT', 'SXH', 'SRB', 'SRT', 'SRP', 'SRC', 'T', 'H'], do_not_specialize_on_alignment=['SXB', 'SXT', 'SXH', 'SRB', 'SRT', 'SRP', 'SRC', 'T', 'H'])
 def _rms_norm_rope_kernel(
     x,
     weight,
@@ -28,7 +28,7 @@ def _rms_norm_rope_kernel(
     SRP,
     SRC,
     T,
-    H: tl.constexpr,
+    H,
     D: tl.constexpr,
     PAIRS: tl.constexpr,
 ):

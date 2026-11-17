@@ -444,6 +444,21 @@ def get_css() -> str:
     border-top: 1px solid var(--border-color-primary, rgba(17, 84, 118, 0.12));
     background: var(--background-fill-secondary, #f4f9fc);
 }
+.wangp-confirm-fields { display: grid; gap: 12px; padding: 0 16px 16px; }
+.wangp-confirm-fields:empty { display: none; }
+.wangp-confirm-fields label { display: grid; gap: 5px; font-size: 0.86rem; }
+.wangp-confirm-fields :is(input, textarea) {
+    box-sizing: border-box;
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid var(--input-border-color);
+    border-radius: 5px;
+    background: var(--input-background-fill);
+    color: var(--body-text-color);
+    font: inherit;
+}
+.wangp-confirm-fields textarea { resize: vertical; }
+.wangp-confirm-fields small { color: var(--body-text-color-subdued); }
 .wangp-confirm-actions button {
     min-width: 78px;
     height: 30px;
@@ -480,6 +495,7 @@ def get_javascript() -> str:
             backdrop.className = "wangp-confirm-backdrop";
             backdrop.setAttribute("role", "dialog");
             backdrop.setAttribute("aria-modal", "true");
+            backdrop.setAttribute("aria-label", opts.title || "Confirm");
             const buttonDefs = Array.isArray(opts.buttons) && opts.buttons.length ? opts.buttons : [
                 { text: opts.cancelText || "Cancel", value: false, cancel: true },
                 { text: opts.confirmText || "OK", value: true, primary: true, danger: !!opts.danger }
@@ -488,11 +504,32 @@ def get_javascript() -> str:
                 <div class="wangp-confirm-card">
                     <div class="wangp-confirm-title"></div>
                     <div class="wangp-confirm-message"></div>
+                    <form class="wangp-confirm-fields"></form>
                     <div class="wangp-confirm-actions"></div>
                 </div>`;
             const title = backdrop.querySelector(".wangp-confirm-title");
             const message = backdrop.querySelector(".wangp-confirm-message");
             const actions = backdrop.querySelector(".wangp-confirm-actions");
+            const form = backdrop.querySelector(".wangp-confirm-fields");
+            const fields = (opts.fields || []).map(def => {
+                const label = document.createElement("label");
+                const input = document.createElement(def.multiline ? "textarea" : "input");
+                label.textContent = def.label;
+                input.name = def.name;
+                input.value = def.value || "";
+                input.required = !!def.required;
+                if (def.pattern) input.pattern = def.pattern;
+                if (def.maxLength) input.maxLength = def.maxLength;
+                if (def.multiline) input.rows = 3;
+                label.appendChild(input);
+                if (def.help) {
+                    const help = document.createElement("small");
+                    help.textContent = def.help;
+                    label.appendChild(help);
+                }
+                form.appendChild(label);
+                return input;
+            });
             title.textContent = opts.title || "Confirm";
             message.textContent = opts.message || "";
             let defaultButton = null;
@@ -506,19 +543,24 @@ def get_javascript() -> str:
                 return Object.prototype.hasOwnProperty.call(def, "value") ? def.value : def.text;
             }
             async function choose(def, event) {
+                if (!def.cancel && fields.length && !form.reportValidity()) return;
                 if (typeof def.action === "function") {
                     const result = await def.action(buttonValue(def), event);
                     if (result === false) return;
                 }
-                finish(buttonValue(def));
+                finish(!def.cancel && fields.length ? {value: buttonValue(def), fields: Object.fromEntries(fields.map(input => [input.name, input.value]))} : buttonValue(def));
             }
             function onKeyDown(event) {
                 if (event.key === "Escape") {
                     event.preventDefault();
                     const cancelDef = buttonDefs.find((def) => def.cancel) || { value: false };
                     finish(buttonValue(cancelDef));
+                } else if (event.key === "Enter" && fields.includes(event.target) && event.target.tagName !== "TEXTAREA") {
+                    event.preventDefault();
+                    defaultButton?.click();
                 }
             }
+            form.addEventListener("submit", event => { event.preventDefault(); defaultButton?.click(); });
             buttonDefs.forEach((def, index) => {
                 const button = document.createElement("button");
                 button.type = "button";
@@ -531,13 +573,13 @@ def get_javascript() -> str:
                 if (def.autofocus || (!defaultButton && !def.cancel && index === buttonDefs.length - 1)) defaultButton = button;
             });
             backdrop.addEventListener("click", (event) => {
-                if (event.target !== backdrop) return;
+                if (event.target !== backdrop || opts.closeOnBackdrop === false) return;
                 const cancelDef = buttonDefs.find((def) => def.cancel) || { value: false };
                 finish(buttonValue(cancelDef));
             });
             document.addEventListener("keydown", onKeyDown, true);
             document.body.appendChild(backdrop);
-            (defaultButton || actions.querySelector("button"))?.focus();
+            (fields[0] || defaultButton || actions.querySelector("button"))?.focus();
         });
     };
     window.wangpModelInfo.hydrate = function(popup) {

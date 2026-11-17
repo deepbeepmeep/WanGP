@@ -80,8 +80,7 @@ class Attention(nn.Module):
                 if tensor is not None and norm is not None:
                     attention_kit.rows_(tensor, norm_rows(norm))
 
-        out = attention_kit.qkv_attention(x_list, self.q, self.k, self.v, self.heads, self.head_dim, norm_rope, force_attention=force_attention)
-        return self.proj(out.flatten(2))
+        return attention_kit.qkv_attention(x_list, self.q, self.k, self.v, self.heads, self.head_dim, norm_rope, force_attention=force_attention, out_proj=self.proj)
 
 
 class Block(nn.Module):

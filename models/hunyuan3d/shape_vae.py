@@ -59,7 +59,7 @@ class SelfAttention(nn.Module):
                 _layer_norm_(tensor, norm)
 
     def forward(self, x_list):
-        return self.c_proj(attention_kit.qkv_attention(x_list, self.to_q, self.to_k, self.to_v, self.heads, self.head_dim, self._norm_).flatten(2))
+        return attention_kit.qkv_attention(x_list, self.to_q, self.to_k, self.to_v, self.heads, self.head_dim, self._norm_, out_proj=self.c_proj)
 
 
 class ResidualAttentionBlock(nn.Module):

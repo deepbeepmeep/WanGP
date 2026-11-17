@@ -97,13 +97,12 @@ class TaoMateEngine:
         self.pcm = audio_16k_mono(job.source_audio_path) if job.source_audio_path else None if job.audio_waveform is None else audio_16k_mono(waveform=job.audio_waveform, sample_rate=job.audio_sample_rate)
         if self.pcm is None:
             print("[FaceRefine] The video has no audio: restoring its faces without audio guidance")
-        self.tile_size = self._tile_size(job.vae_config)
-
     @staticmethod
-    def _tile_size(vae_config) -> int:
+    def _tile_size(vae_config, size) -> int:
+        """The Wan 2.2 VAE's tile for a size x size crop: 0 (whole frames) when they fit the VAE Tiling budget."""
         from models.wan.modules.vae2_2 import Wan2_2_VAE
 
-        return Wan2_2_VAE.get_VAE_tile_size(vae_config, torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / 1048576, False)
+        return Wan2_2_VAE.get_VAE_tile_size(vae_config, torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / 1048576, False, size, size)
 
     def _track_reference(self, track_index, transform, matched_reference):
         """The track's reference, uint8 (3, size, size), restored when a restorer is selected unless a supplied picture is already sharp at this size; None when aborted."""
@@ -159,7 +158,7 @@ class TaoMateEngine:
         try:
             return pipeline.refine(segment.stop - segment.start, lambda start, stop: segment.load_crops(start, stop, uint8_storage=True), reference, self.pcm if with_audio else None,
                                    first_frame=job.frame_offset + segment.start, fps=job.fps, size=segment.transform["canvas"][0], seed=job.seed + segment.track_index,
-                                   steps=config["steps"], noise=config["noise"], shift=config["flow_shift"], audio_cfg=config["audio_guidance"], ref_cfg=config["reference_guidance"], tile_size=self.tile_size,
+                                   steps=config["steps"], noise=config["noise"], shift=config["flow_shift"], audio_cfg=config["audio_guidance"], ref_cfg=config["reference_guidance"], tile_size=self._tile_size(job.vae_config, segment.transform["canvas"][0]),
                                    window_offset=segment.window_index_offset, window_total=segment.window_count_total, callback=model_step_callback(pipeline, job.abort_callback, progress, "Denoising", config["steps"]), set_progress_status=status)
         finally:
             pipeline._interrupt = False

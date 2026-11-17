@@ -327,6 +327,8 @@ class PythonSandbox:
         self._live: dict = {}
         self._reported = 0.0
         self.interrupted: Callable[[], bool] = lambda: False
+        if self.apps is not None:
+            self.apps.interrupted = lambda: self.interrupted()
         self._memory_bytes = int(memory_mb) << 20
         self._worker: _Worker | None = None
         self._lock = threading.Lock()
@@ -489,7 +491,14 @@ class PythonSandbox:
             if request.get("op") == "app":
                 if self.apps is None:
                     raise PermissionError("Web apps are disabled: the user can enable them in Configuration > Deepy > Python > App Development (Advanced).")
-                return {"value": self.apps.script_call(str(request.get("action", "")), dict(request.get("arguments") or {}))}
+                action, arguments = str(request.get("action", "")), dict(request.get("arguments") or {})
+                if action == "import_asset" and arguments.get("transparent") and self.call_tool is not None:
+                    # Prime parks Deepy at this safe point, retaining its context and GPU ownership.
+                    result = self.call_tool("wangp_python", {"action": action, "arguments": self._localize(arguments)})
+                    if isinstance(result, dict) and result.get("status") == "error":
+                        raise RuntimeError(result.get("error", "Background Removal Failed"))
+                    return {"value": result}
+                return {"value": self.apps.script_call(action, arguments)}
             return {"error": f"Unknown sandbox request {request.get('op')!r}."}
         except Exception as error:
             return {"error": str(error), "error_type": type(error).__name__}

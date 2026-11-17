@@ -2,6 +2,9 @@
 """Optional INT8 backends shared by Quanto and ConvRot linear layers."""
 from __future__ import annotations
 
+import contextlib
+import contextvars
+import ctypes
 import importlib
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -40,6 +43,7 @@ _compile_cache_root = None
 _compile_cache_backend = None
 _kitchen_triton = None  # Triton INT8 kernels for the layers the Kitchen GEMM cannot take, when Kitchen is the backend
 _rotated_triton = None  # fused ConvRot Triton kernels for large inputs (Triton backend, or Kitchen's Triton route)
+_column_triton = None  # the same kernels' quantizer writing in place into a ColumnInput, when WGPKernels is the backend
 _blockwise_triton = None
 _blockwise_required = False
 _kitchen_dlpack_export = None  # (Kitchen module, its own DLPack exporter) while the direct exporter replaces it
@@ -132,9 +136,10 @@ def _probe_wgpkernels():
         return None, str(exc)
 
 
-def resolve_backend(selection):
+def resolve_backend(selection, precision):
     """Validate user selection before changing the active runtime or config. The selected backend, else the Auto choice: WGPKernels,
-    then Comfy Kitchen, then Triton, then PyTorch (kernel_policy.RANKING)."""
+    then Comfy Kitchen (skipped with the "strict" kernel precision: less precise than PyTorch), then Triton, then PyTorch
+    (kernel_policy.RANKING)."""
     if selection not in {value for _, value in CHOICES}:
         raise ValueError(f"Unknown INT8 kernel backend: {selection!r}")
     if selection == "disabled":
@@ -146,7 +151,7 @@ def resolve_backend(selection):
             return selection, module
         print(f"[INT8] {_LABELS[selection]} unavailable: {reason}. Using the Auto choice.")
     for backend in kernel_policy.RANKING[:3]:
-        if backend != selection:
+        if backend != selection and (backend != "kitchen" or precision != "strict"):
             module, reason = probes[backend]()
             if module is not None:
                 return backend, module
@@ -174,8 +179,44 @@ def _wgp_aligned(x):
     return x.clone(memory_format=torch.contiguous_format) if x.stride(-1) != 1 or x.stride(0) % 8 or x.data_ptr() % 16 else x
 
 
+CHUNK_SCRATCH_BYTES = 64 * 1024 * 1024  # INT8 activations of one launch inside chunked_rows(); 0: the kernels' own 16 MiB (comparison switch)
+_chunked_rows = contextvars.ContextVar("wan2gp_int8_chunked_rows", default=False)
+
+
+@contextlib.contextmanager
+def chunked_rows():
+    """For a caller that already feeds its INT8 linears chunks of rows it sized itself (ops.mlp): within it, WGPKernels quantizes and
+    multiplies up to CHUNK_SCRATCH_BYTES of INT8 activations per launch instead of cutting each chunk again by its 16 MiB: the same
+    results (rows are quantized on their own, the products are exact integers) in a third of the kernels, which are nodes of a
+    block's CUDA graph."""
+    token = _chunked_rows.set(True)
+    try:
+        yield
+    finally:
+        _chunked_rows.reset(token)
+
+
+def _wgp_linear(x, weight, scale, bias, group, precise, act=None, act_weight=None, eps=0.0, residual=None, residual_scale=None, out=None):
+    x = _wgp_aligned(x)
+    if not (_chunked_rows.get() and CHUNK_SCRATCH_BYTES):
+        return _wgp.linear(x, weight, scale, bias, group, precise, act=act, act_weight=act_weight, eps=eps, residual=residual, residual_scale=residual_scale, out=out)
+    path = _wgp.choose_path(x, weight, scale, bias, group, precise, act, act_weight, eps)
+    (m, k), n = (x.shape[0], weight.shape[1]), weight.shape[0]
+    row_bytes = (2 * k if path == "exact" else k) + 4 * (-(-k // 128) if path == "block" else 1)  # the kernels' own rule (_gemm_path)
+    rows = max(128, CHUNK_SCRATCH_BYTES // row_bytes // 128 * 128)
+    if path in ("lines", "small") or m <= max(128, _wgp.SCRATCH_BYTES // row_bytes // 128 * 128):
+        return _wgp.linear(x, weight, scale, bias, group, precise, mode=path, act=act, act_weight=act_weight, eps=eps, residual=residual, residual_scale=residual_scale, out=out)
+    out = torch.empty((m, n), dtype=x.dtype, device=x.device) if out is None else out
+    for start in range(0, m, rows):
+        stop = min(start + rows, m)
+        prepared = _wgp.prepare(x[start:stop], group, path, act, act_weight, eps)
+        _wgp.linear_prepared(prepared, weight, scale, bias, None if residual is None else residual[start:stop], residual_scale, out[start:stop])
+        del prepared
+    return out
+
+
 def _wgp_run(x, weight, scale, bias, group, precise):
-    return _wgp.linear(_wgp_aligned(x), weight, scale, bias, group, precise)
+    return _wgp_linear(x, weight, scale, bias, group, precise)
 
 
 def wgp_linear(input, weight, bias=None, group=0, precise=False, act=None, act_weight=None, act_eps=0.0, residual=None, residual_scale=None,
@@ -204,12 +245,273 @@ def wgp_linear(input, weight, bias=None, group=0, precise=False, act=None, act_w
         if out.shape != (*input.shape[:-1], n) or out.dtype != x.dtype or not out.is_contiguous() or out.data_ptr() % 16:
             raise ValueError("Fused INT8 output must match the output shape and dtype, be contiguous and 16-byte aligned")
         y = out.view(-1, n)
-    y = _wgp.linear(_wgp_aligned(x), weight._data, scale, bias, group, precise, act=act, act_weight=act_weight, eps=act_eps, residual=residual,
+    y = _wgp_linear(x, weight._data, scale, bias, group, precise, act=act, act_weight=act_weight, eps=act_eps, residual=residual,
                     residual_scale=residual_scale, out=y)
     if out is None:
         return y.reshape(*input.shape[:-1], n)
     torch.autograd.graph.increment_version(out)  # written in place: MMGP CUDA graphs copy a mutated block argument back
     return out
+
+
+def _row_offsets(lib):
+    """The WGPKernels entry points addressing rows through a device counter (CUDA graph loops), set up once; False without them."""
+    if not hasattr(lib, "wq8_gemm_at"):
+        return False
+    if not getattr(lib, "_wangp_row_offsets", False):
+        p, i, i64, f = ctypes.c_void_p, ctypes.c_int, ctypes.c_int64, ctypes.c_float
+        lib.wq8_quantize_blocks_at.argtypes = [p, p, p, i, i, i64, i, i, i, p, f, p, p, i64, i64, p]
+        lib.wq8_quantize_at.argtypes = [p, p, p, p, i, i, i64, i, i, i, p, f, p, i64, i64, p]
+        lib.wq8_gemm_at.argtypes = [p, p, p, p, p, p, p, p, p, i, i, i, i, i, i, i, p, p, p, i64, i64, i64, i64, i64, i64, p]
+        lib._wangp_row_offsets = True
+    return True
+
+
+_zeros = {}  # device -> a device int64 zero: the counter of row-offset launches outside graph loops
+
+
+def _loop_group(module):
+    """The rotation group the row-offset kernels run a layer with: a ConvRot INT8 weight's (0, 16, 64, 256), 0 for a plain Quanto INT8
+    weight (the regular WGPKernels path's group 0: no rotation, the same quantizer and GEMM); None for another layer."""
+    name = getattr(getattr(module, "weight_qtype", None), "name", None)
+    if name == "qint8_convrot":
+        return module._convrot_group_size if module._convrot_group_size in (0, 16, 64, 256) else None
+    if (name == "qint8" and getattr(module, "activation_qtype", None) is None and getattr(module, "_router_forward_impl", None) is None
+            and not hasattr(module, "_int8_residual_forward")):  # require_int8_residual: its own forward keeps full precision activations
+        return 0
+    return None
+
+
+def segment_gated_linear_supported(module, x):
+    """Whether segment_gated_linear_ takes this layer and input: WGPKernels with row-offset entry points, a ConvRot or Quanto INT8 weight
+    without LoRA, a BF16 / FP16 CUDA input (what linear's fused residual path takes)."""
+    from mmgp.offload import lora_active
+    return (_backend == "wgpkernels" and _row_offsets(_wgp._lib) and _loop_group(module) is not None and not lora_active(module)
+            and _wgp_supports(x, module.qweight) and not torch.compiler.is_compiling())
+
+
+def _layer_operands(module, dtype, device):
+    weight = module.qweight
+    return weight._data, _loop_group(module), weight._data.shape[0], weight._data.shape[1], _weight_scale(weight, weight._data.shape[0], device),         None if module.bias is None else module.bias.to(dtype)
+
+
+def _zero(device):
+    zero = _zeros.get(device)
+    if zero is None:
+        from mmgp import allocator
+        with allocator.normal_allocations():  # outlives the block: made during a warmup, it would keep that graph pool alive after its graphs
+            zero = _zeros[device] = torch.zeros(1, dtype=torch.int64, device=device)
+    return zero
+
+
+def segment_run_path(module, x, start, stop, offset, span):
+    """The path of segment_gated_linear_ for the run of x's rows [start, stop) (segments of span rows, the first offset rows in): full
+    precision ('exact') where any of its segments' own calls would take it, else the block path."""
+    w, group, _, _, scale, bias = _layer_operands(module, x.dtype, x.device)
+    lengths = {min(stop - start, span - offset), min(span, stop - start), (stop - start - (span - offset)) % span or span}
+    paths = {_wgp.choose_path(x[start:start + length], w, scale, bias, group, False) for length in lengths if 0 < length <= stop - start}
+    return "exact" if paths - {"block", "row"} else "block" if "block" in paths else "row"
+
+
+def _gated_gemms(module, x, path, rows_like, y_row0, gate_row0, gate_step, span, counter, first, step):
+    """x's rows through module, added scaled by their segment's gate into the output rows first + r (+ counter * step) counted from the row
+    y_row0 points to (whose segment's gate row gate_row0 points to, span rows a segment): per 16 MiB of rows, the prepared rows and one GEMM
+    whose residual epilogue reads each row's gate. rows_like: a tensor of the output rows' shape and dtype (the GEMM plans' shapes)."""
+    w, group, n, k, scale, bias = _layer_operands(module, x.dtype, x.device)
+    lib, stream, sms, dtype = _wgp._lib, _wgp._stream(x.device), _wgp._sm_count(x.device), _wgp._DTYPES[x.dtype]
+    row_bytes = (2 * k if path == "exact" else k) + 4 * (-(-k // 128) if path == "block" else 1)
+    rows = max(128, _wgp.SCRATCH_BYTES // row_bytes // 128 * 128)
+    for start in range(0, x.shape[0], rows):
+        stop = min(x.shape[0], start + rows)
+        prepared = _wgp.prepare(x[start:stop], group, path)
+        variant, split, slot_bytes, counter_bytes = _wgp._plan(prepared.x, prepared.lo, prepared.scale, w, scale, bias, rows_like[:stop - start], path, True)
+        slots = torch.empty(slot_bytes, dtype=torch.uint8, device=x.device) if slot_bytes else None
+        counters = _wgp._zeroed_counters(x.device, counter_bytes, stream).data_ptr() if counter_bytes else None
+        _wgp._check(lib.wq8_gemm_at(prepared.x.data_ptr(), _wgp._ptr(prepared.lo), prepared.scale.data_ptr(), w.data_ptr(), scale.data_ptr(), _wgp._ptr(bias), y_row0,
+                                    gate_row0, y_row0, stop - start, n, k, dtype, variant, sms, split, _wgp._ptr(slots), counters, counter.data_ptr(),
+                                    first + start, step, span, gate_step, 0, 0, stream))
+        del prepared, slots
+
+
+def segment_gated_linear_(module, x, residual, gate, runs):
+    """residual += gate[row] * module(x) row by row, gate a table of rows (one per segment), for runs (start, stop, row0, offset, span) of
+    segments (row_loop_triton.segment_runs: x's row r of a run takes gate row row0 + (offset + r - start) // span): one GEMM per 16 MiB of
+    rows, the GEMM's residual epilogue reading each row's gate (one rounding), instead of one linear per segment (segment_run_path: never
+    a less precise path than theirs; a chunk's GEMM may split K otherwise than one of a segment's rows)."""
+    gate, x = gate.to(x.dtype), _wgp_aligned(x)
+    for start, stop, row0, offset, span in runs:  # positions from the run's first segment's start: the GEMM adds them to its output rows
+        base = residual[start].data_ptr() - offset * residual.shape[1] * residual.element_size()
+        _gated_gemms(module, x[start:stop], segment_run_path(module, x, start, stop, offset, span), residual, base, gate[row0].data_ptr(), gate.stride(0), span,
+                     _zero(x.device), offset, 0)
+    torch.autograd.graph.increment_version(residual)
+    return residual
+
+
+def segment_gated_linear_at(module, x, residual, gate, span, path, counter, first, step):
+    """segment_gated_linear_ of a CUDA graph loop's turn: x's rows (fixed) added into residual's rows first + counter * step, gate row
+    (row // span) of the table (segments of span rows from residual's row 0), with the path segment_run_path gave the eager calls."""
+    _gated_gemms(module, _wgp_aligned(x), path, residual, residual.data_ptr(), gate.to(x.dtype).data_ptr(), gate.stride(0), span, counter, first, step)
+    torch.autograd.graph.increment_version(residual)
+    return residual
+
+
+def prepared_rows_linear_at(module, prepared, count, counter, first, step):
+    """offload.linear_rows(module, rows, 0, out_features) of the prepared input's rows first + counter * step (a CUDA graph loop's turn), count
+    of them (the GEMM of linear_prepared on those rows, its plan for that row count: the same bits): a new tensor (count, out_features)."""
+    w, _, n, k, scale, _ = _layer_operands(module, prepared.dtype, prepared.x.device)
+    bias = None if module.bias is None else module.bias.to(prepared.dtype)
+    view = prepared.rows(0, count)
+    out = torch.empty((count, n), dtype=prepared.dtype, device=prepared.x.device)
+    variant, split, slot_bytes, counter_bytes = _wgp._plan(view.x, view.lo, view.scale, w, scale, bias, out, prepared.path, False)
+    slots = torch.empty(slot_bytes, dtype=torch.uint8, device=out.device) if slot_bytes else None
+    stream = _wgp._stream(out.device)
+    counters = _wgp._zeroed_counters(out.device, counter_bytes, stream).data_ptr() if counter_bytes else None
+    _wgp._check(_wgp._lib.wq8_gemm_at(prepared.x.data_ptr(), _wgp._ptr(prepared.lo), prepared.scale.data_ptr(), w.data_ptr(), scale.data_ptr(), _wgp._ptr(bias), None, None,
+                                      out.data_ptr(), count, n, k, _wgp._DTYPES[prepared.dtype], variant, _wgp._sm_count(out.device), split, _wgp._ptr(slots), counters,
+                                      counter.data_ptr(), 0, 0, 0, 0, first, step, stream))
+    return out
+
+
+def row_loop_linear(module, x, rows, act=None, out_at=False):
+    """A RowLoopLinear for module over chunks of `rows` rows of inputs like x (act: the input operation fused into its quantizer, x's rows
+    then gate | value for 'swiglu'; out_at: its calls will write their output rows through the counter), or None: a ConvRot or Quanto INT8
+    weight without LoRA, BF16 / FP16 activations, eager inference, on WGPKernels with row-offset entry points or on the Triton backend's
+    kernels (TritonRowLoopLinear, without act)."""
+    from mmgp.offload import lora_active
+    if lora_active(module) or not torch.is_inference_mode_enabled() or _loop_group(module) is None:
+        return None
+    if _backend == "triton":
+        return TritonRowLoopLinear(module, x, rows, out_at) if act is None and _triton_loop_supported(module, x[:rows]) else None
+    if _backend != "wgpkernels" or not _row_offsets(_wgp._lib) or not _wgp_supports(x, module.qweight):
+        return None
+    return RowLoopLinear(module, x, rows, act)
+
+
+def _triton_loop_supported(module, x):
+    """Whether the Triton backend runs this layer on x's rows with the kernels TritonRowLoopLinear reproduces: a ConvRot weight on the
+    fused rotation kernels (rotated_triton_supported), a Quanto weight on the fused quantizing GEMM (quanto_int8_inject's dense path)."""
+    weight = module.qweight
+    if x.dtype not in (torch.bfloat16, torch.float16) or not x.is_cuda or not weight._data.is_cuda:
+        return False
+    if module.weight_qtype.name == "qint8_convrot":
+        return rotated_triton_supported(x, weight, module._convrot_group_size)
+    from shared.kernels import quanto_int8_inject as quanto
+    return (quanto._PATCH_STATE.enabled and quanto._TRITON_MODULE is not None and quanto._TRITON_DIRECT_FUSED_READY and weight._data.dtype == torch.int8
+            and not quanto._prefer_native_quanto_path(x))
+
+
+class TritonRowLoopLinear:
+    """RowLoopLinear for the Triton backend: a chunk of `rows` rows of a ConvRot INT8 linear on its fused rotation kernels (rotated_linear's
+    launches, sub-chunks and configurations) or of a Quanto INT8 linear on the fused quantizing GEMM then its bias added in place (the dense
+    path of quanto_int8_inject): the same bits. The input rows are read through the counter (x_at); the output goes to fixed rows, or with
+    out_at to a fixed scratch whose rows are then stored or added (residual, row_loop_triton.residual_add_at: the usual path's add_ /
+    addcmul_) through the counter. Every operand and scratch is made here, before the loop's body is recorded."""
+
+    def __init__(self, module, x, rows, out_at=False):
+        weight = module.qweight
+        self.n, self.k, self.rows, self.bias = weight._data.shape[0], weight._data.shape[1], rows, module.bias
+        self.y = torch.empty((rows, self.n), dtype=x.dtype, device=x.device) if out_at else None
+        if module.weight_qtype.name == "qint8_convrot":
+            self.group, self.w, self.scale = module._convrot_group_size, weight._data, _weight_scale(weight, self.n, x.device)
+            sub = _rotated_triton.scratch_rows(self.k)
+            self.parts = [(start, min(start + sub, rows)) for start in range(0, rows, sub)]
+            self.q = torch.empty((min(sub, rows), self.k), dtype=torch.int8, device=x.device)
+            self.scales = torch.empty((min(sub, rows), self.k // _rotated_triton.SCALE_BLOCK), dtype=torch.float32, device=x.device)
+            self.configs = _rotated_triton.loop_configs(x.dtype, x.device, self.n, self.k, self.group, self.bias)
+        else:
+            from shared.kernels import quanto_int8_inject as quanto
+            self.group, self.w = None, weight._data if weight._data.is_contiguous() else weight._data.contiguous()
+            self.scale = quanto._prepare_weight_scale(weight._scale, self.n, x.device)
+            self.params, self.kernel = quanto._fused_launch_params(rows, self.k, self.n, x.device), quanto._TRITON_MODULE._fused_dynamic_int8_blockscale_gemm_kernel
+
+    def __call__(self, x, out, counter, x_at=None, out_at=None, residual=None, residual_scale=None, scale_span=0):
+        """RowLoopLinear.__call__'s operands."""
+        from shared.kernels import row_loop_triton
+        y = out if out_at is None else self.y
+        if self.group is None:
+            bm, bn, bk, warps, stages, grid_m, grid_n = self.params
+            self.kernel[(grid_m, grid_n)](x, self.w, self.scale, y, self.rows, self.n, self.k, x.stride(0), x.stride(1), self.w.stride(0), self.w.stride(1), y.stride(0),
+                                          y.stride(1), block_m=bm, block_n=bn, block_k=bk, **({} if x_at is None else dict(counter=counter, first=x_at[0], step=x_at[1], AT=True)),
+                                          num_warps=warps, num_stages=stages)
+            if self.bias is not None:
+                y += self.bias
+        else:
+            quantize_config, gemm_config = self.configs
+            for start, stop in self.parts:
+                count = stop - start
+                if x_at is None:
+                    _rotated_triton._quantize(x[start:stop], self.q, self.scales, count, self.k, self.group, quantize_config)
+                else:
+                    _rotated_triton._quantize(x, self.q, self.scales, count, self.k, self.group, quantize_config, (counter, x_at[0] + start, x_at[1]))
+                _rotated_triton._gemm(self.q, self.scales, self.w, self.scale, self.bias, y[start:stop], count, self.n, self.k, gemm_config)
+        if out_at is not None:
+            if residual is None:
+                row_loop_triton.store_rows_at(out, y, counter, *out_at)
+            else:
+                row_loop_triton.residual_add_at(out, y, residual_scale, counter, *out_at, scale_span)
+
+
+def _convrot_qtype():
+    from shared.qtypes.int8_convrot import _QINT8_CONVROT_QTYPE
+    return _QINT8_CONVROT_QTYPE
+
+
+class RowLoopLinear:
+    """One chunk of `rows` rows of a WGPKernels ConvRot linear, as _wgp_linear runs it inside chunked_rows() (same path, sub-chunks, launch
+    configurations: the same bits), with the chunk's input and / or output rows addressed through a device counter: rows
+    first + counter * step of x or out, else the fixed rows passed. For CUDA graph loops (mmgp.cuda_graphs.loop): every operand and scratch
+    is made here, before the loop's body is recorded, and a call allocates nothing."""
+
+    def __init__(self, module, x, rows, act=None):
+        weight = module.qweight
+        self.w, self.group, self.n, self.k = weight._data, _loop_group(module), weight._data.shape[0], weight._data.shape[1]
+        self.scale = _weight_scale(weight, self.n, x.device)
+        self.bias = None if module.bias is None else module.bias.to(x.dtype)
+        self.dtype, self.device = x.dtype, x.device
+        self.zero = torch.zeros(1, dtype=torch.int64, device=self.device)  # the counter of fixed operands
+        sample = x[:rows]
+        self.act = act
+        self.path = _wgp.choose_path(sample, self.w, self.scale, self.bias, self.group, False, act)
+        if self.path not in ("block", "exact", "row"):
+            raise ValueError(f"row loops take the INT8 GEMM paths, not {self.path}")
+        row_bytes = (2 * self.k if self.path == "exact" else self.k) + 4 * (-(-self.k // 128) if self.path == "block" else 1)
+        sub = rows if rows <= max(128, _wgp.SCRATCH_BYTES // row_bytes // 128 * 128) else max(128, CHUNK_SCRATCH_BYTES // row_bytes // 128 * 128)
+        self.parts = [(start, min(start + sub, rows)) for start in range(0, rows, sub)]
+        width = min(sub, rows)
+        self.q = torch.empty((width, self.k), dtype=torch.int8, device=self.device)
+        self.lo = torch.empty_like(self.q) if self.path == "exact" else None
+        self.sa = torch.empty((width, -(-self.k // 128)) if self.path == "block" else (width,), dtype=torch.float32, device=self.device)
+        self.plans, self.slots = [], []
+        for start, stop in self.parts:
+            count = stop - start
+            out = torch.empty((count, self.n), dtype=self.dtype, device=self.device)
+            plan = _wgp._plan(self.q[:count], None if self.lo is None else self.lo[:count], self.sa[:count], self.w, self.scale, self.bias, out, self.path, False)
+            self.plans.append(plan)
+            self.slots.append(torch.empty(plan[2], dtype=torch.uint8, device=self.device) if plan[2] else None)
+
+    def __call__(self, x, out, counter, x_at=None, out_at=None, residual=None, residual_scale=None, scale_span=0):
+        """x: the input rows (fixed), or the whole input with x_at = (first, step); out: the output rows (fixed), or the whole output with
+        out_at = (first, step), residual (out itself, or None) added with residual_scale (one vector, or scale_span rows per vector)."""
+        lib, stream, sms = _wgp._lib, _wgp._stream(self.device), _wgp._sm_count(self.device)
+        dtype, act = _wgp._DTYPES[self.dtype], _wgp.ACTS[self.act]
+        for (start, stop), (variant, split, _, counter_bytes), slots in zip(self.parts, self.plans, self.slots):
+            count = stop - start
+            q, lo, sa = self.q.data_ptr(), _wgp._ptr(self.lo), self.sa.data_ptr()
+            if x_at is None:
+                source, first, step, at = x[start:stop].data_ptr(), 0, 0, self.zero
+            else:
+                source, first, step, at = x.data_ptr(), x_at[0] + start, x_at[1], counter
+            if self.path == "block":
+                _wgp._check(lib.wq8_quantize_blocks_at(source, q, sa, count, self.k, x.stride(0), dtype, self.group, act, None, 0.0, None, at.data_ptr(), first, step, stream))
+            else:
+                _wgp._check(lib.wq8_quantize_at(source, q, lo, sa, count, self.k, x.stride(0), dtype, self.group, act, None, 0.0, at.data_ptr(), first, step, stream))
+            if out_at is None:
+                target, first, step, at = out[start:stop].data_ptr(), 0, 0, self.zero
+            else:
+                target, first, step, at = out.data_ptr(), out_at[0] + start, out_at[1], counter
+            counters = _wgp._zeroed_counters(self.device, counter_bytes, stream).data_ptr() if counter_bytes else None
+            _wgp._check(lib.wq8_gemm_at(q, lo, sa, self.w.data_ptr(), self.scale.data_ptr(), _wgp._ptr(self.bias), None if residual is None else target,
+                                        _wgp._ptr(residual_scale), target, count, self.n, self.k, dtype, variant, sms, split, _wgp._ptr(slots), counters,
+                                        at.data_ptr(), first, step, scale_span, self.n if scale_span else 0, 0, 0, stream))
 
 
 def wgp_group_scales(input, weight):
@@ -836,14 +1138,266 @@ class _WgpRowProjection:
         return _wgp.prepare(x, group, _wgp_path(module, x, group, precise))
 
     @staticmethod
+    def prepare_in_place(module, x):
+        """(prepare() of x into x's own memory, the bytes of x left free) (offload.prepare_linear_input, when x is the input's only
+        holder), for the INT8 paths of one byte per element ('block', 'row'): the INT8 rows take the first half of x's bytes, the scales
+        a tensor of their own. Rows
+        are quantized by ranges into a bounded scratch, then copied over 16-bit rows already read: row r's INT8 bytes [r K, (r + 1) K)
+        lie in the 16-bit rows below r / 2 + 1, so a range [a, b) is safe once b <= 2 a (the first one from its scratch alone). The
+        same values as prepare(); None (x untouched) for another path."""
+        _, group, precise = _WgpRowProjection.key(module)
+        path = _wgp_path(module, x, group, precise)
+        if path not in ("block", "row") or not x.is_contiguous() or x.element_size() != 2:
+            return None
+        (m, k), step = x.shape, max(128, _SCRATCH_BYTES // x.shape[1] // 128 * 128)
+        memory = x.view(torch.uint8).view(-1)
+        into = memory[:m * k].view(torch.int8).view(m, k)
+        scale, start = None, 0
+        while start < m:
+            stop = min(m, start + (step if start == 0 else min(step, start)))
+            part = _wgp.prepare(x[start:stop], group, path)
+            if scale is None:
+                scale = part.scale.new_empty((m, *part.scale.shape[1:]))
+            into[start:stop].copy_(part.x)
+            scale[start:stop].copy_(part.scale)
+            start, part = stop, None
+        return _wgp.Prepared(path, into, None, scale, x.dtype), memory[m * k:]
+
+    @staticmethod
+    def prepare_into(module, prepared, x, start, rows):
+        """prepare() of rows [start, start + len(x)) of an input of `rows` rows (an offload.RowSource), into prepared, None for the first
+        range: its path, chosen on that range (the rows of a source span several thousands: the block path where m decides), serves
+        every range. Rows are prepared on their own: the same as preparing the whole input."""
+        _, group, precise = _WgpRowProjection.key(module)
+        part = _wgp.prepare(x, group, _wgp_path(module, x, group, precise) if prepared is None else prepared.path)
+        if prepared is None:
+            whole = lambda t: None if t is None else t.new_empty((rows, *t.shape[1:]))
+            prepared = _wgp.Prepared(part.path, whole(part.x), whole(part.lo), whole(part.scale), part.dtype)
+        target = prepared.rows(start, start + x.shape[0])
+        for into, value in ((target.x, part.x), (target.lo, part.lo), (target.scale, part.scale)):
+            if into is not None:
+                into.copy_(value)
+        return prepared
+
+    @staticmethod
+    def prepare_into_at(module, prepared, x, counter, first, step):
+        """prepare_into of rows first + counter * step of the input (a CUDA graph loop's turn, the counter on the device), prepared the
+        first range's way: x prepared on its own, then stored at those rows (the copies prepare_into makes)."""
+        from mmgp import offload
+        part = _wgp.prepare(x, _WgpRowProjection.key(module)[1], prepared.path)
+        for into, value in ((prepared.x, part.x), (prepared.lo, part.lo), (prepared.scale, part.scale)):
+            if into is not None:
+                offload._row_store_at(into, value, counter, first, step)
+
+    @staticmethod
     def rows(module, prepared, start, stop):
         weight, bias = module.qweight, module.bias
         scale = _weight_scale(weight, weight._data.shape[0], weight._data.device)[start:stop]
         bias = None if bias is None else bias[start:stop].to(prepared.dtype)
         return _wgp.linear_prepared(prepared, weight._data[start:stop], scale, bias)
 
+    @staticmethod
+    def slice_input(prepared, start, stop):  # rows of the input (offload.linear_input_rows); the GEMM may round a few values otherwise for fewer rows
+        return prepared.rows(start, stop)
+
 
 _WGP_ROW_PROJECTION = _WgpRowProjection()
+COLUMN_INPUT = True  # comparison switch: False keeps the 16-bit input of a linear fed by ranges of columns
+COLUMN_QUANTIZE_IN_PLACE = True  # comparison switch: False quantizes each range with WGPKernels, then copies it into the kept input
+COLUMN_ROWS = 16384  # rows per GEMM of a kept input: the kernels' top tuning bucket (one tile configuration from there on) and a bounded scratch output while they tune
+
+
+class ColumnInput:
+    """The input of an INT8 linear received by ranges of columns (an attention output computed by groups of heads) and kept as its
+    kernels quantize it, one byte per element instead of the 16-bit input: the WGPKernels block path, or the Triton backend's
+    ConvRot kernels. Rotation groups and activation scales cover at most `unit` columns, so every range is quantized as the whole
+    input would be, and the layer's output has the precision of its own forward: the same results with the Triton kernels; with
+    WGPKernels the GEMMs run on more rows per call (another tile configuration: a few results per million one unit in the last
+    place away). Columns that end inside a unit wait for the next range. The rows of segments short enough for another path of the
+    layer stay in 16 bits and go through the layer itself. LoRAs: mmgp LoraColumns, their input products summed range by range.
+    ConvRot layers are quantized by the Triton kernel in both cases, straight into the kept input (for WGPKernels with its 128-column
+    scales: one kernel per range instead of a quantization and two copies; it divides by the scale where WGPKernels multiply by its
+    inverse, another rounding of the same precision)."""
+    def __init__(self, module, rows, dtype, segments, loras, fused):
+        self.module, self.rows, self.dtype, self.loras, self.fused = module, rows, dtype, loras, fused
+        self.group, self.triton = getattr(module, "_convrot_group_size", 0), _backend == "triton"
+        self.block = _rotated_triton.SCALE_BLOCK if self.triton else 128  # columns per activation scale
+        self.quantizer = _rotated_triton if self.triton else _column_triton if COLUMN_QUANTIZE_IN_PLACE and self.group in (16, 64, 256) else None
+        self.unit, self.done, self.carry, self.q, self.scale = max(self.block, self.group), 0, None, None, None
+        self.parts = None  # [(first row, stop row, INT8 rows)]: the kept input in parts of memory (reuse), else one tensor (self.q)
+        # short segments keep their 16-bit rows where the layer's own call would treat them apart: WGPKernels on its fused path (off it,
+        # with a LoRA, the layer runs all its rows through the block path in one call), the Triton kernels' few-row paths
+        short = segments if fused or self.triton else ()
+        self.wide = {(start, stop): None for start, stop, _ in short or () if 0 < stop - start <= _column_short_rows()}
+
+    def reuse(self, memory):
+        """Keeps the INT8 input in memory (bytes, a 1-D uint8 tensor on the device, 16-byte aligned) instead of a tensor of its own:
+        memory a caller has no more use for (the free half of an input prepared in place). Memory smaller than the input keeps its
+        first rows (a multiple of 128), the others get a tensor of their own (an attention wider than the model: its kept input is
+        larger than the free half). Returns whether it keeps any."""
+        width = self.module.in_features
+        fit = self.rows if memory is None or memory.numel() >= self.rows * width else memory.numel() // width // 128 * 128
+        if self.q is not None or self.parts is not None or memory is None or not fit or memory.data_ptr() % 16:
+            return False
+        head = memory[:fit * width].view(torch.int8).view(fit, width)
+        if fit == self.rows:
+            self.q = head
+        else:
+            self.parts = [(0, fit, head), (fit, self.rows, None)]  # the tail's tensor is made with the scales, at the first range
+        return True
+
+    def _q_rows(self, first, last):
+        """The kept INT8 rows [first, last): a view of the part holding them, or, for the rows of a GEMM that cross from one part to the
+        next (one per pass at most), a copy of them (the GEMM reads the same rows as from one tensor: the same results)."""
+        if self.parts is None:
+            return self.q[first:last]
+        pieces = [q[max(first, start) - start:min(last, stop) - start] for start, stop, q in self.parts if start < last and stop > first]
+        return pieces[0] if len(pieces) == 1 else torch.cat(pieces)
+
+    def append(self, x_list):
+        """The next columns, (..., columns) in 16 bits, handed off in x_list."""
+        x = x_list[0]
+        x_list.clear()
+        x = x.reshape(self.rows, -1)
+        if self.scale is None:
+            if self.parts is not None:
+                first, stop, _ = self.parts[1]
+                self.parts[1] = (first, stop, torch.empty((stop - first, self.module.in_features), dtype=torch.int8, device=x.device))
+            elif self.q is None:
+                self.q = torch.empty((self.rows, self.module.in_features), dtype=torch.int8, device=x.device)
+            self.scale = torch.empty((self.rows, self.module.in_features // self.block), dtype=torch.float32, device=x.device)
+            self.wide = {(start, stop): x.new_empty((stop - start, self.module.in_features)) for start, stop in self.wide}
+        if self.loras is not None:
+            self.loras.append(x)
+        if self.carry is not None:  # one quantization per range: fewer kernels than the waiting columns on their own
+            x, self.carry = torch.cat((self.carry, x), dim=1), None
+        ready = x.shape[1] // self.unit * self.unit
+        if ready:
+            first, last = self.done, self.done + ready
+            for start, stop, kept in self.parts or [(0, self.rows, self.q)]:  # each part of the kept rows quantized on its own (rows are independent)
+                if self.quantizer is not None:
+                    self.quantizer.quantize_columns(x[start:stop, :ready], kept, self.scale[start:stop], first, self.group, self.block)
+                else:
+                    q, scale = _wgp.quantize_blocks(_wgp_aligned(x[start:stop, :ready]), self.group)
+                    kept.view(torch.int64)[:, first // 8:last // 8].copy_(q.view(torch.int64))  # by 8 bytes: a third faster than the copy of single bytes
+                    self.scale[start:stop, first // 128:last // 128].copy_(scale)
+                    del q, scale
+            for (start, stop), wide in self.wide.items():
+                wide[:, first:last].copy_(x[start:stop, :ready])
+            self.done = last
+        if ready < x.shape[1]:
+            self.carry = x[:, ready:].clone()
+
+    def _spans(self, start, stop):
+        """[start, stop) by equal parts of at most COLUMN_ROWS rows; the rows of a short segment together."""
+        if (start, stop) in self.wide:
+            return [(start, stop)]
+        rows = -(-(stop - start) // -(-(stop - start) // COLUMN_ROWS) // 128) * 128
+        return [(first, min(first + rows, stop)) for first in range(start, stop, rows)]
+
+    def _rows(self, first, last, out=None, residual_scale=None, fused=False):
+        """The layer's output for the rows [first, last) of one span, LoRAs included, written into out when given. fused (no LoRA): out
+        holds the residual and becomes residual + residual_scale * output, rounded once."""
+        module = self.module
+        wide = self.wide.get((first, last))
+        if wide is not None:
+            if fused:
+                return linear_with_fusion(module, wide, residual=out, residual_scale=residual_scale, out=out)
+            return module(wide) if out is None else out.copy_(module(wide))
+        weight = module.qweight
+        scale = _weight_scale(weight, weight._data.shape[0], self.scale.device)
+        if out is None:
+            out = torch.empty((last - first, module.out_features), dtype=self.dtype, device=self.scale.device)
+        q = self._q_rows(first, last)
+        if self.triton:
+            _rotated_triton.prepared_linear(q, self.scale[first:last], weight._data, scale, module.bias, out)
+        else:
+            bias = None if module.bias is None else module.bias.to(self.dtype)
+            _wgp.linear_prepared(_wgp.Prepared("block", q, None, self.scale[first:last], self.dtype), weight._data, scale, bias,
+                                 out if fused else None, residual_scale if fused else None, out)
+        del q
+        if self.loras is not None:
+            self.loras.add_to(out, first, last)
+        return out
+
+    def linear(self, start=0, stop=None):
+        """The layer's output for the rows [start, stop) (all by default), (stop - start, out_features)."""
+        stop = self.rows if stop is None else stop
+        out = torch.empty((stop - start, self.module.out_features), dtype=self.dtype, device=self.scale.device)
+        for first, last in self._spans(start, stop):
+            self._rows(first, last, out[first - start:last - start])
+        return out
+
+    def _add(self, start, stop, residual, scale):
+        """residual[start:stop] += scale * output (None for 1, a number, or one value per channel in the residual's dtype), a part of
+        rows at a time: off the fused path (a LoRA) each part's output is added as soon as it is computed, never the whole output
+        beside the residual."""
+        for first, last in self._spans(start, stop):
+            target = residual[first:last]
+            if self.fused:
+                self._rows(first, last, target, scale, True)
+            elif scale is None:
+                target.add_(self._rows(first, last))
+            elif isinstance(scale, (int, float)):
+                target.add_(self._rows(first, last), alpha=scale)
+            else:
+                target.addcmul_(self._rows(first, last), scale)
+
+    def linear_residual(self, residual, scale=None):
+        """residual += scale * layer(input) (scale: None for 1, a number, or one value per output channel), as ops.linear_residual_."""
+        rows = residual.view(-1, residual.shape[-1])
+        if isinstance(scale, (int, float)) and self.fused:
+            scale = torch.full((self.module.out_features,), scale, dtype=rows.dtype, device=rows.device)
+        self._add(0, self.rows, rows, scale if scale is None or isinstance(scale, (int, float)) else scale.reshape(-1).to(rows.dtype))
+        if self.fused:
+            torch.autograd.graph.increment_version(residual)  # written in place: MMGP CUDA graphs copy a mutated block argument back
+        return residual
+
+    def gated_linear(self, residual, gate, segments):
+        """residual[start:stop] += gate[row] * layer(input[start:stop]) for each segment (start, stop, row), as ops.gated_linear."""
+        rows = residual.view(-1, residual.shape[-1])
+        for start, stop, row in segments:
+            if stop > start:
+                self._add(start, stop, rows, gate[row].reshape(-1).to(rows.dtype))
+        if self.fused:
+            torch.autograd.graph.increment_version(residual)  # written in place: MMGP CUDA graphs copy a mutated block argument back
+        return residual
+
+
+def _column_short_rows():
+    """Rows up to which the layer may take another path than the one a ColumnInput keeps its input for: the full precision paths of
+    WGPKernels (tuned per shape), the few-row paths of the Triton backend's ConvRot layers (rotated_triton_supported)."""
+    return 32 if _backend == "triton" else _wgp.DECIDE_MAX_ROWS
+
+
+def column_input(module, rows, dtype, device, segments=None, residual=None):
+    """A ColumnInput for module's input of `rows` rows in `dtype`, to be read through its linear(), linear_residual() or gated_linear()
+    (residual: where the output will be added; segments: gated_linear's), or None when this layer cannot read its input by ranges of
+    columns: a backend or weight format whose kernels read the 16-bit input or scale it over the whole row, full precision
+    activations required, a LoRA that is not low rank, or too few rows on the kept path to save memory."""
+    from mmgp import offload
+    qtype = getattr(module, "weight_qtype", None)
+    if (not COLUMN_INPUT or qtype is None or qtype.name not in ("qint8", "qint8_convrot") or torch.compiler.is_compiling()
+            or device.type != "cuda" or dtype not in (torch.bfloat16, torch.float16) or getattr(module, "activation_qtype", None) is not None
+            or hasattr(module, "_int8_residual_forward") or qtype.name == "qint8" and getattr(module, "_router_forward_impl", None) is not None):
+        return None
+    data, group = module.qweight._data, module._convrot_group_size if qtype.name == "qint8_convrot" else 0
+    if _backend == "triton":  # its fused ConvRot kernels (rotated_triton_supported): a scale per row and 64 columns
+        if _rotated_triton is None or group not in (16, 64, 256) or module.in_features % max(group, 64) or not data.is_contiguous():
+            return None
+    elif _backend != "wgpkernels" or group not in (0, 16, 64, 256) or module.in_features % max(128, group):
+        return None
+    if (not data.is_cuda or data.dtype != torch.int8
+            or 4 * sum(stop - start for start, stop, _ in segments or () if stop - start <= _column_short_rows()) > rows):
+        return None  # mostly short segments (one per frame): little to keep in INT8
+    loras = None
+    if offload.lora_active(module):
+        if not offload.linear_columns_supported(module):
+            return None
+        loras = offload.LoraColumns(module)
+    # the fused residual linear where the layer's own call would use it: otherwise its output, then the residual update
+    fused = residual is not None and loras is None and can_fuse_linear(module, residual) and residual.dtype == dtype and residual.is_contiguous()
+    return ColumnInput(module, rows, dtype, segments, loras, fused)
 
 
 class _Int8RowProjection:
@@ -873,6 +1427,10 @@ class _Int8RowProjection:
         if (_backend == "triton" and x.is_cuda and not triton._prefer_native_quanto_path(x)):
             return triton._TRITON_MODULE.prepare_blockscale_input(x, module.out_features)
         return x
+
+    @staticmethod
+    def slice_input(prepared, start, stop):  # rows of the input (offload.linear_input_rows): every row is computed on its own
+        return (prepared[0][start:stop], prepared[1][start:stop], *prepared[2:]) if isinstance(prepared, tuple) else prepared[start:stop]
 
     @staticmethod
     def rows(module, prepared, start, stop):
@@ -939,6 +1497,11 @@ class _KitchenRowProjection:
         return q, scales, x.dtype
 
     @staticmethod
+    def slice_input(prepared, start, stop):  # rows of the input (offload.linear_input_rows)
+        q, scales, dtype = prepared
+        return q[start:stop], scales[start:stop], dtype
+
+    @staticmethod
     def rows(module, prepared, start, stop):
         q, scales, dtype = prepared
         weight, bias = module.qweight, module.bias
@@ -964,8 +1527,8 @@ _KITCHEN_ROW_PROJECTION = _KitchenRowProjection()
 
 def configure(selection, verbose_level=0, *, resolved=None):
     global _backend, _kitchen, _kitchen_hip, _original_forward, _direct_cutlass, _sm120_cutlass, _kitchen_triton, _rotated_triton, revision
-    global _blockwise_triton, _kitchen_dlpack_export, _wgp
-    backend, module = resolve_backend(selection) if resolved is None else resolved
+    global _blockwise_triton, _kitchen_dlpack_export, _wgp, _column_triton
+    backend, module = resolve_backend(selection, kernel_policy.precision) if resolved is None else resolved
     kernel_policy.configure_families(selection)
     previous_backend = _backend
     if _kitchen_dlpack_export is not None:
@@ -982,7 +1545,7 @@ def configure(selection, verbose_level=0, *, resolved=None):
     _direct_cutlass = False
     _sm120_cutlass = False
     _kitchen_triton = None
-    _rotated_triton = None
+    _rotated_triton = _column_triton = None
     if backend == "triton":
         if not triton.maybe_enable_quanto_int8_kernel(verbose_level):
             raise RuntimeError("Failed to enable Triton INT8 kernels")
@@ -993,6 +1556,11 @@ def configure(selection, verbose_level=0, *, resolved=None):
         _wgp = module
         _original_forward = qbytes.WeightQBytesLinearFunction.forward
         qbytes.WeightQBytesLinearFunction.forward = staticmethod(_wgp_quanto_forward)
+        if torch.version.hip is None and torch.cuda.get_device_capability() >= (8, 0):  # the BF16 floor of the Triton kernels
+            try:
+                _column_triton = _probe_rotated_triton()
+            except (ImportError, OSError, RuntimeError):
+                _column_triton = None
     elif backend == "kitchen":
         from optimum.quanto.tensor.weights import qbytes
         _register_ops()

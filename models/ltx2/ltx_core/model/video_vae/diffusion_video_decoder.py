@@ -701,7 +701,8 @@ class DiffusionVideoDecoder(nn.Module):
         pixel_scale = self.upsamples[3].stride[0], self.upsamples[3].stride[1] * self.patch_size, self.upsamples[3].stride[2] * self.patch_size
         spatial = tiling_config.spatial_config if tiling_config is not None else None
         temporal = tiling_config.temporal_config if tiling_config is not None else None
-        spatial_tile = spatial.tile_size_in_pixels if spatial is not None else max(stage4_h * pixel_scale[1], stage4_w * pixel_scale[2])
+        whole = max(stage4_h * pixel_scale[1], stage4_w * pixel_scale[2])
+        spatial_tile = whole if spatial is None else spatial.tile_size_in_pixels if spatial.diffusion_tile_in_pixels is None else spatial.diffusion_tile_in_pixels or whole
         spatial_tile = max(192, spatial_tile)
         temporal_tile = temporal.tile_size_in_frames if temporal is not None else stage4_t * pixel_scale[0] - 1
         temporal_tile = max(48, temporal_tile)

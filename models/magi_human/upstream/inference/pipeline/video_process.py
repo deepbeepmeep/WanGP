@@ -50,7 +50,7 @@ def merge_video_and_audio(video_path: str, audio_path: str, save_path: str):
         "error",
     ]
     try:
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, stdin=subprocess.DEVNULL, check=True)
         os.remove(video_path)
         os.remove(audio_path)
     except subprocess.CalledProcessError as e:

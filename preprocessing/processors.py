@@ -117,8 +117,8 @@ def prepare_generation_assets(model_def, base_model_type, settings, server_confi
     has_guide = guide is not None or settings.get("image_guide") is not None
     definitions = []
     if settings.get("image_refs") and settings.get("remove_background_images_ref", 0) > 0 and not model_def.get("no_background_removal", False):
-        from preprocessing.rembg.assets import ensure_assets
-        ensure_assets()
+        from preprocessing.rembg.assets import ensure_assets, selected_model
+        ensure_assets(model_name=selected_model(model_def.get("background_removal_model", "u2net"), server_config))
     if has_guide and not model_def.get("skip_video_guide_preprocess", False):
         if not model_def.get("custom_preprocessor"):
             kinds = [kind for letter, kind in guide_processes.items() if letter in video_mode]

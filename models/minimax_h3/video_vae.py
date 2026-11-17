@@ -18,9 +18,13 @@
 import torch
 import torch.nn.functional as F
 
-from shared.utils.phase_progress import vae_encoding_progress
+from mmgp import transfer
+
+from shared.image_vae import tiling
+from shared.utils.phase_progress import PhaseProgress, vae_encoding_progress
 from shared.utils.utils import guide_to_float
 
+from .components.sol_decoder import BLOCK as SOL_BLOCK, MiniMaxH3SolDecoder3d
 from .components.video_autoencoder import AutoencoderKLMiniMaxH3, get_linear_split_map as get_video_vae_linear_split_map, group_qkv_rows
 
 
@@ -48,9 +52,11 @@ IMAGE_DECODER = {"decoder_num_layers": 24, "decoder_num_attention_heads": 16, "d
 
 
 class MiniMaxH3VideoVAE(AutoencoderKLMiniMaxH3):
-    def __init__(self, upsampling=False, decoder_num_layers=36, single_frame=False, image_decoder=False):
-        decoder = IMAGE_DECODER if image_decoder else {"decoder_num_layers": decoder_num_layers, "decoder_patch_size_t": 1 if single_frame else None}
+    def __init__(self, upsampling=False, decoder_num_layers=36, single_frame=False, image_decoder=False, sol=False):
+        decoder = IMAGE_DECODER if image_decoder else {"decoder_num_layers": 1 if sol else decoder_num_layers, "decoder_patch_size_t": 1 if single_frame else None}
         super().__init__(out_channels=12 if upsampling else 3, **decoder, latents_mean=LATENTS_MEAN, latents_std=LATENTS_STD)
+        if sol:  # Sol-H3-VAE: the H3 encoder with a 24-layer decoder of whole frames
+            self.decoder = MiniMaxH3SolDecoder3d()
         self.upsampling = upsampling
         self.register_buffer("_latents_mean", torch.tensor(LATENTS_MEAN, dtype=torch.float32, device="cpu"), persistent=upsampling)
         self.register_buffer("_latents_std", torch.tensor(LATENTS_STD, dtype=torch.float32, device="cpu"), persistent=upsampling)
@@ -58,8 +64,12 @@ class MiniMaxH3VideoVAE(AutoencoderKLMiniMaxH3):
         self.register_buffer("pixel_std", torch.tensor(IMAGENET_STD, device="cpu").view(1, 3, 1, 1, 1), persistent=False)
         self._interrupt = False
 
-    @staticmethod
-    def get_VAE_tile_size(vae_config, device_mem_capacity, mixed_precision):
+    def get_VAE_tile_size(self, vae_config, device_mem_capacity, mixed_precision):
+        """H3's own tiles are always 256 pixels, the only size its decoder works with (larger tiles and whole frames come out as a grid
+        of patches): the VAE Tiling setting is the VRAM a decode may use, weights included (shared.image_vae.tiling), recorded here,
+        and sets how many tiles go through the decoder per call. The value returned is the tile size of the post-processing
+        upsamplers that read the model's."""
+        self.decode_vram = tiling.vram_budget(vae_config, device_mem_capacity)
         if vae_config == 0:
             return 256
         return {1: 0, 2: 512, 3: 256}.get(int(vae_config), 128)
@@ -133,6 +143,43 @@ class MiniMaxH3VideoVAE(AutoencoderKLMiniMaxH3):
         mean = self._latents_mean.view(1, -1, 1, 1, 1).to(latents)
         std = self._latents_std.view(1, -1, 1, 1, 1).to(latents)
         return super().decode((latents * std + mean).to(self._model_dtype), return_dict=False, uint8_rounding=uint8_rounding)[0]
+
+    def _decode(self, z, uint8_rounding=None):
+        if not isinstance(self.decoder, MiniMaxH3SolDecoder3d):
+            return super()._decode(z, uint8_rounding)
+        decoder, batch = self.decoder, z.shape[0]
+        if z.shape[2] == 1:  # a lone latent decodes poorly alone (23 to 28 dB to the source, the full VAE 30 to 37): five copies, its first frame kept, as H3's VAE does
+            z = z.repeat(1, 1, SOL_BLOCK, 1, 1)
+            frames = 1
+        else:
+            frames = decoder.output_frames(z.shape[2])
+        decoded, height = None, z.shape[-2] * decoder.patch_size
+        with PhaseProgress(batch * decoder.steps(z.shape[2])) as progress, transfer.RamWriter("decoded video", depth=64, max_bytes=256 << 20) as writer:
+            decoder.progress = progress
+            try:
+                for item in range(batch):
+                    position = 0
+
+                    def emit(pixels, row, last):
+                        """A band of pixel rows (from row on) of the frames of a latent frame, converted on the GPU and written to the RAM
+                        output; last: the frame's last band."""
+                        nonlocal decoded, position
+                        if position >= frames:
+                            return
+                        part = self._prepare_decoded_chunk(pixels[:, :, :frames - position], uint8_rounding)
+                        if decoded is None:
+                            decoded = torch.empty(batch, part.shape[1], frames, height, part.shape[-1], dtype=part.dtype, device="cpu")
+                        target = decoded[item:item + 1, :, position:position + part.shape[2], row:row + part.shape[-2]]
+                        writer.write(target, part) if frames > 1 else transfer.copy_(target, part)  # one picture: one transfer
+                        if last:
+                            position += part.shape[2]
+
+                    decoder(self.post_quant_conv(z[item:item + 1]), emit)
+                    if position != frames:
+                        raise RuntimeError(f"MiniMax H3 Sol VAE decoded {position} frames, expected {frames}")
+            finally:
+                decoder.progress = None
+        return decoded
 
     def _prepare_decoded_chunk(self, chunk, uint8_rounding=None):
         if self.upsampling:

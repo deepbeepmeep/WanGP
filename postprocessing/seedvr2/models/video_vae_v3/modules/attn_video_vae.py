@@ -80,6 +80,9 @@ def _pay_vae_attention(attn, hidden_states, temb):
         hidden_states = hidden_states + residual
     return hidden_states / attn.rescale_output_factor
 
+UPSAMPLE_CHUNK_BYTES = 256 << 20  # bytes of upscale_conv output per call in Upsample3D._upscale (one input frame at least)
+
+
 class Upsample3D(Upsample2D):
     """A 3D upsampling layer with an optional convolution."""
 
@@ -132,6 +135,25 @@ class Upsample3D(Upsample2D):
         else:
             self.Conv2d_0 = conv
 
+    def _upscale(self, x, drop_head):
+        """upscale_conv then the depth-to-space rearrangement (and remove_head when drop_head), by chunks of input frames written into
+        the output: the same values, without the full-size upscale_conv output and its rearranged and head-removed copies."""
+        s, z = self.spatial_ratio, self.temporal_ratio
+        b, c, f, h, w = x.shape
+        out = x.new_empty((b, c, f * z - (1 if drop_head else 0), h * s, w * s))
+        frames = max(1, UPSAMPLE_CHUNK_BYTES // (x[:, :, :1].numel() * x.element_size() * s * s * z))
+        for start in range(0, f, frames):
+            y = rearrange(self.upscale_conv(x[:, :, start:start + frames]), "b (x y z c) f h w -> b c (f z) (h x) (w y)", x=s, y=s, z=z)
+            first = start * z
+            if drop_head and start == 0:  # remove_head: the first frame, then from the third on
+                out[:, :, :1] = y[:, :, :1]
+                y = y[:, :, 2:]
+                first = 2
+            first -= 1 if drop_head else 0
+            out[:, :, first:first + y.size(2)] = y
+            del y
+        return out
+
     def forward(
         self,
         hidden_states_list: list,
@@ -148,6 +170,13 @@ class Upsample3D(Upsample2D):
 
         if self.use_conv_transpose:
             return self.conv(hidden_states)
+
+        if not self.slicing:
+            hidden_states = self._upscale(hidden_states, drop_head=self.temporal_up and memory_state != MemoryState.ACTIVE)
+            if self.use_conv:
+                conv = self.conv if self.name == "conv" else self.Conv2d_0
+                hidden_states = conv(hidden_states, memory_state=memory_state)
+            return hidden_states
 
         if self.slicing:
             split_size = hidden_states.size(2) // 2
@@ -1331,27 +1360,31 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                 progress_callback(1, 1)
             return out
 
-    def slicing_decode(self, z: torch.Tensor, progress_callback=None) -> torch.Tensor:
+    def slicing_decode(self, z: torch.Tensor, progress_callback=None, to_ram: bool = False) -> torch.Tensor:
+        """to_ram: each decoded slice of frames goes to its place in a RAM video as it is decoded (no decoded window in VRAM)."""
         sp_size = 1
         if self.use_slicing and (z.shape[2] - 1) > self.slicing_latent_min_size * sp_size:
             z_slices = z[:, :, 1:].split(split_size=self.slicing_latent_min_size * sp_size, dim=2)
             if callable(progress_callback):
                 progress_callback(0, len(z_slices))
-            decoded_slices = [
-                self._decode(
-                    torch.cat((z[:, :, :1], z_slices[0]), dim=2),
-                    memory_state=MemoryState.INITIALIZING
-                )
-            ]
-            if callable(progress_callback):
-                progress_callback(1, len(z_slices))
-            for z_idx in range(1, len(z_slices)):
-                decoded_slices.append(
-                    self._decode(z_slices[z_idx], memory_state=MemoryState.ACTIVE)
-                )
-                if callable(progress_callback):
-                    progress_callback(z_idx + 1, len(z_slices))
-            out = torch.cat(decoded_slices, dim=2)
+            out, position = None, 0
+            with transfer.RamWriter("decoded video", depth=64, max_bytes=512 << 20) as writer:
+                decoded_slices = []
+                for z_idx in range(len(z_slices)):
+                    piece = self._decode(torch.cat((z[:, :, :1], z_slices[0]), dim=2), memory_state=MemoryState.INITIALIZING) if z_idx == 0 \
+                        else self._decode(z_slices[z_idx], memory_state=MemoryState.ACTIVE)
+                    if not to_ram:
+                        decoded_slices.append(piece)
+                    else:
+                        if out is None:
+                            frames = 1 + (z.shape[2] - 1) * (piece.shape[2] - 1) // max(1, z_slices[0].shape[2])
+                            out = torch.empty((*piece.shape[:2], frames, *piece.shape[3:]), device="cpu", dtype=piece.dtype)
+                        writer.write(out[:, :, position:position + piece.shape[2]], piece)
+                        position += piece.shape[2]
+                    del piece
+                    if callable(progress_callback):
+                        progress_callback(z_idx + 1, len(z_slices))
+            out = torch.cat(decoded_slices, dim=2) if not to_ram else out[:, :, :position]
             # Clear memory efficiently
             modules_with_memory = [m for m in self.modules() 
                                 if isinstance(m, InflatedCausalConv3d) and m.memory is not None]
@@ -1362,6 +1395,8 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
             if callable(progress_callback):
                 progress_callback(0, 1)
             out = self._decode(z)
+            if to_ram:
+                out = out.cpu()
             if callable(progress_callback):
                 progress_callback(1, 1)
             return out
@@ -1568,7 +1603,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                     progress.update(current - progress.n)
                     if callable(progress_callback):
                         progress_callback(current, total_steps)
-                return self.slicing_decode(z, progress_callback=report)
+                return self.slicing_decode(z, progress_callback=report, to_ram=True)
         else:
             if self.debug:
                 self.debug.log(f"Using VAE tiled decoding (Tile: {tile_size}, Overlap: {tile_overlap})", category="vae", force=True, indent_level=1)
@@ -1613,7 +1648,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
             ramp_cache['w'] = 0.5 - 0.5 * torch.cos(t_w * torch.pi)
 
         tile_id = 0
-        with tqdm(total=total_steps, desc="SeedVR2 VAE decode", unit="chunk") as progress:
+        with tqdm(total=total_steps, desc="SeedVR2 VAE decode", unit="chunk") as progress, transfer.RamWriter("decoded video", depth=64, max_bytes=512 << 20) as writer:
             for (row, y_lat), (col, x_lat) in product(enumerate(tile_rows), enumerate(tile_cols)):
                 y_lat_end = min(y_lat + latent_tile_h, H)
                 x_lat_end = min(x_lat + latent_tile_w, W)
@@ -1717,7 +1752,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                         pending_rows = decoded_tile.new_empty((*decoded_tile.shape[:3], h_out - next_y, output_w))
                     pending_rows[..., x_out:x_out + next_x].copy_(decoded_tile[:, :, :, next_y:, :next_x])
                 final = decoded_tile[:, :, :, :next_y, :next_x].div_(count[:, :, :, y_out:y_out + next_y, x_out:x_out + next_x].clamp(min=1e-6))
-                transfer.copy_(result[:, :, : decoded_tile.shape[2], y_out:y_out + next_y, x_out:x_out + next_x], final)  # (to RAM, without a GPU copy of the tile)
+                writer.write(result[:, :, : decoded_tile.shape[2], y_out:y_out + next_y, x_out:x_out + next_x], final)  # (to RAM, the GPU not waiting)
                 final = decoded_tile = None
 
         if z.shape[2] == 1:  # single frame

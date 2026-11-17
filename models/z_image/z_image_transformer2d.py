@@ -130,9 +130,8 @@ class Attention(nn.Module):
     def forward(self, h_list: list, freqs_cis: torch.Tensor, NAG= None) -> torch.Tensor:
         """Compute self-attention with RoPE. h_list is cleared to free memory early."""
         if NAG is None:
-            out = attention_kit.qkv_attention(h_list, self.to_q, self.to_k, self.to_v, self.n_heads, self.head_dim,
-                                              lambda query, key, group: self._norm_rope_(query, key, freqs_cis))
-            return self.to_out(out.flatten(2, 3))
+            return attention_kit.qkv_attention(h_list, self.to_q, self.to_k, self.to_v, self.n_heads, self.head_dim,
+                                               lambda query, key, group: self._norm_rope_(query, key, freqs_cis), out_proj=self.to_out[0])
         h = h_list.pop()
         query = self.to_q(h)
         key = self.to_k(h)

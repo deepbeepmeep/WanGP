@@ -86,206 +86,12 @@ class Attention(nn.Module):
             return _run_sparse_attention([q, k, v], out_dtype, shape, self.bsa_params)
         return _run_attention([q, k, v], out_dtype)
 
-    def forward(self, x: torch.Tensor, shape=None, num_cond_latents=None, return_kv=False, num_ref_latents=None, ref_img_index=None, mask_frame_range=None, ref_target_masks=None) -> torch.Tensor:
-        """
-        """
-        x = _take_tensor(x)
-        B, N, C = x.shape
-        out_dtype = x.dtype
-        qkv = self.qkv(x)
-        x = None
-        if qkv.dtype != out_dtype:
-            qkv = qkv.to(out_dtype)
-
-        qkv_shape = (B, N, 3, self.num_heads, self.head_dim)
-        qkv = qkv.view(qkv_shape)
-        q, k, v = qkv.unbind(2)
-        q, k = self.q_norm(q), self.k_norm(k)
-        v = v.contiguous()
-        del qkv
-
-        if return_kv:
-            k_cache, v_cache = k.clone(), v.clone()
-
-        q, k = self.rope_3d(q, k, shape, ref_img_index, num_ref_latents)
-
-        N_t, N_h, N_w = shape
-        # cond mode
-        if num_cond_latents is not None and num_cond_latents == 1:
-            # image to video
-            num_cond_latents_thw = num_cond_latents * (N // N_t)
-            # process the condition tokens
-            q_cond = q[:, :num_cond_latents_thw].contiguous()
-            k_cond = k[:, :num_cond_latents_thw].contiguous()
-            v_cond = v[:, :num_cond_latents_thw].contiguous()
-            x_cond = self._process_attn(q_cond, k_cond, v_cond, shape, out_dtype)
-            # process the noise tokens
-            q_noise = q[:, num_cond_latents_thw:].contiguous()
-            x_noise = self._process_attn(q_noise, k, v, shape, out_dtype)
-            # merge x_cond and x_noise
-            x = x_cond.new_empty(B, N, self.num_heads, self.head_dim)
-            x[:, :num_cond_latents_thw].copy_(x_cond)
-            x[:, num_cond_latents_thw:].copy_(x_noise)
-            del x_cond, x_noise
-        elif num_cond_latents is not None and num_cond_latents > 1:
-            # video continuation
-            assert num_ref_latents is not None and ref_img_index is not None, f"No specified insertion position for reference frame"
-            num_ref_latents_thw = (N // N_t)
-            num_cond_latents_thw = num_cond_latents * (N // N_t)
-            # process the condition tokens
-            q_ref = q[:, :num_ref_latents_thw].contiguous()
-            k_ref = k[:, :num_ref_latents_thw].contiguous()
-            v_ref = v[:, :num_ref_latents_thw].contiguous()
-            q_cond = q[:, num_ref_latents_thw:num_cond_latents_thw].contiguous()
-            k_cond = k[:, num_ref_latents_thw:num_cond_latents_thw].contiguous()
-            v_cond = v[:, num_ref_latents_thw:num_cond_latents_thw].contiguous()
-            x_ref = self._process_attn(q_ref, k_ref, v_ref, shape, out_dtype)
-            x_cond = self._process_attn(q_cond, k_cond, v_cond, shape, out_dtype)
-            if num_cond_latents == N_t:
-                x = x_ref.new_empty(B, num_cond_latents_thw, self.num_heads, self.head_dim)
-                x[:, :num_ref_latents_thw].copy_(x_ref)
-                x[:, num_ref_latents_thw:num_cond_latents_thw].copy_(x_cond)
-                del x_ref, x_cond
-            else:
-                # process the noise tokens
-                q_noise = q[:, num_cond_latents_thw:].contiguous()
-                
-                start_noise, end_noise, num_noisy_frames = 0, 0, N_t - num_cond_latents
-                if mask_frame_range is not None and mask_frame_range > 0:
-                    start_noise = ref_img_index - mask_frame_range - num_cond_latents + num_ref_latents
-                    end_noise   = ref_img_index + mask_frame_range - num_cond_latents + num_ref_latents + 1
-
-                if start_noise >= 0 and end_noise > start_noise and end_noise <= num_noisy_frames:
-                    # remove attention with the reference image in the target range, preventing repeated actions.
-                    start_pos = start_noise * (N // N_t)
-                    end_pos   = end_noise * (N // N_t)
-                    q_noise_front = q_noise[:, :start_pos].contiguous()
-                    q_noise_maskref = q_noise[:, start_pos:end_pos].contiguous()
-                    q_noise_back = q_noise[:, end_pos:].contiguous()
-                    k_non_ref = k[:, num_ref_latents_thw:].contiguous()
-                    v_non_ref = v[:, num_ref_latents_thw:].contiguous()
-                    x_noise_front = self._process_attn(q_noise_front, k, v, shape, out_dtype) # q_front has attention with ref + cond + noisy
-                    x_noise_back = self._process_attn(q_noise_back, k, v, shape, out_dtype) # q_back has attention with ref + cond + noisy
-                    x_noise_maskref = self._process_attn(q_noise_maskref, k_non_ref, v_non_ref, shape, out_dtype) # q_mask has attention with cond+noisy
-                    x_noise = x_noise_front.new_empty(B, q_noise.shape[1], self.num_heads, self.head_dim)
-                    x_noise[:, :start_pos].copy_(x_noise_front)
-                    x_noise[:, start_pos:end_pos].copy_(x_noise_maskref)
-                    x_noise[:, end_pos:].copy_(x_noise_back)
-                    del x_noise_front, x_noise_maskref, x_noise_back
-                else:
-                    x_noise = self._process_attn(q_noise, k, v, shape, out_dtype)
-                # merge x_cond and x_noise
-                x = x_ref.new_empty(B, N, self.num_heads, self.head_dim)
-                x[:, :num_ref_latents_thw].copy_(x_ref)
-                x[:, num_ref_latents_thw:num_cond_latents_thw].copy_(x_cond)
-                x[:, num_cond_latents_thw:].copy_(x_noise)
-                del x_ref, x_cond, x_noise
-
-        else:
-            # text to video
-            x = self._process_attn(q, k, v, shape, out_dtype)
-
-        x_output_shape = (B, N, C)
-        x = x.reshape(x_output_shape)
-        x = self.proj(x)
-
-        # calculate attention mask for the given area in reference image
-        x_ref_attn_map = None
-        if ref_target_masks is not None:
-            assert num_cond_latents is not None and num_cond_latents > 0, f"currently, multitalk only supports image to video or video continuation"
-            x_ref_attn_map = get_attn_map_with_target(
-                q[:, num_cond_latents_thw:].type_as(x),
-                k.type_as(x),
-                shape,
-                ref_target_masks=ref_target_masks,
-                cp_split_hw=self.cp_split_hw,
-            )
-        q = k = v = None
-
-        if return_kv:
-            return x, (k_cache, v_cache), x_ref_attn_map
-        else:
-            return x, x_ref_attn_map
-
-    def forward_with_kv_cache(self, x: torch.Tensor, shape=None, num_cond_latents=None, kv_cache=None, num_ref_latents=None, ref_img_index=None, mask_frame_range=None, ref_target_masks=None) -> torch.Tensor:
-        """
-        """
-        x = _take_tensor(x)
-        B, N, C = x.shape
-        out_dtype = x.dtype
-        qkv = self.qkv(x)
-        x = None
-        if qkv.dtype != out_dtype:
-            qkv = qkv.to(out_dtype)
-        
-        qkv_shape = (B, N, 3, self.num_heads, self.head_dim)
-        qkv = qkv.view(qkv_shape)
-        q, k, v = qkv.unbind(2)
-        q, k = self.q_norm(q), self.k_norm(k)
-        v = v.contiguous()
-        del qkv
-
-        N_t, N_h, N_w = shape
-        k_cache, v_cache = kv_cache
-        if k_cache.shape[0] == 1:
-            k_cache = k_cache.repeat(B, 1, 1, 1)
-            v_cache = v_cache.repeat(B, 1, 1, 1)
-        
-        if num_cond_latents is not None and num_cond_latents > 0:
-            k_full = torch.cat([k_cache, k], dim=1).contiguous()
-            v_full = torch.cat([v_cache, v], dim=1).contiguous()
-            q_padding = torch.cat([torch.empty_like(k_cache), q], dim=1).contiguous()
-            q_padding, k_full = self.rope_3d(q_padding, k_full, (N_t + num_cond_latents, N_h, N_w), ref_img_index, num_ref_latents)
-            q = q_padding[:, -N:].contiguous()
-            del q_padding
-        else:
-            k_full = k
-            v_full = v
-        
-        start_noise, end_noise, num_noisy_frames = 0, 0, N_t
-        if mask_frame_range is not None and mask_frame_range > 0:
-            start_noise = ref_img_index - mask_frame_range - num_cond_latents + num_ref_latents 
-            end_noise   = ref_img_index + mask_frame_range - num_cond_latents + num_ref_latents + 1 
-        
-        if start_noise >= 0 and end_noise > start_noise and end_noise <= num_noisy_frames:
-            # remove attention with the reference image in the target range, preventing repeated actions.
-            num_ref_latents_thw = (N // N_t)
-            start_pos = start_noise * (N // N_t)
-            end_pos   = end_noise * (N // N_t)
-            q_noise_front = q[:, :start_pos].contiguous()
-            q_noise_maskref = q[:, start_pos:end_pos].contiguous()
-            q_noise_back = q[:, end_pos:].contiguous()
-            k_non_ref = k_full[:, num_ref_latents_thw:].contiguous()
-            v_non_ref = v_full[:, num_ref_latents_thw:].contiguous()
-            x_noise_front = self._process_attn(q_noise_front, k_full, v_full, shape, out_dtype) # q_front --> ref+cond+noisy
-            x_noise_back = self._process_attn(q_noise_back, k_full, v_full, shape, out_dtype) # q_back --> ref+cond+noisy
-            x_noise_maskref = self._process_attn(q_noise_maskref, k_non_ref, v_non_ref, shape, out_dtype) # q_mask --> cond+noisy
-            x = x_noise_front.new_empty(B, N, self.num_heads, self.head_dim)
-            x[:, :start_pos].copy_(x_noise_front)
-            x[:, start_pos:end_pos].copy_(x_noise_maskref)
-            x[:, end_pos:].copy_(x_noise_back)
-            del x_noise_front, x_noise_maskref, x_noise_back
-        else:
-            x = self._process_attn(q, k_full, v_full, shape, out_dtype)
-        
-        x_output_shape = (B, N, C)
-        x = x.reshape(x_output_shape) 
-        x = self.proj(x)
-
-        # calculate attention mask for the given area in reference image
-        x_ref_attn_map = None
-        if ref_target_masks is not None:
-            assert num_cond_latents is not None and num_cond_latents > 0, f"currently, multitalk only supports image to video or video continuation"
-            x_ref_attn_map = get_attn_map_with_target(
-                q.type_as(x),
-                k_full.type_as(x),
-                shape,
-                ref_target_masks=ref_target_masks,
-                cp_split_hw=self.cp_split_hw,
-            )
-        q = k = v = k_full = v_full = None
-
-        return x, x_ref_attn_map
+    def forward(self, x, shape=None, num_cond_latents=0, return_kv=False, num_ref_latents=None, ref_img_index=None, mask_frame_range=None, ref_target_masks=None, layer_cache=None, rope=None):
+        from ..prefix_attention import prefix_attention
+        output, ref_map = prefix_attention(
+            self, x, shape, num_cond_latents, avatar=True, layer_cache=layer_cache,
+            build_cache=return_kv, rope=rope, num_ref_latents=num_ref_latents, ref_img_index=ref_img_index, mask_frame_range=mask_frame_range, ref_target_masks=ref_target_masks)
+        return output, ref_map
 
 
 class SingleStreamAttention(nn.Module):
@@ -363,7 +169,7 @@ class SingleStreamAttention(nn.Module):
             human1 = normalize_and_scale(x_ref_attn_map[0], (human1_min_value, human1_max_value), (self.rope_h1[0], self.rope_h1[1]))
             human2 = normalize_and_scale(x_ref_attn_map[1], (human2_min_value, human2_max_value), (self.rope_h2[0], self.rope_h2[1]))
             background_pos = self.rope_bak if x_ref_attn_map.shape[0] <= 3 else 100
-            back   = torch.full((x_ref_attn_map.size(1),), background_pos, dtype=human1.dtype).to(human1.device)
+            back = torch.full((x_ref_attn_map.size(1),), background_pos, dtype=human1.dtype, device=human1.device)
             max_indices = x_ref_attn_map.argmax(dim=0).clamp(max=2)
             normalized_map = torch.stack([human1, human2, back], dim=1)
             normalized_pos = normalized_map[range(x_ref_attn_map.size(1)), max_indices] 
@@ -386,7 +192,7 @@ class SingleStreamAttention(nn.Module):
 
         # multitalk with rope1d pe
         if x_ref_attn_map is not None:
-            per_frame = torch.zeros(N_a, dtype=encoder_k.dtype).to(encoder_k.device)
+            per_frame = torch.zeros(N_a, dtype=encoder_k.dtype, device=encoder_k.device)
             human1_pos = (self.rope_h1[0] + self.rope_h1[1]) / 2
             human2_pos = (self.rope_h2[0] + self.rope_h2[1]) / 2
             if human_num is not None and human_num > 2:

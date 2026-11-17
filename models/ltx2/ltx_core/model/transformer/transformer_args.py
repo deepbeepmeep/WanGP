@@ -53,21 +53,18 @@ class TransformerArgs:
     ref_context: torch.Tensor | None = None
 
 
-@dataclass(frozen=True)
-class FunctionalTimestepEmbedder:
-    num_channels: int
-    flip_sin_to_cos: bool
-    downscale_freq_shift: float
-    scale: float
-    linear_1_weight: torch.Tensor
-    linear_1_bias: torch.Tensor | None
-    linear_2_weight: torch.Tensor
-    linear_2_bias: torch.Tensor | None
-
-
 def _can_broadcast_timesteps(frame_indices: torch.Tensor | None, frame_count: int) -> bool:
+    """Whether the tokens come by frames of equal length in order (timesteps then one per frame): checked on the device once per
+    frame_indices tensor (one per latent state's plan, reused at every step) and frame count, not at every call (the check synchronizes)."""
     if frame_indices is None or frame_indices.ndim != 2:
         return False
+    verdicts = frame_indices.__dict__.setdefault("_broadcast_verdicts", {})
+    if frame_count not in verdicts:
+        verdicts[frame_count] = _check_broadcast_timesteps(frame_indices, frame_count)
+    return verdicts[frame_count]
+
+
+def _check_broadcast_timesteps(frame_indices: torch.Tensor, frame_count: int) -> bool:
     token_count = frame_indices.shape[1]
     if frame_count <= 0 or token_count % frame_count != 0:
         return False
@@ -104,72 +101,21 @@ def _embed_timestep_functional(
     timestep: torch.Tensor,
     hidden_dtype: torch.dtype,
     out_device: torch.device,
-    embedder_copy: FunctionalTimestepEmbedder | None = None,
 ) -> torch.Tensor:
-    if embedder_copy is None:
-        emb = adaln.emb
-        time_proj = emb.time_proj
-        linear_1 = emb.timestep_embedder.linear_1
-        linear_2 = emb.timestep_embedder.linear_2
-        num_channels = time_proj.num_channels
-        flip_sin_to_cos = time_proj.flip_sin_to_cos
-        downscale_freq_shift = time_proj.downscale_freq_shift
-        scale = time_proj.scale
-        linear_1_weight = linear_1.weight
-        linear_1_bias = linear_1.bias
-        linear_2_weight = linear_2.weight
-        linear_2_bias = linear_2.bias
-    else:
-        num_channels = embedder_copy.num_channels
-        flip_sin_to_cos = embedder_copy.flip_sin_to_cos
-        downscale_freq_shift = embedder_copy.downscale_freq_shift
-        scale = embedder_copy.scale
-        linear_1_weight = embedder_copy.linear_1_weight
-        linear_1_bias = embedder_copy.linear_1_bias
-        linear_2_weight = embedder_copy.linear_2_weight
-        linear_2_bias = embedder_copy.linear_2_bias
-    weight_device = linear_1_weight.device
-    compute_dtype = linear_1_weight.dtype
+    # the weights are read outside the embedder's forward: MMGP keeps them with the model's base (X0Model._offload_base_modules)
+    time_proj, embedder = adaln.emb.time_proj, adaln.emb.timestep_embedder
+    linear_1, linear_2 = embedder.linear_1, embedder.linear_2
     timesteps_proj = get_timestep_embedding(
-        timestep.to(device=weight_device),
-        num_channels,
-        flip_sin_to_cos=flip_sin_to_cos,
-        downscale_freq_shift=downscale_freq_shift,
-        scale=scale,
-    ).to(dtype=compute_dtype)
-    hidden_states = F.linear(timesteps_proj, linear_1_weight, linear_1_bias)
-    hidden_states = F.silu(hidden_states)
-    hidden_states = F.linear(hidden_states, linear_2_weight, linear_2_bias)
-    return hidden_states.to(device=out_device, dtype=hidden_dtype)
-
-
-def _duplicate_tensor_to_device(tensor: torch.Tensor | None, device: torch.device) -> torch.Tensor | None:
-    if tensor is None:
-        return None
-    return tensor.detach().to(device=device, copy=True)
-
-
-def _duplicate_timestep_embedder(
-    adaln: AdaLayerNormSingle | None,
-    device: torch.device,
-) -> FunctionalTimestepEmbedder | None:
-    if adaln is None or device.type != "cuda":
-        return None
-    emb = adaln.emb
-    time_proj = emb.time_proj
-    timestep_embedder = emb.timestep_embedder
-    linear_1 = timestep_embedder.linear_1
-    linear_2 = timestep_embedder.linear_2
-    return FunctionalTimestepEmbedder(
-        num_channels=time_proj.num_channels,
+        timestep.to(device=linear_1.weight.device),
+        time_proj.num_channels,
         flip_sin_to_cos=time_proj.flip_sin_to_cos,
         downscale_freq_shift=time_proj.downscale_freq_shift,
         scale=time_proj.scale,
-        linear_1_weight=_duplicate_tensor_to_device(linear_1.weight, device),
-        linear_1_bias=_duplicate_tensor_to_device(linear_1.bias, device),
-        linear_2_weight=_duplicate_tensor_to_device(linear_2.weight, device),
-        linear_2_bias=_duplicate_tensor_to_device(linear_2.bias, device),
-    )
+    ).to(dtype=linear_1.weight.dtype)
+    hidden_states = F.linear(timesteps_proj, linear_1.weight, linear_1.bias)
+    hidden_states = F.silu(hidden_states)
+    hidden_states = F.linear(hidden_states, linear_2.weight, linear_2.bias)
+    return hidden_states.to(device=out_device, dtype=hidden_dtype)
 
 
 class TransformerArgsPreprocessor:
@@ -202,9 +148,6 @@ class TransformerArgsPreprocessor:
         self.double_precision_rope = double_precision_rope
         self.positional_embedding_theta = positional_embedding_theta
         self.rope_type = rope_type
-        self._phase_timestep_device: torch.device | None = None
-        self._phase_main_timestep_embedder: FunctionalTimestepEmbedder | None = None
-        self._phase_prompt_timestep_embedder: FunctionalTimestepEmbedder | None = None
 
     def _rope_cache_key(
         self,
@@ -246,22 +189,6 @@ class TransformerArgsPreprocessor:
         embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.shape[-1])
         return self._finalize_timestep_outputs(embedded_timestep, adaln, batch_size, frame_indices)
 
-    def _ensure_phase_timestep_embedders(self, device: torch.device) -> None:
-        if device.type != "cuda":
-            self.clear_phase_timestep_embedders()
-            return
-        if self._phase_timestep_device == device and self._phase_main_timestep_embedder is not None:
-            return
-        self.clear_phase_timestep_embedders()
-        self._phase_timestep_device = torch.device(device)
-        self._phase_main_timestep_embedder = _duplicate_timestep_embedder(self.adaln, device)
-        self._phase_prompt_timestep_embedder = _duplicate_timestep_embedder(self.prompt_adaln, device)
-
-    def clear_phase_timestep_embedders(self) -> None:
-        self._phase_timestep_device = None
-        self._phase_main_timestep_embedder = None
-        self._phase_prompt_timestep_embedder = None
-
     def _normalize_sigma_batch(self, sigma: torch.Tensor, reference: torch.Tensor, batch_size: int) -> torch.Tensor:
         sigma_batch = sigma.to(device=reference.device, dtype=reference.dtype)
         if sigma_batch.ndim == 0:
@@ -294,7 +221,6 @@ class TransformerArgsPreprocessor:
         frame_indices: torch.Tensor | None = None,
         scale_multiplier: float | int | None = None,
         include_embedded: bool = True,
-        embedder_copy: FunctionalTimestepEmbedder | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if base_timestep is None:
             return None, None
@@ -308,7 +234,6 @@ class TransformerArgsPreprocessor:
             step_timestep.flatten(),
             hidden_dtype,
             base_timestep.device,
-            embedder_copy=embedder_copy,
         )
         embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.shape[-1])
         timestep, embedded = self._finalize_timestep_outputs(embedded_timestep, adaln, batch_size, frame_indices)
@@ -456,7 +381,6 @@ class TransformerArgsPreprocessor:
         prepared = self._get_prepared_conditioning(modality.context)
         if prepared is not None:
             return prepared
-        self._ensure_phase_timestep_embedders(modality.latent.device)
         self._get_runtime_timestep_bases(modality)
         projected_context = self.caption_projection(modality.context) if self.caption_projection is not None else None
         return PreparedConditioning(context=modality.context, projected_context=projected_context)
@@ -488,7 +412,6 @@ class TransformerArgsPreprocessor:
             x.shape[0],
             latent_dtype,
             frame_indices=modality.frame_indices,
-            embedder_copy=self._phase_main_timestep_embedder,
         )
         if timestep is None or embedded_timestep is None:
             timestep, embedded_timestep = self._prepare_timestep(
@@ -508,7 +431,6 @@ class TransformerArgsPreprocessor:
                 x.shape[0],
                 latent_dtype,
                 include_embedded=False,
-                embedder_copy=self._phase_prompt_timestep_embedder,
             )
             if prompt_timestep is None:
                 prompt_timestep, _ = self._prepare_timestep(modality.sigma, self.prompt_adaln, x.shape[0], latent_dtype)
@@ -585,30 +507,8 @@ class MultiModalTransformerArgsPreprocessor:
         self.cross_pe_max_pos = cross_pe_max_pos
         self.audio_cross_attention_dim = audio_cross_attention_dim
         self.av_ca_timestep_scale_multiplier = av_ca_timestep_scale_multiplier
-        self._phase_cross_scale_shift_timestep_embedder: FunctionalTimestepEmbedder | None = None
-        self._phase_cross_gate_timestep_embedder: FunctionalTimestepEmbedder | None = None
-
-    def _ensure_phase_timestep_embedders(self, device: torch.device) -> None:
-        self.simple_preprocessor._ensure_phase_timestep_embedders(device)
-        if device.type != "cuda":
-            self._phase_cross_scale_shift_timestep_embedder = None
-            self._phase_cross_gate_timestep_embedder = None
-            return
-        if (
-            self.simple_preprocessor._phase_timestep_device == device
-            and self._phase_cross_scale_shift_timestep_embedder is not None
-        ):
-            return
-        self._phase_cross_scale_shift_timestep_embedder = _duplicate_timestep_embedder(self.cross_scale_shift_adaln, device)
-        self._phase_cross_gate_timestep_embedder = _duplicate_timestep_embedder(self.cross_gate_adaln, device)
-
-    def clear_phase_timestep_embedders(self) -> None:
-        self.simple_preprocessor.clear_phase_timestep_embedders()
-        self._phase_cross_scale_shift_timestep_embedder = None
-        self._phase_cross_gate_timestep_embedder = None
 
     def build_prepared_conditioning(self, modality: Modality) -> PreparedConditioning:
-        self._ensure_phase_timestep_embedders(modality.latent.device)
         return self.simple_preprocessor.build_prepared_conditioning(modality)
 
     def prepare(
@@ -677,7 +577,6 @@ class MultiModalTransformerArgsPreprocessor:
             frame_indices=frame_indices,
             scale_multiplier=timestep_scale_multiplier,
             include_embedded=False,
-            embedder_copy=self._phase_cross_scale_shift_timestep_embedder,
         )
         if scale_shift_timestep is None:
             scale_shift_timestep, _ = self.simple_preprocessor._prepare_timestep(
@@ -697,7 +596,6 @@ class MultiModalTransformerArgsPreprocessor:
             frame_indices=frame_indices,
             scale_multiplier=self.av_ca_timestep_scale_multiplier,
             include_embedded=False,
-            embedder_copy=self._phase_cross_gate_timestep_embedder,
         )
         if gate_noise_timestep is None:
             gate_noise_timestep, _ = self.simple_preprocessor._prepare_timestep(

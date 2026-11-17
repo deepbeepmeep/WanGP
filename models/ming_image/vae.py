@@ -3,17 +3,17 @@
 import torch
 
 from models.qwen.autoencoder_kl_qwenimage import AutoencoderKLQwenImage
+from shared.image_vae import tiling
 from shared.utils.phase_progress import check_abort
 
 
 class MingImageVAE(AutoencoderKLQwenImage):
     @staticmethod
-    def get_VAE_tile_size(vae_config, device_mem_capacity, mixed_precision):
-        # Match Qwen Image 2.1's memory tiers. Sizes are input/output pixels;
-        # the shared autoencoder applies the same tiling to encode and decode.
-        if vae_config == 0:
-            vae_config = 1 if device_mem_capacity >= 16000 else 2 if device_mem_capacity >= 8000 else 3
-        return True, {1: 1024, 2: 512, 3: 256}[vae_config]
+    def get_VAE_tile_size(vae_config, device_mem_capacity, mixed_precision, output_height=None, output_width=None):
+        """(tiling, tile size in input / output pixels, for encoding and decoding): the largest tile within the VAE Tiling setting's
+        share of the VRAM, no tiling when the whole picture fits (the first Qwen VAE's measured costs)."""
+        tile = tiling.choose_tile(vae_config, device_mem_capacity, AutoencoderKLQwenImage.COSTS, output_height, output_width)
+        return tile > 0, tile or 256
 
     def configure_tiling(self, tile_setting):
         if tile_setting is None or (isinstance(tile_setting, int) and not isinstance(tile_setting, bool)):

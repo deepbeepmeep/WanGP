@@ -25,7 +25,7 @@ def remove_background(image):
     (BackgroundRemover: no alpha matting, transparent white background), with BiRefNet General instead of u2net (no cast shadows)."""
     if image.mode == "RGBA" and image.getextrema()[3][0] < 255:
         return image
-    from rembg import remove
+    from preprocessing.rembg.native import remove
     from preprocessing.rembg.assets import OBJECT_MODEL
     from shared.utils.utils import new_rembg_session
 

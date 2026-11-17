@@ -1,5 +1,6 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
-"""Fused GroupNorm + SiLU + replicate padding of the causal 3D VAE (the input of each 3x3x3 convolution): one read for the statistics,
+"""Fused GroupNorm + SiLU + replicate padding of the causal 3D VAEs with GroupNorm (HunyuanVideo, Kandinsky 5 and 6: the input of each
+3x3x3 convolution): one read for the statistics,
 one read and one write of the padded convolution input, instead of the GroupNorm, SiLU and padding passes. FP32 arithmetic in registers;
 the norm output is rounded to the activation dtype before the SiLU, as in the PyTorch path, and the per-channel affine follows PyTorch's
 fused parameters (a * x + b, from the group mean and rstd rounded to the activation dtype, as PyTorch stores them). Only the group

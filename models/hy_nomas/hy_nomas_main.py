@@ -25,6 +25,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from models.hyvideo.text_encoder.text_encoder_1_5 import PROMPT_TEMPLATE, TextEncoder as QwenTextEncoder
+from shared.image_vae.output import float_to_video_bytes
 from shared.utils import files_locator as fl
 from shared.utils.phase_progress import check_abort, generation_progress, set_phase_status
 from shared.utils.text_encoder_cache import TextEncoderCache
@@ -51,6 +52,12 @@ KEEP_DECODED_FRAMES = True  # the open world's decoded frames (its video, then e
 def _to_uint8(video):
     """(3, frames, height, width) in [-1, 1] -> uint8 (frames, height, width, 3) on the CPU."""
     return ((video.float() + 1) * 127.5).round().clamp_(0, 255).to(torch.uint8).permute(1, 2, 3, 0).cpu().numpy()
+
+
+def _video_and_world_bytes(frames):
+    """Clamped frames (3, n, height, width) as (6, n, height, width) bytes: WanGP's bytes of the video (shared.image_vae.output.
+    float_to_video_bytes: the conversion WanGP applies to a float video), then the rounded bytes the world keeps (_to_uint8)."""
+    return torch.cat([float_to_video_bytes(frames), ((frames.float() + 1) * 127.5).round().clamp_(0, 255).to(torch.uint8)])
 
 
 def flow_sigmas(steps):
@@ -202,8 +209,9 @@ class model_factory:
 
     @staticmethod
     def _last_frame_jpeg(video, size=None):
-        """The clip's last frame as JPEG, within size x size (None: the world's resolution)."""
-        frame = ((video[:, -1].float().clamp(-1, 1) + 1) * 127.5).round().to(torch.uint8).permute(1, 2, 0).cpu().numpy()
+        """The clip's last frame as JPEG, within size x size (None: the world's resolution); video in [-1, 1], or its rounded bytes."""
+        frame = video[:, -1] if video.dtype == torch.uint8 else ((video[:, -1].float().clamp(-1, 1) + 1) * 127.5).round().to(torch.uint8)
+        frame = frame.permute(1, 2, 0).cpu().numpy()
         image = Image.fromarray(frame)
         if size is not None:
             image.thumbnail((size, size))
@@ -301,6 +309,7 @@ class model_factory:
         del noise
 
         world_output = world_output or "world"
+        rounded = None
         latents_out = latents_out if base is None else torch.cat([base.latents.to(device), latents_out], dim=2)
         if world_output == "world":  # no video: only its last frames, for the world's still
             start = max(0, latents_out.shape[2] - 2 * OVERLAP)
@@ -309,10 +318,12 @@ class model_factory:
             video, head = self._decode_tail(latents_out, latent_frames, None)
             video = torch.cat([video, head[:, -TEMPORAL_RATIO:].clamp(-1, 1)], dim=1)[:, :frame_num]
             del head
-        else:
-            video = self.decoder.decode(latents_out)
+        else:  # the whole video, to RAM window after window: WanGP's bytes, and the rounded bytes the world keeps (Replay / Record)
+            decoded = self.decoder.decode_to_ram(latents_out, _video_and_world_bytes)
+            video, rounded = decoded[:3], decoded[3:]
+            del decoded
         # the world's whole video, kept for Replay / Record (before the length trim); a continuation's is decoded when they need it
-        world_frames = _to_uint8(video) if KEEP_DECODED_FRAMES and world_output == "world_video" and base is None else None
+        world_frames = rounded.permute(1, 2, 3, 0).numpy() if KEEP_DECODED_FRAMES and world_output == "world_video" and base is None else None
         history.release_working_set()
         if world_output == "video":
             self.close_session()
@@ -339,7 +350,8 @@ class model_factory:
         manifest["world_id"] = uuid.uuid4().hex
         latents_out = latents_out.cpu()
         # a small thumbnail for the gallery strip, the full resolution frame for the viewer's still
-        side_file = world_file.build(manifest, latents_out, text_states, camera, self._last_frame_jpeg(video, 320), self._last_frame_jpeg(video))
+        last = video if rounded is None else rounded[:, :frame_num]  # (the rounded bytes of a whole video: the still's pixels as before)
+        side_file = world_file.build(manifest, latents_out, text_states, camera, self._last_frame_jpeg(last, 320), self._last_frame_jpeg(last))
         self.session = WorldSession(manifest, history, latents_out, text_states, camera, world_latents=latents_out.shape[2], world_frames=world_frames)
         return {"x": video, "side_files": {world_file.EXTENSION: side_file}}
 

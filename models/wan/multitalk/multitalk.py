@@ -41,9 +41,9 @@ def loudness_norm(audio_array, sr=16000, lufs=-23):
     return normalized_audio
 
  
-def get_embedding(speech_array, wav2vec_feature_extractor, audio_encoder, sr=16000, device='cpu', fps = 25):
+def get_embedding(speech_array, wav2vec_feature_extractor, audio_encoder, sr=16000, device='cpu', fps = 25, seq_len = None):
     audio_duration = len(speech_array) / sr
-    video_length = audio_duration * fps
+    video_length = audio_duration * fps if seq_len is None else seq_len  # seq_len: the frames the audio lasts, when the caller counted them
 
     # wav2vec_feature_extractor
     audio_feature = np.squeeze(
@@ -66,6 +66,43 @@ def get_embedding(speech_array, wav2vec_feature_extractor, audio_encoder, sr=160
     audio_emb = audio_emb.cpu().detach()
     return audio_emb
 
+
+class GuideEmbeddings:
+    """The audio guide of one speaker as the table the windows read: one row of embeddings per video frame.
+
+    The encoder compares every moment of what it is given with every other: its memory grows with the square of the length. A guide of
+    BLOCK_FRAMES at most goes through it in one pass, as it always did. A longer one is cut in blocks of BLOCK_FRAMES, each embedded with
+    MARGIN_FRAMES of the audio around it (dropped from the result) when the first window that reads it comes, and released once the
+    windows are past it: memory and time follow the video, not the guide."""
+    BLOCK_FRAMES, MARGIN_FRAMES = 3000, 150  # with 150 frames around a block, its first and last frames are as close to a one-pass result as any other (50: measurably less)
+
+    def __init__(self, speech_array, sr, fps):
+        self.speech_array, self.sr, self.fps = speech_array, sr, fps
+        self.shape = (int(len(speech_array) / sr * fps),)
+        self.blocks = {}
+
+    def _block(self, no, encoder):
+        frames = self.shape[0]
+        if frames <= self.BLOCK_FRAMES:
+            return get_embedding(self.speech_array, *encoder, sr=self.sr, fps=self.fps)
+        start, stop = no * self.BLOCK_FRAMES, min((no + 1) * self.BLOCK_FRAMES, frames)
+        first, last = max(0, start - self.MARGIN_FRAMES), min(frames, stop + self.MARGIN_FRAMES)
+        samples = self.speech_array[round(first * self.sr / self.fps): len(self.speech_array) if last == frames else round(last * self.sr / self.fps)]
+        return get_embedding(samples, *encoder, sr=self.sr, fps=self.fps, seq_len=last - first)[start - first: stop - first]
+
+    def rows(self, indices, encoder):
+        """The rows of these frame indices. encoder: a list that receives the feature extractor and the encoder when a block has to be
+        embedded, so that one load serves every speaker of a window."""
+        first, last = int(indices.min()) // self.BLOCK_FRAMES, int(indices.max()) // self.BLOCK_FRAMES
+        self.blocks = {no: block for no, block in self.blocks.items() if first <= no <= last}
+        for no in range(first, last + 1):
+            if no not in self.blocks:
+                if not encoder:
+                    encoder.extend(custom_init('cpu', fl.locate_folder("chinese-wav2vec2-base")))
+                self.blocks[no] = self._block(no, encoder)
+        table = self.blocks[first] if first == last else torch.cat([self.blocks[no] for no in range(first, last + 1)])
+        return table[indices - first * self.BLOCK_FRAMES]
+
 def extract_audio_from_video(filename, sample_rate):
     raw_audio_path = filename.split('/')[-1].split('.')[0]+'.wav'
     ffmpeg_command = [
@@ -82,14 +119,14 @@ def extract_audio_from_video(filename, sample_rate):
         "2",
         str(raw_audio_path),
     ]
-    subprocess.run(ffmpeg_command, check=True)
+    subprocess.run(ffmpeg_command, stdin=subprocess.DEVNULL, check=True)
     human_speech_array, sr = librosa.load(raw_audio_path, sr=sample_rate)
     human_speech_array = loudness_norm(human_speech_array, sr)
     os.remove(raw_audio_path)
 
     return human_speech_array
 
-def audio_prepare_single(audio_path, sample_rate=16000, duration = 0):
+def audio_prepare_single(audio_path, sample_rate=16000, duration = None):  # duration: the most seconds read, None for the whole file
     ext = os.path.splitext(audio_path)[1].lower()
     if ext in ['.mp4', '.mov', '.avi', '.mkv']:
         human_speech_array = extract_audio_from_video(audio_path, sample_rate)
@@ -100,7 +137,7 @@ def audio_prepare_single(audio_path, sample_rate=16000, duration = 0):
         return human_speech_array
 
  
-def audio_prepare_multi(left_path, right_path, audio_type = "add", sample_rate=16000, duration = 0, pad = 0, min_audio_duration = 0):
+def audio_prepare_multi(left_path, right_path, audio_type = "add", sample_rate=16000, duration = None, pad = 0, min_audio_duration = 0):
     if not (left_path==None or right_path==None):
         human_speech_array1 = audio_prepare_single(left_path, duration = duration)
         human_speech_array2 = audio_prepare_single(right_path, duration = duration)
@@ -152,18 +189,15 @@ def get_full_audio_embeddings(audio_guide1 = None, audio_guide2 = None, combinat
     from shared.utils.download import process_files_def_if_needed
 
     process_files_def_if_needed(query_download_def())
-    wav2vec_feature_extractor, audio_encoder= custom_init('cpu', fl.locate_folder("chinese-wav2vec2-base"))
-    # wav2vec_feature_extractor, audio_encoder= custom_init('cpu', "ckpts/wav2vec")
     pad = int(padded_frames_for_embeddings/ fps * sr)
-    new_human_speech1, new_human_speech2, sum_human_speechs, duration_changed = audio_prepare_multi(audio_guide1, audio_guide2, combination_type, duration= num_frames / fps, pad = pad, min_audio_duration = min_audio_duration )
+    # num_frames: the most frames of each guide to read, 0 for all of it
+    new_human_speech1, new_human_speech2, sum_human_speechs, duration_changed = audio_prepare_multi(audio_guide1, audio_guide2, combination_type, duration= num_frames / fps if num_frames > 0 else None, pad = pad, min_audio_duration = min_audio_duration )
     if return_sum_only:
         full_audio_embs = None
     else:
-        audio_embedding_1 = get_embedding(new_human_speech1, wav2vec_feature_extractor, audio_encoder, sr=sr, fps= fps)
-        audio_embedding_2 = get_embedding(new_human_speech2, wav2vec_feature_extractor, audio_encoder, sr=sr, fps= fps)
-        full_audio_embs = []
-        if audio_guide1 != None: full_audio_embs.append(audio_embedding_1)
-        if audio_guide2 != None: full_audio_embs.append(audio_embedding_2)
+        full_audio_embs = []  # embedded when the windows read them (GuideEmbeddings)
+        if audio_guide1 != None: full_audio_embs.append(GuideEmbeddings(new_human_speech1, sr, fps))
+        if audio_guide2 != None: full_audio_embs.append(GuideEmbeddings(new_human_speech2, sr, fps))
         if audio_guide2 == None and not duration_changed: sum_human_speechs = None
     return full_audio_embs, sum_human_speechs
 
@@ -175,6 +209,7 @@ def get_window_audio_embeddings(full_audio_embs, audio_start_idx=0, clip_length 
     indices = (torch.arange(2 * 2 + 1) - 2) * 1 
 
     audio_embs = []
+    encoder = []  # loaded when a block of a guide has to be embedded, once for every speaker
     # split audio with window size
     for human_idx in range(HUMAN_NUMBER):   
         center_indices = torch.arange(
@@ -184,8 +219,8 @@ def get_window_audio_embeddings(full_audio_embs, audio_start_idx=0, clip_length 
         ).unsqueeze(
             1
         ) + indices.unsqueeze(0)
-        center_indices = torch.clamp(center_indices, min=0, max=full_audio_embs[human_idx].shape[0]-1).to(full_audio_embs[human_idx].device)
-        audio_emb = full_audio_embs[human_idx][center_indices][None,...] #.to(self.device)
+        center_indices = torch.clamp(center_indices, min=0, max=full_audio_embs[human_idx].shape[0]-1)
+        audio_emb = full_audio_embs[human_idx].rows(center_indices, encoder)[None,...] #.to(self.device)
         audio_embs.append(audio_emb)
     audio_embs = torch.concat(audio_embs, dim=0) #.to(self.param_dtype)
 

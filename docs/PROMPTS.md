@@ -437,7 +437,7 @@ The Prompt Enhancer can use a local model on the WanGP machine or the same exter
 
 ### Where It Is Enabled
 
-Open **Configuration > Prompt Enhancer / Deepy**, then select **Prompt Enhancer / Deepy LLM Engine**.
+Open **Configuration > Deepy / Prompt Enhancer**, then select **Deepy / Prompt Enhancer LLM Engine**.
 
 That global configuration decides:
 
@@ -796,7 +796,7 @@ If your line-processing mode is set to add each new line as a new request, WanGP
 - If you want several separate prompt ideas queued at once, choose `Each New Line Will Add a new ... Request to the Generation Queue`.
 - If `Match images and text prompts` fails, the number of images and prompts must match cleanly.
 - If `@` or `@@` seems ignored, the Prompt Enhancer is probably disabled or not used for that run.
-- If an external engine cannot be saved, enable **Deepy Prime** and complete that engine's setup in **Configuration > Prompt Enhancer / Deepy**.
+- If an external engine cannot be saved, enable **Deepy Prime** and complete that engine's setup in **Configuration > Deepy / Prompt Enhancer**.
 - If remote enhancement cannot inspect an image, confirm that the selected provider/model accepts images and that the external tool is authenticated.
 - If you do not want prompts or visual inputs to leave the machine, select a local engine instead of Codex, Claude Code, or a cloud-backed OpenCode provider.
 

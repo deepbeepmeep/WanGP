@@ -12,9 +12,11 @@ import torch.nn.functional as F
 from einops import rearrange
 from shared.kernels import kernel_policy, vae_ops
 from shared.cuda_memory import mmgp_vram_allocator
+from shared.image_vae import tiling
+from shared.image_vae.output import blend_h_edge_ as _blend_h_edge_, blend_v_edge_ as _blend_v_edge_, float_to_cpu_uint8 as _vae_float_to_cpu_uint8, float_to_uint8 as _vae_float_to_uint8
 
 try:
-    from . import vae_kernels as _kernels
+    from shared.kernels import causal_pad_triton as _kernels
 except (ImportError, OSError, RuntimeError):
     _kernels = None
 
@@ -231,22 +233,31 @@ def _run_part(net, x, part, feat_cache, feat_idx):
     return x
 
 
-def _split(sizes, budget):
-    """Non-overlapping ranges covering each axis in equal parts of at most budget."""
-    out = []
-    for size in sizes:
-        count = -(-size // max(1, budget))
-        bounds = [size * i // count for i in range(count + 1)]
-        out.append(list(zip(bounds[:-1], bounds[1:])))
+def _split(sizes, halo, scale, side):
+    """Non-overlapping regions covering frames of `sizes` (h, w), each axis in equal parts, whose area with their halos stays within
+    side x side (a region is `scale` pixels of that budget per pixel, plus `halo` on each side that is not a frame border; any shape:
+    full-width bands where that takes fewer regions). A tiled run's time follows the number of regions and its VRAM the largest one:
+    among the splits within a tenth of the fewest regions, the one with the shortest borders between regions (least halo to
+    recompute). Regions keep 8 pixels at least."""
+    limits = [max(1, size // 8) for size in sizes]
+    span = lambda size, count: scale * -(-size // count) + halo * min(count - 1, 2)
+    fits = [(rows, next((cols for cols in range(1, limits[1] + 1) if span(sizes[0], rows) * span(sizes[1], cols) <= side * side), None)) for rows in range(1, limits[0] + 1)]
+    fits = [(rows, cols) for rows, cols in fits if cols is not None]
+    if fits:
+        fewest = min(rows * cols for rows, cols in fits)
+        counts = min((item for item in fits if 10 * item[0] * item[1] <= 11 * fewest), key=lambda item: ((item[0] - 1) * sizes[1] + (item[1] - 1) * sizes[0], item[0] * item[1]))
+    else:
+        counts = limits
+    out = [[(size * i // count, size * (i + 1) // count) for i in range(count)] for size, count in zip(sizes, counts)]
     return [(rows, cols) for rows in out[0] for cols in out[1]]
 
 
 def _segments(net, size, splits, tile):
     """Exact tiling of net (Encoder3d / Decoder3d) for frames of `size` at its input: [(start, stop, tiles)] for the stage ranges between
-    `splits`. The attention runs on the whole frame (tiles None), the other ranges tile after tile with halos, the regions (halos
-    included) within `tile` pixels at their largest resolution (decoder output / encoder input), encoder ranges at lower resolution
-    within tile x sqrt(their scale), ranges at the latent resolution within tile / 2 (more channels and causal caches per pixel).
-    Consecutive whole-frame ranges are merged (no round trip through the CPU)."""
+    `splits`. The attention runs on the whole frame (tiles None), the other ranges region after region with halos, the regions (halos
+    included) within tile x tile pixels of area at their largest resolution (decoder output / encoder input; any shape, see _split),
+    encoder ranges at lower resolution within a tile of tile x sqrt(their scale), ranges at the latent resolution within tile / 2
+    (more channels and causal caches per pixel). Consecutive whole-frame ranges are merged (no round trip through the CPU)."""
     stages, bounds, out, full = net._stages(), [0, *splits, len(net._stages())], [], size[0]
     for start, stop in zip(bounds[:-1], bounds[1:]):
         part = stages[start:stop]
@@ -259,13 +270,13 @@ def _segments(net, size, splits, tile):
             big_out = _sizes(part, big)[-1]
             plan, need = _plan(part, big, tuple(((s - 64) // 2, (s - 64) // 2 + 64) for s in big_out))
             if factor > 1:  # encoder: largest at the input
-                budget = (tile * (size[0] / full) ** 0.5 - (need[0][1] - need[0][0] - 64 * factor)) // factor
+                halo, scale, side = need[0][1] - need[0][0] - 64 * factor, factor, tile * (size[0] / full) ** 0.5
             elif factor == 1:
-                budget = tile // 2 - (need[0][1] - need[0][0] - 64)
+                halo, scale, side = need[0][1] - need[0][0] - 64, 1, tile // 2
             else:  # decoder: largest at the output, where up stages also hold their upsampled input; intermediate outputs: tile / 2
                 widths = [(hi - lo) * (2 if kind == 'up' else 1) for kind, ((lo, hi), _), in_size in _flat(part, plan) if in_size[0] * (2 if kind == 'up' else 1) == big_out[0]]
-                budget = (tile if stop == len(stages) else tile // 2) - (max(widths) - 64)
-            tiles = _split(out_size, max(int(budget), 8))
+                halo, scale, side = max(widths) - 64, 1, tile if stop == len(stages) else tile // 2
+            tiles = _split(out_size, -(-halo // 2), scale, side)
             tiles = None if len(tiles) == 1 else tiles
         if tiles is None and out and out[-1][2] is None:
             out[-1] = (out[-1][0], stop, None)
@@ -311,7 +322,7 @@ def _exact_tiled(net, chunks, segments, size, sink):
             (a, b), (c, d) = need
             cache, offset = [None] * sum(isinstance(m, nn.Conv3d) for m in net.modules()), 0
             for i, (_, cached, first) in enumerate(chunks):
-                x = inputs[i][..., a:b, c:d].to(device).contiguous(memory_format=torch.channels_last_3d)
+                x = transfer.from_ram(inputs[i][..., a:b, c:d], device).contiguous(memory_format=torch.channels_last_3d)
                 y = net(x, feat_cache=cache if cached else None, feat_idx=[0], part=(start, stop, plan, need, first))
                 x = None
                 if last:
@@ -319,7 +330,7 @@ def _exact_tiled(net, chunks, segments, size, sink):
                 else:
                     if store[i] is None:
                         store[i] = torch.empty((*y.shape[:3], *out_size), dtype=y.dtype, device="cpu", memory_format=torch.channels_last_3d)
-                    store[i][..., region[0][0]:region[0][1], region[1][0]:region[1][1]].copy_(y)
+                    transfer.ram_copy_(store[i][..., region[0][0]:region[0][1], region[1][0]:region[1][1]], y.cpu())  # (no pool of threads)
                 offset += y.shape[2]
                 y = None
         inputs, size = store, out_size
@@ -346,13 +357,13 @@ class ExactStream:
             store = None
             for region, plan, need, cache in tiles:
                 (a, b), (c, d) = need
-                y = self.net(x[..., a:b, c:d].to(device).contiguous(memory_format=torch.channels_last_3d), feat_cache=cache, feat_idx=[0], part=(start, stop, plan, need, first))
+                y = self.net(transfer.from_ram(x[..., a:b, c:d], device).contiguous(memory_format=torch.channels_last_3d), feat_cache=cache, feat_idx=[0], part=(start, stop, plan, need, first))
                 if number == len(self.work) - 1:
                     sink(region, y)
                 else:
                     if store is None:
                         store = torch.empty((*y.shape[:3], *out_size), dtype=y.dtype, device="cpu", memory_format=torch.channels_last_3d)
-                    store[..., region[0][0]:region[0][1], region[1][0]:region[1][1]].copy_(y)
+                    transfer.ram_copy_(store[..., region[0][0]:region[0][1], region[1][0]:region[1][1]], y.cpu())
                 y = None
             x = store
 
@@ -361,14 +372,15 @@ def _exact_decode(model, z, segments, any_end_frame, sink):
     """Tiled decoding equal to the untiled one (fast path) of scaled latents z on the GPU, through _exact_tiled."""
     x = model.conv2(z)
     count = x.shape[2]
-    _exact_tiled(model.decoder, [(x[:, :, i:i + 1], not (any_end_frame and i == count - 1), i == 0) for i in range(count)], segments, tuple(x.shape[-2:]), sink)
+    # a single latent frame (a picture) runs without causal caches: no chunk follows to read them
+    _exact_tiled(model.decoder, [(x[:, :, i:i + 1], count > 1 and not (any_end_frame and i == count - 1), i == 0) for i in range(count)], segments, tuple(x.shape[-2:]), sink)
 
 
 def _exact_encode(model, x, scale, tile_size, any_end_frame):
     """Tiled encoding equal to the untiled one (fast path) of x on the GPU (Wan 2.2: in patches): the encoder up to its last downsampling
     tile after tile with halos, the rest (attention included) on the whole latent frame."""
     count = 2 + (x.shape[2] - 2) // 4 if any_end_frame else 1 + (x.shape[2] - 1) // 4
-    chunks = [(x[:, :, max(0, 4 * i - 3):4 * i + 1], True, False) for i in range(count)]
+    chunks = [(x[:, :, max(0, 4 * i - 3):4 * i + 1], count > 1, False) for i in range(count)]  # a single frame: no causal caches
     if any_end_frame:
         chunks[-1] = (x[:, :, -1:], False, False)
     out_list = [None] * count
@@ -384,29 +396,6 @@ def _exact_encode(model, x, scale, tile_size, any_end_frame):
     return (mu - scale[0]) * scale[1]
 
 
-def _vae_float_to_cpu_uint8(frames):
-    frames.clamp_(-1.0, 1.0).add_(1.0).mul_(127.5).round_().clamp_(0.0, 255.0)
-    return transfer.move(frames, "cpu", torch.uint8)  # (without a RAM copy of the video in its float dtype, nor a GPU one of a cropped view)
-
-
-def _blend_v_edge_(top_edge, tile, blend_extent):
-    blend_extent = min(int(top_edge.shape[-2]), int(tile.shape[-2]), int(blend_extent))
-    if blend_extent <= 0:
-        return
-    weights = torch.arange(blend_extent, device=tile.device, dtype=tile.dtype).div_(blend_extent).view(1, 1, 1, blend_extent, 1)
-    edge = top_edge[:, :, :, -blend_extent:, :].to(device=tile.device, dtype=tile.dtype)
-    edge.mul_(1.0 - weights)
-    tile[:, :, :, :blend_extent, :].mul_(weights).add_(edge)
-
-
-def _blend_h_edge_(left_edge, tile, blend_extent):
-    blend_extent = min(int(left_edge.shape[-1]), int(tile.shape[-1]), int(blend_extent))
-    if blend_extent <= 0:
-        return
-    weights = torch.arange(blend_extent, device=tile.device, dtype=tile.dtype).div_(blend_extent).view(1, 1, 1, 1, blend_extent)
-    edge = left_edge[:, :, :, :, -blend_extent:].to(device=tile.device, dtype=tile.dtype)
-    edge.mul_(1.0 - weights)
-    tile[:, :, :, :, :blend_extent].mul_(weights).add_(edge)
 
 
 class CausalConv3d(nn.Conv3d):
@@ -1014,7 +1003,7 @@ class WanVAE_(nn.Module):
             if i == 0:
                 out_list.append(self.encoder(
                     x[:, :, :1, :, :],
-                    feat_cache=self._enc_feat_map,
+                    feat_cache=self._enc_feat_map if iter_ > 1 else None,  # a single latent frame (a picture): no chunk follows to read the causal caches
                     feat_idx=self._enc_conv_idx))
             elif any_end_frame and i== iter_ -1:
                 out_list.append(self.encoder(
@@ -1057,7 +1046,7 @@ class WanVAE_(nn.Module):
             if i == 0:
                 out_list.append(self.decoder(
                     x[:, :, i:i + 1, :, :],
-                    feat_cache=self._feat_map,
+                    feat_cache=self._feat_map if iter_ > 1 else None,  # a single latent frame (a picture): no chunk follows to read the causal caches
                     feat_idx=self._conv_idx))
             elif any_end_frame and i==iter_-1:
                 out_list.append(self.decoder(
@@ -1148,7 +1137,7 @@ class WanVAE_(nn.Module):
             for i in range(x.shape[2]):
                 self._conv_idx = [0]
                 if i == 0:
-                    tile = self.decoder(x[:, :, i:i + 1, :, :], feat_cache=self._feat_map, feat_idx=self._conv_idx)
+                    tile = self.decoder(x[:, :, i:i + 1, :, :], feat_cache=self._feat_map if x.shape[2] > 1 else None, feat_idx=self._conv_idx)
                 elif any_end_frame and i == x.shape[2] - 1:
                     tile = self.decoder(x[:, :, -1:, :, :], feat_cache=None, feat_idx=self._conv_idx)
                 else:
@@ -1207,14 +1196,21 @@ class WanVAE_(nn.Module):
                         (r0, r1), (c0, c1) = ((lo * f, min(hi * f, limit)) for (lo, hi), limit in zip(region, (target_height, target_width)))
                         a, b = max(offset, frame_start), min(offset + y.shape[2], target_end)
                         if a < b and r0 < r1 and c0 < c1:
-                            decoded[:, :, a - frame_start:b - frame_start, r0:r1, c0:c1] = _vae_float_to_cpu_uint8(y[:, :, a - offset:b - offset, :r1 - r0, :c1 - c0])
-                    _exact_decode(self, z, segments, any_end_frame, sink)
+                            writer.write(decoded[:, :, a - frame_start:b - frame_start, r0:r1, c0:c1], _vae_float_to_uint8(y[:, :, a - offset:b - offset, :r1 - r0, :c1 - c0]))
+                    with transfer.RamWriter() as writer:  # each tile's bytes reach RAM while the next one is decoded
+                        _exact_decode(self, z, segments, any_end_frame, sink)
                     return decoded
-                if tile_size <= 0:
+                if tile_size <= 0:  # each chunk of frames goes to RAM as it is decoded: no clip-long output in VRAM
                     z = latent_source.to(device=device, dtype=dtype)
-                    frames = self.decode(z, scale, any_end_frame=any_end_frame)[:, :, frame_start:target_end, :target_height, :target_width]
-                    decoded = _vae_float_to_cpu_uint8(frames)
-                    del z, frames
+                    if scale is not None:
+                        z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(1, self.z_dim, 1, 1, 1) if isinstance(scale[0], torch.Tensor) else z / scale[1] + scale[0]
+                    decoded = torch.empty((latent_source.shape[0], 3, target_frames, target_height, target_width), dtype=torch.uint8, device="cpu")
+                    with transfer.RamWriter() as writer:  # (without waiting for the GPU: the next chunk is decoded meanwhile)
+                        for start, frames in self.decode_tile_chunks(z, any_end_frame=any_end_frame):
+                            a, b = max(start, frame_start), min(start + frames.shape[2], target_end)
+                            if a < b:
+                                writer.write(decoded[:, :, a - frame_start:b - frame_start], _vae_float_to_uint8(frames[:, :, a - start:b - start, :target_height, :target_width]))
+                    del z
                     return decoded
 
                 tile_sample_min_size = tile_size
@@ -1421,41 +1417,22 @@ class WanVAE:
         ).to(dtype).eval() #.requires_grad_(False).to(device)
         self.model._model_dtype = dtype
 
+    # measured VRAM (shared.image_vae.tiling), FP16, + 10 %. With the Triton kernels ("fast" kernel precision: regions with halos, the
+    # untiled result): per megapixel of the largest region, halos included, for regions that fill their tile (8.3 GiB per megapixel to
+    # decode, 6.7 to 8.9 to encode; whole frames need a little less). On the PyTorch path (blended tiles): tiles of 256 and 512
+    # pixels, then whole frames of 832x480 and 1280x720.
+    COSTS = {True: {"weights": 0.24, "decode": [(0.065, 0.61), (0.262, 2.4), (0.59, 5.3), (0.92, 8.3)], "encode": [(0.065, 0.61), (0.127, 1.06), (0.262, 2.0), (0.59, 4.35), (0.92, 6.6)]},
+             False: {"weights": 0.24, "decode": [(0.065, 0.7), (0.26, 2.85), (0.4, 4.5), (0.92, 10.0)], "encode": [(0.065, 1.1), (0.26, 2.8), (0.4, 3.7), (0.92, 8.6)]}}
+
     @staticmethod
     def get_VAE_tile_size(vae_config, device_mem_capacity, mixed_precision, output_height=None, output_width=None):
-        if mmgp_vram_allocator():  # no allocator fragmentation to guard against: Default and Low VRAM levels
-            return 256 if vae_config == 3 or device_mem_capacity < 8000 else 512
-        # VAE Tiling
-        if vae_config == 0:
-            if mixed_precision:
-                device_mem_capacity = device_mem_capacity / 2
-            if device_mem_capacity >= 24000:
-                if output_height is not None and output_width is not None and int(output_height) * int(output_width) > 1920 * 1088:
-                    use_vae_config = 2
-                else:
-                    use_vae_config = 1
-            elif device_mem_capacity >= 16000:
-                use_vae_config = 3
-            elif device_mem_capacity >= 8000:
-                use_vae_config = 4
-            else:          
-                use_vae_config = 5
-        else:
-            # Keep WGP's historical public presets; Wan inserts one internal tiers between presets 1 and 3.
-            use_vae_config = vae_config + 2
-
-        if use_vae_config == 1:
-            VAE_tile_size = 0  
-        elif use_vae_config == 2:
-            VAE_tile_size = 1024 
-        elif use_vae_config == 3:
-            VAE_tile_size = 512 
-        elif use_vae_config == 4:
-            VAE_tile_size = 256  
-        else: 
-            VAE_tile_size = 128  
-
-        return  VAE_tile_size
+        """The tile size in pixels (0: no tiling, whenever the whole frames fit the VAE Tiling setting's VRAM budget), from this VAE's
+        measured costs with the kernels in use. With the Triton kernels a tile is a budget of tile x tile pixels per region, of any
+        size (tiling.largest_tile: what the budget allows, in the fewest regions); else the largest preset that fits."""
+        fast = _kernels is not None and kernel_policy.allow_approximate() and torch.cuda.is_available() and _kernels.supported(torch.device("cuda", torch.cuda.current_device()))
+        if fast:
+            return tiling.largest_tile(vae_config, device_mem_capacity, WanVAE.COSTS[True], output_height, output_width, minimum=256)  # (below: many regions, 2 to 3 times the time)
+        return tiling.choose_tile(vae_config, device_mem_capacity, WanVAE.COSTS[False], output_height, output_width, (1024, 512, 256, 128))
 
     def encode(self, videos, tile_size = 256, any_end_frame = False):
         """

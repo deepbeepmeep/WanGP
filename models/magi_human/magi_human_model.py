@@ -10,12 +10,14 @@ import torch.nn.functional as F
 import torchaudio.functional as taF
 from accelerate import init_empty_weights
 from diffusers.video_processor import VideoProcessor
-from mmgp import offload
+from mmgp import offload, runtime
 from PIL import Image
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from transformers.models.t5gemma import T5GemmaEncoderModel
 
+from shared.image_vae import tiling
+from shared.image_vae.output import float_to_video_bytes
 from shared.utils import files_locator as fl
 from shared.utils.loras_mutipliers import update_loras_slists
 from shared.utils.text_encoder_cache import TextEncoderCache
@@ -32,6 +34,22 @@ from inference.model.turbo_vaed import get_turbo_vaed  # noqa: E402
 from inference.pipeline.data_proxy import MagiDataProxy  # noqa: E402
 from inference.pipeline.scheduler_unipc import FlowUniPCMultistepScheduler  # noqa: E402
 from inference.pipeline.video_process import load_audio_and_encode, resample_audio_sinc, resizecrop  # noqa: E402
+
+
+class MagiVAE(Wan2_2_VAE):
+    """The Wan 2.2 VAE, which encodes the start image, beside the Turbo decoder, which decodes the video: each gets the tile its own
+    measured costs allow within the VAE Tiling budget (the Wan 2.2 VAE's tile for a decoder that holds much less tiled the video for
+    nothing, or left it to the decoder's table of frame sizes, which ignores the card)."""
+    # TurboVAED (FP16), exact tiles (TurboVAED.decode_to_ram: each window by tiles with their halo, the whole-frame result within a
+    # rounding): megapixels of a tile (clipped to the frame) and GiB above the weights (+ 10 %), measured at 1280x704 x 121; the
+    # length of the clip does not count (windows of 7 latent frames). Larger tiles are faster: 1280x704 x 121 in 8.1 s with tiles of
+    # 256 pixels, 7.0 s with 384, 6.6 s with 512, 5.6 s with 768 or 1024, 5.4 s whole (blended tiles of 256 before: 10.6 s).
+    TURBO_COSTS = {"weights": 0.2, "decode": [(0.0655, 1.6), (0.147, 2.83), (0.262, 4.62), (0.541, 8.2), (0.721, 10.8), (0.901, 14.3)]}
+    turbo_tile = None  # pixels of a decoded tile (0: whole frames), chosen by get_VAE_tile_size; None: not chosen
+
+    def get_VAE_tile_size(self, vae_config, device_mem_capacity, mixed_precision, output_height=None, output_width=None):
+        self.turbo_tile = tiling.choose_tile(vae_config, device_mem_capacity, self.TURBO_COSTS, output_height, output_width, (1024, 768, 512, 384, 256))
+        return Wan2_2_VAE.get_VAE_tile_size(vae_config, device_mem_capacity, mixed_precision, output_height, output_width)
 
 
 MODEL_CONFIG = {
@@ -218,7 +236,6 @@ class MagiHumanModel:
         self.text_encoder_cache = TextEncoderCache()
         self._default_negative_prompt_embeds = None
         self._default_negative_prompt_len = None
-        self._turbo_vae_decode_max_pixels = 832 * 480
         self.sr_num_inference_steps = int(self.model_def.get("sr_num_inference_steps", 5))
         self.sr_cfg_number = int(self.model_def.get("sr_cfg_number", 1))
         self.sr_noise_value = int(self.model_def.get("sr_noise_value", 220))
@@ -231,7 +248,7 @@ class MagiHumanModel:
         self._sr_sigmas = _ZeroSNRDDPMDiscretization()(1000, do_append_zero=False, flip=True)
         self.video_processor = VideoProcessor(vae_scale_factor=16)
 
-        self.vae = Wan2_2_VAE(vae_pth=fl.locate_file("Wan2.2_VAE.safetensors"), dtype=VAE_dtype, device="cpu")
+        self.vae = MagiVAE(vae_pth=fl.locate_file("Wan2.2_VAE.safetensors"), dtype=VAE_dtype, device="cpu")
         self.vae.device = self.device
         self.audio_vae = SAAudioFeatureExtractor(device="cpu", model_path=fl.locate_folder("stable-audio-open-1.0"))
         self.turbo_vae = get_turbo_vaed(
@@ -446,28 +463,15 @@ class MagiHumanModel:
         return self._finalize_audio_latent(audio_latent, frame_num)
 
     def _decode_video(self, latents: torch.Tensor, tile_size: int):
+        """The video (3, frames, height, width) as the bytes WanGP makes of a decoded video, in RAM: each decoded piece is converted
+        on the GPU and written to its place (no 16-bit copy of every tile in RAM, no float32 video). The tile is the Turbo decoder's
+        own choice (MagiVAE.turbo_tile); before it is chosen, the tile given or the decoder's table of frame sizes."""
         turbo_dtype = next(self.turbo_vae.parameters()).dtype
-        sample_h = int(latents.shape[-2]) * self.vae_stride[1]
-        sample_w = int(latents.shape[-1]) * self.vae_stride[2]
-        output_offload = int(tile_size) > 0 or sample_h * sample_w > self._turbo_vae_decode_max_pixels
-        temporal_chunk_size = 0
-        # if sample_h * sample_w >= 1920 * 1088:
-        #     temporal_chunk_size = 3
-        # elif sample_h * sample_w >= 1280 * 704 and latents.shape[2] > self.turbo_vae.step_size:
-        #     temporal_chunk_size = 5
-        # print(
-        #     f"[Magi][VAE] decode {sample_w}x{sample_h} latent_shape={tuple(latents[:1].shape)} "
-        #     f"tile_size={tile_size} temporal_chunk_size={temporal_chunk_size} output_offload={output_offload}",
-        #     flush=True,
-        # )
-        decoded = self.turbo_vae.decode(
-            latents[:1].to(device=self.device, dtype=turbo_dtype),
-            output_offload=output_offload,
-            tile_size=tile_size,
-            temporal_chunk_size=temporal_chunk_size,
-        )
-        with torch.inference_mode(False):
-            return decoded[0].float().clamp(-1, 1).clone()
+        latents = latents[:1].to(device=self.device, dtype=turbo_dtype)
+        tile = self.vae.turbo_tile
+        if tile is None:
+            tile = self.turbo_vae._resolve_spatial_tile_size(latents, int(tile_size or 0))
+        return self.turbo_vae.decode_to_ram(latents, float_to_video_bytes, tile_size=tile)[0]
 
     def _decode_audio(self, latent_audio: torch.Tensor):
         set_phase_status("Audio VAE Decoding")
@@ -553,7 +557,7 @@ class MagiHumanModel:
                     txt_feat_len=uncond_prompt_lens,
                 )
                 uncond_inputs, uncond_state = self._prepare_proxy_input(uncond_eval_input, data_proxy)
-                if joint_pass:
+                if joint_pass and runtime.joint_pass_useful(transformer, packed_inputs[0].shape[0], transformer.config.hidden_size):
                     pred_pair = self._run_transformer(transformer, *[[packed_inputs[i], uncond_inputs[i]] for i in range(len(packed_inputs))])
                     if pred_pair is None:
                         return None, None

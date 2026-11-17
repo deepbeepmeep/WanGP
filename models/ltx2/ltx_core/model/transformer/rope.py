@@ -457,6 +457,66 @@ def apply_rope_cache_inplace(input_tensor: torch.Tensor, rope_cache: RopeCache) 
     return input_tensor
 
 
+def _grid_boxes(grid_sizes: tuple[int, ...], start: int, stop: int) -> list[tuple[tuple[int, int], ...]]:
+    """The tokens [start, stop) of a row-major grid as consecutive boxes, a range per axis each (whole rows, frames, ... where they fit)."""
+    if start >= stop:
+        return []
+    if len(grid_sizes) == 1:
+        return [((start, stop),)]
+    inner = math.prod(grid_sizes[1:])
+    (first, head), (last, tail) = divmod(start, inner), divmod(stop, inner)
+    if first == last:
+        return [((first, first + 1),) + box for box in _grid_boxes(grid_sizes[1:], head, tail)]
+    boxes = [((first, first + 1),) + box for box in _grid_boxes(grid_sizes[1:], head, inner)] if head else []
+    first += bool(head)
+    if last > first:
+        boxes.append(((first, last),) + tuple((0, size) for size in grid_sizes[1:]))
+    return boxes + ([((last, last + 1),) + box for box in _grid_boxes(grid_sizes[1:], 0, tail)] if tail else [])
+
+
+def _split_rope_rows(input_tensor: torch.Tensor, rope_cache: RopeCache, layout: RopeLayoutCache, token0: int, counter=None, step: int = 0) -> bool:
+    """The split RoPE of input_tensor's tokens, the layout's from token0 (+ counter * step: a CUDA graph loop's turn), in one launch with
+    the layout's whole tables (the boxes' values); False where the compact kernel does not apply."""
+    num_heads = rope_cache.num_attention_heads
+    dim = input_tensor.shape[-1]
+    if num_heads is None or not rope_cache.split_groups or _is_compiling_graph() or (dim // num_heads) % 2:
+        return False
+    axis_count = len(rope_cache.axes)
+    axis_width = rope_cache.axes[0].cos.shape[-1] if axis_count else 0
+    dim_no_pad = num_heads * (dim // num_heads // 2) - rope_cache.pad_size
+    if axis_width <= 0 or dim_no_pad <= 0 or dim_no_pad % axis_count != 0 or axis_width * axis_count != dim_no_pad:
+        return False
+    return split_rope(input_tensor, rope_cache, layout, token0=token0, counter=counter, step=step)
+
+
+def apply_rope_cache_rows_inplace(input_tensor: torch.Tensor, rope_cache: RopeCache, rows: range) -> torch.Tensor:
+    """apply_rope_cache_inplace for the tokens rows (a range of the cache's tokens) held by input_tensor (batch, len(rows), dim): with split
+    RoPE in one layout, one launch over the layout's tables; otherwise each layout's part of them cut into boxes of its grid, each rotated
+    as a layout of its own with its axes' tables sliced. rows may carry a CUDA graph loop's counter and step (attention_kit.LoopRows):
+    its turn's tokens, the one-launch path only."""
+    counter, step = getattr(rows, "counter", None), getattr(rows, "step", 0)
+    if rope_cache.rope_type == LTXRopeType.SPLIT:
+        layout = next((layout for layout in rope_cache.layouts if layout.token_start <= rows.start and rows.stop <= layout.token_stop), None)
+        if layout is not None and _split_rope_rows(input_tensor, rope_cache, layout, rows.start - layout.token_start, counter, step):
+            return input_tensor
+    if counter is not None:
+        raise RuntimeError("a CUDA graph loop's rows take the one-launch split RoPE")
+    apply_layout = _apply_split_rope_layout_inplace if rope_cache.rope_type == LTXRopeType.SPLIT else _apply_interleaved_rope_layout_inplace
+    for layout in rope_cache.layouts:
+        start, stop = max(rows.start, layout.token_start), min(rows.stop, layout.token_stop)
+        offset = start
+        for box in _grid_boxes(layout.grid_sizes, start - layout.token_start, stop - layout.token_start):
+            sizes = tuple(high - low for low, high in box)
+            count = math.prod(sizes)
+            axes = rope_cache.rope_axes or ()
+            part = RopeLayoutCache(0, count, sizes, tuple(cos[box[axis][0]:box[axis][1]] for cos, axis in zip(layout.axis_cos, axes)),
+                                   tuple(sin[box[axis][0]:box[axis][1]] for sin, axis in zip(layout.axis_sin, axes)),
+                                   tuple(_build_layout_axis_token_indices(sizes, axis, input_tensor.device) for axis in axes) if _is_compiling_graph() else ())
+            apply_layout(input_tensor[:, offset - rows.start:offset - rows.start + count], rope_cache, part)
+            offset += count
+    return input_tensor
+
+
 def apply_rope_cache_heads_inplace(input_tensor: torch.Tensor, rope_cache: RopeCache, heads: range) -> torch.Tensor:
     """Rotate a contiguous range of heads with the original cache's absolute frequency and padding positions."""
     if len(heads) == rope_cache.num_attention_heads:

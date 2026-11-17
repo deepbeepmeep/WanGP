@@ -93,6 +93,10 @@ from diffusers.models.attention_processor import (
 )
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from diffusers.models.modeling_utils import ModelMixin
+from mmgp import transfer
+from shared.cuda_memory import mmgp_vram_allocator
+from shared.image_vae import tiling
+from shared.kernels import kernel_policy
 from .unet_causal_3d_blocks import fused_norm_silu
 from .vae import DecoderCausal3D, BaseOutput, DecoderOutput, DiagonalGaussianDistribution, EncoderCausal3D
 
@@ -110,6 +114,11 @@ from .vae import DecoderCausal3D, BaseOutput, DecoderOutput, DiagonalGaussianDis
 class DecoderOutput2(BaseOutput):
     sample: torch.FloatTensor
     posterior: Optional[DiagonalGaussianDistribution] = None
+
+
+def _stream_kernels():
+    """The Triton kernels serve the streamed decode and the layers ("fast" kernel precision on a supported CUDA GPU); else PyTorch's."""
+    return torch.cuda.is_available() and fused_norm_silu(torch.empty(0, device="cuda"))
 
 
 MODEL_OUTPUT_PATH = os.environ.get('MODEL_OUTPUT_PATH')
@@ -148,7 +157,47 @@ class AutoencoderKLCausal3D(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
             `force_upcast` can be set to `False` - see: https://huggingface.co/madebyollin/sdxl-vae-fp16-fix
     """
 
+    # Streamed decode (CUDA devices, with the Triton kernels or PyTorch's layers): its result does not depend on the tile and chunk
+    # sizes (57 dB between them, the same PSNR to the source), and larger ones are not faster (measured at 832x480 and 1280x720, 65
+    # frames: tiles of 384 and 512 pixels, chunks of 4 latent frames, for 1.6 to 3.5 times the VRAM). It streams tiles of STREAM_TILES
+    # latent pixels, the first that the VAE Tiling budget holds, by chunks of STREAM_CHUNK latent frames. Against the untiled decode
+    # (real footage, PyTorch layers), where blended tiles of 256:32 / 256:16 / 192:16 give 42.5 / 42.0 / 38.8 dB at 832x480 x 17 and
+    # 44.9 / 41.9 / 40.4 at 624x352 x 33: 46.3 and 40.4 dB with statistics from every other box of the frame ("fast" kernel precision:
+    # 4.4 s at 832x480 x 65), 48.9 and 49.6 dB with statistics from the whole frame ("strict": 10.0 s, the time of the blended tiles,
+    # for 1.9 GiB instead of 2.8 to 8.7; PyTorch's layers with every other box: 6.1 s).
+    # The encoder's tiles are blended and do change the result (PSNR of footage encoded then decoded, 832x480 x 65): their frames
+    # most (16: 34.3 dB, 32: 35.3 to 35.9, 48: 35.7 to 36.7, 64: as 48), their pixels less (0.2 to 0.6 dB), all at the same speed.
+    # ENCODE_TILES: (pixels, frames), the first that the budget holds.
+    # Each with its GiB above the weights (+ 10 %; the encoder's and the untiled figures with the Triton kernels (True) and with
+    # PyTorch's layers (False), the streamed tiles on the route that needs the most); WEIGHTS: encoder and decoder, GiB.
+    # An output that fits the budget whole is decoded (encoded) untiled: UNTILED (UNTILED_ENCODE), GiB per megapixel of a frame times
+    # the frames, measured on single frames at 1280x720 and 1920x1088 (the most per frame: 5 to 33 frames hold 0.5 to 0.6 of it).
+    STREAM_TILES, STREAM_CHUNK = ((32, 2.2), (24, 1.3)), 2
+    ENCODE_TILES = {True: (((256, 48), 6.0), ((192, 48), 3.4), ((128, 48), 1.52), ((128, 32), 1.05)),
+                    False: (((256, 48), 8.6), ((192, 48), 4.9), ((128, 48), 2.2), ((128, 32), 1.5))}
+    UNTILED, UNTILED_ENCODE, WEIGHTS = {True: 4.25, False: 8.5}, {True: 2.9, False: 4.75}, 0.46
+    stream_tile = None  # latent pixels of a streamed decode tile, chosen by get_VAE_tile_size (None: the encoder's tile)
+    vram_room = None  # GiB above the weights that the VAE Tiling budget leaves, set by get_VAE_tile_size (None: not a CUDA device)
+
+    def _fits_untiled(self, x, costs, pixels_per_side=1):
+        """The (batch, channels, frames, height, width) clip x, latent (pixels_per_side: the VAE's spatial ratio) or video, is within
+        the VAE Tiling budget in one piece."""
+        frames = x.shape[2] if pixels_per_side == 1 else 1 + (x.shape[2] - 1) * self.time_compression_ratio
+        megapixels = x.shape[0] * frames * x.shape[3] * x.shape[4] * pixels_per_side ** 2 / 1e6
+        return self.vram_room is not None and x.is_cuda and megapixels * costs[bool(fused_norm_silu(x))] <= self.vram_room
+
     def get_VAE_tile_size(self, vae_config, device_mem_capacity, mixed_precision):
+        self.stream_tile = self.vram_room = None
+        if torch.cuda.is_available():
+            room = tiling.vram_budget(vae_config, device_mem_capacity) / tiling.GIB - self.WEIGHTS
+            if not mmgp_vram_allocator():  # (PyTorch's allocator reserves more than it allocates)
+                room /= 2
+            self.vram_room = room
+            fits = lambda tiles: next((tile for tile, need in tiles if need <= room), tiles[-1][0])
+            self.stream_tile = fits(self.STREAM_TILES)
+            sample_size, sample_tsize = fits(self.ENCODE_TILES[bool(_stream_kernels())])
+            return {"tile_sample_min_tsize": sample_tsize, "tile_latent_min_tsize": sample_tsize // self.time_compression_ratio, "tile_sample_min_size": sample_size,
+                    "tile_latent_min_size": sample_size // 2 ** (len(self.config.block_out_channels) - 1), "tile_overlap_factor": 0.25}
         if mixed_precision:
             device_mem_capacity /= 1.5
         if vae_config == 0:
@@ -454,10 +503,11 @@ class AutoencoderKLCausal3D(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
         set_phase_status("VAE Encoding")
         assert len(x.shape) == 5, "The input tensor should have 5 dimensions"
 
-        if self.use_temporal_tiling and x.shape[2] > self.tile_sample_min_tsize:
+        untiled = self._fits_untiled(x, self.UNTILED_ENCODE)  # no tiling when the whole clip fits the VAE Tiling budget
+        if not untiled and self.use_temporal_tiling and x.shape[2] > self.tile_sample_min_tsize:
             return self.temporal_tiled_encode(x, return_dict=return_dict)
-        
-        if self.use_spatial_tiling and (x.shape[-1] > self.tile_sample_min_size or x.shape[-2] > self.tile_sample_min_size):
+
+        if not untiled and self.use_spatial_tiling and (x.shape[-1] > self.tile_sample_min_size or x.shape[-2] > self.tile_sample_min_size):
             return self.spatial_tiled_encode(x, return_dict=return_dict)
                             
         if self.use_slicing and x.shape[0] > 1:
@@ -495,29 +545,44 @@ class AutoencoderKLCausal3D(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
 
         return DecoderOutput(sample=dec)
 
-    def streamed_decode(self, z, tile, chunk_frames, stats_tile=16, stats_step=2, stats_group=4, global_modules=3):
+    def streamed_decode(self, z, tile, chunk_frames, stats_tile=16, stats_step=2, stats_group=4, global_modules=3, to_ram=None):
         """Decodes without tile overlap or blending. The low-resolution start of the decoder (mid block, whose attention spans all the frames,
         and the first global_modules modules of the up blocks) runs on the whole clip with its exact GroupNorm statistics. The other GroupNorms
-        normalize with whole-clip statistics estimated by streaming a spread-out part of the frame (one stats_tile tile in stats_step, both
-        ways) through the clip first; with these statistics fixed, the decoder is local and causal, so each output tile (side `tile` latent
+        normalize with whole-clip statistics estimated by streaming boxes of the frame through the clip first (one stats_tile tile in
+        stats_step, both ways: stats_step 1 is the whole frame); with these statistics fixed, the decoder is local and causal, so each output tile (side `tile` latent
         pixels) streams through all the frames by chunks of chunk_frames latent frames, holding only its own causal caches, and is computed
         exactly with a halo of the receptive field. Memory follows the tile and chunk sizes, not the frame size. Needs the Triton GroupNorm
-        kernels."""
+        kernels. to_ram: a function of each decoded piece on the GPU (its final form: a dtype conversion, bytes); the video is then
+        returned in RAM, each piece written to its place there as it is decoded, without the caller waiting for the GPU: neither the
+        decoded clip in VRAM nor a conversion of the whole video on the CPU."""
         sample, modules = self.decoder.stream_start(self.post_quant_conv(z), global_modules)
         sample = sample.cpu()  # the passes read boxes and tile regions of it: in RAM between them, not in VRAM
         frames, height, width = sample.shape[2:]
         box_height, box_width = min(stats_tile, height), min(stats_tile, width)
         boxes = [(slice(y, y + box_height), slice(x, x + box_width)) for y in sorted({min(y, height - box_height) for y in range(0, height, stats_tile * stats_step)})
                  for x in sorted({min(x, width - box_width) for x in range(0, width, stats_tile * stats_step)})]
-        calls = sample.shape[0] * frames * -(-len(boxes) // stats_group)  # last resnet calls
+        calls = sample.shape[0] * frames * (1 + -(-len(boxes) // stats_group))  # last resnet calls (a first group, then all of them)
         with vae_decoding_progress(calls, modules[-1], title="VAE Decoding Statistics"):
             stats = self.decoder.stream_statistics(sample, modules, boxes, 1, stats_group)
         with vae_decoding_progress(-(-height // tile) * -(-width // tile) * -(-frames // chunk_frames), self.decoder.conv_out.conv):
-            return self.decoder.stream_tiles(sample, modules, stats, tile, chunk_frames)
+            if to_ram is None:
+                return self.decoder.stream_tiles(sample, modules, stats, tile, chunk_frames)
+            out, shape = None, self.decoder.stream_shape(sample, modules)
+
+            def sink(frame, rows, columns, pixels):
+                nonlocal out
+                piece = to_ram(pixels)
+                if out is None:
+                    out = torch.empty((*piece.shape[:2], *shape), dtype=piece.dtype, device="cpu")
+                writer.write(out[:, :, frame:frame + piece.shape[2], rows, columns], piece)
+
+            with transfer.RamWriter("decoded video", depth=64, max_bytes=256 << 20) as writer:
+                self.decoder.stream_tiles(sample, modules, stats, tile, chunk_frames, sink)
+            return out
 
     @apply_forward_hook
     def decode(
-        self, z: torch.FloatTensor, return_dict: bool = True, generator=None
+        self, z: torch.FloatTensor, return_dict: bool = True, generator=None, to_ram=None
     ) -> Union[DecoderOutput, torch.FloatTensor]:
         """
         Decode a batch of images.
@@ -534,11 +599,18 @@ class AutoencoderKLCausal3D(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
 
         """
 
-        if (self.use_temporal_tiling or self.use_spatial_tiling) and not self.disable_causal_conv and not self.parallel_decode and fused_norm_silu(z):
-            # memory-bounded decode without tile overlap or blending (fast kernels): streamed tiles of the preset's size, chunks and statistics
-            # boxes per call of half its frames (peak below the preset's tiled decode)
-            chunk = max(self.tile_latent_min_tsize // 2, 1)
-            decoded = self.streamed_decode(z, self.tile_latent_min_size, chunk, stats_group=chunk)
+        if (self.use_temporal_tiling or self.use_spatial_tiling) and not self.disable_causal_conv and not self.parallel_decode and z.is_cuda:
+            if self._fits_untiled(z, self.UNTILED, 2 ** (len(self.config.block_out_channels) - 1)):
+                with vae_decoding_progress(1, self.decoder):  # the whole output fits the VAE Tiling budget: no tiling
+                    decoded = self.decoder(self.post_quant_conv(z))
+                if to_ram is not None:
+                    decoded = to_ram(decoded).cpu()
+                return (decoded,) if not return_dict else DecoderOutput(sample=decoded)
+            # memory-bounded decode without tile overlap or blending (every CUDA device and kernel precision): streamed tiles of the
+            # size the VAE Tiling budget holds, by chunks of STREAM_CHUNK latent frames, whatever the encoder's tiles (same result)
+            # Statistics from every other box of the frame, or from the whole frame with the "strict" kernel precision (+ 60 % of time)
+            decoded = self.streamed_decode(z, self.stream_tile or self.tile_latent_min_size, self.STREAM_CHUNK, stats_step=2 if kernel_policy.allow_approximate() else 1,
+                                           stats_group=self.STREAM_CHUNK, to_ram=to_ram)
             return (decoded,) if not return_dict else DecoderOutput(sample=decoded)
 
         tiles = z.shape[0] if self.use_slicing else 1
@@ -562,6 +634,8 @@ class AutoencoderKLCausal3D(ModelMixin, ConfigMixin, FromOriginalVAEMixin):
                 decoded = torch.cat(decoded_slices)
             else:
                 decoded = self._decode(z).sample
+            if to_ram is not None:  # (the same result as the streamed decode's: the video in RAM, in its final form)
+                decoded = to_ram(decoded).cpu()
 
             if not return_dict:
                 return (decoded,)

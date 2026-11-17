@@ -32,6 +32,8 @@ function loopOn() { try { return localStorage.getItem('sr.loop') === '1'; } catc
 export function mountInspector(root) {
   let shownId = null, compareId = null, sourceOn = false, signatureShown = '', promptOpen = false;  // the prompt is the showrunner's: folded unless opened
   const saveShot = fieldSaver((shotId, fields) => actions.ops([{ op: 'update_shot', shot: shotId, fields }], { quiet: true }).catch(error => toast(error.message, 'error')), 500);
+  // what the panel shows of a shot: the shot, the take tier, and whether the showrunner's buttons are available (they follow its task)
+  const signature = shot => JSON.stringify(shot) + state.shootTier + actions.directorBlocked();
 
   function render() {
     const scroll = root.scrollTop, same = state.selection.size === 1 && [...state.selection][0] === shownId;
@@ -57,8 +59,8 @@ export function mountInspector(root) {
     const remake = doc.brief.kind === 'remake', notForRemake = remake ? ' style="display:none"' : '';  // its motion, length, words and joins come from the source
     const drafts = doc.brief.draft_resolution, busy = rendering ? 'This shot is rendering: wait for its take.' : '';
     const final = finalTier(doc);
-    const retake = remake && !final && shot.takes.length;  // as the Board's toolbar: a remake shot with a take gets Reshoot, not the showrunner's Shoot
-    const shootButtons = !drafts || take?.kept_source ? '' : `${tierToggle(doc)}${retake ? '' : `<button class="btn ${final && take?.tier === 'draft' ? 'primary' : ''}" id="i-shoot" ${availability(busy || (final ? actions.renderBlocked() || (notFinal(doc, [shot]).length ? '' : 'This shot already has a final take: Reshoot makes another.') : actions.directorBlocked()), final ? 'Renders it at the target size now, with the prompt, seed and pictures of its take: no language model, and nobody looks at the take' : 'The showrunner renders it at the draft size and looks at the take')}>${icon(final ? 'bolt' : 'clapper')} Shoot this shot</button>`}`;
+    const retake = remake && !final && shot.takes.length;  // as the Board's toolbar: a remake shot with a take gets Render again, not the showrunner's Shoot
+    const shootButtons = !drafts || take?.kept_source ? '' : `${tierToggle(doc)}${retake ? '' : `<button class="btn ${final && take?.tier === 'draft' ? 'primary' : ''}" id="i-shoot" ${availability(busy || (final ? actions.renderBlocked() || (notFinal(doc, [shot]).length ? '' : 'This shot already has a final take: Render again makes another.') : actions.directorBlocked()), final ? 'Renders it at the target size now, with the prompt, seed and pictures of its take: no language model, and nobody looks at the take' : 'The showrunner renders it at the draft size and looks at the take')}>${icon(final ? 'bolt' : 'clapper')} Shoot this shot</button>`}`;
     root.innerHTML = `<div class="inspector">
       <div class="insp-head"><span class="shot-num">${index + 1}</span><input class="input bare grow" id="i-title" value="${esc(shot.title)}" placeholder="Shot ${index + 1}" style="font-weight:650;font-size:15px">
         <button class="btn small icon ${shot.locked ? 'active' : ''}" id="i-lock" title="${shot.locked ? 'Locked: the showrunner keeps it. Click to unlock' : 'Lock: the showrunner will not change it'}">${icon(shot.locked ? 'lock' : 'unlock')}</button>
@@ -76,7 +78,7 @@ export function mountInspector(root) {
           ${shootButtons}
           <button class="btn ${drafts && take?.tier === 'draft' ? '' : 'primary'}" id="i-fix" ${availability(actions.directorBlocked(), 'Say what is wrong or what should change: the showrunner fixes this shot and keeps the rest')}>${icon('director')} Fix…</button>
           ${doc.brief.review_before_edit ? `<button class="btn reject ${shot.status === 'rejected' && verdict?.by === 'user' ? 'active' : ''}" id="i-reject" title="Mark the take for a redo, with a note for the showrunner, and carry on reviewing">${icon('x')} Redo…</button>` : ''}
-          ${take.settings && Object.keys(take.settings).length ? `<button class="btn" id="i-rerun" ${availability(rendering ? 'This shot is rendering: wait for its take.' : '', 'Another take now, with the same prompt and pictures and a new seed, without the showrunner: nobody is told what was wrong. To say it, use Fix.')}>${icon('refresh')} Reshoot</button>` : ''}</div>
+          ${take.settings && Object.keys(take.settings).length ? `<button class="btn" id="i-rerun" ${availability(rendering ? 'This shot is rendering: wait for its take.' : '', 'Another take now, with the same prompt and pictures and a new seed, without the showrunner: nobody is told what was wrong. To say it, use Fix.')}>${icon('refresh')} Render again</button>` : ''}</div>
         ${[verdict, verdict?.by === 'user' && take.showrunner_verdict].filter(Boolean).map(item => `<div class="verdict-note ${item.ok ? 'ok' : 'bad'}">${icon(item.ok ? 'check' : 'alert')}<span><b>${item.by === 'user' ? 'You' : 'Showrunner'}:</b> ${shotRefs(item.note || (item.by === 'user' ? (item.ok ? 'Approved.' : 'Marked for a redo.') : item.ok ? 'Good take.' : 'Needs a retry.'), doc.shots, doc.cast)}</span></div>`).join('')}
         ${heardHtml(take, shot)}${checksHtml(take, shot)}` : `<div class="verdict-row">${shootButtons}${drafts ? '' : `<button class="btn primary" id="i-shoot" ${availability(rendering ? 'This shot is rendering: wait for its take.' : actions.directorBlocked())}>${icon('clapper')} ${rendering ? 'Rendering…' : 'Shoot this shot'}</button>`}
           ${rendering ? '' : `<button class="btn" id="i-render" ${availability(actions.renderBlocked(), 'Renders it now from its prompt, without the showrunner: no language model, and nobody checks the take. Without a prompt, one is made from what you wrote on the shot.')}>${icon('bolt')} Render now</button>`}
@@ -114,7 +116,7 @@ export function mountInspector(root) {
         <div class="col" style="margin-top:10px"><input class="input mono" id="i-template" value="${esc(shot.generation?.template || 'gen_video')}">
         <textarea class="textarea json" id="i-settings" spellcheck="false">${esc(JSON.stringify(settings, null, 2))}</textarea><div class="muted" style="font-size:12px">JSON merged into the shot's settings when you leave the field.</div></div></details>
     </div>`;
-    signatureShown = JSON.stringify(shot) + state.shootTier;
+    signatureShown = signature(shot);
     bindShot(shot, take);
   }
 
@@ -168,8 +170,8 @@ export function mountInspector(root) {
     if (!heard) return '';
     const extra = [heard.before, heard.after].filter(Boolean).map(words => `“${esc(words)}”`).join(' and ');
     const notes = [
-      ...heard.missing.map(line => [false, `<b>Not said as written:</b> “${esc(line)}”<br>${said}<br><b>Reshoot</b> tries another take.`]),
-      ...heard.between.map(words => [false, `<b>Words added between its lines:</b> “${esc(words)}”<br>They cannot be cut without a jump: <b>Reshoot</b> tries another take.`]),
+      ...heard.missing.map(line => [false, `<b>Not said as written:</b> “${esc(line)}”<br>${said}<br><b>Render again</b> tries another take.`]),
+      ...heard.between.map(words => [false, `<b>Words added between its lines:</b> “${esc(words)}”<br>They cannot be cut without a jump: <b>Render again</b> tries another take.`]),
       ...heard.inexact.map(line => [true, `A word may differ in “${esc(line)}”<br>${said}`]),
       ...(extra && shot.line_cut ? [[true, `<b>Cut, as not in its lines:</b> ${extra}`]] : extra && !heard.missing.length ? [[true, `<b>Not in its lines, left in the shot:</b> ${extra}`]] : [])];
     return notes.map(([ok, text]) => `<div class="verdict-note ${ok ? 'ok' : 'bad'}">${icon(ok ? 'scissors' : 'alert')}<span>${text}</span></div>`).join('');
@@ -364,20 +366,20 @@ export function mountInspector(root) {
   }
 
   function renderMany(shots) {
-    const retake = state.doc.brief.kind === 'remake' && !finalTier(state.doc) && shots.every(shot => shot.takes.length);  // as the Board's toolbar: Reshoot, not the showrunner's Shoot
+    const retake = state.doc.brief.kind === 'remake' && !finalTier(state.doc) && shots.every(shot => shot.takes.length);  // as the Board's toolbar: Render again, not the showrunner's Shoot
     const total = shots.reduce((sum, shot) => sum + (actions.take(shot)?.duration_s || shot.duration_s || 0), 0);
     root.innerHTML = `<div class="inspector"><div class="insp-head"><b style="font-size:15px">${shots.length} shots selected</b><span class="muted">· ${formatDuration(total)}</span></div>
       <div class="refs" style="grid-template-columns:repeat(3,1fr)">${shots.slice(0, 9).map(shot => { const take = actions.take(shot); return `<div class="ref" style="aspect-ratio:16/9">${take?.poster ? `<img src="${actions.file(take.poster)}" alt="">` : `<div style="position:absolute;inset:0;${art(shot.id + shot.section, shot.intent)}"></div>`}</div>`; }).join('')}</div>
       <div class="col">
         <button class="btn approve" data-bulk="approve" ${availability(shots.some(shot => actions.take(shot)) ? '' : 'None of them has a take yet.')}>${icon('check')} Approve their takes</button>
-        ${state.doc.brief.draft_resolution ? `<div class="row" style="flex-wrap:nowrap">${tierToggle(state.doc)}${retake ? `<button class="btn grow" data-bulk="reshoot-now" ${availability(actions.renderBlocked(), `Another take of each now at ${reshootSize(state.doc)}, with the same prompt and pictures and a new seed, without the showrunner`)}>${icon('refresh')} Reshoot ${shots.length} shots</button>` : `<button class="btn grow" data-bulk="shoot" ${availability(finalTier(state.doc) ? actions.renderBlocked() || (notFinal(state.doc, shots).length ? '' : 'They already have a final take.') : actions.directorBlocked(), finalTier(state.doc) ? 'Renders them at the target size now, with the prompt, seed and pictures of their takes: no language model, and nobody looks at the takes' : 'The showrunner renders them at the draft size and looks at the takes')}>${icon(finalTier(state.doc) ? 'bolt' : 'clapper')} Shoot ${shots.length} shots</button>`}</div>` : ''}
+        ${state.doc.brief.draft_resolution ? `<div class="row" style="flex-wrap:nowrap">${tierToggle(state.doc)}${retake ? `<button class="btn grow" data-bulk="reshoot-now" ${availability(actions.renderBlocked(), `Another take of each now at ${reshootSize(state.doc)}, with the same prompt and pictures and a new seed, without the showrunner`)}>${icon('refresh')} Render ${shots.length} shots again</button>` : `<button class="btn grow" data-bulk="shoot" ${availability(finalTier(state.doc) ? actions.renderBlocked() || (notFinal(state.doc, shots).length ? '' : 'They already have a final take.') : actions.directorBlocked(), finalTier(state.doc) ? 'Renders them at the target size now, with the prompt, seed and pictures of their takes: no language model, and nobody looks at the takes' : 'The showrunner renders them at the draft size and looks at the takes')}>${icon(finalTier(state.doc) ? 'bolt' : 'clapper')} Shoot ${shots.length} shots</button>`}</div>` : ''}
         <button class="btn" data-bulk="lock">${icon('lock')} Lock / unlock</button>
         <button class="btn" data-bulk="include">${icon('eye')} Include / exclude</button>
         <button class="btn" data-bulk="reshoot" ${availability(actions.directorBlocked())}>${icon('refresh')} Ask the showrunner to fix them…</button>
         <button class="btn" data-bulk="render" ${availability(actions.renderBlocked() || (shots.some(shot => !shot.takes.length) ? '' : 'All of them have a take.'), 'Renders the ones without a take now, without the showrunner: no language model, and nobody checks the takes')}>${icon('bolt')} Render now</button>
         <div class="field"><div class="label">${icon('layers')} Move to section</div><input class="input" id="bulk-section" placeholder="The part of the video they belong to"></div>
         <div class="field"${state.doc.brief.kind === 'remake' ? ' style="display:none"' : ''}><div class="label">${icon('transition')} Transition</div><div class="seg" id="bulk-tr">${TRANSITIONS.map(([key, label]) => `<button data-tr="${key}">${label}</button>`).join('')}</div></div>
-        ${retake && state.doc.brief.draft_resolution ? '' : `<button class="btn" data-bulk="reshoot-now" ${availability(actions.renderBlocked() || (shots.some(shot => shot.takes.length) ? '' : 'None of them has a take yet: Render now makes their first.'), `Another take of each one that has a take, now at ${reshootSize(state.doc)}, with the same prompt and pictures and a new seed, without the showrunner`)}>${icon('refresh')} Reshoot them</button>`}
+        ${retake && state.doc.brief.draft_resolution ? '' : `<button class="btn" data-bulk="reshoot-now" ${availability(actions.renderBlocked() || (shots.some(shot => shot.takes.length) ? '' : 'None of them has a take yet: Render now makes their first.'), `Another take of each one that has a take, now at ${reshootSize(state.doc)}, with the same prompt and pictures and a new seed, without the showrunner`)}>${icon('refresh')} Render them again</button>`}
         <div class="together-note" id="bulk-together" hidden></div>
         <button class="btn danger" data-bulk="delete">${icon('trash')} Delete</button></div></div>`;
     bindTierToggle(root);
@@ -425,7 +427,7 @@ export function mountInspector(root) {
       if (active && root.contains(active) && active.matches('textarea, input, select')) return;  // no redraw under the user's hands
       const id = state.selection.size === 1 ? [...state.selection][0] : null;
       const shot = id && actions.shot(id);
-      if (shot && shot.id === shownId && JSON.stringify(shot) + state.shootTier === signatureShown && !root.querySelector('#cmp-handle')) return;
+      if (shot && shot.id === shownId && signature(shot) === signatureShown && !root.querySelector('#cmp-handle')) return;
       render();
     },
   };

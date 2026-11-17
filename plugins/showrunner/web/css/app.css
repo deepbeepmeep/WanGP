@@ -113,6 +113,7 @@ a { color: inherit; }
 .input.bare:hover { border-color: var(--line); }
 .label { font-size: 11.5px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; display: flex; align-items: center; gap: 6px; }
 .field { display: flex; flex-direction: column; }
+.chip[hidden] { display: none; }
 .chip { display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 10px; border-radius: 99px; background: var(--surface-3); border: 1px solid var(--line); font-size: 12.5px; color: var(--text-2); cursor: default; white-space: nowrap; }
 .chip svg { width: 13px; height: 13px; }
 .chip.clickable { cursor: pointer; }

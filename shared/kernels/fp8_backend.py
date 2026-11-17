@@ -268,5 +268,9 @@ class _FP8RowProjection:
             out.add_(bias)
         return out
 
+    @staticmethod
+    def slice_input(prepared, start, stop):  # rows of the input (offload.linear_input_rows): one activation scale for the whole input
+        return (prepared[0][start:stop], *prepared[1:]) if isinstance(prepared, tuple) else prepared[start:stop]
+
 
 _FP8_ROW_PROJECTION = _FP8RowProjection()

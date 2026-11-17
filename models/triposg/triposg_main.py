@@ -58,7 +58,7 @@ def _valid_alpha(alpha, min_ratio=0.01):
 def _segmentation_alpha(rgb):
     """Upstream's photo path with rembg BiRefNet General in place of BriaRMBG-1.4: the soft mask thresholded (Otsu), components under 200 pixels
     removed, and the box of the largest remaining contour."""
-    from rembg import remove
+    from preprocessing.rembg.native import remove
     from skimage.measure import label
     from skimage.morphology import remove_small_objects
     from preprocessing.rembg.assets import OBJECT_MODEL
@@ -136,7 +136,8 @@ class model_factory:
     # ---------------------------------------------------------------- conditioning
 
     def _object_image(self, image):
-        digest = _image_digest(image, self.config["padding_ratio"])
+        from preprocessing.rembg.assets import OBJECT_MODEL, selected_model
+        digest = (_image_digest(image, self.config["padding_ratio"]), selected_model(OBJECT_MODEL))
         if self._prepared[0] != digest:
             self._prepared = (digest, object_image(image, self.config["padding_ratio"]))
             check_abort()

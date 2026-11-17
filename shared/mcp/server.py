@@ -1690,16 +1690,18 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
 
     jobs = _JobStore(session)
     agent_instructions = None
-    plugin_instructions = ""
+    routing_instructions = ""
     if api_version == "2.1":
         from .plugin_toolbox import instructions as plugin_toolbox_instructions
-        from .skills import SkillMCP
+        from .skills import SkillStore, skill_mcp
 
-        plugin_instructions = plugin_toolbox_instructions()  # routing declared by the enabled plugins, for Prime and external agents alike
+        skills = SkillStore(session._root / "user_skills")
+        # The enabled plugins' routing and the user's skills, for Prime and external agents alike, taken once per server (a Prime session)
+        routing_instructions = "\n\n".join(part for part in (plugin_toolbox_instructions(), skills.instructions()) if part)
         if not compact_model_tools:  # Prime already carries these rules in its system prompt
             from shared.deepy import load_agent_instructions
-            agent_instructions = "\n\n".join(part for part in (_AGENT_INSTRUCTIONS_HEADER, load_agent_instructions(), plugin_instructions) if part)
-        mcp = SkillMCP("WanGP", instructions=agent_instructions, skills_root=session._root / "user_skills", **dict(settings or {}))
+            agent_instructions = "\n\n".join(part for part in (_AGENT_INSTRUCTIONS_HEADER, load_agent_instructions(), routing_instructions) if part)
+        mcp = skill_mcp("WanGP", instructions=agent_instructions, skills=skills, **dict(settings or {}))
     else:
         mcp = FastMCP("WanGP", **dict(settings or {}))
     default_job_event_limit = max(0, min(int(default_job_event_limit), _MAX_STORED_EVENTS))
@@ -1843,7 +1845,7 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
             return agent_instructions
         if api_version != "1":
             guide = f"WanGP MCP API {api_version}. Use toolbox descriptions to choose a domain. Use declared shortcuts and known call recipes directly; otherwise discover actions, read the selected contract, then execute. Reuse known contracts. Specialized workflows are available in wangp://guides/workflows."
-            return f"{guide}\n\n{plugin_instructions}" if plugin_instructions else guide
+            return f"{guide}\n\n{routing_instructions}" if routing_instructions else guide
         return _AGENT_GUIDE_PATH.read_text(encoding="utf-8")
 
     def legacy_model_tool(function):

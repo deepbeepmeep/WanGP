@@ -2,12 +2,13 @@ from enum import Enum
 from typing import Protocol
 
 import torch
+from mmgp import offload
 
 from ...utils import rms_norm
 from shared import attention_kit
 from shared.attention import pay_attention
-from .rope import LTXRopeType, RopeCache, apply_rotary_emb_inplace, apply_rope_cache_heads_inplace
-from shared.kernels.ops import project_many
+from .rope import LTXRopeType, RopeCache, apply_rotary_emb_inplace, apply_rope_cache_heads_inplace, apply_rope_cache_rows_inplace
+from shared.kernels.ops import mean_square_scale_, project_many
 
 memory_efficient_attention = None
 flash_attn_interface = None
@@ -159,6 +160,21 @@ class DBMRMSNorm(torch.nn.Module):
         return rms_norm(x, weight=self.weight, eps=self.eps, in_place=in_place)
 
 
+def _kit_residual(residual, gate):
+    """attention_kit's (residual rows, gate table, segments) for residual += gate * out, gate (batch or 1, groups, dim) for all tokens
+    (groups 1) or per frame; None for a gate per token, which the kit does not take (the caller adds the output)."""
+    batch, tokens, dim = residual.shape
+    if gate is None:
+        return residual.view(-1, dim), None, None
+    groups = gate.shape[1]
+    if groups == tokens and tokens > 1 or tokens % groups:
+        return None
+    span = tokens // groups
+    segments = [(item * tokens + group * span, item * tokens + (group + 1) * span, (item if gate.shape[0] > 1 else 0) * groups + group)
+                for item in range(batch) for group in range(groups)]
+    return residual.view(-1, dim), gate.reshape(-1, dim), segments
+
+
 class Attention(torch.nn.Module):
     def __init__(
         self,
@@ -213,20 +229,46 @@ class Attention(torch.nn.Module):
         return tuple(result)
 
     def _norm_rope_(self, query, key, pe, k_pe, group):
-        """attention_kit callback: q_norm/k_norm (over all heads) and RoPE of q and/or k in place."""
+        """attention_kit callback: q_norm/k_norm (over all heads) and RoPE of q and/or k in place (the tokens of group.rows when given)."""
         for which, (tensor, norm, freqs, heads) in enumerate(((query, self.q_norm, pe, group.q), (key, self.k_norm, pe if k_pe is None else k_pe, group.kv))):
             if tensor is not None:
                 rows = tensor.flatten(2)
                 if group.mean_squares is None:
                     norm(rows)
                 else:
-                    rows.mul_(group.mean_squares[which].add(norm.eps).rsqrt_())
-                    rows.mul_(norm.weight[heads.start * self.dim_head:heads.stop * self.dim_head])
+                    mean_square_scale_(rows, group.mean_squares[which], norm.eps, norm.weight[heads.start * self.dim_head:heads.stop * self.dim_head])
                 if freqs is not None:
-                    if len(heads) == self.heads:
+                    if group.rows is not None:  # all heads of a range of tokens (norm_rows)
+                        apply_rope_cache_rows_inplace(rows, freqs, group.rows)
+                    elif len(heads) == self.heads:
                         apply_rotary_emb_inplace(rows, freqs, self.rope_type)
                     else:
                         apply_rope_cache_heads_inplace(rows, freqs, heads)
+
+    def _gated_source(self, x_list: list) -> torch.Tensor:
+        """The head gates (batch, tokens, heads) of a RowSource input, filled from each range of its rows as the kit prepares it (the
+        source then hands them out once): x_list's source replaced by one that also computes them. Each gate row as from the whole input."""
+        source = x_list[0]
+        head_gate = torch.empty((*source.shape[:-1], self.heads), dtype=source.dtype, device=source.device)
+        gates, fill = head_gate.view(-1, self.heads), source.fill
+
+        def gated(start: int, stop: int) -> torch.Tensor:
+            rows = fill(start, stop)
+            torch.sigmoid(self.to_gate_logits(rows), out=gates[start:stop]).mul_(2.0)  # in place: one kernel less per range of rows
+            return rows
+
+        def gated_at(first: int, step: int, count: int):  # gated inside a CUDA graph loop, rows from its counter
+            rows_at = None if source.fill_at is None else source.fill_at(first, step, count)
+            if rows_at is None:
+                return None
+
+            def run(counter):
+                rows = rows_at(counter)
+                offload._row_store_at(gates, torch.sigmoid(self.to_gate_logits(rows)).mul_(2.0), counter, first, step)
+                return rows
+            return run
+        x_list[0] = offload.RowSource(source.shape, source.dtype, source.device, gated, gated_at)
+        return head_gate
 
     def forward(
         self,
@@ -236,30 +278,51 @@ class Attention(torch.nn.Module):
         pe: torch.Tensor | None = None,
         k_pe: torch.Tensor | None = None,
         NAG: dict | None = None,
-    ) -> torch.Tensor:
+        residual: torch.Tensor | None = None,
+        gate: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        """The attention's output; with residual (batch, tokens, dim), residual += gate * output where the kit adds it into residual itself
+        (gate None, per channel or per frame: a cross attention by chunks of queries, a self attention by spans of rows after the
+        output's projection), then None; otherwise the output."""
         split_heads = all(freqs is None or isinstance(freqs, RopeCache) and freqs.rope_type == LTXRopeType.SPLIT
                           and freqs.num_attention_heads == self.heads for freqs in (pe, k_pe))
         split_cross = (context_list is not None and NAG is None and split_heads and context_list[0].shape[0] == x_list[0].shape[0] and
                        attention_kit.head_groups(self.heads, x_list[0].shape[0] * max(x_list[0].shape[1], context_list[0].shape[1])) > 1)
         if ((context_list is None and mask is None or split_cross) and self._resolve_attention_override()[0] is None):
-            # the gates read the attention input: computed first so that the input is released by the q/k/v projections
-            gate_logits = None if self.to_gate_logits is None else self.to_gate_logits(x_list[0])
-            callback = lambda query, key, group: self._norm_rope_(query, key, pe, k_pe, group)
-            options = dict(split_heads=split_heads, norm_spans_heads=True, norm_stats=self._head_mean_squares, attention_mask=mask)
-            if context_list is None:
-                out = attention_kit.qkv_attention(x_list, self.to_q, self.to_k, self.to_v, self.heads, self.dim_head, callback, **options)
+            # the gates read the attention input: computed first so that the input is released by the q/k/v projections. The kit
+            # gates each group's output and applies to_out's linear (to_out: that linear, then an identity)
+            if isinstance(x_list[0], offload.RowSource):  # its gates are read from each range of rows as the kit prepares it
+                head_gate = None if self.to_gate_logits is None else self._gated_source(x_list)
             else:
-                out = attention_kit.cross_qkv_attention(x_list, context_list, self.to_q, self.to_k, self.to_v, self.heads, self.dim_head, callback, **options)
-            if gate_logits is not None:
-                out.mul_((2.0 * torch.sigmoid(gate_logits).to(dtype=out.dtype)).unsqueeze(-1))
-            return self.to_out(out.flatten(2, 3))
+                gate_logits = None if self.to_gate_logits is None else self.to_gate_logits(x_list[0])
+                head_gate = None if gate_logits is None else 2.0 * torch.sigmoid(gate_logits).to(dtype=x_list[0].dtype)
+                gate_logits = None
+            callback = lambda query, key, group: self._norm_rope_(query, key, pe, k_pe, group)
+            # group.rows may be a CUDA graph loop's turn (attention_kit.LoopRows): the queries' RoPE then runs in one launch of one layout
+            callback.loop_rows = pe is None or isinstance(pe, RopeCache) and pe.rope_type == LTXRopeType.SPLIT and len(pe.layouts) == 1
+            options = dict(split_heads=split_heads, norm_spans_heads=True, norm_stats=self._head_mean_squares, norm_rows=True, attention_mask=mask,
+                           out_proj=self.to_out[0], head_gate=head_gate)
+            added = None if residual is None else _kit_residual(residual, gate)
+            if context_list is None:  # with a residual: the output added by spans of rows after its projection, as the block's own addition
+                if added is not None:
+                    options.update(residual=added[0], gate=added[1], segments=added[2], add_after=True)
+                out = attention_kit.qkv_attention(x_list, self.to_q, self.to_k, self.to_v, self.heads, self.dim_head, callback, **options)
+                return None if added is not None else out
+            if added is not None:  # the projected output added into the residual: no output of all tokens beside it
+                options.update(residual=added[0], gate=added[1], segments=added[2])
+            out = attention_kit.cross_qkv_attention(x_list, context_list, self.to_q, self.to_k, self.to_v, self.heads, self.dim_head, callback, **options)
+            return None if added is not None else out
         x = x_list[0]
+        if isinstance(x, offload.RowSource):
+            x = x_list[0] = x.materialize()
         gate_logits = None if self.to_gate_logits is None else self.to_gate_logits(x)  # first: x is released after the projections
         x_list.clear()
         context = None
         if context_list is not None:
             context = context_list[0]
             context_list.clear()
+            if isinstance(context, offload.RowSource):
+                context = context.materialize()
         cross_attn = context is not None
         if cross_attn:
             q = self.to_q(x)

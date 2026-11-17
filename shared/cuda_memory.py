@@ -32,8 +32,8 @@ def compute_cache_folder(path):
 
 
 def mmgp_vram_allocator():
-    """The MMGP VRAM allocator runs: without the fragmentation the VAE tiling presets were made against, VAEs offer two levels,
-    Default (fast, about 2-3 GB of VRAM) and Low VRAM (Configuration > RAM/VRAM Management > VAE Tiling, values 0 and 3)."""
+    """The MMGP VRAM allocator runs: no fragmentation, and RAM spilling where chosen. VAE tiling then takes the largest tile within
+    its VRAM budget (shared.image_vae.tiling); without it (AMD GPUs, --vram-allocator default), one tile size smaller."""
     return VRAM_ALLOCATOR in ("vmm", "vmm_spill")
 
 

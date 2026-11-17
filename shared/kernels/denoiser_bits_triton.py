@@ -10,7 +10,7 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from shared.kernels.bf16_bits import bf16_bits_to_fp32, fp32_to_bf16_bits
-from shared.kernels.denoiser_triton import _ROPE_CONFIGS, _TUNE_ROWS, _TUNER, _axis_ids, _axis_row, modulation_stride
+from shared.kernels.denoiser_triton import _ROPE_CONFIGS, _TUNE_ROWS, _TUNER, _axis_ids, _axis_row, modulation_stride, scale_shift_block
 
 BF16_ONE = tl.constexpr(0x3F80)
 
@@ -20,45 +20,18 @@ def _round_bf16(v):
     return bf16_bits_to_fp32(fp32_to_bf16_bits(v))
 
 
-@triton.jit(do_not_specialize=['N'], do_not_specialize_on_alignment=['N'])
-def _modulate_bits(X, SCALE, SHIFT, N, D: tl.constexpr, ROWS_BITS: tl.constexpr, BLOCK: tl.constexpr):
-    i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    valid = i < N
-    if D % BLOCK == 0:
-        col = (tl.program_id(0) % (D // BLOCK)) * BLOCK + tl.arange(0, BLOCK)
-    else:
-        col = i % D
-    x = bf16_bits_to_fp32(tl.load(X + i, valid, 0))
-    if ROWS_BITS:  # BF16 modulation rows (the model dtype), read as bits
-        scale = bf16_bits_to_fp32(tl.load(SCALE + col, valid, 0))
-        shift = bf16_bits_to_fp32(tl.load(SHIFT + col, valid, 0))
-    else:  # FP32 rows rounded to BF16 as the eager .to(dtype)
-        scale = _round_bf16(tl.load(SCALE + col, valid, 0))
-        shift = _round_bf16(tl.load(SHIFT + col, valid, 0))
-    factor = _round_bf16(1.0 + scale)
-    scaled = _round_bf16(x * factor)
-    tl.store(X + i, fp32_to_bf16_bits(scaled + shift), valid)
-
-
 def norm_modulate(x, norm, shift, scale, segments):
     """norm(x) (BF16), then per segment x * (1 + scale[row]) + shift[row] with the eager path's BF16 roundings, in place on the norm
-    output; the modulation rows FP32 (rounded to BF16 as the eager cast) or BF16 (read as bits)."""
-    output = norm(x)
-    bits = output.view(torch.int16)
-    width = x.shape[-1]
-    rows_bits = scale.dtype == torch.bfloat16
-    scale, shift = (scale.view(torch.int16), shift.view(torch.int16)) if rows_bits else (scale, shift)
-    for start, stop, row in segments:
-        if stop > start:
-            size = (stop - start) * width
-            _modulate_bits[(triton.cdiv(size, 1024),)](bits[start:stop], scale[row], shift[row], size, width, rows_bits, 1024, enable_fp_fusion=False)
-    torch.autograd.graph.increment_version(output)
-    return output
+    output; the modulation rows FP32 (rounded to BF16 as the eager cast) or BF16 (read as bits). One launch per run of consecutive
+    segments (row_loop_triton.modulate_runs)."""
+    from shared.kernels import row_loop_triton
+    return row_loop_triton.modulate_runs(norm(x), shift, scale, segments, True)
 
 
 @triton.jit(do_not_specialize=['ROWS', 'HEADS', 'SEQ', 'XB', 'XS', 'XH', 'RB', 'RS'], do_not_specialize_on_alignment=['ROWS', 'HEADS', 'SEQ', 'XB', 'XS', 'XH', 'RB', 'RS'])
 def _rms_rope_bits(X, W, ROPE, ROWS, HEADS, SEQ, XB, XS, XH, RB, RS, EPS, RP: tl.constexpr, RC: tl.constexpr, D: tl.constexpr,
-                   PAIRS: tl.constexpr, BLOCK: tl.constexpr):
+                   PAIRS: tl.constexpr, ROPE_BITS: tl.constexpr, BLOCK: tl.constexpr):
+    # D and PAIRS stay constexprs: head-dim classes shared by models (as denoiser_triton._rms_rope)
     rows = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     ok = rows < ROWS
     head = rows % HEADS
@@ -87,8 +60,12 @@ def _rms_rope_bits(X, W, ROPE, ROWS, HEADS, SEQ, XB, XS, XH, RB, RS, EPS, RP: tl
     other = _round_bf16(other * inv * w_other)
     angle = batch[:, None] * RB + seq[:, None] * RS + tl.where(c < PAIRS, c, c - PAIRS)[None, :] * RP
     mask = ok[:, None] & rotated[None, :]
-    cos = bf16_bits_to_fp32(tl.load(ROPE + angle, mask, BF16_ONE))
-    sin = bf16_bits_to_fp32(tl.load(ROPE + angle + RC, mask, 0))
+    if ROPE_BITS:  # a BF16 table, read as bits
+        cos = bf16_bits_to_fp32(tl.load(ROPE + angle, mask, BF16_ONE))
+        sin = bf16_bits_to_fp32(tl.load(ROPE + angle + RC, mask, 0))
+    else:  # an FP32 table (ACE-Step 1.5), read as it is
+        cos = tl.load(ROPE + angle, mask, 1.0)
+        sin = tl.load(ROPE + angle + RC, mask, 0.0)
     first = c[None, :] < PAIRS
     out = tl.fma(tl.where(first, cos, sin), tl.where(first, y, other), tl.where(first, -sin, cos) * tl.where(first, other, y))
     tl.store(ptr, fp32_to_bf16_bits(tl.where(rotated[None, :], out, y)), ok[:, None])
@@ -96,16 +73,18 @@ def _rms_rope_bits(X, W, ROPE, ROWS, HEADS, SEQ, XB, XS, XH, RB, RS, EPS, RP: tl
 
 def rms_rope_(x, weight, rope, eps):
     """In place on Q or K (batch, tokens, heads, head_dim) in BF16, any strides with contiguous channels; weight the BF16 RMSNorm
-    weight; rope the BF16 (1 | batch, tokens, 1, pairs, 2) cos / sin table of the split-half rotation of the first 2 * pairs channels."""
+    weight; rope the BF16 or FP32 (1 | batch, tokens, 1, pairs, 2) cos / sin table of the split-half rotation of the first 2 * pairs
+    channels (a BF16 table is read as bits; an FP32 one as it is: viewed as 16-bit words, its strides would not address its values)."""
     batch, seq, heads, dim = x.shape
     rope_batch = 0 if rope.shape[0] == 1 else rope.stride(0)
-    x_bits, w_bits, rope_bits = x.view(torch.int16), weight.view(torch.int16), rope.view(torch.int16)
+    table_bits = rope.dtype == torch.bfloat16
+    x_bits, w_bits, rope_table = x.view(torch.int16), weight.view(torch.int16), rope.view(torch.int16) if table_bits else rope
 
     def launch(xx, config):
         block, warps = config
         rows = xx.shape[0] * xx.shape[1] * heads
-        _rms_rope_bits[(triton.cdiv(rows, block),)](xx, w_bits, rope_bits, rows, heads, xx.shape[1], *xx.stride()[:3], rope_batch, rope.stride(1), eps,
-                                                    rope.stride(3), rope.stride(4), dim, rope.shape[-2], block, num_warps=warps, enable_fp_fusion=False)
+        _rms_rope_bits[(triton.cdiv(rows, block),)](xx, w_bits, rope_table, rows, heads, xx.shape[1], *xx.stride()[:3], rope_batch, rope.stride(1), eps,
+                                                    rope.stride(3), rope.stride(4), dim, rope.shape[-2], table_bits, block, num_warps=warps, enable_fp_fusion=False)
 
     def prepare_scratch():  # a copy of the first rows, in the head layout of x
         tokens = max(1, min(seq, _TUNE_ROWS // heads))
@@ -113,7 +92,8 @@ def rms_rope_(x, weight, rope, eps):
         scratch.copy_(x_bits[:1, :tokens])
         return lambda config: launch(scratch, config)
 
-    config = _TUNER.config("rms_rope_bits", f"{x.dtype}|{heads}x{dim}|p{rope.shape[-2]}|s{x.stride(2)}", x.device, _ROPE_CONFIGS, prepare_scratch,
+    # no head count in the identity: every Attention Head Split level (group size) reuses one launch configuration
+    config = _TUNER.config("rms_rope_bits", f"{x.dtype}|d{dim}|p{rope.shape[-2]}|s{x.stride(2)}" + ("" if table_bits else "|fp32 table"), x.device, _ROPE_CONFIGS, prepare_scratch,
                            batch * seq * heads >= _TUNE_ROWS)
     launch(x_bits, config)
     torch.autograd.graph.increment_version(x)
@@ -121,14 +101,14 @@ def rms_rope_(x, weight, rope, eps):
 
 
 @triton.jit(do_not_specialize=['N', 'MOD_STRIDE'], do_not_specialize_on_alignment=['N', 'MOD_STRIDE'])
-def _scale_shift_bits(X, SCALE, SHIFT, Y, N, MOD_STRIDE, D: tl.constexpr, PER_TOKEN: tl.constexpr, BLOCK: tl.constexpr):
+def _scale_shift_bits(X, SCALE, SHIFT, Y, N, MOD_STRIDE, D, PER_TOKEN: tl.constexpr, BLOCK: tl.constexpr, DIVIDES: tl.constexpr):
     # denoiser_triton._scale_shift with BF16 x, scale, shift and y as bits: x * (1 + scale) + shift with the eager roundings
     i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     group = tl.program_id(1).to(tl.int64)
     offset = group * N + i
     if PER_TOKEN:
         s = i
-    elif D % BLOCK == 0:
+    elif DIVIDES:
         s = group * MOD_STRIDE + (tl.program_id(0) % (D // BLOCK)) * BLOCK + tl.arange(0, BLOCK)
     else:
         s = group * MOD_STRIDE + i % D
@@ -146,20 +126,21 @@ def scale_shift(x, scale, shift, in_place):
     per_token = scale.shape[1] == x.shape[1] and scale.is_contiguous()  # strided per-token rows go through the row groups
     groups = 1 if per_token else scale.shape[0] * scale.shape[1]
     size = x.numel() // groups
-    _scale_shift_bits[(triton.cdiv(size, 1024), groups)](
+    block, divides = scale_shift_block(x.shape[2], per_token)
+    _scale_shift_bits[(triton.cdiv(size, block), groups)](
         x.view(torch.int16), scale.view(torch.int16), shift.view(torch.int16), out.view(torch.int16), size, modulation_stride(scale), x.shape[2],
-        per_token, 1024,
+        per_token, block, divides,
         enable_fp_fusion=False)
     if in_place:
         torch.autograd.graph.increment_version(out)
     return out
 
 
-@triton.jit(do_not_specialize=['N', 'TOKENS', 'WIDTH', 'G0', 'G1', 'G2', 'BATCH_STRIDE', 'HEAD_START'], do_not_specialize_on_alignment=['N', 'TOKENS', 'WIDTH', 'G0', 'G1', 'G2', 'BATCH_STRIDE', 'HEAD_START'])
+@triton.jit(do_not_specialize=['N', 'TOKENS', 'WIDTH', 'G0', 'G1', 'G2', 'BATCH_STRIDE', 'HEAD_START', 'PAD', 'FREQ_WIDTH'], do_not_specialize_on_alignment=['N', 'TOKENS', 'WIDTH', 'G0', 'G1', 'G2', 'BATCH_STRIDE', 'HEAD_START', 'PAD', 'FREQ_WIDTH'])
 def _split_rope_bits(X, C0, S0, C1, S1, C2, S2, N, TOKENS,
-                     WIDTH, HALF: tl.constexpr, PAD: tl.constexpr,
+                     WIDTH, HALF: tl.constexpr, PAD,
                      AXES: tl.constexpr, G0, G1, G2, A0: tl.constexpr, A1: tl.constexpr, A2: tl.constexpr,
-                     FREQ_WIDTH: tl.constexpr, BATCH_STRIDE, HEAD_START,
+                     FREQ_WIDTH, BATCH_STRIDE, HEAD_START,
                      FP32: tl.constexpr, FREQ_BITS: tl.constexpr, BLOCK: tl.constexpr):
     # denoiser_triton._split_rope with BF16 x as bits (in place) and, with FREQ_BITS, BF16 cos / sin tables as bits
     i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)

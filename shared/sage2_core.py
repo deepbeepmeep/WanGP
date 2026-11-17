@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from mmgp import cuda_graphs
 
 from shared.kernels.token_mean import token_mean
+from shared.kernels import split_kv as _split_kv
 
 from .sageattention_patch import patch_sageattention
 from .sage1_core import fp16_v, scale_output
@@ -412,6 +413,14 @@ def staged_settings(device, masked=False, scale_v=False, head_dim=128):
     return {**settings, "scale_v": True} if scale_v else settings
 
 
+def program_rows(settings, head_dim):
+    """Query rows of one head that a program of these settings' attention kernel covers, from the kernels' sources: the INT8 QK / FP8
+    PV CUDA kernels of sm89 and sm120 launch a grid of ceil(queries / CTA_Q) x heads x batch programs with CTA_Q = 128
+    (csrc/qattn/*_attn*.cu); the Triton kernel a grid of ceil(queries / BLOCK_M) x heads x batch, BLOCK_M being settings["block_m"]
+    (triton/attn_qk_int8_per_block.py). Read by shared.attention.launch_waves."""
+    return settings["block_m"] if settings["qk_quant_gran"] == "per_block" else 128
+
+
 def fused_qk_layouts(settings, head_dim):
     """Row layouts of these settings' staged q / k quantization for shared.kernels.qk_quant_triton (the norm and RoPE of q and k fused
     with their quantization): {"q": (layout, block, sm_scale, scale_eps), "k": (...)} as staged_quantize_q / staged_quantize_k
@@ -534,16 +543,25 @@ def staged_attention(out, quantized_list, settings, attn_mask=None, return_lse=F
         mask = ((attn_mask,), attn_mask.stride()) if attn_mask is not None else ((None,), (0, 0, 0, 0)) if _TRITON_MASK_ARGUMENT else ((), ())
         num_warps, num_stages = settings["launch"] or ((4, 3) if head_dim == 64 else (8, 4))
         lse = torch.empty((b, heads, qo_len), dtype=torch.float32, device=out.device) if return_lse else torch.empty([0], dtype=torch.float32, device="cpu")
-        attn_qk_int8_per_block._attn_fwd[((qo_len + settings["block_m"] - 1) // settings["block_m"], heads, b)](
-            q_int8, k_int8, v, q_scale, k_scale, out, *mask[0], lse,
-            q_int8.stride(0), q_int8.stride(2), q_int8.stride(1), k_int8.stride(0), k_int8.stride(2), k_int8.stride(1),
-            v.stride(0), v.stride(2), v.stride(1), out.stride(0), out.stride(2), out.stride(1), *mask[1],
-            qo_len, kv_len, heads, heads // k_int8.shape[2], BLOCK_M=settings["block_m"], BLOCK_N=64, HEAD_DIM=head_dim, STAGE=1,
-            RETURN_LSE=return_lse, num_warps=num_warps, num_stages=num_stages)
+
+        def launch(target, q_int8, k_int8, v, q_scale, k_scale):
+            attn_qk_int8_per_block._attn_fwd[((qo_len + settings["block_m"] - 1) // settings["block_m"], heads, b)](
+                q_int8, k_int8, v, q_scale, k_scale, target, *mask[0], lse,
+                q_int8.stride(0), q_int8.stride(2), q_int8.stride(1), k_int8.stride(0), k_int8.stride(2), k_int8.stride(1),
+                v.stride(0), v.stride(2), v.stride(1), target.stride(0), target.stride(2), target.stride(1), *mask[1],
+                qo_len, kv_len, heads, heads // k_int8.shape[2], BLOCK_M=settings["block_m"], BLOCK_N=64, HEAD_DIM=head_dim, STAGE=1,
+                RETURN_LSE=return_lse, num_warps=num_warps, num_stages=num_stages)
+        # its keys split in ranges attended in one launch where that is faster for this shape (fewer, part-empty waves)
+        if return_lse or attn_mask is not None or not _split_kv.attention_triton(out, q_int8, k_int8, v, q_scale, k_scale, settings["block_m"], settings["launch"], launch):
+            launch(out, q_int8, k_int8, v, q_scale, k_scale)
         out = out if v_scale is None else scale_output(out, v_scale, 2)
         return (out, lse) if return_lse else out
+    gran, sm_scale = 3 if settings["qk_quant_gran"] == "per_thread" else 2, settings.get("softmax_dim", head_dim) ** -0.5
+    if (not return_lse and attn_mask is None and settings["pv_accum_dtype"] == "fp32+fp16" and _split_kv.available()
+            and _split_kv.attention(out, q_int8, k_int8, v, q_scale, k_scale, v_scale, gran, sm_scale)):
+        return out  # its keys split in ranges attended in one launch, where that is faster for this shape (fewer, part-empty waves)
     inputs = (q_int8, k_int8, v, out, q_scale, k_scale, v_scale) + ((v_mean,) if settings["pv_accum_dtype"] == "fp32" and settings["smooth_v"] else ())
-    lse = _cuda_kernel(settings)(*inputs, 0, 0, 3 if settings["qk_quant_gran"] == "per_thread" else 2, settings.get("softmax_dim", head_dim) ** -0.5, int(return_lse))
+    lse = _cuda_kernel(settings)(*inputs, 0, 0, gran, sm_scale, int(return_lse))
     return (out, lse) if return_lse else out
 
 

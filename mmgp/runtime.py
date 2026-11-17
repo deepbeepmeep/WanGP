@@ -211,6 +211,87 @@ def weights_resident(module):
 
 _block_names = weakref.WeakKeyDictionary()  # an offload manager -> (model id, id of a module of the model) -> the names of its blocks
 _tower_entries = weakref.WeakKeyDictionary()  # a tower (ModuleList) -> (model id, the entry name of each of its blocks)
+JOINT_PASS_COMPUTE_SHARE = 0.5  # of one prediction's compute estimated at the probed BF16 rate: the transfers above which a joint pass saves time (INT8 GEMMs run about twice as fast)
+_compute_rates = {}  # device name -> multiply-adds per second of a large BF16 GEMM (probed once)
+_tower_params = weakref.WeakKeyDictionary()  # an offload manager -> model id -> (blocks of its towers, their parameters)
+_joint_notices = set()
+
+
+def _compute_rate(device):
+    """Multiply-adds per second of a large BF16 GEMM on this device, probed once (a few milliseconds) and kept under ~/.triton/autotune."""
+    import json
+    from pathlib import Path
+    name = torch.cuda.get_device_name(device)
+    rate = _compute_rates.get(name)
+    if rate is not None:
+        return rate
+    path = Path.home() / ".triton" / "autotune" / "mmgp_compute_rate.json"
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    rate = saved.get(name)
+    if rate is None:
+        a = torch.randn(4096, 4096, device=device, dtype=torch.bfloat16)
+        best = float("inf")
+        for _ in range(4):
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(4):
+                torch.mm(a, a)
+            end.record()
+            end.synchronize()
+            best = min(best, start.elapsed_time(end) / 4)
+        del a
+        rate = saved[name] = 4096 ** 3 / (best / 1000)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(saved, indent=1), encoding="utf-8")
+        except OSError:
+            pass
+    _compute_rates[name] = rate
+    return rate
+
+
+def joint_pass_useful(module, tokens, features, predictions=2):
+    """Whether computing the predictions of a step together, in one pass over the blocks of a managed model (WanGP's Boost: each
+    block loaded once for all of them, their activations held together, a few GB at a hundred thousand tokens), still saves time with
+    the model's current residency. It saves the transfers of the blocks streamed at each pass (not preloaded, not kept by its
+    automatic preload), but only where they are not hidden behind the compute of one prediction (MMGP transfers the next block while
+    one runs): a pass of many tokens is bound by its compute, and a model kept in VRAM transfers nothing. tokens: the tokens of one
+    prediction; features: the model's width (self-attention's share of the compute: 2 x tokens^2 x features multiply-adds per block).
+    The transfer rate is MMGP's measured host-to-GPU rate, the compute that of the blocks' linears (tokens x their parameters) and
+    attention at a probed BF16 rate; the joint pass is kept while the transfers exceed JOINT_PASS_COMPUTE_SHARE of that compute.
+    Unmanaged modules, or a single prediction: False."""
+    owner = _owner(module)
+    if owner is None or predictions < 2:
+        return False
+    manager, model_id = owner
+    from .offload import _pcie_rate
+    per_model = _tower_params.setdefault(manager, {})
+    towers = per_model.get(model_id)
+    if towers is None:  # the blocks MMGP streams (entries model_id/name) and their parameters, tied ones and buffers once
+        names = [name[len(model_id) + 1:] for name, size in manager.blocks_of_modules_sizes.items() if size and name.startswith(model_id + "/")]
+        params = sum(p.numel() for name in names for _, _, p, is_buffer, tied in manager.blocks_of_modules[model_id + "/" + name] if not is_buffer and tied is None)
+        towers = per_model[model_id] = (names, params)
+    names, params = towers
+    preloaded, plan = manager.preloaded_blocks_per_model[model_id], None if manager.auto_preload is None else manager.auto_preload.plans.get(model_id)
+    streamed = sum(manager.blocks_of_modules_sizes[model_id + "/" + name] for name in names
+                   if name not in preloaded and not (plan is not None and manager.auto_preload.own_buffer(model_id, name)))
+    if streamed == 0:
+        useful = False
+    else:
+        device = torch.device("cuda", torch.cuda.current_device())
+        compute_s = (tokens * params + 2 * tokens * tokens * features * len(names)) / _compute_rate(device)  # multiply-adds
+        transfer_s = streamed / _pcie_rate()
+        useful = transfer_s > JOINT_PASS_COMPUTE_SHARE * compute_s
+    key = (model_id, tokens, predictions, useful)
+    if not useful and key not in _joint_notices:
+        _joint_notices.add(key)
+        from tqdm import tqdm
+        tqdm.write(f"[mmgp] Boost off for '{model_id}' ({tokens} tokens, {predictions} predictions): "
+                   + ("its blocks stay in VRAM, nothing to save." if streamed == 0 else "its transfers hide behind the compute; the predictions run one after the other, with less VRAM."))
+    return useful
 
 
 def resident_runs(module, blocks):

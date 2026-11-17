@@ -344,7 +344,7 @@ class family_handler:
     @staticmethod
     def fix_settings(base_model_type, settings_version, model_def, ui_defaults):
         if base_model_type != HUM_ARCHITECTURE:
-            migrate_source(ui_defaults)
+            migrate_source(ui_defaults, settings_version)
         # Retired style-only variants now share the contextual style choice.
         mode = ui_defaults.get("prompt_enhancer", "")
         if isinstance(mode, str):
@@ -359,14 +359,13 @@ class family_handler:
         if not one_prompt.strip() or not inputs["alt_prompt"].strip():
             return "YuE2 requires lyrics and a music style."
         if base_model_type == HUM_ARCHITECTURE:
-            if inputs["audio_prompt_type"] != "A" or inputs["audio_guide"] is None:
+            if inputs["audio_prompt_type"].replace("N", "").replace("V", "") != "A" or inputs["audio_guide"] is None:
                 return "Upload a hummed melody for Hum-to-Song."
             if inputs["model_mode"] not in (0, 1):
                 return "Choose Continue Hum or Hum Only."
         else:
             try:
-                migrate_source(inputs)
-                source = inputs["audio_prompt_type"]
+                source = migrate_source(inputs)
                 validate_source(source, inputs["model_mode"], inputs.get("custom_guide"), inputs.get("audio_guide"))
                 if source in ("1", "12"):
                     read_abc(inputs["custom_guide"], inputs["model_mode"] == 1)

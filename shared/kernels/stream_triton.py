@@ -2,7 +2,8 @@
 """Triton kernel of the streamed LTX VAE ("fast" kernel precision): PixelNorm + SiLU in one pass, written channels last for the Triton
 convolution that follows. FP32 arithmetic in registers with the PyTorch path's rounding points (x ** 2, the mean, + eps, the square root
 and the division each rounded to the activation dtype, SiLU with expf and IEEE division); only the sum of squares runs in another order.
-One binary per channel count, dtype and input layout; sizes and strides are not specialized."""
+One binary per power-of-two range of channel counts, dtype and input layout; sizes, strides and the channel count itself are not
+specialized."""
 import torch
 import triton
 import triton.language as tl
@@ -17,7 +18,7 @@ _CL = torch.channels_last_3d
 
 @triton.jit(do_not_specialize=["TOTAL", "T", "H", "W", "SB", "SC", "ST", "SH", "SW"],
             do_not_specialize_on_alignment=["TOTAL", "T", "H", "W", "SB", "SC", "ST", "SH", "SW"])
-def _norm_silu_kernel(X, OUT, TOTAL, T, H, W, SB, SC, ST, SH, SW, EPS, INV_C, C: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_P: tl.constexpr):
+def _norm_silu_kernel(X, OUT, TOTAL, T, H, W, SB, SC, ST, SH, SW, EPS, INV_C, C, BLOCK_C: tl.constexpr, BLOCK_P: tl.constexpr):
     """BLOCK_P pixels (all channels) of the channels-last output (batch, T, H, W, C): silu(x / sqrt(mean(x ** 2) + EPS)), x read with the
     strides SB..SW."""
     p = tl.program_id(0).to(tl.int64) * BLOCK_P + tl.arange(0, BLOCK_P)
@@ -56,7 +57,7 @@ def norm_silu(x, eps):
         target = torch.empty(pixels * channels, dtype=x.dtype, device=x.device)
         return lambda config: launch(target, pixels, config)
 
-    identity = f"{channels}|{x.dtype}|{'cl' if x.is_contiguous(memory_format=_CL) else 'strided'}"
+    identity = f"{channels}|{x.dtype}|{'cl' if x.is_contiguous(memory_format=_CL) else 'strided'}"  # timed per count; compiled per range
     launch(out, total, _TUNER.config("norm_silu", identity, x.device, ((4096, 4), (2048, 4), (8192, 8), (4096, 8)), scratch, out.numel() >= _TUNE_ELEMENTS))
     return out
 

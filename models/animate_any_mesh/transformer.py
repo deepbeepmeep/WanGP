@@ -46,9 +46,8 @@ class Attention(nn.Module):
         """Self-attention of the motion tokens and the text tokens joined in this order (upstream concatenates them)."""
         projections = (self.to_q, self.to_k, self.to_v)
         # FP32 checkpoint: SDPA, as upstream (the 16-bit kernels do not take FP32); no q/k norm or RoPE
-        out = attention_kit.joint_qkv_attention([(x_list, projections), (text_list, projections)], self.heads, self.head_dim, lambda query, key, group: None,
-                                                force_attention="sdpa")
-        return self.c_proj(out.flatten(2))
+        return attention_kit.joint_qkv_attention([(x_list, projections), (text_list, projections)], self.heads, self.head_dim, lambda query, key, group: None,
+                                                 force_attention="sdpa", out_proj=self.c_proj)
 
 
 class AdaLayerNormZero(nn.Module):

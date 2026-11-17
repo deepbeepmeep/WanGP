@@ -2,6 +2,7 @@ from dataclasses import replace
 import itertools
 from typing import Any, Callable, Iterator, List, Optional, Tuple
 
+import numpy as np
 import torch
 from mmgp import transfer
 from shared.utils.phase_progress import vae_encoding_progress, PhaseProgress, check_abort
@@ -413,9 +414,10 @@ STREAM_TILE_AREA, STREAM_FRAME_SHARE, STREAM_PIECE_FRAMES = 5, 0.64, 4
 ENCODE_TILE_AREA, ENCODE_CHUNK_FRAMES = 7.25, 4
 
 
-def _stream_tiles(shape: tuple, tiling_config: TilingConfig | None, tile_area: float, frame_share: float, scale: int, device: torch.device) -> List[Tile]:
+def _stream_tiles(shape: tuple, tiling_config: TilingConfig | None, tile_area: float, frame_share: float, scale: int, device: torch.device, latents: int | None = None) -> List[Tile]:
     """Spatial tiles of a latent of this shape for a streamed decoding or encoding: the fewest whose latent area, with the overlaps, fits
-    tile_area squares of the tiling size plus frame_share of the frame; their output coordinates and masks in units of `scale`."""
+    `latents` latent pixels (the VAE Tiling budget), else tile_area squares of the tiling size plus frame_share of the frame; their
+    output coordinates and masks in units of `scale`."""
     splitters, mappers = [DEFAULT_SPLIT_OPERATION] * len(shape), [DEFAULT_MAPPING_OPERATION] * len(shape)
     spatial = tiling_config.spatial_config if tiling_config is not None else None
     if spatial is not None:
@@ -428,7 +430,7 @@ def _stream_tiles(shape: tuple, tiling_config: TilingConfig | None, tile_area: f
         def area(counts: tuple[int, int]) -> int:
             return size(height, counts[0]) * size(width, counts[1])
 
-        budget = tile_area * (spatial.tile_size_in_pixels // latent_scale) ** 2 + frame_share * height * width
+        budget = latents if latents is not None else tile_area * (spatial.tile_size_in_pixels // latent_scale) ** 2 + frame_share * height * width
         counts = [(h, w) for h in range(1, height + 1) for w in range(1, width + 1) if (h == 1 or size(height, h) > overlap) and (w == 1 or size(width, w) > overlap)]
         fits = [c for c in counts if area(c) <= budget]
         counts = min(fits, key=lambda c: (c[0] * c[1], area(c))) if fits else min(counts, key=area)
@@ -672,7 +674,8 @@ class VideoDecoder(nn.Module):
         decoded, the overlaps of the tiles blended (on the CPU) when their last tile is decoded. Returns False when interrupted.
         """
         scale = self.video_downscale_factors
-        tiles = _stream_tiles(latent.shape, tiling_config, STREAM_TILE_AREA, STREAM_FRAME_SHARE, scale.height, latent.device)
+        spatial = tiling_config.spatial_config if tiling_config is not None else None
+        tiles = _stream_tiles(latent.shape, tiling_config, STREAM_TILE_AREA, STREAM_FRAME_SHARE, scale.height, latent.device, spatial.decode_tile_latents if spatial is not None else None)
         frames, height, width = latent.shape[2], latent.shape[3] * scale.height, latent.shape[4] * scale.width
         regions = [(tile.out_coords[3].indices(height)[:2], tile.out_coords[4].indices(width)[:2]) for tile in tiles]
         rows, cols = sorted({v for region in regions for v in region[0]}), sorted({v for region in regions for v in region[1]})
@@ -707,10 +710,12 @@ class VideoDecoder(nn.Module):
                 part = part.mul(masks[index][local(index, top, bottom, left, right)].to(part.dtype)).float().cpu()
                 total = sums.get((top, left))
                 if total is None:
-                    total = sums[(top, left)] = part.new_zeros((*part.shape[:2], (frames - 1) * scale.time + 1, *part.shape[3:]))
-                total = total[:, :, position : position + count].add_(part)
+                    total = sums[(top, left)] = torch.from_numpy(np.zeros((*part.shape[:2], (frames - 1) * scale.time + 1, *part.shape[3:]), dtype=np.float32))
+                total = total[:, :, position : position + count]
+                total.numpy()[...] += part.numpy()  # (NumPy: on this thread alone; PyTorch's pool of threads would spin between the pieces)
                 if index == owners[-1]:
-                    write(position, slice(top, bottom), slice(left, right), total.div_(weights[(top, left)]))
+                    total.numpy()[...] /= weights[(top, left)].numpy()
+                    write(position, slice(top, bottom), slice(left, right), total)
             position += count
 
         with PhaseProgress(frames * len(tiles)) as progress:
@@ -782,6 +787,8 @@ def decode_video_to_tensor(
     write_pos = 0
     is_diffusion_decoder = getattr(video_decoder, "is_diffusion_decoder", False)
 
+    writer = None  # the streamed decoding's pieces reach RAM without this thread waiting for the GPU
+
     def write(position: int, rows: slice, cols: slice, frames: torch.Tensor) -> int:
         # patch of the video from frame `position`, cropped to the expected size
         frame_count = min(int(frames.shape[2]), frame_capacity - position)
@@ -793,9 +800,20 @@ def decode_video_to_tensor(
             pass
         elif is_hdr:
             frames = vae_range_to_hdr_linear(frames, transform=hdr_transform, channel_dim=1).to(dtype=tensor_dtype)
-        else:
+        elif frames.is_cuda:
             frames = frames.add_(1.0).mul_(127.5).clamp_(0.0, 255.0)
-        transfer.copy_(video_tensor[position : position + frame_count, top:bottom, left:right], frames[0].permute(1, 2, 3, 0))
+        else:  # blended overlaps, in RAM: the same operations on this thread alone
+            values = frames.numpy()
+            values += 1.0
+            values *= 127.5
+            np.clip(values, 0.0, 255.0, out=values)
+        target, frames = video_tensor[position : position + frame_count, top:bottom, left:right], frames[0].permute(1, 2, 3, 0)
+        if writer is None:
+            transfer.copy_(target, frames)
+        elif frames.is_cuda:
+            writer.write(target, frames.to(tensor_dtype))  # converted on the GPU, as the copy did
+        else:  # blended overlaps, already in RAM: converted and copied on this thread alone
+            transfer.ram_copy_(target, torch.from_numpy(frames.numpy().astype(target.numpy().dtype)))
         return frame_count
 
     try:
@@ -804,22 +822,26 @@ def decode_video_to_tensor(
             decoder_input = [latent]
             latent = None
             tiled_iterator = video_decoder.tiled_decode(decoder_input, tiling_config, **tiled_decode_kwargs)
-            for frames in tiled_iterator:
-                if interrupt_check is not None and interrupt_check():
-                    return None
-                if frames is None:
-                    continue
-                frame_count = write(write_pos, slice(None), slice(None), frames)
-                if frame_count <= 0:
-                    break
-                write_pos += frame_count
+            with transfer.RamWriter("decoded video", depth=64, max_bytes=256 << 20) as writer:  # (each chunk to RAM, the GPU not waiting)
+                for frames in tiled_iterator:
+                    if interrupt_check is not None and interrupt_check():
+                        return None
+                    if frames is None:
+                        continue
+                    frame_count = write(write_pos, slice(None), slice(None), frames)
+                    if frame_count <= 0:
+                        break
+                    write_pos += frame_count
+            writer = None
         elif tiling_config is not None:
             def write_patch(position: int, rows: slice, cols: slice, frames: torch.Tensor) -> None:
                 nonlocal write_pos
                 write_pos = max(write_pos, position + write(position, rows, cols, frames))
 
-            if not video_decoder.tiled_decode(latent, tiling_config, write_patch, interrupt_check):
-                return None
+            with transfer.RamWriter("decoded video", depth=64, max_bytes=256 << 20) as writer:
+                if not video_decoder.tiled_decode(latent, tiling_config, write_patch, interrupt_check):
+                    return None
+            writer = None
         else:
             if interrupt_check is not None and interrupt_check():
                 return None
@@ -921,9 +943,10 @@ def _make_mask_1d(
 
 def _encoder_input(video: torch.Tensor, device: torch.device | None, dtype: torch.dtype | None) -> torch.Tensor:
     """Videos may stay on CPU; each encoded tile is moved to ``device`` on its own, and uint8 tiles are normalized to [-1, 1]."""
+    video = transfer.from_ram(video, device)  # (a tile of a video in RAM: gathered on this thread alone)
     if video.dtype != torch.uint8:
-        return video.to(device=device)
-    return video.to(device=device).to(dtype).div_(127.5).sub_(1.0)
+        return video
+    return video.to(dtype).div_(127.5).sub_(1.0)
 
 
 def encode_video(
@@ -956,7 +979,8 @@ def encode_video(
     if (frames - 1) % scale.time:
         raise ValueError("Invalid number of frames: Encode input must have 1 + 8 * x frames (e.g., 1, 9, 17, ...). Please check your input.")
     shape = (batch, getattr(video_encoder, "latent_channels", 128), 1 + (frames - 1) // scale.time, height // scale.height, width // scale.width)
-    tiles = _stream_tiles(shape, tiling_config, ENCODE_TILE_AREA, 0, 1, device)
+    spatial = tiling_config.spatial_config
+    tiles = _stream_tiles(shape, tiling_config, ENCODE_TILE_AREA, 0, 1, device, spatial.encode_tile_latents if spatial is not None else None)
     chunks = [(0, 1)] + [(start, min(start + ENCODE_CHUNK_FRAMES, frames)) for start in range(1, frames, ENCODE_CHUNK_FRAMES)]
     output = weights = None
     with vae_encoding_progress(len(tiles) * len(chunks), video_encoder, enabled=frames > 1):

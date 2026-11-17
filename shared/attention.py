@@ -433,6 +433,56 @@ __all__ = [
     'attention',
 ]
 
+_WAVE_KEYS = 8192  # keys of the probe's launches: long enough for the attention kernel to outweigh what surrounds it
+
+
+def launch_waves(device, head_dim, force_attention=None, masked=False):
+    """shared.kernels.launch_waves.LaunchWaves of the attention kernel that the staged functions (sage_staged) or pay_attention would
+    run on this device, with this force_attention and head_dim (a mask when masked): the query rows of one head that one of its
+    programs covers (.rows), how many programs the device runs at once and what a part-filled last wave costs. Probed once per
+    kernel and GPU (a second or two, kept under ~/.triton/autotune) by launching the attention over scratch tensors: the rows per
+    program come from the staged core where the kernel's source gives them (its program_rows), else from the probe. None for the
+    block-sparse attentions, and where the probe cannot run now or found no waves."""
+    from shared.kernels import launch_waves as waves
+    attn = force_attention or offload.shared_state["_attention"]
+    if attn in ("sparge", "chipmunk", "veda", "vsa"):
+        return None
+    staged = sage_staged(device, head_dim, force_attention, masked)
+    rows = None
+
+    def scratch(length, width):  # only while probing (no generator may be made during CUDA graph recording); no FP32 copy of the whole: a block repeated
+        generator = torch.Generator(device=device).manual_seed(length)
+        return torch.randn((1, 1024, 1, width), generator=generator, device=device).to(torch.bfloat16).repeat(1, -(-length // 1024), 1, 1)[:, :length]
+
+    if staged is not None:
+        core, settings = staged
+        width = settings.get("padded_dim") or head_dim
+        rows = core.program_rows(settings, head_dim) if hasattr(core, "program_rows") else None
+        identity = f"{core.__name__.rsplit('.', 1)[-1]} {' '.join(f'{key}={settings[key]}' for key in sorted(settings) if key != 'padded_dim')} d{width}"
+
+        def prepare(most):
+            q = scratch(most, width)
+            staged_k, staged_v = core.staged_quantize_k([scratch(_WAVE_KEYS, width)], settings), core.staged_quantize_v([scratch(_WAVE_KEYS, width)], settings)
+
+            def stage(length):
+                query = q[:, :length]
+                staged_q = core.staged_quantize_q(query, settings)
+                return lambda: core.staged_attention(query, [staged_q, staged_k, staged_v], settings)
+            return stage
+    else:
+        attn = get_default_attention_mode() if attn in ("auto", "sol", "vdn") else "sage2" if attn == "radial" else attn
+        width, identity = head_dim, f"{attn} d{head_dim}"
+
+        def prepare(most):
+            q, k, v = scratch(most, width), scratch(_WAVE_KEYS, width), scratch(_WAVE_KEYS, width)
+            return lambda length: lambda: pay_attention([q[:, :length], k, v], force_attention=attn)
+
+    model = waves.get(identity, device, f"Attention ({identity})", prepare, rows)
+    if model is not None:
+        model.keys = _WAVE_KEYS  # the probe's programs attend this many keys: a wave of a launch over other keys lasts in proportion
+    return model
+
+
 def get_cu_seqlens(batch_size, lens, max_len):
     # MPS compatibility: use dynamic device detection
     _cu_device = "mps" if _is_mps else "cuda"

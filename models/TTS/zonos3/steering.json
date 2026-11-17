@@ -1,0 +1,1186 @@
+{
+ "source": "Zyphra/ZONOS3-Mini assets/steering/studio_bundle_mect60k_x10.json (commit 9fd14e51)",
+ "sets": {
+  "identity": {
+   "space": "raw",
+   "directions": [
+    "age",
+    "gender"
+   ]
+  },
+  "pitch": {
+   "space": "raw",
+   "directions": [
+    "pitch",
+    "pitch_range"
+   ]
+  },
+  "accents_en": {
+   "space": "raw",
+   "directions": [
+    "american",
+    "australian",
+    "british",
+    "indian",
+    "irish",
+    "scottish",
+    "welsh"
+   ]
+  },
+  "accents_l1": {
+   "space": "raw",
+   "directions": [
+    "deu",
+    "fra",
+    "hin",
+    "pol",
+    "por",
+    "spa",
+    "vie"
+   ]
+  },
+  "mandarin": {
+   "space": "raw",
+   "directions": [
+    "cmn"
+   ]
+  },
+  "mandarin_hidden": {
+   "space": "attnres_source",
+   "directions": [
+    "cmn"
+   ],
+   "source_index": 15
+  },
+  "texture": {
+   "space": "raw",
+   "directions": [
+    "authoritative",
+    "deep",
+    "husky",
+    "raspy",
+    "shrill",
+    "soft"
+   ]
+  },
+  "room": {
+   "space": "raw",
+   "directions": [
+    "clean"
+   ]
+  },
+  "delivery": {
+   "space": "attnres_source",
+   "directions": [
+    "conversational",
+    "loud",
+    "pitch",
+    "tempo",
+    "whisper"
+   ],
+   "source_index": 19
+  },
+  "expressive": {
+   "space": "attnres_source",
+   "directions": [
+    "expressive"
+   ],
+   "source_index": 19
+  },
+  "disfluency": {
+   "space": "attnres_source",
+   "directions": [
+    "disfluent"
+   ],
+   "source_index": 19
+  },
+  "mood": {
+   "space": "attnres_source",
+   "directions": [
+    "arousal",
+    "articulation",
+    "clarity",
+    "dominance",
+    "loudness",
+    "tempo",
+    "valence"
+   ],
+   "source_index": 19
+  },
+  "emotions": {
+   "space": "attnres_source",
+   "directions": [
+    "adoring",
+    "angry",
+    "confused",
+    "content",
+    "cute",
+    "desirous",
+    "disappointed",
+    "disgusted",
+    "distressed",
+    "ecstatic",
+    "embarrassed",
+    "fearful",
+    "guilty",
+    "happy",
+    "interested",
+    "pained",
+    "proud",
+    "realizing",
+    "relieved",
+    "sad",
+    "scared",
+    "serene",
+    "surprised"
+   ],
+   "source_index": 19
+  },
+  "emphasis_nv_nodur": {
+   "space": "attnres_source",
+   "directions": [
+    "emphasis"
+   ],
+   "source_index": 19
+  }
+ },
+ "steer_release": {
+  "onset_seconds": 4.0,
+  "ramp_seconds": 1.0,
+  "hold": 0.35,
+  "exempt": [
+   "delivery.tempo",
+   "delivery.whisper"
+  ]
+ },
+ "timing": {
+  "delivery.tempo": [
+   [
+    -4.0,
+    2.881
+   ],
+   [
+    -2.0,
+    2.212
+   ],
+   [
+    -1.0,
+    1.451
+   ],
+   [
+    0.0,
+    1.0
+   ],
+   [
+    1.0,
+    0.779
+   ],
+   [
+    2.0,
+    0.63
+   ],
+   [
+    4.0,
+    0.549
+   ]
+  ],
+  "delivery.conversational": [
+   [
+    -4.0,
+    0.958
+   ],
+   [
+    -2.0,
+    0.981
+   ],
+   [
+    -1.0,
+    0.99
+   ],
+   [
+    0.0,
+    1.0
+   ],
+   [
+    1.0,
+    1.008
+   ],
+   [
+    2.0,
+    1.065
+   ],
+   [
+    4.0,
+    1.172
+   ]
+  ],
+  "delivery.whisper": [
+   [
+    0.0,
+    1.0
+   ],
+   [
+    1.0,
+    1.076
+   ],
+   [
+    2.0,
+    1.121
+   ],
+   [
+    4.0,
+    1.104
+   ]
+  ],
+  "delivery.loud": [
+   [
+    0.0,
+    1.0
+   ],
+   [
+    1.0,
+    0.988
+   ],
+   [
+    2.0,
+    0.955
+   ],
+   [
+    4.0,
+    0.945
+   ]
+  ],
+  "disfluency.disfluent": [
+   [
+    -8.0,
+    0.903
+   ],
+   [
+    -4.0,
+    0.938
+   ],
+   [
+    0.0,
+    1.0
+   ],
+   [
+    4.0,
+    1.122
+   ],
+   [
+    8.0,
+    1.323
+   ],
+   [
+    16.0,
+    1.908
+   ],
+   [
+    32.0,
+    2.754
+   ]
+  ],
+  "expressive.expressive": [
+   [
+    -16.0,
+    0.835
+   ],
+   [
+    -8.0,
+    0.891
+   ],
+   [
+    -4.0,
+    0.957
+   ],
+   [
+    0.0,
+    1.0
+   ],
+   [
+    4.0,
+    1.062
+   ],
+   [
+    8.0,
+    1.208
+   ],
+   [
+    16.0,
+    1.497
+   ]
+  ]
+ },
+ "controls": [
+  {
+   "id": "gender",
+   "label": "Gender",
+   "type": "bipolar",
+   "poles": [
+    "masculine",
+    "feminine"
+   ],
+   "map": {
+    "-": {
+     "identity.gender": -1
+    },
+    "+": {
+     "identity.gender": 1
+    }
+   },
+   "range": [
+    -3,
+    3
+   ],
+   "safe": [
+    -2,
+    2
+   ],
+   "spannable": false
+  },
+  {
+   "id": "age",
+   "label": "Age",
+   "type": "bipolar",
+   "poles": [
+    "younger",
+    "older"
+   ],
+   "map": {
+    "-": {
+     "identity.age": -1
+    },
+    "+": {
+     "identity.age": 1
+    }
+   },
+   "range": [
+    -3,
+    3
+   ],
+   "safe": [
+    -2,
+    2
+   ],
+   "spannable": false
+  },
+  {
+   "id": "pitch",
+   "label": "Pitch",
+   "type": "bipolar",
+   "poles": [
+    "lower",
+    "higher"
+   ],
+   "map": {
+    "-": {
+     "pitch.pitch": -1
+    },
+    "+": {
+     "pitch.pitch": 1
+    }
+   },
+   "range": [
+    -3,
+    3
+   ],
+   "safe": [
+    -2,
+    2
+   ],
+   "spannable": false
+  },
+  {
+   "id": "range",
+   "label": "Intonation",
+   "type": "bipolar",
+   "poles": [
+    "monotone",
+    "varied"
+   ],
+   "map": {
+    "-": {
+     "pitch.pitch_range": -1
+    },
+    "+": {
+     "pitch.pitch_range": 1
+    }
+   },
+   "range": [
+    -3,
+    3
+   ],
+   "safe": [
+    -2,
+    2
+   ],
+   "spannable": false
+  },
+  {
+   "id": "deep",
+   "label": "Deep",
+   "type": "unipolar",
+   "map": {
+    "+": {
+     "texture.deep": 1
+    }
+   },
+   "range": [
+    0,
+    6
+   ],
+   "safe": [
+    0,
+    4
+   ],
+   "spannable": false
+  },
+  {
+   "id": "bright",
+   "label": "Bright",
+   "type": "unipolar",
+   "map": {
+    "+": {
+     "texture.shrill": 1
+    }
+   },
+   "range": [
+    0,
+    6
+   ],
+   "safe": [
+    0,
+    4
+   ],
+   "spannable": false
+  },
+  {
+   "id": "husky",
+   "label": "Husky",
+   "type": "unipolar",
+   "map": {
+    "+": {
+     "texture.husky": 1
+    }
+   },
+   "range": [
+    0,
+    6
+   ],
+   "safe": [
+    0,
+    4
+   ],
+   "spannable": false
+  },
+  {
+   "id": "raspy",
+   "label": "Raspy",
+   "type": "unipolar",
+   "map": {
+    "+": {
+     "texture.raspy": 1
+    }
+   },
+   "range": [
+    0,
+    6
+   ],
+   "safe": [
+    0,
+    4
+   ],
+   "spannable": false
+  },
+  {
+   "id": "soft",
+   "label": "Soft",
+   "type": "unipolar",
+   "map": {
+    "+": {
+     "texture.soft": 1
+    }
+   },
+   "range": [
+    0,
+    6
+   ],
+   "safe": [
+    0,
+    4
+   ],
+   "spannable": false
+  },
+  {
+   "id": "authority",
+   "label": "Authority",
+   "type": "unipolar",
+   "map": {
+    "+": {
+     "texture.authoritative": 1
+    }
+   },
+   "range": [
+    0,
+    6
+   ],
+   "safe": [
+    0,
+    4
+   ],
+   "spannable": false
+  },
+  {
+   "id": "room",
+   "label": "Room",
+   "type": "bipolar",
+   "poles": [
+    "phone",
+    "studio"
+   ],
+   "map": {
+    "-": {
+     "room.clean": -1
+    },
+    "+": {
+     "room.clean": 1
+    }
+   },
+   "range": [
+    -4,
+    6
+   ],
+   "safe": [
+    -2,
+    4
+   ],
+   "spannable": false
+  },
+  {
+   "id": "projection",
+   "label": "Projection",
+   "type": "bipolar",
+   "poles": [
+    "whisper",
+    "loud"
+   ],
+   "map": {
+    "-": {
+     "delivery.whisper": 1
+    },
+    "+": {
+     "delivery.loud": 1
+    }
+   },
+   "range": [
+    -3,
+    4
+   ],
+   "safe": [
+    -1.5,
+    2
+   ],
+   "spannable": true
+  },
+  {
+   "id": "pace",
+   "label": "Pace",
+   "type": "bipolar",
+   "poles": [
+    "slower",
+    "faster"
+   ],
+   "map": {
+    "-": {
+     "delivery.tempo": -1
+    },
+    "+": {
+     "delivery.tempo": 1
+    }
+   },
+   "range": [
+    -3,
+    3
+   ],
+   "safe": [
+    -2,
+    2
+   ],
+   "spannable": true
+  },
+  {
+   "id": "chatty",
+   "label": "Read ↔ chatty",
+   "type": "bipolar",
+   "poles": [
+    "read",
+    "chatty"
+   ],
+   "map": {
+    "-": {
+     "delivery.conversational": -1
+    },
+    "+": {
+     "delivery.conversational": 1
+    }
+   },
+   "range": [
+    -5,
+    5
+   ],
+   "safe": [
+    -4,
+    4
+   ],
+   "spannable": true
+  },
+  {
+   "id": "hesitant",
+   "label": "Hesitation",
+   "type": "bipolar",
+   "poles": [
+    "fluent",
+    "hesitant"
+   ],
+   "map": {
+    "-": {
+     "disfluency.disfluent": -1
+    },
+    "+": {
+     "disfluency.disfluent": 1
+    }
+   },
+   "range": [
+    -8,
+    20
+   ],
+   "safe": [
+    -8,
+    8
+   ],
+   "spannable": true
+  },
+  {
+   "id": "lively",
+   "label": "Liveliness",
+   "type": "bipolar",
+   "poles": [
+    "flat",
+    "lively"
+   ],
+   "map": {
+    "-": {
+     "expressive.expressive": -1
+    },
+    "+": {
+     "expressive.expressive": 1
+    }
+   },
+   "range": [
+    -16,
+    16
+   ],
+   "safe": [
+    -8,
+    8
+   ],
+   "spannable": true
+  },
+  {
+   "id": "emphasis",
+   "label": "Emphasis",
+   "type": "unipolar",
+   "map": {
+    "+": {
+     "emphasis_nv_nodur.emphasis": 4.0,
+     "mood.arousal": 1.0
+    }
+   },
+   "range": [
+    0,
+    6
+   ],
+   "safe": [
+    0,
+    6
+   ],
+   "spannable": true
+  },
+  {
+   "id": "valence",
+   "label": "Valence",
+   "type": "bipolar",
+   "poles": [
+    "negative",
+    "positive"
+   ],
+   "map": {
+    "-": {
+     "mood.valence": -1
+    },
+    "+": {
+     "mood.valence": 1
+    }
+   },
+   "range": [
+    -6,
+    6
+   ],
+   "safe": [
+    -4,
+    4
+   ],
+   "spannable": true
+  },
+  {
+   "id": "arousal",
+   "label": "Arousal",
+   "type": "bipolar",
+   "poles": [
+    "calm",
+    "excited"
+   ],
+   "map": {
+    "-": {
+     "mood.arousal": -1
+    },
+    "+": {
+     "mood.arousal": 1
+    }
+   },
+   "range": [
+    -6,
+    6
+   ],
+   "safe": [
+    -4,
+    4
+   ],
+   "spannable": true
+  },
+  {
+   "id": "angry",
+   "label": "Angry",
+   "type": "unipolar",
+   "map": {
+    "+": {
+     "emotions.angry": 1
+    }
+   },
+   "range": [
+    0,
+    6
+   ],
+   "safe": [
+    0,
+    4
+   ],
+   "spannable": true
+  },
+  {
+   "id": "happy",
+   "label": "Happy",
+   "type": "unipolar",
+   "map": {
+    "+": {
+     "emotions.happy": 1
+    }
+   },
+   "range": [
+    0,
+    6
+   ],
+   "safe": [
+    0,
+    4
+   ],
+   "spannable": true
+  },
+  {
+   "id": "sad",
+   "label": "Sad",
+   "type": "unipolar",
+   "map": {
+    "+": {
+     "emotions.sad": 1
+    }
+   },
+   "range": [
+    0,
+    8
+   ],
+   "safe": [
+    0,
+    6
+   ],
+   "spannable": true
+  },
+  {
+   "id": "calm",
+   "label": "Calm",
+   "type": "unipolar",
+   "map": {
+    "+": {
+     "emotions.serene": 1
+    }
+   },
+   "range": [
+    0,
+    8
+   ],
+   "safe": [
+    0,
+    6
+   ],
+   "spannable": true
+  },
+  {
+   "id": "scared",
+   "label": "Scared",
+   "type": "unipolar",
+   "map": {
+    "+": {
+     "emotions.scared": 1
+    }
+   },
+   "range": [
+    0,
+    14
+   ],
+   "safe": [
+    0,
+    12
+   ],
+   "spannable": true
+  },
+  {
+   "id": "confused",
+   "label": "Confused",
+   "type": "unipolar",
+   "map": {
+    "+": {
+     "emotions.confused": 1
+    }
+   },
+   "range": [
+    0,
+    4
+   ],
+   "safe": [
+    0,
+    3
+   ],
+   "spannable": true
+  }
+ ],
+ "accents": [
+  {
+   "id": "american",
+   "label": "North America",
+   "map": {
+    "accents_en.american": 1
+   },
+   "range": [
+    0,
+    2
+   ],
+   "safe": [
+    0,
+    1.5
+   ]
+  },
+  {
+   "id": "british",
+   "label": "England",
+   "map": {
+    "accents_en.british": 1
+   },
+   "range": [
+    0,
+    2
+   ],
+   "safe": [
+    0,
+    1.5
+   ]
+  },
+  {
+   "id": "scottish",
+   "label": "Scotland",
+   "map": {
+    "accents_en.scottish": 1
+   },
+   "range": [
+    0,
+    2
+   ],
+   "safe": [
+    0,
+    1.5
+   ]
+  },
+  {
+   "id": "irish",
+   "label": "Ireland",
+   "map": {
+    "accents_en.irish": 1
+   },
+   "range": [
+    0,
+    2
+   ],
+   "safe": [
+    0,
+    1.5
+   ]
+  },
+  {
+   "id": "welsh",
+   "label": "Wales",
+   "map": {
+    "accents_en.welsh": 1
+   },
+   "range": [
+    0,
+    2
+   ],
+   "safe": [
+    0,
+    1.5
+   ]
+  },
+  {
+   "id": "australian",
+   "label": "Australia",
+   "map": {
+    "accents_en.australian": 1
+   },
+   "range": [
+    0,
+    2
+   ],
+   "safe": [
+    0,
+    1.5
+   ]
+  },
+  {
+   "id": "indian",
+   "label": "India",
+   "map": {
+    "accents_en.indian": 1
+   },
+   "range": [
+    0,
+    2
+   ],
+   "safe": [
+    0,
+    1.5
+   ]
+  },
+  {
+   "id": "hin",
+   "label": "Hindi",
+   "map": {
+    "accents_l1.hin": 1
+   },
+   "range": [
+    0,
+    2
+   ],
+   "safe": [
+    0,
+    1.5
+   ]
+  },
+  {
+   "id": "spa",
+   "label": "Spanish",
+   "map": {
+    "accents_l1.spa": 1
+   },
+   "range": [
+    0,
+    2
+   ],
+   "safe": [
+    0,
+    1.5
+   ]
+  },
+  {
+   "id": "fra",
+   "label": "French",
+   "map": {
+    "accents_l1.fra": 1
+   },
+   "range": [
+    0,
+    2
+   ],
+   "safe": [
+    0,
+    1.5
+   ]
+  },
+  {
+   "id": "por",
+   "label": "Portuguese",
+   "map": {
+    "accents_l1.por": 1
+   },
+   "range": [
+    0,
+    2
+   ],
+   "safe": [
+    0,
+    1.5
+   ]
+  },
+  {
+   "id": "deu",
+   "label": "German",
+   "map": {
+    "accents_l1.deu": 1
+   },
+   "range": [
+    0,
+    2
+   ],
+   "safe": [
+    0,
+    1.5
+   ]
+  },
+  {
+   "id": "vie",
+   "label": "Vietnamese",
+   "map": {
+    "accents_l1.vie": 1
+   },
+   "range": [
+    0,
+    2
+   ],
+   "safe": [
+    0,
+    1.5
+   ]
+  },
+  {
+   "id": "pol",
+   "label": "Polish",
+   "map": {
+    "accents_l1.pol": 1
+   },
+   "range": [
+    0,
+    2
+   ],
+   "safe": [
+    0,
+    1.5
+   ]
+  },
+  {
+   "id": "mandarin",
+   "label": "Mandarin",
+   "map": {
+    "mandarin.cmn": 1,
+    "mandarin_hidden.cmn": 0.3333333333333333
+   },
+   "range": [
+    0,
+    1.5
+   ],
+   "safe": [
+    0,
+    1.5
+   ]
+  }
+ ],
+ "presets": {
+  "BBC newsreader": {
+   "accent:british": 1.5,
+   "authority": 3,
+   "room": 2
+  },
+  "Elderly Scottish narrator": {
+   "age": 1.5,
+   "accent:scottish": 1.5,
+   "deep": 2,
+   "range": -1
+  },
+  "Young Australian": {
+   "age": -1.5,
+   "accent:australian": 1.5,
+   "range": 1
+  },
+  "Gravelly old man": {
+   "gender": -1,
+   "age": 2,
+   "raspy": 3,
+   "deep": 2
+  },
+  "Soft-spoken Irish woman": {
+   "gender": 1,
+   "accent:irish": 1.5,
+   "soft": 3
+  },
+  "Indian English caller": {
+   "accent:indian": 1.5,
+   "room": -2
+  },
+  "Chatty podcaster": {
+   "chatty": 3,
+   "room": 1,
+   "lively": 4
+  },
+  "Late-night radio": {
+   "deep": 2,
+   "room": 3,
+   "pace": -0.8,
+   "projection": -0.6
+  }
+ },
+ "moods": [
+  {
+   "id": "angry",
+   "label": "Angry",
+   "control": "angry",
+   "dose": 4
+  },
+  {
+   "id": "happy",
+   "label": "Happy",
+   "control": "happy",
+   "dose": 4
+  },
+  {
+   "id": "sad",
+   "label": "Sad",
+   "control": "sad",
+   "dose": 6
+  },
+  {
+   "id": "calm",
+   "label": "Calm",
+   "control": "calm",
+   "dose": 4
+  },
+  {
+   "id": "scared",
+   "label": "Scared",
+   "control": "scared",
+   "dose": 12
+  },
+  {
+   "id": "confused",
+   "label": "Confused",
+   "control": "confused",
+   "dose": 3
+  }
+ ]
+}

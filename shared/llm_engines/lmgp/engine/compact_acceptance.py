@@ -20,9 +20,9 @@ MAX_DRAFTS = 16  # the drafts a row may follow, a bound of the kernel's unrolled
 _INF = tl.constexpr(float("inf"))
 
 
-@triton.jit(do_not_specialize=("vocab", "drafts_count", "penalty", "inv_penalty", "inv_temperature"))
+@triton.jit(do_not_specialize=("vocab", "drafts_count", "penalty", "inv_penalty", "inv_temperature", "KEEP"))  # KEEP (top-k) at runtime: one compile for every k
 def _rules_top(LOGITS, DRAFTS, HISTORY, EXEMPT, BIAS, SUPPRESSED, THINKING_STOPS, THINKING, VALUES, IDS, vocab, drafts_count, penalty, inv_penalty, inv_temperature,
-               PENALIZE: tl.constexpr, HAS_EXEMPT: tl.constexpr, BLOCK_SIZE: tl.constexpr, KEEP: tl.constexpr, MAX_DRAFTS: tl.constexpr):
+               PENALIZE: tl.constexpr, HAS_EXEMPT: tl.constexpr, BLOCK_SIZE: tl.constexpr, KEEP, MAX_DRAFTS: tl.constexpr):
     row, block = tl.program_id(0), tl.program_id(1)
     offsets = tl.arange(0, BLOCK_SIZE)
     tokens = block * BLOCK_SIZE + offsets
@@ -50,7 +50,7 @@ def _rules_top(LOGITS, DRAFTS, HISTORY, EXEMPT, BIAS, SUPPRESSED, THINKING_STOPS
     value = tl.where(in_thinking & (row >= remaining), tl.where(tokens == close, 0.0, -_INF), value)
     value = tl.where(inside, value * inv_temperature, -_INF)
     base = (row * tl.num_programs(1) + block) * KEEP
-    for kept in tl.static_range(KEEP):
+    for kept in range(KEEP):
         position = tl.argmax(value, 0)
         tl.store(VALUES + base + kept, tl.max(value, 0))
         tl.store(IDS + base + kept, block * BLOCK_SIZE + position)

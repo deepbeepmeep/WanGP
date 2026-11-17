@@ -6,6 +6,9 @@ import torch
 def rms_norm(x: torch.Tensor, weight: torch.Tensor | None = None, eps: float = 1e-6, in_place = False) -> torch.Tensor:
     # deepbeepmeep RMS Norm
     if in_place:
+        from shared.kernels import ops
+        if ops.rms_norm_(x, eps, weight) is not None:  # one pass, rounded once (as precise as the passes below or more)
+            return x
         scale = torch.linalg.vector_norm(x, ord=2, dim=-1, keepdim=True, dtype=torch.float32)
         scale.square_().div_(x.shape[-1]).add_(eps).rsqrt_()
         x.mul_(scale)
@@ -32,8 +35,8 @@ def to_velocity(
     Returns:
         Velocity
     """
-    if isinstance(sigma, torch.Tensor):
-        sigma = sigma.to(calc_dtype).item()
+    if isinstance(sigma, torch.Tensor):  # times its reciprocal, as CUDA divides by a Python number (bit-identical), without reading it back: a device sync
+        return ((sample.to(calc_dtype) - denoised_sample.to(calc_dtype)) * sigma.to(calc_dtype).reciprocal()).to(sample.dtype)
     if sigma == 0:
         raise ValueError("Sigma can't be 0.0")
     return ((sample.to(calc_dtype) - denoised_sample.to(calc_dtype)) / sigma).to(sample.dtype)

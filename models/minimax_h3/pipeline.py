@@ -22,7 +22,7 @@ from shared.utils.frame_scheduler import SLASH_BLOCK_RE, floor_frame_count, norm
 from shared.utils.utils import convert_video_tensor_to_uint8_chunked
 from .constants import (H3_AUDIO_REFINEMENT_DENOISE, H3_AUDIO_REFINEMENT_SETTING, H3_AUDIO_REFINEMENT_STEPS, H3_CONTROL_LATENT_CONTINUATION,
                         H3_HYPERFLOW_LORA, H3_PHASE_2_NOISE_LEVEL_START_DEFAULT, H3_REGENERATE_IC_LORA, H3_REGENERATE_IC_TASK, H3_REGENERATE_LORA,
-                        h3_grouped_masking_enabled)
+                        h3_grouped_masking_enabled, h3_veda_full_layers)
 from .dialogue import H3_DIALOGUE_GENERATION, generate_dialogue, is_dialogue_prompt
 from .excerpts import H3_AUDIO_EXCERPTS_SETTING, H3_VIDEO_EXCERPTS_SETTING, parse_excerpts, reference_video_frame_limit
 from .first_block_cache import MiniMaxH3FirstBlockCache
@@ -60,10 +60,6 @@ H3_PHASE_2_TILE_OVERLAP_RATIO = 0.25
 H3_PHASE_2_TILE_ALIGNMENT = 32
 H3_PHASE_2_TILING_FLAG = "~"
 H3_TURBO_LORA_KEY = "minimax_h3_lora_turbo"
-# Per-window control videos (Depth / In-Context Guide): True = aligned guide, packed as a keyframe clip on the target's own
-# RoPE time/space grid (guide frame i on output frame i) and not shown to the prompt encoder; False = reference video placed
-# on its own time span before the target and presented to the prompt encoder as <Video 1>
-H3_ALIGNED_CONTROL_VIDEO = False
 VDN_TURBO_LORA = "minimax_h3_vdn_turbo_8step_lora_bf16.safetensors"
 
 
@@ -309,8 +305,9 @@ def _keep_source_outside_mask(video, source, masks, to_uint8, margin_fraction=0.
     height, width = video.shape[-2:]
     margin = max(1, round(min(height, width) * margin_fraction))
     source = _as_video(source)
-    for start in range(0, video.shape[1], chunk):
-        stop = start + chunk
+    frames = min(video.shape[1], source.shape[1], masks.shape[1])  # frames past the source (temporal outpainting to the 17-frame grid) have none to restore
+    for start in range(0, frames, chunk):
+        stop = min(start + chunk, frames)
         mask = guide_mask_to_float(masks[:1, start:stop]).float()
         if mask.shape[-2:] != (height, width):
             mask = F.interpolate(mask, size=(height, width), mode="bilinear", align_corners=False)
@@ -864,6 +861,8 @@ class MiniMaxH3Pipeline:
                  starting_sigma=None, preserve_input_mask_values=False, refinement_mode=False,
                  custom_settings=None, duration_seconds=None, verbose_level=0, dialogue_segment=False, image_mode=0,
                  context_scale=None, overlapped_latents=None, window_start_frame_no=0, batch_size=1, **kwargs):
+        if hasattr(self.transformer, "veda_attention"):
+            self.transformer.veda_attention.full_layers = h3_veda_full_layers(custom_settings)
         if self.audio_only and H3_DIALOGUE_GENERATION and not dialogue_segment and is_dialogue_prompt(input_prompt):
             self._early_stop = False
             return generate_dialogue(
@@ -1057,8 +1056,11 @@ class MiniMaxH3Pipeline:
         if self.transformer.control_layers and two_phase:
             raise ValueError("MiniMax H3 ControlNet-Union supports one-phase generation only")
         video_references = "V" in (video_prompt_type or "") and "G" not in (video_prompt_type or "") and not fun_control  # Ref2VA reference videos, or an in-context control video (VU) on any H3 model
+        # "2", the aligned guide (ComfyUI's MiniMaxH3AddGuide at frame 0): each window's section of the control video as a keyframe clip on
+        # the target's own time / space grid (guide frame i on output frame i), not shown to the prompt encoder; without it, a control
+        # video is a reference video on its own time span before the target, presented to the prompt encoder as <Video 1>
         aligned_control = (_as_video(input_frames)[:, history_count:history_count + aligned_target_frames]
-                           if H3_ALIGNED_CONTROL_VIDEO and video_references and "-" not in (video_prompt_type or "") and not self.source_edit else None)
+                           if "2" in (video_prompt_type or "") and video_references and not image_outputs and not self.source_edit else None)
         # Injected frames on the window's first or end frame act as its start / end image (same prompt order as the enhancer's labels);
         # frames inside the overlap or on a frame already owned by the start / continuation frame are dropped
         injected_frames = [(image, int(position) - history_count) for image, position in zip(frames_to_inject or (), frames_relative_positions_list or ())]

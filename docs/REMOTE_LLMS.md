@@ -12,8 +12,8 @@ WanGP does not request or store provider passwords, API keys, access tokens, or 
 
 ## Common WanGP setup
 
-1. Open `Configuration` and select `Prompt Enhancer / Deepy`.
-2. Set `Prompt Enhancer / Deepy LLM Engine` to Codex, Claude Code, or OpenCode.
+1. Open `Configuration` and select `Deepy / Prompt Enhancer`.
+2. Set `Deepy / Prompt Enhancer LLM Engine` to Codex, Claude Code, or OpenCode.
 3. Configure the selected engine as described below.
 4. Select `Deepy Prime`.
 5. Click `Save Settings`.
@@ -74,7 +74,7 @@ OpenCode is the universal-provider option. WanGP talks to an OpenCode HTTP serve
 
 ### Installation and provider authentication
 
-Install OpenCode outside WanGP and authenticate providers using OpenCode. In the OpenCode terminal UI, run `/connect`, choose a provider, and follow its authentication flow. You can also use the OpenCode authentication commands documented by the project.
+Install OpenCode outside WanGP: OpenCode 2 (npm package `@opencode/cli`) and OpenCode 1 (`opencode-ai`) both work. Authenticate providers using OpenCode. In the OpenCode terminal UI, run `/connect`, choose a provider, and follow its authentication flow. You can also use the OpenCode authentication commands documented by the project.
 
 Provider credentials remain in OpenCode. After adding or removing a provider, restart an already-running OpenCode server if necessary and click `Refresh` in WanGP.
 
@@ -88,7 +88,7 @@ See the [OpenCode provider documentation](https://opencode.ai/docs/providers/).
 - `OpenCode model`: models returned for the selected provider.
 - `Reasoning effort`: OpenCode model variant, when the model publishes variants.
 - `OpenCode configuration`: optional JSON/JSONC passed through `OPENCODE_CONFIG_CONTENT` only when WanGP starts a local server.
-- `Refresh`: queries `/config/providers` and caches the returned providers, models, context limits, defaults, and variants.
+- `Refresh`: queries OpenCode's catalog and caches the returned providers, models, context limits, defaults, and variants.
 
 Refresh intentionally shows only providers currently available to OpenCode. It does not list every provider OpenCode supports. For example, to expose DeepSeek V4, connect the DeepSeek provider in OpenCode, supply a DeepSeek API key there, restart the server if needed, and refresh WanGP. DeepSeek V4 Pro and Flash then appear when reported by OpenCode's provider catalog.
 
@@ -109,6 +109,8 @@ opencode serve --hostname 127.0.0.1 --port 4096
 ```
 
 Stop a manually started server with `Ctrl+C` in the same terminal.
+
+OpenCode 2 always protects its server with a password. A server WanGP starts gets one automatically. When you start OpenCode 2 yourself, give it a password in the `OPENCODE_PASSWORD` environment variable and start WanGP with the same variable; otherwise OpenCode picks a random password that WanGP cannot know, and Deepy reports that the server asks for a password. OpenCode 1 servers need a password only if you set one (`OPENCODE_SERVER_PASSWORD`, with `OPENCODE_SERVER_USERNAME` when it is not `opencode`).
 
 ## Long generations
 

@@ -136,6 +136,62 @@ def add_(out, y, factor, scale, rank_first):
     torch.autograd.graph.increment_version(out)
 
 
+# Below the kernels above, whose line numbers are part of Triton's cache keys.
+_RESIDUAL_ALIGNMENT = ["Y", "FACTOR", "OUT", "RES", "GATE", "M", "K"]  # row ranges of shared buffers: one variant whatever their alignment
+
+
+@triton.jit(do_not_specialize=["M", "K", "SCALE"], do_not_specialize_on_alignment=_RESIDUAL_ALIGNMENT)
+def _output_residual(Y, FACTOR, OUT, RES, GATE, M, N, K, SY, SFN, SFK, SO, SR, SCALE, HAS_GATE: tl.constexpr, RANK_FIRST: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    """res += gate * (out + scale * y @ factor) with the roundings of the separate operations: the output pass (out += scale * y @ factor,
+    one rounding), then res.addcmul_(out, gate) (one rounding: the product of two 16-bit values is exact in FP32) or, without a gate,
+    res.add_(out). One pass over the rows instead of two; out is only read."""
+    rm = tl.program_id(0).to(tl.int64) * BM + tl.arange(0, BM)
+    rn = tl.program_id(1) * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+    m_mask, n_mask = rm < M, rn < N
+    y_ptr = Y + rm[:, None] * SY + rk[None, :]
+    factor_ptr = FACTOR + rk[:, None] * SFK + rn[None, :] if RANK_FIRST else FACTOR + rn[:, None] * SFN + rk[None, :]
+    acc = tl.zeros((BM, BN), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BK)):
+        y = tl.load(y_ptr, mask=m_mask[:, None], other=0.0)
+        if RANK_FIRST:
+            acc = tl.dot(y, tl.load(factor_ptr, mask=(k * BK + rk < K)[:, None] & n_mask[None, :], other=0.0), acc)
+        else:
+            acc = tl.dot(y, tl.trans(tl.load(factor_ptr, mask=n_mask[:, None], other=0.0)), acc)
+        y_ptr += BK
+        factor_ptr += BK * (SFK if RANK_FIRST else 1)
+    mask = m_mask[:, None] & n_mask[None, :]
+    dtype = RES.dtype.element_ty
+    out = (acc * SCALE + tl.load(OUT + rm[:, None] * SO + rn[None, :], mask=mask, other=0.0).to(tl.float32)).to(dtype).to(tl.float32)
+    if HAS_GATE:
+        out = out * tl.load(GATE + rn, mask=n_mask, other=0.0).to(tl.float32)[None, :]
+    res_ptr = RES + rm[:, None] * SR + rn[None, :]
+    tl.store(res_ptr, (tl.load(res_ptr, mask=mask, other=0.0).to(tl.float32) + out).to(dtype), mask=mask)
+
+
+def _launch_residual(residual, out, y, factor, scale, gate, rank_first, config):
+    bm, bn, warps, stages = config
+    m, k, n = y.shape[0], factor.shape[0] if rank_first else factor.shape[1], factor.shape[1] if rank_first else factor.shape[0]
+    _output_residual[(triton.cdiv(m, bm), triton.cdiv(n, bn))](y, factor, out, residual, residual if gate is None else gate, m, n, k, y.stride(0), 0 if rank_first else factor.stride(0),
+                                                               factor.stride(0) if rank_first else 0, out.stride(0), residual.stride(0), scale, gate is not None, rank_first, bm, bn, BK,
+                                                               num_warps=warps, num_stages=stages, enable_fp_fusion=False)
+
+
+def residual_(residual, out, y, factor, scale, rank_first, gate=None):
+    """residual += gate * (out + scale * y @ factor): add_(out, ...) then residual.addcmul_(out, gate) (gate: one value per output, in
+    residual's dtype) or residual.add_(out), with their roundings, in one pass over the rows. residual and out (rows, outputs) of one
+    16-bit dtype with contiguous rows (supported(out, ...) and the same of residual); out is left as it was."""
+    y = _pad(y)
+
+    def scratch():
+        y_rows, out_rows, residual_rows = y[:_TUNE_ROWS], out[:_TUNE_ROWS], residual[:_TUNE_ROWS].clone()
+        return lambda config: _launch_residual(residual_rows, out_rows, y_rows, factor, 0.0, gate, rank_first, config)
+
+    config = _TUNER.config("output_residual", f"gate={gate is not None} rank_first={rank_first}", residual.device, _CANDIDATES, scratch, y.shape[0] >= _TUNE_ROWS)
+    _launch_residual(residual, out, y, factor, scale, gate, rank_first, config)
+    torch.autograd.graph.increment_version(residual)
+
+
 from shared.kernels.triton_compilation_log import install_triton_compilation_logger  # noqa: E402
 
 install_triton_compilation_logger()

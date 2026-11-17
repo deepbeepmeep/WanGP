@@ -11,6 +11,8 @@ from .catalog import catalog_digest, load_config, os_key
 from .execute import ProcessRunner
 from .state import InstallError, atomic_json, digest, file_hash, inside, plain_path, read_json
 
+PYPI_INDEX = "https://pypi.org/simple"
+
 
 def package_name(requirement):
     match = re.match(r"([A-Za-z0-9][A-Za-z0-9._-]*)", requirement)
@@ -37,6 +39,7 @@ class DependencyInputs:
         self.find_links = []
         self.no_index = False
         self.torch_index = None
+        self.torch_requirements = []
         self.torch_packages = []
 
     def add_index(self, option, url):
@@ -119,7 +122,18 @@ class DependencyInputs:
             else:
                 self.add_requirement(argument)
                 if is_torch:
+                    self.torch_requirements.append(self.requirements[-1])
                     self.torch_packages.append(package_name(self.requirements[-1]))
+
+    def torch_only_configuration(self):
+        """The regular indexes first, the Torch index last: under best-match the
+        packages they share come from the regular indexes, as in the main graph."""
+        quote = lambda value: json.dumps(value, ensure_ascii=True)
+        lines = []
+        for index, url in enumerate(dict.fromkeys([*self.indexes, self.default_index or PYPI_INDEX])):
+            lines.extend(["[[index]]", f'name = "wangp-regular-{index}"', f"url = {quote(url)}"])
+        lines.extend(["[[index]]", 'name = "wangp-torch"', f"url = {quote(self.torch_index)}", "default = true"])
+        return "\n".join(lines) + "\n"
 
     def index_configuration(self):
         quote = lambda value: json.dumps(value, ensure_ascii=True)
@@ -180,12 +194,38 @@ def collect_inputs(plan, extra_requirements=()):
     return inputs
 
 
+def route_torch_dependencies(inputs, destination, runtime, runner, python):
+    """Bind to the Torch index the dependencies of the Torch packages that only it provides
+    (ROCm's rocm / rocm-sdk-* / amd-torch-device-* wheels): an explicit index serves only the
+    packages bound to it, and uv binds direct requirements only."""
+    folder = destination / "torch-dependencies"
+    folder.mkdir()
+    (folder / "requirements.txt").write_text("\n".join(inputs.torch_requirements) + "\n", encoding="utf-8")
+    (folder / "uv.toml").write_text(inputs.torch_only_configuration(), encoding="utf-8")
+    output = folder / "requirements.lock"
+    arguments = runtime.command("pip", "compile", str(folder / "requirements.txt"), "--python-version", python, "--no-header", "--no-annotate", "--emit-index-annotation", "--index-strategy", "unsafe-best-match", "--output-file", str(output))
+    arguments[arguments.index("--no-config"):arguments.index("--no-config") + 1] = ["--config-file", str(folder / "uv.toml")]
+    for location in dict.fromkeys(inputs.find_links):
+        arguments.extend(("--find-links", location))
+    runner.run(arguments, env=runtime.environment(), cwd=folder)
+    name = None
+    for line in output.read_text(encoding="utf-8").splitlines():
+        if not line.startswith(" "):
+            name = package_name(line)
+        elif line.strip().removeprefix("# from ").rstrip("/") == inputs.torch_index.rstrip("/") and name not in inputs.torch_packages:
+            inputs.requirements.append(name)
+            inputs.torch_packages.append(name)
+
+
 def resolve_dependencies(plan, destination, runtime, *, extra_requirements=(), runner=None, installed=None):
     if plan["platform"] != os_key():
         raise InstallError("platform_mismatch", "Resolve on the target operating system")
     inputs = collect_inputs(plan, extra_requirements)
     destination = plain_path(destination)
     destination.mkdir(parents=True, exist_ok=False)
+    runner = runner or ProcessRunner(destination / "resolve.log")
+    if inputs.torch_index and not inputs.no_index:
+        route_torch_dependencies(inputs, destination, runtime, runner, plan["python"])
     project = destination / "pyproject.toml"
     project.write_text(inputs.project(plan["python"]), encoding="utf-8")
     configuration = destination / "uv.toml"
@@ -198,7 +238,6 @@ def resolve_dependencies(plan, destination, runtime, *, extra_requirements=(), r
         for name, version in sorted(installed.items()):
             preferences.extend(("[[packages]]", "name = " + json.dumps(name), "version = " + json.dumps(version)))
         output.write_text("\n".join(preferences) + "\n", encoding="utf-8")
-    runner = runner or ProcessRunner(destination / "resolve.log")
     arguments = runtime.command("pip", "compile", str(project), "--python-version", plan["python"], "--format", "pylock.toml", "--generate-hashes", "--no-header", "--index-strategy", "first-index", "--output-file", str(output))
     # An explicit config file excludes user/ancestor config while retaining our named indexes.
     arguments[arguments.index("--no-config"):arguments.index("--no-config") + 1] = ["--config-file", str(configuration)]

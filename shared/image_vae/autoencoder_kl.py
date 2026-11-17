@@ -19,8 +19,9 @@ from typing import Dict, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
+from shared.image_vae import blocks, tiling
 from shared.kernels import vae_ops
-from shared.utils.conv_bands import band_convs, conv_bands
+from shared.utils.conv_bands import band_convs, downsample_bands
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.loaders import PeftAdapterMixin
@@ -47,18 +48,22 @@ from diffusers.models.autoencoders.vae import (
 from diffusers.models.resnet import ResnetBlock2D
 
 
-def _resnet_forward(resnet, input_list):
-    """ResnetBlock2D.forward for this VAE (no time embedding, resampling or dropout), the same values with fewer full-size tensors alive.
-    input_list: [input], emptied so that the input is released once its shortcut projection is taken; each intermediate is released
-    before the next convolution and the residual sum is computed in place."""
-    input_tensor = input_list.pop()
-    hidden_states = resnet.nonlinearity(resnet.norm1(input_tensor))
-    if resnet.conv_shortcut is not None:
-        input_tensor = resnet.conv_shortcut(input_tensor.contiguous())
-    hidden_states = resnet.conv1(hidden_states)
-    hidden_states = resnet.norm2(hidden_states)
-    hidden_states = resnet.conv2(resnet.nonlinearity(hidden_states))
-    return hidden_states.add_(input_tensor).div_(resnet.output_scale_factor)
+_HALF = (torch.float16, torch.bfloat16)
+
+
+def _autocast(sample):
+    """16-bit activations on a GPU run under autocast to their dtype: the GroupNorms then compute in FP32, rounded once, and the shared
+    blocks apply (strips of rows on channels-last activations, row-window convolutions): half the peak VRAM and 1.7-1.9x faster than
+    GroupNorms computed in 16 bits on whole NCHW images, as precise against a 32-bit decode. Other inputs run as PyTorch computes them."""
+    enabled = sample.is_cuda and sample.dtype in _HALF
+    return torch.autocast(sample.device.type, dtype=sample.dtype if enabled else torch.bfloat16, enabled=enabled)
+
+
+def _resnet_forward(resnet, input_list, scratch=None):
+    """ResnetBlock2D.forward for this VAE (no time embedding, resampling or dropout) through the shared block. input_list: [input],
+    emptied so that the input is released once read; scratch: see shared.image_vae.blocks.resnet_block."""
+    out = blocks.resnet_block(input_list, resnet.norm1, resnet.conv1, resnet.norm2, resnet.conv2, resnet.conv_shortcut, scratch)
+    return out if resnet.output_scale_factor == 1 else out.div_(resnet.output_scale_factor)
 
 
 def _attention_forward(attn, hidden_states, *args, **kwargs):
@@ -66,7 +71,7 @@ def _attention_forward(attn, hidden_states, *args, **kwargs):
     vae_ops.attention: by chunks of queries where SDPA has no memory-efficient kernel (BF16 on Turing), the same values elsewhere."""
     residual = hidden_states
     batch, channels, height, width = hidden_states.shape
-    hidden_states = attn.group_norm(hidden_states.view(batch, channels, height * width)).transpose(1, 2)
+    hidden_states = attn.group_norm(hidden_states.reshape(batch, channels, height * width)).transpose(1, 2)  # channels-last or not
     query, key, value = attn.to_q(hidden_states), attn.to_k(hidden_states), attn.to_v(hidden_states)
     head_dim = key.shape[-1] // attn.heads
     query, key, value = (x.view(batch, -1, attn.heads, head_dim).transpose(1, 2) for x in (query, key, value))
@@ -79,19 +84,46 @@ def _attention_forward(attn, hidden_states, *args, **kwargs):
 
 def _decoder_forward(decoder, sample):
     """diffusers Decoder.forward (no latent embeddings) running the up blocks' resnets itself: each one is handed its input, so a block's
-    input does not stay alive for the whole block."""
-    sample = decoder.mid_block(decoder.conv_in(sample), None)
-    for up_block in decoder.up_blocks:
-        for resnet in up_block.resnets:
-            resnet_input, sample = [sample], None
-            sample = resnet(resnet_input)
-        for upsampler in up_block.upsamplers or ():
-            sample = upsampler(sample)
-    sample = decoder.conv_act(decoder.conv_norm_out(sample))
-    return decoder.conv_out(sample)
+    input does not stay alive for the whole block, and the blocks of a level share the storage of the one that halves the channels."""
+    with _autocast(sample):
+        sample = decoder.mid_block(decoder.conv_in(sample), None)
+        scratch = []
+        for up_block in decoder.up_blocks:
+            for resnet in up_block.resnets:
+                resnet_input, sample = [sample], None
+                sample = resnet(resnet_input, scratch=scratch)
+            scratch.clear()
+            for upsampler in up_block.upsamplers or ():
+                upsampler_input, sample = [sample], None
+                sample = upsampler(upsampler_input)
+        output_input, sample = [sample], None
+        return blocks.norm_conv(output_input, decoder.conv_norm_out, decoder.conv_out).contiguous()
+
+
+def _encoder_forward(encoder, sample):
+    """diffusers Encoder.forward with the output convolution through the shared block."""
+    with _autocast(sample):
+        if torch.is_autocast_enabled(sample.device.type):
+            sample = sample.contiguous(memory_format=torch.channels_last)
+        sample = encoder.conv_in(sample)
+        for down_block in encoder.down_blocks:
+            sample = down_block(sample)
+        output_input, sample = [encoder.mid_block(sample)], None
+        return blocks.norm_conv(output_input, encoder.conv_norm_out, encoder.conv_out).contiguous()
 
 
 class AutoencoderMixin:
+    # measured VRAM (shared.image_vae.tiling) of the Flux / Z-Image VAE: BF16, the larger of the routes with and without the Triton
+    # convolutions, + 10 %
+    COSTS = {"weights": 0.16, "decode": [(1.05, 0.75), (4.2, 2.8)], "encode": [(1.05, 0.63), (4.2, 2.3)]}
+
+    @staticmethod
+    def get_VAE_tile_size(vae_config, device_mem_capacity, mixed_precision, output_height=None, output_width=None):
+        """(tiling, tile size in pixels): the largest tile within the VAE Tiling setting's VRAM budget, no tiling when the whole
+        picture fits (tiling.choose_tile)."""
+        tile = tiling.choose_tile(vae_config, device_mem_capacity, AutoencoderKL.COSTS, output_height, output_width, (2048, 1024, 512))
+        return tile > 0, tile or 512
+
     def enable_tiling(self):
         r"""
         Enable tiled VAE decoding. When this option is enabled, the VAE will split the input tensor into tiles to
@@ -213,9 +245,12 @@ class AutoencoderKL(ModelMixin, AutoencoderMixin, ConfigMixin, FromOriginalModel
             mid_block_add_attention=mid_block_add_attention,
         )
 
-        for block in self.decoder.up_blocks:  # nearest x2 + conv by bands of rows: no full-size upsampled input
+        for block in self.decoder.up_blocks:  # nearest x2 + conv by rows: no full-size upsampled input
             for upsampler in block.upsamplers or ():
-                upsampler.forward = lambda hidden_states, *args, _conv=upsampler.conv, **kwargs: conv_bands(hidden_states, _conv, upsample=True)
+                upsampler.forward = lambda input_list, *args, _conv=upsampler.conv, **kwargs: blocks.upsample(input_list, _conv)
+        for block in self.encoder.down_blocks:  # the padded stride-2 convolution by bands of rows
+            for downsampler in block.downsamplers or ():
+                downsampler.forward = lambda hidden_states, *args, _conv=downsampler.conv, **kwargs: downsample_bands(hidden_states, _conv)
         band_convs(self)  # large 3x3 convolutions by bands of rows: no full-image cuDNN workspace
         for module in self.modules():  # every activation follows a normalization (a fresh tensor): in place, without a second full-size tensor
             if isinstance(module, nn.SiLU):
@@ -228,6 +263,7 @@ class AutoencoderKL(ModelMixin, AutoencoderMixin, ConfigMixin, FromOriginalModel
             for resnet in block.resnets:
                 resnet.forward = functools.partial(_resnet_forward, resnet)
         self.decoder.forward = functools.partial(_decoder_forward, self.decoder)
+        self.encoder.forward = functools.partial(_encoder_forward, self.encoder)
         self.quant_conv = nn.Conv2d(2 * latent_channels, 2 * latent_channels, 1) if use_quant_conv else None
         self.post_quant_conv = nn.Conv2d(latent_channels, latent_channels, 1) if use_post_quant_conv else None
 

@@ -1,7 +1,7 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 from shared.utils.hf import build_hf_url
 from .help import INFOS, PROMPT_INFOS, DEEPY_INFOS, DEEPY_PROMPT_INFOS, TURBO_INFOS, TURBO_PROMPT_INFOS, TURBO_DEEPY_INFOS, TURBO_DEEPY_PROMPT_INFOS
-from .prompts import CLASSIC, STRUCTURED, EDIT, STRUCTURED_EDIT
+from .prompts import CLASSIC, STRUCTURED, EDIT, STRUCTURED_EDIT, RMBG3_ENHANCER, RMBG3_PROMPT
 
 REPO = "DeepBeepMeep/Fibo2"
 TEXT_FOLDER = "Qwen3-VL-4B-Instruct"
@@ -68,6 +68,21 @@ class family_handler:
             result["image_ref_choices"]["choices"] = result["image_ref_choices"]["choices"][1:] + [("No Reference Images (Masked Editing)", "")]
             result["image_ref_choices"]["default"] = "KI"
             result["prompt_enhancer_def"]["selection"] = ["TI", "TI1"]
+        if model_def.get("matting"):
+            result.update({
+                "prompt_enhancer_def": {"selection": ["T"], "default": "", "labels": {"T": "Background Removal Prompt"}},
+                "text_prompt_enhancer_instructions": RMBG3_ENHANCER,
+                "image_prompt_enhancer_instructions": RMBG3_ENHANCER,
+                "text_prompt_enhancer_instructions1": RMBG3_ENHANCER,
+                "image_prompt_enhancer_instructions1": RMBG3_ENHANCER,
+                "text_prompt_enhancer_max_tokens": 512, "image_prompt_enhancer_max_tokens": 512,
+                "text_prompt_enhancer_max_tokens1": 512, "image_prompt_enhancer_max_tokens1": 512,
+                "prompt_enhancer_video_duration": False,
+                "infos": "RMBG-3.0 generates a grayscale alpha matte from a reference image in four steps. White keeps the subject, black removes the background, and gray preserves partial opacity. Use the default fixed prompt. Weights: CC BY-NC 4.0; commercial use requires a separate Bria license.",
+                "prompt_infos": "Use the default matte instruction unchanged. The optional Background Removal Prompt enhancer restores that fixed instruction; it does not describe or edit the scene.",
+                "deepy_infos": 'Alpha-matte generation: model_type="fibo2_rmbg3", image_mode=1, one image_refs source, video_prompt_type="KI", num_inference_steps=4, guidance_scale=1. Keep prompt_enhancer off unless requested. The output is a grayscale matte, not a color cutout.',
+                "deepy_prompt_infos": "Use this exact fixed prompt for every reference image: " + RMBG3_PROMPT,
+            })
         return result
 
     @staticmethod

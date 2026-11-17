@@ -218,12 +218,9 @@ def whole_video_reasons(temporal_upsampling="", spatial_upsampling=""):
     if temporal_upsampling and temporal is None:
         reasons.append("the Temporal Upsampling method takes a video in one piece")
     if spatial_upsampling:
-        from postprocessing import spatial_upsamplers
-        upsampler, spatial = spatial_upsamplers.find_postprocessing_upsampler(spatial_upsampling), chunk_rules(spatial_upsampling)
+        spatial = chunk_rules(spatial_upsampling)
         if spatial is None:
             reasons.append("the Spatial Upsampling method takes a video in one piece")
-        elif upsampler.query_upsampler_def().get("source_audio_conditioning", False):
-            reasons.append("the Spatial Upsampling method follows the sound track")
         elif temporal is not None and not works_frame_by_frame(spatial, spatial_upsampling):
             reasons.append("Temporal and Spatial Upsampling are both on")
     return reasons
@@ -237,10 +234,13 @@ def growth(temporal_upsampling="", spatial_upsampling=""):
     return (float(temporal[1]) if temporal else 1.0), (float(spatial[1]) ** 2 if spatial else 1.0)
 
 
-def chunk_plans(rules, value, frames_count: int, chunk_frame_bytes: float) -> list[ChunkPlan]:
+def chunk_plans(rules, value, frames_count: int, chunk_frame_bytes: float, max_frames: int = 0) -> list[ChunkPlan]:
     """The chunks of a video of frames_count frames for an upsampler's rules; chunk_frame_bytes: what a source frame weighs once
-    processed. One chunk when the whole video fits CHUNK_BYTES."""
+    processed. One chunk when the whole video fits CHUNK_BYTES. No chunk holds more than max_frames source frames (0: no such limit),
+    the window of the upsampler's model included."""
     budget = max(1, int(CHUNK_BYTES // chunk_frame_bytes))
+    if max_frames > 0:
+        budget = min(budget, max_frames)
     if frames_count <= budget:
         return [ChunkPlan(0, frames_count, 0)]
     minimum = int(getattr(rules, "minimum_requested_frames", 1))
@@ -250,6 +250,9 @@ def chunk_plans(rules, value, frames_count: int, chunk_frame_bytes: float) -> li
         floor = max(minimum, OVERLAP_SHARE * overlap_frames(rules, frames_count, value) + 1)
         return max(align_requested_frames(budget, frame_step=step, round_up=False), align_requested_frames(floor, frame_step=step, round_up=True))
     chunk_frames, overlap = chunk_shape(rules, value, frames_count, by_memory)
+    if 0 < max_frames < chunk_frames:
+        chunk_frames = align_requested_frames(max_frames, frame_step=int(getattr(rules, "chunk_frame_step", getattr(rules, "frame_step", 1))), round_up=False)
+        overlap = overlap_frames(rules, chunk_frames, value)
     return build_chunk_plan(0, frames_count, frames_count, chunk_frames, frame_step=int(getattr(rules, "frame_step", 1)), minimum_requested_frames=minimum, overlap_frames=overlap)
 
 
@@ -262,15 +265,16 @@ class ProcessedVideo(FrameChunks):
     temporal, spatial: (value, run) of each upsampler in use; run(frames, start_frame, cache, return_cache) returns the (C, frames, H, W)
     uint8 result and the cache for the next chunk, or (None, None) once the user stopped it.
     per_frame(frames): what is applied last to the frames given (Film Grain). progress(chunk_no, chunks): called before each chunk.
+    max_frames: the most source frames a chunk may hold (0: as many as CHUNK_BYTES allows).
     frames: the output frames given so far. aborted: a run stopped the video before its end."""
 
-    def __init__(self, read_frames, frames_count, width, height, temporal=None, spatial=None, per_frame=None, progress=None):
+    def __init__(self, read_frames, frames_count, width, height, temporal=None, spatial=None, per_frame=None, progress=None, max_frames=0):
         self.read, self.frames_count, self.per_frame, self.progress = read_frames, int(frames_count), per_frame, progress
         self.driver, self.follower = (temporal, spatial) if temporal is not None else (spatial, None)  # the upsampler setting the chunks, the one after it
         self.value = None if self.driver is None else self.driver[0]
         self.rules = None if self.driver is None else chunk_rules(self.value, temporal=temporal is not None)
         frames_growth, pixels_growth = growth("" if temporal is None else temporal[0], "" if spatial is None else spatial[0])
-        self.plans = chunk_plans(self.rules, self.value, self.frames_count, width * height * 3 * frames_growth * pixels_growth)
+        self.plans = chunk_plans(self.rules, self.value, self.frames_count, width * height * 3 * frames_growth * pixels_growth, max_frames)
         self.frames, self.aborted = 0, False
 
     def _give(self, pieces):

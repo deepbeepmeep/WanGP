@@ -6,6 +6,7 @@ import re
 
 import numpy as np
 import torch
+from mmgp import runtime
 from diffusers import FlowMatchEulerDiscreteScheduler
 from tqdm import tqdm
 
@@ -392,7 +393,7 @@ class Qwen21Pipeline(QwenImage21Pipeline):
                 def denoise(value, guidance):
                     model_input = torch.cat([condition, value], dim=1) if condition is not None else value
                     inputs = [{**branch, "hidden_states": model_input, "timestep": timestep.expand(batch_size).to(dtype) / 1000, "kv_cache_mode": None if branch["kv_cache"] is None else ("extract" if branch["kv_cache"].layer_caches[0].empty() else "cached"), "return_dict": False} for branch in branches]
-                    predictions = self.transformer(branches=inputs, nag_parameters=nag_parameters) if nag_parameters or (joint_pass and len(inputs) > 1) else [self.transformer(**item)[0] for item in inputs]
+                    predictions = self.transformer(branches=inputs, nag_parameters=nag_parameters) if nag_parameters or (joint_pass and runtime.joint_pass_useful(self.transformer, model_input.shape[1], self.transformer.inner_dim, len(inputs))) else [self.transformer(**item)[0] for item in inputs]
                     return predictions[0][:, -value.shape[1]:], predictions[1][:, -value.shape[1]:] if len(predictions) > 1 else None
                 def combine(positive, negative, guidance, time):
                     return positive if negative is None else negative + guidance * (positive - negative)

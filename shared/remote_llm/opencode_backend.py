@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import os
 import base64
+import getpass
 import json
 import mimetypes
 import queue
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -29,6 +31,10 @@ OPENCODE_MCP_SERVER = "wangp"  # OpenCode declares MCP tools as <server>_<tool>
 OPENCODE_TOOL_NAMES_INSTRUCTIONS = f"""Tools that these instructions name without the {OPENCODE_MCP_SERVER}_ prefix are declared with it: call mcp_resource as {OPENCODE_MCP_SERVER}_mcp_resource."""
 OPENCODE_RETRY_LIMIT_S = 300  # a provider retry further away than this (a usage limit) ends the turn with its message
 OPENCODE_TOOL_TIMEOUT_MS = 24 * 3600 * 1000  # OpenCode fails an MCP call after 60 s by default; WanGP bounds job waits itself and scripts and plugin actions can take hours
+OPENCODE_START_TIMEOUT_S = 15
+# OpenCode 2: its own tools stay off, the WanGP server's are allowed (the last matching rule wins)
+OPENCODE2_PERMISSIONS = [{"action": "*", "resource": "*", "effect": "deny"}, {"action": f"{OPENCODE_MCP_SERVER}_*", "resource": "*", "effect": "allow"}]
+OPENCODE2_TURN_END = {"session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"}
 
 
 def _resolve_opencode_executable(configured: str) -> str:
@@ -44,6 +50,21 @@ def _resolve_opencode_executable(configured: str) -> str:
     else:
         candidates.append(shutil.which("opencode"))
     return next((candidate for candidate in candidates if candidate and os.path.isfile(candidate)), configured)
+
+
+def _wangp_server_password(create: bool = False) -> str:
+    """The password of the OpenCode 2 servers WanGP starts (OpenCode 2 always asks for one), kept for the user so that a server outliving
+    WanGP still answers it and every OpenCode backend of WanGP reaches it. OpenCode 1 does not read OPENCODE_PASSWORD."""
+    path = Path(tempfile.gettempdir()) / f"wangp-opencode-{getpass.getuser()}.key"
+    try:
+        return path.read_text(encoding="ascii").strip()
+    except OSError:
+        if not create:
+            return ""
+    password = secrets.token_urlsafe(24)
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="ascii") as writer:
+        writer.write(password)
+    return password
 
 
 def _opencode_launch_command(executable: str, port: int) -> list[str]:
@@ -69,6 +90,8 @@ def _opencode_tools(tools: Sequence[dict[str, Any]]) -> tuple[list[dict[str, Any
 
 
 class OpenCodeBackend:
+    """Deepy through an OpenCode server: OpenCode 1 (/global/health, /session/{id}/message answering the whole turn) or OpenCode 2 (/api/...,
+    the prompt admitted at once and the turn followed through session events)."""
     engine = "opencode"
 
     def __init__(self, profile: dict[str, Any], toolbox: Any | None = None) -> None:
@@ -76,15 +99,19 @@ class OpenCodeBackend:
         self.base_url = str(self.profile.get("base_url", "http://127.0.0.1:4096") or "").rstrip("/")
         self.toolbox = toolbox
         self._process: subprocess.Popen[str] | None = None
+        self._api = 1  # the server's API, read by _ensure_server
         self._session_id = ""
+        self._instructions = ""  # the system text last given to an OpenCode 2 session
         self._abort = False
         self._bridge: MCPHttpBridge | None = None
         self._call_tool: ToolCallback | None = None
         self._model_catalog = list(self.profile.get("model_catalog", []) or [])
         self._temp_dir = tempfile.TemporaryDirectory(prefix="wangp-opencode-", ignore_cleanup_errors=True)
 
-    @staticmethod
-    def _auth():
+    def _auth(self, api: int | None = None):
+        if (api or self._api) == 2:  # its user is always opencode
+            password = os.environ.get("OPENCODE_PASSWORD", "") or os.environ.get("OPENCODE_SERVER_PASSWORD", "") or _wangp_server_password()
+            return ("opencode", password) if password else None
         password = os.environ.get("OPENCODE_SERVER_PASSWORD", "")
         return (os.environ.get("OPENCODE_SERVER_USERNAME", "opencode"), password) if password else None
 
@@ -113,12 +140,27 @@ class OpenCodeBackend:
         response.encoding = "utf-8"
         return response.iter_lines(decode_unicode=True)
 
+    def _server_api(self, timeout: float) -> int | None:
+        """The API of the OpenCode server at base_url: 2 (it answers /api/info), 1 (/global/health), None when no server answers."""
+        for api, path in ((2, "/api/info"), (1, "/global/health")):
+            try:
+                response = requests.get(self.base_url + path, timeout=timeout, auth=self._auth(api))
+            except requests.RequestException:
+                return None
+            if response.status_code == 401:
+                raise RuntimeError(f"The OpenCode server at {self.base_url} asks for a password. Start WanGP with the server's password in OPENCODE_PASSWORD (OpenCode 2) or OPENCODE_SERVER_PASSWORD (OpenCode 1), or stop that server: WanGP then starts its own.")
+            try:
+                payload = response.json() if response.ok else None
+            except ValueError:  # OpenCode 2 answers /global/health with its web page
+                payload = None
+            if isinstance(payload, dict) and payload.get("version" if api == 2 else "healthy"):
+                return api
+        return None
+
     def _ensure_server(self) -> None:
-        try:
-            self._request("GET", "/global/health", timeout=2)
+        if api := self._server_api(2):
+            self._api = api
             return
-        except RuntimeError:
-            pass
         parsed = urlparse(self.base_url)
         if (parsed.hostname or "").lower() not in {"127.0.0.1", "localhost", "::1"}:
             raise RuntimeError(f"OpenCode server is not reachable at {self.base_url}.")
@@ -127,21 +169,24 @@ class OpenCodeBackend:
         child_env = os.environ.copy()
         if config := str(self.profile.get("config", "") or "").strip():
             child_env["OPENCODE_CONFIG_CONTENT"] = config
+        if not (child_env.get("OPENCODE_PASSWORD") or child_env.get("OPENCODE_SERVER_PASSWORD")):
+            child_env["OPENCODE_PASSWORD"] = _wangp_server_password(create=True)  # else OpenCode 2 picks a random one that WanGP cannot know
         try:
             self._process = subprocess.Popen(_opencode_launch_command(executable, parsed.port or 4096), cwd=self._temp_dir.name, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=child_env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0)
         except (FileNotFoundError, PermissionError, OSError) as exc:
             raise RuntimeError(f"OpenCode is not reachable and could not be started with '{configured} serve'. Install/configure OpenCode or correct its executable and server URL. {exc}") from exc
-        for _ in range(50):
+        deadline = time.time() + OPENCODE_START_TIMEOUT_S
+        while time.time() < deadline:
             time.sleep(0.1)
-            try:
-                self._request("GET", "/global/health", timeout=1)
+            if api := self._server_api(1):
+                self._api = api
                 return
-            except RuntimeError:
-                continue
         raise RuntimeError("OpenCode server did not become ready.")
 
     def list_models(self) -> list[dict[str, Any]]:
         self._ensure_server()
+        if self._api == 2:
+            return self._list_models_v2()
         response = self._request("GET", "/config/providers", timeout=30)
         providers = response.get("providers", []) if isinstance(response, dict) else []
         defaults = response.get("default", {}) if isinstance(response, dict) else {}
@@ -175,21 +220,60 @@ class OpenCodeBackend:
         self._model_catalog = catalog
         return catalog
 
+    def _list_models_v2(self) -> list[dict[str, Any]]:
+        names = {str(provider.get("id", "")): str(provider.get("name", "") or provider.get("id", "")) for provider in self._request("GET", "/api/provider", timeout=30).get("data", [])}
+        default = self._request("GET", "/api/model/default", timeout=30).get("data") or {}
+        catalog = []
+        for model in self._request("GET", "/api/model", timeout=30).get("data", []):
+            if model.get("type", "chat") != "chat" or not model.get("enabled", True):
+                continue
+            provider_id, model_id = str(model.get("providerID", "") or ""), str(model.get("id", "") or "")
+            catalog.append({"provider": provider_id, "provider_name": names.get(provider_id, provider_id), "model": model_id, "display_name": str(model.get("name", "") or model_id),
+                            "is_default": (provider_id, model_id) == (default.get("providerID"), default.get("id")), "context_window": max(0, int((model.get("limit") or {}).get("context", 0) or 0)),
+                            "reasoning_efforts": [str(variant.get("id", "")) for variant in model.get("variants") or [] if variant.get("id")]})
+        if not catalog:
+            raise RuntimeError("OpenCode did not report any available models. Configure or authenticate a provider in OpenCode first.")
+        self._model_catalog = catalog
+        return catalog
+
+    def _start_bridge(self, tools: Sequence[dict[str, Any]]) -> str:
+        exposed, originals = _opencode_tools(tools)
+        proxy = build_tool_proxy(exposed, lambda name, arguments: self._call_tool(originals[name], arguments) if self._call_tool is not None else {"status": "error", "tool": originals[name], "error": "WanGP tool bridge is not active."})
+        self._bridge = MCPHttpBridge(proxy)
+        return self._bridge.start()
+
     def _ensure_session(self, system_prompt: str, tools: Sequence[dict[str, Any]]) -> None:
         self._ensure_server()
         if self._session_id:
             return
+        if self._api == 2:
+            return self._ensure_session_v2(tools)
         result = self._request("POST", "/session", json={"title": "WanGP Deepy"})
         self._session_id = str(result.get("id", "") or "")
         if not self._session_id:
             raise RuntimeError("OpenCode did not return a session id.")
         if self.toolbox is not None:
-            exposed, originals = _opencode_tools(tools)
-            proxy = build_tool_proxy(exposed, lambda name, arguments: self._call_tool(originals[name], arguments) if self._call_tool is not None else {"status": "error", "tool": originals[name], "error": "WanGP tool bridge is not active."})
-            self._bridge = MCPHttpBridge(proxy)
-            url = self._bridge.start()
+            url = self._start_bridge(tools)
             try:
                 self._request("POST", "/mcp", json={"name": OPENCODE_MCP_SERVER, "config": {"type": "remote", "url": url, "oauth": False, "codemode": False, "timeout": OPENCODE_TOOL_TIMEOUT_MS}}, timeout=15)
+            except Exception:
+                self._bridge.close()
+                self._bridge = None
+                raise
+
+    def _ensure_session_v2(self, tools: Sequence[dict[str, Any]]) -> None:
+        body: dict[str, Any] = {"permissions": OPENCODE2_PERMISSIONS}
+        if model := self._model():
+            body["model"] = {"id": model["modelID"], "providerID": model["providerID"], **({"variant": effort} if (effort := str(self.profile.get("reasoning_effort", "") or "").strip()) else {})}
+        self._session_id = str((self._request("POST", "/api/session", json=body).get("data") or {}).get("id", "") or "")
+        if not self._session_id:
+            raise RuntimeError("OpenCode did not return a session id.")
+        self._instructions = ""
+        self._request("PATCH", f"/api/session/{self._session_id}", json={"title": "WanGP Deepy"})  # named: OpenCode does not ask the model for a title
+        if self.toolbox is not None:
+            url = self._start_bridge(tools)
+            try:
+                self._request("PUT", f"/api/experimental/mcp/{OPENCODE_MCP_SERVER}", json={"config": {"type": "remote", "url": url, "oauth": False, "codemode": False, "timeout": {"execution": OPENCODE_TOOL_TIMEOUT_MS}}}, timeout=15)
             except Exception:
                 self._bridge.close()
                 self._bridge = None
@@ -231,28 +315,39 @@ class OpenCodeBackend:
         parts = payload.get("parts", []) if isinstance(payload, dict) else []
         return "".join(str(part.get("text", "") or "") for part in parts if isinstance(part, dict) and part.get("type") == "text").strip()
 
+    @staticmethod
+    def _system_text(system_prompt: str, tools: Sequence[dict[str, Any]]) -> str:
+        return "\n\n".join(part for part in (str(system_prompt or "").strip(), OPENCODE_TOOL_NAMES_INSTRUCTIONS if tools else "", OPENCODE_PROGRESS_INSTRUCTIONS) if part)
+
+    @staticmethod
+    def _image_urls(images: Sequence[str]) -> list[tuple[str, str]]:
+        urls = []
+        for path in images:
+            mime = mimetypes.guess_type(str(path))[0] or "image/png"
+            with open(path, "rb") as reader:
+                urls.append((f"data:{mime};base64,{base64.b64encode(reader.read()).decode('ascii')}", mime))
+        return urls
+
     def run_turn(self, text: str, *, system_prompt: str, tools: Sequence[dict[str, Any]], images: Sequence[str], on_event: EventCallback, call_tool: ToolCallback, should_stop: StopCallback) -> str:
         self._call_tool = call_tool
         self._ensure_session(system_prompt, tools)
         if not self._model_catalog:
             self.list_models()
         self._abort = False
-        body: dict[str, Any] = {
-            "parts": [{"type": "text", "text": str(text or "")}],
-            "system": "\n\n".join(part for part in (str(system_prompt or "").strip(), OPENCODE_TOOL_NAMES_INSTRUCTIONS if tools else "", OPENCODE_PROGRESS_INSTRUCTIONS) if part),
-            "tools": {"*": False, f"{OPENCODE_MCP_SERVER}_*": True},  # OpenCode's own tools stay off, including the ones later versions add
-        }
         if llm_io_enabled():
             log_llm_io("OUT", self.engine, "turn-context", {"system_prompt": system_prompt, "user_text": str(text or ""), "images": [media_descriptor(path) for path in images], "tools": list(tools), "model": self._model() or "Automatic"})
+        if self._api == 2:
+            return self._run_turn_v2(text, self._system_text(system_prompt, tools), images, on_event, should_stop)
+        body: dict[str, Any] = {
+            "parts": [{"type": "text", "text": str(text or "")}],
+            "system": self._system_text(system_prompt, tools),
+            "tools": {"*": False, f"{OPENCODE_MCP_SERVER}_*": True},  # OpenCode's own tools stay off, including the ones later versions add
+        }
         if model := self._model():
             body["model"] = model
         if effort := str(self.profile.get("reasoning_effort", "") or "").strip():
             body["variant"] = effort
-        for path in images:
-            mime = mimetypes.guess_type(str(path))[0] or "image/png"
-            with open(path, "rb") as reader:
-                url = f"data:{mime};base64,{base64.b64encode(reader.read()).decode('ascii')}"
-            body["parts"].append({"type": "file", "url": url, "mime": mime})
+        body["parts"].extend({"type": "file", "url": url, "mime": mime} for url, mime in self._image_urls(images))
         result_box: dict[str, Any] = {}
         error_box: list[BaseException] = []
         event_queue: queue.Queue[dict[str, Any]] = queue.Queue()
@@ -412,6 +507,119 @@ class OpenCodeBackend:
         self._call_tool = None
         return answer
 
+    def _run_turn_v2(self, text: str, system: str, images: Sequence[str], on_event: EventCallback, should_stop: StopCallback) -> str:
+        """OpenCode 2 admits the prompt at once: the turn's text, steps and end arrive as session events on /api/event."""
+        session = self._session_id
+        if system != self._instructions:  # the system text of the session (OpenCode puts it in its system prompt from the next step)
+            self._request("PUT", f"/api/experimental/session/{session}/instructions/entries/{OPENCODE_MCP_SERVER}", json={"value": system}, timeout=30)
+            self._instructions = system
+        body: dict[str, Any] = {"text": str(text or "")}
+        if images:
+            body["files"] = [{"uri": url, "name": Path(path).name} for path, (url, _mime) in zip(images, self._image_urls(images))]
+        event_queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        stream_ready, stream_stop, stream_closed = threading.Event(), threading.Event(), threading.Event()
+
+        def read_events():
+            # the stream is closed here, at its next line (a heartbeat every 15 s at most): closed from another thread, the close waits for it
+            try:
+                with requests.get(self.base_url + "/api/event", headers={"Accept": "text/event-stream"}, stream=True, timeout=(10, None), auth=self._auth()) as response:
+                    response.raise_for_status()
+                    response.encoding = "utf-8"
+                    # events as they arrive: read by blocks, the small ones (server.connected, the end of the turn) would wait for later traffic
+                    for raw_line in response.iter_lines(chunk_size=None, decode_unicode=True):
+                        if stream_stop.is_set():
+                            break
+                        line = str(raw_line or "")
+                        if not line.startswith("data:"):
+                            continue
+                        try:
+                            event = json.loads(line[5:].strip())
+                        except Exception:
+                            continue
+                        log_llm_io("IN", self.engine, "sse-event", event)
+                        stream_ready.set()  # the stream opens with server.connected
+                        event_queue.put(event)
+            except Exception:
+                pass
+            finally:
+                stream_ready.set()
+                stream_closed.set()
+
+        event_worker = threading.Thread(target=read_events, name="wangp-opencode-events", daemon=True)
+        event_worker.start()
+        stream_ready.wait(timeout=10)
+        if stream_closed.is_set() and event_queue.empty():
+            raise RuntimeError(f"OpenCode's event stream could not be opened at {self.base_url}/api/event.")
+        texts: dict[str, str] = {}  # "<assistant message>:<ordinal>" -> its text so far, in arrival order
+        step_models: dict[str, dict[str, Any]] = {}
+        last_usage: dict[str, Any] = {}
+        final_message = last_step = provider_error = failure = ended = ""
+        try:
+            self._request("POST", f"/api/session/{session}/prompt", json=body, timeout=60)
+            while not ended:
+                if should_stop() and not self._abort:
+                    self.interrupt()
+                try:
+                    event = event_queue.get(timeout=0.1)
+                except queue.Empty:
+                    if stream_closed.is_set():
+                        raise RuntimeError("OpenCode's event stream closed before the end of the turn.")
+                    continue
+                kind, data = str(event.get("type", "") or ""), dict(event.get("data", {}) or {})
+                if data.get("sessionID") != session:
+                    continue
+                message = str(data.get("assistantMessageID", "") or "")
+                key = f"{message}:{data.get('ordinal', 0)}"
+                if kind == "session.text.delta" and data.get("delta"):
+                    texts[key] = texts.get(key, "") + str(data["delta"])
+                    on_event(BackendEvent("commentary_delta", str(data["delta"]), {"item_id": key}))
+                elif kind == "session.text.ended":
+                    full, previous = str(data.get("text", "") or ""), texts.get(key, "")
+                    texts[key] = full
+                    if full.startswith(previous) and full != previous:
+                        on_event(BackendEvent("commentary_delta", full[len(previous):], {"item_id": key}))
+                    elif full and not full.startswith(previous):
+                        on_event(BackendEvent("commentary_replace", full, {"item_id": key}))
+                elif kind == "session.reasoning.delta" and data.get("delta"):
+                    on_event(BackendEvent("reasoning_delta", str(data["delta"]), {"item_id": f"{message}:reasoning:{data.get('ordinal', 0)}", "summary_index": 0}))
+                elif kind == "session.step.started":
+                    step_models[message] = dict(data.get("model", {}) or {})
+                    last_step = message
+                elif kind == "session.step.ended":
+                    model = step_models.get(message, {})
+                    usage = self._usage({"info": {"tokens": data.get("tokens", {}), "providerID": model.get("providerID", ""), "modelID": model.get("id", "")}})
+                    if usage and usage != last_usage:
+                        last_usage = usage
+                        on_event(BackendEvent("usage", data=usage))
+                    if data.get("finish") != "tool-calls":
+                        final_message = message
+                elif kind == "session.compaction.ended":
+                    on_event(BackendEvent("compaction", data={"provider": "opencode"}))
+                elif kind == "session.retry.scheduled":
+                    reason = str((data.get("error", {}) or {}).get("message", "") or "The provider did not answer.")
+                    on_event(BackendEvent("provider_retry", reason))
+                    if float(data.get("at", 0) or 0) / 1000 - time.time() > OPENCODE_RETRY_LIMIT_S:
+                        provider_error = reason
+                        self.interrupt()
+                elif kind in OPENCODE2_TURN_END:
+                    ended = kind
+                    failure = str((data.get("error", {}) or {}).get("message", "") or data.get("reason", "") or "")
+        finally:
+            stream_stop.set()
+            self._call_tool = None
+        if provider_error:
+            raise RuntimeError(f"OpenCode provider: {provider_error}")
+        if ended == "session.execution.failed":
+            raise RuntimeError(f"OpenCode: {failure or 'the turn failed'}")
+        if ended == "session.execution.interrupted":
+            if not self._abort:
+                raise RuntimeError(f"OpenCode stopped the turn ({failure}).")
+            final_message = final_message or last_step  # stopped: what the step had written, as OpenCode 1 answers
+        final_parts = [(key, part) for key, part in texts.items() if final_message and key.startswith(final_message + ":") and part]
+        for key, part in final_parts:
+            on_event(BackendEvent("commentary_promote", part, {"item_id": key}))
+        return "".join(part for _key, part in final_parts).strip()
+
     def one_shot(self, text: str, *, system_prompt: str, images: Sequence[str], max_output_tokens: int) -> str:
         return self.run_turn(text, system_prompt=system_prompt, tools=[], images=images, on_event=lambda _event: None, call_tool=lambda _name, _args: {}, should_stop=lambda: False)
 
@@ -419,7 +627,7 @@ class OpenCodeBackend:
         self._abort = True
         if self._session_id:
             try:
-                self._request("POST", f"/session/{self._session_id}/abort", timeout=10)
+                self._request("POST", f"/api/session/{self._session_id}/interrupt" if self._api == 2 else f"/session/{self._session_id}/abort", timeout=10)
             except Exception:
                 pass
 

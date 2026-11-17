@@ -35,7 +35,9 @@ _CONVOLUTIONS = {torch.nn.Conv1d: F.conv1d, torch.nn.Conv2d: F.conv2d, torch.nn.
 
 @functools.cache
 def _supported(index):
-    return torch.cuda.get_device_capability(index) == (7, 5)
+    # GeForce GTX 16 (TU116/TU117) is also 7.5 but has no tensor cores, and FP16 convolutions fail there: black images (WanGP issue 2637,
+    # and the GTX 16 exception of other diffusion apps). Its BF16 convolutions stay on PyTorch's route.
+    return torch.cuda.get_device_capability(index) == (7, 5) and "GTX 16" not in torch.cuda.get_device_name(index)
 
 
 def supported(device) -> bool:

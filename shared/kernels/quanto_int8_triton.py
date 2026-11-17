@@ -1124,7 +1124,7 @@ if _TRITON_AVAILABLE:
             mask=(offs_m[:, None] < m) & (offs_n[None, :] < n),
         )
 
-    @triton.jit
+    @triton.jit(do_not_specialize=["first", "step"])
     def _fused_dynamic_int8_blockscale_gemm_kernel(
         a_ptr,
         b_ptr,
@@ -1142,7 +1142,13 @@ if _TRITON_AVAILABLE:
         block_m: tl.constexpr,
         block_n: tl.constexpr,
         block_k: tl.constexpr,
+        counter=None,
+        first=0,
+        step=0,
+        AT: tl.constexpr = False,
     ):
+        if AT:  # a's rows from first + counter * step (a CUDA graph loop's turn)
+            a_ptr += (first + tl.load(counter) * step) * stride_am
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
         offs_m = (pid_m * block_m + tl.arange(0, block_m)).to(tl.int64)  # 64 bits: rows x width passes 2^31 on long high resolution videos

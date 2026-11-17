@@ -1,4 +1,7 @@
 from shared.utils.phase_progress import vae_encoding_progress, vae_decoding_progress, set_phase_status
+from shared.image_vae import tiling
+from shared.image_vae.output import blend_edge_
+from mmgp import transfer
 from typing import Optional, Union
 
 import torch
@@ -94,31 +97,16 @@ class AutoencoderKLWrapper(ModelMixin, ConfigMixin):
         # only relevant if vae tiling is enabled
         self.set_tiling_params(sample_size=sample_size, overlap_factor=0.25)
 
+    # measured VRAM (shared.image_vae.tiling), BF16, 97 frames by temporal tiles of 4 latent frames, + 10 %: tiles of 256 and 512
+    # pixels, then whole frames of 832x480, 1280x704 and 1920x1088 (3.5 GiB per megapixel, 2.3 times faster than tiles of 512 and
+    # 4.6 times faster than tiles of 256). A tiled decode also holds the assembled video (1.2 GiB at 1920x1088 x 97).
+    COSTS = {"weights": 2.32, "decode": [(0.0655, 0.67), (0.262, 1.12), (0.4, 1.55), (0.9, 3.5), (2.09, 8.1)], "encode": [(0.0655, 0.27), (0.262, 1.03), (0.4, 1.55), (0.9, 3.5), (2.09, 8.1)]}
+
     @staticmethod
-    def get_VAE_tile_size(vae_config, device_mem_capacity, mixed_precision):
-
-        z_tile = 4
-        # VAE Tiling
-        if vae_config == 0:
-            if mixed_precision:
-                device_mem_capacity = device_mem_capacity / 1.5
-            if device_mem_capacity >= 24000:
-                use_vae_config = 1            
-            elif device_mem_capacity >= 8000:
-                use_vae_config = 2
-            else:          
-                use_vae_config = 3
-        else:
-            use_vae_config = vae_config
-
-        if use_vae_config == 1:
-            hw_tile = 0 
-        elif use_vae_config == 2:
-            hw_tile = 512  
-        else: 
-            hw_tile = 256  
-
-        return  (z_tile, hw_tile)
+    def get_VAE_tile_size(vae_config, device_mem_capacity, mixed_precision, output_height=None, output_width=None):
+        """(latent frames per temporal tile, tile size in pixels): no spatial tiling (0) whenever the whole frames fit the VAE Tiling
+        setting's VRAM budget, else the largest tile that does."""
+        return 4, tiling.choose_tile(vae_config, device_mem_capacity, AutoencoderKLWrapper.COSTS, output_height, output_width, (512, 256))
 
     def set_tiling_params(self, sample_size: int = 512, overlap_factor: float = 0.25):
         self.tile_sample_min_size = sample_size
@@ -367,13 +355,53 @@ class AutoencoderKLWrapper(ModelMixin, ConfigMixin):
             dec = self.decoder(z, target_shape=target_shape)
         return dec
 
+    def _decode_to_ram(self, z, target_shape, timestep, to_ram):
+        """The video decode() gives, in RAM in its final form (to_ram: a function of a decoded piece on the GPU, a dtype conversion or
+        bytes): with temporal tiles, each tile's frames once blended with the tail frames kept from the tile before it (on the GPU,
+        in FP16 as decode() blends them in RAM) go through to_ram and are written to their place without waiting for the GPU. RAM
+        holds the video in its final form only (decode() keeps every decoded tile in RAM in FP16, blends them there with PyTorch's
+        CPU operations, then concatenates them)."""
+        if not (self.use_z_tiling and z.shape[2] > (self.z_sample_size + 1) > 1):
+            decoded = self._hw_tiled_decode(z, target_shape, timestep) if self.use_hw_tiling else self._decode(z, target_shape=target_shape, timestep=timestep)
+            return to_ram(decoded).cpu()
+        latent_frames, frames_per_latent = self.z_sample_size, 8
+        stride = int(latent_frames * 0.75)
+        extent = int(latent_frames * frames_per_latent * 0.25)
+        limit = latent_frames * frames_per_latent - extent
+        starts = list(range(0, z.shape[2], stride))
+        lengths = [(min(start + latent_frames + 1, z.shape[2]) - start - 1) * frames_per_latent + (1 if index == 0 else 0) for index, start in enumerate(starts)]
+        kept = [min(length, limit + (1 if index == 0 else 0)) for index, length in enumerate(lengths)]
+        out, tail, position = None, None, 0
+        with transfer.RamWriter("decoded video", depth=64, max_bytes=256 << 20) as writer:
+            for index, start in enumerate(starts):
+                tile = z[:, :, start : start + latent_frames + 1]
+                decoded = self._hw_tiled_decode(tile, target_shape, timestep) if self.use_hw_tiling else self._decode(tile, target_shape=target_shape, timestep=timestep)
+                decoded = decoded.to(torch.float16)
+                if index > 0:
+                    decoded = decoded[:, :, 1:]
+                    e = min(tail.shape[2], decoded.shape[2], extent)
+                    blend_edge_(decoded[:, :, :e], tail[:, :, tail.shape[2] - e :], 2)
+                tail = decoded[:, :, decoded.shape[2] - min(extent, decoded.shape[2]) :].clone()
+                if kept[index]:  # (a last tile of one latent frame after the first adds no frame)
+                    piece = to_ram(decoded[:, :, : kept[index]])
+                    if out is None:
+                        out = torch.empty((*piece.shape[:2], sum(kept), *piece.shape[3:]), dtype=piece.dtype, device="cpu")
+                    writer.write(out[:, :, position : position + piece.shape[2]], piece)
+                    position += piece.shape[2]
+                    del piece
+                del decoded
+        return out
+
     def decode(
         self,
         z: torch.FloatTensor,
         return_dict: bool = True,
         target_shape=None,
         timestep: Optional[torch.Tensor] = None,
+        to_ram=None,
     ) -> Union[DecoderOutput, torch.FloatTensor]:
+        """to_ram: a function of a decoded piece on the GPU (its final form); the video is then returned in RAM, written piece by piece
+        as it is decoded (_decode_to_ram)."""
         tiles = 1
         if self.use_z_tiling and z.shape[2] > (self.z_sample_size + 1) > 1:
             tiles *= len(range(0, z.shape[2], int(self.z_sample_size * 0.75)))
@@ -382,6 +410,9 @@ class AutoencoderKLWrapper(ModelMixin, ConfigMixin):
             tiles *= len(range(0, z.shape[-2], stride)) * len(range(0, z.shape[-1], stride))
         with vae_decoding_progress(tiles, self.decoder):
             assert target_shape is not None, "target_shape must be provided for decoding"
+            if to_ram is not None:
+                decoded = self._decode_to_ram(z, target_shape, timestep, to_ram)
+                return (decoded,) if not return_dict else DecoderOutput(sample=decoded)
             if self.use_z_tiling and z.shape[2] > (self.z_sample_size + 1) > 1:
             # Split z into overlapping tiles and decode them separately.
                 tile_latent_min_tsize = self.z_sample_size

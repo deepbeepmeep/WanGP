@@ -78,7 +78,7 @@ class model_factory:
         self.image_encoder = _load(image_encoder, fl.locate_file(os.path.join(PROJECT, DINO_LARGE_FILE)))
 
     def _load_paint(self, filename, model_type, save_quantized):
-        from models.z_image.autoencoder_kl import AutoencoderKL
+        from shared.image_vae.autoencoder_kl import AutoencoderKL
         from .rrdbnet import RRDBNet
 
         with open(os.path.join(CONFIGS, "hunyuan3d_21.json"), encoding="utf-8") as reader:
@@ -99,8 +99,9 @@ class model_factory:
     # ---------------------------------------------------------------- conditioning (cached on the CPU)
 
     def _object_image(self, image):
-        """Background removed (rembg u2net), cached by the input image."""
-        key = ("rgba", image_key(image))
+        """Background removed, cached by the input image and selected remover."""
+        from preprocessing.rembg.assets import OBJECT_MODEL, selected_model
+        key = ("rgba", image_key(image), selected_model(OBJECT_MODEL))
         rgba = self.cache.encode(lambda _: [torch.from_numpy(np.array(remove_background(image).convert("RGBA")))], ["rgba"], cache_keys=[key])[0]
         return Image.fromarray(rgba.numpy())
 

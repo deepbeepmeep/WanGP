@@ -1,0 +1,22 @@
+Native inference adaptations for WanGP
+
+U2NET: xuebinqin/U-2-Net, model/u2net.py (Apache-2.0).
+https://github.com/xuebinqin/U-2-Net
+Inference returns the primary logits; deprecated interpolation calls replaced;
+abort checks added. LICENSE_U2NET accompanies the code.
+
+BiRefNet General: ZhengPeng7/BiRefNet (MIT), Hugging Face revision
+e2bf8e4460fc8fa32bba5ea4d94b3233d367b0e4.
+https://huggingface.co/ZhengPeng7/BiRefNet
+Inference-only Swin-L / multiscale / deformable ASPP implementation. Training
+heads removed; separate q/k/v projections use WanGP shared attention and MMGP.
+LICENSE_BIREFNET and LICENSE_SWIN accompany the implementation.
+
+Bria RMBG-2.0 uses the same BiRefNet architecture with Bria's trained weights:
+https://huggingface.co/briaai/RMBG-2.0
+Weights are CC BY-NC 4.0, not covered by BiRefNet's MIT code license.
+Commercial use requires a separate agreement with Bria.
+
+Alpha matting follows Daniel Gatis's rembg MIT implementation (v2.0.65):
+https://github.com/danielgatis/rembg
+LICENSE_REMBG accompanies the implementation. ONNX inference is not used.

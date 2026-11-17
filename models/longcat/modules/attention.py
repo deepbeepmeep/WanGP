@@ -74,101 +74,12 @@ class Attention(nn.Module):
             return _run_sparse_attention([q, k, v], out_dtype, shape, self.bsa_params)
         return _run_attention([q, k, v], out_dtype)
 
-    def forward(self, x: torch.Tensor, shape=None, num_cond_latents=None, return_kv=False) -> torch.Tensor:
-        """
-        """
-        x = _take_tensor(x)
-        B, N, C = x.shape
-        out_dtype = x.dtype
-        qkv = self.qkv(x)
-        x = None
-        if qkv.dtype != out_dtype:
-            qkv = qkv.to(out_dtype)
-
-        qkv_shape = (B, N, 3, self.num_heads, self.head_dim)
-        qkv = qkv.view(qkv_shape)
-        q, k, v = qkv.unbind(2)
-        q, k = self.q_norm(q), self.k_norm(k)
-        v = v.contiguous()
-        del qkv
-
-        if return_kv:
-            k_cache, v_cache = k.clone(), v.clone()
-
-        q, k = self.rope_3d(q, k, shape)
-
-        # cond mode
-        if num_cond_latents is not None and num_cond_latents > 0:
-            num_cond_latents_thw = num_cond_latents * (N // shape[0])
-            # process the condition tokens
-            q_cond = q[:, :num_cond_latents_thw].contiguous()
-            k_cond = k[:, :num_cond_latents_thw].contiguous()
-            v_cond = v[:, :num_cond_latents_thw].contiguous()
-            x_cond = self._process_attn(q_cond, k_cond, v_cond, shape, out_dtype)
-            # process the noise tokens
-            q_noise = q[:, num_cond_latents_thw:].contiguous()
-            x_noise = self._process_attn(q_noise, k, v, shape, out_dtype)
-            # merge x_cond and x_noise
-            x = x_cond.new_empty(B, N, self.num_heads, self.head_dim)
-            x[:, :num_cond_latents_thw].copy_(x_cond)
-            x[:, num_cond_latents_thw:].copy_(x_noise)
-            del x_cond, x_noise
-        else:
-            x = self._process_attn(q, k, v, shape, out_dtype)
-        q = k = v = None
-
-        x_output_shape = (B, N, C)
-        x = x.reshape(x_output_shape)
-        x = self.proj(x)
-
-        if return_kv:
-            return x, (k_cache, v_cache)
-        else:
-            return x
-
-    def forward_with_kv_cache(self, x: torch.Tensor, shape=None, num_cond_latents=None, kv_cache=None) -> torch.Tensor:
-        """
-        """
-        x = _take_tensor(x)
-        B, N, C = x.shape
-        out_dtype = x.dtype
-        qkv = self.qkv(x)
-        x = None
-        if qkv.dtype != out_dtype:
-            qkv = qkv.to(out_dtype)
-        
-        qkv_shape = (B, N, 3, self.num_heads, self.head_dim)
-        qkv = qkv.view(qkv_shape)
-        q, k, v = qkv.unbind(2)
-        q, k = self.q_norm(q), self.k_norm(k)
-        v = v.contiguous()
-        del qkv
-
-        T, H, W = shape
-        k_cache, v_cache = kv_cache
-        if k_cache.shape[0] == 1 and B > 1:
-            k_cache = k_cache.repeat(B, 1, 1, 1)
-            v_cache = v_cache.repeat(B, 1, 1, 1)
-        
-        if num_cond_latents is not None and num_cond_latents > 0:
-            k_full = torch.cat([k_cache, k], dim=1).contiguous()
-            v_full = torch.cat([v_cache, v], dim=1).contiguous()
-            q_padding = torch.cat([torch.empty_like(k_cache), q], dim=1).contiguous()
-            q_padding, k_full = self.rope_3d(q_padding, k_full, (T + num_cond_latents, H, W))
-            q = q_padding[:, -N:].contiguous()
-            del q_padding
-        else:
-            k_full = k
-            v_full = v
-            
-        x = self._process_attn(q, k_full, v_full, shape, out_dtype)
-        q = k = v = k_full = v_full = None
-        
-        x_output_shape = (B, N, C)
-        x = x.reshape(x_output_shape)
-        x = self.proj(x)
-
-        return x
+    def forward(self, x, shape=None, num_cond_latents=0, return_kv=False, layer_cache=None, rope=None):
+        from .prefix_attention import prefix_attention
+        output, ref_map = prefix_attention(
+            self, x, shape, num_cond_latents, avatar=False, layer_cache=layer_cache,
+            build_cache=return_kv, rope=rope)
+        return output
 
 
 class MultiHeadCrossAttention(nn.Module):
@@ -204,6 +115,11 @@ class MultiHeadCrossAttention(nn.Module):
         B, N, C = x.shape
         assert C == self.dim and cond.shape[2] == self.dim
         out_dtype = x.dtype
+        # Lengths are prepared as Python integers before the block graph scope.
+        # Trim the usual single prompt before projecting: no device-to-host sync
+        # or host tensor construction is allowed during CUDA graph capture.
+        if B == 1 and kv_seqlen is not None:
+            cond = cond[:, :kv_seqlen[0]]
 
         q = self.q_linear(x).view(B, N, self.num_heads, self.head_dim)
         x = None
@@ -219,15 +135,16 @@ class MultiHeadCrossAttention(nn.Module):
 
         q, k = self.q_norm(q), self.k_norm(k)
 
-        k_lens = kv_seqlen
-        if k_lens is not None:
-            if isinstance(k_lens, torch.Tensor):
-                k_lens = k_lens.tolist() if B > 1 else k_lens.to(q.device)
-            elif isinstance(k_lens, list) and B == 1:
-                k_lens = torch.tensor(k_lens, device=q.device)
-        qkv_list = [q, k, v]
-        del q, k, v
-        x = _run_attention(qkv_list, out_dtype, k_lens=k_lens)
+        if B > 1 and kv_seqlen is not None:
+            x = torch.empty_like(q)
+            for index, length in enumerate(kv_seqlen):
+                x[index:index + 1] = _run_attention(
+                    [q[index:index + 1], k[index:index + 1, :length], v[index:index + 1, :length]], out_dtype)
+            q = k = v = None
+        else:
+            qkv_list = [q, k, v]
+            del q, k, v
+            x = _run_attention(qkv_list, out_dtype)
         x = x.view(B, N, C)
         x = self.proj(x)
         return x

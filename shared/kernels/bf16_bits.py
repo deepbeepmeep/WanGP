@@ -131,15 +131,19 @@ if triton is not None:
         y = x * _weight(W, offs, mask, W_BITS).to(tl.float64) * _inverse_rms(x, n_cols, eps) * silu
         tl.store(Y + row * n_cols + offs, fp64_to_bf16_bits(y), mask)
 
-    @triton.jit(do_not_specialize=("TOTAL",), do_not_specialize_on_alignment=("TOTAL",))
-    def _silu_mul_kernel(X, OUT, COLUMNS: tl.constexpr, TOTAL, BLOCK: tl.constexpr):
-        # silu_mul's PyTorch route on BF16: silu(gate) rounded to BF16 (in place), then the product rounded
-        index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-        source = index // COLUMNS * (2 * COLUMNS) + index % COLUMNS
-        gate = bf16_bits_to_fp32(tl.load(X + source, index < TOTAL, 0))
-        value = bf16_bits_to_fp32(tl.load(X + source + COLUMNS, index < TOTAL, 0))
+    @triton.jit(do_not_specialize=("ROWS",), do_not_specialize_on_alignment=("ROWS",))
+    def _silu_mul_kernel(X, OUT, ROWS, COLUMNS, R: tl.constexpr, BLOCK: tl.constexpr):
+        # silu_mul's PyTorch route on BF16: silu(gate) rounded to BF16 (in place), then the product rounded. Tiles of R rows and BLOCK
+        # columns with the width at runtime: one compile per tile shape for every FFN width
+        rows = tl.program_id(0).to(tl.int64) * R + tl.arange(0, R)
+        columns = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        valid = (rows < ROWS)[:, None] & (columns < COLUMNS)[None, :]
+        row, column = rows[:, None], columns[None, :]
+        source = row * (2 * COLUMNS) + column
+        gate = bf16_bits_to_fp32(tl.load(X + source, valid, 0))
+        value = bf16_bits_to_fp32(tl.load(X + source + COLUMNS, valid, 0))
         activated = bf16_bits_to_fp32(fp32_to_bf16_bits(tl.div_rn(gate, 1.0 + libdevice.exp(-gate))))
-        tl.store(OUT + index, fp32_to_bf16_bits(activated * value), index < TOTAL)
+        tl.store(OUT + row * COLUMNS + column, fp32_to_bf16_bits(activated * value), valid)
 
     @triton.jit
     def _power_of_two(top, offset: tl.constexpr):
@@ -181,10 +185,11 @@ if triton is not None:
     def _store_block(PARTIAL, index, valid_rows, acc, b: tl.constexpr):
         tl.store(PARTIAL + index[:, None] * 256 + b * 32 + tl.arange(0, 32)[None, :], acc, mask=valid_rows[:, None])
 
-    @triton.jit(do_not_specialize=("Q_PER_SEQ", "TABLE_WIDTH"), do_not_specialize_on_alignment=("Q_PER_SEQ", "TABLE_WIDTH"))
+    @triton.jit(do_not_specialize=("Q_PER_SEQ", "TABLE_WIDTH", "H_Q", "H_KV"), do_not_specialize_on_alignment=("Q_PER_SEQ", "TABLE_WIDTH", "H_Q", "H_KV"))
     def _q8_attention_partials_kernel(Q, K, V, KS, VS, TABLES, LENGTHS, PARTIAL, MAXIMUM, SUM, Q_PER_SEQ, TABLE_WIDTH,
-                                      H_Q: tl.constexpr, H_KV: tl.constexpr, PAGE: tl.constexpr, SPLITS: tl.constexpr,
-                                      M: tl.constexpr, N: tl.constexpr, SCALE: tl.constexpr):
+                                      H_Q, H_KV, PAGE: tl.constexpr, SPLITS: tl.constexpr,
+                                      M: tl.constexpr, N: tl.constexpr, SCALE):
+        # H_Q, H_KV and SCALE at runtime: one compile for every model's head counts and attention scale
         # Paged Q8 attention (head_dim 256) of the query heads sharing a KV head and of all the queries of a sequence (decode or
         # verification rows, causal): each K/V page is read once per split. FP16 tensor-core dots with FP32 accumulation on the
         # int8 values (exact in FP16), one per block of 32 values, the FP16 scales applied to the block results: queries scaled
@@ -192,9 +197,10 @@ if triton is not None:
         # remainder) pairs scaled per row. Tiles and splits do not depend on the query count.
         sequence, kv_head, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
         split, query_block = tile % SPLITS, tile // SPLITS
-        group: tl.constexpr = H_Q // H_KV
+        group = H_Q // H_KV
         rows = query_block * M + tl.arange(0, M)
-        query_index = sequence * Q_PER_SEQ + rows // group
+        row_query = rows // group  # the row's query within the sequence, once (the key tiles below reuse it)
+        query_index = sequence * Q_PER_SEQ + row_query
         query_head = kv_head * group + rows % group
         valid_rows = rows < Q_PER_SEQ * group
         row_offsets = (query_index * H_Q + query_head) * 256
@@ -240,7 +246,7 @@ if triton is not None:
             scores += _scores_block(q5, K, KS, offsets, scale_offsets, valid_columns, 5)
             scores += _scores_block(q6, K, KS, offsets, scale_offsets, valid_columns, 6)
             scores += _scores_block(q7, K, KS, offsets, scale_offsets, valid_columns, 7)
-            valid = valid_rows[:, None] & valid_columns[None, :] & (columns[None, :] <= prefix_len + rows[:, None] // group)
+            valid = valid_rows[:, None] & valid_columns[None, :] & (columns[None, :] <= prefix_len + row_query[:, None])
             scores = tl.where(valid, scores * row_scale[:, None], -1.0e20)
             new_maximum = tl.maximum(maximum, tl.max(scores, 1))
             correction = tl.exp2((maximum - new_maximum) * 1.4426950408889634)
@@ -310,7 +316,11 @@ def silu_mul(x):
     """BF16 x = [gate, value] on the last dimension: silu(gate) * value."""
     x = x.contiguous()
     output = torch.empty((*x.shape[:-1], x.shape[-1] // 2), device=x.device, dtype=x.dtype)
-    _silu_mul_kernel[(triton.cdiv(output.numel(), 256),)](_bits(x), _bits(output), output.shape[-1], output.numel(), 256)
+    columns = output.shape[-1]
+    rows = output.numel() // columns
+    block = min(1024, triton.next_power_of_2(columns))
+    tile_rows = 1024 // block  # narrow rows: several per program
+    _silu_mul_kernel[(triton.cdiv(rows, tile_rows), triton.cdiv(columns, block))](_bits(x), _bits(output), rows, columns, tile_rows, block)
     return output
 
 

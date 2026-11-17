@@ -29,7 +29,7 @@ class OpenCodeConfigUI:
 
 def create_opencode_config_ui(gr, profile: dict[str, Any], *, visible: bool, lock_config: bool) -> OpenCodeConfigUI:
     with gr.Group(visible=visible, elem_classes=["wangp-transparent-group"]) as group:
-        gr.Markdown("**OpenCode setup** — install and authenticate providers in OpenCode outside WanGP. [Provider authentication help](https://opencode.ai/docs/providers/). Provider credentials remain in OpenCode; optional server Basic Auth is read at runtime from `OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD` and is not saved. Refresh lists only providers currently configured in OpenCode. Custom configuration below is saved verbatim, so use OpenCode authentication or environment-variable references instead of putting secrets in it.")
+        gr.Markdown("**OpenCode setup** — install and authenticate providers in OpenCode outside WanGP. [Provider authentication help](https://opencode.ai/docs/providers/). Provider credentials remain in OpenCode; WanGP works with OpenCode 1 and OpenCode 2; the password of a server you start yourself is read at runtime from `OPENCODE_PASSWORD` (OpenCode 2) or `OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD` (OpenCode 1) and is not saved. Refresh lists only providers currently configured in OpenCode. Custom configuration below is saved verbatim, so use OpenCode authentication or environment-variable references instead of putting secrets in it.")
         with gr.Row():
             executable = gr.Textbox(value=profile["executable"], label="OpenCode executable")
             base_url = gr.Textbox(value=profile["base_url"], label="OpenCode server URL")

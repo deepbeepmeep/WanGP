@@ -48,8 +48,8 @@ def _notify_sage():
 
 
 if triton is not None:
-    @triton.jit
-    def _temporal_conv_kernel(src, taps, dst, frames, spatial, channels: tl.constexpr,
+    @triton.jit(do_not_specialize=["frames", "spatial"])  # channels at runtime: one kernel for every Head Split group size
+    def _temporal_conv_kernel(src, taps, dst, frames, spatial, channels,
                               dim: tl.constexpr, block_t: tl.constexpr, normalize: tl.constexpr):
         frame_block, pixel, head = tl.program_id(0), tl.program_id(1), tl.program_id(2)
         rows = frame_block * block_t + tl.arange(0, block_t)

@@ -1,5 +1,6 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
-"""Triton kernels of the Wan VAEs (2.1 and 2.2) on channels-last activations ("fast" kernel precision).
+"""Triton kernels of the causal video VAEs of the Wan architecture (Wan 2.1 and 2.2; the first Qwen VAE has the same layers) on
+channels-last activations ("fast" kernel precision).
 
 causal_pad: the input of each causal convolution built in one pass: RMS norm over the channels + SiLU (or the plain input), the cached
 last frames of the previous chunk in front, the zero padding, and the next chunk's cache. Replaces the norm (5 passes), SiLU, cache copy,
@@ -12,8 +13,8 @@ input, with the bias and the residual of the block added as PyTorch rounds them,
 convolution read from the low-resolution input (no upsampled copy). 1.1-1.5x faster than cuDNN on RTX 50 GPUs, where it is enabled; only
 the accumulation order differs.
 
-One binary per channel count, kernel shape, mode and activation dtype; sizes, strides and paddings are not specialized, so a new
-resolution, video length or tile size compiles nothing. Launch configurations start from a static choice and are tuned once per kernel,
+causal_pad compiles once per power-of-two range of channel counts, mode and activation dtype; sizes, strides and paddings are not
+specialized, so a new resolution, video length or tile size compiles nothing. Launch configurations start from a static choice and are tuned once per kernel,
 identity and GPU on scratch outputs of a large call."""
 import torch
 import triton
@@ -23,7 +24,7 @@ from triton.language.extra import libdevice
 from shared.kernels.triton_tuner import LaunchTuner
 from shared.kernels.conv3d_triton import channels_last_weight, conv, conv_eligible, conv_supported, supported  # noqa: F401 (used through this module)
 
-_TUNER = LaunchTuner("wan2gp_wan_vae_kernels", 6, "Wan VAE")
+_TUNER = LaunchTuner("wan2gp_wan_vae_kernels", 7, "Wan VAE")
 _TUNE_ELEMENTS = 1 << 24  # calls writing at least this many elements tune the configurations
 _CL = torch.channels_last_3d
 _EPS = {dtype: torch.tensor(1e-12, dtype=dtype, device="cpu").item() for dtype in (torch.float16, torch.bfloat16, torch.float32)}  # F.normalize eps
@@ -31,11 +32,13 @@ _EPS = {dtype: torch.tensor(1e-12, dtype=dtype, device="cpu").item() for dtype i
 
 @triton.jit(do_not_specialize=["TOTAL", "T", "H", "W", "NC", "FRONT", "PH", "PW", "KEEP", "SB", "SC", "ST", "SH", "SW"])
 def _causal_pad_kernel(X, CACHE, GAMMA, OUT, KEPT, TOTAL, T, H, W, NC, FRONT, PH, PW, KEEP, SB, SC, ST, SH, SW, SCALE, EPS,
-                       C: tl.constexpr, BLOCK_C: tl.constexpr, BLOCK_P: tl.constexpr, STRIDED: tl.constexpr, NORM: tl.constexpr):
+                       C, BLOCK_C: tl.constexpr, BLOCK_P: tl.constexpr, STRIDED: tl.constexpr, NORM: tl.constexpr,
+                       REPLICATE: tl.constexpr):
     """BLOCK_P pixels (all channels) of the padded output (batch, FRONT + T, H + 2 PH, W + 2 PW, C): silu(rms_norm(x)) (NORM) or x inside,
-    the NC cached frames (batch, NC, H, W, C) just before the first frame, zeros elsewhere; the last KEEP frames without the spatial
-    padding also go to KEPT (batch, KEEP, H, W, C), the cache of the next chunk. x is channels-last contiguous, or read with the strides
-    SB..SW (STRIDED)."""
+    the NC cached frames (batch, NC, H, W, C) just before the first frame, zeros elsewhere, or with REPLICATE the nearest pixel of the
+    frame and the earliest frame there is (the first cached one, else x's first); the last KEEP frames without the spatial padding also
+    go to KEPT (batch, KEEP, H, W, C), the cache of the next chunk. x is channels-last contiguous, or read with the strides SB..SW
+    (STRIDED)."""
     p = tl.program_id(0).to(tl.int64) * BLOCK_P + tl.arange(0, BLOCK_P)
     valid = p < TOTAL
     w = p % (W + 2 * PW) - PW
@@ -45,8 +48,16 @@ def _causal_pad_kernel(X, CACHE, GAMMA, OUT, KEPT, TOTAL, T, H, W, NC, FRONT, PH
     t = r % (FRONT + T) - FRONT
     b = r // (FRONT + T)
     inside = valid & (h >= 0) & (h < H) & (w >= 0) & (w < W)
-    from_x = inside & (t >= 0)
-    from_cache = inside & (t < 0) & (t >= -NC)
+    kept_frame = t >= T - KEEP
+    if REPLICATE:
+        h = tl.minimum(tl.maximum(h, 0), H - 1)
+        w = tl.minimum(tl.maximum(w, 0), W - 1)
+        t = tl.maximum(t, -NC)
+        from_x = valid & (t >= 0)
+        from_cache = valid & (t < 0)
+    else:
+        from_x = inside & (t >= 0)
+        from_cache = inside & (t < 0) & (t >= -NC)
     c = tl.arange(0, BLOCK_C)
     lanes = c < C
     if STRIDED:
@@ -65,21 +76,24 @@ def _causal_pad_kernel(X, CACHE, GAMMA, OUT, KEPT, TOTAL, T, H, W, NC, FRONT, PH
     cached = tl.load(CACHE + ((((b * NC + t + NC) * H + h) * W + w) * C)[:, None] + c[None, :], from_cache[:, None] & lanes[None, :], other=0.0)
     out = tl.where(from_x[:, None], x.to(dtype), cached.to(dtype))
     tl.store(OUT + (p * C)[:, None] + c[None, :], out, valid[:, None] & lanes[None, :])
-    keep = inside & (t >= T - KEEP)
+    keep = inside & kept_frame
     tl.store(KEPT + ((((b * KEEP + t - T + KEEP) * H + h) * W + w) * C)[:, None] + c[None, :], out, keep[:, None] & lanes[None, :])
 
 
-def causal_pad(x, pad, cache=None, norm=None, keep=0):
+def causal_pad(x, pad, cache=None, norm=None, keep=0, replicate=False):
     """Channels-last input of a causal convolution with padding pad = (left, right, top, bottom, front, 0) (CausalConv3d._padding) for
     x (batch, channels, frames, height, width): silu(norm(x)) with an RMS_norm module (whose gamma and scale it reads), else x, after the
     last frames of the previous chunk (cache, at most `front` frames) and zero padding. keep > 0: also returns the last `keep` frames of
-    that input without the spatial padding (the next chunk's cache)."""
+    that input without the spatial padding (the next chunk's cache): the frames that exist, so a first chunk shorter than `keep` keeps
+    its own frames and no frame of zeros before them (the next chunk reads zeros before a shorter cache anyway). replicate: replicate
+    padding instead of zeros, in space and before the earliest frame (the first cached one, else the first of x)."""
     batch, channels, frames, height, width = x.shape
     left, _, top, _, front, _ = pad
     strided = not x.is_contiguous(memory_format=_CL)
     if cache is not None and not cache.is_contiguous(memory_format=_CL):
         cache = cache.contiguous(memory_format=_CL)
     cached = 0 if cache is None else cache.shape[2]
+    keep = min(keep, cached + frames)
     out = torch.empty((batch, channels, front + frames, height + 2 * top, width + 2 * left), dtype=x.dtype, device=x.device, memory_format=_CL)
     kept = torch.empty((batch, channels, keep, height, width), dtype=x.dtype, device=x.device, memory_format=_CL) if keep else out
     total = out.numel() // channels
@@ -91,14 +105,15 @@ def causal_pad(x, pad, cache=None, norm=None, keep=0):
         block_p = max(1, elements // block_c)
         _causal_pad_kernel[(triton.cdiv(pixels, block_p),)](x, x if cache is None else cache, gamma, target, kept, pixels, frames, height, width,
                                                             cached, front, top, left, keep, *x.stride(), scale, eps, channels, block_c,
-                                                            block_p, strided, norm is not None, num_warps=warps)
+                                                            block_p, strided, norm is not None, replicate, num_warps=warps)
 
     def scratch():
         pixels = min(total, 1 << 16)
         target = torch.empty(pixels * channels, dtype=x.dtype, device=x.device)
         return lambda config: launch(target, pixels, config, 0)
 
-    identity = f"{channels}|{x.dtype}|{'norm' if norm is not None else 'copy'}|{'strided' if strided else 'cl'}"
+    # timed per channel count (keeps the tuned entries), compiled per range: the candidates' binaries serve every count of the range
+    identity = f"{channels}|{x.dtype}|{'norm' if norm is not None else 'copy'}|{'strided' if strided else 'cl'}{'|replicate' if replicate else ''}"
     launch(out, total, _TUNER.config("causal_pad", identity, x.device, ((4096, 4), (2048, 4), (8192, 8), (4096, 8)), scratch, out.numel() >= _TUNE_ELEMENTS))
     return (out, kept) if keep else out
 

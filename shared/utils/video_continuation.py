@@ -1,9 +1,9 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
-"""Continuing a Source Video from its file.
+"""Gathering the windows of a generation in a file, after a Source Video when one is continued.
 
-The model only reads the last frames of a Source Video. The frames before them stay in the file: the new frames of each window are
-encoded alone and joined to the video made so far by copying its pictures, so nothing is encoded twice and the video is never held in
-memory. A Source Video encoded like the new frames opens that file as it is; another one (other size, rate, codec, or shortened) is
+The model only reads the last frames of what comes before a window. The frames before them stay in a file: the new frames of each
+window are encoded alone and joined to the video made so far by copying its pictures, so nothing is encoded twice and the video is
+never held in memory. A Source Video encoded like the new frames opens that file as it is; another one (other size, rate, codec, or shortened) is
 encoded once, a few frames at a time, going through the upsamplers and Film Grain of the generation on the way when they are on.
 
 The whole Source Video is still loaded when something has to process its frames with the new ones (loading_reasons)."""
@@ -48,15 +48,20 @@ def loading_reasons(video_source, *, processing=(), hdr=False, frames_returned=F
     return reasons
 
 
-def loaded_source_plan(video_source, keep_frames, fps, new_frames, max_frames, **criteria):
+def loaded_source_plan(video_source, keep_frames, fps, new_frames, max_frames, first_window_frames=0, **criteria):
     """What a generation that loads its whole Source Video keeps in memory: the reasons it is loaded (the criteria of loading_reasons),
-    its frames read at fps (0 for a file that cannot be read: its own error follows), the new frames planned and the most frames that
-    may be kept. None when the Source Video stays in its file."""
+    its frames read at fps (0 for a file that cannot be read: its own error follows), the new frames kept with them and the most frames
+    that may be kept. None when the Source Video stays in its file.
+
+    The loaded Source Video leaves memory once it is saved with the first window, of first_window_frames at most (0: one window makes
+    the whole video), each later window being saved alone: only that window counts. An HDR output and frames returned to the caller
+    stay in memory to the end ("kept"): every new frame counts."""
     reasons = loading_reasons(video_source, **criteria)
     if not reasons:
         return None
-    source_frames = source_frames_count(video_source, keep_frames, fps) if probe_video_stream_metadata(video_source) is not None else 0
-    return {"reasons": reasons, "source_frames": source_frames, "new_frames": int(new_frames), "max_frames": int(max_frames), "window_frames": 0}
+    source_frames, kept = source_frames_count(video_source, keep_frames, fps) if probe_video_stream_metadata(video_source) is not None else 0, bool(criteria.get("hdr") or criteria.get("frames_returned"))
+    held_frames = int(new_frames) if kept or first_window_frames <= 0 else min(int(new_frames), int(first_window_frames))
+    return {"reasons": reasons, "source_frames": source_frames, "new_frames": held_frames, "max_frames": int(max_frames), "window_frames": 0, "kept": kept}
 
 
 def frames_limit_error(plan, extra_windows=0):
@@ -67,18 +72,20 @@ def frames_limit_error(plan, extra_windows=0):
     new_frames = plan["new_frames"] + extra_windows * plan["window_frames"]
     if plan["source_frames"] + new_frames <= plan["max_frames"]:
         return ""
-    return (f"The whole Source Video has to be loaded in memory because {_listed(plan['reasons'])}: its {plan['source_frames']} frames and the {new_frames} new ones "
-            f"are more than the {plan['max_frames']} frames that can be kept in memory. Keep fewer frames of the Source Video, generate fewer frames, or turn that off.")
+    return (f"The whole Source Video has to be loaded in memory because {_listed(plan['reasons'])}: its {plan['source_frames']} frames and the {new_frames} "
+            f"{'new ones' if plan['kept'] else 'of the first window'} are more than the {plan['max_frames']} frames that can be kept in memory. "
+            f"Keep fewer frames of the Source Video, {'generate fewer frames' if plan['kept'] else 'use a shorter window'}, or turn that off.")
 
 
 def loading_notice(plan, video_source, width, height):
-    """The console line telling that a Source Video is loaded whole, why, and the memory it takes: its frames at the output size for the
-    whole generation, and more while they are read (the decoded frames, then two copies of the resized ones)."""
+    """The console line telling that a Source Video is loaded whole, why, and the memory it takes: its frames at the output size until
+    they are saved with the first window (to the end of a generation whose output stays in memory), and more while they are read (the
+    decoded frames, then two copies of the resized ones)."""
     metadata = probe_video_stream_metadata(video_source)
     resized, decoded = plan["source_frames"] * width * height * 3, plan["source_frames"] * metadata["display_width"] * metadata["display_height"] * 3
     peak = max(2 * decoded, decoded + resized, 2 * resized)
     return (f"[Continue Video] The whole Source Video ({plan['source_frames']} frames) is loaded in memory because {_listed(plan['reasons'])}: "
-            f"about {resized / 2**30:.1f} GB of RAM held during the generation, up to {peak / 2**30:.1f} GB while it is loaded.")
+            f"about {resized / 2**30:.1f} GB of RAM held {'during the generation' if plan['kept'] else 'until the first window is saved'}, up to {peak / 2**30:.1f} GB while it is loaded.")
 
 
 def read_source_tail(read_frames, frames_count, tail_frames):
@@ -117,7 +124,8 @@ def copy_obstacles(video_source, source_frames, fps, width, height, segment_fact
 
 
 class ContinuedVideo:
-    """The file a continued Source Video and its new windows are gathered in, for one generation.
+    """The file the windows of a generation are gathered in, after its Source Video when it continues one kept in its file
+    (video_source None otherwise: the first window opens the file).
 
     read_frames(start, count) gives frames_count frames of the Source Video at the size and rate of the generation, as a (frames, H, W, C)
     uint8 tensor; encode(frames, path) writes frames (a list of tensors or FrameChunks) to a video file without sound and returns its
@@ -174,6 +182,9 @@ class ContinuedVideo:
         """Add the new frames of a window and return the file holding the whole video so far (pictures only), valid until the next call.
         None when the user stopped the post-processing of the Source Video."""
         segment = self.encode(frames, self._work_path())
+        if self.file is None and self.video_source is None:  # nothing before the first window: its own file opens the video
+            self.file, self.file_frames = segment, video_stream_facts(segment)["frames"]
+            return segment
         segment_facts = video_stream_facts(segment)
         if self.file is None:
             if self.source_file is None:

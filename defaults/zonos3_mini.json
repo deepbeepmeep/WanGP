@@ -1,0 +1,20 @@
+{
+    "model": {
+        "name": "TTS ZONOS3 Mini",
+        "architecture": "zonos3_mini",
+        "description": "Fast multilingual speech in 43 languages with 27 built-in voices or a voice cloned from a short recording, with emotions and delivery set by voice-design presets or by cues in the text such as [happy] or [whisper], plus multi-speaker dialogues line by line. Small (1.8 GB) and far faster than real time; the cues are a fixed set of styles, not free descriptions or sounds.",
+        "URLs": [
+            "https://huggingface.co/DeepBeepMeep/TTS/resolve/main/ZONOS3_Mini_bf16.safetensors"
+        ]
+    },
+    "prompt": "Hello there. It's lovely to finally meet you. I've heard so much about your work, and I'd love to hear how the new project is going.",
+    "audio_prompt_type": "",
+    "duration_seconds": 60,
+    "pause_seconds": 0.3,
+    "temperature": 0.75,
+    "top_k": 80,
+    "top_p": 0.69,
+    "guidance_scale": 1.0,
+    "num_inference_steps": 1,
+    "prompt_enhancer": ""
+}

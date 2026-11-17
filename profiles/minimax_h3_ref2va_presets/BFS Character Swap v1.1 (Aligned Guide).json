@@ -1,0 +1,9 @@
+{
+    "activated_loras": [
+        "https://huggingface.co/Alissonerdx/Minimax-H3-ComfyUI/resolve/main/loras/minimax_h3_character_swap_v1.1_ref2va_fro.safetensors"
+    ],
+    "loras_multipliers": "1.0",
+    "video_prompt_type": "IVU2",
+    "prompt": "body_swap: subject_definitions: <Subject 1> is the [DESCRIBE THE CHARACTER OF THE REFERENCE IMAGE: sex, height, build, face, skin, eyes, hair, clothing] shown in <Picture 1>, whose identity, face, head, hair or fur, skin, body shape, proportions and clothing define the character in the target video. The guide video provides the scene and the performance: its background, environment, lighting, camera, framing, body pose, hand and arm movement, head rotation, gaze direction, lip movement and facial expression, frame by frame; only the main subject of the guide video is replaced: its face, hair, body and clothing become <Subject 1>.  summary: [video generation + reference] Replace the guide subject with <Subject 1>, keeping the scene, camera and the complete motion and performance of the guide video.  detailed_description: [Shot 1] <Subject 1> takes the exact place of the guide subject and moves with the same timing, body pose, gestures, head motion, gaze, speech and facial expressions, while keeping the complete identity from <Picture 1>: facial structure, hair or fur, skin, body shape and clothing stay stable in every frame. The background, lighting, colors and camera of the guide video are preserved. Prevent identity drift, clothing changes, texture crawling and flicker.",
+    "help": "BFS Character Swap v1.1 (by Alissonerdx): the main person of the Control Video becomes the character of the Reference Image, keeping the scene, camera and performance. Replace the bracketed part of the prompt with a head-to-toe description of the character. Works well with an 8-step accelerator profile."
+}

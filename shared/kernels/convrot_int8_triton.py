@@ -76,9 +76,11 @@ def _hadamard_step(a, BM: tl.constexpr, SEG: tl.constexpr, STRIDE: tl.constexpr)
     return tl.permute(out, (0, 1, 4, 3, 2)).reshape((BM, SEG))
 
 
-@triton.jit(do_not_specialize=["m", "stride_x"])
+@triton.jit(do_not_specialize=["m", "stride_x", "first", "step"], do_not_specialize_on_alignment=["x", "q", "scales"])  # ranges of columns start at any 4-byte scale
 def _rotate_quantize_kernel(x, q, scales, m, k, stride_x, BM: tl.constexpr, SEG: tl.constexpr, GROUP: tl.constexpr, NORM: tl.constexpr,
-                            BK: tl.constexpr):
+                            BK: tl.constexpr, counter=None, first=0, step=0, AT: tl.constexpr = False):
+    if AT:  # x's rows from first + counter * step (a CUDA graph loop's turn)
+        x += (first + tl.load(counter) * step) * stride_x
     rows = tl.program_id(0) * BM + tl.arange(0, BM)
     cols = tl.program_id(1) * SEG + tl.arange(0, SEG)
     inside = rows[:, None] < m
@@ -99,7 +101,7 @@ def _rotate_quantize_kernel(x, q, scales, m, k, stride_x, BM: tl.constexpr, SEG:
     tl.store(scales + rows[:, None].to(tl.int64) * (k // BK) + blocks[None, :], scale, inside)
 
 
-@triton.jit(do_not_specialize=["m"])
+@triton.jit(do_not_specialize=["m"], do_not_specialize_on_alignment=["q", "scales", "out"])  # ranges of rows of a kept input
 def _blockscale_gemm_kernel(q, scales, w, weight_scale, bias, out, m, n, k, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
                             HAS_BIAS: tl.constexpr):
     rows = tl.program_id(0) * BM + tl.arange(0, BM)
@@ -127,11 +129,12 @@ _GEMM_CANDIDATES = ((64, 128, 8, 3), (64, 128, 4, 3), (128, 64, 4, 4), (64, 128,
 _TUNE_ROWS = 2048
 
 
-def _quantize(x, q, scales, count, k, group, config):
+def _quantize(x, q, scales, count, k, group, config, at=None):
+    """at: (counter, first, step), x's rows from first + counter * step instead of its first rows."""
     rows, warps = config
     seg = max(group, SCALE_BLOCK)
     _rotate_quantize_kernel[(triton.cdiv(count, rows), k // seg)](x, q, scales, count, k, x.stride(0), rows, seg, group, group ** -0.5, SCALE_BLOCK,
-                                                                 num_warps=warps)
+                                                                 *(() if at is None else (*at, True)), num_warps=warps)
 
 
 def _gemm(q, scales, weight, scale, bias, out, count, n, k, config):
@@ -140,13 +143,38 @@ def _gemm(q, scales, weight, scale, bias, out, count, n, k, config):
                                                                           bias is not None, num_warps=warps, num_stages=stages)
 
 
+def _quantize_identity(k, group, dtype):
+    return f"k{k} g{group} {str(dtype)[6:]}"
+
+
+def _gemm_identity(n, k, dtype, bias):
+    return f"n{triton.next_power_of_2(n)} k{k} {str(dtype)[6:]}{' bias' if bias is not None else ''}"
+
+
+def _gemm_candidates(n):
+    static = (128, 256, 8, 2) if n >= 4096 else (64, 128, 8, 3)
+    return (static,) + tuple(c for c in _GEMM_CANDIDATES if c != static)
+
+
+def scratch_rows(k):
+    """Rows per launch of rotated_linear for an input of k columns (SCRATCH_BYTES of INT8 activations and scales)."""
+    return max(128, SCRATCH_BYTES // (k + 4 * (k // SCALE_BLOCK)) // 128 * 128)
+
+
+def loop_configs(dtype, device, n, k, group, bias):
+    """rotated_linear's (quantize, GEMM) launch configurations as its calls inside a CUDA graph capture take them: the tuned winners, else the
+    static ones (no tuning)."""
+    return (_TUNER.config("rotate_quantize", _quantize_identity(k, group, dtype), device, _QUANTIZE_CANDIDATES, None, False),
+            _TUNER.config("blockscale_gemm", _gemm_identity(n, k, dtype, bias), device, _gemm_candidates(n), None, False))
+
+
 def rotated_linear(x, weight, scale, bias, group):
     """ConvRot INT8 linear for large inputs: x (M, K) BF16/FP16 with unit column stride; weight (N, K) contiguous INT8, rotated rows; scale
     (N,) FP32; group 16, 64 or 256, K a multiple of max(group, 64). The launch configurations are tuned on scratch copies of the call's
     first rows (LaunchTuner)."""
     m, k = x.shape
     n = weight.shape[0]
-    rows = max(128, SCRATCH_BYTES // (k + 4 * (k // SCALE_BLOCK)) // 128 * 128)
+    rows = scratch_rows(k)
     out = torch.empty((m, n), dtype=x.dtype, device=x.device)
     q = torch.empty((min(rows, m), k), dtype=torch.int8, device=x.device)
     scales = torch.empty((min(rows, m), k // SCALE_BLOCK), dtype=torch.float32, device=x.device)
@@ -159,19 +187,52 @@ def rotated_linear(x, weight, scale, bias, group):
                 sample = part[:_TUNE_ROWS].clone()
                 q_scratch, scales_scratch = torch.empty_like(q[:len(sample)]), torch.empty_like(scales[:len(sample)])
                 return lambda config: _quantize(sample, q_scratch, scales_scratch, len(sample), k, group, config)
-            quantize_config = _TUNER.config("rotate_quantize", f"k{k} g{group} {str(x.dtype)[6:]}", x.device, _QUANTIZE_CANDIDATES, quantize_scratch,
+            quantize_config = _TUNER.config("rotate_quantize", _quantize_identity(k, group, x.dtype), x.device, _QUANTIZE_CANDIDATES, quantize_scratch,
                                             count >= 256)
         _quantize(part, q, scales, count, k, group, quantize_config)
         if gemm_config is None:
-            static = (128, 256, 8, 2) if n >= 4096 else (64, 128, 8, 3)
-
             def gemm_scratch():
                 sample_q, sample_scales = q[:min(count, _TUNE_ROWS)].clone(), scales[:min(count, _TUNE_ROWS)].clone()
                 out_scratch = torch.empty((len(sample_q), n), dtype=x.dtype, device=x.device)
                 return lambda config: _gemm(sample_q, sample_scales, weight, scale, bias, out_scratch, len(sample_q), n, k, config)
-            gemm_config = _TUNER.config("blockscale_gemm", f"n{triton.next_power_of_2(n)} k{k} {str(x.dtype)[6:]}{' bias' if bias is not None else ''}",
-                                        x.device, (static,) + tuple(c for c in _GEMM_CANDIDATES if c != static), gemm_scratch, count >= 256)
+            gemm_config = _TUNER.config("blockscale_gemm", _gemm_identity(n, k, x.dtype, bias), x.device, _gemm_candidates(n), gemm_scratch, count >= 256)
         _gemm(q, scales, weight, scale, bias, out[start:start + count], count, n, k, gemm_config)
+    return out
+
+
+def quantize_columns(x, q, scales, first, group, block=SCALE_BLOCK):
+    """x (M, columns) BF16/FP16 with unit column stride, whole rotation groups and scale blocks (max(group, block) columns each),
+    rotated and quantized in place into the columns [first, first + columns) of q (M, K) INT8 and their scales (M, K / block), as
+    rotated_linear quantizes its input: nothing in it spans more columns, so an input received by ranges of columns is quantized
+    as it would be whole. block: columns per activation scale (128: the form the WGPKernels block GEMM reads)."""
+    (m, k), columns, seg = q.shape, x.shape[1], max(group, block)
+
+    def launch(source, target, target_scales, count, width, row_stride, config):
+        rows, warps = config
+        _rotate_quantize_kernel[(triton.cdiv(count, rows), columns // seg)](source, target, target_scales, count, width, row_stride, rows, seg, group,
+                                                                            group ** -0.5, block, num_warps=warps)
+
+    def scratch():
+        sample = x[:_TUNE_ROWS].clone()
+        q_scratch = torch.empty((len(sample), columns), dtype=torch.int8, device=x.device)
+        scales_scratch = torch.empty((len(sample), columns // block), dtype=torch.float32, device=x.device)
+        return lambda config: launch(sample, q_scratch, scales_scratch, len(sample), columns, sample.stride(0), config)
+    identity = f"k{k} g{group}{'' if block == SCALE_BLOCK else f' b{block}'} {str(x.dtype)[6:]}"
+    config = _TUNER.config("rotate_quantize", identity, x.device, _QUANTIZE_CANDIDATES, scratch, m >= 256)
+    launch(x, q[:, first:], scales[:, first // block:], m, k, x.stride(0), config)
+
+
+def prepared_linear(q, scales, weight, scale, bias, out):
+    """rotated_linear's block-scaled GEMM on an input quantized beforehand (quantize_columns), written into out (M, N): its rows as
+    rotated_linear's."""
+    (m, k), n, dtype = q.shape, weight.shape[0], out.dtype
+
+    def scratch():
+        sample_q, sample_scales = q[:_TUNE_ROWS].clone(), scales[:_TUNE_ROWS].clone()
+        out_scratch = torch.empty((len(sample_q), n), dtype=dtype, device=q.device)
+        return lambda config: _gemm(sample_q, sample_scales, weight, scale, bias, out_scratch, len(sample_q), n, k, config)
+    config = _TUNER.config("blockscale_gemm", _gemm_identity(n, k, dtype, bias), q.device, _gemm_candidates(n), scratch, m >= 256)
+    _gemm(q, scales, weight, scale, bias, out, m, n, k, config)
     return out
 
 

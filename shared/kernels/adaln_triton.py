@@ -10,13 +10,14 @@ import triton.language as tl
 
 @triton.jit(do_not_specialize=['ROWS', 'INNER', 'S0', 'S1', 'H0', 'H1'],
             do_not_specialize_on_alignment=['ROWS', 'INNER', 'S0', 'S1', 'H0', 'H1'])
-def _adaln(X, S, H, Y, ROWS, INNER, S0, S1, H0, H1, EPS: tl.constexpr, D: tl.constexpr, BLOCK: tl.constexpr):
+def _adaln(X, S, H, Y, ROWS, INNER, S0, S1, H0, H1, EPS, D, BLOCK: tl.constexpr):
+    # D, EPS at runtime: one kernel per power-of-two range of widths (BLOCK), whatever the model
     row = tl.program_id(0).to(tl.int64)
     c = tl.arange(0, BLOCK)
     x = tl.load(X + row * D + c, c < D, 0).to(tl.float32)
-    mean = tl.div_rn(tl.sum(x, 0), D)
+    mean = tl.div_rn(tl.sum(x, 0), D.to(tl.float32))
     centered = tl.where(c < D, x - mean, 0.)
-    var = tl.div_rn(tl.sum(centered * centered, 0), D)
+    var = tl.div_rn(tl.sum(centered * centered, 0), D.to(tl.float32))
     inv = tl.div_rn(1., tl.sqrt_rn(var + EPS))
     dtype = Y.dtype.element_ty
     norm = (centered * inv).to(dtype).to(tl.float32)

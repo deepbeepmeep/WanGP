@@ -644,7 +644,7 @@ class Showrunner:
     def render_directly(self, production_id: str, shot_ids: list[str], final: bool = False, new_seed: bool | None = None) -> dict[str, Any]:
         """Render shots now, one after the other, without the showrunner: the render action's own work (the cast's pictures, spoken lines, lengths) with no language model and no verdict.
         A shot nobody chose a model for gets the brief's for what it shows, a shot without a prompt one made from what it says, kept on the shot, where it can be edited.
-        new_seed: None draws a new seed for a draft and keeps the take's for a final (its draft at the target size); True, a new one either way (Reshoot)."""
+        new_seed: None draws a new seed for a draft and keeps the take's for a final (its draft at the target size); True, a new one either way (Render again)."""
         production = self.store.get(production_id)
         if self.director.status(production_id)["running"]:
             raise RuntimeError("The showrunner is working on this production: this comes back when it finishes, or after Pause or Stop.")

@@ -11,6 +11,8 @@ import itertools
 import threading
 import weakref
 
+import torch
+
 from . import allocator
 
 _clients = weakref.WeakKeyDictionary()
@@ -20,6 +22,7 @@ _requests = []  # [size, device, done, freed] of the helpers' shortages, release
 _ready = threading.Condition()
 _stamps = itertools.count(1)
 _parked = weakref.WeakSet()  # the offload objects parked
+releases = 0  # VRAM shortages that released memory: the blocks kept in VRAM may have changed since a reading of this count
 
 
 def stamp():
@@ -48,6 +51,7 @@ def reclaimable(exclude=None):
 
 def _reclaim(size, device):
     # what the allocation of size bytes misses, the VRAM it may still take deducted (its size when the room did not refuse it)
+    global releases
     if threading.get_ident() in _helpers:
         request = [size, device, threading.Event(), 0]
         with _ready:
@@ -61,16 +65,31 @@ def _reclaim(size, device):
     for manager in sorted(parked(), key=lambda manager: manager.last_used()):
         freed += manager.reclaim_parked(size - freed)
         if freed >= size:
-            return freed
-    # then the running objects: by priority, the least recently used object first in each (an idle one before the one allocating)
-    running = [(priority, client, _manager(client)) for client, priority in list(_clients.items())]
-    for _, client, manager in sorted(running, key=lambda item: (item[0], 0 if item[2] is None else item[2].last_used())):
-        if manager is not None and manager.parked:
-            continue
-        freed += client.on_pressure(max(0, size - freed))
-        if freed >= size:
             break
+    else:
+        # then the running objects: by priority, the least recently used object first in each (an idle one before the one allocating)
+        running = [(priority, client, _manager(client)) for client, priority in list(_clients.items())]
+        for _, client, manager in sorted(running, key=lambda item: (item[0], 0 if item[2] is None else item[2].last_used())):
+            if manager is not None and manager.parked:
+                continue
+            freed += client.on_pressure(max(0, size - freed))
+            if freed >= size:
+                break
+    releases += freed > 0
     return freed
+
+
+def make_room(size, device):
+    """Outside any capture (a graph warmup included): the VRAM an allocation of size bytes missed, made as the allocator makes it for an eager
+    allocation: the memory it caches, back to the driver after a synchronization, then what the clients release. A capture that ran short
+    asks it once it has ended, before it is made again. Returns whether any memory was freed."""
+    if allocator.capture_running():
+        return False
+    room = allocator.room(device)
+    torch.cuda.empty_cache()
+    if allocator.room(device) < size + HEADROOM and _reclaim(size, device) > 0:
+        torch.cuda.empty_cache()  # what the clients released goes back to the driver too: a capture takes no memory still in use elsewhere
+    return allocator.room(device) > room
 
 
 def helper_thread():

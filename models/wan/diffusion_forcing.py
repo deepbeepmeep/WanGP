@@ -7,6 +7,7 @@ from typing import Union
 import logging
 import numpy as np
 import torch
+from mmgp import runtime
 from diffusers.image_processor import PipelineImageInput
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
@@ -384,7 +385,7 @@ class DTT2V:
                         return None
                     noise_pred= noise_pred.to(torch.float32)                                                                  
                 else:
-                    if joint_pass:
+                    if joint_pass and runtime.joint_pass_useful(self.model, math.prod(latent_model_input.shape[-3:]) // math.prod(self.model.patch_size), self.model.dim):
                         noise_pred_cond, noise_pred_uncond = self.model(
                             x=[latent_model_input, latent_model_input],
                             context= [prompt_embeds, negative_prompt_embeds],

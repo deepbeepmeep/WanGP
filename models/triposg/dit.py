@@ -71,8 +71,7 @@ class Attention(nn.Module):
 
     def forward(self, x_list):
         """Self-attention of x (handed off in x_list), (batch, tokens, dim)."""
-        out = attention_kit.qkv_attention(x_list, self.to_q, self.to_k, self.to_v, self.heads, self.head_dim, self._norm_)
-        return self.to_out[0](out.flatten(2))
+        return attention_kit.qkv_attention(x_list, self.to_q, self.to_k, self.to_v, self.heads, self.head_dim, self._norm_, out_proj=self.to_out[0])
 
     def keys_values(self, context):
         """Normalized keys and values (1, tokens, heads, head_dim) of a context (1, tokens, context_dim)."""

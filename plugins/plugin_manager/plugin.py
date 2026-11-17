@@ -206,18 +206,58 @@ class PluginManagerUIPlugin(WAN2GPPlugin):
                     if (!restart) window.WanGPAppBar?.order(enabledUserPlugins);
                     const payload = makePayload({ restart: restart, enabled_plugins: enabledUserPlugins });
                     updateGradioInput('save_action_input', payload);
-
-                    if (restart) {
-                        setTimeout(() => {
-                            document.body.innerHTML = "<div style='display:flex;justify-content:center;align-items:center;height:100vh;background-color:#0b0f19;color:#e5e7eb;font-family:sans-serif;text-align:center;'><h2>WanGP is restarting...<br><br>You can safely close this tab.<br>A new tab will open shortly.</h2></div>";
-                            window.open('', '_self', '');
-                            window.close();
-                        }, 1000);
-                    }
                 };
 
                 window.handleRestart = function() {
                     handlePluginOrderSave(true, false);
+                };
+
+                window.waitForPluginRestart = async function(restart) {
+                    if (!restart) {
+                        window.WanGPAppBar?.changed();
+                        return;
+                    }
+                    if (document.getElementById('wangp-plugin-restarting')) return;
+                    const notice = document.createElement('div');
+                    notice.id = 'wangp-plugin-restarting';
+                    notice.setAttribute('role', 'status');
+                    notice.style.cssText = 'position:fixed;inset:0;z-index:10002;display:flex;flex-direction:column;gap:24px;justify-content:center;align-items:center;background:#0b0f19;color:#e5e7eb;font:20px sans-serif;text-align:center';
+                    notice.textContent = 'WanGP is restarting. This page will reconnect automatically.';
+                    document.body.append(notice);
+                    const config = window.gradio_config;
+                    const url = new URL(config.root.replace(/\/$/, '') + '/config', location.href);
+                    // A stopped server cannot send a ready event. Poll only for
+                    // this requested restart, once a second for at most 10 minutes.
+                    const deadline = Date.now() + 600000;
+                    while (Date.now() < deadline) {
+                        await new Promise(resolve => setTimeout(resolve, 1000));
+                        const controller = new AbortController();
+                        const timeout = setTimeout(() => controller.abort(), 3000);
+                        try {
+                            const response = await fetch(url, {cache: 'no-store', signal: controller.signal});
+                            // Authentication sessions expire with the old process.
+                            if (response.status === 401) {
+                                location.reload();
+                                return;
+                            }
+                            if (response.ok) {
+                                const current = await response.json();
+                                if (current.auth_required || (current.app_id != null && current.app_id !== config.app_id)) {
+                                    location.reload();
+                                    return;
+                                }
+                            }
+                        } catch (_) {
+                            // The old listener is gone and its replacement is starting.
+                        } finally {
+                            clearTimeout(timeout);
+                        }
+                    }
+                    notice.textContent = 'WanGP has not reconnected. Check its console for startup errors, then reload this page.';
+                    const reload = document.createElement('button');
+                    reload.textContent = 'Reload Page';
+                    reload.onclick = () => location.reload();
+                    notice.append(reload);
                 };
             }
         """
@@ -569,6 +609,7 @@ class PluginManagerUIPlugin(WAN2GPPlugin):
             with gr.Column(visible=False):
                 self.plugin_action_input = gr.Textbox(elem_id="plugin_action_input")
                 self.save_action_input = gr.Textbox(elem_id="save_action_input")
+                self.restart_result = gr.JSON()
                 self.catalog_refresh_input = gr.Textbox(elem_id="app_catalog_refresh")
 
         js = self._get_js_script_html()
@@ -586,7 +627,7 @@ class PluginManagerUIPlugin(WAN2GPPlugin):
         )
 
         # Saving an order changes nothing on this page: the dragged list and the app bar already show it.
-        self.save_action_input.change(fn=self._handle_save_action, inputs=[self.save_action_input], show_progress="hidden").then(fn=None, js=catalog_changed_js)
+        self.save_action_input.change(fn=self._handle_save_action, inputs=[self.save_action_input], outputs=[self.restart_result], show_progress="hidden").success(fn=None, inputs=[self.restart_result], js="restart => { window.waitForPluginRestart(restart); }")
         
         WangpProgress.bind(self.plugin_action_input.change, self._handle_plugin_action_from_json,
             inputs=[self.plugin_action_input],
@@ -681,26 +722,24 @@ class PluginManagerUIPlugin(WAN2GPPlugin):
         return result_message
 
     def _save_and_restart(self, enabled_plugins: list):
+        if not callable(self.restart_application):
+            raise gr.Error("Restart hook is unavailable. Please restart WanGP manually.")
         update_config(self.server_config, self.server_config_filename, {"enabled_plugins": enabled_plugins})
         gr.Info("Settings saved. Restarting application...")
-        if callable(getattr(self, "restart_application", None)):
-            self.restart_application()
-            return
-        elif callable(getattr(self, "quit_application", None)):            
-            gr.Warning("Restart hook is unavailable. WAN2GP will now quit. Please start WAN2GP again manually.")
-            self.quit_application()
-            return
+        self.restart_application()
+        return True
 
     def _handle_save_action(self, payload_str: str):
         if not payload_str:
-            return
+            return False
         payload = json.loads(payload_str)
         enabled_plugins = self.server_config.get("enabled_plugins", []) if payload["enabled_plugins"] is None else payload["enabled_plugins"]
         if payload["restart"]:
-            self._save_and_restart(enabled_plugins)
+            return self._save_and_restart(enabled_plugins)
         else:  # a new order needs no restart: the app bar follows it
             update_config(self.server_config, self.server_config_filename, {"enabled_plugins": enabled_plugins})
             self.app.app_bar.refresh_default()
+            return False
 
     def _install_plugin_and_refresh(self, url, progress=WangpProgress()):
         progress(0, desc="Starting installation...")

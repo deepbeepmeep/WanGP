@@ -281,6 +281,7 @@ class model_factory:
             masking_strength = 1.,
             vae_upsampler = None,
             set_progress_status=None,
+            VAE_tile_size = None,
             **bbargs
     ):
             if self._interrupt:
@@ -561,7 +562,7 @@ class model_factory:
                 vae_latent = x
                 lq_latent = vae_upsampler_lq_latent if vae_upsampler_lq_latent is not None else vae_latent
                 with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                    x = self.vae.decode(vae_latent)
+                    x = self.vae.decode(vae_latent, VAE_tile_size or 0)  # by tiles when the whole picture exceeds the VAE Tiling budget
 
                 img_msk_rebuilt = inp.get("img_msk_rebuilt") if isinstance(inp, dict) else None
                 if img_msk_rebuilt is not None and (lanpaint_enabled or (masking_strength == 1 and not flux2)):

@@ -3,6 +3,7 @@
 import json
 
 import gradio as gr
+from gradio.blocks import Block, convert_component_dict_to_list
 
 from shared.utils.form_sync import FormConflict, Saved
 
@@ -55,8 +56,17 @@ class GradioForm:
         for event in self.view_events:
             args = [values.get(component, component.value) for component in event.inputs]
             result = event.fn(*args)
+            # Callbacks also return component-keyed dictionaries or component
+            # instances. Normalize them as Gradio does before serializing.
+            if isinstance(result, dict) and result:
+                if result == gr.skip() and len(event.outputs) > 1:
+                    result = [gr.skip() for _ in event.outputs]
+                else:
+                    result = convert_component_dict_to_list([component._id for component in event.outputs], result)
             results = [result] if len(event.outputs) == 1 else result
             for component, result in zip(event.outputs, results):
+                if isinstance(result, Block):
+                    result = {**result.constructor_args, '__type__': 'update'}
                 update = result if isinstance(result, dict) and result.get('__type__') == 'update' else gr.update(value=result)
                 if component in updates:
                     updates[component].update(update)

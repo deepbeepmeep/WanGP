@@ -329,6 +329,15 @@ For a new workflow:
 5. Use sliding windows for supported long-video workflows, and tiling where the model exposes it. Look for seams or continuity changes when tuning these options.
 6. Add compatible LoRAs, controls and upsampling one feature at a time so their effects are easy to compare.
 
+### VAE Tiling
+
+The last step of a generation turns the result into pixels with the model's VAE; large pictures and frames can need several GB of VRAM there. **VAE Tiling** (Configuration > RAM/VRAM Management) sets the VRAM this step may use, the VAE itself included:
+
+- **Auto** (default): all the VRAM that other programs leave free when the generation starts. The fastest choice, but not a predictable one: with a browser or a game open, the same job can be cut into smaller tiles than the day before.
+- **Up to 3/4**, **1/2** or **1/3 of the VRAM**: a fixed share of your GPU, whatever else is running. The same job is always cut the same way. Choose a smaller share when other programs need VRAM, or if you see out of memory errors while decoding.
+
+WanGP estimates what each tile size needs at your resolution and picks the largest that fits. When the whole picture or frame fits, it is not tiled at all, which is both the fastest and free of any tile blending. Smaller tiles take longer, and very small ones can show slight differences where tiles meet. A few models still use fixed tile sizes. MiniMax H3 always works in 256-pixel tiles, the only size its video VAE handles; for it the setting decides how many tiles are decoded together: more at once is a little faster and needs more VRAM.
+
 INT8, FP8, GGUF, NVFP4, NF4 and Nunchaku are checkpoint/quantization choices, not separate creative model families. Availability, memory savings, speed and output can vary with the model, GPU and installed kernels. Follow the [installation guide](INSTALLATION.md) or [AMD guide](AMD-INSTALLATION.md) for hardware-specific setup.
 
 ## Model switching and custom models

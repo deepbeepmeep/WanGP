@@ -1,0 +1,4 @@
+{
+    "alt_prompt": "room=-2, chatty=2",
+    "help": "Conversational speech over a phone-like line. Changes the voice itself."
+}
