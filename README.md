@@ -83,7 +83,7 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 ## 🔥 Latest Updates : 
 
-## 12th of November 2026: WanGP v20.00 - VRAM and RAM so Low You Can't Measure Them !
+## 17th of November 2026: WanGP v20.00 - VRAM and RAM so Low You Can't Measure Them !
 
 - **Even Less VRAM, Again!** Thought VRAM usage couldn't get any lower? The new **Smart Inputs Chunker**, which replaces the Attention Head Splitter, lets you generate **15 seconds of H3 video at 1080p with only 8 GB of VRAM!** Best of all, generation takes in the worst case **1-2% longer**. Find it in *Configuration > Performance > Smart Inputs Chunker* and choose **Auto** to use chunking only when VRAM would otherwise run short.
 
@@ -198,7 +198,7 @@ WanGP is a one-stop super app for open source generative models: create videos, 
   - **Jump in the recording**: the transcript shows under the Audio gallery player, as text or as a timeline per speaker; click a line or a turn to play from there.
   - **Subtitled videos**: get the video back with the transcript or translation as subtitles, shown or hidden with the new **CC** button of the Video gallery.
   - **Your names and words**: name the speakers, give the spelling of names and jargon, keep every hesitation or get clean text, with timings per turn or per word; translations can be timed and subtitled too.
-  - **Deepy Prime**: ask for speaker-labelled transcripts, translations or subtitled videos once a Nemotron model is chosen in **Configuration > Deepy / Prompt Enhancer > Transcription**.
+  - **Deepy Prime**: ask for speaker-labelled transcripts, translations or subtitled videos once a Nemotron model is chosen in **Configuration > Prompt Enhancer / Deepy > Transcription**.
 
 - **WanGP Manager (Experimental, Windows)**: [download the official app](https://github.com/deepbeepmeep/WanGP/releases/latest/download/WanGPManager.exe) for guided setup that selects the recommended GPU profile and installs Python and dependencies for you.\
   Keep several installations, update their dependencies and recommended kernels, try an older WanGP build or restore both source and environment from a saved version.\
@@ -211,7 +211,7 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 ## 29th of October 2026: WanGP v18.888 - Are You Game?
 
-- **Deepy Prime Can Now Build Apps**: turn an idea into a game, an interactive story, a music toy or an explorable 3D scene, with images, video, sound and 3D assets made by WanGP's generative models. Play in the chat, keep your creations in the new **Apps gallery**, save progress and share them as `.wgpapp` files. Deepy can keep improving an app in later conversations, including one someone else shared with you. This development preview is off by default: under **Configuration → Deepy / Prompt Enhancer → Python**, enable **Python Sandbox** and set **App Development (Advanced)** to **Web Apps**, then save. See the [Apps guide](docs/APPS.md).
+- **Deepy Prime Can Now Build Apps**: turn an idea into a game, an interactive story, a music toy or an explorable 3D scene, with images, video, sound and 3D assets made by WanGP's generative models. Play in the chat, keep your creations in the new **Apps gallery**, save progress and share them as `.wgpapp` files. Deepy can keep improving an app in later conversations, including one someone else shared with you. This development preview is off by default: under **Configuration → Prompt Enhancer / Deepy → Python**, enable **Python Sandbox** and set **App Development (Advanced)** to **Web Apps**, then save. See the [Apps guide](docs/APPS.md).
 
 - **3D Models, Organized by What You Want to Do**: start with **Create**, **Texture**, **Refine**, **Split**, **Animate** or **Reconstruct**, then choose a model for that task. Shape generation and texturing are now separate choices: use a preset to combine them in one generation, optionally adding new **Hi3D** refinement before also new **SUPRA-Tex**, **Hunyuan3D 2.1 Paint** or **TRELLIS.2 Texture** paints the result. Existing meshes can go straight to the matching tool with **To Input Mesh** in the 3D gallery. See the [3D models guide](docs/MODELS.md#3d-models).
 
