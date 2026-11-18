@@ -34,7 +34,7 @@ class VideoConditionByKeyframeIndex(ConditioningItem):
         positions = get_pixel_coords(
             latent_coords=latent_coords,
             scale_factors=latent_tools.scale_factors,
-            causal_fix=latent_tools.causal_fix if self.frame_idx == 0 else False,
+            causal_fix=latent_tools.causal_fix,
         )
         # Negative continuation offsets retain their legacy prepend convention.
         # Layout appearance references use a literal -1 pixel-frame position.
