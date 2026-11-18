@@ -108,7 +108,7 @@ def _attn_fwd_bsa_varlen(
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
     # load scales
     qk_scale = sm_scale
-        qk_scale *= 1.44269504  # 1/ln2; exp2(x/ln2) == exp(x)
+    qk_scale *= 1.44269504  # 1/ln2; exp2(x/ln2) == exp(x)
     # load q: it will stay in SRAM throughout
     q = tl.load(Q_block_ptr)
     S = tl.load(block_indices_lens)
@@ -137,10 +137,10 @@ def _attn_fwd_bsa_varlen(
             acc = acc * alpha[:, None]
             # update acc
             v = tl.load(V_block_ptr_i)
-                    acc = tl.dot(p.to(v.dtype), v, acc)  # keep in log2 domain for FA2 optimization
+            acc = tl.dot(p.to(v.dtype), v, acc)  # keep in log2 domain for FA2 optimization
             # update m_i and l_i
             # place this at the end of the loop to reduce register pressure: https://github.com/triton-lang/triton/commit/ee6abd9
-                    l_i = l_i * alpha + l_ij  # running sum of exp
+            l_i = l_i * alpha + l_ij  # running sum of exp
             m_i = m_ij
             V_block_ptr_i = tl.advance(V_block_ptr_i, (BLOCK_N, 0))
             KT_block_ptr_i = tl.advance(KT_block_ptr_i, (0, BLOCK_N))
@@ -244,7 +244,7 @@ def _attn_fwd_bsa_varlen_align(
     acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
     # load scales
     qk_scale = sm_scale
-        qk_scale *= 1.44269504  # 1/ln2; exp2(x/ln2) == exp(x)
+    qk_scale *= 1.44269504  # 1/ln2; exp2(x/ln2) == exp(x)
     # load q: it will stay in SRAM throughout
     q = tl.load(Q_block_ptr)
     S = tl.load(block_indices_lens)
@@ -270,10 +270,10 @@ def _attn_fwd_bsa_varlen_align(
         acc = acc * alpha[:, None]
         # update acc
         v = tl.load(V_block_ptr_i)
-                acc = tl.dot(p.to(v.dtype), v, acc)  # keep in log2 domain for FA2 optimization
+        acc = tl.dot(p.to(v.dtype), v, acc)  # keep in log2 domain for FA2 optimization
         # update m_i and l_i
         # place this at the end of the loop to reduce register pressure: https://github.com/triton-lang/triton/commit/ee6abd9
-                l_i = l_i * alpha + l_ij  # running sum of exp
+        l_i = l_i * alpha + l_ij  # running sum of exp
         m_i = m_ij
 
     
