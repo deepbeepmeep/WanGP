@@ -9,6 +9,7 @@ from .adaln import AdaLayerNormSingle, adaln_embedding_coefficient
 from .attention import AttentionCallable, AttentionFunction
 from .modality import Modality
 from .rope import LTXRopeType
+from .sol_attention import first_modality, sol_attention
 from .transformer import BasicAVTransformerBlock, TransformerConfig
 from shared.kernels import ops as kernels
 from .transformer_args import (
@@ -486,6 +487,10 @@ class LTXModel(torch.nn.Module):
 
         self._refresh_preprocessor_refs()
         self.interrupted = False
+        # Refresh the Sol-Attn policy (enabled state, per-step tau, one-time runtime validation).
+        sol_source = first_modality(video) or first_modality(audio)
+        if sol_source is not None:
+            sol_attention.begin_forward(sol_source.latent.device, sol_source.latent.dtype, video, audio)
         joint_pass = isinstance(video, (list, tuple)) or isinstance(audio, (list, tuple))
         if joint_pass:
             video_list = list(video) if isinstance(video, (list, tuple)) else [None] * len(audio)
