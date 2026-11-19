@@ -313,11 +313,15 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
             )
 
         sigma = self.sigmas[self.step_index]
+        if sample.device.type == "mps":
+            # Metal can read offset zero from an indexed CPU scalar view.
+            # Give this step its own scalar storage before mixed-device math.
+            sigma = sigma.clone()
         alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma)
 
         if self.predict_x0:
             if self.config.prediction_type == "flow_prediction":
-                sigma_t = self.sigmas[self.step_index]
+                sigma_t = sigma
                 x0_pred = sample - sigma_t * model_output
             else:
                 raise ValueError(
@@ -331,7 +335,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
             return x0_pred
         else:
             if self.config.prediction_type == "flow_prediction":
-                sigma_t = self.sigmas[self.step_index]
+                sigma_t = sigma
                 epsilon = sample - (1 - sigma_t) * model_output
             else:
                 raise ValueError(
@@ -340,7 +344,7 @@ class FlowUniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
                 )
 
             if self.config.thresholding:
-                sigma_t = self.sigmas[self.step_index]
+                sigma_t = sigma
                 x0_pred = sample - sigma_t * model_output
                 x0_pred = self._threshold_sample(x0_pred)
                 epsilon = model_output + x0_pred
