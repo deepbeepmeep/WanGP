@@ -123,9 +123,10 @@ class modelsManagerPlugin(WAN2GPPlugin):
             inputs=[],
             outputs=[self.filter_input],
             show_progress="hidden",
-        )
+        ).then(fn=None, js="() => window.wangpModelInventoryFinished()", api_name=False)
 
-        self.filter_button.click(
+        gr.on(
+            triggers=[self.filter_button.click, self.filter_input.submit],
             fn=self._build_filtered_tree,
             inputs=[self.filter_input],
             outputs=model_outputs,
@@ -307,16 +308,8 @@ class modelsManagerPlugin(WAN2GPPlugin):
             window.updatemodelInput("model_action_input", payload);
         };
 
-        function ismodelTabActive() {
-            const root = modelRoot();
-            const tabs = root.querySelectorAll('button[role="tab"]');
-            for (const tab of tabs) {
-                if (tab.getAttribute('aria-selected') === 'true') {
-                    const label = (tab.textContent || '').trim();
-                    if (label === 'Models Manager') return true;
-                }
-            }
-            return false;
+        function activeAppTab() {
+            return modelRoot().querySelector('.wangp-native-app-tabs > .tab-wrapper button[data-tab-id][aria-selected="true"]');
         }
 
         function triggermodelRefresh() {
@@ -325,52 +318,16 @@ class modelsManagerPlugin(WAN2GPPlugin):
             if (btn) btn.click();
         }
 
-        function triggermodelFilter() {
-            const root = modelRoot();
-            const btn = root.querySelector('#ckpt_filter_btn button') || root.querySelector('#ckpt_filter_btn');
-            if (btn) btn.click();
-        }
-
-        function setupmodelFilterEnter() {
-            const root = modelRoot();
-            const input = root.querySelector('#ckpt_filter_input textarea, #ckpt_filter_input input');
-            if (!input || input.dataset.ckptEnterBound === '1') return;
-            input.dataset.ckptEnterBound = '1';
-            input.addEventListener('keydown', (evt) => {
-                if (evt.key !== 'Enter') return;
-                evt.preventDefault();
-                evt.stopPropagation();
-                triggermodelFilter();
-            });
-        }
-
-
         let ckptTabWasActive = false;
-        let ckptRefreshBusy = false;
         let ckptRefreshStartedAt = 0;
-
-        function waitForRefreshReady() {
-            const root = modelRoot();
-            const treeRoot = root.querySelector('.ckpt-stats');
-            if (treeRoot && treeRoot.dataset.status === 'ready') {
-                ckptRefreshBusy = false;
-                setupmodelFilterEnter();
-                return;
-            }
-            if (ckptRefreshStartedAt && Date.now() - ckptRefreshStartedAt > 60000) {
-                ckptRefreshBusy = false;
-                setupmodelFilterEnter();
-                return;
-            }
-            setTimeout(waitForRefreshReady, 400);
-        }
+        window.wangpModelInventoryFinished = () => { ckptRefreshStartedAt = 0; };
 
         function startmodelBuild() {
-            if (ckptRefreshBusy) return;
-            ckptRefreshBusy = true;
+            // A lost connection can discard the completion notification.
+            // Permit the next visit to retry after the existing timeout.
+            if (Date.now() - ckptRefreshStartedAt < 60000) return;
             ckptRefreshStartedAt = Date.now();
             triggermodelRefresh();
-            setTimeout(waitForRefreshReady, 200);
         }
 
         // The screen the Models Manager was opened from, where its return link and Alt+M lead back.
@@ -384,44 +341,48 @@ class modelsManagerPlugin(WAN2GPPlugin):
         }
 
         function handleTabChange() {
-            const active = ismodelTabActive();
-            if (!active) {
+            const tab = activeAppTab();
+            const active = tab?.dataset.tabId === 'plugin_model_manager';
+            if (tab && !active) {
                 const root = modelRoot();
-                const tab = root.querySelector('.wangp-native-app-tabs > .tab-wrapper button[data-tab-id][aria-selected="true"]');
-                if (tab) {
-                    const appLink = root.querySelector(`#wangp-app-bar [data-app-route="${CSS.escape(tab.dataset.tabId)}"]`);
-                    ckptReturn = {target: tab.dataset.tabId, label: appLink ? appLink.getAttribute('aria-label') : tab.textContent.trim()};
-                }
+                const appLink = root.querySelector(`#wangp-app-bar [data-app-route="${CSS.escape(tab.dataset.tabId)}"]`);
+                ckptReturn = {target: tab.dataset.tabId, label: appLink ? appLink.getAttribute('aria-label') : tab.textContent.trim()};
             }
             if (active && !ckptTabWasActive) {
                 updatemodelReturnLink();
                 startmodelBuild();
             }
-            if (active) {
-                setTimeout(setupmodelFilterEnter, 280);
-            }
             ckptTabWasActive = active;
         }
 
-        function initmodelBridge() {
+        let observedTabBar = null;
+        function observeAppTabs() {
             const root = modelRoot();
-            const tabs = root.querySelectorAll('button[role="tab"]');
-            if (!tabs || tabs.length === 0) {
-                setTimeout(initmodelBridge, 400);
+            const bar = root.querySelector('.wangp-native-app-tabs > .tab-wrapper');
+            tabObserver.disconnect();
+            observedTabBar = bar;
+            if (!bar) {
+                // End the bootstrap watch as soon as Gradio mounts its tabs.
+                tabObserver.observe(root, {childList: true, subtree: true});
                 return;
             }
-            const tabObserver = new MutationObserver(handleTabChange);
-            tabObserver.observe(root, { attributes: true, subtree: true, attributeFilter: ['aria-selected'] });
+            tabObserver.observe(bar, {childList: true, subtree: true, attributes: true, attributeFilter: ['aria-selected']});
+            tabObserver.observe(bar.parentElement, {childList: true});
+            if (bar.parentElement.parentElement) tabObserver.observe(bar.parentElement.parentElement, {childList: true});
             handleTabChange();
         }
+        const tabObserver = new MutationObserver(records => {
+            if (!observedTabBar?.isConnected) observeAppTabs();
+            else if (records.some(record => observedTabBar.contains(record.target))) handleTabChange();
+        });
 
         document.addEventListener('keydown', (evt) => {
             if (!evt.altKey || evt.ctrlKey || evt.metaKey || evt.shiftKey || evt.repeat || evt.key.toLowerCase() !== 'm') return;
             evt.preventDefault();
-            window.WanGPAppBar?.navigate(ismodelTabActive() ? ckptReturn.target : 'plugin_model_manager');
+            window.WanGPAppBar?.navigate(activeAppTab()?.dataset.tabId === 'plugin_model_manager' ? ckptReturn.target : 'plugin_model_manager');
         });
 
-        initmodelBridge();
+        observeAppTabs();
         """
 
     def _show_loading(self):

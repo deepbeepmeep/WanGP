@@ -772,19 +772,21 @@ def generate_dropdown_model_list(deps, current_model_type, state=None):
     return dropdown_families, dropdown_models, dropdown_finetunes
 
 
-def change_model_family(deps, state, current_model_family):
+def change_model_family(deps, state, current_model_family, *, target_only=False):
     dropdown_types = get_filtered_dropdown_model_types(deps, get_model_output_filter(deps, state))
     current_family_name = deps.families_infos[current_model_family][1]
     models_families = [deps.get_model_family(t, for_ui=True) for t in dropdown_types]
     dropdown_choices = [(compact_name(current_family_name, deps.get_model_name(model_type)), model_type) for model_type, family in zip(dropdown_types, models_families) if family == current_model_family]
     dropdown_choices = sorted(dropdown_choices, key=lambda c: c[0])
     family_dropdown_types = [choice[1] for choice in dropdown_choices]
-    direct_status_map, aggregated_parent_status_map = get_model_download_status_maps(deps, family_dropdown_types)
     last_model_per_family = state.get("last_model_per_family", {})
     model_type = last_model_per_family.get(current_model_family, "")
-    if len(model_type) == "" or model_type not in [choice[1] for choice in dropdown_choices]:
-        model_type = dropdown_choices[0][1]
+    if model_type not in family_dropdown_types:
+        model_type = next(iter(family_dropdown_types), "")
+    if target_only:
+        return model_type
 
+    direct_status_map, aggregated_parent_status_map = get_model_download_status_maps(deps, family_dropdown_types)
     parent_model_type = deps.get_parent_model_type(model_type)
     dropdown_choices = [(*tup, deps.get_parent_model_type(tup[1])) for tup in dropdown_choices]
     dropdown_base_types_choices, finetunes_dict = create_models_hierarchy(dropdown_choices)
@@ -796,19 +798,23 @@ def change_model_family(deps, state, current_model_family):
     return gr.Dropdown(choices=dropdown_base_types_choices, value=parent_model_type, scale=3 if model_finetunes_visible else 6), gr.Dropdown(choices=dropdown_choices, value=model_type, visible=model_finetunes_visible)
 
 
-def change_model_base_types(deps, state, current_model_family, model_base_type_choice):
+def change_model_base_types(deps, state, current_model_family, model_base_type_choice, *, target_only=False):
     dropdown_types = get_filtered_dropdown_model_types(deps, get_model_output_filter(deps, state))
     current_family_name = deps.families_infos[current_model_family][1]
     dropdown_choices = [(compact_name(current_family_name, deps.get_model_name(model_type)), model_type, model_base_type_choice) for model_type in dropdown_types if deps.get_parent_model_type(model_type) == model_base_type_choice and deps.get_model_family(model_type, for_ui=True) == current_model_family]
     dropdown_choices = sorted(dropdown_choices, key=lambda c: c[0])
-    _, finetunes_dict = create_models_hierarchy(dropdown_choices)
     base_dropdown_types = [choice[1] for choice in dropdown_choices]
+    model_type = state.get("last_model_per_type", {}).get(model_base_type_choice)
+    if model_type not in base_dropdown_types:
+        # The hierarchy puts the base first when it is selectable. A group
+        # containing only finetunes keeps the sorted order of its entries.
+        model_type = model_base_type_choice if model_base_type_choice in base_dropdown_types else next(iter(base_dropdown_types), "")
+    if target_only:
+        return model_type
+
+    _, finetunes_dict = create_models_hierarchy(dropdown_choices)
     direct_status_map, _ = get_model_download_status_maps(deps, base_dropdown_types)
     finetunes_dict[model_base_type_choice] = decorate_finetune_dropdown_choices(deps, finetunes_dict[model_base_type_choice])
     dropdown_choices = decorate_dropdown_choices_with_status(finetunes_dict[model_base_type_choice], direct_status_map)
     model_finetunes_visible = len(dropdown_choices) > 1
-    last_model_per_type = state.get("last_model_per_type", {})
-    model_type = last_model_per_type.get(model_base_type_choice, "")
-    if len(model_type) == "" or model_type not in [choice[1] for choice in dropdown_choices]:
-        model_type = dropdown_choices[0][1]
     return gr.update(scale=3 if model_finetunes_visible else 6), gr.Dropdown(choices=dropdown_choices, value=model_type, visible=model_finetunes_visible)

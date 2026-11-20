@@ -285,6 +285,42 @@ class Director:
         self._noted[production_id] = True
         self.store.get(production_id).apply([{"op": "log", "text": f"Told the showrunner: {text}"}], by="user", record=False)
 
+    def queue(self, production_id: str, text: str) -> None:
+        """A message for after the current task: it waits in the production (a restart keeps it) and starts as its own task once this one ends well.
+        With nothing running, it starts now. A stopped, paused or failed task leaves the queue waiting, for the user to send or remove."""
+        text = str(text or "").strip()
+        if not text:
+            raise ValueError("Write a message for the showrunner.")
+        with self._lock:
+            job = self._jobs.get(production_id)
+        production = self.store.get(production_id)
+        if (job is None or job.done()) and production.snapshot()["director"].get("state") != "paused":
+            self.start(production_id, "message", text)
+            return
+        queued = [*(production.snapshot()["director"].get("queued") or []), text]
+        production.apply([{"op": "director", "fields": {"queued": queued}}, {"op": "log", "text": f"For after this task: {text}"}], by="user", record=False)
+
+    def unqueue(self, production_id: str, index: int) -> None:
+        """Take a waiting message out of the queue (sent now with `send_next`, or dropped)."""
+        production = self.store.get(production_id)
+        queued = list(production.snapshot()["director"].get("queued") or [])
+        if not 0 <= index < len(queued):
+            raise ValueError("No such waiting message.")
+        queued.pop(index)
+        production.apply([{"op": "director", "fields": {"queued": queued}}], by="user", record=False)
+
+    def _next_queued(self, production_id: str) -> None:
+        """The first waiting message, as the next task."""
+        production = self.store.get(production_id)
+        queued = list(production.snapshot()["director"].get("queued") or [])
+        if not queued:
+            return
+        production.apply([{"op": "director", "fields": {"queued": queued[1:]}}], by="system", record=False)
+        try:
+            self.start(production_id, "message", queued[0])
+        except (RuntimeError, ValueError) as error:  # the showrunner became unavailable: the message waits again, at the head of the queue
+            production.apply([{"op": "director", "fields": {"queued": queued}}, {"op": "log", "text": f"Your next message waits: {error}"}], by="system", record=False)
+
     def note_waiting(self, production_id: str) -> bool:
         """The user wrote while a long batch runs: said once, for the toolbox to stop between its shots, as a note otherwise waits until the whole batch has ended."""
         return self._noted.pop(production_id, False)
@@ -400,7 +436,9 @@ class Director:
             if last["text"]:  # its last words stay in the conversation
                 production.apply([{"op": "log", "text": last["text"]}], by="deepy", record=False)
             publish(result.status, last)
-            if result.status in ("done", "error"):
+            if result.status == "done" and production.snapshot()["director"].get("queued"):  # the user's next message, as its own task: the user hears at the end of the queue
+                threading.Thread(target=self._next_queued, args=(production_id,), name=f"Showrunner next message {production_id}", daemon=True).start()
+            elif result.status in ("done", "error"):
                 self._tell_user(production, result.error if result.status == "error" else None)
         except Exception as error:  # the job thread reports to the page instead of dying silently
             production.apply([{"op": "director", "fields": {"state": "idle", "last": {"status": "error", "error": str(error), "time": time.time()}}}], by="system", record=False)

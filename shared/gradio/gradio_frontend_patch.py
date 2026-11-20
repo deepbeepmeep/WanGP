@@ -152,6 +152,8 @@ function wangpSameProp(previous, next) {
 // Object values keep Gradio's handling: components react to their identity.
 function wangpSkipUpdate(node, update, next) {
     const prop = update.prop;
+    // RenderComponent reports its own initial props back to the layout store.
+    if (prop === "elem_classes" && node.wangpStudioRender && update.value === node.wangpStudioRender.classes) return true;
     // A label/visibility-only update clears the mark; a node whose mark is already
     // cleared has nothing to apply (Svelte would not invalidate it either).
     if (prop === "value_is_output" && next === false && node.props.value_is_output === false) return true;
@@ -160,6 +162,42 @@ function wangpSkipUpdate(node, update, next) {
         return (value === null || typeof value !== "object") && Object.is(node.props.value, value);
     }
     return prop !== "loading_status" && next !== null && typeof next === "object" && wangpSameProp(node.props[prop], next);
+}
+"""
+
+# Studio roles are presentation metadata. Keep the plugin's elem_classes in
+# the layout store and compose the two lists only when passing props to Svelte.
+_STUDIO_CLASSES = """
+function wangpStudioClasses(node, props) {
+    const roles = node.wangpStudioMap?.get(node.props.elem_id || `component-${node.id}`);
+    const authored = node.props.elem_classes;
+    const cached = node.wangpStudioRender;
+    if (!roles) {
+        if (cached) {
+            props.elem_classes = authored || [];
+            delete node.wangpStudioRender;
+        }
+        return;
+    }
+    if (!cached || cached.authored !== authored || cached.roles !== roles) {
+        const classes = [].concat(authored || [], roles);
+        node.wangpStudioRender = {authored, roles, classes: [...new Set(classes)]};
+    }
+    props.elem_classes = node.wangpStudioRender.classes;
+}
+"""
+_STUDIO_ROLE_MAP = """
+function wangpStudioRoles(components) {
+    const byId = new Map();
+    for (const component of components) {
+        const roles = component.wangp_studio_classes;
+        if (!roles) continue;
+        const id = component.props.elem_id || `component-${component.id}`;
+        const previous = byId.get(id);
+        // Existing Generate/Edit forms can use the same explicit element ID.
+        byId.set(id, previous ? [...new Set([...previous, ...roles])] : roles);
+    }
+    return byId.size ? byId : null;
 }
 """
 # Gradio's status store replaces an entry on each actual status/progress change.
@@ -314,7 +352,12 @@ _PATCHES = {
         # update, forcing a layout of the whole form between the flush's DOM
         # writes. Only a value change can move the scroll position: a label or
         # visibility update needs no read and performs no scroll.
-        ('tt(()=>{x=v&&v.offsetHeight+v.scrollTop>v.scrollHeight-100})', 'tt(()=>{x=v&&(l.$$.dirty[0]&1)!==0&&v.offsetHeight+v.scrollTop>v.scrollHeight-100})'),
+        # Gradio keeps hidden textboxes mounted. Inspect its visibility classes
+        # without a geometry read, including when a parent column is hidden.
+        ('tt(()=>{x=v&&v.offsetHeight+v.scrollTop>v.scrollHeight-100})',
+         'const wangpCanScroll=()=>J&&v&&!v.closest(".block.hidden,.column.hide,[hidden]");'
+         'tt(()=>{x=(l.$$.dirty[0]&1)!==0&&wangpCanScroll()&&v.offsetHeight+v.scrollTop>v.scrollHeight-100})'),
+        ('x&&J&&!$&&v.scrollTo(0,v.scrollHeight)', 'x&&!$&&wangpCanScroll()&&v.scrollTo(0,v.scrollHeight)'),
     ],
     'AudioPlayer-DG1QBBp6.js': [
         # Svelte invalidates timeRef after this DOM write, re-running the
@@ -480,6 +523,9 @@ _PATCHES = {
         ('if (await R0(), !wn() || (await Q(!0, !1, wn), !wn())) return;', 'if (await R0(), !wn() || (await Q(!1, !1, wn), !wn())) return;'),
     ],
     'Blocks-BMC4HgbM.js': [
+        ('function Mu(l){', _STUDIO_CLASSES + 'function Mu(l){'),
+        ('e=new ku({props:c})', 'wangpStudioClasses(l[0],c),e=new ku({props:c})'),
+        ('Oi(()=>n=!1)),e.$set(u)', 'Oi(()=>n=!1)),("elem_classes"in u||"elem_id"in u)&&wangpStudioClasses(r[0],u),e.$set(u)'),
         ('requestAnimationFrame(()=>{Jt(he,pe,oe)})', 'wangpScheduleUpdate(()=>{Jt(he,pe,oe)})'),
         ('async function No(S,J,K){', 'const wangpMetadataPending=new Map(),wangpMetadataSent=new Map();async function No(S,J,K){'),
         ('const R=pe;if(dn.length>0)', 'const R=pe;' + metadata_events.PREPARE_JS + 'if(dn.length>0)'),
@@ -522,6 +568,10 @@ _PATCHES = {
         ('return l.$$set=w=>{' + _NODE_INPUTS, 'return l.$$set=w=>{' + _NODE_SKIP + _NODE_INPUTS),
     ],
     'index-Do3LSwBC.js': [
+        # Use the same element identity on initial mount and keyed rerenders.
+        ('function Nw(e){', _STUDIO_ROLE_MAP + 'function Nw(e){let wangpStudioMap;'),
+        ('q(),u=k,B(c),c=g,', 'q(),wangpStudioMap=wangpStudioRoles(g),u=k,B(c),c=g,'),
+        ('async function M(k,g,P,v){const f=s[k.id];', 'async function M(k,g,P,v){const f=s[k.id];if(wangpStudioMap)f.wangpStudioMap=wangpStudioMap;'),
         # UI submissions include State slots and private events absent from
         # /info. Their dependency inputs describe the actual positional payload.
         # Named API calls retain the public parameter/keyword validation.

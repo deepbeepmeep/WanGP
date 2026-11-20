@@ -66,9 +66,12 @@
         : {...data, type: 'status', data: data.description};
     }
     generationProgress = data;
-    const sessionStatus = WAC.restorationStatus || loadingSession || WAC.state.status;
+    const sessionStatus = WAC.effectiveStatus(WAC.state.status);
     const loading = sessionStatus?.kind === 'session_loading' && currentTab !== 'chat';
-    if (loading) data = {type: 'status', data: sessionStatus.text, aborting: false};
+    if (loading) {
+      const {text, progress} = sessionStatus;
+      data = progress ? {type: 'progress', data: [[progress.done, progress.total], text, null, 'tokens']} : {type: 'status', data: text};
+    }
     $('#abort-generation').hidden = loading;
     const node = $('#generation-progress'); node.hidden = !data;
     if (!data) return;
@@ -231,7 +234,7 @@
   function consumeChat(payload, notify = true) {
     const wasLoading = WAC.state.status?.kind === 'session_loading';
     WAC.consumePayload(payload);
-    if (loadingSession) WAC.setStatus(loadingSession);
+    if (loadingSession && !WAC.restorationStatus && WAC.state.status?.kind !== 'session_loading') WAC.setStatus(loadingSession);
     if (wasLoading || WAC.state.status?.kind === 'session_loading') progress(generationProgress);
     const messageId = [...WAC.state.order].reverse().find(id => WAC.state.messages[id].role === 'assistant');
     const message = messageId && WAC.messageNode(messageId);

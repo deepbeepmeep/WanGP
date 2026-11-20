@@ -35,6 +35,7 @@ import enum
 import math
 import os
 import sys
+import time
 import traceback
 import weakref
 
@@ -46,6 +47,21 @@ from . import graph_loop, memory_pressure, runtime
 
 MAX_KEYS = 8  # graphs kept per block, the least recently used dropped first: weight locations, CFG branches of other lengths, resolutions
 MOVE_BYTES = 32 << 20  # arguments from this size move into their static buffer when only their caller holds them
+# A graph saves the host time of a block call and the gaps between its kernels on the GPU. When both are small against the block's work,
+# its capture costs more than it saves. The first block calls of a model run eagerly and are timed (the first, which compiles and tunes
+# its kernels, left out). When the host takes about as long to issue a block as the GPU to run it, the host is the bottleneck and the
+# graphs are used. Otherwise one block is captured on trial while the others run eagerly: its first replay is compared with the eager
+# calls of the blocks just before it (same step, same state of the pipeline), and the other blocks capture only when the replay is
+# faster by PROBE_GAIN and, when the application tells how many steps are left (register_horizon), when what a block saves over the
+# steps left pays its measured capture. With a horizon the host-bound passes are put on trial too. Each pass decides apart (identified
+# by the shape of the largest argument of its block calls: the resolutions of a multi-stage pipeline); a verdict holds until the
+# model's graphs are cleared (the model released).
+PROBE = os.environ.get("MMGP_GRAPH_PROBE", "1") != "0"  # comparison switch: 0 captures as before, without the timing
+PROBE_CALLS = 4  # block calls run eagerly before a block goes on trial
+TRIAL_CALLS = 256  # block calls after which a trial graph never replayed (its key changed, e.g. weights moved) gives way to another
+PROBE_NEIGHBOURS = 3  # eager block calls just before the trial's replay that it is compared with
+PROBE_GAIN = 0.03  # relative GPU time that a replay must save over an eager call
+GPU_BOUND_RATIO = 1.25  # GPU time over host time of an eager block call from which the host stays ahead (a graph is put on trial)
 ESCAPE_WARMUP = True  # comparison switch: the result of a key's first call leaves the graph pool (_escape)
 RECAPTURE_HELD = True  # comparison switch: a graph whose replay may overwrite a buffer held since a later capture is captured again
 _SCALARS = (bool, int, float, str, type(None), torch.dtype, torch.device)
@@ -53,6 +69,8 @@ _depth = 0
 _recording = 0
 _key_providers = []
 _gates = []
+_eager_checks = []  # register_eager
+_horizon = None  # register_horizon
 _blocked = None  # why the blocks of the scope running are not graphed (a gate's reason), or None
 _reported = set()
 _capture_setups = []
@@ -286,6 +304,20 @@ def register_key(provider):
     """provider() -> hashable: a global state that changes what blocks compute (attention mode, kernel options), part of every key."""
     if provider not in _key_providers:
         _key_providers.append(provider)
+
+
+def register_horizon(provider):
+    """provider() -> the number of steps still to run after the current one of the loop that calls the blocks (e.g. denoising steps),
+    or None when unknown: the probe of auto graphs captures a pass only when its graphs save more than their capture over these steps."""
+    global _horizon
+    _horizon = provider
+
+
+def register_eager(check):
+    """check() -> True when the current block calls must run eagerly, neither captured nor replayed (e.g. a denoising step that uses a
+    kernel option once): checked at each block call, so keep it cheap."""
+    if check not in _eager_checks:
+        _eager_checks.append(check)
 
 
 def register_gate(gate):
@@ -686,16 +718,28 @@ def _name_phase(error, failed):
         error.args = (f"{failed}: {error.args[0]}", *error.args[1:])
 
 
+def _steps_left():
+    return None if _horizon is None else _horizon()
+
+
+def _pass_of(leaves):
+    """The pass a block call belongs to, for the CUDA graph probe: the shape of its largest tensor argument (its hidden state)."""
+    largest = max((leaf for leaf in leaves if isinstance(leaf, torch.Tensor)), key=torch.Tensor.numel, default=None)
+    return None if largest is None else tuple(largest.shape)
+
+
 class BlockGraphs:
     """CUDA graphs of the tower blocks of one model."""
 
-    def __init__(self, name, weights_key, weight_tensors, extra_inputs, ready, forget=None):
+    def __init__(self, name, weights_key, weight_tensors, extra_inputs, ready, forget=None, probe=False):
         # extra_inputs(block) -> [(list, index)]: tensors read by the block that are neither weights nor arguments, read by its graphs from
         # static buffers (their list items are these buffers during a capture); ready() -> False while the weights may move; forget(): the
         # graphs are gone, so are the records that weights_key keeps on the blocks
         self.name, self.weights_key, self.weight_tensors, self.extra_inputs, self.ready = name, weights_key, weight_tensors, extra_inputs, ready
         self.forget = forget
         self.disabled = None  # the reason why this model's blocks run eagerly (e.g. weights whose kernels cannot be captured), or None
+        self.auto = probe  # graphs only where a block's GPU work is short enough for the host to be the bottleneck (timed, PROBE)
+        self.probes = {}  # pass (shape of the largest tensor argument) -> its timing and verdict, see _probe_state
         self.reported, self.captures = False, 0
         self.checked = set()  # (block, method, signature) whose capture checked the reads
         self.blas = {}  # (block, method, signature) -> whether its eager warmup used cuBLAS (its capture stream then needs the workspaces)
@@ -717,6 +761,7 @@ class BlockGraphs:
         # output buffers that a capture put in the pool, by the order of that capture: the scratch of the graphs captured before may lie
         # over them (the pool shares it in the order of the captures), which their replays overwrite (_held_later)
         self.captures, self.later = 0, {}
+        self.probes = {}
         _blas_workspaces.clear()  # library caches may be released between models too; prepare them again before a new capture
         if self.forget is not None:
             self.forget()
@@ -747,7 +792,8 @@ class BlockGraphs:
     def call(self, module, forward, args, kwargs):
         global _recording, _recorded
         # A block called by a stage being prepared or captured (a stage spanning several blocks) runs inside that stage's graph.
-        if _recording or _blocked is not None or self.disabled is not None or not self.ready():
+        if (_recording or _blocked is not None or self.disabled is not None or not self.ready()
+                or any(check() for check in _eager_checks)):
             return forward(*args, **kwargs)
         method = getattr(forward, "__func__", forward)
         # The same call as the last one of this module on registered state only (an engine calling a stage on its persistent buffers): the
@@ -804,6 +850,33 @@ class BlockGraphs:
         if retained_output or entry is not None and self._held_later(entry):  # its replay would overwrite a buffer the caller holds
             self._evict(key, static_key)
             entry = None
+        trial = None  # the probe whose trial graph this call captures
+        if entry is None and self.auto and PROBE:
+            probe = self._probe_state(leaves)
+            if probe["verdict"] == "eager":
+                return forward(*args, **kwargs)
+            if probe["verdict"] is None:
+                probe["calls"] += 1
+                if probe["calls"] <= PROBE_CALLS:
+                    return self._timed(probe, forward, args, kwargs, first=probe["calls"] == 1)
+                if probe["trial"] is None and probe["calls"] == PROBE_CALLS + 1:
+                    probe["eager"][-1][1].synchronize()
+                    gpu = sum(a.elapsed_time(b) for a, b, _ in probe["eager"]) / len(probe["eager"])
+                    host = sum(seconds for _, _, seconds in probe["eager"]) * 1000 / len(probe["eager"])
+                    probe["eager"] = []
+                    if gpu < GPU_BOUND_RATIO * host and _steps_left() is None:
+                        probe["verdict"] = "graph"
+                        tqdm.write(f"[MMGP] CUDA graphs of the blocks of '{self.name}' used for inputs {probe['shape']}: the host is the "
+                                   f"bottleneck ({host:.1f} ms to issue a block, {gpu:.1f} ms of GPU work).")
+                        probe = None
+                # one block's graph is on trial and the others wait for its verdict, unless that block comes with another key (its
+                # arguments changed from one step to the next) or never comes back: the new key goes on trial
+                if probe is not None:
+                    probe["blocks"].add(id(module))
+                    if (probe["trial"] is not None and probe["trial"][0] != id(module) and probe["calls"] - probe["since"] < TRIAL_CALLS):
+                        return self._timed(probe, forward, args, kwargs)
+                    probe["trial"], probe["since"], probe["eager"] = key, probe["calls"], []
+                    trial = probe
         if entry is None:  # first call of this key: eager (it compiles and tunes the kernels, makes the caches of the weights), then captured
             if lifetimes is None:
                 lifetimes = self._consumable(args, kwargs, leaves, positions, buffers)
@@ -851,12 +924,15 @@ class BlockGraphs:
                         # Returned views keep execution storage alive: capture them with the ordinary owner's version counter.
                         self._capture_lifetimes, self._capture_output_plan = consumed, plan
                         shared = [leaves[index] for index in consumed if allocator.storage_shared(leaves[index])]
+                        capture_began = time.perf_counter()
                         entry = self._leave_shared_chunks(shared) if shared else self._capture_room(module, forward, leaves, spec, signature, extras, extra_signature, out, static_key, buffers, not retained_output, self.blas[blas_key])
                         if entry is None:  # a different allocation trace must not replay the proposed aliases
                             self._capture_output_plan = None
                             entry = self._capture_room(module, forward, leaves, spec, signature, extras, extra_signature, out, static_key, buffers, not retained_output, self.blas[blas_key])
                         if entry:
                             self.entries[key] = entry
+                        if trial is not None:
+                            trial["capture_ms"] = (time.perf_counter() - capture_began) * 1000
                     finally:
                         self.__dict__.pop('_capture_lifetimes', None)
                         self.__dict__.pop('_capture_output_plan', None)
@@ -879,13 +955,56 @@ class BlockGraphs:
             self.memo[(id(module), id(args[0]) if args else None)] = (method, args, tuple(arg.data_ptr() if isinstance(arg, torch.Tensor) else None for arg in args), key[4], key[5], entry,
                                      (copies, borrowed, mutated, result, [torch.cuda.current_stream()]))
             return result
-        result = self._replay(entry, leaves, extras)
+        probe = next((p for p in self.probes.values() if p["trial"] == key and p["verdict"] is None), None) if self.probes else None
+        if probe is not None and len(probe["eager"]) == PROBE_NEIGHBOURS:
+            result = self._timed_replay(probe, entry, leaves, extras)
+        else:
+            result = self._replay(entry, leaves, extras)
         if entry.emptied:
             handoffs = _handoffs(args, kwargs)
             for index in entry.emptied:
                 container = handoffs.get(id(leaves[index]))
                 if container is not None:
                     container.clear()
+        return result
+
+    def _probe_state(self, leaves):
+        # Each pass of a model decides apart (e.g. the two resolutions of a two-stage pipeline): the shape of its largest argument
+        pass_key = _pass_of(leaves)
+        probe = self.probes.get(pass_key)
+        if probe is None:  # block calls counted, the key on trial, the call count when it began, the last eager calls' events, verdict
+            probe = self.probes[pass_key] = {"calls": 0, "trial": None, "since": 0, "eager": [], "verdict": None, "shape": pass_key,
+                                             "blocks": set(), "capture_ms": 0.0}
+        return probe
+
+    def _timed(self, probe, forward, args, kwargs, first=False):
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        began = time.perf_counter()
+        start.record()
+        out = forward(*args, **kwargs)
+        end.record()
+        if not first:  # the first call compiles and tunes
+            probe["eager"] = (probe["eager"] + [(start, end, time.perf_counter() - began)])[-PROBE_NEIGHBOURS:]
+        return out
+
+    def _timed_replay(self, probe, entry, leaves, extras):
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        result = self._replay(entry, leaves, extras)
+        end.record()
+        end.synchronize()
+        eager_ms = sum(a.elapsed_time(b) for a, b, _ in probe["eager"]) / len(probe["eager"])
+        graph_ms = start.elapsed_time(end)
+        # the other blocks capture at their next call and replay at the calls of the steps left: as many per step as the calls of a
+        # block between the trial's capture and this replay (one step: CFG branches with the same key count twice)
+        steps = _steps_left()
+        replays = None if steps is None else steps * (probe["calls"] - probe["since"]) / max(len(probe["blocks"]), 1)
+        pays = replays is None or (eager_ms - graph_ms) * replays > probe["capture_ms"]
+        probe["verdict"], probe["eager"] = "graph" if graph_ms <= (1 - PROBE_GAIN) * eager_ms and pays else "eager", []
+        verdict = "used" if probe["verdict"] == "graph" else "skipped: they would save less than their capture costs"
+        horizon = "" if replays is None else f", {probe['capture_ms']:.0f} ms to capture, {replays:.0f} replays left"
+        tqdm.write(f"[MMGP] CUDA graphs of the blocks of '{self.name}' {verdict} for inputs {probe['shape']} (a block takes "
+                   f"{eager_ms:.1f} ms without its graph, {graph_ms:.1f} ms with it{horizon}).")
         return result
 
     def _move(self, key, leaf):

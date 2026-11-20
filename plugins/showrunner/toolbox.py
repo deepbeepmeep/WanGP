@@ -102,6 +102,7 @@ class ShowrunnerToolbox:
         plugin.register_deepy_action(self.update_shot, uses_gpu=False, summary="Change fields of one shot (refused on locked shots or when the user changed it after your revision).")
         plugin.register_deepy_action(self.add_shots, uses_gpu=False, summary="Insert shots at a position (or at the end).")
         plugin.register_deepy_action(self.remove_shot, uses_gpu=False, summary="Remove a shot that is not locked.")
+        plugin.register_deepy_action(self.split_shot, uses_gpu=False, summary="Cut a shot in two: the second part continues the first and takes over its end picture (one model window holds an end picture).")
         plugin.register_deepy_action(self.move_shots, uses_gpu=False, summary="Move shots before another shot (or to the end).")
         plugin.register_deepy_action(self.cast, paths={"images": "read", "master": "read", "voice": "read"}, uses_gpu=False,
                                      summary="Add, update or remove a cast member: name, role, description, reference images, master image, voice description or sample.")
@@ -185,7 +186,8 @@ class ShowrunnerToolbox:
     def _warnings(self, production, shot_ids=None) -> list[str]:
         doc = production.snapshot()
         remake = [warning for shot in doc["shots"] if shot.get("source_range") and (shot_ids is None or shot["id"] in shot_ids) for warning in remake_groups.prompt_warnings(shot)]
-        return self._hold_lengths(production, doc, shot_ids) + templates.lint(doc, self._catalog(doc), shot_ids) + remake
+        stale = model.stale_shots(doc, [shot["id"] for shot in doc["shots"] if shot_ids is not None and shot["id"] not in shot_ids])
+        return self._hold_lengths(production, doc, shot_ids) + templates.lint(doc, self._catalog(doc), shot_ids) + remake + stale
 
     def _hold_lengths(self, production, doc: dict[str, Any], shot_ids=None) -> list[str]:
         """Every shot plays its whole take, on a length its model really makes, unless the user's settings let Deepy pick any length (`whole_take` says which shots this concerns)."""
@@ -223,7 +225,7 @@ class ShowrunnerToolbox:
             for painted in shot.get("painted_frames") or []:
                 painted.update(path=resolve(painted["path"]), source=resolve(painted["source"]))
             for line in shot.get("dialogue") or []:  # a line's audio while it is in its speaker's current voice
-                if line.get("audio") and line.get("voice") == voices.get((model.speaker(doc, line.get("speaker")) or {}).get("id")):
+                if line.get("audio") and (line.get("own") or line.get("voice") == voices.get((model.speaker(doc, line.get("speaker")) or {}).get("id"))):
                     line["audio"] = resolve(line["audio"])
                 else:
                     line.pop("audio", None), line.pop("duration_s", None)
@@ -266,7 +268,88 @@ class ShowrunnerToolbox:
             settings["audio_prompt_type"] = letters  # the driving audio as a kept soundtrack the picture follows, not a voice reference
         if entry is not None and entry.get("video_edit") and settings.get("video_mask"):
             settings["video_prompt_type"] = settings.get("video_prompt_type", "IVU").replace("U", "A")  # WanGP ignores a mask beside U
+        self._ends(ctx, target, shot, entry, settings)
         return settings
+
+    def _ends(self, ctx, target, shot: dict[str, Any], entry: dict[str, Any] | None, settings: dict[str, Any]) -> None:
+        """How the shot starts and ends, as its model takes them: its pictures (its own, or a frame of another shot's take, cut now) as image_start / image_end
+        with their letters, and one window long enough for an end picture to close the shot (WanGP puts an end picture at the end of the first window).
+        A continued shot's start, the end of the shot before it, is cut when it renders (_continuation)."""
+        doc = target.snapshot()
+        for key, link, word in (("image_start", "start_from", "start"), ("image_end", "end_on", "end")):
+            if shot.get(link):
+                other = model.find(doc["shots"], shot[link]["shot"], "shot")
+                take = model.chosen_take(other)
+                if take is None or take.get("kind") not in ("video", "image"):
+                    raise ValueError(f"{shot['id']} {word}s on a frame of {other['id']}, which has no take yet: render {other['id']} first.")
+                settings[key] = ctx.virtualize(str(self._take_frame(target, other, take, shot[link]["at"])))
+        wanted = "".join(letter for letter, used in (("S", settings.get("image_start")), ("V", shot.get("continues")), ("E", settings.get("image_end"))) if used)
+        if not wanted:
+            return
+        if entry is None or entry["task"] not in templates.VIDEO_TASKS:
+            raise ValueError(f"{shot['id']} starts or ends on a picture or another shot: only a video model does that.")
+        if missing := [letter for letter in wanted if letter not in entry["frames"]]:
+            words = {"S": "start on a picture", "E": "end on a picture", "V": "continue another shot"}
+            able = [item["label"] for item in self._catalog(doc) if item["task"] == entry["task"] and all(letter in item.get("frames", "") for letter in wanted)]
+            raise ValueError(f"{shot['id']}'s model ({entry['label']}) cannot {' or '.join(words[letter] for letter in missing)}" + (f": give it one that can, such as {able[0]}." if able else "."))
+        settings["image_prompt_type"] = wanted
+        if "E" in wanted and (largest := entry["window_max"] or entry["longest_frames"]):
+            first, step, fps = entry["take_frames"]
+            overlap = int(settings.get("sliding_window_overlap") or entry["overlap"]) if shot.get("continues") else 0
+            frames = math.ceil(model.take_length(doc, shot) * fps) + overlap
+            if frames > largest:
+                at = math.floor((largest - overlap) / fps * 10) / 10
+                raise ValueError(f"{shot['id']} ends on its end picture after {model.take_length(doc, shot):g} s, but its model holds one only in a window of {largest / fps:.1f} s: "
+                                 f"split it (split_shot at_s={at:g}), so that its second part continues the first and ends on the picture.")
+            settings["sliding_window_size"] = min(largest, max(int(settings.get("sliding_window_size") or entry["longest_frames"] or 0), first + -(-max(0, frames - first) // step) * step))
+
+    @staticmethod
+    def _take_frame(target, shot: dict[str, Any], take: dict[str, Any], at: str) -> Path:
+        """The first or last frame the edit plays of a shot's take (a picture take is its own frame)."""
+        path = target.resolve(take["path"])
+        if take.get("kind") == "image":
+            return path
+        fps, frames = float(take["fps"]), max(1, round(float(take["duration_s"]) * float(take["fps"])))
+        frame = round(model._trim_of(shot)[0] * fps) if at == "start" else round(model._plays_until(shot) * fps) - 1
+        return media.video_frame(path, min(max(0, frame), frames - 1), target.folder / "media" / "frames")
+
+    def _continuation(self, ctx, target, shot: dict[str, Any], entry: dict[str, Any], settings: dict[str, Any]) -> int:
+        """A continued shot's start: the last frames the edit plays of the shot before it (its overlap, with their sound), as the video WanGP continues,
+        asked for the shot's own frames after them. Returns how many frames of the output are that start, which the take leaves out."""
+        doc = target.snapshot()
+        before = model.previous_shot(doc, shot)
+        if before is None:
+            raise ValueError(f"{shot['id']} continues the shot before it, but it opens the edit.")
+        take = model.chosen_take(before)
+        if take is None or take.get("kind") != "video":
+            raise ValueError(f"{shot['id']} continues {before['id']}, which has no video take yet: render {before['id']} first.")
+        fps = entry["take_frames"][2]
+        if abs(float(take["fps"]) - fps) > 0.01:
+            raise ValueError(f"{shot['id']} continues {before['id']}, made at {float(take['fps']):g} fps: give {shot['id']} the model of {before['id']}, or one that makes {float(take['fps']):g} fps.")
+        end = min(round(model._plays_until(before) * fps), round(float(take["duration_s"]) * fps))
+        shared = int(settings.get("sliding_window_overlap") or entry["overlap"])  # on its model's grid: the window then holds exactly the frames asked for after it
+        if (played := end - round(model._trim_of(before)[0] * fps)) < shared:  # the shared frames are frames the edit shows of it
+            raise ValueError(f"{shot['id']} continues {before['id']}, which plays {played} frames: fewer than the {shared} its model shares with the video it continues. "
+                             f"Make {before['id']} longer, or let {shot['id']} start on its own.")
+        clip = media.video_window(target.resolve(take["path"]), end - shared, shared, fps, target.folder / "media" / "continued")
+        if guide := settings.get("audio_guide"):  # WanGP reads the driving audio from the first shared frame: the shared frames' sound comes first, or the lips run early
+            folder, lead, part, song = target.folder / "media" / "slices", shared / fps, shot.get("audio_slice"), target.resolve(doc["brief"].get("song"))
+            if part and song is not None and ctx.resolve(guide) == media.audio_slice(song, float(part[0]), float(part[1]), folder) and float(part[0]) >= lead:
+                guide = media.audio_slice(song, float(part[0]) - lead, float(part[1]), folder)  # the song under the shared frames: on the song, the shot before it ends where this slice starts
+            else:
+                guide = media.prefixed_audio(clip, ctx.resolve(guide), shared, fps, folder)  # a line, the user's recording: after the sound the shot before it ends on
+            settings["audio_guide"] = ctx.virtualize(str(guide))
+        first, step, _ = entry["take_frames"]  # one frame of the length is shared with the source; WanGP moves a length to its model's grid, which could make the take shorter than planned
+        length = math.ceil(model.take_length(doc, shot) * fps) + 1
+        settings.update(video_source=ctx.virtualize(str(clip)), sliding_window_overlap=shared, video_length=max(first, first + -(-max(0, length - first) // step) * step))
+        return shared
+
+    @staticmethod
+    def _new_frames(target, path: str | Path, shared: int) -> Path:
+        """A continuation's own frames, with their sound: WanGP's output without the `shared` frames of the video it continued."""
+        facts = media.probe(path)
+        frames = round(float(facts["duration_s"]) * float(facts["fps"]))
+        return media.video_window(path, shared, frames - shared, float(facts["fps"]), target.folder / "media" / "parts")
 
     @staticmethod
     def _driving_lines(doc: dict[str, Any], shot: dict[str, Any], entry: dict[str, Any] | None, spoken: bool = True) -> list[dict[str, Any]]:
@@ -366,7 +449,7 @@ class ShowrunnerToolbox:
                 result.update(user_prompt_rules={name: text}, user_prompt_rules_note=templates.PROMPT_RULES_NOTE)
             return result
         if section == "timeline":  # before assembling: what assemble would warn about, while it costs no version
-            warnings = self._music_warnings(target, target.snapshot(), model.cut_length(doc)) + model.cut_lines(doc) + model.singing_without_song(doc) + model.song_drift(doc) + model.song_words(doc) + model.missing_ends(doc) + self._length_warning(doc)
+            warnings = self._music_warnings(target, target.snapshot(), model.cut_length(doc)) + model.cut_lines(doc) + model.singing_without_song(doc) + model.song_drift(doc) + model.song_words(doc) + model.missing_ends(doc) + self._length_warning(doc) + model.stale_shots(doc)
             return {"revision": doc["revision"], "total_s": model.cut_length(doc), "timeline": model.timeline(doc), **({"warnings": warnings} if warnings else {})}
         if section == "full":
             size = len(json.dumps(doc, default=str))
@@ -511,14 +594,16 @@ class ShowrunnerToolbox:
     def update_shot(self, ctx, production: str, shot: str, fields: dict[str, Any], revision: int | None = None) -> dict[str, Any]:
         """fields: any of title, section, intent, camera, cast, dialogue, duration_s, audio_slice, generation (settings are merged; null removes one), status, included, chosen_take,
         trim [start_s, end_s], speed (0.25 to 4, how fast the take plays in the edit; trim stays in seconds of the take), sound (false: the take plays silent),
-        transition {type: cut|crossfade|fade_black|fade_white, duration_s}, notes. revision: the one you last read, which guards
+        transition {type: cut|crossfade|fade_black|fade_white, duration_s}, notes, continues (true: it goes on from the end of the shot before it in the edit, the
+        overlap frames shared and left out of its take; no start picture then), start_from / end_on ({shot, at: start|end}: it starts or ends on that frame of
+        another shot's take, cut when it renders; null removes it). Its own start or end picture: generation settings image_start / image_end. revision: the one you last read, which guards
         against the user's edits since then, never against your own or the system's writes: one revision serves a batch of calls. Changed settings or cast are validated again."""
         target = self._production(ctx, production)
         self._only_the_fix(ctx, target, [shot])
         if isinstance(fields.get("generation"), dict) and isinstance(fields["generation"].get("settings"), dict):
             fields = {**fields, "generation": {**fields["generation"], "settings": self._portable(ctx, target, fields["generation"]["settings"])}}
         result = self._apply(target, [{"op": "update_shot", "shot": shot, "fields": fields, "revision": revision}], revision)
-        problems, renders = self._validate(ctx, target, [shot]) if {"generation", "cast"} & set(fields) else ([], {})
+        problems, renders = self._validate(ctx, target, [shot]) if {"generation", "cast", "continues", "start_from", "end_on"} & set(fields) else ([], {})
         warnings = self._warnings(target, [shot]) + problems
         return {"revision": target.doc["revision"], **result[0], **({"warnings": warnings} if warnings else {}), **({"renders": renders} if renders else {})}
 
@@ -533,6 +618,19 @@ class ShowrunnerToolbox:
         problems, renders = self._validate(ctx, target, result[0]["shots"])
         warnings = self._warnings(target, result[0]["shots"]) + problems + ([] if target.snapshot()["deliverables"] else self._script_warnings(ctx, target))  # a shot added to a finished film is about that shot
         return {"revision": target.doc["revision"], **result[0], **({"warnings": warnings} if warnings else {}), **({"renders": renders} if renders else {}), **self._prompt_guides(target, result[0]["shots"])}
+
+    def split_shot(self, ctx, production: str, shot: str, at_s: float, revision: int | None = None) -> dict[str, Any]:
+        """Cut a shot in two at at_s seconds of its plan. The new second part continues the first (continues: true) and takes over its end picture or
+        frame and its part of the song; the first keeps its start, dialogue and takes. A shot that ends on a picture after more than one model window
+        is rendered this way: render the first part, then the second."""
+        target = self._production(ctx, production)
+        self._only_the_fix(ctx, target, [shot])
+        result = self._apply(target, [{"op": "split_shot", "shot": shot, "at_s": at_s, "revision": revision}], revision)
+        if (fixing := self._fixing(ctx, target)) is not None:  # the second part belongs to the fix of the first
+            target.apply([{"op": "director", "fields": {"shots": [*fixing, *result[0]["shots"]]}}], by="system", record=False)
+        problems, renders = self._validate(ctx, target, [shot, *result[0]["shots"]])
+        warnings = self._warnings(target, [shot, *result[0]["shots"]]) + problems
+        return {"revision": target.doc["revision"], **result[0], **({"warnings": warnings} if warnings else {}), **({"renders": renders} if renders else {})}
 
     def remove_shot(self, ctx, production: str, shot: str, revision: int | None = None) -> dict[str, Any]:
         target = self._production(ctx, production)
@@ -611,7 +709,8 @@ class ShowrunnerToolbox:
                 target.apply([{"op": "log", "text": f"Render of {shot_id} failed: {render['error']}"}], by="system", record=False)
             renders.append(render)
         ctx.progress(done=len(renders), total=len(shots), text="Rendered", force=True)
-        return {"revision": target.doc["revision"], "renders": renders}
+        stale = model.stale_shots(target.snapshot(), shots)  # shots made from these, which their new takes no longer join
+        return {"revision": target.doc["revision"], "renders": renders, **({"now_stale": stale} if stale else {})}
 
     def render_shot(self, ctx, target, shot_id: str, new_seed: bool | int = False, index: int = 0, total: int = 1, by: str = "deepy", final: bool = False,
                     requested: list[str] | tuple[str, ...] = ()) -> dict[str, Any]:
@@ -675,6 +774,13 @@ class ShowrunnerToolbox:
             settings.update(templates.planned_length(target.snapshot(), shot, entry))
         if not str(settings.get("prompt") or "").strip():
             return {"shot": shot_id, "error": "the shot's settings have no prompt"}
+        shared = 0
+        if shot.get("continues"):
+            try:
+                shared = self._continuation(ctx, target, shot, entry, settings)
+            except ValueError as error:
+                return {"shot": shot_id, "error": str(error)}
+        links = model.frame_links(target.snapshot(), shot)  # what it is made from, to tell when one of them changes
         if new_seed:
             settings["seed"] = -1 if new_seed is True else int(new_seed)
         ctx.progress(done=index, total=total, text=f"Rendering {shot_id} ({index + 1}/{total})", force=True)
@@ -686,7 +792,7 @@ class ShowrunnerToolbox:
         except Exception as error:
             target.apply([{"op": "update_shot", "shot": shot_id, "fields": {"status": "failed"}}], by=by, record=False)
             return {"shot": shot_id, "error": str(error)}
-        entries = media_entries(response)
+        entries, short = media_entries(response), ""
         if not entries:
             target.apply([{"op": "update_shot", "shot": shot_id, "fields": {"status": "failed"}}], by=by, record=False)
             result = (response.get("result") or {}) if isinstance(response, dict) else {}
@@ -696,14 +802,21 @@ class ShowrunnerToolbox:
         try:
             path = ctx.resolve(entry["path"])  # tool results name files as the caller does
             used = entry.get("settings") if isinstance(entry.get("settings"), dict) else settings
-            take = self.showrunner.add_take(target.id, shot_id, path, by=by, settings=self._real_paths(ctx, used), media_id=entry.get("media_id") if by == "deepy" else None, gpu_s=generated, base_loras=base_loras, tier=tier)
+            if shared:  # WanGP returns the shot it continued followed by the new frames: the take is the new frames, as the edit plays them
+                path = str(self._new_frames(target, path, shared))
+                facts, planned = media.probe(path), model.take_length(target.snapshot(), shot)
+                if (facts["duration_s"] or 0.0) < planned - 1.5 / float(facts["fps"]):  # its model's frame grid gave fewer frames than asked: said, not hidden
+                    short = f"{shot_id} came out {facts['duration_s']:.2f} s long without the frames it shares with the shot before it, shorter than its {planned:g} s: its end is cut short in the edit."
+            take = self.showrunner.add_take(target.id, shot_id, path, by=by, settings=self._real_paths(ctx, used), media_id=entry.get("media_id") if by == "deepy" and not shared else None, gpu_s=generated,
+                                            base_loras=base_loras, tier=tier, links=links)
         except Exception as error:  # the media exists: report it with the shot and render the next shots
             target.apply([{"op": "update_shot", "shot": shot_id, "fields": {"status": "failed"}}], by=by, record=False)
             return {"shot": shot_id, "media_id": entry.get("media_id"), "error": f"the take could not be recorded ({error}): record it with record_take"}
         target.apply([{"op": "budget", "gpu_seconds": time.time() - started}], by="system", record=False)
         heard = self.showrunner.hear_take(target, shot_id, take["take"], listening=lambda: ctx.progress(done=index, total=total, text=f"Listening to {shot_id} ({index + 1}/{total})", force=True))
         measured = {key: value for key, value in self.check_take(ctx, target.id, shot_id, take["take"]).items() if key in ("ok", "cut_faults", "edge_bands")} if shot.get("source_range") else None  # a remake's take against its source
-        return {"shot": shot_id, "take": take["take"], "media_id": entry.get("media_id"), "path": ctx.virtualize(path), "duration_s": take.get("duration_s"), "size": f"{take.get('width')}x{take.get('height')}", **({"heard": heard} if heard else {}), **({"check": measured} if measured else {}),
+        # a continuation's media id would be WanGP's whole output, the shot it continued included: it is inspected by its path
+        return {"shot": shot_id, "take": take["take"], "media_id": None if shared else entry.get("media_id"), "path": ctx.virtualize(path), "duration_s": take.get("duration_s"), "size": f"{take.get('width')}x{take.get('height')}", **({"warning": short} if short else {}), **({"heard": heard} if heard else {}), **({"check": measured} if measured else {}),
                         **{key: response[key] for key in ("cut_times_seconds", "canvas") if isinstance(response, dict) and key in response}}
 
     def _keep_source(self, ctx, target, shot: dict[str, Any], doc: dict[str, Any], by: str) -> dict[str, Any]:
@@ -853,7 +966,7 @@ class ShowrunnerToolbox:
                 continue
             if made:
                 voices.append({"cast": member["id"], "name": member["name"], "voice": ctx.virtualize(str(target.resolve(voice)))})
-            if line.get("audio") and line.get("voice") == voice and not new_take and target.resolve(line["audio"]).is_file():
+            if line.get("audio") and (line.get("own") or line.get("voice") == voice and not new_take) and target.resolve(line["audio"]).is_file():  # the user's recording is never replaced
                 spoken.append({"shot": shot, "line": index, "speaker": member["name"], "path": ctx.virtualize(str(target.resolve(line["audio"]))),
                                "duration_s": line.get("duration_s"), "kept": True})
                 continue
@@ -1033,8 +1146,10 @@ class ShowrunnerToolbox:
         return [f"The music stops at {max(ends):.1f} s and the video runs to {duration_s:.1f} s. Make it as long as the cut (a longer score or song, a track for the tail) or tell the user plainly."]
 
     def edit(self, ctx, production: str, audio_mode: Literal["song", "clips", "mix"] | None = None, song: str | None = None, song_start_s: float | None = None,
-             tracks: list[dict[str, Any]] | None = None, subtitles: list[dict[str, Any]] | None = None, overlays: list[dict[str, Any]] | None = None, level_voices: bool | None = None, voices_from_model: bool | None = None) -> dict[str, Any]:
-        """Set the edit's sound, subtitles and text. voices_from_model: only when the user asks in words, switches the brief's Voices: true, the video model says the lines with nothing recorded first; false, they are recorded first again. level_voices: when the user asks, brings the shots whose lines their video model says to one level in the export (with the brief's Voices on the video model). audio_mode: song (the production's song alone), clips (each take's own sound: dialogue, effects) or
+             tracks: list[dict[str, Any]] | None = None, subtitles: list[dict[str, Any]] | None = None, overlays: list[dict[str, Any]] | None = None, level_voices: bool | None = None, voices_from_model: bool | None = None,
+             song_subtitles: bool | None = None) -> dict[str, Any]:
+        """Set the edit's sound, subtitles and text. song_subtitles: only when the user asks, the lyrics of a cut that plays the song as a subtitle track (off by default: a music
+        video carries no subtitles). voices_from_model: only when the user asks in words, switches the brief's Voices: true, the video model says the lines with nothing recorded first; false, they are recorded first again. level_voices: when the user asks, brings the shots whose lines their video model says to one level in the export (with the brief's Voices on the video model). audio_mode: song (the production's song alone), clips (each take's own sound: dialogue, effects) or
         mix (both). song: a song you made (media id or path) becomes the production's song, analysed for bars and sections. tracks:
         [{media, start_s, gain_db, in_s, out_s, fade_in_s, fade_out_s}] narration, voice-over or score laid over the edit, replacing the current tracks (a score under speech sits
         around -12 dB; in_s and out_s: the part of the file it plays; keep what `production` lists for tracks you leave as they are); [{shot, line, gain_db}] lays a line spoken with `speak` from its shot's start (start_s to place it elsewhere). subtitles: [{media, language}] SRT files, kept as removable tracks. overlays: text or pictures over the cut, replacing
@@ -1049,7 +1164,7 @@ class ShowrunnerToolbox:
                 raise ValueError("A music video's words follow its song and an illustrated story's its narrator, so the video model cannot say them here: tell the user.")
             if templates.voicing_template(target.snapshot(), self._catalog(target.snapshot()), False) is None:
                 raise ValueError("None of the user's video templates can say lines, so they stay recorded first: tell the user.")
-        fields = {key: value for key, value in {"audio_mode": audio_mode, "song_start_s": song_start_s, "level_voices": level_voices}.items() if value is not None}
+        fields = {key: value for key, value in {"audio_mode": audio_mode, "song_start_s": song_start_s, "level_voices": level_voices, "song_subtitles": song_subtitles}.items() if value is not None}
         if tracks is not None:
             fields["audio_tracks"] = [self._track(ctx, target, track) for track in tracks]
         if subtitles is not None:
@@ -1242,7 +1357,7 @@ class ShowrunnerToolbox:
             cues = media.subtitle_cues(path)
             subtitles.update(count=len(cues), cues=[f"{start:.2f}-{end:.2f} {text}" for start, end, text in cues[:40]], **({"cues_listed": 40} if len(cues) > 40 else {}))
         delivered = assemble.delivery(path)
-        warnings = self._music_warnings(target, doc, result.get("duration_s")) + model.cut_lines(doc) + model.singing_without_song(doc) + model.song_drift(doc) + model.song_words(doc) + model.missing_ends(doc) + self._length_warning(doc)
+        warnings = self._music_warnings(target, doc, result.get("duration_s")) + model.cut_lines(doc) + model.singing_without_song(doc) + model.song_drift(doc) + model.song_words(doc) + model.missing_ends(doc) + self._length_warning(doc) + model.stale_shots(doc)
         cues = media.subtitle_cues(path)
         if cues and result.get("duration_s") and cues[-1][1] > result["duration_s"] - 0.7:
             warnings.append(f'The last words end at {cues[-1][1]:.2f} s and the video at {result["duration_s"]:.2f} s: it stops on them. Hold the end for a moment (a longer last shot, or a card after them).')

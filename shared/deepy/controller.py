@@ -1223,7 +1223,7 @@ class DeepyController:
             # Its cards are back; its context comes back when the user writes to it, unless an interrupted action has to go on.
             return {"event": assistant_chat.build_replay_batch(session, loaded["replay_commands"]), "prefill": session.pending_action_replay is not None}
 
-    def prefill_restored_session_context(self, state, *, replay_pending: bool = False):
+    def prefill_restored_session_context(self, state, *, replay_pending: bool = False, on_status: Callable[[str], None] | None = None):
         session = get_or_create_assistant_session(state)
         with session.turn_lock:
             prefill_tokens = 0
@@ -1234,7 +1234,7 @@ class DeepyController:
                 thinking_enabled = True if session.pending_action_replay is None else bool(session.pending_action_replay["thinking_enabled"])
                 assistant = self._build_local_engine(state, session, tools, send_cmd, system_prompt, custom_system_prompt_key, thinking_enabled=thinking_enabled)
                 with deepy_log_scope(start_if_needed=self._sync_debug_enabled()):
-                    prefill_tokens = assistant.prefill_restored_context()
+                    prefill_tokens = assistant.prefill_restored_context(on_status=on_status)
             else:
                 session.pending_replay_reason = ""
             session_store.schedule_autosave(session)

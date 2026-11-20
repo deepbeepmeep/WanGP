@@ -110,4 +110,5 @@ def cuda_inference(x, *, dtypes=(torch.bfloat16,), approximate=False, capability
 
 # A preferred family can change while the resolved INT8 backend stays the same.
 # Include the preference itself, including for standalone managed components.
-cuda_graphs.register_key(lambda: (kernel_policy.precision, kernel_policy.families))
+cuda_graphs.register_key(lambda: (kernel_policy.precision, kernel_policy.families, kernel_policy.sage2_execution_quality()))
+cuda_graphs.register_eager(kernel_policy.first_step_precise)  # one use: no graph for that step

@@ -4,8 +4,11 @@ from __future__ import annotations
 import html
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass
 from pathlib import Path
+from queue import SimpleQueue
 from typing import Any, Callable
 
 import gradio as gr
@@ -620,7 +623,13 @@ def bind_deepy_chat_ui(
 
         session = get_or_create_assistant_session(state_value)
         try:
-            prefill_tokens, replay_stream = handlers.prefill_restored_session_context(state_value, replay_pending=True)
+            updates = SimpleQueue()
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="Deepy session prefill") as worker:
+                result = worker.submit(copy_context().run, handlers.prefill_restored_session_context, state_value, replay_pending=True, on_status=updates.put)
+                result.add_done_callback(lambda _: updates.put(None))
+                for event in iter(updates.get, None):
+                    yield event, gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+                prefill_tokens, replay_stream = result.result()
         except Exception as exc:
             reason = str(exc).strip() or exc.__class__.__name__
             warning = f"Deepy session could not be restored: {reason}"

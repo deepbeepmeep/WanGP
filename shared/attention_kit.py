@@ -30,7 +30,7 @@ import torch
 from tqdm import tqdm
 from mmgp import allocator, cuda_graphs, offload, runtime
 
-from shared.attention import pay_attention, sage_staged, sage_attention_mask, launch_waves
+from shared.attention import pay_attention, sage_staged, sage_attention_mask, launch_waves, fp4_geometry, dense_staged, kv_first_staged, owned_query_staged
 from shared.kernels import dispatch, ops
 from shared.llm_engines.lmgp.layers import kv_formats
 
@@ -82,6 +82,13 @@ def configure(mode):
     chunker, head_split = mode, 0 if mode == "off" else 3
 
 
+def reset_chunking_measurements():
+    """A new attention implementation needs its own allocation peaks and warmup partitions."""
+    _Room.ceiling, _Room.pending, _Room.own, _Room.chosen = {}, {}, {}, {}
+    _Room.last_end = None
+    _needed.clear()
+
+
 AUTO_MARGIN = (512 << 20, 0.10)  # Auto leaves at least this much of the card free (bytes, share): the CUDA context, workspaces, fragmentation
 _needed = {}  # Auto: kind of call -> whether it is chunked (decided at its first call, kept: a CUDA graph records that decision)
 
@@ -108,9 +115,13 @@ def kv_first_attention(qkv_list, force_attention=None):
     """pay_attention(qkv_list, force_attention=force_attention, recycle_q=True) when nothing else holds k and v: with SageAttention 2
     (sm86/sm89/sm120) or SageAttention, k is quantized and released before v is copied for its quantization, a peak lower by half of k;
     same results."""
-    staged = sage_staged(qkv_list[0].device, qkv_list[0].shape[-1], force_attention)
+    q, k = qkv_list[:2]
+    use_fp4 = fp4_geometry(q.device, q.dtype, q.shape[0], q.shape[1], k.shape[1], q.shape[2], k.shape[2], q.shape[3], force_attention)
+    del q, k
+    staged = None if use_fp4 else sage_staged(qkv_list[0].device, qkv_list[0].shape[-1], force_attention)
     if staged is None:
         return pay_attention(qkv_list, force_attention=force_attention, recycle_q=True)
+    staged = kv_first_staged(staged, qkv_list, force_attention)
     core, settings = staged
     query, key_list, value_list = qkv_list[0], qkv_list[1:2], qkv_list[2:3]
     qkv_list.clear()
@@ -663,20 +674,22 @@ def cross_qkv_attention(x_list, context_list, q_proj, k_proj, v_proj, heads, hea
 
 
 @torch.compiler.disable()
-def _token_qk(projections, linear_inputs, lengths, batch, heads, kv_heads, head_dim, dtype, device, norm_rope, staged, cross, kept, statistics, any_heads=False):
+def _token_qk(projections, linear_inputs, lengths, batch, heads, kv_heads, head_dim, dtype, device, norm_rope, staged, cross, kept, statistics, any_heads=False, *, split_dense=None):
     """The chunk pass of norm_rows: k then q of all heads projected by chunks of tokens of each batch item (TOKEN_QK_BYTES, a multiple of
     128 rows: the quantizers' blocks). Returns, for each of the `kept` groups ((q heads, kv heads) ranges), its q and k normalized and
     rotated by norm_rope (group.rows), quantized for the staged core, chunks joined: [((q_int8, q_scale), (k_int8, k_scale)), ...] (k's
     smoothing mean is the group's first chunk's, per batch item); with `statistics`, the per token mean squares of q and of k over all
     heads, (batch, tokens, 1) FP32, for the groups that project theirs again (HeadGroup.mean_squares), else None. any_heads (norm_rows
     "heads"): with the statistics, only the kept heads are normalized (by them, as the groups projected again are), rotated and
-    quantized; otherwise all heads, by the model's own norm."""
+    quantized; otherwise all heads, by the model's own norm. For a split dense core the same retention budget holds BF16 K alone.
+    Pack it in its final basis before the Q statistics pass; the caller then projects and packs Q one head group at a time."""
     core, settings = staged
+    keep_key_only = split_dense is not None
     result, squares_of = {}, {}
     for which, total in ((1, kv_heads), (0, heads)):
         index = 1 if cross and which else 0
         module, prepared, length = projections[index][which], linear_inputs[index], lengths[index]
-        ranges = [group[0] if which == 0 else group[1] for group in kept]
+        ranges = [] if keep_key_only and which == 0 else [group[which] for group in kept]
         chunk = max(128, TOKEN_QK_BYTES // (total * head_dim * dtype.itemsize) // 128 * 128)
         wholes, scales = [None] * len(ranges), [[] for _ in ranges]
         squares = torch.empty((batch, length, 1), dtype=torch.float32, device=device) if statistics else None
@@ -699,10 +712,15 @@ def _token_qk(projections, linear_inputs, lengths, batch, heads, kv_heads, head_
                     group = HeadGroup(range(stop_head * heads // total) if which else range(stop_head), range(stop_head) if which else range(stop_head * kv_heads // total),
                                       (sub_squares, sub_squares), range(start, stop))
                     norm_rope(part, None, group) if which == 0 else norm_rope(None, part, group)
-                elif ranges:  # all heads quantized at once (per head: the kept groups' ranges are those of the whole), then each kept group's
+                elif ranges:  # apply the model's norm to all heads before taking the retained groups
                     group = HeadGroup(range(heads), range(kv_heads), None, range(start, stop))
                     norm_rope(part, None, group) if which == 0 else norm_rope(None, part, group)
-                if ranges:
+                if ranges and keep_key_only:
+                    for number, head_range in enumerate(ranges):
+                        if wholes[number] is None:
+                            wholes[number] = part.new_empty((batch, length, len(head_range), head_dim))
+                        wholes[number][item, start:stop].copy_(part[0, :, head_range.start:head_range.stop])
+                elif ranges:
                     if which == 0:
                         quantized, scale = core.staged_quantize_q(part, settings)
                     else:
@@ -715,13 +733,18 @@ def _token_qk(projections, linear_inputs, lengths, batch, heads, kv_heads, head_
                         item_scales[number].append(scale[:, head_range.start:head_range.stop])
                     del quantized, scale
                 del part
-            for number in range(len(ranges)):
-                scales[number].append(torch.cat(item_scales[number], dim=-1))
+            if not keep_key_only:
+                for group_scales, chunk_scales in zip(scales, item_scales):
+                    group_scales.append(torch.cat(chunk_scales, dim=-1))
             del item_scales
-        result[which] = [(whole, torch.cat(group_scales)) for whole, group_scales in zip(wholes, scales)]
+        if not keep_key_only:
+            result[which] = [(whole, torch.cat(group_scales)) for whole, group_scales in zip(wholes, scales)]
+        elif which == 1:
+            result[1] = split_dense[0].pack_split_keys(wholes, split_dense[1])
         squares_of[which] = squares
         del wholes, scales, squares
-    return list(zip(result[0], result[1])), ((squares_of[0], squares_of[1]) if statistics else None)
+    packed_groups = result[1] if keep_key_only else list(zip(result[0], result[1]))
+    return packed_groups, (squares_of[0], squares_of[1]) if statistics else None
 
 
 class LoopRows:
@@ -898,7 +921,7 @@ def joint_qkv_attention(streams, *args, **kwargs):
 def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, norm_spans_heads=False, split_heads=True, kv_prefix=None,
                         attention_mask=None, force_attention=None, attention_fn=None, norm_stats=None, _cross=False, norm_v=None, softmax_scale=None,
                         head_split_level=None, fused_quant=None, kv_window=None, out_proj=None, residual=None, gate=None, segments=None, norm_rows=False, head_gate=None,
-                        add_after=False, _room=None):
+                        add_after=False, _room=None, sample_query=None):
     """Attention of the q/k/v projections of several streams joined along the tokens in their order: streams is a list of
     (x_list, (q_proj, k_proj, v_proj)), each x handed off in its list, of shape (batch, tokens, features) or (tokens, features), or
     an mmgp offload.RowSource of shape (batch, tokens, features): an input only its projections read, prepared by ranges of tokens
@@ -909,6 +932,8 @@ def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, nor
     gets group.mean_squares to scale its rows; otherwise the tensors hold all heads. split_heads=False keeps all heads together.
     attention_fn: optional model-specific sparse attention accepting the disposable qkv_list and HeadGroup. It owns attention
     computation; projection preparation, head splitting and normalization still use this kit. Staged Sage quantization is disabled.
+    sample_query: optional (projected_rows, token_ids, core) callback reproducing the fused query norm and RoPE at the requested positions.
+    A V-first core can then select a key format from the same prepared projection before it packs the full keys.
     kv_prefix: (key, value) of shape (batch, prefix tokens, kv_heads, head_dim), already normalized and rotated, put before the
     projected keys and values; or a cached prefix (cache_prefix, q8_prefix: KVPrefix), q8 / q4_0 dequantized into the joined keys and values,
     native attended in a pass of its own (a native prefix needs the staged core it was made for: no mask, no attention_fn), a prefix
@@ -970,6 +995,15 @@ def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, nor
         split_heads = chunking_needed(device, whole, ("attention", heads, kv_heads, head_dim, batch, tuple(lengths), dtype, _cross))
     sizes = head_partition(kv_heads, split_tokens, head_split_level) if split_heads else [kv_heads]  # the sizes follow the launch probe below, once the inputs are prepared
     groups = len(sizes)
+    if (staged is not None and groups == 1 and kv_prefix is None and kv_window is None and attention_mask is None
+            and heads == kv_heads and fp4_geometry(device, dtype, batch, tokens, lengths[1] if _cross else tokens,
+                                                    heads, kv_heads, head_dim, force_attention)):
+        # The FP4 kernel reads the long side directly after norm/RoPE. Account
+        # for the unquantized projections before taking that path under Auto.
+        direct_bytes = kv_heads * _head_bytes(_cross, batch, lengths, tokens, heads, kv_heads, head_dim, dtype, None)
+        direct_bytes += batch * tokens * heads * head_dim * dtype.itemsize
+        if chunker != "auto" or not chunking_needed(device, direct_bytes, ("nvfp4", heads, batch, tuple(lengths), dtype, _cross)):
+            staged = None
     if callable(attention_mask) and staged is None:
         raise ValueError("A per-group attention mask (a callable) needs a staged attention core")
     cached = isinstance(kv_prefix, KVPrefix)
@@ -1017,7 +1051,9 @@ def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, nor
             _unsplit_notice = True
         groups, sizes, out_columns = 1, [kv_heads], None
     shape, token_keep = None, 0
-    token_capable = (norm_rows and norm_spans_heads and staged is not None and staged[1].get("padded_dim") is None and attention_fn is None and kv_prefix is None
+    # The token cache joins NHD packed tensors and batch-major scales. Sage1 uses flattened varlen rows and offsets.
+    batch_packed = staged is not None and "qk_quant_gran" in staged[1] and staged[1].get("padded_dim") is None
+    token_capable = (norm_rows and norm_spans_heads and batch_packed and attention_fn is None and kv_prefix is None
                      and kv_window is None and not callable(attention_mask) and not extra and not shared_kv and norm_v is None and (len(lengths) == 1 or _cross)
                      and TOKEN_QK_POLICY != "none" and all(prepared is not None and offload.linear_input_rows(prepared, 0, 1) is not None for prepared in linear_inputs))
     if groups > 1 and WAVE_SPLIT and attention_fn is None and not callable(attention_mask) and device.type == "cuda":  # the launch probe, asked only where the heads are split
@@ -1129,9 +1165,26 @@ def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, nor
         kv_ranges.append(range(kv_ranges[-1].stop if kv_ranges else 0, (kv_ranges[-1].stop if kv_ranges else 0) + size))
     q_ranges = [range(head_range.start * ratio, head_range.stop * ratio) for head_range in kv_ranges]
     mean_squares, kept = None, []
+    split_dense = None
+    if (not _cross and kv_prefix is None and kv_window is None and attention_mask is None
+            and attention_fn is None and softmax_scale is None):
+        candidate = dense_staged(staged, device, dtype, batch, tokens, max(sizes) * ratio, max(sizes), head_dim, force_attention,
+                                 recycle_query=groups == 1 or out_columns is not None or token_capable,
+                                 split_keys=groups > 1 and token_capable)
+        if candidate is not None and "recycle_value" in candidate[1]:
+            # Prepared projections, joined streams and cloned shared K/V all produce disposable V rows.
+            candidate[1]["recycle_value"] = shared_kv or len(lengths) > 1 or all(v is not None for v in linear_inputs)
+        if groups == 1 or not token_capable:
+            staged = candidate
+        elif candidate is not None:
+            # A core offering pack_split_keys declares where its extra projection and group calibration pay off.
+            # Its BF16 pilot samples must be read before the ordinary chunk pass converts Q/K to INT8.
+            eligible = getattr(candidate[0], "split_keys_eligible", None)
+            if eligible is not None and eligible(tokens, candidate[1]):
+                split_dense = candidate
     # a cross attention over a short context, split: by chunks of query tokens with all heads instead (each chunk's norm over all
     # heads is its own: one projection of q; k and v of the whole context once), each chunk gated and projected at once
-    query_chunks = (norm_rows and _cross and groups > 1 and staged is not None and staged[1].get("padded_dim") is None and attention_fn is None and kv_prefix is None
+    query_chunks = (norm_rows and _cross and groups > 1 and batch_packed and attention_fn is None and kv_prefix is None
                     and kv_window is None and not callable(attention_mask) and not shared_kv and norm_v is None and (residual is None or out_proj is not None)
                     and linear_inputs[0] is not None
                     and batch * lengths[1] * kv_heads * head_dim * dtype.itemsize * 2 <= TOKEN_QK_BYTES and lengths[1] * 4 <= lengths[0]
@@ -1141,7 +1194,8 @@ def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, nor
         pass
     elif count or token_capable and groups > 1 and CHUNK_STATISTICS:  # q and k of all heads by chunks of tokens, never whole in 16 bits
         kept, mean_squares = _token_qk(projections, linear_inputs, lengths, batch, heads, kv_heads, head_dim, dtype, device, norm_rope, staged, _cross,
-                                       list(zip(q_ranges[:count], kv_ranges[:count])), count < groups, norm_rows == "heads")
+                                       list(zip(q_ranges[:count], kv_ranges[:count])), count < groups or split_dense is not None, norm_rows == "heads",
+                                       split_dense=split_dense)
     elif norm_spans_heads and groups > 1 and norm_stats is not None:
         mean_squares = norm_stats(project)
     elif norm_spans_heads and groups > 1:
@@ -1159,6 +1213,9 @@ def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, nor
             mean_squares.append(squares.div_(total * head_dim).unsqueeze(-1))
         mean_squares = tuple(mean_squares)
 
+    if (staged is not None and not native and not callable(attention_mask) and (groups == 1 or all(i is not None for i in linear_inputs))
+            and staged[1].get("qk_quant_gran") in (None, "per_block")):
+        staged = owned_query_staged(staged)
     if staged is not None:
         core, settings = staged
         if native:  # the layout the prefix was kept in (cache_prefix)
@@ -1220,11 +1277,13 @@ def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, nor
     for index in range(groups):
         group = HeadGroup(q_ranges[index], kv_ranges[index], mean_squares)
         last = index == groups - 1
+        if split_dense is not None:
+            core = split_dense[0]
+            settings = kept[index][1] if index < len(kept) else split_dense[1].copy()
         if index and _room is not None and len(_room[2]) > 6:
             _room[2].append(allocator.probe_peak(device) - _room[1])
             allocator.probe_reset(device)
-        if index < len(kept):  # q and k kept from the chunk pass: v projected, then the kept q and k, freed after the attention
-            core, settings = staged
+        if index < len(kept) and split_dense is None:  # regular core: both q and k have already been packed
             value_list = [project(2, group.kv)]
             quantized = [None, None, core.staged_quantize_v(value_list, settings)]
             if last:
@@ -1281,23 +1340,36 @@ def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, nor
         if kv_window is not None:
             window(2, value_list[0], group.kv)
         quantized = [None, None, core.staged_quantize_v(value_list, settings)]
+        if (sample_query is not None and fusing_k and fusing_q and batch == 1 and len(lengths) == 1
+                and not _cross and not norm_spans_heads and kv_prefix is None and kv_window is None
+                and linear_inputs[0] is not None and hasattr(core, "early_query_ids")):
+            ids = core.early_query_ids(settings, tokens, len(group.q), device)
+            if ids is not None:
+                # Use the original GEMM dimensions, including LoRAs. Projecting only the pilot rows
+                # can change a BF16 rounding and, through the fitted value decoder, the generated clip.
+                pilot = project(0, group.q)[0].index_select(0, ids).unsqueeze(0)
+                settings["early_q"] = sample_query(pilot, ids, core)
+                del pilot
         # the keys of a native prefix's passes share its mean
         k_settings = {**settings, "k_mean": core.prefix_mean_heads(kv_prefix.k_mean, group.kv)} if native else settings
         # k is quantized and released before q is projected: one 16-bit tensor of the group (or of all heads) at a time
-        if not shared_kv:
-            key = project(1, group.kv)
-        fused = fused_quant(None, key, group, core, k_settings) if fusing_k else None
-        if fused is None:
-            norm_rope(None, key, group)
-            key = with_prefix(key, 1, group.kv)
-            if kv_window is not None:
-                window(1, key, group.kv)
-            if callable(attention_mask):
-                attention_mask(None, key, group)
-            quantized[1] = core.staged_quantize_k([key], k_settings)
+        if split_dense is not None and index < len(kept):
+            quantized[1], kept[index] = kept[index][0], None
         else:
-            quantized[1] = fused[1]
-        del key, fused
+            if not shared_kv:
+                key = project(1, group.kv)
+            fused = fused_quant(None, key, group, core, k_settings) if fusing_k else None
+            if fused is None:
+                norm_rope(None, key, group)
+                key = with_prefix(key, 1, group.kv)
+                if kv_window is not None:
+                    window(1, key, group.kv)
+                if callable(attention_mask):
+                    attention_mask(None, key, group)
+                quantized[1] = core.staged_quantize_k([key], k_settings)
+            else:
+                quantized[1] = fused[1]
+            del key, fused
         query = project(0, group.q)
         if last:
             release()

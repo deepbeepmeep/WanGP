@@ -231,6 +231,7 @@ class Attention(nn.Module):
                                                     lambda query, key, group: self._norm_rope_(query, key, rope, packed_rope, allow_fusion),
                                                     fused_quant=(lambda query, key, group, core, settings:
                                                                  kernels.split_half_norm_rope_quant_(query, key, rope, self.q_norm, self.k_norm, core, settings)) if allow_fusion else None,
+                                                    sample_query=(lambda q, ids, core: kernels.norm_rope_query_sample(q, ids, rope, self.q_norm, core)) if allow_fusion else None,
                                                     attention_fn=self.vsa if use_vsa else self.veda if use_veda else None,
                                                     extra_proj=self.gate_proj if use_vsa else None, head_split_level=VSA_HEAD_SPLIT_LEVEL if use_vsa else None,
                                                     out_proj=self.out_proj, residual=residual, gate=gate, segments=segments)

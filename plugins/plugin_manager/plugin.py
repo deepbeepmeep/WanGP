@@ -81,10 +81,7 @@ class PluginManagerUIPlugin(WAN2GPPlugin):
                     return JSON.stringify(Object.assign({ nonce: `${Date.now()}-${Math.random()}` }, data));
                 }
 
-                function makeSortable() {
-                    const root = pluginRoot();
-                    const userPluginList = root.querySelector('#user-plugin-list');
-                    if (!userPluginList) return;
+                function makeSortable(userPluginList) {
                     if (userPluginList.dataset.sortableBound === '1') return;
                     userPluginList.dataset.sortableBound = '1';
 
@@ -157,26 +154,16 @@ class PluginManagerUIPlugin(WAN2GPPlugin):
                     }
                 }
                 
-                function observeUserPluginList() {
-                    const root = pluginRoot();
-                    if (!root) {
-                        setTimeout(observeUserPluginList, 400);
-                        return;
-                    }
-                    if (root.dataset.pluginSortableObserver === '1') {
-                        makeSortable();
-                        return;
-                    }
-                    root.dataset.pluginSortableObserver = '1';
-                    const observer = new MutationObserver(() => {
-                        makeSortable();
-                    });
-                    observer.observe(root, { childList: true, subtree: true });
-                    makeSortable();
+                const root = pluginRoot();
+                if (!root.__wangpPluginDragBound) {
+                    root.__wangpPluginDragBound = true;
+                    // The catalog can replace the list. Bind the current list
+                    // before the first dragstart bubbles to it.
+                    root.addEventListener('dragstart', event => {
+                        const list = event.target.closest?.('#user-plugin-list');
+                        if (list) makeSortable(list);
+                    }, true);
                 }
-                
-                setTimeout(observeUserPluginList, 200);
-                setTimeout(makeSortable, 500);
 
                 window.handlePluginAction = function(button, action) {
                     const pluginItem = button.closest('.plugin-item');

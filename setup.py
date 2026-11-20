@@ -306,6 +306,8 @@ def get_env_details(name, env_data):
         return {'error': inspection["error"], 'type': env_type, 'path': dir_name}
     packages = inspection["packages"]
     data = {key: packages.get(distribution) or "Missing" for key, distribution in (("torch", "torch"), ("sageattention", "sageattention"), ("spas_sage_attn", "spas-sage-attn"), ("flash_attn", "flash-attn"))}
+    if packages.get("sagegp"):
+        data["sageattention"] = "SageGP " + packages["sagegp"]
     data["triton"] = packages["triton"] or packages["triton-windows"] or "Missing"
     return {**data, "python": inspection["python"], "path": dir_name, "type": env_type}
 
@@ -388,6 +390,9 @@ def install_logic(env_name, env_type, env_path, py_k, torch_k, triton_k, sage_k,
         cmd = resolve_cmd(config['components']['sage'][sage_k]['cmd'])
         cmd = cmd.replace("{py}", "cp" + py_k.replace(".", ""))  # wheels built for each Python version
         if cmd.startswith("http") or cmd.startswith("sageattention"):
+            if "sagegp" in cmd:  # SageGP ships the sageattention package under its own distribution: the old one goes first
+                uninstall = pip.replace(" install", " uninstall", 1).replace("--index-strategy unsafe-best-match ", "")
+                run_cmd(f"{uninstall} sageattention" if uninstall.startswith("uv ") else f"{uninstall} -y sageattention")
             run_cmd(f"{pip} {cmd}")
         else:
             if env_type == "venv" or env_type == "uv":

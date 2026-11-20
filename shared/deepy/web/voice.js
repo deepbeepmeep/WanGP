@@ -182,6 +182,10 @@
   };
   function mount() {
     mountPending = false;
+    if (mode === 'disabled') {
+      document.querySelectorAll('#assistant_chat_microphone, .wangp-prompt-microphone').forEach(button => {button.hidden = true;});
+      return;
+    }
     const ask = document.getElementById('assistant_chat_ask_button');
     if (ask && !document.getElementById('assistant_chat_microphone')) {
       const button = document.createElement('button'); button.type = 'button'; button.id = 'assistant_chat_microphone'; button.innerHTML = icon;
@@ -199,23 +203,34 @@
       if (help) { if (help.nextElementSibling !== button) help.after(button); }
       else if (button.parentElement !== label) label.append(button);
     });
-    document.querySelectorAll('#assistant_chat_microphone, .wangp-prompt-microphone').forEach(button => {button.hidden = mode === 'disabled';});
+    document.querySelectorAll('#assistant_chat_microphone, .wangp-prompt-microphone').forEach(button => {button.hidden = false;});
   }
   WAC.refreshVoiceConfig = async () => {
     const response = await fetch('deepy_api/voice');
     if (!response.ok) throw new Error('Unable to check microphone configuration.');
-    const config = await response.json(); mode = config.mode; mount(); return config;
+    const config = await response.json(); setMode(config.mode); return config;
   };
-  WAC.setVoiceMode = value => { mode = value; if (mode === 'disabled' && active) cancel(active); mount(); };
   const mountSelector = '.wangp-voice-prompt, #assistant_chat_ask_button';
-  new MutationObserver(mutations => {
+  const observer = new MutationObserver(mutations => {
     if (mountPending || !mutations.some(mutation => mutation.target.closest?.(mountSelector) ||
         Array.from(mutation.addedNodes).some(node => node.nodeType === 1 && (node.matches(mountSelector) || node.querySelector(mountSelector))))) return;
     mountPending = true;
     requestAnimationFrame(mount);
-  }).observe(document.body, {childList: true, subtree: true});
+  });
+  function setMode(value) {
+    if (value === mode) return;
+    mode = value;
+    // The standalone Web composer is static. Gradio can remount prompt
+    // fields and their labels, but only enabled microphones need reattaching.
+    if (mode === 'disabled') observer.disconnect();
+    else if (!document.body.hasAttribute('data-deepy-app')) observer.observe(document.querySelector('gradio-app') || document.body, {childList: true, subtree: true});
+    mount();
+  }
+  WAC.setVoiceMode = value => {
+    if (value === 'disabled' && active) cancel(active);
+    setMode(value);
+  };
   window.addEventListener('focus', () => WAC.refreshVoiceConfig().catch(() => {}));
   window.addEventListener('pagehide', () => { if (active) cancel(active); });
   WAC.refreshVoiceConfig().catch(() => {});
-  mount();
 })();

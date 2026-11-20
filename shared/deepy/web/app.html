@@ -79,7 +79,12 @@
       </div>
       <form id="deepy-settings-form">
         <div class="settings-panels">
-          <section id="properties-settings" role="tabpanel" aria-labelledby="properties-tab"><div id="property-mode"></div><div id="property-fields" class="settings-fields"></div></section>
+          <section id="properties-settings" role="tabpanel" aria-labelledby="properties-tab">
+            <label class="chat__compact-preference" title="Collapse each turn by default, keeping generated media and the latest statement visible. Shared between Gradio and the Web app.">
+              <input type="checkbox" data-deepy-compact-actions checked><span>Compacted View of Thoughts and Actions</span><span role="alert"></span>
+            </label>
+            <div id="property-mode"></div><div id="property-fields" class="settings-fields"></div>
+          </section>
           <section id="templates-settings" role="tabpanel" aria-labelledby="templates-tab" hidden><p>Select the existing settings template used by each tool.</p><div id="template-fields" class="settings-fields"></div></section>
         </div>
         <footer class="settings-footer"><span id="settings-status" role="status"></span><button id="save-settings" type="submit" disabled>Save settings</button></footer>

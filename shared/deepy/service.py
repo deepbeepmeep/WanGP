@@ -205,7 +205,7 @@ class DeepyService(WorkspaceSupport, PluginJobSupport, GenerationRuntime):
 
     def _resume_session(self):
         try:
-            self._deps.controller.prefill_restored_session_context(self._state)
+            self._deps.controller.prefill_restored_session_context(self._state, on_status=partial(self.publish, "chat"))
         finally:
             self.publish("chat", chat.build_status_event(None, visible=False, session=self._session))
         def resumed_command(command, data=None):

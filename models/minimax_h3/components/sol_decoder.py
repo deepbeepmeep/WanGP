@@ -30,7 +30,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from shared.attention import pay_attention
+from shared.attention import indexed_window_plans, pay_attention
 from shared.kernels import ops as kernels, vae_ops
 
 from ..interrupt import GenerationInterrupted
@@ -71,8 +71,20 @@ class _Parity:
         steps = int(j.max()) + 1
         lows = torch.full((steps,), T).scatter_reduce(0, j, t, "amin")
         highs = torch.zeros(steps, dtype=torch.long).scatter_reduce(0, j, t + 1, "amax")
-        self.steps = [(step if step < nb else None, int(lows[step]), int(highs[step]), []) for step in range(steps)]
+        # Indices are relative to the ring and to the first output row. Interior steps with the same
+        # temporal bounds can reuse the entire window plan, including its device index buffers.
+        self.steps, layouts, first_steps = [], {}, []
+        for step in range(steps):
+            block = min(step, nb - 1)
+            lo, hi = int(lows[step]), int(highs[step])
+            bounds = (lo - block * BLOCK, hi - block * BLOCK, starts[block + 1] - starts[block])
+            first = layouts.setdefault(bounds, step)
+            first_steps.append(first)
+            groups = [] if first == step else self.steps[first][3]
+            self.steps.append((block if step < nb else None, lo, hi, groups))
         for step, length, two in sorted(set(zip(window_j.tolist(), lengths.tolist(), spans_two.tolist()))):
+            if step != first_steps[step]:
+                continue
             chosen = ((window_j == step) & (lengths == length) & (spans_two == two)).nonzero().flatten()
             tokens = order[firsts[chosen][:, None] + torch.arange(length)]
             block = min(step, nb - 1)
@@ -83,7 +95,7 @@ class _Parity:
             per_call = max(1, WINDOW_BYTES // (keys.shape[1] * decoder.dim * 2))
             for first in range(0, len(chosen), per_call):
                 part = slice(first, first + per_call)
-                self.steps[step][3].append(tuple(tensor.to(state.device) for tensor in (ring[tokens[part]], keys[part], tokens[part] - int(lows[step]) * HW)))
+                self.steps[step][3].append((ring[tokens[part]], keys[part], tokens[part] - int(lows[step]) * HW))
         # no reference to the state: the state holds the parities, and a cycle would keep the clip's buffers until the next GC
         self.rope_module, self.H, self.W, self.starts, self.device = decoder.rope, H, W, starts, state.device
         self.shifted, self.shift, self.time_shift, self.tables = odd, shift, time_shift, {}
@@ -111,6 +123,15 @@ class _State:
         self.N = self.starts[-1]
         self.parities = [_Parity(decoder, self, odd) for odd in (False, True)]
         self.qkv = torch.empty((TIME_SHIFT + BLOCK) * self.HW + 2 * self.S, decoder.heads, 3, decoder.head_dim, dtype=self.dtype, device=self.device)
+        layouts = {id(groups): groups for parity in self.parities for _, _, _, groups in parity.steps}
+        plans = indexed_window_plans(self.qkv, list(layouts.values()), self.S, min(self.T, BLOCK) * self.HW + self.S, WINDOW_BYTES)
+        if plans is None:
+            prepared = {key: [tuple(index.to(self.device) for index in group) for group in groups] for key, groups in layouts.items()}
+        else:
+            prepared = dict(zip(layouts, plans))
+        for parity in self.parities:
+            parity.indexed = plans is not None
+            parity.steps = [(block, lo, hi, prepared[id(groups)]) for block, lo, hi, groups in parity.steps]
         self.attention = torch.empty(BLOCK * self.HW, decoder.dim, dtype=self.dtype, device=self.device)
         self.global_attention = torch.empty(self.nb * self.S, decoder.dim, dtype=self.dtype, device=self.device)
         self.x = torch.empty(self.N + self.nb * self.S, decoder.dim, dtype=self.dtype, device=self.device)
@@ -125,7 +146,7 @@ class MiniMaxH3SolBlock(MiniMaxH3VideoTransformerBlock):
         fused = self._fused(x[:1])
         query, key, value = state.qkv.unbind(2)
         heads, head_dim, dim, base = decoder.heads, decoder.head_dim, decoder.dim, TIME_SHIFT * HW + S
-        for block, lo, hi, groups in parity.steps:
+        for block, lo, hi, windows in parity.steps:
             if getattr(decoder, "_interrupt", False):
                 raise GenerationInterrupted
             if block is not None:
@@ -134,15 +155,19 @@ class MiniMaxH3SolBlock(MiniMaxH3VideoTransformerBlock):
                     state.qkv[:base].copy_(state.qkv[base + (BLOCK - TIME_SHIFT) * HW:base + BLOCK * HW + S])
                 self._project_qkv(x[starts[block]:starts[block + 1]], state.qkv[base:base + count], parity.rope(block), fused)
                 self._project_qkv(x[state.N + block * S:state.N + (block + 1) * S], state.qkv[base + count:base + count + S], None, fused)
-            for queries, keys, outputs in groups:
-                n, length = queries.shape
-                qkv_list = [query.index_select(0, queries.view(-1)).view(n, length, heads, head_dim),
-                            *(tensor.index_select(0, keys.view(-1)).view(n, -1, heads, head_dim) for tensor in (key, value))]
-                state.attention.index_copy_(0, outputs.view(-1), pay_attention(qkv_list, recycle_q=True).reshape(n * length, dim))
-            if block is not None and not last:  # the global tokens of the last layer are never read
-                rows = slice(base, base + count + S)
-                qkv_list = [query[base + count:base + count + S][None], key[rows][None], value[rows][None]]
-                state.global_attention[block * S:(block + 1) * S] = pay_attention(qkv_list, force_attention="sdpa").reshape(S, dim)
+            global_out = state.global_attention[block * S:(block + 1) * S] if block is not None and not last else None
+            if parity.indexed:
+                windows(query, key, value, state.attention, base, count + S if global_out is not None else 0, global_out)
+            else:
+                for queries, keys, outputs in windows:
+                    n, length = queries.shape
+                    qkv_list = [query.index_select(0, queries.view(-1)).view(n, length, heads, head_dim),
+                                *(tensor.index_select(0, keys.view(-1)).view(n, -1, heads, head_dim) for tensor in (key, value))]
+                    state.attention.index_copy_(0, outputs.view(-1), pay_attention(qkv_list, recycle_q=True).reshape(n * length, dim))
+                if global_out is not None:
+                    rows = slice(base, base + count + S)
+                    qkv_list = [query[base + count:base + count + S][None], key[rows][None], value[rows][None]]
+                    global_out.copy_(pay_attention(qkv_list, force_attention="sdpa").reshape(S, dim))
             rows = slice(lo * HW, hi * HW)  # final for this layer: their windows are attended
             self._post_attention(state.attention[:(hi - lo) * HW], x[rows], fused)
             if last:

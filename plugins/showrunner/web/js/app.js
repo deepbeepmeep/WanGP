@@ -98,6 +98,12 @@ export const actions = {
       return status;
     } catch (error) { toast(error.message, 'error', 7000); }
   },
+  async queue(text) {  // for after the current task
+    try { await api.queue(state.pid, text); } catch (error) { toast(error.message, 'error', 6000); }
+  },
+  async unqueue(index) {
+    try { await api.unqueue(state.pid, index); } catch (error) { toast(error.message, 'error', 6000); }
+  },
   async steer(text) {
     try { await api.steer(state.pid, text); } catch (error) { toast(error.message, 'error', 6000); }
   },
@@ -273,6 +279,12 @@ function eventsFor(pid) {
       if (event.error) toast(`The singer's voice could not be changed: ${event.error}`, 'error', 8000);
       else if (event.done) toast('The song is sung in its new voice. The former version is in the bin.', 'ok');
       mounted?.songVoice?.();
+    },
+    upscale: event => {  // a version made larger, from Deliver
+      state.upscaling = event.done ? null : { version: event.version, progress: event.progress, status: event.status };
+      if (event.error) toast(`The version could not be upscaled: ${event.error}`, 'error', 8000);
+      else if (event.done) toast('The upscaled version is ready: it is the newest in Versions.', 'ok');
+      mounted?.upscaling?.();
     },
     assemble: event => {
       if (!state.userAssembling) {  // an assembly the user started reports on its own button

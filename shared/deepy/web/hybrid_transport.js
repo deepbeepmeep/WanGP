@@ -134,18 +134,22 @@
     const workspaceInfo = message => galleryTabs.dispatchEvent(new CustomEvent('gradio', {bubbles: true, detail: {event: 'info', data: message}}));
     const workspaces = new WanGPWorkspacePicker(galleryTabs, (path, payload) => transport.request(path, payload), notice, {info: workspaceInfo});
     let sessionWorkspaces = null;
-    function syncSessionWorkspaces() {
-      const host = document.querySelector('#deepy-session-workspaces');
+    function mountSessionWorkspaces() {
+      if (sessionWorkspaces?.node.isConnected) return;
+      sessionWorkspaces?.dialog.remove();
+      sessionWorkspaces = null;
+      const host = document.getElementById('deepy-session-workspaces');
       if (!host) return;
-      if (sessionWorkspaces?.node.parentNode !== host) {
-        sessionWorkspaces?.dialog.remove();
-        sessionWorkspaces = new WanGPWorkspacePicker(host, (path, payload) => transport.request(path, payload), notice, {deepy: true, management: false});
-      }
+      sessionWorkspaces = new WanGPWorkspacePicker(host, (path, payload) => transport.request(path, payload), notice, {deepy: true, management: false});
       sessionWorkspaces.render(workspaces.state, true);
     }
     // Gradio mounts this field when its Sessions tab becomes visible.
-    new MutationObserver(syncSessionWorkspaces).observe(document.querySelector('#assistant_chat_settings_panel'), {childList: true, subtree: true});
-    function renderWorkspaces(state, reset = false) {workspaces.render(state, reset); syncSessionWorkspaces();}
+    new MutationObserver(mountSessionWorkspaces).observe(document.querySelector('#assistant_chat_settings_panel'), {childList: true, subtree: true});
+    function renderWorkspaces(state, reset = false) {
+      workspaces.render(state, reset);
+      if (sessionWorkspaces?.node.isConnected) sessionWorkspaces.render(workspaces.state, true);
+      else mountSessionWorkspaces();
+    }
     const viewer = new WanGPWorkspaceViewer(workspaces, transport);
     WAC.queuedRequestAction = (action, message_id, text) => {control('queued', {action, message_id, text}); return true;};
     WAC.stopBridgeTargets = () => [{click: () => control('stop')}];

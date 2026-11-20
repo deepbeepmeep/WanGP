@@ -815,6 +815,18 @@ def _norm_parameters(norm, tokens, device):
     return norm.weight, torch.finfo(torch.float32).eps if norm.eps is None else norm.eps, None
 
 
+def norm_rope_query_sample(q, ids, rope, q_norm, core, *, interleaved=False, rope_first=False):
+    """Apply the fused quantizer's per-head norm and the original positions' RoPE to sampled Q rows."""
+    if isinstance(q_norm, list) or (rope is not None and (rope.ndim not in (5, 6) or rope.shape[3] > 64)):
+        return None
+    norm = _norm_parameters(q_norm, q.size(1), q.device)
+    weight = norm[0]
+    if weight is not None and (weight.device != q.device or weight.dtype not in (q.dtype, torch.float32)
+                               or weight.ndim not in (1, 2) or weight.size(-1) != 128 or weight.stride(-1) != 1):
+        return None
+    return core.sample_projected_query(q, ids, rope, norm, interleaved=interleaved, rope_first=rope_first)
+
+
 def split_half_norm_rope_quant_(q, k, rope, q_norm, k_norm, core, settings, *, interleaved=False, rope_first=False):
     """The staged SageAttention 2 quantization of q and / or k (batch, tokens, heads, head_dim; the other None) fused with their
     per-head RMSNorm (a module with .weight and .eps, a (weight, eps) tuple, None, or segments [(start, stop, module or tuple)] over
@@ -823,20 +835,31 @@ def split_half_norm_rope_quant_(q, k, rope, q_norm, k_norm, core, settings, *, i
     or (..., pairs, 2, 2) rotation matrices [[cos, -sin], [sin, cos]], read through their strides; None for no rotation; channel p
     with p + pairs, or interleaved 2p with 2p + 1): (q_quantized, k_quantized) as the core's staged_quantize_q / staged_quantize_k
     return them, quantized from the FP32 rotated rows (one rounding fewer than the in-place kernel followed by the core's
-    quantizer), k's mean from FP32 partial sums. rope_first: the rotation before the norm (Hi3D), both in FP32. Heads that the core
-    pads (settings["padded_dim"]: 96 attended as 128) get INT8 rows of the padded width, zeros beyond head_dim. q is left as it is
-    (staged_attention writes the output into it) and k is not modified (the caller releases it). None where the fusion does not apply
+    quantizer), k's mean from FP32 partial sums. The CUDA per-warp query path preserves the rotation's 16-bit rounding.
+    rope_first rotates before the norm (Hi3D), both in FP32. Padded heads get INT8 rows with zeros beyond head_dim.
+    The caller releases k after packing. A core with recycle_query enabled may pack into the disposable q projection
+    before staged_attention writes its output there. Other calls preserve q during packing. None where the fusion does not apply
     (a core without fused_qk_layouts or a quantization layout the kernels do not reproduce, no CUDA inference, attended head_dim not
     64 / 128, norm weights on another device / dtype): the caller runs norm_rope and the core's quantizers."""
     x = q if q is not None else k
     width = settings.get("padded_dim") or x.shape[-1]
-    (q_weight, q_eps, q_rows), (k_weight, k_eps, k_rows) = (_norm_parameters(norm, x.shape[1], x.device) for norm in (q_norm, k_norm))
     layouts = core.fused_qk_layouts(settings, x.shape[-1]) if _qk_quant is not None and hasattr(core, "fused_qk_layouts") else None
     # the kernel reads the weights in their own dtype (FP32 scales of some INT8 checkpoints included) and multiplies in FP32
-    if (layouts is None or width not in (64, 128) or not cuda_inference(x, dtypes=(torch.bfloat16, torch.float16))
-            or not all(w.device == x.device and w.dtype in (x.dtype, torch.float32) for w in (q_weight, k_weight) if w is not None)):
+    warp_query = getattr(core, "fused_warp_query", None) if layouts is None and k is None else None
+    warp_key = getattr(core, "fused_warp_key", None) if layouts is None and q is None else None
+    if (layouts is None and warp_query is None and warp_key is None) or width not in (64, 128) or not cuda_inference(x, dtypes=(torch.bfloat16, torch.float16)):
+        return None
+    q_weight, q_eps, q_rows = _norm_parameters(q_norm if q is not None else None, x.shape[1], x.device)
+    k_weight, k_eps, k_rows = _norm_parameters(k_norm if k is not None else None, x.shape[1], x.device)
+    if not all(w.device == x.device and w.dtype in (x.dtype, torch.float32) for w in (q_weight, k_weight) if w is not None):
         return None
     options = {"interleaved": interleaved, "rope_first": rope_first}
+    if warp_key is not None:
+        key = warp_key(k, rope, (k_weight, k_eps, k_rows), settings, **options)
+        return None if key is None else (None, key)
+    if warp_query is not None:
+        query = warp_query(q, rope, (q_weight, q_eps, q_rows), settings, **options)
+        return None if query is None else (query, None)
     quantized = [None, None]
     if k is not None:
         layout, block, sm_scale, scale_eps = layouts["k"]
@@ -847,8 +870,9 @@ def split_half_norm_rope_quant_(q, k, rope, q_norm, k_norm, core, settings, *, i
         del mean
     if q is not None:
         layout, block, sm_scale, scale_eps = layouts["q"]
+        recycle = hasattr(core, "fused_query_recycle") and core.fused_query_recycle(q, settings)
         quantized[0] = _qk_quant.norm_rope_quantize(q, q_weight, rope, q_eps, layout, block, sm_scale=sm_scale, scale_eps=scale_eps,
-                                                    weight_rows=q_rows, width=width, **options)
+                                                    weight_rows=q_rows, width=width, recycle=recycle, **options)
     return tuple(quantized)
 
 

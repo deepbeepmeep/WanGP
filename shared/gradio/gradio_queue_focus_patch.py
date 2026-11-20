@@ -227,7 +227,7 @@ def get_javascript() -> str:
     const observer = new MutationObserver(records => {{
       if (observeMainTab() || !observedPanel) return;
       if (records.some(record => record.type === "attributes" && record.target === observedTab)) scheduleMainTabKeepAliveSync();
-      if (records.some(record => record.type === "childList" && observedPanel.contains(record.target) &&
+      if (patch.targetComponentIds !== null && records.some(record => record.type === "childList" && observedPanel.contains(record.target) &&
           [...record.addedNodes, ...record.removedNodes].some(hasComponent))) invalidateComponentIds();
     }});
     patch.keepAliveObserver = observer;

@@ -11,6 +11,7 @@ export function mountDeliver(container) {
   let selected = null, compareWith = null, changes = null;
   const number = id => state.doc.deliverables.findIndex(item => item.id === id) + 1;  // versions are numbered in the order they were made
   let seen = null;
+  let upscalers = null;  // WanGP's video upsamplers, read once
   function markSeen() {  // the next step stops asking to watch a version that is on this page, also one that arrives while it is open
     const latest = state.doc.deliverables.at(-1)?.id;
     if (!latest || latest === seen) return;
@@ -62,6 +63,10 @@ export function mountDeliver(container) {
             <div class="row"><span class="muted grow">Picture</span><b>${current.width || '?'}×${current.height || '?'}${current.fps ? ` · ${current.fps} fps` : ''}</b></div>
             <div class="row"><span class="muted grow">Made by</span><b>${current.by === 'deepy' ? 'the showrunner' : 'you'} · ${esc(method(current))}</b></div>
             <div class="row"><span class="muted grow">When</span><b>${ago(current.time)}</b></div></div>
+            ${state.upscaling ? `<select class="select" style="margin-top:12px" disabled title="${esc(state.upscaling.status || 'Upscaling…')}"><option>Upscaling${state.upscaling.progress != null ? ` · ${Math.round(state.upscaling.progress)}%` : '…'}</option></select>`
+              : `<div class="col" style="gap:6px;margin-top:12px"><div class="row" style="gap:6px;flex-wrap:nowrap"><select class="select grow" id="upscale" title="The same edit at a larger size, by one of WanGP's upsamplers: faces and lips stay as they are. For more detail in every shot, Shoot Final renders them again at the target size"><option value="">Upscale this version…</option></select>
+                <select class="select" id="upscale-scale" hidden title="How many times larger" style="width:auto"></select><button class="btn" id="upscale-go" hidden>${icon('bolt')} Upscale</button></div>
+                <div class="muted" id="upscale-help" hidden style="font-size:12.5px"></div></div>`}
             <select class="select" id="other-format" style="margin-top:12px" title="Makes the shots again in another format; this version stays as it is" ${actions.directorBlocked() ? 'disabled' : ''}><option value="">Make it in another format…</option>${['16:9', '9:16', '1:1', '4:3', '2.39:1'].filter(aspect => aspect !== doc.brief.aspect).map(aspect => `<option value="${aspect}">${aspect}${aspect === '9:16' ? ' (vertical)' : aspect === '1:1' ? ' (square)' : ''}</option>`).join('')}</select>
             <a class="btn ${stale ? '' : 'primary'}" style="margin-top:12px;width:100%" href="${actions.file(current.path, true)}" download="${esc(name(current))}">${icon('download')} Download${current === latest && stale ? ' (previous edit)' : ''}</a></div>` : ''}
         </div></div>
@@ -100,6 +105,28 @@ export function mountDeliver(container) {
       else askForFix([]);
     });
     container.querySelector('#other-format')?.addEventListener('change', event => { const aspect = event.target.value; event.target.value = ''; if (aspect) actions.makeFormat(aspect); });
+    const upscale = container.querySelector('#upscale');
+    if (upscale && !state.upscaling) {
+      upscalers ??= api.upscalers().then(result => result.upscalers).catch(() => []);
+      const scale = container.querySelector('#upscale-scale'), go = container.querySelector('#upscale-go'), help = container.querySelector('#upscale-help');
+      let list = [];
+      upscalers.then(found => {  // the upsamplers enabled in WanGP, named as there
+        if (!container.contains(upscale)) return;
+        list = found;
+        upscale.insertAdjacentHTML('beforeend', list.length ? list.map(item => `<option value="${esc(item.id)}" title="${esc(item.description || '')}">${esc(item.label)}</option>`).join('') : '<option disabled>No upsampler is enabled in Configuration > Extensions</option>');
+      });
+      upscale.addEventListener('change', () => {  // its scales, if it offers several, and what it does
+        const item = list.find(entry => entry.id === upscale.value);
+        scale.innerHTML = (item?.multipliers || []).map(value => `<option value="${value}">×${value}</option>`).join('');
+        scale.hidden = !item?.multipliers.length;
+        go.hidden = !item;
+        Object.assign(help, { hidden: !item?.description, textContent: item?.description || '' });
+      });
+      go.addEventListener('click', async () => {
+        const item = list.find(entry => entry.id === upscale.value);
+        if (item) try { await api.upscale(state.pid, current.id, item.id, item.multipliers.length ? +scale.value : null); state.upscaling = { version: current.id }; render(); toast('Upscaling the version: it comes in Versions when ready.', 'info'); } catch (error) { toast(error.message, 'error', 7000); }
+      });
+    }
     bindSound();
     container.querySelectorAll('[data-version]').forEach(element => element.onclick = () => { selected = element.dataset.version; compareWith = null; render(); });
     container.querySelectorAll('[data-compare]').forEach(button => button.onclick = event => { event.stopPropagation(); compare(current.id, button.dataset.compare); });
@@ -236,6 +263,7 @@ export function mountDeliver(container) {
   function bindSound() {
     const edit = () => state.doc.edit;
     container.querySelector('#edit-sound').onclick = () => actions.go('timeline');
+    container.querySelector('#song-subtitles')?.addEventListener('click', () => actions.ops([{ op: 'edit', fields: { song_subtitles: !edit().song_subtitles } }]));
     container.querySelectorAll('[data-subtitle]').forEach(button => button.onclick = () => actions.ops([{ op: 'edit', fields: { subtitles: edit().subtitles.filter((_, number) => number !== +button.dataset.subtitle) } }]));
     container.querySelector('#add-srt')?.addEventListener('click', async () => {
       const files = await pickFiles('.srt', false);
@@ -244,7 +272,7 @@ export function mountDeliver(container) {
   }
 
   render();
-  return { update() { markSeen(); render(); }, assembling: render, destroy() { subtitles.forEach(url => url && URL.revokeObjectURL(url)); } };
+  return { update() { markSeen(); render(); }, assembling: render, upscaling: render, destroy() { subtitles.forEach(url => url && URL.revokeObjectURL(url)); } };
 }
 
 // When a version was made: the time, with the day when it was not today.
@@ -309,6 +337,7 @@ function soundPanel(doc) {
   const lines = doc.shots.filter(shot => shot.included && shot.takes.length).reduce((count, shot) => count + (shot.dialogue || []).filter(line => (line.line || '').trim()).length, 0);  // what assemble subtitles
   const soundtrack = { song: 'Song only', clips: 'Shot sound only', mix: 'Song and shot sound' }[doc.brief.song ? edit.audio_mode : 'clips'];
   const tracks = edit.audio_tracks.length ? count(edit.audio_tracks.length, 'track') + ' over the edit' : 'no track over the edit';
+  const song = doc.brief.song && edit.audio_mode === 'song';  // its lines are the song's lyrics: a subtitle track of them only when asked
   return `<div class="panel"><div class="panel-head"><h3>Sound and subtitles</h3><span class="hint">What the export plays and shows, besides the picture</span></div>
     <div class="col" style="gap:14px">
       <div class="row" style="flex-wrap:wrap"><span class="label" style="margin:0">${icon('music')} Sound</span><span>${soundtrack}${edit.level_voices && doc.brief.voices_from_model && edit.audio_mode !== 'song' ? ', voices evened out' : ''} · ${tracks}</span><span class="grow"></span>
@@ -316,6 +345,7 @@ function soundPanel(doc) {
       <div><div class="label">${icon('note')} Subtitles <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">a track the viewer turns on, never burnt into the picture</span></div>
         ${edit.subtitles.length ? edit.subtitles.map((item, index) => `<div class="row" style="font-size:13px"><b>${esc(name(item.path))}</b><span class="chip">${esc(item.language || 'eng')}</span><span class="grow"></span>
           <a class="btn small ghost" href="${actions.file(item.path, true)}" download="${esc(name(item.path))}">${icon('download')}</a><button class="btn small ghost icon" data-subtitle="${index}" title="Remove">${icon('x')}</button></div>`).join('')
+          : song ? `<label class="row muted" style="font-size:12.5px;cursor:pointer;gap:10px" title="The words sung, timed on the song, as a track the viewer can turn on"><span class="toggle ${edit.song_subtitles ? 'on' : ''}" id="song-subtitles"></span>Lyrics as subtitles${edit.song_subtitles ? '' : ': none in the export'}</label>`
           : `<div class="muted" style="font-size:12.5px">${lines ? `From the shots' dialogue: ${lines} line${lines > 1 ? 's' : ''}, timed on the cut and written as in the script. An SRT file you add replaces them.` : 'None: the words written in the shots\' dialogue become subtitles, or add an SRT file.'}</div>`}
         <button class="btn small" id="add-srt" style="margin-top:8px">${icon('plus')} SRT file</button></div>
     </div></div>`;

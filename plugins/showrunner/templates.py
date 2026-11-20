@@ -105,9 +105,16 @@ def choices(doc: dict[str, Any], catalog: list[dict[str, Any]], rules: dict[str,
     auto, picks, rules = automatic(catalog), chosen(doc, catalog), rules or {}
     return [{**role, "label": role.get("label") or next(entry["category"] for entry in catalog if _fits(role["id"], entry)), "auto": auto.get(role["id"]), "value": picks.get(role["id"]),
              "choices": [{"value": entry_name(entry), "label": entry.get("label") or entry["name"], "refs": entry.get("refs", False), "audio": entry.get("audio", False), "speaks": speaks_its_lines(entry),
-                          "rules": rules.get(entry_name(entry), "")}
+                          "rules": rules.get(entry_name(entry), ""), "frames": entry.get("frames", ""), **_window_seconds(entry)}
                          for entry in catalog if _fits(role["id"], entry)]}
             for role in ROLES if any(_fits(role["id"], entry) for entry in catalog)]
+
+
+def _window_seconds(entry: dict[str, Any]) -> dict[str, float]:
+    """The longest window of a template's model and the overlap a continuation shares, in seconds: the page offers to split a shot whose end picture lies past it."""
+    largest = entry.get("window_max") or entry.get("longest_frames")
+    fps = (entry.get("take_frames") or [0, 1, 0])[2]
+    return {"window_s": round(largest / fps, 3), "overlap_s": round((entry.get("overlap") or 0) / fps, 3)} if largest and fps and "E" in entry.get("frames", "") else {}
 
 
 def pick(picks: dict[str, str], catalog: list[dict[str, Any]], role: str, template: str | None) -> dict[str, str]:

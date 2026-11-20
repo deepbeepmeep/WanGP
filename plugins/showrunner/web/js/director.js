@@ -13,7 +13,8 @@ const TASK_LABEL = { plan: 'Planning the production', shoot: 'Shooting', reshoot
 export function mountDirector(root) {
   root.innerHTML = `<div class="director"><div id="d-banner"></div><div class="dir-feed" id="d-feed"></div>
     <div class="composer"><div class="d-status" id="d-status"></div><div id="d-context"></div>
-      <div class="box"><textarea id="d-input" rows="1"></textarea><button class="btn primary small icon" id="d-send" title="Send">${icon('send')}</button></div>
+      <div id="d-queued"></div>
+      <div class="box"><textarea id="d-input" rows="1"></textarea><button class="btn small icon" id="d-later" hidden title="Send after this task: it starts as a task of its own once the current one ends (Ctrl+Enter)">${icon('clock')}</button><button class="btn primary small icon" id="d-send" title="Send">${icon('send')}</button></div>
       <div class="quick" id="d-actions"></div></div></div>`;
   const feed = root.querySelector('#d-feed'), input = root.querySelector('#d-input'), written = new WeakMap();
   const lines = new Map();  // each entry of the log as a line, written once
@@ -70,7 +71,10 @@ export function mountDirector(root) {
     const percent = live.progress ? `<span class="mono">${Math.round(live.progress.progress || 0)}%</span>` : '';
     const reload = busy && live.status?.kind === 'loading' && live.status.progress ? `<div class="progress" title="Reloading this production's conversation into Deepy"><i style="width:${Math.round(100 * live.status.progress.done / live.status.progress.total)}%"></i></div>` : '';
     write(root.querySelector('#d-status'), `<div class="d-line">${busy ? '<span class="typing"><i></i><i></i><i></i></span>' : ''}<span class="d-doing" ${busy && live.stats?.text ? `title="${esc(live.stats.text)}"` : ''}>${shotNames(line)}</span>${percent}</div>${live.progress ? `<div class="progress"><i style="width:${live.progress.progress || 0}%"></i></div>` : ''}${reload}`);
-    input.placeholder = busy ? 'Your note reaches it at its next step…' : paused() ? 'Your note resumes its task…' : 'Ask for a change: "make shot 3 at night"…';
+    input.placeholder = busy ? 'Your note reaches it at its next step, or after this task (clock)…' : paused() ? 'Your note resumes its task…' : 'Ask for a change: "make shot 3 at night"…';
+    root.querySelector('#d-later').hidden = !busy && !paused();
+    const queued = doc.director.queued || [];
+    write(root.querySelector('#d-queued'), queued.length ? `<div class="queued">${queued.map((text, index) => `<div class="queued-item" title="Starts as a task of its own when the current one ends">${icon('clock')}<span class="grow">${number(index)}${esc(text)}</span><button class="context-x" data-unqueue="${index}" title="Take it out of the queue">${icon('x')}</button></div>`).join('')}</div>` : '');
   }
 
   function renderActions() {
@@ -169,7 +173,10 @@ export function mountDirector(root) {
     if (stick) feed.scrollTop = feed.scrollHeight;
   }
 
-  function send() {
+  const number = index => (state.doc.director.queued || []).length > 1 ? `<b>${index + 1}.</b> ` : '';
+  root.querySelector('#d-queued').addEventListener('click', event => { const button = event.target.closest('[data-unqueue]'); if (button) actions.unqueue(+button.dataset.unqueue); });
+
+  function send(later = false) {
     const text = input.value.trim();
     if (!text) return;
     const selected = about();
@@ -177,14 +184,16 @@ export function mountDirector(root) {
     input.value = '';
     ignored = selected.join(',');  // a selection is about one message: selecting again brings the chip back
     autosize();
-    if (working()) actions.steer(full);
+    if (later && (working() || paused())) actions.queue(full);
+    else if (working()) actions.steer(full);
     else if (paused()) actions.resume(full);
     else actions.direct('message', full, selected);
   }
   function autosize() { input.style.height = 'auto'; if (input.value) input.style.height = `${Math.min(140, input.scrollHeight)}px`; }  // empty: one line, whatever the width of its placeholder
   input.addEventListener('input', autosize);
-  input.addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); send(); } });
-  root.querySelector('#d-send').onclick = send;
+  input.addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); send(event.ctrlKey || event.metaKey); } });
+  root.querySelector('#d-send').onclick = () => send();
+  root.querySelector('#d-later').onclick = () => send(true);
 
   // Out of sight (another panel, or the panel folded), only the order of the steps is kept: showing the panel draws it (app.js renderSide).
   const draw = () => {

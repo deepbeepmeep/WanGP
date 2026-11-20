@@ -4,6 +4,8 @@ import argparse
 import json
 import os
 from pathlib import Path
+import platform
+import shutil
 import subprocess
 import sys
 import threading
@@ -96,6 +98,20 @@ def catalog_summary(config):
     return {"profiles": {key: {"python": config["components"]["python"][value["python"]]["ver"], "torch": config["components"]["torch"][value["torch"]]["label"], "label": key.replace("_", " "), "platforms": value.get("platforms", ["win", "linux", "macos"])} for key, value in config["gpu_profiles"].items()}}
 
 
+def check_linux_install_tools(runtime):
+    path = runtime.environment()["PATH"]
+    missing = [tool for tool in ("cc", "git") if shutil.which(tool, path=path) is None]
+    if not missing:
+        return
+    try:
+        release = platform.freedesktop_os_release()
+    except OSError:
+        release = {}
+    ubuntu = release.get("ID") == "ubuntu" or "ubuntu" in release.get("ID_LIKE", "").split()
+    instruction = "Run 'sudo apt install build-essential git' in a terminal" if ubuntu else "Install the missing tools with your distribution's package manager"
+    raise InstallError("missing_install_tools", f"Missing Linux installation tools: {', '.join(missing)}. {instruction}, then retry the installation.")
+
+
 def snapshot_checkout(source, destination, release_id, runner, emit):
     source = plain_path(source)
     if not (source / ".git").exists():
@@ -183,6 +199,8 @@ def run_action(action, args, data, runtime, cancelled, emit, request_id):
         operation = args["operation"]
         if operation not in ("install", "update", "repair", "switch-version", "rollback"):
             raise InstallError("invalid_operation", "Unknown installation action")
+        if sys.platform == "linux" and operation == "install" and args["profile"] != "Demo":
+            check_linux_install_tools(runtime)
         preview = data / "previews" / request_id
         preview.mkdir(parents=True, exist_ok=False)
         existing = installation_info(args["root"], args.get("python"), data) if operation != "install" else None

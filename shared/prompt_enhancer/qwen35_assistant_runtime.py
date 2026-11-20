@@ -548,7 +548,7 @@ class Qwen35AssistantRuntime:
         if self.tokenizer is None:
             raise RuntimeError("Prompt enhancer tokenizer is missing for assistant runtime.")
         self.debug_enabled = bool(debug_enabled)
-        self.context_progress = None  # called with (done, total) while a conversation is prefilled
+        self.context_progress = None  # (prepared context tokens, target context tokens)
         self.prefill_setup_seconds = 0.0  # of the prefill being timed: preparing the runtime (engine, graph capture), which is no measure of its speed
         self.telemetry_enabled = self.debug_enabled and _DEEPY_TELEMETRY_ENABLED
         self._runtime_extra_tokens = getattr(model, "_prompt_enhancer_thinking_extra_tokens", 0)
@@ -1122,6 +1122,8 @@ class Qwen35AssistantRuntime:
         normalized_token_ids = [int(token_id) for token_id in token_ids]
         if len(normalized_token_ids) == 0:
             raise ValueError("Cannot prefill assistant context with an empty token sequence.")
+        if self.context_progress is not None:
+            self.context_progress(0, len(normalized_token_ids))
         setup_started_at = time.perf_counter()
         _engine, llm = self._ensure_clean_runtime(max_context_tokens=len(normalized_token_ids), max_new_tokens=1, seed=seed)
         self.prefill_setup_seconds += time.perf_counter() - setup_started_at
@@ -1143,6 +1145,8 @@ class Qwen35AssistantRuntime:
         else:
             llm.model_runner.call("run", scheduled, is_prefill)
         seq = scheduled[0]
+        if self.context_progress is not None:
+            self.context_progress(len(initial_token_ids), len(normalized_token_ids))
         seq = self._chunk_prefill_suffix(seq, normalized_token_ids[len(initial_token_ids):], processed_tokens=len(initial_token_ids))
         self._seal_sequence(seq)
         self._log_speculative_alignment(seq, "after context prefill")
@@ -1168,6 +1172,9 @@ class Qwen35AssistantRuntime:
             suffix = suffix[1:]  # a response that sampled its own end of turn (after parallel tool calls) keeps it once, as the chat format writes it
         if len(suffix) == 0:
             return seq
+        target_tokens = len(seq.token_ids) + len(suffix)
+        if self.context_progress is not None and processed_tokens is None:
+            self.context_progress(len(seq.token_ids), target_tokens)
         llm = self._get_live_llm()
         speculative = bool(getattr(self.model, "_prompt_enhancer_speculative_decoding", False))
         # Without MTP, decode processes the last token (a sampled token or the
@@ -1217,7 +1224,7 @@ class Qwen35AssistantRuntime:
                 )
                 self._log_speculative_alignment(seq, f"after suffix chunk {chunk_index}/{total_chunks}")
                 if self.context_progress is not None:
-                    self.context_progress(chunk_index, total_chunks)
+                    self.context_progress(seq.num_tokens, target_tokens)
         finally:
             seq.logits_processor = original_processor
             seq.logits_processor_update_state = original_update

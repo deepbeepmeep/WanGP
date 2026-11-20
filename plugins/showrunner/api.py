@@ -106,6 +106,11 @@ class Steer(BaseModel):
     text: str = Field(min_length=1, max_length=20000)
 
 
+class UpscaleRequest(BaseModel):
+    process: str  # one of /api/upscalers' ids
+    multiplier: float | None = None  # one of its multipliers, when it offers some
+
+
 def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
     app = FastAPI(title=title, docs_url=None, redoc_url=None, openapi_url=None)
     store = showrunner.store
@@ -270,7 +275,7 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
     @app.post("/api/productions/{production_id}/upload")
     async def upload(production_id: str, file: UploadFile = File(...), role: str = Form("bin"), target: str | None = Form(None)):
         production(production_id)
-        if role not in ("bin", "song", "source", "reference", "cast", "take", "shot", "painted", "track", "subtitles"):
+        if role not in ("bin", "song", "source", "reference", "cast", "take", "shot", "painted", "track", "subtitles", "start", "end", "line"):
             raise HTTPException(400, "Unknown upload role.")
         with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename or "").suffix) as handle:
             shutil.copyfileobj(file.file, handle)
@@ -363,6 +368,18 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
         showrunner.director.steer(production_id, request.text)
         return showrunner.director.status(production_id)
 
+    @app.post("/api/productions/{production_id}/director/queue")
+    def queue(production_id: str, request: Steer):
+        production(production_id)
+        showrunner.director.queue(production_id, request.text)
+        return showrunner.director.status(production_id)
+
+    @app.post("/api/productions/{production_id}/director/queue/{index}/remove")
+    def unqueue(production_id: str, index: int):
+        production(production_id)
+        showrunner.director.unqueue(production_id, index)
+        return showrunner.director.status(production_id)
+
     @app.post("/api/productions/{production_id}/director/pause")
     def pause_director(production_id: str, now: bool = False):
         production(production_id)
@@ -425,6 +442,15 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
     def rerun(production_id: str, shot_id: str):
         production(production_id)
         return showrunner.rerun(production_id, shot_id)
+
+    @app.get("/api/upscalers")
+    def upscalers():
+        return {"upscalers": showrunner.host.upscalers()}
+
+    @app.post("/api/productions/{production_id}/versions/{deliverable_id}/upscale")
+    def upscale(production_id: str, deliverable_id: str, request: UpscaleRequest):
+        production(production_id)
+        return showrunner.upscale_version(production_id, deliverable_id, request.process, request.multiplier)
 
     @app.get("/api/singer-voice")
     def singer_voice():

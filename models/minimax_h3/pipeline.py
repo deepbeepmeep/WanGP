@@ -1477,7 +1477,9 @@ class MiniMaxH3Pipeline:
                                                sigma_video, source_buffer, 1.0 - VISUAL_COND_TIMESTEP)
                     model_sigma_video = condition_control_video(video, sigma_video)
                     payload["endpoint_sigmas"] = (sigma_video_next, stage_sigmas_audio[step + 1])  # where the step lands: HyperFlow's r
-                    video_velocity, audio_velocity = self.transformer(video, audio, model_sigma_video, stage_sigmas_audio[step:step + 1], context, payload, spectrum=spectrum, first_block_cache=first_block_cache)
+                    video_velocity, audio_velocity = self.transformer(
+                        video, audio, model_sigma_video, stage_sigmas_audio[step:step + 1], context, payload,
+                        spectrum=spectrum, first_block_cache=first_block_cache)
                     if spectrum is not None:
                         spectrum.finish_step()
                     if stage_solver == "er_sde":

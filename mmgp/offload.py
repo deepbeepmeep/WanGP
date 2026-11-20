@@ -6782,7 +6782,7 @@ class LoadingCallback:
         self.check_abort()
 
 
-def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, minimumBudget = 0, workingVRAM = None, asyncTransfers = True, compile = False, convertWeightsFloatTo = torch.bfloat16, perc_reserved_mem_max = 0, coTenantsMap = None, vram_safety_coefficient = 0.85, compile_mode ="default", verboseLevel = -1, loading_callback=None, prefetchWindow = None, smartPinning = None, autoPreload = False, cudaGraphs = False, preloadExperts = True, cpuCompute = False, cpuComputePinning = 0, pinPool = False, cpuComputeForce = False, preloadPriority = None):
+def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, minimumBudget = 0, workingVRAM = None, asyncTransfers = True, compile = False, convertWeightsFloatTo = torch.bfloat16, perc_reserved_mem_max = 0, coTenantsMap = None, vram_safety_coefficient = 0.85, compile_mode ="default", verboseLevel = -1, loading_callback=None, prefetchWindow = None, smartPinning = None, autoPreload = False, cudaGraphs = False, preloadExperts = True, cpuCompute = False, cpuComputePinning = 0, pinPool = False, cpuComputeForce = False, preloadPriority = None, cudaGraphsProbe = None):
     """Configure offloading, optionally reporting phases and accepting cancellation."""
     global last_offload_obj
     kwargs = locals().copy()
@@ -6803,7 +6803,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
         raise error from None
 
 
-def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, minimumBudget = 0, workingVRAM = None, asyncTransfers = True, compile = False, convertWeightsFloatTo = torch.bfloat16, perc_reserved_mem_max = 0, coTenantsMap = None, vram_safety_coefficient = 0.85, compile_mode ="default", verboseLevel = -1, loading_callback=None, prefetchWindow = None, smartPinning = None, autoPreload = False, cudaGraphs = False, preloadExperts = True, cpuCompute = False, cpuComputePinning = 0, pinPool = False, cpuComputeForce = False, preloadPriority = None):
+def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, minimumBudget = 0, workingVRAM = None, asyncTransfers = True, compile = False, convertWeightsFloatTo = torch.bfloat16, perc_reserved_mem_max = 0, coTenantsMap = None, vram_safety_coefficient = 0.85, compile_mode ="default", verboseLevel = -1, loading_callback=None, prefetchWindow = None, smartPinning = None, autoPreload = False, cudaGraphs = False, preloadExperts = True, cpuCompute = False, cpuComputePinning = 0, pinPool = False, cpuComputeForce = False, preloadPriority = None, cudaGraphsProbe = None):
     """Hook to a pipeline or a group of modules in order to reduce their VRAM requirements:
     pipe_or_dict_of_modules : the pipeline object or a dictionary of modules of the model
     quantizeTransformer: set True by default will quantize on the fly the video / image model
@@ -6843,6 +6843,10 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
         graph per location of its weights (kept in VRAM, or each slot of the swapped blocks); its LoRA copies come and go with it as without
         graphs, copied before each replay into buffers that its graphs read.
         See mmgp.cuda_graphs for the contract of a block call.
+    cudaGraphsProbe: None by default. Model ids among the graphed ones (or one id) whose blocks capture graphs only when they are worth
+        it: the first block calls of each scope are timed, and when the GPU work of a block lasts much longer than the host takes to issue
+        it (the GPU is the bottleneck, a graph would save nothing), the scope's blocks run without graphs. The other graphed models always
+        capture.
     cpuCompute: False by default. True, "auto" (the models that declare _mm_cpu_compute_reserve, e.g. language model decoders) or model ids:
         the blocks of the towers of these models that are not kept in VRAM compute their large
         linears on the CPU, in their storage, for short calls (decoding: at most the model's _mm_cpu_compute_max_rows rows, CPU_COMPUTE_MAX_ROWS
@@ -6967,6 +6971,7 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
 
     self.anyCompiledModule = compileAllModels or len(modelsToCompile)>0
     graphed_models = [] if isinstance(cudaGraphs, bool) else cudaGraphs if isinstance(cudaGraphs, list) else [cudaGraphs]
+    probed_models = cudaGraphsProbe if isinstance(cudaGraphsProbe, (list, tuple)) else [] if cudaGraphsProbe is None else [cudaGraphsProbe]
     cpu_models = list(models) if cpuCompute is True else [] if not cpuCompute else [model_id for model_id, model in models.items() if hasattr(model, "_mm_cpu_compute_reserve")] if cpuCompute == "auto" \
                  else cpuCompute if isinstance(cpuCompute, list) else [cpuCompute]
     self.pool_models = [] if not pinPool or not asyncTransfers else list(models) if pinPool is True else pinPool if isinstance(pinPool, list) else [pinPool]
@@ -7144,7 +7149,7 @@ def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLo
             from .cuda_graphs import BlockGraphs
             graphs = self.cuda_graphs[model_id] = BlockGraphs(model_id, functools.partial(self._graph_weights_key, current_model), functools.partial(self._graph_weight_tensors, current_model),
                                                               functools.partial(self._graph_lora_inputs, current_model), functools.partial(self._graph_ready, model_id),
-                                                              functools.partial(self._graph_forget, current_model))
+                                                              functools.partial(self._graph_forget, current_model), probe=model_id in probed_models)
             towers_set = set(towers_modules)
 
         loading_phase("Hooks and LoRA Slots", model_id)

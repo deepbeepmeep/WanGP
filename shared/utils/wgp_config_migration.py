@@ -12,7 +12,7 @@ from shared.remote_llm.config import QWEN38_FLASH_NEXT_VISIBLE
 
 LEGACY_EXTENSIONS_DEFAULTS_MIGRATED_KEY = "_extensions_defaults_migrated"
 EXTENSIONS_DEFAULTS_VERSION_KEY = "extensions_defaults_version"
-EXTENSIONS_DEFAULTS_TARGET_VERSION = Decimal("1.33")
+EXTENSIONS_DEFAULTS_TARGET_VERSION = Decimal("1.34")
 EXTENSIONS_DEFAULTS_TARGET_VERSION_TEXT = str(EXTENSIONS_DEFAULTS_TARGET_VERSION)
 INSTALLED_REMOTE_PLUGINS_KEY = "installed_remote_plugins"
 
@@ -322,6 +322,10 @@ def migrate_extension_defaults(server_config, server_config_filename="", *, work
     if version < Decimal("1.33"):  # Attention Head Split became the Smart Inputs Chunker under a new key: its Auto (any level) is On
         head_split = server_config.pop("attention_head_split", 0)
         server_config.setdefault("inputs_chunker", "off" if _is_off(head_split) else "on")
+        changed = True
+
+    if version < Decimal("1.34") and server_config.get("compile") == "cudagraph":  # CUDA graphs only where they save time
+        server_config["compile"] = "auto"
         changed = True
 
     if workspace_root is not None and version < Decimal('1.28'):

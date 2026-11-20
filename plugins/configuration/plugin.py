@@ -1,6 +1,7 @@
 from postprocessing import memory as processor_memory
 from shared.kernels import fp8_backend, int8_backend, kernel_policy
 from shared import attention_kit, model_dropdowns
+from shared.attention import sagegp_ready
 from shared.cuda_memory import COMPUTE_CACHE_KEY, COMPUTE_CACHE_PATH_DEFAULT, COMPUTE_CACHE_PATH_KEY, RAM_ALLOCATOR_DEFAULT, RAM_ALLOCATOR_KEY, compute_cache_folder, compute_cache_useful
 import gradio as gr
 from shared.utils.plugins import WAN2GPPlugin
@@ -427,6 +428,12 @@ class ConfigTabPlugin(WAN2GPPlugin):
                     self.attention_choice = gr.Dropdown(
                         choices=self.attention_modes_choices,
                         value=self.attention_mode, label="Attention Type", interactive=not self.args.lock_config
+                    )
+                    self.sage2_first_step_precise_choice = gr.Checkbox(
+                        value=self.server_config.get("sage2_first_step_precise", kernel_policy.SAGE2_FIRST_STEP_PRECISE_DEFAULT),
+                        label="Run the First Denoising Step in Precise (Sage 2/3 Adaptative GP and Sage3 GP)", interactive=not self.args.lock_config,
+                        info="The first step sets the composition: computed precisely, the video stays closer to an exact computation for a small part of the speed gain.",
+                        visible=sagegp_ready,
                     )
                     self.quantization_choice = gr.Dropdown(choices=self.transformer_quantization_choices, value=self.transformer_quantization, label="Transformer Model Quantization (if available otherwise get the closest available)")
                     self.transformer_dtype_policy_choice = gr.Dropdown(choices=[("Auto (Best for Hardware)", ""), ("FP16", "fp16"), ("BF16", "bf16")], value=self.transformer_dtype_policy, label="Transformer Data Type (if available)")
@@ -1090,7 +1097,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
         inputs = [
             self.state,
             self.transformer_types_choices, self.show_all_model_filter_choice, self.fit_canvas_choice,
-            self.attention_choice, self.generation_preview_choice, self.preload_model_policy_choice, self.clear_file_list_choice, self.multi_prompts_gen_type_choice, self.keep_intermediate_sliding_windows_choice,
+            self.attention_choice, self.sage2_first_step_precise_choice, self.generation_preview_choice, self.preload_model_policy_choice, self.clear_file_list_choice, self.multi_prompts_gen_type_choice, self.keep_intermediate_sliding_windows_choice,
             self.display_stats_choice, self.max_frames_multiplier_choice, self.keep_resolution_on_model_switch_choice, self.enable_4k_resolutions_choice, self.checkpoints_paths_choice, self.loras_root_choice, self.save_queue_if_crash_choice,
             self.UI_theme_choice, self.floating_generate_button_choice, self.queue_color_scheme_choice, self.process_queues_when_browser_unfocused_choice, self.prevent_power_throttling_choice, self.compute_cache_choice, self.compute_cache_path_choice,
             self.quantization_choice, self.transformer_dtype_policy_choice, self.mixed_precision_choice,
@@ -1208,7 +1215,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
 
         (
             transformer_types_choices, show_all_model_filter_choice, fit_canvas_choice,
-            attention_choice, generation_preview_choice, preload_model_policy_choice, clear_file_list_choice, multi_prompts_gen_type_choice, keep_intermediate_sliding_windows_choice,
+            attention_choice, sage2_first_step_precise_choice, generation_preview_choice, preload_model_policy_choice, clear_file_list_choice, multi_prompts_gen_type_choice, keep_intermediate_sliding_windows_choice,
             display_stats_choice, max_frames_multiplier_choice, keep_resolution_on_model_switch_choice, enable_4k_resolutions_choice, checkpoints_paths_choice, loras_root_choice, save_queue_if_crash_choice,
             UI_theme_choice, floating_generate_button_choice, queue_color_scheme_choice, process_queues_when_browser_unfocused_choice, prevent_power_throttling_choice, compute_cache_choice, compute_cache_path_choice,
             quantization_choice, transformer_dtype_policy_choice, mixed_precision_choice,
@@ -1342,7 +1349,8 @@ class ConfigTabPlugin(WAN2GPPlugin):
 
         new_server_config = copy.deepcopy(old_server_config)
         new_server_config.update({
-            "attention_mode": attention_choice, "transformer_types": transformer_types_choices,
+            "attention_mode": attention_choice, "sage2_first_step_precise": sage2_first_step_precise_choice,
+            "transformer_types": transformer_types_choices,
             model_dropdowns.SHOW_ALL_MODEL_FILTER_CONFIG_KEY: show_all_model_filter_choice,
             "generation_preview": generation_preview_choice,
             "text_encoder_quantization": text_encoder_quantization_choice, "save_path": save_path_choice,
@@ -1493,7 +1501,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             'workspace_storage_mode', 'workspaces_dir', 'mcp_workspace_mode', 'mcp_port', 'mcp_webui', 'mcp_workspace_visibility', 'mcp_visual_inspection',
             VOICE_MODE_KEY,
             DEEPY_VOICE_LANGUAGE_KEY,
-            "attention_mode", "vae_config", "boost", "int8_kernels", "fp8_kernels", "kernel_precision", "inputs_chunker", "save_path", "image_save_path", "audio_save_path", "mesh_save_path",
+            "attention_mode", "sage2_first_step_precise", "vae_config", "boost", "int8_kernels", "fp8_kernels", "kernel_precision", "inputs_chunker", "save_path", "image_save_path", "audio_save_path", "mesh_save_path",
             "metadata_type", "clear_file_list", "multi_prompts_gen_type", "keep_intermediate_sliding_windows", "fit_canvas", "depth_anything_v2_variant",
             "notification_sound_enabled", "notification_sound_volume", *notifications.CONFIG_KEYS, "audio_processors", "temporal_upsamplers", "spatial_upsamplers", "matanyone_version", REMBG_MODEL_KEY,
             "prompt_enhancer_temperature", "prompt_enhancer_top_p", "prompt_enhancer_randomize_seed", "prompt_enhancer_quantization", PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY, "enhancer_mode",
@@ -1560,6 +1568,9 @@ class ConfigTabPlugin(WAN2GPPlugin):
         upsampler_api.release_changed_config_upsamplers(old_server_config, new_server_config, changes)
         if "kernel_precision" in changes:
             kernel_policy.configure(new_server_config["kernel_precision"])
+        if "sage2_first_step_precise" in changes:
+            kernel_policy.configure_sage2_first_step_precise(new_server_config["sage2_first_step_precise"])
+            attention_kit.reset_chunking_measurements()
         if "inputs_chunker" in changes:
             attention_kit.configure(new_server_config["inputs_chunker"])
         if int8_resolution is not None:

@@ -2,9 +2,11 @@
 """What the Showrunner page and Deepy's toolbox both do: imports, takes with their posters, song analysis, reruns and assembly."""
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import random
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -71,6 +73,7 @@ class Showrunner:
         self.director = Director(store, host, settle=self.settle)
         self._renders: dict[tuple[str, str], Any] = {}
         self._voice_changes: set[str] = set()  # productions whose song is changing voice
+        self._upscales: set[str] = set()  # productions with a version being upscaled
         self._render_lock = threading.Lock()
         self._analysis_lock = threading.Lock()
 
@@ -88,7 +91,7 @@ class Showrunner:
         return facts
 
     def upload(self, production_id: str, filename: str, data_path: Path, role: str = "bin", target: str | None = None) -> dict[str, Any]:
-        """Import a dropped file into the production's media folder, then use it as: bin, song, reference, cast (target = cast id or new), take (target = shot id; a sound
+        """Import a dropped file into the production's media folder, then use it as: bin, song, reference, cast (target = cast id or new), start / end (target = shot id: the picture it starts or ends on), line (target = "shot:index": the user's recording of that dialogue line), take (target = shot id; a sound
         plays over the edit from that shot), shot (a video or a picture as a new shot, target = its position or the end), painted (target = "shot:frame",
         a remake's painted frame), track (narration, score or effects over the edit, from shot target or 0 s) or subtitles (an SRT file)."""
         production = self.store.get(production_id)
@@ -132,6 +135,19 @@ class Showrunner:
             production.apply([{"op": "edit", "fields": {"audio_tracks": tracks, **({"audio_mode": "mix"} if doc["edit"]["audio_mode"] == "song" else {})}}])
         elif role == "take":
             production.apply([{"op": "add_take", "shot": target, "take": {**facts, "note": "Uploaded"}}])
+        elif role == "line":  # the user's recording of a dialogue line (target "shot:index"): it drives the shot as a spoken line does, and nothing re-records it
+            if facts["kind"] != "audio":
+                raise ValueError("A line's recording is a sound file.")
+            shot_id, _, index = str(target).rpartition(":")
+            dialogue = copy.deepcopy(model.find(production.snapshot()["shots"], shot_id, "shot")["dialogue"])
+            line = dialogue[int(index)]
+            line.update(audio=relative, own=True, voice="", spoken=model.line_key(line), duration_s=facts["duration_s"])
+            production.apply([{"op": "update_shot", "shot": shot_id, "fields": {"dialogue": dialogue}}])
+        elif role in ("start", "end"):  # a picture the shot starts or ends on, in place of a frame of another shot or the shot before it
+            if facts["kind"] != "image":
+                raise ValueError("A start or end picture is an image.")
+            key, link = ("image_start", "start_from") if role == "start" else ("image_end", "end_on")
+            production.apply([{"op": "update_shot", "shot": target, "fields": {link: None, **({"continues": False} if role == "start" else {}), "generation": {"settings": {key: relative}}}}])
         elif role == "shot":  # a video or a picture of the user's as a new shot (target: its position, else the end)
             if facts["kind"] == "audio":
                 raise ValueError("A shot is a video or a picture: drop a sound on a shot to play it from there.")
@@ -147,10 +163,12 @@ class Showrunner:
         return {"path": relative, "role": role, "target": target, **facts}
 
     def add_take(self, production_id: str, shot_id: str, path: str | Path, *, by: str, settings: dict[str, Any] | None = None, media_id: str | None = None,
-                 note: str = "", gpu_s: float | None = None, base_loras: list[Any] | None = None, tier: str | None = None, kept_source: bool = False, choose: bool = True) -> dict[str, Any]:
+                 note: str = "", gpu_s: float | None = None, base_loras: list[Any] | None = None, tier: str | None = None, kept_source: bool = False, choose: bool = True,
+                 links: dict[str, Any] | None = None) -> dict[str, Any]:
         production = self.store.get(production_id)
         facts = self.take_facts(production, production.resolve(production.adopt(path)))  # a take from outside the production is copied in
-        take = {**facts, "media": media_id, "settings": production.rel_settings(settings or {}), "note": note, "gpu_s": None if gpu_s is None else round(gpu_s, 1), "base_loras": base_loras, "tier": tier, "kept_source": kept_source}
+        take = {**facts, "media": media_id, "settings": production.rel_settings(settings or {}), "note": note, "gpu_s": None if gpu_s is None else round(gpu_s, 1), "base_loras": base_loras, "tier": tier, "kept_source": kept_source,
+                "links": links}
         result = production.apply([{"op": "add_take", "shot": shot_id, "take": take, "choose": choose}], by=by)
         return {**result[0], **facts}
 
@@ -277,6 +295,48 @@ class Showrunner:
         finally:
             with self._render_lock:
                 self._voice_changes.discard(production.id)
+
+    def upscale_version(self, production_id: str, deliverable_id: str, process: str, multiplier=None) -> dict[str, Any]:
+        """A version at a larger size, in the background, by one of WanGP's spatial upsamplers: a new version of the same edit (its picture only
+        changes), so it is as current as the version it comes from. Faces and lips stay as they are; Final re-renders the shots for more detail."""
+        production = self.store.get(production_id)
+        version = model.find(production.snapshot()["deliverables"], deliverable_id, "version")
+        if version.get("kind") != "video":
+            raise ValueError("Only a video version can be upscaled.")
+        upscaler = next((item for item in self.host.upscalers() if item["id"] == process), None)
+        if upscaler is None:
+            raise ValueError(f"No upsampler {process} in this WanGP: Configuration > Extensions lists them.")
+        if upscaler["multipliers"] and multiplier not in upscaler["multipliers"]:
+            raise ValueError(f"{upscaler['label']} scales by {', '.join(f'{value:g}' for value in upscaler['multipliers'])}.")
+        with self._render_lock:
+            if production_id in self._upscales:
+                raise RuntimeError("A version of this production is already being upscaled.")
+            self._upscales.add(production_id)
+        threading.Thread(target=self._upscale, args=(production, version, upscaler, multiplier), daemon=True).start()
+        return {"status": "upscaling"}
+
+    def _upscale(self, production, version, upscaler, multiplier):
+        publish = lambda **fields: self.store.publish({"type": "upscale", "production": production.id, "version": version["id"], **fields})
+        context = _DirectContext(self, production)
+        try:
+            publish(progress=0, status="Waiting for the GPU")
+            with self.host.gpu_turn(context.cancelled):  # never beside a language model, after the showrunners at work
+                workspace = self.host.production_workspace(production.snapshot()["title"], production.folder / "media")
+                made = self.host.upscale_video(production.resolve(version["path"]), upscaler["id"], multiplier, workspace,
+                                               on_progress=lambda update: publish(progress=getattr(update, "progress", None), status=getattr(update, "status", "")))
+            source = production.resolve(version["path"])
+            out = source.with_name(f"{source.stem}-{upscaler['id']}{f'-x{multiplier:g}' if multiplier else ''}{made.suffix}")
+            shutil.move(str(made), out)
+            facts = self.take_facts(production, out)
+            label = f"{upscaler['label']}{f' ×{multiplier:g}' if multiplier else ''}"
+            production.apply([{"op": "deliverable", "deliverable": {**facts, "kind": "video", "method": f"upscaled with {label}", "revision": version.get("revision"), "by": "user",
+                                                                    "edit_key": version.get("edit_key"), "snapshot": version.get("snapshot"), "upscaled_from": version["id"]}}], by="user")
+            publish(done=True)
+        except Exception as failure:
+            publish(done=True, error=str(failure))
+        finally:
+            with self._render_lock:
+                self._upscales.discard(production.id)
 
     @staticmethod
     def _delivered(shot: dict[str, Any], fps: float) -> tuple[int, int]:
@@ -578,6 +638,10 @@ class Showrunner:
         if take is None or not take.get("settings"):
             raise ValueError("This shot has no take with saved settings yet: use Render now.")
         tier = take.get("tier")
+        ends = {"image_start", "image_end"}
+        if shot.get("continues") or shot.get("start_from") or shot.get("end_on") or ends & set(take["settings"]) or ends & set(shot["generation"].get("settings") or {}):
+            self.render_directly(production_id, [shot_id], final=tier == "final", new_seed=True)  # its start and end as they are now: another shot's new take, a new picture
+            return {"shot": shot_id, "status": "rendering"}
         settings = production.resolve_settings(take["settings"])
         settings.update({key: value for key, value in shot["generation"].get("settings", {}).items() if key in ("prompt", "alt_prompt", "negative_prompt")})
         if take.get("base_loras"):  # the cast cards say which LoRAs of the cast this take gets, as they are now

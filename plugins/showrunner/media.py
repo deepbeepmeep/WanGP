@@ -286,6 +286,20 @@ def padded_audio(path: str | Path, duration_s: float, out_folder: str | Path) ->
     return out
 
 
+def prefixed_audio(clip: str | Path, path: str | Path, frames: int, fps: float, out_folder: str | Path) -> Path:
+    """The sound of a clip's `frames` frames (silence when it has none) followed by an audio file, as a WAV in out_folder: the driving audio of a
+    shot that continues that clip, which WanGP reads from the first frame it shares with it."""
+    duration = frames / fps
+    out = Path(out_folder) / f"{Path(clip).stem}-then-{Path(path).stem}.wav"
+    if not out.is_file():
+        out.parent.mkdir(parents=True, exist_ok=True)
+        head = ["-i", str(clip)] if probe(clip)["has_audio"] else ["-f", "lavfi", "-t", f"{duration:.6f}", "-i", "anullsrc=r=48000:cl=stereo"]
+        same = "aresample=48000,aformat=sample_fmts=s16:channel_layouts=stereo"
+        _run([ffmpeg(), "-y", "-v", "error", *head, "-i", str(path), "-filter_complex",
+              f"[0:a]atrim=end={duration:.6f},apad=whole_dur={duration:.6f},{same}[head];[1:a]{same}[rest];[head][rest]concat=n=2:v=0:a=1[out]", "-map", "[out]", "-c:a", "pcm_s16le", str(out)])
+    return out
+
+
 def joined_audio(paths: list[str | Path], out_folder: str | Path, gap_s: float = 0.3) -> Path:
     """Audio files one after the other with gap_s of silence between them, as a WAV in out_folder (the lines of a shot driving it together)."""
     key = hashlib.sha1(json.dumps([[str(path), Path(path).stat().st_mtime_ns] for path in paths] + [gap_s]).encode("utf-8")).hexdigest()[:12]

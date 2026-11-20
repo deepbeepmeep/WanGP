@@ -7,6 +7,7 @@ from functools import lru_cache
 import torch
 
 from shared.kernels.token_mean import token_mean
+from shared.kernels import sage_block_query
 
 try:  # SageAttention 2
     from sageattention.triton.quant_per_block_varlen import quant_per_block_int8_kernel
@@ -151,9 +152,16 @@ def staged_quantize_k(k_list, settings):
 def staged_quantize_q(q, settings, sm_scale=None):
     """INT8 q with its scales (the softmax scale, in base 2, goes into them: sm_scale, or that of q's head_dim); q is not released
     (staged_attention can write the output into it)."""
+    factor = (_sm_scale(q.shape[-1]) if sm_scale is None else sm_scale) * 1.44269504
+    batch, tokens, heads, dim = q.shape
+    if (settings.get("recycle_query") and _fp16_required(q.device) and (q.dtype == torch.float16 or _bits_input(q))
+            and (batch == 1 or q.stride(0) == tokens * q.stride(1)) and sage_block_query.recyclable_query(q)):
+        packed, scales = sage_block_query.pack_query(q, 128, factor, varlen=True)
+        return (packed.view(-1, heads, dim), scales.view(-1, heads), _offsets(batch, tokens, q.device),
+                _offsets(batch, scales.size(1), q.device))
     if q.dtype == torch.bfloat16 and _fp16_required(q.device) and not _bits_input(q):
         q = q.to(torch.float16)
-    return _quantize(q, 128, (_sm_scale(q.shape[-1]) if sm_scale is None else sm_scale) * 1.44269504)
+    return _quantize(q, 128, factor)
 
 
 @torch.compiler.disable
@@ -197,6 +205,8 @@ def staged_attention(out, quantized_list, settings, attn_mask=None, return_lse=F
         _attn_fwd[grid](*args, *strides, heads, heads // k_int8.shape[1], **launch)
     if fp16_output:
         out.copy_(rows.view(out.shape))
+    elif settings.get("recycle_query") and q_int8.data_ptr() == out.data_ptr():
+        torch.autograd.graph.increment_version(out)
     out = out if v_scale is None else scale_output(out, v_scale, 2)
     return (out, lse) if return_lse else out
 
@@ -256,7 +266,10 @@ def attention(qkv_list, recycle_q=False, scale_v=False, attention_mask=None, sm_
     padded, sm_scale = padded_head_dim(head_dim, q.device), _sm_scale(head_dim) if sm_scale is None else sm_scale
     if padded != head_dim:
         q, k, v = (torch.nn.functional.pad(tensor, (0, padded - head_dim)) for tensor in (q, k, v))
+    recycle_q = recycle_q and not (torch._C._overlaps(q, k) or torch._C._overlaps(q, v))
     settings = SCALED_V_SETTINGS if scale_v else SETTINGS
+    if recycle_q:
+        settings = {**settings, "recycle_query": True}
     quantized = [None, _quantize_k(k, False), staged_quantize_v([v], settings)]
     k = v = None
     quantized[0] = staged_quantize_q(q, settings, sm_scale)

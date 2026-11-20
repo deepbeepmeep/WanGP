@@ -2233,6 +2233,11 @@ WAC.setRestoration = function (restoration) {
   WAC.setStatus(WAC.state.status);
 };
 
+WAC.effectiveStatus = function (status) {
+  if (status?.kind === 'session_loading' && status.progress) return status;
+  return WAC.restorationStatus || status;
+};
+
 WAC.uploadMediaFiles = async function (files, request, notice, updateGallery, fromChat = false) {
   let lastId = null;
   for (const file of files) {
@@ -2329,7 +2334,7 @@ WAC.waitForChatUpload = async function () {
 
 WAC.setStatus = function (status, restoreAnchor) {
   WAC.state.status = status || null;
-  const effective = WAC.restorationStatus || status;
+  const effective = WAC.effectiveStatus(status);
   const node = WAC.statusNode();
   const key = effective?.visible && effective.kind === 'tool' ? WAC.chatSessionId + ':' + effective.text : null;
   if (key && node?.classList.contains('is-visible') && node.querySelector('.chat__status-text')?.title !== String(effective.text)) {
@@ -2358,7 +2363,7 @@ WAC.syncStatusLayout = function (scrollState = WAC.captureAutoscrollState()) {
 WAC.renderStatus = function (status, restoreAnchor) {
   WAC.ensureShell();
   const scrollState = WAC.captureAutoscrollState();
-  status = WAC.restorationStatus || status;
+  status = WAC.effectiveStatus(status);
   const restoring = !!WAC.restorationStatus;
   document.querySelectorAll('button#assistant_chat_reset_button, #assistant_chat_reset_button button').forEach(button => { button.disabled = restoring; });
   const node = WAC.statusNode();

@@ -9,6 +9,7 @@ SageAttention 2's quantizers (Apache 2.0, https://github.com/thu-ml/SageAttentio
 quant_per_block.py), so the quantization-only mode reproduces them bit for bit; the row groups of a scale follow the layouts
 LAYOUT_PER_BLOCK (one scale per block of rows), LAYOUT_THREAD_Q (eight scales per 32 rows, rows r, r + 8, r + 16, r + 24),
 LAYOUT_THREAD_K (four scales per 64 rows, row pairs) and LAYOUT_WARP_Q (four scales per 128 rows, 32 consecutive rows each).
+The SM120 CUDA query layout uses its own 32-row kernel below, rounding the rotation to the input dtype before nearest-even INT8 conversion.
 The rotation pairs channel p with p + PAIRS (split halves) or, interleaved, 2p with 2p + 1; the cos / sin of pair p are read at the
 table's pair stride, the sine at its last-dimension stride from the cosine, so a (..., pairs, 2) table and the 2 x 2 matrices
 [[cos, -sin], [sin, cos]] of a (..., pairs, 2, 2) table both work as they are.
@@ -22,6 +23,7 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from .triton_tuner import LaunchTuner
+from .sage_block_query import recyclable_query as recyclable_query
 
 LAYOUT_PER_BLOCK, LAYOUT_THREAD_Q, LAYOUT_THREAD_K, LAYOUT_WARP_Q = 0, 1, 2, 3
 SCALES_PER_BLOCK = {LAYOUT_PER_BLOCK: 1, LAYOUT_THREAD_Q: 8, LAYOUT_THREAD_K: 4, LAYOUT_WARP_Q: 4}
@@ -41,7 +43,7 @@ def _blocks(seq, layout, block):
 @triton.jit
 def _rows(X, W, WROW, ROPE, MEAN, base, seq, ok, c, batch, head, RB, RS, RH, MB, MH, WH, EPS, RP: tl.constexpr, RC: tl.constexpr, D: tl.constexpr,
           PAIRS: tl.constexpr, NORM: tl.constexpr, ROTATE: tl.constexpr, HAS_MEAN: tl.constexpr, SUB: tl.constexpr, LANES: tl.constexpr,
-          INTERLEAVED: tl.constexpr, SEGMENTED: tl.constexpr, ROPE_FIRST: tl.constexpr):
+          INTERLEAVED: tl.constexpr, SEGMENTED: tl.constexpr, ROPE_FIRST: tl.constexpr, FIXED_LANES: tl.constexpr = False):
     """The rows at base (one head; c spans D rounded up to a power of two, the channels beyond D are zeros): weighted RMSNorm in FP32
     rounded to the activation dtype (NORM; the weight row of each token from WROW with SEGMENTED, else that of the head at stride WH,
     0 for one row), the rotation of the first 2 * PAIRS channels in FP32 (ROTATE, cos / sin pairs of ROPE), minus the head's MEAN row
@@ -59,7 +61,16 @@ def _rows(X, W, WROW, ROPE, MEAN, base, seq, ok, c, batch, head, RB, RS, RH, MB,
             even, odd = tl.split(lanes)
             x0, x2 = tl.split(even)
             x1, x3 = tl.split(odd)
-            total = tl.sum(tl.fma(x3, x3, tl.fma(x2, x2, tl.fma(x1, x1, x0 * x0))), 1)
+            squares = tl.fma(x3, x3, tl.fma(x2, x2, tl.fma(x1, x1, x0 * x0)))
+            if FIXED_LANES:
+                # _rms_rope sums lanes at XOR distances 16, 8, 4, 2, 1. A CTA spanning a whole quantization
+                # group otherwise reduces in a different order and can move a rotated value across an INT8 boundary.
+                for stage in tl.static_range(5):
+                    left, right = tl.split(tl.permute(tl.reshape(squares, (SUB, 2, 16 >> stage)), 0, 2, 1))
+                    squares = left + right
+                total = tl.reshape(squares, (SUB,))
+            else:
+                total = tl.sum(squares, 1)
         else:
             total = tl.sum(x * x, 1)
         inv = libdevice.rsqrt(total / D + EPS)[:, None]
@@ -99,11 +110,11 @@ def _norm_rope_quant(X, W, WROW, ROPE, OUT, SCALE, MEAN, SUMS, SEQ, XB, XS, XH, 
                      SCALE_EPS, RP: tl.constexpr, RC: tl.constexpr, D: tl.constexpr, PAIRS: tl.constexpr, NORM: tl.constexpr, ROTATE: tl.constexpr,
                      SUM_ONLY: tl.constexpr, HAS_MEAN: tl.constexpr, LAYOUT: tl.constexpr, BLOCK: tl.constexpr, GROUPS: tl.constexpr,
                      SUB: tl.constexpr, LANES: tl.constexpr, INTERLEAVED: tl.constexpr, SEGMENTED: tl.constexpr, ROPE_FIRST: tl.constexpr,
-                     DP: tl.constexpr, OW: tl.constexpr):
+                     DP: tl.constexpr, OW: tl.constexpr, RECYCLE: tl.constexpr = False):
     """One block of BLOCK rows (tokens) of one head of one batch item of X (batch, tokens, heads, D), by steps of SUB rows (_rows): the
     sum of the rows into SUMS (SUM_ONLY), or the rows times SM_SCALE as INT8 into OUT with the GROUPS scales of the LAYOUT into SCALE.
     DP: D rounded up to a power of two; OW: the channels written per row of OUT, D or DP (an attention that pads the heads to DP
-    reads zeros beyond D)."""
+    reads zeros beyond D). RECYCLE: OUT is X's own storage (its rows' first bytes): each step's rows are read before they are written."""
     blk = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1).to(tl.int64)
     batch = tl.program_id(2).to(tl.int64)
@@ -150,6 +161,8 @@ def _norm_rope_quant(X, W, WROW, ROPE, OUT, SCALE, MEAN, SUMS, SEQ, XB, XS, XH, 
         else:
             q = v / tl.sum(scale, 0)
         q += 0.5 * tl.where(q >= 0, 1, -1)
+        if RECYCLE:  # the INT8 row overlaps the row's first channels, which other threads of the step read (values, RoPE partners)
+            tl.debug_barrier()
         tl.store(OUT + batch * OB + seq[:, None] * OS + head * OH + c[None, :], q.to(tl.int8), ok[:, None] & (c < OW)[None, :])
 
 
@@ -157,7 +170,7 @@ SUB_ROWS, LANE_SUMS = 8, True  # rows per step (the live tile of the in-place Ro
 
 
 def _launch(x, weight, rope, out, scale, mean, sums, eps, sm_scale, scale_eps, pairs, norm, rotate, sum_only, layout, block, warps, scratch=None,
-            stages=2, sub=None, lanes=None, interleaved=False, weight_rows=None, rope_first=False):
+            stages=2, sub=None, lanes=None, interleaved=False, weight_rows=None, rope_first=False, recycle=False):
     xx = x if scratch is None else scratch
     batch, seq, heads, dim = xx.shape
     blocks = _blocks(seq, layout, block) if not sum_only else triton.cdiv(seq, block)
@@ -172,7 +185,7 @@ def _launch(x, weight, rope, out, scale, mean, sums, eps, sm_scale, scale_eps, p
         seq, *xx.stride()[:3], *rope_args[1:4], *out_args[1:], *scale_args[1:], *mean_args[1:], *sums_args[1:],
         weight.stride(0) if _per_head(weight, weight_rows) else 0, eps, sm_scale, scale_eps, rope_args[4], rope_args[5], dim, pairs, norm, rotate,
         sum_only, mean is not None, layout, block, SCALES_PER_BLOCK[layout], SUB_ROWS if sub is None else sub, LANE_SUMS if lanes is None else lanes,
-        interleaved, weight_rows is not None, rope_first, triton.next_power_of_2(dim), dim if out is None else out.shape[-1],
+        interleaved, weight_rows is not None, rope_first, triton.next_power_of_2(dim), dim if out is None else out.shape[-1], recycle,
         num_warps=warps, num_stages=stages, enable_fp_fusion=False)
 
 
@@ -226,29 +239,82 @@ def norm_rope_mean(x, weight, rope, eps, block=64, *, interleaved=False, weight_
 
 
 def norm_rope_quantize(x, weight, rope, eps, layout, block, *, mean=None, sm_scale=1.0, scale_eps=1e-7, interleaved=False, weight_rows=None,
-                       rope_first=False, width=None):
+                       rope_first=False, width=None, recycle=False):
     """INT8 rows and FP32 scales (batch, heads, blocks * scales per block) of the normalized (weight, eps), rotated (rope, interleaved,
     rope_first as norm_rope_mean) rows of x, minus mean (batch, heads, D) when given and times sm_scale, in the given scale layout and
-    block of rows; x is not modified. width: the INT8 rows' width when the attention pads the heads (D rounded up to a power of two),
-    zeros beyond D."""
+    block of rows; x is not modified, except with recycle: the INT8 rows are written into the first bytes of x's own rows (an x the caller
+    owns, recyclable_query, without padded heads), same values. width: the INT8 rows' width when the attention pads the heads (D rounded
+    up to a power of two), zeros beyond D."""
     batch, seq, heads, dim = x.shape
-    out = torch.empty((batch, seq, heads, width or dim), dtype=torch.int8, device=x.device)
+    out = x.view(torch.int8)[..., :dim] if recycle else torch.empty((batch, seq, heads, width or dim), dtype=torch.int8, device=x.device)
     scale = torch.empty((batch, heads, _blocks(seq, layout, block) * SCALES_PER_BLOCK[layout]), dtype=torch.float32, device=x.device)
     pairs = _pairs(rope)
 
     def launch(xx, config):
         if xx is x:
             _launch(x, weight, rope, out, scale, mean, None, eps, sm_scale, scale_eps, pairs, weight is not None, rope is not None, False, layout, block,
-                    config[0], stages=config[1], interleaved=interleaved, weight_rows=weight_rows, rope_first=rope_first)
-        else:
+                    config[0], stages=config[1], interleaved=interleaved, weight_rows=weight_rows, rope_first=rope_first, recycle=recycle)
+        else:  # tuning on a scratch copy of rows: a recycled launch writes into the scratch's own rows, never into x
             rows = xx.shape[1]
-            _launch(x, weight, rope, out[:1, :rows], scale[:1, :, :_blocks(rows, layout, block) * SCALES_PER_BLOCK[layout]], mean, None, eps, sm_scale, scale_eps,
-                    pairs, weight is not None, rope is not None, False, layout, block, config[0], scratch=xx, stages=config[1], interleaved=interleaved,
-                    weight_rows=weight_rows, rope_first=rope_first)
+            _launch(x, weight, rope, xx.view(torch.int8)[..., :dim] if recycle else out[:1, :rows], scale[:1, :, :_blocks(rows, layout, block) * SCALES_PER_BLOCK[layout]],
+                    mean, None, eps, sm_scale, scale_eps, pairs, weight is not None, rope is not None, False, layout, block, config[0], scratch=xx, stages=config[1],
+                    interleaved=interleaved, weight_rows=weight_rows, rope_first=rope_first, recycle=recycle)
 
     launch(x, _config(x, "norm_rope_quant", f"p{pairs}M{int(mean is not None)}I{int(interleaved)}G{int(weight_rows is not None)}{_variant(weight, weight_rows, rope_first)}"
-                      f"{'' if width in (None, dim) else f'W{width}'}", block, weight is not None, rope is not None, False, layout, launch))
+                      f"{'' if width in (None, dim) else f'W{width}'}{'Y' if recycle else ''}", block, weight is not None, rope is not None, False, layout, launch))
+    if recycle:
+        torch.autograd.graph.increment_version(x)
     return out, scale
+
+
+@triton.jit(do_not_specialize=["N", "H"])
+def _warp_query(X, W, WROW, ROPE, OUT, SCALES, N, H, D: tl.constexpr, XZ, XT, XH, RZ, RT, RH, RP: tl.constexpr,
+                RC: tl.constexpr, WH, EPS, PAIRS: tl.constexpr, INTERLEAVED: tl.constexpr, ROPE_FIRST: tl.constexpr,
+                RECYCLE: tl.constexpr):
+    batch, head = tl.program_id(2).to(tl.int64), tl.program_id(1).to(tl.int64)
+    tile = tl.program_id(0)
+    row = tile.to(tl.int64) * 32 + tl.arange(0, 32)
+    d = tl.arange(0, D)
+    x = _rows(X, W, WROW, ROPE, X, batch * XZ + row * XT + head * XH, row, row < N, d, batch, head,
+              RZ, RT, RH, 0, 0, WH, EPS, RP, RC, D, PAIRS, W is not None, ROPE is not None, False, 32,
+              True, INTERLEAVED, WROW is not None, ROPE_FIRST, True).to(X.dtype.element_ty).to(tl.float32)
+    # The CUDA per-warp quantizer rounds the 16-bit input to nearest even and gives even its padded groups a scale.
+    peak = tl.maximum(tl.max(tl.max(tl.abs(x), 1), 0), 1.e-7)
+    tl.store(SCALES + (batch * H + head) * tl.num_programs(0) + tile, peak / 127.)
+    if RECYCLE:
+        # All source rows and RoPE partners of this tile have been read.
+        tl.debug_barrier()
+        base = 2 * (batch * XZ + row * XT + head * XH)
+    else:
+        base = ((batch * N + row) * H + head) * D
+    if W is None and ROPE is None:
+        # Sage2's CUDA QuantInt8Kernel uses --use_fast_math. Its reciprocal
+        # flushes to zero for BF16 peaks above 2**126, before multiplying by 127.
+        inverse = tl.inline_asm_elementwise("rcp.approx.ftz.f32 $0, $1;", "=f,f", [peak], tl.float32,
+                                            is_pure=True, pack=1)
+        quant_scale = 127. * inverse
+    else:
+        quant_scale = 127. / peak
+    tl.store(OUT + base[:, None] + d[None, :],
+             libdevice.rint(x * quant_scale).to(tl.int8), row[:, None] < N)
+
+
+def warp_query(x, norm, rope, *, interleaved=False, rope_first=False, recycle=False):
+    """SM120 Sage2++ per-warp INT8 Q from the projected rows, preserving the rounding after norm and rotation."""
+    batch, tokens, heads, dim = x.shape
+    weight, eps, weight_rows = norm
+    groups = triton.cdiv(tokens, 128) * 4
+    scales = torch.empty((batch, heads, groups), device=x.device, dtype=torch.float32)
+    out = x.view(torch.int8)[..., :dim] if recycle else torch.empty(x.shape, device=x.device, dtype=torch.int8)
+    strides = (0, 0, 0, 0, 0) if rope is None else (
+        rope.stride(0) if rope.shape[0] > 1 else 0, rope.stride(1), rope.stride(2) if rope.shape[2] > 1 else 0,
+        rope.stride(3), rope.stride(4))
+    _warp_query[(groups, heads, batch)](x, weight, weight_rows, rope, out, scales, tokens, heads, dim,
+        *x.stride()[:3], *strides, weight.stride(0) if _per_head(weight, weight_rows) else 0, eps, _pairs(rope),
+        interleaved, rope_first, recycle, num_warps=4, enable_fp_fusion=False)
+    if recycle:
+        torch.autograd.graph.increment_version(x)
+    return out, scales
 
 
 from shared.kernels.triton_compilation_log import install_triton_compilation_logger

@@ -19,14 +19,20 @@
     const heading = WAC.transcript()?.querySelector('.chat__compact-thinking .chat__compact-title');
     if (!heading) return;
     const elapsed = clock ? clock.elapsed + (clock.paused ? 0 : (performance.now() - clock.received) / 1000) : null;
-    heading.textContent = elapsed === null ? 'Working…' : `Working… ${durationLabel(elapsed)}`;
+    const title = elapsed === null ? 'Working…' : `Working… ${durationLabel(elapsed)}`;
+    if (heading.textContent !== title) heading.textContent = title;
   }
 
   function syncClockTimer() {
-    clearInterval(clockTimer);
-    clockTimer = clock && !clock.paused ? setInterval(updateThinkingTime, 1000) : null;
-    updateThinkingTime();
+    if (clock && !clock.paused && !document.hidden) {
+      if (clockTimer === null) clockTimer = setInterval(updateThinkingTime, 1000);
+    } else if (clockTimer !== null) {
+      clearInterval(clockTimer);
+      clockTimer = null;
+    }
+    if (!document.hidden) updateThinkingTime();
   }
+  document.addEventListener('visibilitychange', syncClockTimer);
 
   function holdScroll(body) {
     if (body._compactSignature) WAC.compactScrollState ||= WAC.captureAutoscrollState();
@@ -326,32 +332,18 @@
     schedule(event, previousActive);
     return result;
   };
-  function mount() {
-    for (const host of document.querySelectorAll('#properties-settings')) {
-      if (host.querySelector('[data-deepy-compact-actions]')) continue;
-      const label = document.createElement('label');
-      label.className = 'chat__compact-preference';
-      const input = document.createElement('input');
-      input.type = 'checkbox'; input.dataset.deepyCompactActions = ''; input.checked = compactByDefault;
-      input.onchange = async () => {
-        const previous = compactByDefault;
-        status.textContent = "";
-        WAC.setCompactActions(input.checked);
-        input.disabled = true;
-        try { await WAC.saveDisplaySettings({compact_actions: input.checked}); }
-        catch (error) { WAC.setCompactActions(previous); status.textContent = error.message; }
-        finally { input.disabled = false; }
-      };
-      const caption = document.createElement('span'); caption.textContent = 'Compacted View of Thoughts and Actions';
-      const status = document.createElement('span'); status.setAttribute('role', 'alert');
-      label.append(input, caption, status);
-      label.title = 'Collapse each turn by default, keeping generated media and the latest statement visible. Shared between Gradio and the Web app.';
-      host.prepend(label);
-    }
+  const input = document.querySelector('[data-deepy-compact-actions]');
+  if (input) {
+    const status = input.parentElement.querySelector('[role=alert]');
+    input.checked = compactByDefault;
+    input.onchange = async () => {
+      const previous = compactByDefault;
+      status.textContent = '';
+      WAC.setCompactActions(input.checked);
+      input.disabled = true;
+      try { await WAC.saveDisplaySettings({compact_actions: input.checked}); }
+      catch (error) { WAC.setCompactActions(previous); status.textContent = error.message; }
+      finally { input.disabled = false; }
+    };
   }
-  const hosts = '#properties-settings';
-  new MutationObserver(records => {
-    if (records.some(record => Array.from(record.addedNodes).some(node => node.nodeType === 1 && (node.matches(hosts) || node.querySelector(hosts))))) mount();
-  }).observe(document.body, {childList: true, subtree: true});
-  mount();
 })();

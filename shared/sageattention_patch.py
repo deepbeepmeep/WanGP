@@ -5,7 +5,18 @@ https://github.com/thu-ml/SageAttention/pull/387
 Apply before attention runs. These JIT entry points are launched from Python, not called by other JIT functions.
 """
 from importlib import import_module
+from importlib.metadata import PackageNotFoundError, version
 import re
+
+
+def sageattention_version():
+    """Version of the installed SageAttention. SageGP ships SageAttention 2.2 under its own distribution name. Raises
+    PackageNotFoundError (an ImportError) when neither is installed."""
+    try:
+        return version("sageattention")
+    except PackageNotFoundError:
+        version("sagegp")
+        return "2.2.0"
 
 
 def _int64_offsets(source, names):

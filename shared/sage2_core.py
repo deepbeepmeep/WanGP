@@ -17,6 +17,7 @@ limitations under the License.
 
 import sys
 import torch
+from tqdm import tqdm
 
 if sys.platform == 'darwin' and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
     raise ImportError("SageAttention is CUDA-only and is disabled on Apple Silicon MPS")
@@ -25,7 +26,9 @@ import torch.nn.functional as F
 from mmgp import cuda_graphs
 
 from shared.kernels.token_mean import token_mean
-from shared.kernels import split_kv as _split_kv
+from shared.kernels import sage_block_query
+from shared.kernels import kernel_policy, sage2_sm120 as _sm120, sage2_fp16_sm120 as _sm120_fp16
+from shared.kernels.dispatch import choose
 
 from .sageattention_patch import patch_sageattention
 from .sage1_core import fp16_v, scale_output
@@ -95,8 +98,8 @@ def is_sage2_supported():
             return False
     return True
 
-from importlib.metadata import version
-sg2_version = version("sageattention")
+from .sageattention_patch import sageattention_version
+sg2_version = sageattention_version()
 sg2pp = sg2_version.startswith("2.2")
 
 import subprocess
@@ -168,10 +171,6 @@ def _use_low_shared_masked_triton(device: torch.device) -> bool:
 
 def _attn_false_low_shared_masked(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None, output_dtype=torch.float16, return_lse=False):
     global _LOW_SHARED_MASKED_TRITON_PATCH_PRINTED
-    if not _LOW_SHARED_MASKED_TRITON_PATCH_PRINTED:
-        print(f"[SageAttention] Using low-shared-memory masked Triton patch (BLOCK_M={_LOW_SHARED_MASKED_BLOCK_M}, BLOCK_N={_LOW_SHARED_MASKED_BLOCK_N}, GPU limit={_get_shared_memory_limit(q.device)} bytes).")
-        _LOW_SHARED_MASKED_TRITON_PATCH_PRINTED = True
-
     o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
 
     if tensor_layout == "HND":
@@ -193,6 +192,15 @@ def _attn_false_low_shared_masked(q, k, v, q_scale, k_scale, tensor_layout="HND"
 
     stride_bz_mask, stride_h_mask, stride_m_mask, stride_n_mask = attn_mask.stride(0), attn_mask.stride(1), attn_mask.stride(2), attn_mask.stride(3)
     lse = torch.empty([b, h_qo, qo_len], dtype=torch.float32, device=q.device) if return_lse else torch.empty([0], dtype=torch.float32, device="cpu")
+    if _get_cuda_arch(q.device) == "sm120" and kernel_policy.allow_approximate():
+        query, key, value, target = (q, k, v, o) if tensor_layout == "NHD" else (
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), o.transpose(1, 2))
+        if _sm120_fp16.attention(query, key, value, q_scale, k_scale, target, attn_mask, lse if return_lse else None,
+                                 _LOW_SHARED_MASKED_BLOCK_M):
+            return o, lse
+    if not _LOW_SHARED_MASKED_TRITON_PATCH_PRINTED:
+        tqdm.write(f"[SageAttention] Using low-shared-memory masked Triton patch (BLOCK_M={_LOW_SHARED_MASKED_BLOCK_M}, BLOCK_N={_LOW_SHARED_MASKED_BLOCK_N}, GPU limit={_get_shared_memory_limit(q.device)} bytes).")
+        _LOW_SHARED_MASKED_TRITON_PATCH_PRINTED = True
     grid = ((qo_len + _LOW_SHARED_MASKED_BLOCK_M - 1) // _LOW_SHARED_MASKED_BLOCK_M, h_qo, b)
     attn_qk_int8_per_block._attn_fwd[grid](
         q, k, v, q_scale, k_scale, o, attn_mask, lse,
@@ -314,7 +322,10 @@ def sageattn(
     if qkv_list[0].shape[-1] == 256:
         if tensor_layout != "NHD" or is_causal or return_lse or sm_scale is not None:
             raise ValueError("SageAttention with head_dim 256 takes NHD tensors, without causal mask, softmax scale or LSE")
-        return _sageattn_head256(qkv_list, attn_mask, scale_v, recycle_q)
+        return _sageattn_staged(qkv_list, attn_mask, scale_v, recycle_q)
+    if (arch == "sm86" and recycle_q and tensor_layout == "NHD" and not is_causal and not return_lse and sm_scale is None
+            and qkv_list[0].shape[-1] in (64, 128) and sage_block_query.recyclable_query(qkv_list[0])):
+        return _sageattn_staged(qkv_list, attn_mask, scale_v, True)
     if attn_mask is not None or cuda_graphs.recording() and not cuda_kernels_capturable(qkv_list[0].device):
         return sageattn_qk_int8_pv_fp16_triton(qkv_list, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, attn_mask=attn_mask, scale_v=scale_v)
     if arch == "sm80":
@@ -329,12 +340,14 @@ def sageattn(
         raise ValueError(f"Unsupported CUDA architecture: {arch}")
 
 
-def _sageattn_head256(qkv_list, attn_mask, scale_v, recycle_q):
-    """sageattn of NHD q, k and v with head_dim 256 through the staged functions (no CUDA kernel, and sageattn_qk_int8_pv_fp16_triton's
-    launches exceed the shared memory at 256). k is copied: staged_quantize_k subtracts its mean in place and callers may hold it."""
+def _sageattn_staged(qkv_list, attn_mask, scale_v, recycle_q):
+    """NHD per-block attention. K can be borrowed, so stage its smoothing on private storage."""
     q, k, v = qkv_list
     qkv_list.clear()
-    settings = staged_settings(q.device, attn_mask is not None, scale_v, 256)
+    settings = staged_settings(q.device, attn_mask is not None, scale_v, q.shape[-1])
+    recycle_q = recycle_q and not (torch._C._overlaps(q, k) or torch._C._overlaps(q, v))
+    if recycle_q:
+        settings = {**settings, "recycle_query": True}
     quantized = [None, staged_quantize_k([k.clone()], settings), staged_quantize_v([v], settings)]
     k = v = None
     quantized[0] = staged_quantize_q(q, settings)
@@ -364,7 +377,7 @@ def cuda_kernels_capturable(device):
             _capturable = bool((q_int8 == 7).all())  # captured, not run: the kernel went to the capture stream
             del graph
         if not _capturable:
-            print("[Sage] This SageAttention build cannot run its CUDA kernels in CUDA graphs: its slower Triton kernels are used in CUDA Graph mode. "
+            tqdm.write("[Sage] This SageAttention build cannot run its CUDA kernels in CUDA graphs: its slower Triton kernels are used in CUDA Graph mode. "
                   "SageAttention 2.2.0 post6 or later keeps the CUDA kernels (see docs/INSTALLATION.md).")
     return _capturable
 
@@ -373,7 +386,7 @@ def _fp8_pv_settings(arch):
     """sageattn's settings for the INT8 QK / FP8 PV kernels of sm89 and sm120."""
     if arch == "sm89":
         return {"qk_quant_gran": "per_thread", "pv_accum_dtype": "fp32+fp16" if sg2pp else "fp32+fp32", "smooth_v": False}
-    # sm120 has accurate fp32 accumulator for fp8 mma and triton kernel is currently not usable on sm120.
+    # The SM120 CUDA backend uses per-warp Q/K. Its buffered FP16 accumulation uses per-channel E4M3 V scaled to 2.25.
     return {"qk_quant_gran": "per_warp", "pv_accum_dtype": "fp32+fp16" if sg2pp else "fp32", "smooth_v": not sg2pp}
 
 
@@ -385,8 +398,9 @@ def _fp8_pv_settings(arch):
 # scale stays that of the real head_dim.
 _PER_BLOCK_SETTINGS = {"qk_quant_gran": "per_block", "block_m": 128, "launch": None, "scale_v": False}
 _LOW_SHARED_SETTINGS = {"qk_quant_gran": "per_block", "block_m": _LOW_SHARED_MASKED_BLOCK_M, "launch": (4, 3), "scale_v": False}
-# head_dim 256 (no CUDA kernel): the same Triton kernel on every architecture, launches that fit 99 KiB of shared memory
+# head_dim 256: Triton launches that fit 99 KiB of shared memory
 _HEAD256_SETTINGS = {"qk_quant_gran": "per_block", "block_m": 128, "launch": (8, 1), "scale_v": False}
+_SM120_HEAD256_SETTINGS = {**_HEAD256_SETTINGS, "output_splits": 2}
 _MASKED_HEAD256_SETTINGS = {"qk_quant_gran": "per_block", "block_m": 64, "launch": (8, 2), "scale_v": False}
 # The Triton attention of SageAttention 2.2 takes a mask and its strides, that of 2.1 does not (no masked path)
 _TRITON_MASK_ARGUMENT = "mask" in attn_qk_int8_per_block._attn_fwd.arg_names
@@ -404,6 +418,8 @@ def staged_settings(device, masked=False, scale_v=False, head_dim=128):
         return None
     if head_dim == 256:
         settings = _MASKED_HEAD256_SETTINGS if masked else _HEAD256_SETTINGS
+        if not masked and _get_cuda_arch(device) == "sm120" and kernel_policy.allow_approximate():
+            settings = _SM120_HEAD256_SETTINGS
     elif masked:
         settings = _LOW_SHARED_SETTINGS if _use_low_shared_masked_triton(device) else _PER_BLOCK_SETTINGS
     elif (arch := _get_cuda_arch(device)) == "sm86" or cuda_graphs.recording() and not cuda_kernels_capturable(device):
@@ -413,19 +429,38 @@ def staged_settings(device, masked=False, scale_v=False, head_dim=128):
     return {**settings, "scale_v": True} if scale_v else settings
 
 
+def indexed_window_plans(settings, ring, steps, global_rows, max_global_keys, group_bytes):
+    """Batched window preparation for the buffered per-warp SM120 forward."""
+    _, heads, _, dim = ring.shape
+    if (dim != 64 or _get_cuda_arch(ring.device) != "sm120" or ring.stride(-1) != 1
+            or settings["qk_quant_gran"] != "per_warp" or settings["pv_accum_dtype"] != "fp32+fp16"
+            or not 0 < global_rows <= 16 or not global_rows <= max_global_keys <= min(262144, ring.shape[0])
+            or not steps or not all(step and all(0 < q.shape[1] <= k.shape[1] < 2048 for q, k, _ in step) for step in steps)):
+        return None
+    if (_capturable is None and torch.cuda.is_current_stream_capturing()) or not cuda_kernels_capturable(ring.device):
+        return None
+    from shared.kernels.sage2_indexed_windows import make_plans
+    choose("Sage2 Indexed Windows", owned_triton=True)
+    return make_plans(steps, heads, dim, ring.dtype, ring.device, global_rows, max_global_keys, group_bytes,
+                      _qattn_sm89.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf)
+
+
 def program_rows(settings, head_dim):
     """Query rows of one head that a program of these settings' attention kernel covers, from the kernels' sources: the INT8 QK / FP8
     PV CUDA kernels of sm89 and sm120 launch a grid of ceil(queries / CTA_Q) x heads x batch programs with CTA_Q = 128
     (csrc/qattn/*_attn*.cu); the Triton kernel a grid of ceil(queries / BLOCK_M) x heads x batch, BLOCK_M being settings["block_m"]
     (triton/attn_qk_int8_per_block.py). Read by shared.attention.launch_waves."""
-    return settings["block_m"] if settings["qk_quant_gran"] == "per_block" else 128
+    # One wide SM120 tile launches a CTA per half of the output. Express that in equivalent rows per CTA
+    # for Head Split. Including the split count in the settings gives the wave probe its own cache entry.
+    if settings["qk_quant_gran"] == "per_block":
+        return settings["block_m"] // settings.get("output_splits", 1)
+    return 128
 
 
 def fused_qk_layouts(settings, head_dim):
     """Row layouts of these settings' staged q / k quantization for shared.kernels.qk_quant_triton (the norm and RoPE of q and k fused
     with their quantization): {"q": (layout, block, sm_scale, scale_eps), "k": (...)} as staged_quantize_q / staged_quantize_k
-    quantize; None where the fused kernels do not reproduce the core's quantizers (the per-warp CUDA kernels of sm120 round
-    differently by one LSB in places and are not validated there)."""
+    quantize. The CUDA per-warp layout uses fused_warp_query for Q and the original key centering and quantizer for K."""
     if _qk_layouts is None:
         return None
     if settings["qk_quant_gran"] == "per_thread":
@@ -440,6 +475,78 @@ def _pad_dim(x_list, settings):
     padded = settings.get("padded_dim")
     if padded is not None and x_list[0].shape[-1] != padded:
         x_list[0] = F.pad(x_list[0], (0, padded - x_list[0].shape[-1]))
+
+
+def fused_warp_query(q, rope, norm, settings, **options):
+    """SM120 per-warp query quantization in the same pass as the model's normalization and RoPE."""
+    weight, _, weight_rows = norm
+    if (_qk_layouts is None or settings["qk_quant_gran"] != "per_warp" or _get_cuda_arch(q.device) != "sm120"
+            or not kernel_policy.allow_approximate() or q.shape[-1] not in (64, 128) or not 512 <= q.shape[1] <= 32768
+            or settings.get("padded_dim") or q.stride(-1) != 1 or (weight is not None and weight.stride(-1) != 1)
+            or (weight_rows is not None and weight.ndim != 2)
+            or (rope is None and weight is None)):
+        return None
+    choose("Sage2 Fused Query Quantization", owned_triton=True)
+    return _qk_layouts.warp_query(q, norm, rope, recycle=_recycle_query(q, settings.get("recycle_query", False)), **options)
+
+
+def fused_query_recycle(q, settings):
+    """Whether fused quantization can write its INT8 rows into this owned query projection."""
+    if settings["qk_quant_gran"] == "per_block":
+        return (settings.get("recycle_query", False) and not settings.get("padded_dim") and _get_cuda_arch(q.device) == "sm86"
+                and sage_block_query.recyclable_query(q))
+    return settings["qk_quant_gran"] == "per_thread" and not settings.get("padded_dim") and _recycle_query(q, settings.get("recycle_query", False))
+
+
+def _recycle_query(q, owned):
+    # The INT8 QK / FP8 PV CUDA forward of SM89 (that SM120 runs too: qk_int_sv_f8_cuda_sm89.cuh) takes byte strides for INT8 Q, copies
+    # each CTA's query rows to shared memory before its key loop and writes only its own output tile, at the end.
+    if (not owned or _qk_layouts is None or q.shape[-1] not in (64, 128) or _get_cuda_arch(q.device) not in ("sm89", "sm120")
+            or not _qk_layouts.recyclable_query(q)):
+        return False
+    # Older extensions launch on the default stream. Overwriting Q from Triton
+    # there is safe only if packing and the CUDA consumer share that stream.
+    if _capturable is None and torch.cuda.is_current_stream_capturing():
+        return False
+    return cuda_kernels_capturable(q.device) or torch.cuda.current_stream(q.device) == torch.cuda.default_stream(q.device)
+
+
+def _warp_key(k, km, tensor_layout):
+    layout = 0 if tensor_layout == "NHD" else 1
+    seq_dim, head_axis = (1, 2) if layout == 0 else (2, 1)
+    key = torch.empty(k.shape, dtype=torch.int8, device=k.device)
+    scale = torch.empty((k.size(0), k.size(head_axis), (k.size(seq_dim) + 63) // 64), dtype=torch.float32, device=k.device)
+    if km is None:
+        _fused.quant_per_block_int8_cuda(k, key, scale, 64, layout)
+    else:
+        _fused.quant_per_block_int8_fuse_sub_mean_cuda(k, km.squeeze(seq_dim).contiguous(), key, scale, 64, layout)
+    return key, scale
+
+
+def _thread_query(q, recycle):
+    """per_thread_int8's query quantization (BLKQ 128, WARPQ 32) of q (NHD view); recycle: into q's own storage, the first bytes of each
+    row (each program reads its 4 rows of one head, then writes them: every value it stores is divided by the maximum of all of them)."""
+    b, tokens, heads, head_dim = q.shape
+    out = q.view(torch.int8)[..., :head_dim] if recycle else torch.empty(q.shape, dtype=torch.int8, device=q.device)
+    blocks = (tokens + 127) // 128 * 32
+    scale = torch.empty((b, heads, blocks), dtype=torch.float32, device=q.device)
+    quant_query_per_thread_int8_kernel[(blocks, heads, b)](
+        q, out, scale, tokens, q.stride(0), q.stride(2), q.stride(1), out.stride(0), out.stride(2), out.stride(1), scale.stride(0), scale.stride(1), C=head_dim, BLK=32)
+    if recycle:
+        torch.autograd.graph.increment_version(q)
+    return out, scale
+
+
+def _thread_key(k, km, tensor_layout):
+    """per_thread_int8's key quantization (BLKK 64, WARPK 64) of k minus km, k left as it is."""
+    k = k if km is None else k - km
+    key = torch.empty(k.shape, dtype=torch.int8, device=k.device)
+    x, out = (k, key) if tensor_layout == "NHD" else (k.transpose(1, 2), key.transpose(1, 2))
+    b, tokens, heads, head_dim = x.shape
+    scale = torch.empty((b, heads, (tokens + 63) // 64 * 4), dtype=torch.float32, device=k.device)
+    quant_key_per_thread_int8_kernel[((tokens + 63) // 64 * 4, heads, b)](
+        x, out, scale, tokens, x.stride(0), x.stride(2), x.stride(1), out.stride(0), out.stride(2), out.stride(1), scale.stride(0), scale.stride(1), C=head_dim, BLK=64)
+    return key, scale
 
 
 def _quant_per_block(x, x_int8, block, sm_scale):
@@ -479,12 +586,10 @@ def staged_quantize_k(k_list, settings):
     b, kv_len, heads, head_dim = k.shape
     km = settings.get("k_mean")
     km = token_mean(k, 1) if km is None else km.to(k.dtype).expand(b, -1, -1).unsqueeze(1)
+    if settings["qk_quant_gran"] == "per_warp":
+        return _warp_key(k, km, "NHD")
     k_int8 = torch.empty(k.shape, dtype=torch.int8, device=k.device)
     blocks = (kv_len + 63) // 64
-    if settings["qk_quant_gran"] == "per_warp":
-        k_scale = torch.empty((b, heads, blocks), dtype=torch.float32, device=k.device)
-        _fused.quant_per_block_int8_fuse_sub_mean_cuda(k, km.squeeze(1).contiguous(), k_int8, k_scale, 64, 0)
-        return k_int8, k_scale
     k.sub_(km)
     if settings["qk_quant_gran"] == "per_block":
         return k_int8, _quant_per_block(k, k_int8, 64, 1.0)
@@ -497,25 +602,27 @@ def staged_quantize_k(k_list, settings):
 
 @torch.compiler.disable
 def staged_quantize_q(q, settings):
-    """INT8 q with its scales; q is not released (staged_attention can write the output into it)."""
+    """INT8 q and scales. Eligible owned projections can hold their packed rows and then their output."""
     _maybe_set_device(q.device)
+    if settings["qk_quant_gran"] == "per_block" and fused_query_recycle(q, settings):
+        return sage_block_query.pack_query(q, settings["block_m"], 1.0 / q.shape[-1] ** 0.5 * 1.44269504)
+    if (settings["qk_quant_gran"] != "per_block" and not settings.get("padded_dim")
+            and _recycle_query(q, settings.get("recycle_query", False))):
+        if settings["qk_quant_gran"] == "per_thread":
+            return _thread_query(q, True)
+        return _qk_layouts.warp_query(q, (None, 0., None), None, recycle=True)
     head_dim = q.shape[-1]
     q_list = [q]
     _pad_dim(q_list, settings)  # a padded copy: q itself stays for the output
     q = q_list.pop()
+    if settings["qk_quant_gran"] == "per_thread":
+        return _thread_query(q, False)
     b, qo_len, heads, _ = q.shape
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
     if settings["qk_quant_gran"] == "per_block":  # the softmax scale, in base 2, goes into q's scales
         return q_int8, _quant_per_block(q, q_int8, settings["block_m"], 1.0 / head_dim ** 0.5 * 1.44269504)
-    warps = (qo_len + 127) // 128 * 4
-    if settings["qk_quant_gran"] == "per_warp":
-        q_scale = torch.empty((b, heads, warps), dtype=torch.float32, device=q.device)
-        _fused.quant_per_warp_int8_cuda(q, q_int8, q_scale, 128, 32, 0)
-    else:
-        q_scale = torch.empty((b, heads, warps * 8), dtype=torch.float32, device=q.device)
-        quant_query_per_thread_int8_kernel[(warps * 8, heads, b)](
-            q, q_int8, q_scale, qo_len, q.stride(0), q.stride(2), q.stride(1), q_int8.stride(0), q_int8.stride(2), q_int8.stride(1),
-            q_scale.stride(0), q_scale.stride(1), C=q.shape[-1], BLK=32)
+    q_scale = torch.empty((b, heads, (qo_len + 127) // 128 * 4), dtype=torch.float32, device=q.device)
+    _fused.quant_per_warp_int8_cuda(q, q_int8, q_scale, 128, 32, 0)
     return q_int8, q_scale
 
 
@@ -551,17 +658,22 @@ def staged_attention(out, quantized_list, settings, attn_mask=None, return_lse=F
                 v.stride(0), v.stride(2), v.stride(1), target.stride(0), target.stride(2), target.stride(1), *mask[1],
                 qo_len, kv_len, heads, heads // k_int8.shape[2], BLOCK_M=settings["block_m"], BLOCK_N=64, HEAD_DIM=head_dim, STAGE=1,
                 RETURN_LSE=return_lse, num_warps=num_warps, num_stages=num_stages)
-        # its keys split in ranges attended in one launch where that is faster for this shape (fewer, part-empty waves)
-        if return_lse or attn_mask is not None or not _split_kv.attention_triton(out, q_int8, k_int8, v, q_scale, k_scale, settings["block_m"], settings["launch"], launch):
+        # masked and head-dim-256 calls on GeForce Blackwell: its FP16 kernels, where they apply
+        handled = ((attn_mask is not None or head_dim == 256) and _get_cuda_arch(out.device) == "sm120" and kernel_policy.allow_approximate()
+                   and _sm120_fp16.attention(q_int8, k_int8, v, q_scale, k_scale, out, attn_mask,
+                                            lse if return_lse else None, settings["block_m"]))
+        if not handled:
             launch(out, q_int8, k_int8, v, q_scale, k_scale)
+        if settings.get("recycle_query") and q_int8.data_ptr() == out.data_ptr():
+            torch.autograd.graph.increment_version(out)
         out = out if v_scale is None else scale_output(out, v_scale, 2)
         return (out, lse) if return_lse else out
     gran, sm_scale = 3 if settings["qk_quant_gran"] == "per_thread" else 2, settings.get("softmax_dim", head_dim) ** -0.5
-    if (not return_lse and attn_mask is None and settings["pv_accum_dtype"] == "fp32+fp16" and _split_kv.available()
-            and _split_kv.attention(out, q_int8, k_int8, v, q_scale, k_scale, v_scale, gran, sm_scale)):
-        return out  # its keys split in ranges attended in one launch, where that is faster for this shape (fewer, part-empty waves)
     inputs = (q_int8, k_int8, v, out, q_scale, k_scale, v_scale) + ((v_mean,) if settings["pv_accum_dtype"] == "fp32" and settings["smooth_v"] else ())
-    lse = _cuda_kernel(settings)(*inputs, 0, 0, gran, sm_scale, int(return_lse))
+    forward = _fp8_buffered_forward if settings["pv_accum_dtype"] == "fp32+fp16" else _cuda_kernel(settings)
+    lse = forward(*inputs, 0, 0, gran, sm_scale, int(return_lse))
+    if settings.get("recycle_query") and q_int8.data_ptr() == out.data_ptr():
+        torch.autograd.graph.increment_version(out)
     return (out, lse) if return_lse else out
 
 
@@ -573,6 +685,19 @@ def _cuda_kernel(settings):
     if settings["smooth_v"]:
         return _qattn_sm89.qk_int8_sv_f8_accum_f32_fuse_v_scale_fuse_v_mean_attn
     return _qattn_sm89.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn
+
+
+def _fp8_buffered_forward(q, k, v, out, qs, ks, vs, layout, causal, gran, sm_scale, return_lse):
+    """The Sage2++ CUDA forward, or its parallel key ranges for short queries on GeForce Blackwell."""
+    rows = q.shape[1 if layout == 0 else 2]
+    if 0 < rows <= 128 and not causal and gran == 2 and sm_scale > 0 and _get_cuda_arch(q.device) == "sm120" and kernel_policy.allow_approximate():
+        query, key, value, target = (q, k, v, out) if layout == 0 else (
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), out.transpose(1, 2))
+        result = _sm120.split_attention(target, query, key, value, qs, ks, vs, sm_scale, return_lse)
+        if result is not None:
+            return result
+    return _qattn_sm89.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(
+        q, k, v, out, qs, ks, vs, layout, causal, gran, sm_scale, int(return_lse))
 
 
 _TRITON_LSE_ARGUMENT = "RETURN_LSE" in attn_qk_int8_per_block._attn_fwd.arg_names
@@ -646,6 +771,15 @@ def prefix_v(v, v_scale, v_mean, heads, batch):
         v, v_scale = v.expand(batch, -1, -1, -1), v_scale.expand(batch, -1, -1)
         v_mean = None if v_mean is None else v_mean.expand(batch, -1, -1)
     return v.contiguous(), v_scale.contiguous(), None if v_mean is None else v_mean.contiguous()
+
+
+def _smoothing_lse(q, mean, tensor_layout):
+    if tensor_layout == "NHD":
+        q, mean = q.transpose(1, 2), mean.transpose(1, 2)
+    if 1 < mean.shape[1] < q.shape[1]:
+        mean = mean.repeat_interleave(q.shape[1] // mean.shape[1], dim=1)
+    return torch.matmul(q, mean.transpose(2, 3)).squeeze(-1).float()
+
 
 @torch.compiler.disable
 def sageattn_qk_int8_pv_fp16_triton(
@@ -768,10 +902,7 @@ def sageattn_qk_int8_pv_fp16_triton(
     if smooth_k:
         km = token_mean(k, seq_dim)
         if return_lse:
-            if tensor_layout == "NHD":
-                lse_correction = torch.matmul(q.transpose(1, 2), km.transpose(1, 2).transpose(2, 3)).squeeze(-1).to(torch.float32)
-            else:
-                lse_correction = torch.matmul(q, km.transpose(2, 3)).squeeze(-1).to(torch.float32)
+            lse_correction = _smoothing_lse(q, km, tensor_layout)
     else:
         km = None
 
@@ -786,7 +917,8 @@ def sageattn_qk_int8_pv_fp16_triton(
         else:
             q_int8, q_scale, k_int8, k_scale = per_block_int8_triton(q, k, km=km, sm_scale=sm_scale, tensor_layout=tensor_layout)
     elif quantization_backend == "cuda":
-        q_int8, q_scale, k_int8, k_scale = per_block_int8_cuda(q, k, km=km, sm_scale=sm_scale, tensor_layout=tensor_layout)
+        block_q = _LOW_SHARED_MASKED_BLOCK_M if masked_low_shared else 128
+        q_int8, q_scale, k_int8, k_scale = per_block_int8_cuda(q, k, km=km, BLKQ=block_q, sm_scale=sm_scale, tensor_layout=tensor_layout)
     else:
         raise ValueError(f"Unsupported quantization backend: {quantization_backend}")
     del q,k, km
@@ -1280,17 +1412,23 @@ def sageattn_qk_int8_pv_fp8_cuda(
     if smooth_k:
         km = token_mean(k, seq_dim)
         if return_lse:
-            if tensor_layout == "NHD":
-                lse_correction = torch.matmul(q.transpose(1, 2), km.transpose(1, 2).transpose(2, 3)).squeeze(-1).to(torch.float32)
-            else:
-                lse_correction = torch.matmul(q, km.transpose(2, 3)).squeeze(-1).to(torch.float32)
+            lse_correction = _smoothing_lse(q, km, tensor_layout)
     else:
         km = None
 
-    if qk_quant_gran == "per_warp":
+    q_nhd = q if _tensor_layout == 0 else q.transpose(1, 2)
+    if qk_quant_gran in ("per_warp", "per_thread") and _recycle_query(q_nhd, recycle_q and head_dim_og == q.size(-1)):
+        # Q and K may share storage. Finish reading K (and the LSE correction above) before packing Q.
+        k_int8, k_scale = (_warp_key if qk_quant_gran == "per_warp" else _thread_key)(k, km, tensor_layout)
+        k = km = None
+        q_int8, q_scale = _qk_layouts.warp_query(q_nhd, (None, 0., None), None, recycle=True) if qk_quant_gran == "per_warp" else _thread_query(q_nhd, True)
+        if _tensor_layout:
+            q_int8 = q_int8.transpose(1, 2)
+    elif qk_quant_gran == "per_warp":
         q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=32, BLKK=64)
     elif qk_quant_gran == "per_thread":
         q_int8, q_scale, k_int8, k_scale = per_thread_int8_triton(q, k, km, tensor_layout=tensor_layout, BLKQ=128, WARPQ=32, BLKK=64, WARPK=64)
+    del q_nhd
     q_size = q.size()
     q_device = q.device
     if recycle_q:
@@ -1307,7 +1445,7 @@ def sageattn_qk_int8_pv_fp8_cuda(
     elif pv_accum_dtype == "fp32+fp32":
         lse = _qattn_sm89.qk_int8_sv_f8_accum_f32_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
     elif pv_accum_dtype == "fp32+fp16":
-        lse = _qattn_sm89.qk_int8_sv_f8_accum_f16_fuse_v_scale_attn_inst_buf(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
+        lse = _fp8_buffered_forward(q_int8, k_int8, v_fp8, o, q_scale, k_scale, v_scale, _tensor_layout, _is_caual, _qk_quant_gran, sm_scale, _return_lse)
 
 
     o = o[..., :head_dim_og]
@@ -1690,6 +1828,12 @@ def xper_channel_fp8(
     else:
         v = v_or_list
     device = v.device
+    tokens = v.shape[1 if tensor_layout == "NHD" else 2]
+    if (not smooth_v and scale_max == 2.25 and tensor_layout in ("NHD", "HND") and v.dtype in (torch.bfloat16, torch.float16)
+            and _get_cuda_arch(device) == "sm120" and kernel_policy.allow_approximate() and v.stride(-1) == 1
+            and v.shape[-1] in (64, 128) and 512 <= tokens <= 262144):
+        choose("Sage2 FP8 Value Packing", owned_triton=True)
+        return _sm120.pack_value(v, tensor_layout == "NHD")
     if tensor_layout == "HND":
         b, h_kv, kv_len, head_dim = v.shape
         padded_len = (kv_len + 63) // 64 * 64

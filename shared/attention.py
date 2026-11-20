@@ -1,17 +1,18 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 # Modifications Copyright (c) 2025-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import functools
+import os
 import sys
 from contextlib import contextmanager, nullcontext
 
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from tqdm import tqdm
-from importlib.metadata import version
 from mmgp import cuda_graphs, offload
 import torch.nn.functional as F
 import warnings
 from importlib.metadata import version
+from .sageattention_patch import sageattention_version
 
 _is_mps = sys.platform == 'darwin' and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
 
@@ -26,6 +27,85 @@ try:
     triton_installed = True
 except:
     triton_installed = False
+
+# Select the SM120 dense kernels of SageGP from tensor metadata. Experimental asymmetric paths retain their opt-in.
+_routed = None
+_wide = None
+_fp4_scores = None
+_precise = None
+if (major, minor) == (12, 0) and triton_installed:
+    from triton import language as _tl
+    if hasattr(_tl, "dot_scaled") and tuple(int(n) for n in triton.__version__.split(".")[:2]) >= (3, 6):
+        try:
+            from sagegp import hooks as _sagegp_hooks
+            from sagegp.sm120 import wide as _wide, routed as _routed, fast as _fp4_scores, dense as _precise
+        except ImportError:
+            pass
+        else:
+            from shared.kernels.dispatch import choose as _choose
+            _sagegp_hooks.register_constant = cuda_graphs.register_constant
+            _sagegp_hooks.notice = lambda operation: _choose(operation, owned_triton=True)
+
+
+# SageGP's RTX 50xx kernels are installed: they take priority over SageAttention 2 and 3 (sage_gp_redirect)
+sagegp_ready = _fp4_scores is not None
+_SAGE_GP_MODES = {"sage3": "fast", "sageadaptative": "adaptive"}
+
+
+def sage_gp_redirect(attn):
+    """(attention mode, Sage2 quality override) of a generation. With SageGP's RTX 50xx kernels, "sage3" runs SageGP Fast (every score
+    in NVFP4, SageAttention 3 speed at a fraction of its error) and "sageadaptative" SageGP Adaptive, both through the Sage2 path, which
+    then serves "sage2" with SageGP Precise."""
+    return ("sage2", _SAGE_GP_MODES[attn]) if sagegp_ready and attn in _SAGE_GP_MODES else (attn, None)
+
+
+def fp4_geometry(device, dtype, batch, queries, keys, heads, kv_heads, dim, force_attention=None):
+    """Whether a direct kernel can consume these projections before the standard staged INT8 packing."""
+    if (force_attention or offload.shared_state.get("_attention")) != "sage2":
+        return False
+    from shared.kernels import kernel_policy
+    return (_wide is not None and kernel_policy.sage2_execution_quality() in ("adaptive", "fast")
+            and _wide.preferred(device, dtype, batch, queries, keys, heads, kv_heads, dim))
+
+
+def owned_query_staged(staged):
+    if staged is not None and staged[0] in (sage1_core, sage2_core):
+        return staged[0], {**staged[1], "recycle_query": True}
+    return staged
+
+
+def dense_staged(staged, device, dtype, batch, tokens, heads, kv_heads, dim, force_attention, *, recycle_query=False, split_keys=False):
+    """split_keys: the call packs keys split by chunks of tokens (q / k norms over all heads), which the Fast core cannot: Adaptive
+    serves it instead, the fastest core that can."""
+    if staged is None or staged[0] is not sage2_core:
+        return owned_query_staged(staged) if recycle_query else staged
+    from shared.kernels import kernel_policy
+    quality = kernel_policy.sage2_execution_quality()
+    sage2 = (force_attention or offload.shared_state.get("_attention")) == "sage2"
+    if (_fp4_scores is not None and quality == "fast" and not split_keys and sage2
+            and _fp4_scores.eligible(device, dtype, batch, tokens, tokens, heads, kv_heads, dim)):
+        return _fp4_scores, _fp4_scores.settings(recycle_query)
+    # Precise: SageGP's INT8 kernel, about 8 % faster than the staged Sage2 core at its error (keys split by chunks of tokens keep
+    # the staged Sage2 core)
+    if (_precise is not None and quality == "regular" and not split_keys and sage2 and tokens > 8192 and _routed.supported(device, dtype)
+            and _precise.eligible(batch, tokens, tokens, heads, kv_heads, dim, dtype)):
+        return _precise, {"recycle_query": recycle_query, "int8_scores": True}
+    # Adaptive also serves the calls Fast cannot
+    if (_routed is not None and quality in ("adaptive", "fast") and sage2
+            and _routed.eligible(device, dtype, batch, tokens, tokens, heads, kv_heads, dim)):
+        return _routed, _routed.settings(recycle_query)
+    return owned_query_staged(staged) if recycle_query else staged
+
+
+def kv_first_staged(staged, tensors, force_attention):
+    if staged is None:
+        return staged
+    q, k, v = tensors
+    if (q.shape == k.shape == v.shape and q.dtype == k.dtype == v.dtype and q.device == k.device == v.device
+            and all(x.stride(-1) == 1 for x in tensors)):
+        return dense_staged(staged, q.device, q.dtype, *q.shape[:2], q.size(2), k.size(2), q.size(3), force_attention,
+                            recycle_query=True)
+    return owned_query_staged(staged)
 
 
 # Model-specific attention modes exposed only by per-generation overrides.
@@ -104,7 +184,7 @@ except ImportError:
     block_sparse_sage2_attn_cuda = None
     if not triton_installed: 
         try:
-            sg2_version = version("sageattention")
+            sg2_version = sageattention_version()
             print("Sage Attention has been detected but it won't work until Triton is installed.")
         except ImportError:
             pass
@@ -119,7 +199,7 @@ except ImportError:
     sageattn_attention_mask_support_reason = lambda *args, **kwargs: "SageAttention 2 is unavailable"
     if not triton_installed: 
         try:
-            sg2_version = version("sageattention")
+            sg2_version = sageattention_version()
             if not triton_installed: print("Sage Attention 2 has been detected but it won't work until Triton is installed.")
         except ImportError:
             pass
@@ -283,13 +363,15 @@ def _attention_modes():
         ret.append("xformers")
     if sageattn_varlen_wrapper != None:
         ret.append("sage")
-    if sageattn2 != None and version("sageattention").startswith("2") :
+    if sageattn2 != None and sageattention_version().startswith("2") :
         ret.append("sage2")
-    if block_sparse_sage2_attn_cuda != None and version("sageattention").startswith("2") :
+    if block_sparse_sage2_attn_cuda != None and sageattention_version().startswith("2") :
         ret.append("radial")
 
-    if sageattn3 != None: # and version("sageattention").startswith("3") :
+    if sageattn3 != None or sagegp_ready:  # with SageGP, its Fast mode serves sage3 (sage_gp_redirect)
         ret.append("sage3")
+    if sagegp_ready:
+        ret.append("sageadaptative")
 
     return tuple(ret)
 
@@ -345,7 +427,7 @@ def get_current_cuda_architecture(device=None):
     return major * 10 + minor
 
 
-_SAGE_ATTENTION_MODES = {"sage", "sage2", "sage3", "radial"}
+_SAGE_ATTENTION_MODES = {"sage", "sage2", "sage3", "sageadaptative", "radial"}
 
 
 def resolve_attention_mode(attention_mode=None, disable_sage_pre_ada=False):
@@ -377,11 +459,14 @@ def attention_shared_state(default_attention=None):
 
 @contextmanager
 def attention_config_shared_state(attention_mode=None, resolver=resolve_attention_mode, **resolver_kwargs):
+    from shared.kernels import kernel_policy
     previous = offload.shared_state.get("_attention", _MISSING)
-    offload.shared_state["_attention"] = resolver(attention_mode, **resolver_kwargs)
+    previous_quality = kernel_policy.sage2_quality_override
+    offload.shared_state["_attention"], kernel_policy.sage2_quality_override = sage_gp_redirect(resolver(attention_mode, **resolver_kwargs))
     try:
         yield offload.shared_state["_attention"]
     finally:
+        kernel_policy.sage2_quality_override = previous_quality
         if previous is _MISSING:
             offload.shared_state.pop("_attention", None)
         else:
@@ -419,6 +504,18 @@ def sage_staged(device, head_dim, force_attention=None, masked=False):
     settings = sage2_core.staged_settings(device, masked, scale_v, head_dim)
     return None if settings is None else (sage2_core, settings)
 
+
+def indexed_window_plans(ring, steps, global_rows, max_global_keys, group_bytes):
+    """Optional shared Sage2 plans over an interleaved (row, head, Q/K/V, channel) buffer, one per window step."""
+    from shared.kernels import dispatch
+    if ring.ndim != 4 or ring.shape[2] != 3 or not dispatch.cuda_inference(ring, dtypes=(torch.float16, torch.bfloat16), approximate=True):
+        return None
+    staged = sage_staged(ring.device, ring.shape[-1])
+    prepare = getattr(staged[0], "indexed_window_plans", None) if staged is not None else None
+    if prepare is not None:
+        return prepare(staged[1], ring, steps, global_rows, max_global_keys, group_bytes)
+    return None
+
 __all__ = [
     'ATTENTION_MODE_AVAILABILITY',
     'attention_config_shared_state',
@@ -429,6 +526,7 @@ __all__ = [
     'resolve_attention_mode',
     'pay_attention',
     'sage_staged',
+    'indexed_window_plans',
     'sage_attention_mask',
     'attention',
 ]
@@ -575,9 +673,26 @@ def pay_attention(
     if attn == "chipmunk":
         from src.chipmunk.modules import SparseDiffMlp, SparseDiffAttn
         from src.chipmunk.util import LayerCounter, GLOBAL_CONFIG
+    dense_call = (attention_mask is None and not causal and not dropout_p and softmax_scale is None
+                  and window_size == (-1, -1) and q_lens is None and k_lens is None)
+    if (attn == "sage2" and dense_call and sageattn2 is not None and k.shape == v.shape
+            and q.device == k.device == v.device and q.shape[-1] == k.shape[-1]):
+        core = None
+        if _fp4_scores is not None and _fp4_scores.eligible(q.device, q.dtype, batch, lq, lk, q.size(2), k.size(2), q.size(3)):
+            core = _fp4_scores
+        elif _routed is not None and _routed.eligible(q.device, q.dtype, batch, lq, lk, q.size(2), k.size(2), q.size(3)):
+            core = _routed
+        elif (_wide is not None and q.shape[-1] == 256 and q.shape == k.shape and all(x.stride(-1) == 1 for x in (q, k, v))
+              and _wide.preferred(q.device, q.dtype, batch, lq, lk, q.size(2), k.size(2), q.size(3))):
+            core = _wide
+        if core is not None:
+            projections = [q, k, v]
+            del q, k, v
+            return core.attention_owned(projections, recycle_q=recycle_q).to(out_dtype)
     if attn == "radial": attn ="sage2"
     # a block recorded for a CUDA graph: Sage 3 kernels, which are not known to run on PyTorch's current stream, give way to Sage 2
     if attn == "sage3" and sageattn2 is not None and cuda_graphs.recording(): attn = "sage2"
+    attn = sage_gp_redirect(attn)[0]  # a mode set without the generation's redirect (its quality then stays the configured one)
 
     if b > 1 and k_lens != None and attn in ("sage2", "sage3", "sdpa"):
         assert attention_mask == None

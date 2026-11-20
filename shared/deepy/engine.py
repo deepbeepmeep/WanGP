@@ -7048,9 +7048,9 @@ class AssistantEngine:
         started_at = time.perf_counter()
         self._prefill_started_at = started_at if tokens > 0 else None
         self._live_prefill_tokens = tokens
-        long_call = rebuilds_conversation and tokens >= _CONTEXT_BAR_TOKENS and self.runtime is not None
+        long_call = rebuilds_conversation and tokens >= _CONTEXT_BAR_TOKENS and runtime is not None and runtime.context_progress is None
         if long_call:
-            self.runtime.context_progress = self._report_context_progress
+            runtime.context_progress = self._report_context_progress
         completed = False
         result = None
         try:
@@ -7059,7 +7059,7 @@ class AssistantEngine:
             return result
         finally:
             if long_call:
-                self.runtime.context_progress = None
+                runtime.context_progress = None
                 self._close_context_progress()
             # the runtime's setup and the call's preparation after a load (experts placed by the first forward's hook) both open the call
             setup_seconds = max(0.0 if runtime is None else runtime.prefill_setup_seconds, self._prepared_at - started_at)
@@ -7075,13 +7075,17 @@ class AssistantEngine:
         if phase != "Reading the Prompt":  # Flash-Next's own prompt pass (qwen4_exp): the reading the prefill speed measures
             self._prepared_at = time.perf_counter()
 
-    def _report_context_progress(self, done: int, total: int) -> None:
+    def _report_context_progress(self, done: int, total: int, *, on_resume_status: Callable[[str], None] | None = None) -> None:
         """A conversation being rebuilt moves the bar of the status line, three times a second at most."""
         now = time.perf_counter()
-        if done < total and now - self._context_progress_at < 0.33:
+        if done < total and now - self._context_progress_at < 1 / 3:
             return
         self._context_progress_at = now
-        self._emit_chat_event(assistant_chat.build_status_event("Reloading Conversation", kind="loading", session=self.session, progress={"done": done, "total": total}))
+        progress = {"done": done, "total": total}
+        if on_resume_status is not None:
+            on_resume_status(assistant_chat.build_status_event("Prefilling KV Cache", kind="session_loading", session=self.session, detail=f"{done:,} / {total:,} tokens", progress=progress))
+        else:
+            self._emit_chat_event(assistant_chat.build_status_event("Reloading Conversation", kind="loading", session=self.session, progress=progress))
 
     def _close_context_progress(self) -> None:
         """The status line goes back to what it said before the bar."""
@@ -9409,7 +9413,7 @@ class AssistantEngine:
         self._snapshot_synchronized_live_context()
         return mode
 
-    def prefill_restored_context(self) -> int:
+    def prefill_restored_context(self, *, on_status: Callable[[str], None] | None = None) -> int:
         if len(self.session.messages) == 0:
             return 0
         runtime = self._acquire_runtime()
@@ -9419,6 +9423,10 @@ class AssistantEngine:
             if len(untrimmed_tokens) > context_window_tokens:
                 raise RuntimeError(f"Saved Deepy session requires {len(untrimmed_tokens):,} context tokens, exceeding the current maximum of {context_window_tokens:,}.")
             target_tokens, _trimmed = self._fit_rendered_messages_to_window(add_generation_prompt=False)
+            if on_status is not None:
+                # The system prefix and the history are separate runtime calls, but prepare one conversation.
+                total = len(target_tokens)
+                runtime.context_progress = lambda done, _target: self._report_context_progress(done, total, on_resume_status=on_status)
             mode = self._extend_context_from_preserved_base(target_tokens)
             if mode is None:
                 mode = self._prefill_from_new_header(target_tokens)
@@ -9430,6 +9438,9 @@ class AssistantEngine:
             self._log(f"Restored session context prepared ({len(target_tokens):,} tokens, mode={mode}).")
             return len(target_tokens)
         finally:
+            if on_status is not None:
+                runtime.context_progress = None
+                self._context_progress_at = 0.0
             self._pause_runtime(pause_reason="idle", preserve_session_snapshot=True)
 
     def _build_tool_error(self, tool_name: str, arguments: dict[str, Any], error_text: str) -> dict[str, Any]:

@@ -226,19 +226,19 @@ def create_editor() -> FinetuneEditorUI:
                                 enhancer_system_1_default = gr.State(value="")
                                 with gr.Column(elem_classes=["wangp-finetune-editor-enhancer-field"]):
                                     enhancer_system_1_editor = gr.Textbox(label="System Prompt", value="", lines=6)
-                                    enhancer_system_1_default_button = gr.Button("👁", visible=False, min_width=1, scale=0, elem_classes=["wangp-finetune-editor-enhancer-default-btn"])
+                                    enhancer_system_1_default_button = _enhancer_default_button()
                                 enhancer_system_1_tokens = gr.Textbox(label="Max Tokens (empty = auto)", value="", lines=1, max_lines=1)
                             with gr.Column(visible=False, elem_classes=["wangp-finetune-editor-field-group"]) as enhancer_system_2_group:
                                 enhancer_system_2_default = gr.State(value="")
                                 with gr.Column(elem_classes=["wangp-finetune-editor-enhancer-field"]):
                                     enhancer_system_2_editor = gr.Textbox(label="System Prompt", value="", lines=6)
-                                    enhancer_system_2_default_button = gr.Button("👁", visible=False, min_width=1, scale=0, elem_classes=["wangp-finetune-editor-enhancer-default-btn"])
+                                    enhancer_system_2_default_button = _enhancer_default_button()
                                 enhancer_system_2_tokens = gr.Textbox(label="Max Tokens (empty = auto)", value="", lines=1, max_lines=1)
                             with gr.Column(visible=False, elem_classes=["wangp-finetune-editor-field-group"]) as enhancer_system_3_group:
                                 enhancer_system_3_default = gr.State(value="")
                                 with gr.Column(elem_classes=["wangp-finetune-editor-enhancer-field"]):
                                     enhancer_system_3_editor = gr.Textbox(label="System Prompt", value="", lines=6)
-                                    enhancer_system_3_default_button = gr.Button("👁", visible=False, min_width=1, scale=0, elem_classes=["wangp-finetune-editor-enhancer-default-btn"])
+                                    enhancer_system_3_default_button = _enhancer_default_button()
                                 enhancer_system_3_tokens = gr.Textbox(label="Max Tokens (empty = auto)", value="", lines=1, max_lines=1)
                 import_file = gr.File(label="Import Finetune JSON", file_types=[".json"], type="filepath", visible=False)
             with gr.Column(elem_classes=["wangp-finetune-editor-footer"]):
@@ -346,6 +346,10 @@ def create_editor() -> FinetuneEditorUI:
     ui.enhancer_system_2_default_button.click(fn=_use_model_def_prompt, inputs=[ui.enhancer_system_2_default], outputs=[ui.enhancer_system_2_editor], queue=False, show_progress="hidden")
     ui.enhancer_system_3_default_button.click(fn=_use_model_def_prompt, inputs=[ui.enhancer_system_3_default], outputs=[ui.enhancer_system_3_editor], queue=False, show_progress="hidden")
     return ui
+
+
+def _enhancer_default_button():
+    return gr.Button("Copy the system prompt defined by the source model into this field.", visible=False, min_width=1, scale=0, elem_classes=["wangp-finetune-editor-enhancer-default-btn"])
 
 
 def close_editor():
@@ -1907,7 +1911,7 @@ def get_css() -> str:
     max-height: 24px !important;
     padding: 0 !important;
     flex: 0 0 24px !important;
-    font-size: 13px !important;
+    font-size: 0 !important;
     line-height: 1 !important;
     border: 0 !important;
     outline: 0 !important;
@@ -1950,11 +1954,16 @@ def get_css() -> str:
     background: transparent !important;
     box-shadow: none !important;
     color: var(--body-text-color, #172b3a) !important;
-    font-size: 14px !important;
+    font-size: 0 !important;
     line-height: 1 !important;
 }
+button.wangp-finetune-editor-enhancer-default-btn::before,
+.wangp-finetune-editor-enhancer-default-btn button::before {
+    content: "👁" / "";
+    font-size: 14px;
+}
 .wangp-finetune-editor-enhancer-default-btn::after {
-    content: "Copy the source model system prompt";
+    content: "Copy the source model system prompt" / "";
     position: absolute;
     top: 28px;
     right: 0;
@@ -2069,16 +2078,6 @@ def get_javascript() -> str:
             const app = document.querySelector("gradio-app");
             return app ? (app.shadowRoot || app) : document;
         }
-        function installEnhancerDefaultTooltips(scope = root()) {
-            const text = "Copy the system prompt defined by the source model into this field.";
-            const selector = ".wangp-finetune-editor-enhancer-default-btn, .wangp-finetune-editor-enhancer-default-btn button";
-            const buttons = [...scope.querySelectorAll(selector)];
-            if (scope.matches?.(selector)) buttons.push(scope);
-            buttons.forEach((button) => {
-                button.removeAttribute("title");
-                if (button.getAttribute("aria-label") !== text) button.setAttribute("aria-label", text);
-            });
-        }
         function markdownSnippet(action) {
             if (action === "bold") return { prefix: "**", suffix: "**", sample: "bold text" };
             if (action === "italic") return { prefix: "*", suffix: "*", sample: "italic text" };
@@ -2118,11 +2117,5 @@ def get_javascript() -> str:
             event.preventDefault();
             insertMarkdown(button.closest(".wangp-markdown-editor-toolbar"), button.getAttribute("data-wangp-md-action") || "");
         });
-        installEnhancerDefaultTooltips();
-        new MutationObserver(mutations => {
-            for (const mutation of mutations) for (const node of mutation.addedNodes) {
-                if (node.nodeType === 1) installEnhancerDefaultTooltips(node);
-            }
-        }).observe(root(), { childList: true, subtree: true });
     })();
     """

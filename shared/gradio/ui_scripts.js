@@ -92,10 +92,9 @@
             }
         }
         for (const button of document.querySelectorAll('.wangp-lora-download-row > button')) {
-            button.setAttribute('aria-label', 'Download');
+            if (button.getAttribute('aria-label') !== 'Download') button.setAttribute('aria-label', 'Download');
         }
     };
-    window.wangpRefreshSettingsTools();
     let inputModeFrame = 0;
     const inputModeHelp = {"": "Text Prompt", S: "Start with an Image", V: "Continue an Uploaded Video", L: "Continue the Last Generated Video"};
     const inputModeShortLabels = {"": "Text", S: "Start image", V: "Continue Video", L: "Last Video"};
@@ -398,6 +397,21 @@
     window.visualViewport?.addEventListener('scroll', scheduleActionAppearance);
     // Form rebuilds register their new bars; resize handles visibility and geometry.
     window.wangpRefreshActionBars = scheduleActionAppearance;
+    // Several Gradio continuations can finish in the same frame. Wait for
+    // layout as before, then attach once to the settled form for that frame.
+    let formToolsFrame = 0;
+    window.wangpRefreshFormTools = function() {
+        if (formToolsFrame) return;
+        formToolsFrame = requestAnimationFrame(() => {
+            formToolsFrame = 0;
+            requestAnimationFrame(() => {
+                window.wangpPromptTools?.attach?.(document);
+                window.wangpRefreshInputModes(); // also lays out Settings tools
+                window.wangpRefreshActionBars();
+                window.__wangpMagicMaskNS.scheduleMount();
+            });
+        });
+    };
     scheduleActionAppearance();
     document.addEventListener('click', (event) => {
         const closeButton = event.target.closest('button[aria-label="Close"]');

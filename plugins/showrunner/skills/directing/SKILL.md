@@ -88,6 +88,16 @@ advice's automatic picks.
   picture) as `image_refs` when the shot's settings give none: list the cast ids in `cast` and leave `image_refs` out unless the shot
   needs other pictures too. Never pass a cast picture as `image_start`: a start image becomes the first frame of the shot, so its
   framing, aspect and setting leak into it (a square portrait gives a square take; an indoor photo opens a beach shot indoors).
+- A shot starts on its prompt and references, on a picture (`image_start` in its settings), on a frame of another shot's take
+  (`start_from` {shot, at: start|end}), or goes on from the shot before it in the edit (`continues: true`: their shared overlap frames are
+  left out of its take, so the join is seamless). It ends on its own, on a picture (`image_end`) or on a frame (`end_on`). Use them when the
+  user asks for continuity, a start or end image, or one long take across shots; the tools name a model that can when the shot's cannot.
+- An end picture closes one model window: continued shots, each with its end picture, make a long take that passes through several.
+  A shot that ends on a picture after more than one window is refused at render: `split_shot` cuts it so the second part continues the first.
+- A shot made from another (continued, or a frame of it) goes stale when that shot gets another take or cut: its `stale` says so, and so do
+  the warnings and render's `now_stale`. Render it again after the shot it comes from, or tell the user.
+- A dialogue line with `own: true` holds the user's own recording: it drives the shot whatever its speaker's voice, and `speak` keeps it.
+  A music video carries no lyrics subtitles unless the user asks for them (`edit(song_subtitles=true)`).
 - A lip-synced shot also takes its exact slice of the song as driving audio, with the template of `cast_shots_lip_synced`: set its
   `audio_slice`. On a cut that plays the song, a shot's `dialogue` holds the lyric sung under it, for the subtitles: `render` never speaks it. Give a shot that shows the singer singing its slice. `render` takes the brief's song, cuts the slice and makes the
   shot's model keep it as its soundtrack, whatever audio choice its template or settings hold; do not cut it yourself.

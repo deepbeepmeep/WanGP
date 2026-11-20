@@ -226,11 +226,14 @@ def locate_file(file_name, create_path_if_none = False, error_if_none = True, ex
             path = os.path.join(folder, file_name)
             if os.path.isfile(path):
                 return path
-            searched_locations.append(os.path.abspath(path))
-    
+            searched_locations.append(path)
+
     if create_path_if_none:
         return get_download_location(file_name)
-    if error_if_none: raise Exception(f"Unable to locate file '{file_name}', tried {searched_locations}")
+    if error_if_none:
+        if not os.path.isabs(file_name):
+            searched_locations = [os.path.abspath(path) for path in searched_locations]
+        raise Exception(f"Unable to locate file '{file_name}', tried {searched_locations}")
     return None
 
 def get_local_model_filename(model_filename, use_locator = True, extra_paths = None, lora_dir = None):

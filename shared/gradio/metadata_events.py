@@ -26,7 +26,9 @@ def install():
         config = original(self)
         for dependency in config["dependencies"]:
             sources = getattr(self.fns[dependency["id"]].fn, "_wangp_metadata_inputs", None)
-            if sources is not None:
+            # Only bind() supplies this list. A plugin callable can implement
+            # __getattr__ and return a proxy for an unknown attribute.
+            if isinstance(sources, list):
                 dependency["wangp_metadata_inputs"] = sources
         return config
 

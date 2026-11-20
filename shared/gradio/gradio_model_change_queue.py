@@ -42,7 +42,7 @@ def _prepare(app):
             continue
         # Plugins may add model-change listeners and branch existing chains.
         # Release after WanGP's form refresh, independently of those listeners.
-        tails = [fn for fn in app.fns.values() if getattr(fn.fn, '_wangp_model_switch_tail', False) and target in fn.inputs]
+        tails = [fn for fn in app.fns.values() if getattr(fn.fn, '_wangp_model_switch_tail', False) is True and target in fn.inputs]
         if tails:
             [tail] = tails
         else:

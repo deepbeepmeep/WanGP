@@ -277,7 +277,8 @@ def _encode_command(doc, clips, resolve, out, video_args, audio_args, gain_db: f
                 moved = out.with_name(f"{out.stem}-{index}.srt")
                 moved.write_text(_srt(recut_cues(_srt_cues(resolve(item["path"]).read_text(encoding="utf-8")), item["cut"], places)), encoding="utf-8")
                 subtitles[index] = {**item, "path": str(moved)}
-    if not subtitles and any(clip["dialogue"] for clip in clips):  # the shots' lines, timed on this cut (an SRT of the edit's own replaces them)
+    lyrics_off = model.on_the_song(doc) and not doc["edit"].get("song_subtitles")  # on a song, the shots' lines are its lyrics: a track of them only when the user asks
+    if not subtitles and not lyrics_off and any(clip["dialogue"] for clip in clips):  # the shots' lines, timed on this cut (an SRT of the edit's own replaces them)
         srt = out.with_suffix(".srt")
         sung = model.checked_lyrics(doc) if model.on_the_song(doc) else None
         srt.write_text(dialogue_srt(clips, offsets, resolve) if sung is None else sung_srt(sung, float(doc["edit"].get("song_start_s") or 0.0), total), encoding="utf-8")

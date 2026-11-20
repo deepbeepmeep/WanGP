@@ -731,6 +731,12 @@ def _apply_overlays(dense: torch.Tensor, overlay: torch.Tensor, overlay_scale: t
         dense[pages, positions % page] = _dequantize_kvcache(overlay[rows], overlay_scale[rows], dtype)
 
 
+def _exact_prefill_warps(q: torch.Tensor) -> int:
+    # Turing's tensor-core lowering of a rank-3 tl.dot puts all warps on its batch axis and takes one batch element per warp: the
+    # exact prefill kernels' 32-channel blocks of a head need as many warps (head dim 256: 8, else Triton aborts)
+    return max(4, q.shape[-1] // 32) if dispatch.capability(q.device.index) < (8, 0) else 4
+
+
 def _q8_paged_prefill(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, k_scale: torch.Tensor, v_scale: torch.Tensor, context, softmax_scale: float) -> torch.Tensor:
     output = torch.empty_like(q)
     query_lengths = context.cu_seqlens_q[1:] - context.cu_seqlens_q[:-1]
@@ -741,7 +747,7 @@ def _q8_paged_prefill(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Ten
             q, k_cache, v_cache, k_scale, v_scale, context.block_tables, context.cu_seqlens_q, context.cu_seqlens_k, output,
             q.stride(0), q.stride(1), k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
             k_scale.stride(0), k_scale.stride(1), k_scale.stride(2), context.block_tables.stride(0), output.stride(0), output.stride(1), softmax_scale,
-            q.shape[1], k_cache.shape[2], q.shape[2], k_cache.shape[1], BLOCK_M=32, BLOCK_N=32, num_warps=4, num_stages=_Q8_EXACT_PREFILL_STAGES,
+            q.shape[1], k_cache.shape[2], q.shape[2], k_cache.shape[1], BLOCK_M=32, BLOCK_N=32, num_warps=_exact_prefill_warps(q), num_stages=_Q8_EXACT_PREFILL_STAGES,
         )
         return output
     q8_paged_prefill_kernel[grid](
@@ -835,7 +841,7 @@ class Attention(nn.Module):
                 return output if context.speculative_verify else output.unsqueeze(1)
             if context.block_tables is not None:
                 _log_kv_attention_backend_once("mixed_prefill", f"[Deepy][KV cache] prefix prefill backend=exact integer paged attention over the {self.kv_layout.value} cache (Triton).")
-                return attention_mixed.prefill(q, self, context, self.scale)
+                return attention_mixed.prefill(q, self, context, self.scale, num_warps=_exact_prefill_warps(q))
         if (q8_attention is not None or q8_grouped or q8_prefill or q8_speculative) and q.is_cuda and q.is_contiguous() and q.dtype in (torch.float16, torch.bfloat16) and self.head_dim <= 256 and self.head_dim % _Q8_KV_BLOCK_SIZE == 0:
             dtype_name = "BF16" if q.dtype == torch.bfloat16 else "FP16"
             if q8_grouped:
