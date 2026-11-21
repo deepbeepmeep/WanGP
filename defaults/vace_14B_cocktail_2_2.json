@@ -1,7 +1,7 @@
 {
     "model": {
         "name": "Wan2.2 Vace Experimental Cocktail 14B",
-        "architecture": "vace_14B_2_2",
+        "compile": false,        "architecture": "vace_14B_2_2",
         "modules": [
             "vace_14B"
         ],
