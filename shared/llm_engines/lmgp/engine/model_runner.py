@@ -136,6 +136,21 @@ def _advance_spans(span: tuple[bool, bool, bool], text: str) -> tuple[bool, bool
     return fence, inline, quote
 
 
+_HELD_STATE = ("kv_cache", "kv_cache_scales", "kv_cache_mins", "kv_overlay", "kv_overlay_scales")  # the runtime buffers suspend_runtime gives back
+
+
+def _held_zeros(shape, dtype, device):
+    """A runtime buffer of zeros on an MMGP held buffer, whose VRAM suspend_runtime gives back with its addresses kept (a plain tensor without
+    the VMM allocator)."""
+    from mmgp import allocator
+    nbytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+    with torch.inference_mode(False):  # also written outside inference mode (an assistant's runner thread)
+        buffer = allocator.held_empty(nbytes, device) if nbytes and torch.device(device).type == "cuda" else None
+    if buffer is None:
+        return torch.zeros(shape, device=device, dtype=dtype)
+    return buffer.view(dtype).view(shape).zero_()
+
+
 class ModelRunner:
 
     _MAX_SPECULATIVE_DRAFT_TOKENS = 8
@@ -183,6 +198,10 @@ class ModelRunner:
         self.dtype = config_dtype  # Save for later use
         self._runtime_ready = False
         self._runtime_initializing = False
+        self._suspended = False  # suspend_runtime: its held buffers and graph pools gave their VRAM back, resumed by ensure_runtime_ready
+        self.rebuilt = 0  # executables of its graphs made again from their templates (mmgp.cuda_graphs.Graph)
+        self._state_pool = None  # the pool of the models' sequence state (recurrent states, drafter cache), suspended with its contents in RAM
+        self._saved_state = []  # while suspended: (storage on the GPU, its contents in RAM)
         self._graph_cache = {}
         self._graph_cache_order = []
         self._logits_bias_cache = {}
@@ -235,6 +254,8 @@ class ModelRunner:
 
 
     def ensure_runtime_ready(self):
+        if self._suspended:
+            self._resume_runtime()
         if self.mmgp_graphs:
             from mmgp import runtime
             runtime.ensure_loaded(self.model)  # the base block's addresses are those the engine's graphs capture
@@ -260,7 +281,11 @@ class ModelRunner:
         self._runtime_initializing = True
         try:
             self.allocate_kv_cache()
-            self._prepare_model_sequence_state()
+            from mmgp import allocator
+            if self._state_pool is None and allocator.active == "vmm":
+                self._state_pool = torch.cuda.graph_pool_handle()
+            with allocator.pool_allocations(self._state_pool):  # suspend_runtime gives this state's VRAM back, its contents saved
+                self._prepare_model_sequence_state()
             if not self.enforce_eager:
                 self.capture_cudagraph()
             self._register_graph_state()
@@ -271,6 +296,57 @@ class ModelRunner:
             raise
         finally:
             self._runtime_initializing = False
+
+    def _held_state(self):
+        return [tensor for tensor in (getattr(self, name, None) for name in _HELD_STATE) if tensor is not None]
+
+    def suspend_runtime(self):
+        """The runtime stays prepared and gives its VRAM back, its addresses kept, so that its graphs replay once it resumes
+        (ensure_runtime_ready) instead of being captured again: its KV cache (held buffers, contents lost: the sequences go) and the models'
+        sequence state (its pool, contents copied to RAM and back). The pools of its own graphs stay: some keep state between replays (the MTP
+        drafter's). Without the MMGP VRAM allocator, it is reset."""
+        if not self._runtime_ready or self._suspended:
+            return
+        from mmgp import allocator
+        held = self._held_state()
+        if allocator.active != "vmm" or not all(allocator.held_mapped(tensor) for tensor in held):
+            self.reset_runtime_state()
+            return
+        torch.cuda.synchronize()
+        for tensor in held:
+            allocator.suspend_held(tensor)
+        if self._state_pool is not None:
+            self._saved_state = allocator.save_pool(self._state_pool)
+            if not allocator.suspend_pool(self._state_pool):  # it keeps its VRAM, and its contents
+                self._saved_state = []
+        self._suspended = True
+        cuda_graphs.owners_changed()  # its graphs idle: their executables give their VRAM to the next graphs made
+        self._report(f"suspended: its graphs kept ({self.rebuilt} rebuilt from their templates since it resumed), its KV cache and state out of VRAM")
+        self.rebuilt = 0
+
+    def _resume_runtime(self):
+        from mmgp import allocator
+        self._suspended = False
+        held = self._held_state()
+        saved, self._saved_state = self._saved_state, []
+        if not all(allocator.resume_held(tensor) for tensor in held) or self._state_pool is not None and not allocator.resume_pool(self._state_pool):
+            self._note_guard("runtime_resume_no_room", "VRAM had no room for the suspended runtime: prepared again, graphs captured again")
+            self.reset_runtime_state()
+            return
+        for tensor in held:  # zeros, as at their allocation (the attention reads the unwritten slots of a sequence's last page)
+            tensor.zero_()
+        allocator.restore_pool(saved)
+        self._report("resumed: its graphs replay without a capture")
+
+    def _report(self, text):
+        from mmgp import runtime
+        if runtime.verbose_level(self.model) >= 2:
+            from tqdm import tqdm
+            tqdm.write(f"[LM Engine] Runtime {text}.")
+
+    @property
+    def graphs_idle(self):
+        return self._suspended
 
     def _register_graph_state(self):
         """MMGP mode: the CUDA tensors the target model's graphs read besides weights and arguments (KV pages, recurrent and speculative
@@ -638,6 +714,7 @@ class ModelRunner:
         for name in ("kv_cache", "kv_cache_scales", "kv_cache_mins", "kv_views", "kv_min_views", "kv_overlay", "kv_overlay_scales", "kv_index_pool"):
             if hasattr(self, name):
                 delattr(self, name)
+        self._suspended = False
         # CUDA graphs captured against previous model/KV pointers are unsafe after runtime reset.
         # Force recapture on next prepare to avoid stale-pointer illegal memory access.
         try:
@@ -689,6 +766,9 @@ class ModelRunner:
     def invalidate_graphs_if_model_storage_changed(self) -> bool:
         if not self._runtime_ready or self.enforce_eager:
             return False
+        if self.mmgp_graphs:  # its base back in VRAM first: unloaded (suspended), its tensors are their RAM copies until it loads again
+            from mmgp import runtime
+            runtime.ensure_loaded(self.model)
         current_signature = self._get_model_storage_signature()
         if current_signature == self._model_storage_signature:
             return False
@@ -941,27 +1021,27 @@ class ModelRunner:
         config, layout = self.config, self.kv_layout
         blocks = config.num_kvcache_blocks
         if layout is None or not layout.mixed:
-            self.kv_cache = torch.zeros(2, layers, blocks, self.block_size, num_kv_heads, head_dim, device=runtime_device, dtype=torch.int8 if config.kv_cache_int8 else self.dtype)
+            self.kv_cache = _held_zeros((2, layers, blocks, self.block_size, num_kv_heads, head_dim), torch.int8 if config.kv_cache_int8 else self.dtype, runtime_device)
             self.kv_views = (self.kv_cache[0], self.kv_cache[1])
             self.kv_min_views = (None, None)
             if config.kv_cache_int8:
-                self.kv_cache_scales = torch.zeros(2, layers, blocks, self.block_size, num_kv_heads, scale_elements, device=runtime_device, dtype=torch.float16)
+                self.kv_cache_scales = _held_zeros((2, layers, blocks, self.block_size, num_kv_heads, scale_elements), torch.float16, runtime_device)
             return
         shape = lambda width: (layers, blocks, self.block_size, num_kv_heads, width)
         widths = (layout.k.width(head_dim), layout.v.width(head_dim))
         sizes = [math.prod(shape(width)) for width in widths]
-        self.kv_cache = torch.zeros(sum(sizes), device=runtime_device, dtype=torch.uint8)
+        self.kv_cache = _held_zeros((sum(sizes),), torch.uint8, runtime_device)
         self.kv_views = tuple(self.kv_cache[offset:offset + size].view(fmt.dtype).view(shape(width))
                               for fmt, width, size, offset in zip((layout.k, layout.v), widths, sizes, (0, sizes[0])))
-        self.kv_cache_scales = torch.zeros(2, *shape(scale_elements), device=runtime_device, dtype=torch.float16)
+        self.kv_cache_scales = _held_zeros((2, *shape(scale_elements)), torch.float16, runtime_device)
         asymmetric = [fmt.asymmetric for fmt in (layout.k, layout.v)]
-        self.kv_cache_mins = torch.zeros(sum(asymmetric), *shape(scale_elements), device=runtime_device, dtype=torch.float16) if any(asymmetric) else None
+        self.kv_cache_mins = _held_zeros((sum(asymmetric), *shape(scale_elements)), torch.float16, runtime_device) if any(asymmetric) else None
         mins = iter(self.kv_cache_mins) if self.kv_cache_mins is not None else None
         self.kv_min_views = tuple(next(mins) if flag else None for flag in asymmetric)
         if layout.overlay and getattr(self, "kv_overlay", None) is None:
             rows = config.max_num_seqs * layout.overlay_rows(self.block_size) + 1  # plus a scratch row for tokens without an overlay (PyTorch store path)
-            self.kv_overlay = torch.zeros(2, layers, rows, num_kv_heads, head_dim, device=runtime_device, dtype=torch.int8)
-            self.kv_overlay_scales = torch.zeros(2, layers, rows, num_kv_heads, scale_elements, device=runtime_device, dtype=torch.float16)
+            self.kv_overlay = _held_zeros((2, layers, rows, num_kv_heads, head_dim), torch.int8, runtime_device)
+            self.kv_overlay_scales = _held_zeros((2, layers, rows, num_kv_heads, scale_elements), torch.float16, runtime_device)
 
     def _allocate_index_pool(self, modules, runtime_device) -> None:
         """The paged cache of indexed attention (attention_indexed): a row per block of tokens, per layer."""
@@ -2039,7 +2119,7 @@ class ModelRunner:
         # the warmup compiles the kernels; its drafter passes write the cache rows past its length, which every replay rewrites before reading
         with torch.cuda.stream(stream), allocator.graph_warmup(pool):
             run()
-        graph = torch.cuda.CUDAGraph()
+        graph = cuda_graphs.Graph(self)
         with torch.cuda.graph(graph, pool, stream=stream, capture_error_mode="thread_local"):
             run()
         torch.cuda.synchronize()
@@ -2665,7 +2745,7 @@ class ModelRunner:
             choose_short_batch_kernels()
             choose_short_batch_kernels = None
         for bs in reversed(self.graph_bs if not self.mmgp_graphs else ()):
-            graph = torch.cuda.CUDAGraph()
+            graph = cuda_graphs.Graph(self)
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs],
                         overlay_mapping=overlay_mapping[:bs], overlay_base=overlay_base[:bs], ring_start=ring_start[:bs])
             capture_stream.wait_stream(torch.cuda.current_stream(model_device))
@@ -2723,7 +2803,7 @@ class ModelRunner:
                 speculative_overlay_base = torch.full((1,), -1, dtype=torch.int32, device=model_device)
                 speculative_ring_start = torch.full((1,), 1 << 30, dtype=torch.int32, device=model_device)
                 if not self.mmgp_graphs:
-                    graph = torch.cuda.CUDAGraph()
+                    graph = cuda_graphs.Graph(self)
                     set_context(True, speculative_cu_seqlens_q, speculative_cu_seqlens_k, verify_length, config.max_model_len, speculative_slot_mapping, None, speculative_block_tables, has_previous_state=True, speculative_verify=True,
                                 overlay_mapping=speculative_overlay_mapping, overlay_base=speculative_overlay_base, ring_start=speculative_ring_start)
                     capture_stream.wait_stream(torch.cuda.current_stream(model_device))
@@ -2754,7 +2834,7 @@ class ModelRunner:
                     capture_stream.wait_stream(torch.cuda.current_stream(model_device))
                     with torch.cuda.stream(capture_stream):
                         self._commit_speculative_target_state_eager(processed_tokens)    # warmup
-                    graph = torch.cuda.CUDAGraph()
+                    graph = cuda_graphs.Graph(self)
                     with torch.cuda.graph(graph, pool, stream=capture_stream, capture_error_mode="thread_local"):
                         self._commit_speculative_target_state_eager(processed_tokens)
                     self.speculative_commit_graphs[processed_tokens] = graph
@@ -2779,7 +2859,7 @@ class ModelRunner:
                 mtp_pool = torch.cuda.graph_pool_handle()
                 with torch.cuda.stream(capture_stream), allocator.graph_warmup(mtp_pool):
                     self.model.mtp(mtp_input_ids, mtp_positions, mtp_hidden_states, last_logits_only=True, cache_prepared=True)
-                mtp_graph = torch.cuda.CUDAGraph()
+                mtp_graph = cuda_graphs.Graph(self)
                 with torch.cuda.graph(mtp_graph, mtp_pool, stream=capture_stream, capture_error_mode="thread_local"):
                     mtp_outputs, mtp_logits = self.model.mtp(mtp_input_ids, mtp_positions, mtp_hidden_states, last_logits_only=True, cache_prepared=True)
                     mtp_next_token = torch.argmax(mtp_logits[0, -1]).reshape(1)
@@ -2802,7 +2882,7 @@ class ModelRunner:
                     capture_stream.wait_stream(torch.cuda.current_stream(model_device))
                     with torch.cuda.stream(capture_stream), allocator.graph_warmup(self.mtp_graph_pool):
                         self.model.mtp(refresh_ids, refresh_positions, refresh_hidden, last_logits_only=True, cache_prepared=True)
-                    refresh_graph = torch.cuda.CUDAGraph()
+                    refresh_graph = cuda_graphs.Graph(self)
                     with torch.cuda.graph(refresh_graph, self.mtp_graph_pool, stream=capture_stream, capture_error_mode="thread_local"):
                         refresh_outputs, refresh_logits = self.model.mtp(refresh_ids, refresh_positions, refresh_hidden, last_logits_only=True, cache_prepared=True)
                         refresh_next_token = refresh_logits[0, -1].argmax().reshape(1)

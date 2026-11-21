@@ -130,6 +130,7 @@ gitpython==3.1.45
 stringzilla==4.0.14
 xxhash
 munch
+kaldifst==1.9.0
 wetext==0.1.2
 markdown
 apprise==1.12.0

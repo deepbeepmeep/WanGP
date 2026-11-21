@@ -101,7 +101,7 @@ class model_factory:
                 preview_height = min(200, image.shape[-2])
                 preview_width = max(1, round(image.shape[-1] * preview_height / image.shape[-2]))
                 preview = torch.nn.functional.interpolate(image, size=(preview_height, preview_width), mode="bilinear", align_corners=False) if image.shape[-2:] != (preview_height, preview_width) else image
-                callback(step_idx, preview.to("cpu").transpose(0, 1), False)
+                callback(step_idx, preview.float().transpose(0, 1), False)  # on the GPU: WanGP moves it to RAM without waiting for it
 
         with text_encoding_prompts(1 + int(guide_scale != 1.0 if references else guide_scale > 1.0)):
             try:

@@ -6,6 +6,8 @@ from typing import Callable, Iterable
 
 import torch
 
+from mmgp import cuda_graphs
+
 
 @dataclass
 class GraphKVIndexWriter:
@@ -47,7 +49,7 @@ class CUDAGraphRunner:
             if tensor.device.type != "cuda":
                 raise ValueError(f"[{self._name}] CUDAGraphRunner requires CUDA tensors.")
         self._static_inputs = [tensor.detach().clone() for tensor in inputs]
-        self._graph = torch.cuda.CUDAGraph()
+        self._graph = cuda_graphs.Graph()
         try:
             with torch.inference_mode():
                 with torch.cuda.graph(self._graph, capture_error_mode="thread_local"):

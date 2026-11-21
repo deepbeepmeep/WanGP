@@ -229,7 +229,7 @@ class DeepyJob:
             written = [(record["path_key"], record["path"], record["media_type"], record.get("label", "")) for record in session.media_registry if "write" in record.get("access", []) and record.get("path_key") not in known and record.get("path")]
         said = [block["text"] for block in blocks if block.get("type") == "markdown" and block.get("text")]
         text = "\n\n".join(said)
-        if text != self._text:
+        if said and text != self._text:  # a compaction can take the turn's earlier messages out of the transcript: what was said stays said
             self._reply = said[-1]
             self._emit("text", {"text": text, "delta": text[len(self._text):] if text.startswith(self._text) else text, "last": self._reply})
             self._text = text

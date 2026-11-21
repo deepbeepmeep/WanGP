@@ -206,7 +206,7 @@ def get_window_audio_embeddings(full_audio_embs, audio_start_idx=0, clip_length 
     if full_audio_embs == None: return None
     HUMAN_NUMBER = len(full_audio_embs)
     audio_end_idx = audio_start_idx + clip_length
-    indices = (torch.arange(2 * 2 + 1) - 2) * 1 
+    indices = (torch.arange(2 * 2 + 1, device="cpu") - 2) * 1  # the guides' tables are in RAM
 
     audio_embs = []
     encoder = []  # loaded when a block of a guide has to be embedded, once for every speaker
@@ -215,7 +215,8 @@ def get_window_audio_embeddings(full_audio_embs, audio_start_idx=0, clip_length 
         center_indices = torch.arange(
             audio_start_idx,
             audio_end_idx,
-            1
+            1,
+            device="cpu"
         ).unsqueeze(
             1
         ) + indices.unsqueeze(0)

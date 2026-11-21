@@ -585,10 +585,13 @@ class AutoPreload:
         loaded = m.loaded_blocks[model_id]
         if loaded is not None and any(slot[1] == model_id + "/" + loaded for slot in slots):
             m.gpu_unload_blocks(model_id, loaded)
+        freed = False
         for slot_no, slot in enumerate(slots):
             if slot[1] is None and slot[0] is not None:
-                slot[0] = None
+                slot[0], freed = None, True
                 m.slot_views = {key: views for key, views in m.slot_views.items() if key[1] != slot_no or not key[0].startswith(model_id + "/")}
+        if freed:  # slots in the pool of the weights kept for CUDA graphs give their VRAM back
+            m.trim_graph_pool(model_id)
         if all(slot[1] is None for slot in slots):
             del m.block_slots[model_id]
 

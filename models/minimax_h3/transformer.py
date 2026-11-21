@@ -497,10 +497,12 @@ class FinalLayer(nn.Module):
         return torch.cat(parts)
 
     def forward(self, x_list, temb, video_segment, audio_segment):
-        # PDD heads read a sampling plan changed by the scheduler outside this call.
+        # PDD heads read a sampling plan changed by the scheduler outside this call: eager, on the idle memory of the graph pool, whose
+        # chunks would otherwise stay beside the ordinary ones its temporaries take (the reserved VRAM would be their sum)
         with cuda_graphs.scope():
-            return cuda_graphs.run(self, x_list, temb, video_segment, audio_segment, method="_forward",
-                                   enabled=not isinstance(self.video_out, MiniMaxH3ParallelHead))
+            if isinstance(self.video_out, MiniMaxH3ParallelHead):
+                return cuda_graphs.pooled(self, self._forward, x_list, temb, video_segment, audio_segment)
+            return cuda_graphs.run(self, x_list, temb, video_segment, audio_segment, method="_forward")
 
     def _forward(self, x_list, temb, video_segment, audio_segment):
         hidden = _take(x_list)

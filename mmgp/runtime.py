@@ -29,6 +29,22 @@ def checkpoint():
         callback()
 
 
+_release_callbacks = weakref.WeakKeyDictionary()  # module -> callbacks run when its offload object is released (on_release)
+
+
+def on_release(module, callback):
+    """callback() runs once when the offload object managing module is released (offload.release(): a model switch, a reset): the owner of
+    state kept beside the model while it is suspended (an engine, its graphs) frees it for good."""
+    _release_callbacks.setdefault(module, set()).add(callback)
+
+
+def _released(manager):
+    for model in manager.models.values():
+        for module in model.modules():
+            for callback in _release_callbacks.pop(module, ()):
+                callback()
+
+
 def register_resource(module, prepare, release):
     """Tie a shared execution resource to a model's GPU residency.
 
@@ -90,6 +106,12 @@ def _owner(module):
         return None
     manager = entry[0]()
     return None if manager is None else (manager, entry[1])
+
+
+def verbose_level(module):
+    """The verbose level of the offload object managing module (0 for an unmanaged module)."""
+    owner = _owner(module)
+    return 0 if owner is None else owner[0].verboseLevel
 
 
 def execution_device(module):

@@ -15,7 +15,7 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP, Qwen3RMSNorm, Qwe
 
 from ..layers import attention as shared_attention
 from shared.utils.cancellation import check_cancelled
-from mmgp import transfer
+from mmgp import cuda_graphs, transfer
 
 _REWIND_ROWS = 4096  # rows kept beyond a sliding window: a rewind up to this far stays exact
 _SHIFT_ROWS = 2048  # rows appended between two moves of the kept rows
@@ -276,7 +276,7 @@ class BlockDraft(nn.Module):
                 inputs.copy_(features)
                 fixed_positions.copy_(positions)
                 self._append_context_tensors(inputs, fixed_positions, indices)
-                graph = torch.cuda.CUDAGraph()
+                graph = cuda_graphs.Graph()
                 with torch.cuda.graph(graph, pool=self._append_graph_pool, capture_error_mode="thread_local"):
                     self._append_context_tensors(inputs, fixed_positions, indices)
                 self._append_graph_pool = graph.pool()
@@ -352,7 +352,7 @@ class BlockDraft(nn.Module):
             ids[0, 0].fill_(anchor)
             positions = torch.arange(start_position, start_position + self.block_size, device=ids.device).unsqueeze(0)
             self._forward_block(ids, positions, embedding, output)
-            graph = torch.cuda.CUDAGraph()
+            graph = cuda_graphs.Graph()
             with torch.cuda.graph(graph, capture_error_mode="thread_local"):
                 hidden, logits = self._forward_block(ids, positions, embedding, output)
             self._proposal_buffers = (ids, positions, hidden, logits)

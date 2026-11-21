@@ -7909,6 +7909,9 @@ class AssistantEngine:
             if loading:
                 self._set_status("Loading Deepy...", kind="loading")
             model, _tokenizer = self.runtime_hooks.ensure_loaded()
+            manager = self.runtime_hooks.get_offload_manager()
+            if manager is not None:  # before its first turn: its graphs are kept when it unloads (_unload_weights suspends it), replayed when it comes back
+                manager.make_suspendable()
             model._prompt_enhancer_min_model_len_hint = self._get_context_window_tokens()
             engine = getattr(model, "_prompt_enhancer_vllm_engine", None)
             llm = None if engine is None else getattr(engine, "_llm", None)

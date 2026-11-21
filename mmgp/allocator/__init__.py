@@ -129,6 +129,7 @@ def install(mode="vmm", large_mb=256, chunk_mb=32, spill=False):
     lib.vmm_output_plan_begin.restype = ctypes.c_void_p
     lib.vmm_output_plan_pause.argtypes = ()
     lib.vmm_output_plan_bind.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+    lib.vmm_output_plan_bind_to.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
     lib.vmm_output_plan_capture.argtypes = (ctypes.c_void_p,)
     lib.vmm_output_plan_finish.argtypes = (ctypes.c_void_p,)
     lib.vmm_output_plan_finish.restype = ctypes.c_int
@@ -138,6 +139,14 @@ def install(mode="vmm", large_mb=256, chunk_mb=32, spill=False):
     lib.vmm_graph_storage_overlaps.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int)
     lib.vmm_graph_storage_overlaps.restype = ctypes.c_int
     lib.vmm_pool_live.argtypes = (ctypes.c_int, ctypes.c_ulonglong, ctypes.c_ulonglong)
+    lib.vmm_pool_blocks.argtypes = (ctypes.c_int, ctypes.c_ulonglong, ctypes.c_ulonglong, ctypes.POINTER(ctypes.c_ulonglong), ctypes.POINTER(ctypes.c_int64), ctypes.c_int64)
+    lib.vmm_pool_blocks.restype = ctypes.c_int64
+    lib.vmm_held_alloc.argtypes = (ctypes.c_size_t, ctypes.c_int, ctypes.c_int)
+    lib.vmm_held_alloc.restype = ctypes.c_void_p
+    for name in ("vmm_held_suspend", "vmm_held_resume", "vmm_held_mapped"):
+        getattr(lib, name).argtypes = (ctypes.c_void_p, ctypes.c_int)
+        getattr(lib, name).restype = ctypes.c_int
+    lib.vmm_held_free.argtypes = (ctypes.c_void_p, ctypes.c_int)
     lib.vmm_pool_live.restype = ctypes.c_int64
     lib.vmm_in_pool.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_ulonglong, ctypes.c_ulonglong)
     lib.vmm_in_pool.restype = ctypes.c_int
@@ -146,6 +155,12 @@ def install(mode="vmm", large_mb=256, chunk_mb=32, spill=False):
     lib.vmm_long_lived.argtypes = (ctypes.c_int,)
     lib.vmm_long_lived.restype = ctypes.c_int
     lib.vmm_graph_pools.argtypes = (ctypes.c_int,)
+    lib.vmm_pool_weights.argtypes = (ctypes.c_int, ctypes.c_ulonglong, ctypes.c_ulonglong)
+    lib.vmm_pool_suspend.argtypes = (ctypes.c_int, ctypes.c_ulonglong, ctypes.c_ulonglong)
+    lib.vmm_pool_suspend.restype = ctypes.c_int
+    lib.vmm_pool_resume.argtypes = (ctypes.c_int, ctypes.c_ulonglong, ctypes.c_ulonglong, ctypes.c_void_p)
+    lib.vmm_pool_resume.restype = ctypes.c_int
+    lib.vmm_pool_trim.argtypes = (ctypes.c_int, ctypes.c_ulonglong, ctypes.c_ulonglong)
     lib.vmm_graph_pools.restype = ctypes.c_int64
     _install_oom_error(lib)
     _lib, active = lib, mode
@@ -259,6 +274,116 @@ def pool_live(pool, device=None):
     return _lib.vmm_pool_live(_device_index(device), *pool)
 
 
+@contextlib.contextmanager
+def pool_allocations(pool, weights=False):
+    """This thread's allocations on the current stream go to a graph pool (one that suspend_pool can make idle, its addresses kept), e.g. the
+    buffers of model weights that CUDA graphs kept between generations read (weights: they count as weights, see weight_allocations)."""
+    if active != "vmm" or pool is None:
+        yield
+        return
+    device = torch.cuda.current_device()
+    if weights:
+        _lib.vmm_pool_weights(device, *pool)
+    token = _lib.vmm_begin_warmup(device, *pool, torch.cuda.current_stream(device).cuda_stream)
+    try:
+        yield
+    finally:
+        _lib.vmm_end_warmup(device, *pool, token)
+
+
+class _HeldBuffer:
+    """The memory of a held buffer, for torch.as_tensor (__cuda_array_interface__): freed with the last tensor that uses it."""
+
+    def __init__(self, pointer, nbytes, device):
+        self.pointer, self.device = pointer, device
+        self.__cuda_array_interface__ = {"shape": (nbytes,), "typestr": "|u1", "data": (pointer, False), "version": 3, "strides": None, "stream": None}
+
+    def __del__(self):
+        if _lib is not None:
+            _lib.vmm_held_free(self.pointer, self.device)
+
+
+def held_empty(nbytes, device=None, weight=False):
+    """A uint8 CUDA tensor of nbytes on a held buffer (VMM allocator): its addresses stay for the tensor's life, its VRAM can be given back
+    (suspend_held) and mapped again at the same addresses (resume_held), so that CUDA graphs reading it replay. weight: counted in the
+    models' weights. None without the VMM allocator."""
+    if active != "vmm":
+        return None
+    device = _device_index(device)
+    pointer = _lib.vmm_held_alloc(nbytes, device, int(weight))
+    if not pointer:
+        raise torch.OutOfMemoryError(f"CUDA out of memory: the VMM allocator found no room for a held buffer of {nbytes / 2**20:.1f} MiB.")
+    return torch.as_tensor(_HeldBuffer(pointer, nbytes, device), device=torch.device("cuda", device))
+
+
+class _DeviceMemory:
+    """A CUDA allocation at a raw address, for torch.as_tensor (__cuda_array_interface__); it owns nothing."""
+
+    def __init__(self, pointer, nbytes):
+        self.__cuda_array_interface__ = {"shape": (nbytes,), "typestr": "|u1", "data": (pointer, False), "version": 3, "strides": None, "stream": None}
+
+
+def save_pool(pool, device=None):
+    """The contents of the live allocations of a pool, copied to RAM (after the work queued on the current stream), for restore_pool once
+    it is suspended and resumed: [(address, RAM copy)]."""
+    if active != "vmm" or pool is None:
+        return []
+    device = _device_index(device)
+    count = _lib.vmm_pool_blocks(device, *pool, None, None, 0)
+    addresses, sizes = (ctypes.c_ulonglong * count)(), (ctypes.c_int64 * count)()
+    count = _lib.vmm_pool_blocks(device, *pool, addresses, sizes, count)
+    return [(address, torch.as_tensor(_DeviceMemory(address, size), device=torch.device("cuda", device)).cpu()) for address, size in zip(addresses[:count], sizes[:count]) if size > 0]
+
+
+def restore_pool(saved, device=None):
+    """Copies the contents save_pool took back to their allocations, on the current stream."""
+    device = torch.device("cuda", _device_index(device))
+    for address, contents in saved:
+        torch.as_tensor(_DeviceMemory(address, contents.numel()), device=device).copy_(contents)
+
+
+def _held_pointer(tensor):
+    return tensor.untyped_storage().data_ptr()
+
+
+def suspend_held(tensor):
+    """The VRAM of the held buffer of tensor goes back to the driver (after the work queued on the device), its addresses kept; its contents
+    are lost. False when tensor is not on a held buffer."""
+    return active == "vmm" and bool(_lib.vmm_held_suspend(_held_pointer(tensor), tensor.device.index))
+
+
+def resume_held(tensor):
+    """The held buffer of tensor gets VRAM again at its addresses (after the recoveries of an allocation); its contents are undefined. False
+    when VRAM has no room for it."""
+    return bool(_lib.vmm_held_resume(_held_pointer(tensor), tensor.device.index))
+
+
+def held_mapped(tensor):
+    """True if tensor is on a held buffer that has its VRAM, False if suspended, None if it is not on a held buffer."""
+    state = _lib.vmm_held_mapped(_held_pointer(tensor), tensor.device.index) if active == "vmm" else -1
+    return None if state < 0 else bool(state)
+
+
+def suspend_pool(pool, device=None):
+    """An idle graph pool gives its VRAM back to the driver and keeps its addresses, so that its graphs can replay later (resume_pool). Waits for
+    the work queued on the device. False when the pool cannot be suspended (another allocator, a capture running)."""
+    return active == "vmm" and bool(_lib.vmm_pool_suspend(_device_index(device), *pool))
+
+
+def resume_pool(pool, device=None):
+    """A suspended graph pool gets VRAM again at the addresses of its graphs (after the recoveries of an allocation), on the current stream; an
+    allocation to the pool resumes it as well. False when VRAM has no room for it."""
+    device = _device_index(device)
+    return active != "vmm" or bool(_lib.vmm_pool_resume(device, *pool, torch.cuda.current_stream(device).cuda_stream))
+
+
+def trim_pool(pool, device=None):
+    """A pool of weights (pool_allocations(pool, weights=True)) gives the VRAM of its freed buffers back to the driver, after a device
+    synchronization when it holds memory (a suspended pool's freed buffers only lose their addresses). Nothing while a capture records."""
+    if active == "vmm":
+        _lib.vmm_pool_trim(_device_index(device), *pool)
+
+
 def in_pool(tensor, pool):
     """Whether the storage of tensor is an allocation of this graph pool."""
     return bool(_lib.vmm_in_pool(tensor.untyped_storage().data_ptr(), tensor.device.index, *pool))
@@ -335,6 +460,12 @@ class OutputPlan:
     def bind(self, tensor):
         if self.token is not None:
             _lib.vmm_output_plan_bind(self.token, tensor.untyped_storage().data_ptr())
+
+    def bind_to(self, warmup_pointer, target):
+        """The capture's allocation of the warmup output that was at warmup_pointer is made on target's memory (a buffer of the pool of
+        the same size, that the output goes to)."""
+        if self.token is not None:
+            _lib.vmm_output_plan_bind_to(self.token, warmup_pointer, target.untyped_storage().data_ptr())
 
     def capture(self):
         if self.token is not None:
@@ -463,7 +594,7 @@ def weights(device=None):
 @contextlib.contextmanager
 def weight_allocations():
     """For the model weights this thread moves to the GPU (MMGP's loads): counted apart, so that probe_peak / probe_now measure the
-    other allocations whatever weights are loaded or released between them. Graph pools' allocations are never counted as weights."""
+    other allocations whatever weights are loaded or released between them. Graph pools' allocations count as weights only in a pool of weights (pool_allocations)."""
     if active != "vmm":
         yield
         return

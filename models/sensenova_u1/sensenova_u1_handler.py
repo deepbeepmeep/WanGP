@@ -1,5 +1,6 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 
+import numpy as np
 import torch
 from PIL import Image
 
@@ -152,11 +153,12 @@ class family_handler:
     def preview_latents(base_model_type, latents, meta):
         if not torch.is_tensor(latents) or latents.dim() != 4 or latents.shape[0] != 3:
             return None
-        image = latents.detach().float().cpu().clamp(-1, 1)
+        # with NumPy, on this thread alone: PyTorch's CPU ops wake its pool of threads, which then spin and slow the next denoising step
+        image = latents.detach().float().cpu().numpy()
         channels, frames, height, width = image.shape
-        image = image.permute(0, 2, 1, 3).reshape(channels, height, frames * width)
-        image = image.add(1).mul(127.5).clamp(0, 255).to(torch.uint8)
-        preview = Image.fromarray(image.permute(1, 2, 0).numpy())
+        image = image.transpose(0, 2, 1, 3).reshape(channels, height, frames * width)
+        image = ((np.clip(image, -1, 1) + 1) * 127.5).clip(0, 255).astype(np.uint8)
+        preview = Image.fromarray(np.ascontiguousarray(image.transpose(1, 2, 0)))
         if preview.height > 0:
             scale = 200 / preview.height
             resampling_module = getattr(Image, "Resampling", Image)

@@ -52,6 +52,41 @@ class OpenCodeBackendTests(unittest.TestCase):
         self.assertTrue(aborted.is_set())
         self.assertEqual(retries, ["Free usage exceeded"])
 
+    def test_a_turn_without_tools_cannot_reach_wangp_tools(self):
+        # the server shares WanGP's tools between sessions: a nested inspection calling one would wait on the turn that started it
+        requests_made = []
+
+        def request(method, path, **kwargs):
+            requests_made.append((method, path, kwargs.get("json")))
+            return {"id": "ses_1", "data": {"id": "ses_2"}}
+
+        class Events:
+            encoding = ""
+
+            def raise_for_status(self):
+                pass
+
+            def close(self):
+                pass
+
+            def iter_lines(self, *, decode_unicode=False):
+                return iter(())
+
+        for tools, allowed in (([], False), ([{"type": "function", "function": {"name": "wangp_generate", "description": "", "parameters": {}}}], True)):
+            backend = OpenCodeBackend({"model_catalog": [{"provider": "opencode", "model": "free"}]})
+            backend._session_id, backend._ensure_session, backend._request = "ses_1", lambda *_args: None, request
+            requests_made.clear()
+            with patch("shared.remote_llm.opencode_backend.requests.get", return_value=Events()):
+                backend.run_turn("look", system_prompt="system", tools=tools, images=[], on_event=lambda _event: None, call_tool=lambda *_args: {}, should_stop=lambda: False)
+            body = next(body for _method, path, body in requests_made if path.endswith("/message"))
+            self.assertEqual(body["tools"], {"*": False, "wangp_*": allowed})
+        for toolbox, tools, effects in ((None, [], ["deny"]), (object(), [{"type": "function", "function": {"name": "wangp_generate", "description": "", "parameters": {}}}], ["deny", "allow"])):
+            backend = OpenCodeBackend({}, toolbox=toolbox)
+            backend._api, backend._request, backend._start_bridge = 2, request, lambda _tools: "http://127.0.0.1:1/mcp"
+            requests_made.clear()
+            backend._ensure_session_v2(tools)
+            self.assertEqual([rule["effect"] for rule in requests_made[0][2]["permissions"]], effects)
+
     def test_opencode_2_turn_follows_the_session_events(self):
         backend = OpenCodeBackend({"provider": "fake", "model": "scripted", "model_catalog": [{"provider": "fake", "model": "scripted", "context_window": 32000}]})
         backend._api, backend._session_id = 2, "ses_1"

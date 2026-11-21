@@ -34,11 +34,6 @@ def set_denoising_step(step, steps=0):
     denoising_step, denoising_steps = step, steps
 
 
-def denoising_steps_left():
-    """The steps of the current denoising loop still to run after the one being computed, None when unknown (MMGP's graph horizon)."""
-    return max(denoising_steps - denoising_step - 1, 0) if denoising_steps and denoising_step is not None else None
-
-
 def sage2_execution_quality():
     """The SageGP quality of the attention calls running: "regular" (Precise), "adaptive" or "fast"."""
     return "regular" if sage2_quality_override is None or first_step_precise() else sage2_quality_override

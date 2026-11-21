@@ -262,7 +262,7 @@ class OpenCodeBackend:
                 raise
 
     def _ensure_session_v2(self, tools: Sequence[dict[str, Any]]) -> None:
-        body: dict[str, Any] = {"permissions": OPENCODE2_PERMISSIONS}
+        body: dict[str, Any] = {"permissions": OPENCODE2_PERMISSIONS if self.toolbox is not None and tools else OPENCODE2_PERMISSIONS[:1]}  # a session without tools is denied WanGP's too: the server shares them between sessions
         if model := self._model():
             body["model"] = {"id": model["modelID"], "providerID": model["providerID"], **({"variant": effort} if (effort := str(self.profile.get("reasoning_effort", "") or "").strip()) else {})}
         self._session_id = str((self._request("POST", "/api/session", json=body).get("data") or {}).get("id", "") or "")
@@ -341,7 +341,7 @@ class OpenCodeBackend:
         body: dict[str, Any] = {
             "parts": [{"type": "text", "text": str(text or "")}],
             "system": self._system_text(system_prompt, tools),
-            "tools": {"*": False, f"{OPENCODE_MCP_SERVER}_*": True},  # OpenCode's own tools stay off, including the ones later versions add
+            "tools": {"*": False, f"{OPENCODE_MCP_SERVER}_*": bool(tools)},  # OpenCode's own tools stay off, including the ones later versions add; WanGP's too in a turn without tools (the server shares them between sessions)
         }
         if model := self._model():
             body["model"] = model
@@ -620,8 +620,8 @@ class OpenCodeBackend:
             on_event(BackendEvent("commentary_promote", part, {"item_id": key}))
         return "".join(part for _key, part in final_parts).strip()
 
-    def one_shot(self, text: str, *, system_prompt: str, images: Sequence[str], max_output_tokens: int) -> str:
-        return self.run_turn(text, system_prompt=system_prompt, tools=[], images=images, on_event=lambda _event: None, call_tool=lambda _name, _args: {}, should_stop=lambda: False)
+    def one_shot(self, text: str, *, system_prompt: str, images: Sequence[str], max_output_tokens: int, should_stop: StopCallback | None = None) -> str:
+        return self.run_turn(text, system_prompt=system_prompt, tools=[], images=images, on_event=lambda _event: None, call_tool=lambda _name, _args: {}, should_stop=should_stop or (lambda: False))
 
     def interrupt(self) -> None:
         self._abort = True

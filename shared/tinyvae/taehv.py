@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -251,6 +252,8 @@ def _apply(model, x, parallel, output_indices=None, abort_check=None, output_tra
         if abort_check is not None and abort_check():
             return None
         run(value, 0)
+    if output[0].device.type == "cpu":  # preview frames moved to RAM: joined by NumPy, PyTorch's CPU copies would wake its spinning pool of threads
+        return torch.from_numpy(np.concatenate([frame.numpy() for frame in output], 1))
     return torch.cat(output, 1)
 
 

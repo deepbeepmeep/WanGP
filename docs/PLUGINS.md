@@ -245,6 +245,29 @@ def setup_ui(self):
 #### `set_global(self, variable_name, new_value)`
 Allows your Plugin to safely modify a global variable in the main `wgp.py` application.
 
+#### `register_custom_settings(self, model_types, definitions)`
+Adds your own generation settings to existing models. Call it in `setup_ui`.
+
+*   `model_types`: one model type or a list of them. An architecture name (for example the base model type a family of finetunes shares) covers every model built on it.
+*   `definitions`: a list of settings, each a dictionary with a unique `id`, a `label` (shown in the form), a `name` (short label used in summaries), a `type` (`text`, `int`, `float` or `dropdown`) and a `default`. Numbers may add `min`, `max` and `inc` (the step) to appear as a slider, and a `dropdown` needs `choices` as `(label, value)` pairs. Optional `model_mode` / `model_mode_not` conditions show a setting only in some of the model's modes.
+
+```python
+def setup_ui(self):
+    self.register_custom_settings("my_architecture", [
+        {"id": "my_plugin_refine_steps", "label": "Refinement Steps", "name": "Refine Steps", "type": "int", "default": 4, "min": 1, "max": 12, "inc": 1},
+        {"id": "my_plugin_mode", "label": "Refinement Mode", "name": "Refine Mode", "type": "dropdown", "choices": [("Fast", "fast"), ("Full", "full")], "default": "fast"},
+    ])
+```
+
+The settings then behave like the model's own custom settings:
+
+*   The generation form shows them with the model's other custom settings, so your plugin needs no controls of its own for them.
+*   Their values are saved with the model's settings, in queues and in the metadata of generated files, and restored from them.
+*   Every generation task carries them in its `custom_settings` dictionary under each `id`, whether it comes from the form, the queue, Deepy, the API or an external agent. Read the values there rather than from your own interface state, so that a task always runs with its own values.
+*   Deepy and agents discover the settings with the model and can set them; a value they send is checked against the type, bounds and choices you declared.
+
+Limits: a model holds five custom settings in total, its own included. Settings that do not fit are ignored and reported in the console when WanGP starts, so prefix your ids with your plugin's name and keep to the settings you really need. An id the model already uses is left to the model.
+
 #### `register_data_hook(self, hook_name, callback)`
 Allows you to intercept and modify data at key points. For example, the `before_metadata_save` hook lets you add custom data to the metadata before it's saved to a file.
 

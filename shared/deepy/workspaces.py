@@ -26,7 +26,7 @@ class WorkspaceSupport:
             self.workspace_revision = 0
             saved_id = self._deps.get_server_config().get('last_workspace_id')
             self.workspace_id = saved_id if saved_id in self.workspaces.records else self.workspaces.catalog()[0]['id']
-            self._apply_workspace(self.workspace_id)
+            self._apply_workspace(self.workspace_id, associate=False)  # a conversation takes its workspace at its first request (ensure_session_workspace)
             self._deps.callbacks.emit('save_workspace_choice', self.workspace_id)
 
     def _archive_old_workspaces(self):

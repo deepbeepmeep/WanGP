@@ -3623,6 +3623,7 @@ def init_model_def(model_type, model_def):
     plugin_id = model_plugin_ids_by_architecture.get(base_model_type, "")
     if plugin_id:
         default_model_def["_plugin_id"] = plugin_id
+    app.plugin_manager.add_custom_settings(model_type, base_model_type, default_model_def)
     return _store_model_metadata(model_type, default_model_def)
 
 
@@ -3753,7 +3754,6 @@ apply_fp8_kernel_setting(fp8_kernels)
 attention_kit.configure(server_config.get(attention_kit.CHUNKER_CONFIG_KEY, attention_kit.CHUNKER_DEFAULT))
 # the global states that change what the blocks of a CUDA graph compute are part of the keys of their graphs
 cuda_graphs.register_key(lambda: (offload.shared_state.get("_attention"), attention_kit.chunker, kernel_policy.precision, int8_backend.revision, fp8_backend.revision))
-cuda_graphs.register_horizon(kernel_policy.denoising_steps_left)  # Auto graphs capture a pass only when the steps left pay for it
 # CUDA Graph mode: the attention modes and the classes of quantized weights / layers whose kernels were validated in captured graphs
 CUDA_GRAPH_ATTENTION_MODES = {"sdpa", "flash", "sage", "sage2", "radial", "sol"}
 CUDA_GRAPH_WEIGHT_TYPES = {"WeightQBytesTensor", "ScaledFP8WeightTensor", "Int8ConvRotWeightTensor", "GGUFWeightTensor", "GGUFSourceTensor", "BNBNF4WeightTensor", "AsymW4A8Int8WeightTensor",
@@ -9621,7 +9621,6 @@ def prepare_generate_media(state):
 def generate_preview(model_type, payload):
     if isinstance(payload, (Image.Image, VideoPreview)):
         return payload
-    import einops
     if payload is None:
         return None
     if isinstance(payload, dict):
@@ -9647,28 +9646,22 @@ def generate_preview(model_type, payload):
     else:
         return None
     if latent_rgb_factors is None: return None
-    latents = latents.unsqueeze(0) 
-    nb_latents = latents.shape[2]
-    latents_to_preview = 4
-    latents_to_preview = min(nb_latents, latents_to_preview)
-    skip_latent =  nb_latents / latents_to_preview
-    latent_no = 0
-    selected_latents = []
+    # with NumPy, on this thread alone: PyTorch's CPU ops wake its pool of threads, which then spin and slow the denoising step running meanwhile
+    nb_latents = latents.shape[1]
+    skip_latent = nb_latents / min(nb_latents, 4)
+    latent_no, selected = 0, []
     while latent_no < nb_latents:
-        selected_latents.append( latents[:, : , int(latent_no): int(latent_no)+1])
-        latent_no += skip_latent 
-
-    latents = torch.cat(selected_latents, dim = 2)
-    weight = torch.tensor(latent_rgb_factors, device=latents.device, dtype=latents.dtype).transpose(0, 1)[:, :, None, None, None]
-    bias = torch.tensor(latent_rgb_factors_bias, device=latents.device, dtype=latents.dtype)
-
-    images = torch.nn.functional.conv3d(latents, weight, bias=bias, stride=1, padding=0, dilation=1, groups=1)
-    images = images.add_(1.0).mul_(127.5)
-    images = images.detach().cpu()
-    if images.dtype == torch.bfloat16:
-        images = images.to(torch.float16)
-    images = images.numpy().clip(0, 255).astype(np.uint8)
-    images = einops.rearrange(images, 'b c t h w -> (b h) (t w) c')
+        selected.append(int(latent_no))
+        latent_no += skip_latent
+    latents = latents.detach()
+    if latents.dtype == torch.bfloat16:  # NumPy has no BF16: its bits are the upper half of the FP32 value
+        latents = (latents.view(torch.int16).numpy()[:, selected].view(np.uint16).astype(np.uint32) << 16).view(np.float32)
+    else:
+        latents = latents.numpy()[:, selected].astype(np.float32)
+    images = np.einsum("cthw,cr->rthw", latents, np.asarray(latent_rgb_factors, dtype=np.float32)) + np.asarray(latent_rgb_factors_bias, dtype=np.float32)[:, None, None, None]
+    images = ((images + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
+    channels, frames, h, w = images.shape
+    images = images.transpose(2, 1, 3, 0).reshape(h, frames * w, channels)
     h, w, _ = images.shape
     scale = 200 / h
     images= Image.fromarray(images)

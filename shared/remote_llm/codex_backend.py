@@ -357,8 +357,8 @@ class CodexBackend:
             raise RuntimeError(self._turn_error)
         return self._text.strip()
 
-    def one_shot(self, text: str, *, system_prompt: str, images: Sequence[str], max_output_tokens: int) -> str:
-        return self.run_turn(text, system_prompt=system_prompt, tools=[], images=images, on_event=lambda _event: None, call_tool=lambda _name, _args: {}, should_stop=lambda: False)
+    def one_shot(self, text: str, *, system_prompt: str, images: Sequence[str], max_output_tokens: int, should_stop: StopCallback | None = None) -> str:
+        return self.run_turn(text, system_prompt=system_prompt, tools=[], images=images, on_event=lambda _event: None, call_tool=lambda _name, _args: {}, should_stop=should_stop or (lambda: False))
 
     def interrupt(self) -> None:
         if self._thread_id and self._turn_id:

@@ -286,6 +286,9 @@ class TextEngine:
 
     def _ensure_llm(self):
         if self._llm is not None:
+            if self._disposable is None or self._disposable.released:  # suspended: declared again, it resumes at its next request
+                from mmgp import runtime
+                self._disposable = runtime.disposable(self.model, "the language model's KV cache", self._suspend_engine)
             return
         try:
             import torch._inductor.config as inductor_config
@@ -325,10 +328,12 @@ class TextEngine:
             **self._kv_cache_options,
         )
         self._sampling_params_cls = SamplingParams
-        from mmgp import runtime
+        from mmgp import cuda_graphs, runtime
         # MMGP takes it back only when VRAM runs short while the engine is not in use (its model parked, or idle()): after the blocks of the
         # idle models; the owner of a live context saves it first (close)
-        self._disposable = runtime.disposable(self.model, "the language model's KV cache", self.close)
+        self._disposable = runtime.disposable(self.model, "the language model's KV cache", self._suspend_engine)
+        runtime.on_release(self.model, self.close)  # its model released (a model switch, a reset): the engine goes for good
+        cuda_graphs.register_purge(self._purge_if_suspended)  # RAM short: a suspended engine frees its graphs and saved state
 
     def has_live_context(self) -> bool:
         """A sequence kept between requests (an assistant's conversation): other requests run beside it (LLMEngine.aside)."""
@@ -365,6 +370,29 @@ class TextEngine:
             self.save_context()  # the live context of an owner away (Deepy parked) goes to RAM first
         finally:
             self._close()
+
+    def suspend(self):
+        """The engine stays with its graphs and gives its VRAM back (KV cache, the pools of its graphs: their addresses kept): at its next
+        request it resumes instead of being made again and its graphs replay. The live context of an owner away is saved to RAM first."""
+        disposable, self._disposable = getattr(self, "_disposable", None), None
+        try:
+            self._suspend_engine()
+        finally:
+            if disposable is not None:
+                disposable.close()
+
+    def _purge_if_suspended(self):
+        llm = getattr(self, "_llm", None)
+        runner = None if llm is None else getattr(llm, "model_runner", None)
+        if runner is not None and runner._suspended:  # its context was saved when it was suspended
+            self._close()
+
+    def _suspend_engine(self):  # also MMGP's release of the disposable KV cache, when VRAM runs short while the engine is not in use
+        try:
+            self.save_context()
+        finally:
+            if self._llm is not None:
+                self._llm.suspend()
 
     def _close(self):
         disposable, self._disposable = getattr(self, "_disposable", None), None

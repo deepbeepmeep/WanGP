@@ -96,11 +96,23 @@ class LLMEngine:
         except Exception:
             pass
 
+    def suspend(self):
+        """Its runtime gives its VRAM back and keeps its graphs (ModelRunner.suspend_runtime), resumed at its next use; its sequences go with the
+        contents of the KV cache (an owner saves its context first)."""
+        runner = getattr(self, "model_runner", None)
+        if runner is None:
+            return
+        runner.suspend_runtime()
+        self._reset_sequences()
+
     def reset_runtime_state(self):
         runner = getattr(self, "model_runner", None)
         if runner is None:
             return
         runner.reset_runtime_state()
+        self._reset_sequences()
+
+    def _reset_sequences(self):
         # KV cache is invalid after runtime reset/reprepare, so cached prefix block metadata
         # must be dropped as well to prevent stale-cache reuse.
         try:

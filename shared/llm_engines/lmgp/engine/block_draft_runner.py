@@ -1,6 +1,8 @@
 """Parallel drafters using the established target verification/rejection sampler."""
 import torch
 
+from mmgp import cuda_graphs
+
 from .model_runner import ModelRunner
 from ..utils.context import reset_context, set_context
 
@@ -154,7 +156,7 @@ class BlockDraftRunner(ModelRunner):
                 fixed_bias.copy_(bias.reshape(-1))
             noise = torch.ones((draft_count, unary.shape[-1]), dtype=torch.float32, device=hidden.device)
             self._dspark_gpu_chain(seq, inputs, logits, anchor, fixed_bias, noise, threshold)
-            graph = torch.cuda.CUDAGraph()
+            graph = cuda_graphs.Graph(self)
             with torch.cuda.graph(graph, capture_error_mode="thread_local"):
                 tokens, probabilities, length = self._dspark_gpu_chain(seq, inputs, logits, anchor, fixed_bias, noise, threshold)
             state = (graph, inputs, logits, anchor, fixed_bias, noise, tokens, probabilities, length)
@@ -271,7 +273,7 @@ class BlockDraftRunner(ModelRunner):
                 fixed_bias.copy_(bias.reshape(-1))
             noise = torch.ones((draft_count, self.model.mtp.candidate_selector.top_k), dtype=torch.float32, device=hidden.device)
             self._dflash_gpu_chain(seq, inputs, logits, anchor, fixed_bias, noise)
-            graph = torch.cuda.CUDAGraph()
+            graph = cuda_graphs.Graph(self)
             with torch.cuda.graph(graph, capture_error_mode="thread_local"):
                 tokens, probabilities, length = self._dflash_gpu_chain(seq, inputs, logits, anchor, fixed_bias, noise)
             state = (graph, inputs, logits, anchor, fixed_bias, noise, tokens, probabilities, length)
@@ -363,7 +365,7 @@ class BlockDraftRunner(ModelRunner):
                 fixed_bias.copy_(bias.reshape(-1))
             noise = torch.ones((draft_count, candidates.shape[1]), dtype=torch.float32, device=table.device)
             self._dspine_gpu_chain(seq, inputs, ids, fixed_bias, noise)
-            graph = torch.cuda.CUDAGraph()
+            graph = cuda_graphs.Graph(self)
             with torch.cuda.graph(graph, capture_error_mode="thread_local"):
                 tokens, probabilities, length = self._dspine_gpu_chain(seq, inputs, ids, fixed_bias, noise)
             state = (graph, inputs, ids, fixed_bias, noise, tokens, probabilities, length)

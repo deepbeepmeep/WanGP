@@ -400,8 +400,8 @@ class ClaudeBackend:
         self._cancelled = False
         return self._run_async(self._run(text, system_prompt, tools, images, on_event, call_tool, should_stop))
 
-    def one_shot(self, text: str, *, system_prompt: str, images: Sequence[str], max_output_tokens: int) -> str:
-        return self.run_turn(text, system_prompt=system_prompt, tools=[], images=images, on_event=lambda _event: None, call_tool=lambda _name, _args: {}, should_stop=lambda: False)
+    def one_shot(self, text: str, *, system_prompt: str, images: Sequence[str], max_output_tokens: int, should_stop: StopCallback | None = None) -> str:
+        return self.run_turn(text, system_prompt=system_prompt, tools=[], images=images, on_event=lambda _event: None, call_tool=lambda _name, _args: {}, should_stop=should_stop or (lambda: False))
 
     def interrupt(self) -> None:
         self._cancelled = True

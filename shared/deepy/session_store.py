@@ -237,7 +237,7 @@ def close_external_session(storage_id: str) -> None:
 
 def session_folder_in_use(directory: Path) -> bool:
     lock_path = directory / ".session.lock"
-    return lock_path.is_file() and _process_alive(int(_read_json(lock_path).get("pid", 0) or 0))
+    return lock_path.is_file() and _lock_held(_read_json(lock_path))
 
 
 class SessionReferences:
@@ -709,6 +709,16 @@ def _process_alive(pid: int) -> bool:
         return False
 
 
+def _lock_held(lock: dict) -> bool:
+    """Whether the process that wrote this session lock still holds it. A lock naming this process that it did not take was left by an earlier run
+    with the same PID (containers restart their numbering), not by a live session."""
+    pid = int(lock.get("pid", 0) or 0)
+    if pid == os.getpid():
+        with _ROOT_LOCK:
+            return str(lock.get("token", "")) in _OWNED_LOCKS
+    return _process_alive(pid)
+
+
 def _acquire_session_lock(session, directory: Path) -> None:
     current_path = str(session.session_lock_path or "")
     if current_path and Path(current_path) == directory / ".session.lock":
@@ -723,8 +733,8 @@ def _acquire_session_lock(session, directory: Path) -> None:
             existing = _read_json(lock_path)
             existing_pid = int(existing.get("pid", 0) or 0)
         except Exception:
-            existing_pid = 0
-        if _process_alive(existing_pid):
+            existing, existing_pid = {}, 0
+        if existing_pid and _lock_held(existing):
             raise SessionLockedError(f"Deepy session is already open by process {existing_pid}.")
         lock_path.unlink(missing_ok=True)
         descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -1193,7 +1203,7 @@ def validate_session(storage_id: str, deepy_type: str, active_session=None) -> d
     active_lock = active_session is not None and active_session.storage_session_id == storage_id and Path(str(active_session.session_lock_path or "")) == lock_path
     if lock_path.is_file() and not active_lock:
         lock = _read_json(lock_path)
-        if _process_alive(int(lock.get("pid", 0) or 0)):
+        if _lock_held(lock):
             raise SessionLockedError(f"Deepy session is already open by process {int(lock.get('pid', 0) or 0)}.")
     return manifest
 
@@ -1428,7 +1438,7 @@ def rename_stored_session(storage_id: str, title: str, active_session=None) -> d
     directory = _validated_session_dir(storage_id)
     if (directory / ".session.lock").is_file():
         lock = _read_json(directory / ".session.lock")
-        if _process_alive(int(lock.get("pid", 0) or 0)):
+        if _lock_held(lock):
             raise SessionLockedError("Close this Deepy session before renaming it.")
     normalized_title = _unique_title(title, storage_id)
     manifest = _read_json(directory / "session.json")
@@ -1506,6 +1516,7 @@ def start_new_session(session, *, save_current: bool = True) -> None:
     session.storage_deepy_type = ""
     session.storage_created_at = ""
     session.storage_updated_at = ""
+    session.gallery_workspace_id = ""  # a new conversation takes the workspace shown at its first request
     session.session_environment = {}
     session.model_selection_runtime_signature = ""
     session.safe_checkpoint_revision = 0
@@ -1570,7 +1581,7 @@ def delete_session(storage_id: str, active_session=None) -> Path:
         release_session_lock(active_session)
     elif (directory / ".session.lock").is_file():
         lock = _read_json(directory / ".session.lock")
-        if _process_alive(int(lock.get("pid", 0) or 0)):
+        if _lock_held(lock):
             raise SessionLockedError("Close this Deepy session before deleting it.")
         (directory / ".session.lock").unlink(missing_ok=True)
     trash = sessions_root() / ".trash"
@@ -1595,7 +1606,7 @@ def export_stored_session(storage_id: str, active_session=None) -> Path:
     active_lock = active_session is not None and active_session.storage_session_id == storage_id and Path(str(active_session.session_lock_path or "")) == lock_path
     if lock_path.is_file() and not active_lock:
         lock = _read_json(lock_path)
-        if _process_alive(int(lock.get("pid", 0) or 0)):
+        if _lock_held(lock):
             raise SessionLockedError("Close this Deepy session before exporting it.")
     exports = sessions_root() / "_exports"
     exports.mkdir(parents=True, exist_ok=True)

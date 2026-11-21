@@ -75,16 +75,16 @@ def _restored_history(messages: list[dict[str, Any]]) -> tuple[list[dict[str, An
     return history, cut
 
 
-def _visual_query(server_config: dict[str, Any], media_record, question: str, frame_no: int | None = None, max_image_edge: int | None = None, file_access_policy=None) -> dict[str, Any]:
+def _visual_query(server_config: dict[str, Any], media_record, question: str, frame_no: int | None = None, max_image_edge: int | None = None, file_access_policy=None, should_stop=None) -> dict[str, Any]:
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return _visual_query_without_running_loop(server_config, media_record, question, frame_no, max_image_edge, file_access_policy)
+        return _visual_query_without_running_loop(server_config, media_record, question, frame_no, max_image_edge, file_access_policy, should_stop)
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="wangp-remote-vision") as executor:
-        return executor.submit(_visual_query_without_running_loop, server_config, media_record, question, frame_no, max_image_edge, file_access_policy).result()
+        return executor.submit(_visual_query_without_running_loop, server_config, media_record, question, frame_no, max_image_edge, file_access_policy, should_stop).result()
 
 
-def _visual_query_without_running_loop(server_config: dict[str, Any], media_record, question: str, frame_no: int | None = None, max_image_edge: int | None = None, file_access_policy=None) -> dict[str, Any]:
+def _visual_query_without_running_loop(server_config: dict[str, Any], media_record, question: str, frame_no: int | None = None, max_image_edge: int | None = None, file_access_policy=None, should_stop=None) -> dict[str, Any]:
     engine = resolve_role_engine(server_config, "visual_inspector")
     if engine == ENGINE_DISABLED:
         return {"status": "error", "question": question, "answer": "", "error": "Visual Inspector is disabled in Configuration."}
@@ -140,7 +140,7 @@ def _visual_query_without_running_loop(server_config: dict[str, Any], media_reco
     backend = create_backend(engine, server_config)
     try:
         with temporary_image_paths(images) as paths:
-            answer = backend.one_shot(labeled_question, system_prompt=deepy_vision.VISION_QA_SYSTEM_PROMPT, images=paths, max_output_tokens=deepy_vision.VISION_ANSWER_MAX_NEW_TOKENS)
+            answer = backend.one_shot(labeled_question, system_prompt=deepy_vision.VISION_QA_SYSTEM_PROMPT, images=paths, max_output_tokens=deepy_vision.VISION_ANSWER_MAX_NEW_TOKENS, should_stop=should_stop)
     finally:
         backend.close()
     result = {"status": "done", "media_ids": [item["media_id"] for item in inspected], "media": inspected, "question": question, "answer": answer, "error": ""}
@@ -422,7 +422,7 @@ def run_remote_deepy_turn(server_config: dict[str, Any], session, text: str, sys
             set_remote_status("waiting", f"Waiting for {engine_label}...", "loading")
         return result
 
-    toolbox.bind_runtime_tools(vision_query_callback=lambda record, question, frame=None, max_image_edge=None: _visual_query(server_config, record, question, frame, max_image_edge, toolbox.file_access_policy), tool_progress_callback=tool_progress, vision_is_remote=True)
+    toolbox.bind_runtime_tools(vision_query_callback=lambda record, question, frame=None, max_image_edge=None: _visual_query(server_config, record, question, frame, max_image_edge, toolbox.file_access_policy, lambda: bool(session.interrupt_requested)), tool_progress_callback=tool_progress, vision_is_remote=True)
     execution_instructions_getter = getattr(toolbox, "get_remote_execution_instructions", None)
     execution_instructions = str(execution_instructions_getter() or "").strip() if callable(execution_instructions_getter) else ""
     if execution_instructions:

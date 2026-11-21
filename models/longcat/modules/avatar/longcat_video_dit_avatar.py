@@ -450,7 +450,11 @@ class LongCatVideoAvatarTransformer3DModel(
             step = step.to(dtype)
             enc = enc.to(dtype)
 
-            x = self.x_embedder(x)
+            # Eager beside the graphed blocks, on the graph pool's idle memory (with the head below): its temporaries do not keep ordinary
+            # memory beside the pool, and its output moves into the static buffer the first block reads. Not graphed: its weights may be
+            # streamed, and a replay does not load them
+            with cuda_graphs.scope(not return_kv):
+                x = cuda_graphs.pooled(self, self.x_embedder, x)
 
             with amp.autocast(device_type='cuda', dtype=torch.float32):
                 t = self.t_embedder(step.float().flatten(), torch.float32).reshape(B, N_t, -1)
@@ -554,7 +558,8 @@ class LongCatVideoAvatarTransformer3DModel(
 
         outputs = []
         for x, t, latent_shape in zip(x_list, t_list, latent_shapes):
-            x = self.final_layer(x, t, latent_shape)
+            with cuda_graphs.scope():  # its FP32 temporaries (two copies of the hidden state) on the graph pool's idle memory
+                x = cuda_graphs.pooled(self, self.final_layer, x, t, latent_shape)
             x = self.unpatchify(x, *latent_shape)
             outputs.append(x.to(torch.float32))
 

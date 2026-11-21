@@ -3,6 +3,8 @@ import os
 import time
 import torch
 
+from mmgp import cuda_graphs
+
 from ..layers.draft_chain import CompactDrafts
 
 _COMPACT = "compact_accept" in os.environ.get("WGP_FN_ENABLE", "").split(",")  # the acceptance on the target's top-k support (compact_acceptance), until validated
@@ -26,7 +28,7 @@ def can_batch_acceptance(runner, seq):
 def capture_sampling_graph(runner, compute):
     """The sampling graphs are captured when a shape or rule first comes up, with the model already filling the VRAM, and replayed one at a time, their retained outputs
     read at once: they share one graph pool, as a pool holds whole 32 MiB chunks however little its graph needs (about 1.4 MiB each, up to 8 + 8 of them)."""
-    graph = torch.cuda.CUDAGraph()
+    graph = cuda_graphs.Graph(runner)
     with torch.cuda.graph(graph, pool=runner._sampling_graph_pool, capture_error_mode="thread_local"):
         result = compute()
     runner._sampling_graph_pool = graph.pool()

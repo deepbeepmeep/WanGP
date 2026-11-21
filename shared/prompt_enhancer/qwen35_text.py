@@ -181,7 +181,7 @@ def qwen35_mtp_fit(assets_dir: str | None, variant: str | None, backend: str, mo
     mtp = sum(nbytes for name, nbytes in tensors if drafter(name))
     mtp_filename = _qwen35_mtp_filename(spec, backend, model_path, get_prism_metadata(model_path))
     if mtp_filename:
-        mtp_path = _resolve_qwen35_checkpoint_file(assets_dir, mtp_filename, variant=variant)
+        mtp_path = _resolve_qwen35_checkpoint_file(assets_dir, mtp_filename, variant=variant, error_if_none=False)
         if not mtp_path or not os.path.isfile(mtp_path):
             return None
         mtp += os.path.getsize(mtp_path) if mtp_path.endswith(".safetensors") else sum(info.n_bytes for info in gguf._gguf_get_index(mtp_path).tensor_infos if info.name != "token_embd.weight")
@@ -1004,6 +1004,14 @@ def _generate_messages(
     raise RuntimeError("Qwen3.5 prompt enhancer text runtime is not configured with an available decode engine.")
 
 
+def _suspend_prompt_enhancer_text_runtime(self):
+    # model.unload: the engine stays with its graphs and gives its VRAM back (engine.suspend), resumed at the next request
+    engine = getattr(self, "_prompt_enhancer_vllm_engine", None)
+    if engine is not None:
+        engine.suspend()
+    _release_text_runtime_caches()
+
+
 def _unload_prompt_enhancer_text_runtime(self):
     engine = getattr(self, "_prompt_enhancer_vllm_engine", None)
     if engine is not None:
@@ -1013,6 +1021,10 @@ def _unload_prompt_enhancer_text_runtime(self):
             self._prompt_enhancer_vllm_engine = None
             self._prompt_enhancer_vllm_mode = None
     self._prompt_enhancer_assistant_graph_pool_handle = None
+    _release_text_runtime_caches()
+
+
+def _release_text_runtime_caches():
     try:
         clear_qwen35_runtime_caches()
     except Exception:
@@ -1545,7 +1557,7 @@ def load_qwen35_text_prompt_enhancer(
     speculative = f"{block_draft_method} drafts" if block_draft_method else ("native MTP" if enable_mtp else "")
     print(f"[Qwen3.5VL][{spec['display_name']}] LLM engine: {_describe_llm_features(features, kv_cache_int8, speculative, model._deepy_kv_cache_layout)}")
     model.generate_messages = types.MethodType(_generate_messages, model)
-    model.unload = types.MethodType(_unload_prompt_enhancer_text_runtime, model)
+    model.unload = types.MethodType(_suspend_prompt_enhancer_text_runtime, model)
     model._offload_hooks = ["forward"]
     model.eval()
     return model

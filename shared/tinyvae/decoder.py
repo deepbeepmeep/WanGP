@@ -7,6 +7,7 @@ import json
 import math
 from pathlib import Path
 
+import numpy as np
 import torch
 from PIL import Image
 from torch import nn
@@ -83,27 +84,29 @@ class TinyVAE(nn.Module):
                 for first in range(0, len(indices), together):
                     if abort_check is not None and abort_check():
                         return None
-                    frames.append(to_pixels(self.net(value[indices[first:first + together]])))
-            pixels = torch.cat(frames)
+                    frames.append(to_pixels(self.net(value[indices[first:first + together]])).numpy())
+            pixels = np.concatenate(frames)
         elif image:
             frames = []
             for index in indices:
                 decoded = self.net.decode_video(value[index:index + 1, None], parallel=False, abort_check=abort_check)
                 if decoded is None:
                     return None
-                frames.append(to_pixels(decoded[:, 0]))
-            pixels = torch.cat(frames)
+                frames.append(to_pixels(decoded[:, 0]).numpy())
+            pixels = np.concatenate(frames)
         else:
             decoded = self.net.decode_video(value[None], parallel=False, output_indices=indices, abort_check=abort_check, output_transform=to_pixels)
             if decoded is None:
                 return None
-            pixels = decoded[0]
+            pixels = decoded[0].numpy()
         if abort_check is not None and abort_check():
             return None
+        # frames in RAM assembled by NumPy, on this thread alone: PyTorch's CPU copies wake its pool of threads, which then spin over the
+        # next denoising step
         if video:
-            return [Image.fromarray(frame.permute(1, 2, 0).numpy()) for frame in pixels], len(indices) / duration
-        pixels = pixels.permute(2, 0, 3, 1).flatten(1, 2).numpy()
-        return Image.fromarray(pixels)
+            return [Image.fromarray(np.ascontiguousarray(frame.transpose(1, 2, 0))) for frame in pixels], len(indices) / duration
+        frames, channels, height, width = pixels.shape
+        return Image.fromarray(pixels.transpose(2, 0, 3, 1).reshape(height, frames * width, channels))
 
 
 def load_decoder(name, path):

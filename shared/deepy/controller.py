@@ -388,7 +388,7 @@ class DeepyController:
     def _unload_weights(self) -> None:
         enhancer_offloadobj = self._deps.get_enhancer_offloadobj()
         if enhancer_offloadobj is not None:
-            enhancer_offloadobj.unload_all()
+            enhancer_offloadobj.suspend()  # the VRAM of unload_all(), the CUDA graphs kept for its next load
 
     def answer_visual_query(self, state, media_record, question: str, frame_no: int | None = None, max_image_edge: int | None = None) -> dict[str, Any]:
         """The prompt enhancer's Qwen VL model answers an external agent's visual question directly from the images, as Deepy's inspection does.
