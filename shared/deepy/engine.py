@@ -6539,7 +6539,7 @@ class DeepyZeroTools:
         sampled_end_seconds = min(end_time_seconds, duration_seconds)
         start_frame = deepy_video_tools.resolve_video_frame_no(media_path, time_seconds=start_time_seconds)
         end_frame = deepy_video_tools.resolve_video_frame_no(media_path, time_seconds=sampled_end_seconds)
-        target_count = deepy_vision.video_inspection_sample_count(remote=self._vision_is_remote, mid_res_sampling=mid_res_sampling)
+        target_count = self._video_inspection_sample_count(mid_res_sampling)
         frame_span = end_frame - start_frame
         min_frame_gap = min_frames_between_samples or (max(1, math.ceil(min_seconds_between_samples * effective_fps - 1e-9)) if min_seconds_between_samples is not None else 1)
         span = sampled_end_seconds - start_time_seconds
@@ -6582,6 +6582,15 @@ class DeepyZeroTools:
             if warnings:
                 result["warning"] = " ".join(warnings)
         return result
+
+    def _video_inspection_sample_count(self, mid_res_sampling: bool) -> int:
+        from shared.remote_llm.config import ENGINE_OPENCODE, resolve_role_engine
+
+        count = deepy_vision.video_inspection_sample_count(remote=self._vision_is_remote, mid_res_sampling=mid_res_sampling)
+        if self._vision_is_remote and resolve_role_engine(self._server_config(), "visual_inspector") == ENGINE_OPENCODE:
+            # shortcut: conservative frame cap until OpenCode can budget the images without compacting them away.
+            return min(count, 16)
+        return count
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         """The tools the model sees: every tool for Prime and MCP; for Deepy Zero only its direct tools (short texts) and `toolbox`."""
@@ -6687,8 +6696,8 @@ class DeepyZeroTools:
                 properties["media_inputs"]["description"] = f"One to {self._vision_max_images} ordered visual inputs. Repeat a video media_id with different frame_no or time_seconds values to inspect selected frames jointly. Images omit both selectors."
                 description = f"Directly inspect or compare up to {self._vision_max_images} images and/or explicitly selected video frames in one call."
             elif metadata["name"] == "inspect_video":
-                high_count = deepy_vision.video_inspection_sample_count(remote=self._vision_is_remote, mid_res_sampling=False)
-                mid_count = deepy_vision.video_inspection_sample_count(remote=self._vision_is_remote, mid_res_sampling=True)
+                high_count = self._video_inspection_sample_count(mid_res_sampling=False)
+                mid_count = self._video_inspection_sample_count(mid_res_sampling=True)
                 properties["mid_res_sampling"]["description"] = f"When true, sample up to {mid_count} frames using a 512²-pixel budget instead of the default up to {high_count} frames using a 256²-pixel budget."
                 description = f"Inspect a video time range with up to {high_count} automatically selected frames using a 256²-pixel budget, capped at two samples per second, or up to {mid_count} frames using a 512²-pixel budget when mid_res_sampling is true."
             schemas.append(
