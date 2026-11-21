@@ -19,7 +19,7 @@ from PIL import Image
 
 from shared.cli_args import parse_wgp_args
 from shared.llm_io import configure_llm_io, get_llm_io_path, log_llm_io
-from shared.deepy.engine import AssistantSessionState, begin_assistant_turn, clear_assistant_session
+from shared.deepy.engine import AssistantSessionState, DeepyZeroTools, begin_assistant_turn, clear_assistant_session
 from shared.deepy.filesystem import FileAccessPolicy
 from shared.gradio import assistant_chat
 from shared.remote_llm.codex_backend import CodexAuthenticationRequired, CodexBackend, _codex_launch_command, _resolve_codex_executable
@@ -208,6 +208,28 @@ class RemoteLLMAdapterTests(unittest.TestCase):
                 self.assertTrue(path.is_file())
             finally:
                 configure_llm_io(None)
+
+    def test_opencode_video_inspection_limits_samples_across_the_full_range(self):
+        for engine, expected_count in (("opencode", 16), ("codex", 30)):
+            with self.subTest(engine=engine):
+                config = {"llm_engines": {"deepy": engine}}
+                tools = DeepyZeroTools({}, lambda: [], lambda *_args: None, session=AssistantSessionState(), get_server_config=lambda: config)
+                inspect = Mock(return_value={"status": "done"})
+                tools.bind_runtime_tools(vision_query_callback=inspect, vision_is_remote=True)
+                video = {"media_id": "video_1", "media_type": "video", "path": "source.mp4"}
+                with (
+                    patch.object(tools, "_sync_recent_media"),
+                    patch.object(tools, "_resolve_media_record_input", return_value=video),
+                    patch("shared.deepy.engine.get_video_info", return_value=(24, 832, 480, 360)),
+                    patch("shared.deepy.engine.deepy_video_tools.get_precise_video_fps", return_value=24),
+                    patch("shared.deepy.engine.deepy_video_tools.resolve_video_frame_no", side_effect=[0, 359]),
+                    patch("shared.deepy.engine.deepy_video_tools.picture_checks", return_value={}),
+                ):
+                    result = tools.inspect_video("video_1", question="What moves?", mid_res_sampling=True)
+                self.assertEqual(result["sample_count"], expected_count)
+                records = inspect.call_args.args[0]
+                self.assertEqual(len(records), expected_count)
+                self.assertEqual((records[0]["frame_no"], records[-1]["frame_no"]), (0, 359))
 
     def test_remote_visual_query_uses_each_video_frame_selector(self):
         backend = Mock()

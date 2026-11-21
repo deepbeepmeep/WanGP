@@ -11,6 +11,22 @@ from shared.remote_llm.opencode_backend import OpenCodeBackend, _opencode_tools
 
 
 class OpenCodeBackendTests(unittest.TestCase):
+    def test_opencode_2_grants_wangp_tools_only_when_it_registers_a_bridge(self):
+        tool = {"type": "function", "function": {"name": "wangp_list_gallery", "description": "", "parameters": {}}}
+        for toolbox, tools in ((None, []), (object(), []), (object(), [tool])):
+            with self.subTest(has_toolbox=toolbox is not None, has_tools=bool(tools)):
+                backend = OpenCodeBackend({}, toolbox=toolbox)
+                self.addCleanup(backend.close)
+                with patch.object(backend, "_request", return_value={"data": {"id": "session-1"}}) as request, patch.object(backend, "_start_bridge", return_value="http://localhost/mcp") as start_bridge:
+                    backend._ensure_session_v2(tools)
+                expected = [{"action": "*", "resource": "*", "effect": "deny"}]
+                if tools:
+                    expected.append({"action": "wangp_*", "resource": "*", "effect": "allow"})
+                    start_bridge.assert_called_once_with(tools)
+                else:
+                    start_bridge.assert_not_called()
+                self.assertEqual(request.call_args_list[0].kwargs["json"]["permissions"], expected)
+
     def test_tools_register_under_names_that_opencode_prefixes_back(self):
         tools = [{"type": "function", "function": {"name": name, "description": name, "parameters": {}}} for name in ("wangp_generate", "mcp_resource")]
         exposed, originals = _opencode_tools(tools)

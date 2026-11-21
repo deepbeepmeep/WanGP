@@ -32,8 +32,6 @@ OPENCODE_TOOL_NAMES_INSTRUCTIONS = f"""Tools that these instructions name withou
 OPENCODE_RETRY_LIMIT_S = 300  # a provider retry further away than this (a usage limit) ends the turn with its message
 OPENCODE_TOOL_TIMEOUT_MS = 24 * 3600 * 1000  # OpenCode fails an MCP call after 60 s by default; WanGP bounds job waits itself and scripts and plugin actions can take hours
 OPENCODE_START_TIMEOUT_S = 15
-# OpenCode 2: its own tools stay off, the WanGP server's are allowed (the last matching rule wins)
-OPENCODE2_PERMISSIONS = [{"action": "*", "resource": "*", "effect": "deny"}, {"action": f"{OPENCODE_MCP_SERVER}_*", "resource": "*", "effect": "allow"}]
 OPENCODE2_TURN_END = {"session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"}
 
 
@@ -262,7 +260,12 @@ class OpenCodeBackend:
                 raise
 
     def _ensure_session_v2(self, tools: Sequence[dict[str, Any]]) -> None:
-        body: dict[str, Any] = {"permissions": OPENCODE2_PERMISSIONS}
+        has_tools = self.toolbox is not None and bool(tools)
+        # A one-shot inspector must not call back into the parent turn's tool bridge.
+        permissions = [{"action": "*", "resource": "*", "effect": "deny"}]
+        if has_tools:
+            permissions.append({"action": f"{OPENCODE_MCP_SERVER}_*", "resource": "*", "effect": "allow"})
+        body: dict[str, Any] = {"permissions": permissions}
         if model := self._model():
             body["model"] = {"id": model["modelID"], "providerID": model["providerID"], **({"variant": effort} if (effort := str(self.profile.get("reasoning_effort", "") or "").strip()) else {})}
         self._session_id = str((self._request("POST", "/api/session", json=body).get("data") or {}).get("id", "") or "")
@@ -270,7 +273,7 @@ class OpenCodeBackend:
             raise RuntimeError("OpenCode did not return a session id.")
         self._instructions = ""
         self._request("PATCH", f"/api/session/{self._session_id}", json={"title": "WanGP Deepy"})  # named: OpenCode does not ask the model for a title
-        if self.toolbox is not None:
+        if has_tools:
             url = self._start_bridge(tools)
             try:
                 self._request("PUT", f"/api/experimental/mcp/{OPENCODE_MCP_SERVER}", json={"config": {"type": "remote", "url": url, "oauth": False, "codemode": False, "timeout": {"execution": OPENCODE_TOOL_TIMEOUT_MS}}}, timeout=15)
