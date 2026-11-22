@@ -2066,7 +2066,8 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
         if len(matches) != 1:
             raise ValueError(f"Post-processing process '{process_id}' is {'not available' if not matches else 'ambiguous'} for {media_type}.")
         process_def = matches[0]
-        normalized_parameters, error = postprocessing_catalog.normalize_parameters(process_def, parameters)
+        mcp_parameter_defs = [{**parameter, "name": _POSTPROCESS_PATH_PARAMETERS.get(parameter["name"], parameter["name"])} for parameter in process_def.get("parameters", ())]  # the names discovery shows
+        normalized_parameters, error = postprocessing_catalog.normalize_parameters({**process_def, "parameters": mcp_parameter_defs}, parameters)
         if error:
             raise ValueError(error)
         for parameter_name in set(_POSTPROCESS_PATH_PARAMETERS.values()) & normalized_parameters.keys():

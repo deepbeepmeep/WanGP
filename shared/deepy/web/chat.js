@@ -2262,6 +2262,48 @@ WAC.setPendingUploads = function (items) {
   strip.hidden = !items.length;
 };
 
+// Files dropped on the chat, or the original of media dragged from a gallery (its drag carries the file's URL; an image
+// thumbnail dragged by the browser carries a reduced-resolution file). The transfer is only readable during the drop.
+WAC.chatDropFiles = function (transfer) {
+  const files = Array.from(transfer.files);
+  const media = transfer.getData('application/x-wangp-gallery-media');
+  const source = media || transfer.getData('text/uri-list').split(/\r?\n/).find(line => line && !line.startsWith('#'));
+  if (!source || !URL.canParse(source, location.href)) return files;
+  const url = new URL(source, location.href);
+  if (url.origin !== location.origin || (!media && !url.searchParams.has('__wangp_gallery_preview'))) return files;
+  url.searchParams.delete('__wangp_gallery_preview');
+  return (async () => {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error('Could not load the gallery media.');
+    const blob = await response.blob(), header = response.headers.get('content-disposition') || '';
+    const encoded = /filename\*=utf-8''([^;]+)/i.exec(header), plain = /filename="?([^";]+)"?/i.exec(header);
+    const name = encoded ? decodeURIComponent(encoded[1]) : plain ? plain[1] : decodeURIComponent(url.pathname.split('/file=').pop()).split(/[\\/]/).pop();
+    return [new File([blob], name, {type: blob.type})];
+  })();
+};
+
+// The whole chat panel takes dropped files and gallery media; drags that start inside it (its own images) are ignored.
+WAC.bindChatDrop = function () {
+  if (WAC.chatDropBound) return;
+  WAC.chatDropBound = true;
+  let inside = false;
+  const panelOf = event => event.target.closest?.('#assistant_chat_panel');
+  const accepts = event => !inside && ['Files', 'application/x-wangp-gallery-media'].some(type => event.dataTransfer.types.includes(type));
+  const highlight = on => WAC.panel()?.classList.toggle('is-drop-target', on);
+  document.addEventListener('dragstart', event => { inside = !!panelOf(event); });
+  document.addEventListener('dragend', () => { inside = false; highlight(false); });
+  document.addEventListener('dragover', event => {
+    if (!panelOf(event) || !accepts(event)) return;
+    event.preventDefault(); event.dataTransfer.dropEffect = 'copy'; highlight(true);
+  });
+  document.addEventListener('dragleave', event => { if (panelOf(event) && !WAC.panel()?.contains(event.relatedTarget)) highlight(false); });
+  document.addEventListener('drop', event => {
+    if (!panelOf(event) || !accepts(event)) return;
+    event.preventDefault(); highlight(false);
+    WAC.attachChatFiles(WAC.chatDropFiles(event.dataTransfer));
+  });
+};
+
 WAC.mountChatUpload = function (request, notice, updateGallery) {
   const controls = document.getElementById('assistant_chat_controls');
   if (!controls || document.getElementById('assistant_chat_upload_button')) return;
@@ -2286,12 +2328,13 @@ WAC.mountChatUpload = function (request, notice, updateGallery) {
     catch (error) {uploadNotice(error.message); remove.disabled = false;}
   };
   button.onclick = () => input.click();
-  input.onchange = async () => {
-    if (!input.files.length) return;
+  // files: an array, or a promise of one (media dragged from a gallery is fetched first).
+  WAC.attachChatFiles = async files => {
     button.disabled = true; button.setAttribute('aria-busy', 'true');
-    const files = Array.from(input.files);
     const uploading = (async () => {
-      const id = await WAC.uploadMediaFiles(files, request, uploadNotice, updateGallery, true);
+      const list = await files;
+      if (!list.length) return;
+      const id = await WAC.uploadMediaFiles(list, request, uploadNotice, updateGallery, true);
       await request('media/' + encodeURIComponent(id) + '/select', {});
     })();
     WAC.pendingChatUpload = uploading;
@@ -2301,6 +2344,8 @@ WAC.mountChatUpload = function (request, notice, updateGallery) {
     } catch (error) { uploadNotice(error.message); }
     finally { if (WAC.pendingChatUpload === uploading) WAC.pendingChatUpload = null; button.disabled = false; button.removeAttribute('aria-busy'); input.value = ''; }
   };
+  input.onchange = () => { if (input.files.length) WAC.attachChatFiles(Array.from(input.files)); };
+  WAC.bindChatDrop();
   controls.append(button, input);
   if (document.body.hasAttribute('data-deepy-app')) {
     const clear = document.createElement('button'); clear.id = 'assistant_chat_clear_draft'; clear.type = 'button';

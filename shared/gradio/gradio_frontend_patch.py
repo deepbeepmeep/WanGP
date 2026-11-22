@@ -434,9 +434,15 @@ _PATCHES = {
             if (closest) {event.preventDefault(); event.stopPropagation(); closest.click();}
         }
         function wangpGalleryDrag(event) {
-            const thumbnail = event.target.closest('.thumbnail-item[data-wangp-video-url]');
+            // Videos and image previews drag their original file's URL, so every drop target receives the original.
+            const thumbnail = event.target.closest('.thumbnail-item');
             if (!thumbnail || !this.contains(thumbnail)) return;
-            const source = new URL(thumbnail.dataset.wangpVideoUrl, location.href).href;
+            const url = thumbnail.dataset.wangpVideoUrl || thumbnail.querySelector('img')?.getAttribute('src');
+            if (!url) return;
+            const original = new URL(url, location.href);
+            if (!thumbnail.dataset.wangpVideoUrl && !original.searchParams.has('__wangp_gallery_preview')) return;
+            original.searchParams.delete('__wangp_gallery_preview');
+            const source = original.href;
             event.dataTransfer.effectAllowed = 'copy';
             event.dataTransfer.setData('application/x-wangp-gallery-media', source);
             event.dataTransfer.setData('text/uri-list', source);

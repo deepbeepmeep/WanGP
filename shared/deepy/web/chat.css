@@ -134,6 +134,11 @@
     display: none;
 }
 
+#assistant_chat_panel.is-drop-target {
+    outline: 2px dashed rgba(39, 133, 173, 0.5);
+    outline-offset: -4px;
+}
+
 #assistant_chat_dock.is-open #assistant_chat_panel {
     display: block;
     opacity: 1;

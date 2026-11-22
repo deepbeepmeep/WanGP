@@ -4083,7 +4083,11 @@ def lora_rank(modules):
             if data is None or data[0] is None or data[3] is not None or data[5].get("type", "lora") != "lora":
                 continue
             if module._mm_manager._get_lora_scaling(model._loras_scaling, model, adapter) * data[4] != 0:
-                factors[id(data[0])] = data[0].shape[0]
+                factor = data[0]
+                while isinstance(factor, str):  # a factor shared with another module ("name#slot", the loader's alias)
+                    target, slot = factor.rsplit("#", 1)
+                    factor = model._loras_model_shortcuts[target][adapter][int(slot)]
+                factors[id(factor)] = factor.shape[0]
     return builtins.sum(factors.values())
 
 

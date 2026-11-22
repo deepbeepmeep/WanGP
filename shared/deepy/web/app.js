@@ -316,7 +316,9 @@
           card = document.createElement('article'); card.className = 'media-card'; card.dataset.mediaId = item.id;
           card.dataset.mediaUrl = item.url;
           card.dataset.mediaName = item.name;
-          card.tabIndex = 0; card.setAttribute('aria-label', item.name);
+          card.tabIndex = 0; card.setAttribute('aria-label', item.name); card.draggable = true;
+          // Dropped on the chat, the card attaches its original file, not the thumbnail the browser would drag.
+          card.ondragstart = event => { const source = new URL(item.url, location.href).href; event.dataTransfer.effectAllowed = 'copy'; for (const type of ['application/x-wangp-gallery-media', 'text/uri-list', 'text/plain']) event.dataTransfer.setData(type, source); };
           card.onclick = async event => {
             if (event.target.closest('a, button')) return;
             try { const result = await api('media/' + encodeURIComponent(item.id) + '/select', {}); gallery(result.gallery); }

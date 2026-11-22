@@ -10,7 +10,8 @@ other (proposal_step, run by the runner's chain).
 - The context keys and values are kept by position: every position for the layer that reads the whole context, a ring of the last
   positions for the two sliding-window layers. A pass of the target is appended whole (the rows of its buffer) and the cache length
   moves by the accepted rows only: what a rejected draft wrote lies beyond the length, is never read, and is overwritten by the
-  next pass.
+  next pass. A block writes its own keys and values there too (the rows of its positions, beyond the length) and attends the caches in
+  place, only the positions it reads (block_attend of the target's attention kernels, or the live rows in PyTorch).
 - The head's logits U (h + H latent + b) are computed as U h, once for the 7 rows, plus (U H) latent + U b per token: U H and U b
   are made when the checkpoint loads (draft_head_tensors), so that a token costs a product over 257 columns instead of the vocabulary's 2304.
   Drafts only: verification by the target is exact whatever the drafter computes.
@@ -22,11 +23,13 @@ from torch import nn
 from torch.nn import functional as F
 from mmgp import cuda_graphs, transfer
 
+from . import inkling2
 from .inkling2 import _Tensors, _linear
 from .inkling2_core import DRAFT_FEATURES, rms, softcap
 
 REWIND_ROWS = 4096  # positions a window ring keeps beyond its window: a rewind up to this far leaves the drafts their whole context
 CONFIDENT = "confident_drafts" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(",")  # disabled: the automatic count from the measured history only (MeasuredDrafts), for comparisons
+IN_PLACE = "draft_attention" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(",")  # the block's keys and values written at its positions in the caches, attended there up to the block (the target's attention kernels when it has them); disabled: the previous path (copies of the whole caches, scores over all their rows), for comparisons
 
 
 def _rotate(x, cos, sin):
@@ -206,26 +209,60 @@ class Inkling2Draft(nn.Module):
         rows = positions.clamp_min(0) % self._ring
         return keys[rows], values[rows], positions >= (self._high - self._ring).clamp_min(0)
 
+    def _scores(self, q, keys, values, valid):
+        """[rows, heads * dim]: the block's queries over keys / values [count, kv_heads, dim] (views of the caches), valid [count]: the positions read."""
+        rows, group, dtype = q.shape[0], self.heads // self.kv_heads, q.dtype
+        scores = torch.bmm(q.view(rows, self.kv_heads, group, self.dim).permute(1, 0, 2, 3).reshape(self.kv_heads, rows * group, self.dim), keys.permute(1, 2, 0)) * self.dim ** -0.5
+        scores = scores.masked_fill(~valid, torch.finfo(dtype).min)
+        output = torch.bmm(torch.softmax(scores.float(), -1).to(dtype), values.transpose(0, 1))  # [kv_heads, rows * group, dim]
+        return output.view(self.kv_heads, rows, group, self.dim).permute(1, 0, 2, 3).reshape(rows, -1)
+
+    def _attend(self, index, q, k, v, places, kept):
+        """The block's attention in a layer: its keys k and values v written at its positions places in the layer's cache (rows beyond the cache length,
+        which the next append overwrites; the rings' slots of these positions, as an append takes them), then the positions from the first one the
+        layer reads to the block's last read in place. kept: the first position the rings hold (at most the block's first)."""
+        keys, values, rows = self._keys[index], self._values[index], self.block_size
+        slots = places % keys.shape[0]
+        keys.index_copy_(0, slots, k)
+        values.index_copy_(0, slots, v)
+        local = index in self.local
+        low = kept if local else torch.zeros_like(kept)
+        kernels = inkling2._ATTENTION
+        if kernels is not None and q.is_cuda and kernels.supported(q.device):
+            return kernels.block_attend(q, keys, values, self._cursor, low, self.dim ** -0.5, self.window + rows if local else 0)
+        if local:  # the window's positions gathered from the ring (window + block rows)
+            positions = places[-1] + 1 - (self.window + rows) + torch.arange(self.window + rows, device=q.device)
+            slots = positions.clamp_min(0) % keys.shape[0]
+            return self._scores(q, keys[slots], values[slots], positions >= low)
+        # the cache's rows up to the block, in place: the live ones when the length is known here, all of them in a graph (fixed shapes)
+        count = keys.shape[0] if keys.is_cuda and torch.cuda.is_current_stream_capturing() else self._length + rows
+        return self._scores(q, keys[:count], values[:count], torch.arange(count, device=q.device) <= places[-1])
+
+    def _attend_copies(self, index, q, k, v, cursor):
+        """The previous path (WGP_INKLING2_DISABLE=draft_attention): the layer's context and the block's rows concatenated, every row of the global cache scored."""
+        keys, values, valid = self._context(index, cursor)
+        own = torch.ones(self.block_size, dtype=torch.bool, device=q.device)
+        return self._scores(q, torch.cat((keys, k)), torch.cat((values, v)), torch.cat((valid, own)))
+
     def _block(self, anchor):
         """The states [block, hidden] of the block that starts at the cache length with the token anchor."""
-        dtype, rows, group = self.mask_embed.dtype, self.block_size, self.heads // self.kv_heads
+        dtype, rows = self.mask_embed.dtype, self.block_size
         cursor = self._cursor
         h = torch.cat((self.target.embed_ids(anchor.reshape(1)), self.mask_embed.expand(rows - 1, -1))).to(dtype)
-        cos, sin = self._angles(cursor + torch.arange(rows, device=h.device))
-        own = torch.ones(rows, dtype=torch.bool, device=h.device)
+        places = cursor + torch.arange(rows, device=h.device)
+        cos, sin = self._angles(places)
+        if IN_PLACE:
+            self._high.copy_(torch.maximum(self._high, places[-1:] + 1))  # the block's rows take the rings' slots of its positions
+            kept = torch.minimum((self._high - self._ring).clamp_min(0), cursor)
         for index, layer in enumerate(self.layers):
             attention = layer.self_attn
             x = rms(h, self.eps, layer.input_layernorm.weight).to(dtype)
             q = self._normed(attention.q_proj(x), self.heads, attention.q_norm, cos, sin)
-            keys, values, valid = self._context(index, cursor)
-            keys = torch.cat((keys, self._normed(attention.k_proj(x), self.kv_heads, attention.k_norm, cos, sin)))
-            values = torch.cat((values, attention.v_proj(x).view(rows, self.kv_heads, self.dim)))
-            count = keys.shape[0]
-            scores = torch.bmm(q.view(rows, self.kv_heads, group, self.dim).permute(1, 0, 2, 3).reshape(self.kv_heads, rows * group, self.dim), keys.permute(1, 2, 0)) * self.dim ** -0.5
-            scores = scores.masked_fill(~torch.cat((valid, own)), torch.finfo(dtype).min)
-            output = torch.bmm(torch.softmax(scores.float(), -1).to(dtype), values.transpose(0, 1))  # [kv_heads, rows * group, dim]
-            h = h + attention.o_proj(output.view(self.kv_heads, rows, group, self.dim).permute(1, 0, 2, 3).reshape(rows, -1))
-            keys = values = scores = output = None
+            k = self._normed(attention.k_proj(x), self.kv_heads, attention.k_norm, cos, sin)
+            v = attention.v_proj(x).view(rows, self.kv_heads, self.dim)
+            output = self._attend(index, q, k, v, places, kept) if IN_PLACE else self._attend_copies(index, q, k, v, cursor)
+            h = h + attention.o_proj(output)
+            q = k = v = output = None
             x = rms(h, self.eps, layer.post_attention_layernorm.weight).to(dtype)
             h = h + layer.mlp.down_proj((F.silu(layer.mlp.gate_proj(x).float()) * layer.mlp.up_proj(x).float()).to(dtype))
         return rms(h, self.eps, self.norm.weight).to(dtype)

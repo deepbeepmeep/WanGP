@@ -337,6 +337,104 @@ def attend(q, rel, proj, sinks, keys, values, positions, scale, window=0, table=
     return out
 
 
+@triton.jit(do_not_specialize=("SIZE", "WINDOW", "STEPS", "scale"), do_not_specialize_on_alignment=("Q", "KEYS", "VALUES", "START", "LOW", "PARTS"))
+def _block_part(Q, KEYS, VALUES, START, LOW, PARTS, SIZE, WINDOW, STEPS, scale, TOKENS: tl.constexpr, HEADS: tl.constexpr, KV: tl.constexpr, D: tl.constexpr, STEP: tl.constexpr, GROUP: tl.constexpr):
+    # A part of the keys a block of TOKENS queries reads together (no causality among them, no bias, no sink), for every query row of a KV head (row: token * query heads of a KV head
+    # + head): the largest logit, the sum of the weights relative to it and the values weighted so, into PARTS [KV, parts, rows, D + 2]. Part p of the launch: the positions
+    # [(first // PART + p) * PART, + PART), PART = STEPS * STEP, first: the first position read. Rounding as _attention_part (BF16 product, its scaling, BF16 weights before the values).
+    HPK: tl.constexpr = HEADS // KV
+    kv = tl.program_id(0)
+    end = tl.load(START).to(tl.int64) + TOKENS
+    low = tl.maximum(tl.load(LOW).to(tl.int64), 0)
+    if WINDOW > 0:
+        low = tl.maximum(low, end - WINDOW)
+    span = STEPS * STEP
+    part = low // span + tl.program_id(1)
+    if part * span < end:
+        lanes = tl.arange(0, GROUP)
+        real = lanes < TOKENS * HPK
+        heads = (lanes // HPK).to(tl.int64) * HEADS + kv * HPK + lanes % HPK
+        width = tl.arange(0, D)
+        within = tl.arange(0, STEP)
+        q = tl.load(Q + heads[:, None] * D + width[None, :], mask=real[:, None], other=0.0)  # [GROUP, D] BF16
+        largest = tl.full((GROUP,), float("-inf"), tl.float32)
+        total = tl.zeros((GROUP,), tl.float32)
+        values = tl.zeros((GROUP, D), tl.float32)
+        for step in tl.range(STEPS):  # a runtime loop (unrolled steps spill, as in _attention_part)
+            key = part * span + step * STEP + within
+            valid = (key >= low) & (key < end)
+            record = ((key % SIZE) * KV + kv)[:, None] * D + width[None, :]
+            k = tl.load(KEYS + record, mask=valid[:, None], other=0.0)
+            score = tl.dot(q, tl.trans(k)).to(tl.bfloat16).to(tl.float32)
+            score = (score * scale).to(tl.bfloat16).to(tl.float32)
+            score = tl.where(valid[None, :], score, float("-inf"))
+            top = tl.maximum(largest, tl.max(score, axis=1))
+            decay = tl.where(largest == top, 1.0, libdevice.exp(largest - top))
+            weight = tl.where(valid[None, :], libdevice.exp(score - top[:, None]), 0.0)
+            total = total * decay + tl.sum(weight, axis=1)
+            v = tl.load(VALUES + record, mask=valid[:, None], other=0.0)
+            values = values * decay[:, None] + tl.dot(weight.to(tl.bfloat16), v)
+            largest = top
+        target = PARTS + ((kv * tl.num_programs(1) + tl.program_id(1)) * (TOKENS * HPK) + lanes) * (D + 2)
+        tl.store(target[:, None] + width[None, :], values, mask=real[:, None])
+        tl.store(target + D, largest, mask=real)
+        tl.store(target + D + 1, total, mask=real)
+
+
+@triton.jit(do_not_specialize=("WINDOW", "SPAN", "COUNT"), do_not_specialize_on_alignment=("PARTS", "START", "LOW", "OUT"))
+def _block_merge(PARTS, START, LOW, OUT, WINDOW, SPAN, COUNT, TOKENS: tl.constexpr, HEADS: tl.constexpr, KV: tl.constexpr, D: tl.constexpr, GROUP: tl.constexpr):
+    # The parts of _block_part of a token and KV head merged in their order (COUNT: the parts of the launch, SPAN: positions per part).
+    HPK: tl.constexpr = HEADS // KV
+    token = tl.program_id(0).to(tl.int64)
+    kv = tl.program_id(1)
+    end = tl.load(START).to(tl.int64) + TOKENS
+    low = tl.maximum(tl.load(LOW).to(tl.int64), 0)
+    if WINDOW > 0:
+        low = tl.maximum(low, end - WINDOW)
+    lanes = tl.arange(0, GROUP)
+    real = lanes < HPK
+    width = tl.arange(0, D)
+    largest = tl.full((GROUP,), float("-inf"), tl.float32)
+    total = tl.zeros((GROUP,), tl.float32)
+    values = tl.zeros((GROUP, D), tl.float32)
+    for part in tl.range(0, (end - 1) // SPAN - low // SPAN + 1, loop_unroll_factor=8):
+        source = PARTS + ((kv * COUNT + part) * (TOKENS * HPK) + token * HPK + lanes) * (D + 2)
+        other = tl.load(source + D, mask=real, other=0.0)
+        top = tl.maximum(largest, other)
+        decay = libdevice.exp(largest - top)
+        weight = libdevice.exp(other - top)
+        total = total * decay + tl.load(source + D + 1, mask=real, other=0.0) * weight
+        values = values * decay[:, None] + tl.load(source[:, None] + width[None, :], mask=real[:, None], other=0.0) * weight[:, None]
+        largest = top
+    out = tl.div_rn(values, total[:, None])
+    tl.store(OUT + (token * HEADS + kv * HPK + lanes)[:, None] * D + width[None, :], out.to(OUT.dtype.element_ty), mask=real[:, None])
+
+
+BLOCK_PARTS = 64  # parts of a block's reach at most: a part covers more positions as the reach grows, so that the parts' buffer stays [kv_heads, 65, rows, dim + 2]
+
+
+def block_attend(q, keys, values, start, low, scale, window=0):
+    """[tokens, heads * dim] BF16: the queries q [tokens, heads, dim] of a block of consecutive positions from start (a device tensor [1]), all of
+    them over the keys and values of every position from low (a device tensor [1], at most start) to the block's last, its own included (no causality
+    inside the block, as a drafter's block reads them). keys, values: BF16 [rows, kv_heads, dim], position p at row p % rows (a ring, or a cache by
+    position); window: the positions read at most, the block's included (0: from low). Only those positions are read, whatever the rows of the cache."""
+    tokens, heads, dim = q.shape
+    size, kv_heads = keys.shape[0], keys.shape[1]
+    if not (q.is_contiguous() and keys.is_contiguous() and values.is_contiguous() and q.dtype == keys.dtype == values.dtype == torch.bfloat16):
+        raise ValueError("The block attention takes contiguous BF16 queries and caches")
+    if not (q.is_cuda and keys.is_cuda and values.is_cuda and start.is_cuda and low.is_cuda):
+        raise ValueError("The block attention runs on CUDA tensors")
+    reach = window or size
+    steps = max(STEPS_RING, -(-reach // (CHUNK * BLOCK_PARTS)))
+    count = -(-reach // (steps * CHUNK)) + 1  # one more where the reach straddles a part
+    rows = tokens * (heads // kv_heads)
+    parts = torch.empty(kv_heads, count, rows, dim + 2, dtype=torch.float32, device=q.device)
+    out = torch.empty(tokens, heads * dim, dtype=q.dtype, device=q.device)
+    _block_part[(kv_heads, count)](q, keys, values, start, low, parts, size, window, steps, scale, tokens, heads, kv_heads, dim, CHUNK, max(16, triton.next_power_of_2(rows)), num_warps=4, enable_fp_fusion=False)
+    _block_merge[(tokens, kv_heads)](parts, start, low, out, window, steps * CHUNK, count, tokens, heads, kv_heads, dim, max(2, triton.next_power_of_2(heads // kv_heads)), num_warps=4, enable_fp_fusion=False)
+    return out
+
+
 from shared.kernels.triton_compilation_log import install_triton_compilation_logger  # noqa: E402
 
 install_triton_compilation_logger()
