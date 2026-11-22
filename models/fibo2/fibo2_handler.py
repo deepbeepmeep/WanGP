@@ -78,9 +78,14 @@ class family_handler:
                 "text_prompt_enhancer_max_tokens": 512, "image_prompt_enhancer_max_tokens": 512,
                 "text_prompt_enhancer_max_tokens1": 512, "image_prompt_enhancer_max_tokens1": 512,
                 "prompt_enhancer_video_duration": False,
-                "infos": "RMBG-3.0 generates a grayscale alpha matte from a reference image in four steps. White keeps the subject, black removes the background, and gray preserves partial opacity. Use the default fixed prompt. Weights: CC BY-NC 4.0; commercial use requires a separate Bria license.",
+                "custom_settings": [{"id": "rgba", "name": "RGBA", "label": "RGBA Cutout", "type": "dropdown", "default": "Disabled",
+                                     "choices": [("Disabled (Grayscale Matte)", "Disabled"), ("Enabled (Transparent PNG Cutout)", "Enabled")],
+                                     "info": "Disabled saves the grayscale alpha matte. Enabled saves the source image as an RGBA PNG whose alpha is that matte, gray levels included, so soft edges stay partly transparent. Requires the Main Image Ref."}],
+                "specialities": [{"name": "alpha output", "aliases": ["RGBA", "transparent background", "background removal", "cutout"],
+                                  "description": "Set custom_settings.rgba to Enabled to save the source image as an RGBA PNG cutout whose alpha is the generated matte (soft, partial transparency kept)."}],
+                "infos": "RMBG-3.0 generates a grayscale alpha matte from a reference image in four steps. White keeps the subject, black removes the background, and gray preserves partial opacity. Use the default fixed prompt.\n\n**RGBA Cutout:** Disabled saves the matte itself. Enabled saves the source image as a transparent PNG: the matte becomes its alpha channel, so hair, blur and glass stay partly transparent. Semi-transparent edges keep a trace of the original background color. The cutout needs the Main Image Ref (the source sets the output size).\n\nWeights: CC BY-NC 4.0; commercial use requires a separate Bria license.",
                 "prompt_infos": "Use the default matte instruction unchanged. The optional Background Removal Prompt enhancer restores that fixed instruction; it does not describe or edit the scene.",
-                "deepy_infos": 'Alpha-matte generation: model_type="fibo2_rmbg3", image_mode=1, one image_refs source, video_prompt_type="KI", num_inference_steps=4, guidance_scale=1. Keep prompt_enhancer off unless requested. The output is a grayscale matte, not a color cutout.',
+                "deepy_infos": 'Alpha-matte generation: model_type="fibo2_rmbg3", image_mode=1, one image_refs source, video_prompt_type="KI", num_inference_steps=4, guidance_scale=1. Keep prompt_enhancer off unless requested. Default output is the grayscale matte; custom_settings.rgba="Enabled" saves the source image as an RGBA PNG cutout with the matte as alpha (partial transparency kept; edges keep a trace of the old background color; requires video_prompt_type="KI").',
                 "deepy_prompt_infos": "Use this exact fixed prompt for every reference image: " + RMBG3_PROMPT,
             })
         return result
@@ -116,6 +121,9 @@ class family_handler:
             if inputs["image_mode"] != 2 and (not references or "I" not in inputs.get("video_prompt_type", "")):
                 return "Fibo 2.0 Edit Turbo requires Reference Images or a Control Image with a mask. Use Dev for text-only generation."
             inputs["guidance_scale"] = 1.0
+        if model_def.get("matting") and (inputs.get("custom_settings") or {}).get("rgba") == "Enabled":
+            if inputs["image_mode"] == 2 or "K" not in inputs.get("video_prompt_type", "") or len(references) != 1:
+                return "RGBA Cutout needs exactly one source image as Main Image Ref (First Reference Defines Output Dimensions)."
         inputs["denoising_strength"] = inputs["masking_strength"] = 1.0
 
     @staticmethod

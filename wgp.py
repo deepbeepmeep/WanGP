@@ -2907,7 +2907,7 @@ if not Path(config_load_filename).is_file():
         "text_encoder_quantization" : "int8",
         "save_path": "outputs",  
         "image_save_path": "outputs",  
-        "compile" : "auto",
+        "compile" : "cudagraph",
         "metadata_type": "metadata",
         "boost" : 1,
         "int8_kernels": "auto",
@@ -3736,10 +3736,16 @@ default_profile_image = force_profile_no if force_profile_no >= 0 else server_co
 default_profile_audio = force_profile_no if force_profile_no >= 0 else server_config["audio_profile"]
 default_profile = default_profile_video
 loaded_profile = force_profile_no = -1
-compile = server_config.get("compile", "auto")
+def _graph_compile(value):
+    """"auto" (CUDA graphs where they save time, a choice that existed before graphs were always captured) saved in a config or an
+    override is "cudagraph" now."""
+    return "cudagraph" if value == "auto" else value
+
+
+compile = server_config["compile"] = _graph_compile(server_config.get("compile", "cudagraph"))
 transformer_quantization_choices = [("Scaled Int8 (recommended)", "int8"), ("Scaled Fp8", "fp8"), ("16-bit (no quantization)", "bf16")]
 text_encoder_quantization_choices = [("16-bit (more RAM, better quality)", "bf16"), ("8-bit (less RAM, slightly lower quality)", "int8")]
-compile_choices = [("Disabled", "disabled"), ("Auto CUDA Graph (graphs only where they save time: short steps)", "auto"), ("CUDA Graph (always, the first steps of a new resolution are slightly slower)", "cudagraph"), ("PyTorch Compilation (up to 10% faster, very slow compilation, requires Triton, to be deprecated)", "transformer")]
+compile_choices = [("Disabled", "disabled"), ("CUDA Graph (faster short steps, the first steps of a new resolution are slightly slower)", "cudagraph"), ("PyTorch Compilation (up to 10% faster, very slow compilation, requires Triton, to be deprecated)", "transformer")]
 if args.compile:
     compile="transformer"
     lock_ui_compile = True
@@ -4260,7 +4266,7 @@ def compute_profile(override_profile, output_type="video"):
 
 
 def compute_compile(override_compile, default_compile):
-    return "disabled" if is_mps else override_compile or default_compile
+    return "disabled" if is_mps else _graph_compile(override_compile) or default_compile
 
 def compute_quantization(overrides):
     return overrides.get("transformer_quantization") or transformer_quantization, overrides.get("text_encoder_quantization") or text_encoder_quantization
@@ -4631,15 +4637,11 @@ def load_models(model_type, override_profile = -1, output_type="video", config_i
         int8_backend.prepare_compile_cache(compile_modules or custom_compile)
         if custom_compile:
             wan_model.custom_compile(backend= "inductor", mode ="default")
-        if compilation in ("cudagraph", "auto"):
+        if compilation == "cudagraph":
             model_graphs, handler_graphs = model_def.get("cuda_graphs", False), kwargs.get("cudaGraphs", False)  # the handler's: an LM's decoding steps
             if not model_graphs:
                 _load_models_info("CUDA Graphs are not supported for this Model")
             kwargs["cudaGraphs"] = True if True in (model_graphs, handler_graphs) else list(dict.fromkeys([*(model_graphs or []), *(handler_graphs or [])])) or False
-            if compilation == "auto" and model_graphs and handler_graphs is not True and not model_def.get("audio_only", False):
-                # the model's own towers are timed; an LM's decoding steps (the handler's graphs) and audio models always capture
-                probed = [model_id for model_id in pipe if model_id not in (handler_graphs or [])] if model_graphs is True else model_graphs
-                kwargs["cudaGraphsProbe"] = [model_id for model_id in probed if model_id not in (handler_graphs or [])]
         if compile_modules == False and compilation == "transformer":
             _load_models_info("Pytorch compilation is not supported for this Model")
         # kwargs["pinnedMemory"] = "text_encoder"
@@ -4727,8 +4729,6 @@ def generate_attention_header(model_type, compile, attention_mode, overrides="",
         header += ", Pytorch compilation <B>ON</B>"
     elif compile == "cudagraph":
         header += ", CUDA Graphs <B>ON</B>"
-    elif compile == "auto":
-        header += ", CUDA Graphs <B>AUTO</B>"
     if "fp16" in model_filename:
         header += ", Data Type <B>FP16</B>"
     else:
@@ -14047,7 +14047,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                     gr.Markdown("<B>You can override Transformer Compilation for this generation. Default uses the current Config choice.</B>")
                     compilation_override = gr.Dropdown(
                         choices=[("Default", "")] + compile_choices,
-                        value=override_values.get("compilation", ""),
+                        value=_graph_compile(override_values.get("compilation", "")),
                         label="Override Compilation"
                     )
 

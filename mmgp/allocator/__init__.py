@@ -377,6 +377,14 @@ def resume_pool(pool, device=None):
     return active != "vmm" or bool(_lib.vmm_pool_resume(device, *pool, torch.cuda.current_stream(device).cuda_stream))
 
 
+def alias_capture_stream(body, outer):
+    """While a graph loop's body is recorded on stream `body` (mmgp.graph_loop.loop), its allocations in the capture's pool are those of the
+    capture stream `outer`: they reuse the memory that stream freed before the loop, and leave theirs to it (the loop's node runs between
+    the capture's nodes before and after it). outer None ends it. A no-op with another allocator or an older library."""
+    if active == "vmm" and hasattr(_lib, "vmm_alias_capture_stream"):
+        _lib.vmm_alias_capture_stream(ctypes.c_void_p(body.cuda_stream), ctypes.c_void_p(None if outer is None else outer.cuda_stream))
+
+
 def trim_pool(pool, device=None):
     """A pool of weights (pool_allocations(pool, weights=True)) gives the VRAM of its freed buffers back to the driver, after a device
     synchronization when it holds memory (a suspended pool's freed buffers only lose their addresses). Nothing while a capture records."""

@@ -1180,6 +1180,18 @@ class _WgpRowProjection:
         return prepared
 
     @staticmethod
+    def block_form(module, rows):
+        """The ConvRot group of the 'block' form a range of `rows` rows of this module's input is prepared in, whatever its values (an
+        outside quantizer may then make it: offload.prepare_rows), None where the path is chosen on the input."""
+        _, group, precise = _WgpRowProjection.key(module)
+        return group if not precise and rows > _wgp.DECIDE_MAX_ROWS else None
+
+    @staticmethod
+    def block_prepared(q, scales, dtype):
+        """The prepared input of INT8 rows q and their scales (rows, K / 128), made in the 'block' form by an outside quantizer."""
+        return _wgp.Prepared("block", q, None, scales, dtype)
+
+    @staticmethod
     def prepare_into_at(module, prepared, x, counter, first, step):
         """prepare_into of rows first + counter * step of the input (a CUDA graph loop's turn, the counter on the device), prepared the
         first range's way: x prepared on its own, then stored at those rows (the copies prepare_into makes)."""

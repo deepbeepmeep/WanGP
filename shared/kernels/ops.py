@@ -75,6 +75,7 @@ offload.register_lora_output(_lora_output)
 if _triton is not None:  # the row stores of CUDA graph loops over row ranges (offload's RowSource preparation)
     from . import row_loop_triton as _row_loop_triton
     offload.register_row_store_at(_row_loop_triton.store_rows_at)
+    offload.register_row_copy_at(_row_loop_triton.copy_rows_at)
 
 
 def project_many(modules, x_list):

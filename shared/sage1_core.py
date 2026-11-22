@@ -20,9 +20,12 @@ except ImportError:  # SageAttention 1.0.6
     def _sm_scale(head_dim):
         return head_dim ** -0.5
 try:  # compute capability 7.5: the same kernels reading BF16 q, k and v and writing BF16 output as bits (no FP16 copies)
-    from .sage1_turing import _attn_fwd as _attn_fwd_bits, quant_per_block_int8_bits_kernel as _quant_bits
+    from .sage1_turing import _attn_fwd as _attn_fwd_bits, _attn_range, quant_per_block_int8_bits_kernel as _quant_bits
 except ImportError:
-    _attn_fwd_bits = _quant_bits = None
+    _attn_fwd_bits = _attn_range = _quant_bits = None
+# comparison switch: the query blocks of a part-filled last wave run over ranges of the keys (sage1_turing._attn_range), merged by
+# sagegp.split_merge, the full waves by the kernel as before: faster where a launch has few CTAs per wave (few heads)
+LAST_WAVE_SPLIT = False
 
 SETTINGS = {"scale_v": False}  # the staged functions take the settings of the staged_* functions of shared.sage2_core: v scaling only here
 SCALED_V_SETTINGS = {"scale_v": True}
@@ -188,27 +191,66 @@ def staged_attention(out, quantized_list, settings, attn_mask=None, return_lse=F
             rows.view(torch.int16) if bits else rows)
     strides = (q_int8.stride(1), q_int8.stride(0), k_int8.stride(1), k_int8.stride(0), v.stride(1), v.stride(0), rows.stride(1), rows.stride(0))
     launch = dict(BLOCK_M=128, BLOCK_N=64, HEAD_DIM=head_dim, STAGE=1, num_warps=4 if head_dim == 64 else 8, num_stages=_STAGES[head_dim])
+    mask, mask_mode = None, 0
+    if bits and attn_mask is not None:  # SageAttention's (batch, heads, q, k) layout, broadcastable; boolean as a uint8 view, additive as FP32
+        mask = attn_mask.view(torch.uint8) if attn_mask.dtype == torch.bool else attn_mask.to(torch.float32)
+        mask = mask.expand(batch, heads, tokens, k_int8.shape[0] // batch)
+        mask_mode = 1 if attn_mask.dtype == torch.bool else 2
+    mask_strides = mask.stride() if mask is not None else (0, 0, 0, 0)
+    main, splits = (_range_plan(out.device, head_dim, launch["num_warps"], launch["num_stages"], grid[0], heads * batch, k_int8.shape[0] // batch)
+                    if LAST_WAVE_SPLIT and _attn_range is not None and not return_lse else (grid[0], 1))
+    grid = (main, heads, batch)
     if bits:
-        # attn_mask: SageAttention's (batch, heads, q, k) layout, broadcastable; boolean as a uint8 view, additive as FP32
-        mask, mask_mode = None, 0
-        if attn_mask is not None:
-            mask = attn_mask.view(torch.uint8) if attn_mask.dtype == torch.bool else attn_mask.to(torch.float32)
-            mask = mask.expand(batch, heads, tokens, k_int8.shape[0] // batch)
-            mask_mode = 1 if attn_mask.dtype == torch.bool else 2
         # without a mask the kernel still takes a pointer (never read): q_int8 with zero strides, as Lse without return_lse
         lse = torch.empty((batch, heads, tokens), dtype=torch.float32, device=out.device) if return_lse else q_int8
-        _attn_fwd_bits[grid](*args, q_int8 if mask is None else mask, lse, *strides, *(mask.stride() if mask is not None else (0, 0, 0, 0)),
-                             heads, heads // k_int8.shape[1], V_BITS=v_bits, MASK_MODE=mask_mode, RETURN_LSE=return_lse, **launch)
+        if main:
+            _attn_fwd_bits[grid](*args, q_int8 if mask is None else mask, lse, *strides, *mask_strides,
+                                 heads, heads // k_int8.shape[1], V_BITS=v_bits, MASK_MODE=mask_mode, RETURN_LSE=return_lse, **launch)
     else:
         if attn_mask is not None or return_lse:
             raise ValueError("SageAttention takes an attention mask or returns the log-sum-exp only on the Turing kernel")
-        _attn_fwd[grid](*args, *strides, heads, heads // k_int8.shape[1], **launch)
+        if main:
+            _attn_fwd[grid](*args, *strides, heads, heads // k_int8.shape[1], **launch)
+    if splits > 1:  # the last wave's query blocks: ranges of the keys, merged into the output's rows after the full blocks'
+        from sagegp import split_merge
+        keys, tail_rows = k_int8.shape[0] // batch, tokens - main * 128
+        parts = torch.empty((batch * splits, tail_rows, heads, head_dim), dtype=torch.float32, device=out.device)
+        range_lse = torch.empty((batch * splits, heads, tail_rows), dtype=torch.float32, device=out.device)
+        _attn_range[((tokens + 127) // 128 - main, heads, batch * splits)](*args[:-1], parts, q_int8 if mask is None else mask, range_lse, *strides[:6],
+                                                                            *mask_strides, heads, heads // k_int8.shape[1], main, tail_rows,
+                                                                            -(-((keys + 63) // 64) // splits) * 64,
+                                                                            SPLITS=splits, V_BITS=v_bits, MASK_MODE=mask_mode, **launch)
+        target = rows.view(torch.int16) if bits else rows
+        split_merge.merge(parts, range_lse, target.view(batch, tokens, heads, head_dim), main * 128, bf16_bits=bits)
     if fp16_output:
         out.copy_(rows.view(out.shape))
     elif settings.get("recycle_query") and q_int8.data_ptr() == out.data_ptr():
         torch.autograd.graph.increment_version(out)
     out = out if v_scale is None else scale_output(out, v_scale, 2)
     return (out, lse) if return_lse else out
+
+
+@lru_cache(None)
+def _range_slots(device, head_dim, num_warps, num_stages):
+    """CTAs of the range kernel the GPU runs at once (SMs x its occupancy, from a compilation on placeholder inputs)."""
+    keys = 64 * 32
+    q = torch.zeros((128, 1, head_dim), dtype=torch.int8, device=device)
+    k = torch.zeros((keys, 1, head_dim), dtype=torch.int8, device=device)
+    v = torch.zeros((keys, 1, head_dim), dtype=torch.float16, device=device)
+    seq_q, seq_k = torch.tensor([0, 128], dtype=torch.int32, device=device), torch.tensor([0, keys], dtype=torch.int32, device=device)
+    scale_q, scale_k = torch.tensor([0, 1], dtype=torch.int32, device=device), torch.tensor([0, keys // 64], dtype=torch.int32, device=device)
+    scales = torch.ones(keys // 64, dtype=torch.float32, device=device)
+    parts, lse = torch.empty((2, 128, 1, head_dim), dtype=torch.float32, device=device), torch.empty((2, 1, 128), dtype=torch.float32, device=device)
+    compiled = _attn_range[(1, 1, 2)](q, k, v, seq_q, seq_k, scales, scales, scale_q, scale_k, parts, q, lse, q.stride(1), q.stride(0), k.stride(1),
+                                      k.stride(0), v.stride(1), v.stride(0), 0, 0, 0, 0, 1, 1, 0, 128, keys // 2, SPLITS=2, HEAD_DIM=head_dim,
+                                      BLOCK_M=128, BLOCK_N=64, STAGE=1, V_BITS=False, MASK_MODE=0, num_warps=num_warps, num_stages=num_stages)
+    from sagegp import split_merge
+    return split_merge.triton_slots(device, compiled, num_warps)
+
+
+def _range_plan(device, head_dim, num_warps, num_stages, blocks, programs_per_block, keys):
+    from sagegp import split_merge
+    return split_merge.tail_plan(_range_slots(device, head_dim, num_warps, num_stages), blocks, programs_per_block, (keys + 63) // 64)
 
 
 # A cached prefix (shared.attention_kit.cache_prefix) on the Turing kernel: k as staged_quantize_k makes it with the prefix's own mean

@@ -540,6 +540,10 @@ CUstream const MIXED = reinterpret_cast<CUstream>(~uintptr_t(0));
 
 bool reserved_for_other(CUstream reserved, CUstream stream) { return reserved && reserved != stream; }
 
+// A graph loop's body stream -> the capture stream it is recorded within (mmgp.graph_loop): the loop's node runs after the capture's nodes
+// before it and before those after it, so the body's allocations take, and leave, the capture stream's memory as that stream's own
+std::unordered_map<CUstream, CUstream> capture_stream_aliases;
+
 // at the address where its memory was left, the reserved ranges there apply; elsewhere, the chunk's reservation
 bool chunk_reserved_elsewhere(const PoolUse& use, CUstream stream, CUdeviceptr mapping) { return reserved_for_other(use.reserved, stream) && use.mapping != mapping; }
 
@@ -2303,6 +2307,10 @@ EXPORT void* vmm_alloc(size_t size, int device, CUstream stream) {
             break;
         }
     }
+    if (phase == 2) {
+        auto alias = capture_stream_aliases.find(stream);
+        if (alias != capture_stream_aliases.end()) stream = alias->second;
+    }
     bool to_pool = phase != 0;
     // A warmup runs eagerly: while no capture records, its allocations get the recoveries of ordinary ones (the memory the device has
     // finished with, then what the application frees), and its pool spills into system RAM only after them, as ordinary allocations do.
@@ -2769,6 +2777,12 @@ EXPORT int vmm_capture_spill_later(int on) {  // this thread's captures spill in
     int previous = capture_spill_later;
     capture_spill_later = on != 0;
     return previous;
+}
+
+EXPORT void vmm_alias_capture_stream(CUstream body, CUstream outer) {  // body's capture allocations as outer's (null outer: no longer)
+    std::lock_guard<std::mutex> guard(lock);
+    if (outer) capture_stream_aliases[body] = outer;
+    else capture_stream_aliases.erase(body);
 }
 
 EXPORT int vmm_capture_running() {  // a capture records on some device (a warmup alone runs eagerly)

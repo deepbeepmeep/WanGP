@@ -63,19 +63,7 @@ MAX_KEYS = 8  # graphs kept per block, the least recently used dropped first: we
 # stay. All the graphs go when the model is released (another model).
 GRAPH_CACHE = 2  # generation settings whose graphs a model keeps while unloaded (0: none); MMGP_GRAPH_CACHE overrides it (comparison switch)
 GRAPH_CACHE = int(os.environ.get("MMGP_GRAPH_CACHE", GRAPH_CACHE))
-PROBE_POOL = os.environ.get("MMGP_PROBE_POOL", "1") != "0"  # probed calls on the graph pool (_probe_forward); 0: comparison switch
 MOVE_BYTES = 32 << 20  # arguments from this size move into their static buffer when only their caller holds them
-# A graph saves what the GPU waits for the host while the kernels of a block are issued one by one: nothing when the GPU stays busy. Auto
-# mode (the probe) uses the graphs unless the first block calls show that obvious case: the first call of each pass (the shape of the
-# largest argument of a block call: a resolution) runs untimed (it compiles and tunes its kernels), the next PROBE_CALLS are timed as issued,
-# with no synchronization (the verdict waits for the GPU to have run them), and the graphs are skipped only when the GPU time of every timed
-# call is at least GPU_BOUND_RATIO times the host time that issued it (the GPU busy with earlier work, large blocks, weights streamed in).
-# In doubt the graphs are used. A verdict to use them holds until the model's graphs are cleared; a verdict to skip them holds for the
-# passes timed only (another resolution is timed again). The blocks timed capture at their next call. Block calls run eagerly by an eager
-# check (register_eager: a first step with another kernel) are timed as well.
-PROBE = os.environ.get("MMGP_GRAPH_PROBE", "1") != "0"  # comparison switch: 0 captures as before, without the timing
-PROBE_CALLS = 2  # timed block calls from which the graphs may be skipped
-GPU_BOUND_RATIO = 2.0  # GPU time over host time of a timed block call from which its graphs are useless
 ESCAPE_WARMUP = True  # comparison switch: the result of a key's first call leaves the graph pool (_escape)
 RECAPTURE_HELD = True  # comparison switch: a graph whose replay may overwrite a buffer held since a later capture is captured again
 _SCALARS = (bool, int, float, str, type(None), torch.dtype, torch.device)
@@ -924,7 +912,7 @@ def _name_phase(error, failed):
 
 
 def _pass_of(leaves):
-    """The pass a block call belongs to, for the CUDA graph probe: the shape of its largest tensor argument (its hidden state)."""
+    """The pass a block call belongs to (a generation setting, GRAPH_CACHE): the shape of its largest tensor argument (its hidden state)."""
     largest = max((leaf for leaf in leaves if isinstance(leaf, torch.Tensor)), key=torch.Tensor.numel, default=None)
     return None if largest is None else tuple(largest.shape)
 
@@ -932,7 +920,7 @@ def _pass_of(leaves):
 class BlockGraphs:
     """CUDA graphs of the tower blocks of one model."""
 
-    def __init__(self, name, weights_key, weight_tensors, extra_inputs, ready, forget=None, probe=False, verbose=1, alive=None):
+    def __init__(self, name, weights_key, weight_tensors, extra_inputs, ready, forget=None, verbose=1, alive=None):
         # extra_inputs(block) -> [(list, index)]: tensors read by the block that are neither weights nor arguments, read by its graphs from
         # static buffers (their list items are these buffers during a capture); ready() -> False while the weights may move; forget(): the
         # graphs are gone, so are the records that weights_key keeps on the blocks; alive(weights key) -> whether the weights it names may still
@@ -940,11 +928,10 @@ class BlockGraphs:
         self.name, self.weights_key, self.weight_tensors, self.extra_inputs, self.ready = name, weights_key, weight_tensors, extra_inputs, ready
         self.forget, self.alive = forget, alive
         self.disabled = None  # the reason why this model's blocks run eagerly (e.g. weights whose kernels cannot be captured), or None
-        self.auto = probe  # graphs unless the blocks are clearly GPU-bound (timed, PROBE)
         self.keeping = False  # its graphs are kept when the model unloads (offload.make_suspendable), as with GRAPH_CACHE: buffers of their own
         self.parked = False  # its model's offload object is parked (offload.park): its graphs idle
         self.rebuilt = 0  # executables made again from their templates since the model was last loaded (Graph)
-        self.verbose = verbose  # the probe's verdicts: 1 a short line, 2 its timings
+        self.verbose = verbose
         self.reported, self.captures = False, 0
         self.checked = set()  # (block, method, signature) whose capture checked the reads
         self.blas = {}  # (block, method, signature) -> whether its eager warmup used cuBLAS (its capture stream then needs the workspaces)
@@ -970,8 +957,6 @@ class BlockGraphs:
         # output buffers that a capture put in the pool, by the order of that capture: the scratch of the graphs captured before may lie
         # over them (the pool shares it in the order of the captures), which their replays overwrite (_held_later)
         self.captures, self.later = 0, {}
-        # the probe: passes whose first call ran (compiled), passes timed, the timed calls (events, host seconds), the verdict
-        self.probe = {"compiled": set(), "passes": set(), "timed": [], "verdict": None}
         _blas_workspaces.clear()  # library caches may be released between models too; prepare them again before a new capture
         if self.forget is not None:
             self.forget()
@@ -988,6 +973,7 @@ class BlockGraphs:
         settings = ([s for s in self.settings if s != setting] + [setting] * bool(setting))[-limit:] if limit > 0 else []
         kept = set().union(*settings)
         if not kept or self.pool is None or allocator.active != "vmm" or any(k in self.borrowed and not _unshared(self.static[k]) for k in self.static):
+            self._release_held()
             self.clear()
             return False
         for key in [key for key, entry in self.entries.items() if entry.pass_key not in kept or self.alive is not None and not self.alive(key[4])]:
@@ -1014,6 +1000,19 @@ class BlockGraphs:
                        f"{sum(outside.values()) / 2**20:.1f} MiB of their static buffers stay in VRAM.")
         self.captured = self.rebuilt = 0
         return True
+
+    def _release_held(self):
+        # Static buffers that their callers still hold (latents moved into the input stage's buffer, a RoPE table kept by the pipeline) move to
+        # ordinary memory with their content, for every tensor sharing their storage (a resize copies it): the pool, whose graphs go, then
+        # holds no allocation and gives all its VRAM back, instead of keeping it for them until the callers drop them
+        from . import allocator
+        if self.pool is None or allocator.active != "vmm":
+            return
+        torch.cuda.synchronize()
+        for buffer in {_storage(buffer): buffer for buffer in self.static.values()}.values():
+            if allocator.in_pool(buffer, self.pool) and not _unshared(buffer):
+                storage = buffer.untyped_storage()
+                storage.resize_(storage.nbytes() + 1)
 
     def _resume(self):
         from . import allocator
@@ -1057,11 +1056,7 @@ class BlockGraphs:
         # A block called by a stage being prepared or captured (a stage spanning several blocks) runs inside that stage's graph.
         if _recording or _blocked is not None or self.disabled is not None or not self.ready():
             return forward(*args, **kwargs)
-        if any(check() for check in _eager_checks):  # its calls are still timed by the probe: its blocks capture at the next step
-            if self.auto and PROBE:
-                pass_key = _pass_of(_flatten((args, kwargs))[0])
-                if self._probe_verdict(pass_key) is None:
-                    return self._probe_call(pass_key, forward, args, kwargs)
+        if any(check() for check in _eager_checks):  # its blocks capture at the next step
             return forward(*args, **kwargs)
         if self.suspended:
             self._resume()
@@ -1093,13 +1088,6 @@ class BlockGraphs:
                         leaf.copy_(static)
                 return result
         leaves, spec = _flatten((args, kwargs))
-        if self.auto and PROBE:  # a pass still probed, or whose verdict is not to use graphs, runs as without graphs
-            pass_key = _pass_of(leaves)
-            verdict = self._probe_verdict(pass_key)
-            if verdict == "eager":
-                return forward(*args, **kwargs)
-            if verdict is None:
-                return self._probe_call(pass_key, forward, args, kwargs)
         signature = _signature(leaves, self.holder_ids)
         extras = self.extra_inputs(module)
         extra_signature = _signature([holder[index] for holder, index in extras])
@@ -1216,64 +1204,6 @@ class BlockGraphs:
                 if container is not None:
                     container.clear()
         return result
-
-    def _probe_verdict(self, pass_key):
-        # "graph", "eager", or None while probed; a verdict to skip the graphs only holds for the passes it timed
-        probe = self.probe
-        if probe["verdict"] == "eager" and pass_key not in probe["passes"]:
-            probe.update(passes=set(), timed=[], verdict=None)
-        return probe["verdict"]
-
-    def _probe_call(self, pass_key, forward, args, kwargs):
-        # a block call while probed, run eagerly as without graphs: its block captures at its next call once the graphs are used
-        probe = self.probe
-        if pass_key not in probe["compiled"]:  # the first call of a pass compiles and tunes its kernels: not timed
-            probe["compiled"].add(pass_key)
-            return self._probe_forward(forward, args, kwargs)
-        if len(probe["timed"]) >= PROBE_CALLS:  # decided once the GPU has run the timed calls, without waiting for it
-            if probe["timed"][-1][1].query():
-                self._decide()
-            return forward(*args, **kwargs) if probe["verdict"] == "eager" else self._probe_forward(forward, args, kwargs)
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        start.record()
-        began = time.perf_counter()
-        result = self._probe_forward(forward, args, kwargs)
-        seconds = time.perf_counter() - began
-        end.record()
-        probe["timed"].append((start, end, seconds))
-        probe["passes"].add(pass_key)
-        return result
-
-    def _probe_forward(self, forward, args, kwargs):
-        # a probed call computes on the graph pool, as a capture's warmup: its activations (a block's, GBs for a video model) then take the
-        # memory that the captures reuse, instead of ordinary chunks left cached beside the pool (the reserved VRAM would be their sum).
-        # Its outputs leave the pool (_escape): the next graphs captured may write their scratch there.
-        from . import allocator
-        if allocator.active != "vmm" or not PROBE_POOL:
-            return forward(*args, **kwargs)
-        if self.pool is None:
-            self.pool = torch.cuda.graph_pool_handle()
-        with allocator.graph_warmup(self.pool):
-            out = forward(*args, **kwargs)
-        return self._escape(out)
-
-    def _decide(self):
-        probe = self.probe
-        timed = [(start.elapsed_time(end), seconds * 1000) for start, end, seconds in probe["timed"]]
-        probe["timed"] = []
-        probe["verdict"] = "eager" if all(gpu_ms >= GPU_BOUND_RATIO * host_ms for gpu_ms, host_ms in timed) else "graph"
-        if probe["verdict"] == "eager" and self.pool is not None and not self.entries:  # the memory of the probed calls goes back
-            from . import allocator
-            allocator.trim_pool(self.pool)
-        if self.verbose >= 2:
-            timings = ", ".join(f"{gpu_ms:.1f} ms of GPU time for {host_ms:.1f} ms to issue" for gpu_ms, host_ms in timed)
-            used = "used" if probe["verdict"] == "graph" else "skipped, the GPU stays busy without them"
-            tqdm.write(f"[MMGP] CUDA graphs of the blocks of '{self.name}' {used} (inputs {sorted(probe['passes'])}: {timings}).")
-        elif self.verbose >= 1:
-            if probe["verdict"] == "graph":
-                tqdm.write(f"[MMGP] CUDA Graphs used for '{self.name}'.")
-            else:
-                tqdm.write(f"[MMGP] CUDA Graphs not used for '{self.name}' as they won't provide any Speed Up.")
 
     def _move(self, key, leaf):
         # The caller's tensor takes the storage of its static buffer, which then serves no other call while the caller holds it (borrowed).
@@ -1456,13 +1386,18 @@ class BlockGraphs:
                 shape, stride, dtype, device = signature
                 if arguments and source is not None and torch._debug_has_internal_overlap(source) == 1:
                     raise _OverlappingArgument(len(keys))
-                # graphs kept between generations: buffers of their own in the pool, which gives its VRAM back while the blocks are unloaded
+                # graphs kept between generations: buffers of their own in the pool, which gives its VRAM back while the blocks are unloaded.
+                # An input buffer made once graphs were captured in the pool (a block captured after the input stage that feeds it) is made
+                # outside it, as _escape moves outputs: the scratch of those graphs may lie on the pool's free memory, which their replays
+                # overwrite (a buffer that its argument keeps, e.g. a RoPE table, is not filled again before the next replays)
                 from . import allocator
-                pooled = (GRAPH_CACHE > 0 or self.keeping) and allocator.active == "vmm"
+                late = arguments and bool(self.entries) and self.pool is not None
+                pooled = (GRAPH_CACHE > 0 or self.keeping) and allocator.active == "vmm" and not late
                 if pooled and self.pool is None:
                     self.pool = torch.cuda.graph_pool_handle()
                 # a source in the pool already (a warmup output) is adopted too: the capture then writes into it (OutputPlan), with no copy
-                if source is not None and (not pooled or allocator.in_pool(source, self.pool)) and _adoptable(source, self):
+                if (source is not None and (allocator.in_pool(source, self.pool) if pooled else not (late and allocator.in_pool(source, self.pool)))
+                        and _adoptable(source, self)):
                     self.static[key] = _buffer_alias(source)
                     self.borrowed.add(key)
                 elif slot is not None:

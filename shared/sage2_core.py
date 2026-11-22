@@ -99,6 +99,11 @@ def is_sage2_supported():
     return True
 
 from .sageattention_patch import sageattention_version
+try:  # SageGP's last-wave splits (LAST_WAVE_SPLIT)
+    from sagegp import triton_split as _triton_split
+    from sagegp.sm89 import split as _sm89_split
+except ImportError:
+    _triton_split = _sm89_split = None
 sg2_version = sageattention_version()
 sg2pp = sg2_version.startswith("2.2")
 
@@ -626,6 +631,12 @@ def staged_quantize_q(q, settings):
     return q_int8, q_scale
 
 
+# comparison switch: the query blocks of a part-filled last wave run over ranges of the keys and are merged (SageGP: sagegp.sm89.split
+# for the sm89 CUDA kernel, sagegp.triton_split for the per-block Triton kernel), the full waves by the kernels as before: faster where a
+# launch has few CTAs per wave (few heads)
+LAST_WAVE_SPLIT = False
+
+
 @torch.compiler.disable
 def staged_attention(out, quantized_list, settings, attn_mask=None, return_lse=False):
     """Attention of the staged [(q_int8, q_scale), (k_int8, k_scale), (v, v_scale, v_mean)], written into out and returned. out has
@@ -651,8 +662,9 @@ def staged_attention(out, quantized_list, settings, attn_mask=None, return_lse=F
         num_warps, num_stages = settings["launch"] or ((4, 3) if head_dim == 64 else (8, 4))
         lse = torch.empty((b, heads, qo_len), dtype=torch.float32, device=out.device) if return_lse else torch.empty([0], dtype=torch.float32, device="cpu")
 
-        def launch(target, q_int8, k_int8, v, q_scale, k_scale):
-            attn_qk_int8_per_block._attn_fwd[((qo_len + settings["block_m"] - 1) // settings["block_m"], heads, b)](
+        def launch(target, q_int8, k_int8, v, q_scale, k_scale, blocks=None):
+            blocks = (qo_len + settings["block_m"] - 1) // settings["block_m"] if blocks is None else blocks
+            attn_qk_int8_per_block._attn_fwd[(blocks, heads, b)](
                 q_int8, k_int8, v, q_scale, k_scale, target, *mask[0], lse,
                 q_int8.stride(0), q_int8.stride(2), q_int8.stride(1), k_int8.stride(0), k_int8.stride(2), k_int8.stride(1),
                 v.stride(0), v.stride(2), v.stride(1), target.stride(0), target.stride(2), target.stride(1), *mask[1],
@@ -662,7 +674,13 @@ def staged_attention(out, quantized_list, settings, attn_mask=None, return_lse=F
         handled = ((attn_mask is not None or head_dim == 256) and _get_cuda_arch(out.device) == "sm120" and kernel_policy.allow_approximate()
                    and _sm120_fp16.attention(q_int8, k_int8, v, q_scale, k_scale, out, attn_mask,
                                             lse if return_lse else None, settings["block_m"]))
-        if not handled:
+        main, splits = ((None, 1) if handled or not LAST_WAVE_SPLIT or attn_mask is not None or return_lse or head_dim not in (64, 128) or _triton_split is None
+                        else _triton_split.plan(out.device, q_int8, k_int8, settings["block_m"], num_warps, num_stages))
+        if splits > 1:  # the full blocks, then the last wave's ranges of the keys, merged into out
+            if main:
+                launch(out, q_int8, k_int8, v, q_scale, k_scale, main)
+            _triton_split.tail(q_int8, k_int8, v, q_scale, k_scale, out, main, splits, settings["block_m"], num_warps, num_stages)
+        elif not handled:
             launch(out, q_int8, k_int8, v, q_scale, k_scale)
         if settings.get("recycle_query") and q_int8.data_ptr() == out.data_ptr():
             torch.autograd.graph.increment_version(out)
@@ -671,6 +689,12 @@ def staged_attention(out, quantized_list, settings, attn_mask=None, return_lse=F
     gran, sm_scale = 3 if settings["qk_quant_gran"] == "per_thread" else 2, settings.get("softmax_dim", head_dim) ** -0.5
     inputs = (q_int8, k_int8, v, out, q_scale, k_scale, v_scale) + ((v_mean,) if settings["pv_accum_dtype"] == "fp32" and settings["smooth_v"] else ())
     forward = _fp8_buffered_forward if settings["pv_accum_dtype"] == "fp32+fp16" else _cuda_kernel(settings)
+    if (LAST_WAVE_SPLIT and _sm89_split is not None and not return_lse and gran == 3 and settings["pv_accum_dtype"] in ("fp32+fp16", "fp32+fp32")
+            and _get_cuda_arch(out.device) == "sm89" and _sm89_split.supported(q_int8, out)
+            and _sm89_split.attention(_cuda_kernel(settings), q_int8, k_int8, v, out, q_scale, k_scale, v_scale, sm_scale, settings["pv_accum_dtype"] == "fp32+fp16")):
+        if settings.get("recycle_query") and q_int8.data_ptr() == out.data_ptr():
+            torch.autograd.graph.increment_version(out)
+        return out
     lse = forward(*inputs, 0, 0, gran, sm_scale, int(return_lse))
     if settings.get("recycle_query") and q_int8.data_ptr() == out.data_ptr():
         torch.autograd.graph.increment_version(out)

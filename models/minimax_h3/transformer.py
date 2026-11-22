@@ -17,6 +17,7 @@ from shared.utils.media_control import inference_checkpoint
 # Modified for WanGP: raw-checkpoint names, MMGP QKV splitting/offload, pruned
 # AdaLN curves, shared attention backends, chunked FFNs, and early tensor release.
 
+import contextlib
 import math
 import time
 
@@ -210,8 +211,7 @@ class Attention(nn.Module):
 
     def forward(self, x_list, rope=None, transformer_options=None, residual=None, gate=None, segments=None, input_again=None):
         x = _take(x_list)
-        vdn_input = x if hasattr(self, "vdn") else None
-        seq_len = x.shape[0]
+        seq_len = x.rows() if isinstance(x, offload.RowSource) else x.shape[0]  # a RowSource (1, rows, dim): attention_kit.EXTREME_LOW_VRAM
         packed_rope = None
         if isinstance(rope, tuple):
             rope, packed_rope = rope
@@ -223,6 +223,9 @@ class Attention(nn.Module):
         use_vsa = hasattr(self, "vsa") and self.vsa.policy.enabled
         allow_fusion = not use_sol and not hasattr(self, "vdn")
         split_qkv = hasattr(self, "q_proj")
+        if isinstance(x, offload.RowSource) and not (split_qkv and not use_sol and not hasattr(self, "vdn") and batch == 1):
+            x = x.materialize().view(seq_len, -1)  # read whole by the paths other than the kit's
+        vdn_input = x if hasattr(self, "vdn") else None
         if split_qkv and not use_sol and not hasattr(self, "vdn"):
             x_list, x = [x.view(batch, tokens, x.shape[-1]) if batch > 1 else x], None
             # VSA: q, k, v and the gate are projected by head groups from one prepared input, so the tiled copies stay bounded
@@ -349,6 +352,44 @@ def _norm_modulate(norm, hidden, shift_scale, segments):
     return kernels.norm_modulate([hidden], norm, shift, scale, segments)
 
 
+def _norm_modulate_rows(norm, hidden, shift_scale, segments, shape=None):
+    """_norm_modulate as an mmgp RowSource made by ranges of rows of hidden (rows, dim), of the given shape ((1, rows, dim) for the
+    attention kit), for an FFN that reads it chunk by chunk (kernels.mlp) or an attention that makes it again by head group: never
+    whole beside the residual. Rows as from the whole (row-wise operations)."""
+    shift, scale = shift_scale
+    shift_scale.clear()
+
+    def fill(start, stop):
+        spans = [(max(first, start) - start, min(last, stop) - start, row) for first, last, row in segments if first < stop and last > start]
+        return kernels.norm_modulate([hidden[start:stop]], norm, shift, scale, spans)
+    source = offload.RowSource(hidden.shape if shape is None else shape, hidden.dtype, hidden.device, fill)
+    if shape is not None:  # an attention input: its INT8 form made in one pass where the norm quantization kernel takes it
+        source.fill_prepared, source.fill_prepared_at = _norm_quantize_fill(norm, hidden, shift, scale, segments)
+    return source
+
+
+def _norm_quantize_fill(norm, hidden, shift, scale, segments):
+    """(fill_prepared, fill_prepared_at) of _norm_modulate_rows's RowSource (shared.kernels.norm_quant_triton: the norm, the modulation
+    and the INT8 quantization of a range in one pass, at given rows or at a CUDA graph loop's), (None, None) where that kernel does not
+    take these rows."""
+    from shared.kernels import norm_quant_triton
+    from shared.kernels.row_loop_triton import segment_runs
+    if (type(norm) is not torch.nn.RMSNorm or not norm_quant_triton.supported(hidden, norm.weight) or scale.dim() != 2 or shift.dim() != 2
+            or scale.stride(1) != 1 or shift.stride(1) != 1):
+        return None, None
+    eps = norm.eps if norm.eps is not None else torch.finfo(hidden.dtype).eps
+    rowmod = torch.empty(hidden.shape[0], dtype=torch.int32, device=hidden.device)  # each row's modulation row
+    for start, stop, row0, offset, span in segment_runs(segments):
+        rowmod[start:stop] = torch.arange(offset, offset + stop - start, dtype=torch.int32, device=hidden.device).floor_divide_(span).add_(row0)
+
+    def fill_prepared(start, stop, group, want_rows):
+        return norm_quant_triton.rms_modulate_quantize(hidden[start:stop], norm.weight, eps, scale, shift, rowmod[start:stop], group, want_rows)
+
+    def fill_prepared_at(counter, first, rows, group, want_rows):
+        return norm_quant_triton.rms_modulate_quantize(hidden, norm.weight, eps, scale, shift, rowmod, group, want_rows, (counter, first, rows))
+    return fill_prepared, fill_prepared_at
+
+
 def _gated_residual(hidden_list, gate_list, branch_list, segments):
     hidden = _take(hidden_list)
     gate, branch = gate_list[0].to(hidden.dtype), _take(branch_list)
@@ -384,14 +425,20 @@ class DiTBlock(nn.Module):
     def forward(self, x_list, temb, segments, rope, residual_signature_elements=0):
         residual_list = [_take(x_list)]
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(temb)
-        h_list = [_norm_modulate(self.norm1, residual_list[0], [shift_msa, scale_msa], segments)]
         if not residual_signature_elements and not hasattr(self.attn, 'vdn'):
             # The attention and the FFN add their outputs to the residual themselves, on and off the INT8 kernels' fused path (a
             # LoRA, 16-bit weights): the attention by parts of rows where the kit keeps out_proj's input by head groups, the FFN chunk
             # by chunk (with a LoRA, its output pass and the update in one kernel), so that no whole branch sits beside the residual.
+            # Extreme low VRAM: the attention's and the FFN's inputs given by ranges of rows (RowSources), never whole beside the
+            # residual: the attention makes its input again for each head group, the FFN chunk by chunk as it reads it (more kernels
+            # in a block's graph: the FFN alone 33 nodes on H3 at 1080p 15 s)
+            extreme, residual = attention_kit.EXTREME_LOW_VRAM, residual_list[0]
+            h_list = [_norm_modulate_rows(self.norm1, residual, [shift_msa, scale_msa], segments, (1, *residual.shape)) if extreme
+                      else _norm_modulate(self.norm1, residual, [shift_msa, scale_msa], segments)]
             hidden = self.attn(h_list, rope=rope, residual=residual_list[0], gate=gate_msa, segments=segments)
-            h_list = [_norm_modulate(self.norm2, hidden, [shift_mlp, scale_mlp], segments)]
+            h_list = [(_norm_modulate_rows if extreme else _norm_modulate)(self.norm2, hidden, [shift_mlp, scale_mlp], segments)]
             return self.mlp(h_list, residual=hidden, gate=gate_mlp, segments=segments)
+        h_list = [_norm_modulate(self.norm1, residual_list[0], [shift_msa, scale_msa], segments)]
         if not residual_signature_elements:  # VDN computes its input again rather than keeping it (input_again)
             input_again = (lambda: _norm_modulate(self.norm1, residual_list[0], [shift_msa, scale_msa], segments)) if hasattr(self.attn, 'vdn') else None
             residual_list = [_gated_residual(residual_list, [gate_msa], [self.attn(h_list, rope=rope, input_again=input_again)], segments)]
@@ -547,8 +594,10 @@ class MiniMaxH3Model(nn.Module):
         attention = self.blocks[0].attn
         split_map = get_linear_split_map(self.attention_inner_size, attention.heads, attention.head_dim)
         modules = dict(self.named_modules())
-        state_dict = convert_lora_keys(state_dict, modules,
-                                      fused_split_map=split_map, split_linear_modules_map=split_map)
+        names = set(modules)
+        if self.audio_patch_proj is None:  # H3-Image: audio adapters resolve whatever their naming, and are skipped below
+            names |= {"audio_patch_proj", "final_layer.audio_out", "final_layer.audio_out.linear"}
+        state_dict = convert_lora_keys(state_dict, names, fused_split_map=split_map, split_linear_modules_map=split_map)
         state_dict = {key.removeprefix("diffusion_model."): value for key, value in state_dict.items()}
         # ComfyUI bundles per-layer backend preferences as uint8 JSON tensors.
         # Keep WanGP's attention selection and leave other unknown keys for MMGP to reject.
@@ -1080,7 +1129,13 @@ class MiniMaxH3Model(nn.Module):
                     control_list = None
             return output
 
-        with cuda_graphs.scope():
+        # Smart Inputs Chunker Auto: the extreme mode where the chunked attention would not fit (its inputs given by ranges of rows)
+        attn = self.blocks[self.kept_blocks[0]].attn
+        extreme = (attention_kit.plan_extreme(attn, device, hidden.shape[0], hidden.shape[-1], attn.heads, attn.heads, attn.head_dim,
+                                              (attn.q_proj, attn.k_proj, attn.v_proj), attn.out_proj)
+                   if batch == 1 and hasattr(attn, "q_proj") and not hasattr(attn, "vdn") and not self.sol_attention.use_for_layer(hidden.shape[0])
+                   else contextlib.nullcontext())
+        with extreme, cuda_graphs.scope():
             if first_block_cache is None:
                 for block_index in self.kept_blocks:
                     self._check_interrupt()

@@ -103,7 +103,7 @@ class FiboPipeline:
     @torch.inference_mode()
     def generate(self, input_prompt="", n_prompt="", seed=0, sampling_steps=50, width=1024, height=1024, guide_scale=5.0,
                  batch_size=1, input_ref_images=None, input_frames=None, input_masks=None, video_prompt_type="",
-                 callback=None, VAE_tile_size=None, set_progress_status=None, loras_slists=None, **kwargs):
+                 callback=None, VAE_tile_size=None, set_progress_status=None, loras_slists=None, custom_settings=None, **kwargs):
         device = runtime.execution_device(self.transformer)
         text = "\n".join(line for line in input_prompt.splitlines() if not line.lstrip().startswith("#"))
         references = list(input_ref_images or []) if "I" in video_prompt_type else []
@@ -198,7 +198,14 @@ class FiboPipeline:
         with torch.autocast("cuda", dtype=torch.float16):
             images = [self.vae(pack(item.unsqueeze(0)).to(runtime.execution_device(self.vae)), tile_size=tile_size if tiled else 0)
                       for item in latents]
-        return torch.cat(images).transpose(0, 1)
+        images = torch.cat(images)
+        if (custom_settings or {}).get("rgba") == "Enabled":
+            # RMBG-3.0 matte (uint8 decode): its gray level is the alpha of the source image (straight alpha)
+            if references[0].size != (width, height):
+                raise ValueError(f"RGBA Cutout: source image {references[0].size} does not match the output {width}x{height}.")
+            source = torch.from_numpy(np.asarray(references[0]).copy()).permute(2, 0, 1).unsqueeze(0).to(images.device)
+            images = torch.cat([source.expand(images.shape[0], -1, -1, -1), images.float().mean(1, keepdim=True).round_().to(torch.uint8)], 1)
+        return images.transpose(0, 1)
 
 
 def load_pipeline(model_filename, text_encoder_filename, model_def, model_type, save_quantized):

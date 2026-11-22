@@ -325,22 +325,31 @@ def build_ref2va_packed_sequence(text_token_tags, references, num_latent_frames,
 
 def build_row_timesteps(layout, video_timestep, audio_timestep, condition_video_timestep,
                         condition_audio_timestep, target_condition_timestep=1.0, keyframe_timesteps=()):
-    timesteps = torch.full((layout.sequence_length,), video_timestep, dtype=torch.float32,
-                           device=layout.token_tags.device)
-    timesteps[layout.video_indices[:layout.num_condition_video_rows]] = condition_video_timestep
+    """(timestep table, row -> table index): one table row per role present in the layout (text and target video, video conditions,
+    keyframes, target video conditions, target audio, audio conditions), in that order whatever their values, rows of equal values
+    included: the table and the indices are the same at every denoising step (CUDA graphs captured at the first step replay at the next)."""
+    roles = torch.zeros((layout.sequence_length,), dtype=torch.int64, device=layout.token_tags.device)
+    values = [video_timestep]
+
+    def assign(value, *rows):
+        for indices in rows:
+            roles[indices] = len(values)
+        values.append(value)
+
+    assign(condition_video_timestep, layout.video_indices[:layout.num_condition_video_rows])
     for start, stop, timestep in keyframe_timesteps:  # softened keyframes keep their own noise level
-        timesteps[layout.video_indices[start:stop]] = timestep
+        assign(timestep, layout.video_indices[start:stop])
     if layout.num_target_condition_video_rows:
-        timesteps[layout.video_indices[-layout.num_target_condition_video_rows:]] = target_condition_timestep
-    timesteps[layout.audio_indices[layout.num_condition_audio_rows:]] = audio_timestep
-    timesteps[layout.audio_indices[:layout.num_condition_audio_rows]] = condition_audio_timestep
+        assign(target_condition_timestep, layout.video_indices[-layout.num_target_condition_video_rows:])
+    assign(audio_timestep, layout.audio_indices[layout.num_condition_audio_rows:])
+    assign(condition_audio_timestep, layout.audio_indices[:layout.num_condition_audio_rows])
     condition_latents = layout.num_target_condition_audio_latents
     if condition_latents:
         target_audio_indices = layout.audio_indices[layout.num_condition_audio_rows:]
         channel_latents = target_audio_indices.numel() // MINIMAX_H3_AUDIO_CHANNELS
-        timesteps[target_audio_indices[:condition_latents]] = condition_audio_timestep
-        timesteps[target_audio_indices[channel_latents:channel_latents + condition_latents]] = condition_audio_timestep
-    return torch.unique(timesteps, sorted=True, return_inverse=True)
+        assign(condition_audio_timestep, target_audio_indices[:condition_latents], target_audio_indices[channel_latents:channel_latents + condition_latents])
+    present, indices = torch.unique(roles, sorted=True, return_inverse=True)
+    return torch.tensor(values, dtype=torch.float32, device=roles.device)[present], indices
 
 
 __all__ = ["MINIMAX_H3_AUDIO_TAG", "MINIMAX_H3_KEYFRAME_NOISE_AUG", "MINIMAX_H3_TEXT_TAG",

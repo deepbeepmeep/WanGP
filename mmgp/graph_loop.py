@@ -185,10 +185,12 @@ def stream(device):
 def loop(iterations, counter, pool=None):
     """Records the body of a loop of `iterations` turns (>= 1) into the capture of the current stream; counter: one int64 on the device,
     zeroed here and incremented after each turn. The body is recorded on stream(device); its allocations come from `pool` (the memory pool
-    of the capture, as given to capture_begin), and without one it must allocate nothing. Its memory then stays the body stream's until
-    the capture ends, as for any stream that a capture forks to."""
+    of the capture, as given to capture_begin), and without one it must allocate nothing. They are the capture stream's own for the allocator
+    (allocator.alias_capture_stream): the loop's node runs after the nodes recorded before it and before those after it, so the body reuses
+    the memory the capture freed before the loop and leaves its own to the rest of the capture."""
     if iterations < 1:
         raise ValueError("a CUDA graph loop runs its body once at least")
+    from . import allocator
     lib = _driver()
     outer = torch.cuda.current_stream(counter.device)
     counter.zero_()
@@ -213,8 +215,9 @@ def loop(iterations, counter, pool=None):
     device = counter.device.index
     with torch.cuda.stream(body):
         _check(lib.cuStreamBeginCaptureToGraph(body.cuda_stream, body_graph, None, None, 0, _RELAXED), "cuStreamBeginCaptureToGraph")
-        if pool is not None:  # the body's allocations: the capture's pool, as those of the streams it forks to
+        if pool is not None:  # the body's allocations: the capture's pool, as the capture stream's own
             torch._C._cuda_beginAllocateCurrentStreamToPool(device, pool)
+            allocator.alias_capture_stream(body, outer)
         try:
             yield
             arguments = (ctypes.c_void_p(counter.data_ptr()), ctypes.c_longlong(iterations), ctypes.c_uint64(handle.value))
@@ -222,6 +225,7 @@ def loop(iterations, counter, pool=None):
             _check(lib.cuLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0, body.cuda_stream, pointers, None), "cuLaunchKernel")
         finally:
             if pool is not None:  # as torch.cuda.use_mem_pool: the use this routing took is given back (the capture keeps its own)
+                allocator.alias_capture_stream(body, None)
                 torch._C._cuda_endAllocateToPool(device, pool)
                 torch._C._cuda_releasePool(device, pool)
             ended, nodes = ctypes.c_void_p(), ctypes.c_size_t()

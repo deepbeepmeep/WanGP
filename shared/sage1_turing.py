@@ -21,7 +21,9 @@ q/k inputs, block scales, tiling and arithmetic are those of the original kernel
 of writing an FP16 output and copying it back to BF16, and for short sequences instead of copying v to FP16. MASK_MODE adds an
 attention mask in SageAttention's (batch, heads, q, k) layout (strides, zero for broadcast dimensions): 1 a boolean mask (uint8
 view) whose zero entries get no weight, 2 an additive FP32 mask as SDPA adds it to the scaled scores. RETURN_LSE also writes the base-2
-log-sum-exp of each query's scores, to merge attentions over separate key sets (a cached prefix, shared.attention_kit).
+log-sum-exp of each query's scores, to merge attentions over separate key sets (a cached prefix, shared.attention_kit). _attn_range
+is the same attention for the query blocks of a part-filled last wave over ranges of the keys (sage1_core.LAST_WAVE_SPLIT), its
+normalized outputs and log-sum-exps merged by sagegp.split_merge.
 """
 import triton
 import triton.language as tl
@@ -30,14 +32,14 @@ from shared.kernels.bf16_bits import bf16_bits_to_fp32, fp32_to_bf16_bits
 
 
 @triton.jit
-def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, qo_len,
+def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, qo_len, lo, hi,
                     K_ptrs, K_scale_ptr, V_ptrs, M_ptrs, stride_kn, stride_vn, stride_mk,
                     start_m,
                     H,
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr, V_BITS: tl.constexpr, MASK_MODE: tl.constexpr,
                     ):
-    lo, hi = 0, kv_len
+    # the keys [lo, hi) (K_ptrs, K_scale_ptr, V_ptrs and M_ptrs at lo): all of them, or a range of _attn_range's
     for start_n in range(lo, hi, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         k_mask = offs_n[None, :] < (kv_len - start_n)
@@ -140,7 +142,7 @@ def _attn_fwd(Q, K, V,
 
     q = tl.load(Q_ptrs, mask=offs_m[:, None] < qo_len)
     q_scale = tl.load(Q_scale_ptr)
-    acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, qo_len, K_ptrs, K_scale_ptr, V_ptrs, M_ptrs, stride_kn, stride_vn, stride_mk,
+    acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, qo_len, 0, kv_len, K_ptrs, K_scale_ptr, V_ptrs, M_ptrs, stride_kn, stride_vn, stride_mk,
                                     start_m,
                                     H // num_kv_groups,
                                     BLOCK_M, HEAD_DIM, BLOCK_N,
@@ -151,6 +153,65 @@ def _attn_fwd(Q, K, V,
     tl.store(O_block_ptr, fp32_to_bf16_bits(acc), mask=(offs_m[:, None] < qo_len))
     if RETURN_LSE:  # base-2 log-sum-exp of the scores (log2 e is folded into q_scale), Lse (batch, heads, tokens) FP32
         tl.store(Lse + (off_z * H + off_h) * qo_len + offs_m, m_i + tl.math.log2(l_i), mask=offs_m < qo_len)
+
+
+_RANGE_INTS = ["H", "num_kv_groups", "FIRST", "ROWS", "SPLIT_LEN"]
+
+
+@triton.jit(do_not_specialize=_RANGE_INTS, do_not_specialize_on_alignment=_RANGE_INTS)
+def _attn_range(Q, K, V,
+                cu_seqlens_q, cu_seqlens_k,
+                Q_scale, K_scale, cu_seqlens_q_scale, cu_seqlens_k_scale,
+                Parts, Mask, Lse,
+                stride_qh, stride_qn,
+                stride_kh, stride_kn,
+                stride_vh, stride_vn,
+                stride_mz, stride_mh, stride_mq, stride_mk,
+                H, num_kv_groups, FIRST, ROWS, SPLIT_LEN,
+                SPLITS: tl.constexpr,
+                HEAD_DIM: tl.constexpr,
+                BLOCK_M: tl.constexpr,
+                BLOCK_N: tl.constexpr,
+                STAGE: tl.constexpr,
+                V_BITS: tl.constexpr,
+                MASK_MODE: tl.constexpr,
+                ):
+    """_attn_fwd for the query blocks from FIRST (a part-filled last wave), over the keys of range program 2 % SPLITS of batch item
+    program 2 // SPLITS (SPLIT_LEN keys each): the range's normalized output in FP32 to Parts (batch * SPLITS, ROWS, heads, dim) and its
+    base-2 log-sum-exp to Lse (batch * SPLITS, heads, ROWS), merged by sagegp.split_merge. Every batch item has the same lengths (ROWS
+    query rows from FIRST); the arithmetic of a range is _attn_fwd's."""
+    start_m = FIRST + tl.program_id(0)
+    off_z = (tl.program_id(2) // SPLITS).to(tl.int64)
+    off_h = tl.program_id(1).to(tl.int64)
+    lo = (tl.program_id(2) % SPLITS) * SPLIT_LEN
+    cu_seqlens_q_start = tl.load(cu_seqlens_q + off_z)
+    qo_len = tl.load(cu_seqlens_q + off_z + 1) - cu_seqlens_q_start
+    q_scale_offset = tl.load(cu_seqlens_q_scale + off_z) * H + off_h + start_m * H
+    k_scale_offset = tl.load(cu_seqlens_k_scale + off_z) * (H // num_kv_groups) + off_h // num_kv_groups + (lo // BLOCK_N) * (H // num_kv_groups)
+    cu_seqlens_k_start = tl.load(cu_seqlens_k + off_z)
+    kv_len = tl.load(cu_seqlens_k + off_z + 1) - cu_seqlens_k_start
+    hi = tl.minimum(kv_len, lo + SPLIT_LEN)
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, HEAD_DIM)
+    Q_ptrs = Q + (cu_seqlens_q_start * stride_qn + off_h * stride_qh) + offs_m[:, None] * stride_qn + offs_k[None, :]
+    K_ptrs = K + ((cu_seqlens_k_start + lo) * stride_kn + (off_h // num_kv_groups) * stride_kh) + offs_n[None, :] * stride_kn + offs_k[:, None]
+    V_ptrs = V + ((cu_seqlens_k_start + lo) * stride_vn + (off_h // num_kv_groups) * stride_vh) + offs_n[:, None] * stride_vn + offs_k[None, :]
+    M_ptrs = Mask + off_z * stride_mz + off_h * stride_mh + offs_m[:, None] * stride_mq + (lo + offs_n[None, :]) * stride_mk
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    q = tl.load(Q_ptrs, mask=offs_m[:, None] < qo_len)
+    q_scale = tl.load(Q_scale + q_scale_offset)
+    acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, qo_len, lo, hi, K_ptrs, K_scale + k_scale_offset, V_ptrs, M_ptrs,
+                                    stride_kn, stride_vn, stride_mk, start_m, H // num_kv_groups, BLOCK_M, HEAD_DIM, BLOCK_N, 4 - STAGE,
+                                    offs_m, offs_n, V_BITS, MASK_MODE)
+    acc = acc / l_i[:, None]
+    local = (offs_m - FIRST * BLOCK_M).to(tl.int64)
+    inside = offs_m < qo_len
+    part = tl.program_id(2).to(tl.int64)
+    tl.store(Parts + ((part * ROWS + local[:, None]) * H + off_h) * HEAD_DIM + offs_k[None, :], acc, inside[:, None])
+    tl.store(Lse + (part * H + off_h) * ROWS + local, m_i + tl.math.log2(l_i), inside)
 
 
 @triton.jit(do_not_specialize=["H"])

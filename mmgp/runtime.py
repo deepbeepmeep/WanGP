@@ -231,6 +231,25 @@ def weights_resident(module):
     return all(name in preloaded for name in blocks)
 
 
+def pass_weight_bytes(module):
+    """Bytes a pass over the blocks of a managed model's towers adds, at the least, to the VRAM allocated now for their weights: the slots
+    of its streamed blocks not allocated yet (the prefetch window + 1 of its largest block), less its preloaded blocks, which the VRAM
+    pressure releases (an automatic or a manual preload). Negative when releasing them leaves room. 0 for an unmanaged module or a model
+    whose towers are loaded whole."""
+    owner = _owner(module)
+    if owner is None:
+        return 0
+    manager, model_id = owner
+    towers = tuple(model_id + "/" + name for name in manager.towers_per_model.get(model_id, ()))
+    sizes = [size for name, size in manager.blocks_of_modules_sizes.items() if size and name.startswith(towers)] if towers else []
+    if not sizes:
+        return 0
+    slots = manager.block_slots.get(model_id) or ()
+    allocated = sum(slot[2] for slot in slots if slot[0] is not None)
+    preloaded = sum(size for name, size in manager.preloaded_blocks_per_model[model_id].items() if (model_id + "/" + name).startswith(towers))
+    return (manager.model_prefetch_window(model_id) + 1) * max(sizes) - allocated - preloaded
+
+
 _block_names = weakref.WeakKeyDictionary()  # an offload manager -> (model id, id of a module of the model) -> the names of its blocks
 _tower_entries = weakref.WeakKeyDictionary()  # a tower (ModuleList) -> (model id, the entry name of each of its blocks)
 JOINT_PASS_COMPUTE_SHARE = 0.5  # of one prediction's compute estimated at the probed BF16 rate: the transfers above which a joint pass saves time (INT8 GEMMs run about twice as fast)

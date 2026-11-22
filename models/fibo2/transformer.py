@@ -96,7 +96,7 @@ class FinalLayer(nn.Module):
         (modulation_segments). norm_final(x) * (1 + scale[row]) in one fused pass."""
         scale = self.adaLN_modulation(adaln)
         batch, tokens, dim = x.shape
-        x_list, x = [x.view(-1, dim)], None
+        x_list, x = [x.reshape(-1, dim)], None  # x is a token slice: rows of a batch above 1 are not contiguous
         return self.linear(ops.norm_modulate(x_list, self.norm_final, torch.zeros_like(scale), scale, segments)).view(batch, tokens, -1)
 
 class RopeEmbedder:
