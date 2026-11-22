@@ -71,13 +71,10 @@ def modulate_frames(x, norm, shift, scale, dtype=None):
 
 def modulate_frames_rows(x, norm, shift, scale, dtype):
     """modulate_frames(x, norm, shift, scale).to(dtype) as an mmgp RowSource made by ranges of rows of (batch * tokens, dim), for an
-    FFN that reads it chunk by chunk (shared.kernels.ops.mlp): never whole beside x. Rows as from the whole (row-wise operations)."""
+    FFN that reads it chunk by chunk (shared.kernels.ops.mlp) or a self-attention that makes it again by head group (extreme low VRAM):
+    never whole beside x. Rows as from the whole (row-wise operations)."""
     rows, segments = x.view(-1, x.shape[-1]), frame_segments(x.shape[0], x.shape[1], shift.shape[1])
-
-    def fill(start, stop):
-        spans = [(max(first, start) - start, min(last, stop) - start, row) for first, last, row in segments if first < stop and last > start]
-        return kernels.norm_modulate([rows[start:stop]], norm, shift[0], scale[0], spans).to(dtype)
-    return offload.RowSource(x.shape, dtype, x.device, fill)
+    return kernels.norm_modulate_rows(rows, norm, shift[0], scale[0], segments, x.shape, None if dtype == x.dtype else dtype)
 
 def gated_frames_(x, y_list, gate):
     """x += y * gate per latent frame, in place (gate (1, frames, dim), y handed off in y_list); returns x."""
@@ -396,6 +393,8 @@ class WanSelfAttention(nn.Module):
             return (x if residual is None else residual), None
         x = xlist[0]
         xlist.clear()
+        if isinstance(x, offload.RowSource):  # extreme low VRAM: read whole by the paths other than the kit's
+            x = x.materialize()
 
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
@@ -736,21 +735,25 @@ class WanAttentionBlock(nn.Module):
                      
         e = frame_modulation(self.modulation.weight, e)
         # self-attention
-        x_mod = modulate_frames(x, self.norm1, e[0], e[1])
+        if cam_emb is None and not lynx_feature_extractor and attention_kit.extreme_low_vram():
+            # extreme low VRAM: the input by ranges of rows, made again by the attention for each head group, never whole beside x
+            xlist = [modulate_frames_rows(x, self.norm1, e[0], e[1], attention_dtype)]
+        else:
+            x_mod = modulate_frames(x, self.norm1, e[0], e[1])
 
-        if cam_emb != None:
-            cam_emb = self.cam_encoder(cam_emb)
-            if cam_emb.ndim == 3 and cam_emb.shape[1] == x_mod.shape[1]:
-                x_mod += cam_emb
-            else:
-                cam_emb = cam_emb.repeat(1, 2, 1)
-                cam_emb = cam_emb.unsqueeze(2).unsqueeze(3).repeat(1, 1, grid_sizes[1], grid_sizes[2], 1)
-                cam_emb = rearrange(cam_emb, 'b f h w d -> b (f h w) d')
-                x_mod += cam_emb
+            if cam_emb != None:
+                cam_emb = self.cam_encoder(cam_emb)
+                if cam_emb.ndim == 3 and cam_emb.shape[1] == x_mod.shape[1]:
+                    x_mod += cam_emb
+                else:
+                    cam_emb = cam_emb.repeat(1, 2, 1)
+                    cam_emb = cam_emb.unsqueeze(2).unsqueeze(3).repeat(1, 1, grid_sizes[1], grid_sizes[2], 1)
+                    cam_emb = rearrange(cam_emb, 'b f h w d -> b (f h w) d')
+                    x_mod += cam_emb
 
-        xlist = [x_mod.to(attention_dtype)]
-        if lynx_feature_extractor: get_cache("lynx_ref_buffer")[sub_x_no][self.block_no] = xlist[0]
-        del x_mod
+            xlist = [x_mod.to(attention_dtype)]
+            if lynx_feature_extractor: get_cache("lynx_ref_buffer")[sub_x_no][self.block_no] = xlist[0]
+            del x_mod
         gated = cam_emb is None  # the output projection adds its output, gated per latent frame, into x
         y, x_ref_attn_map = self.self_attn( xlist, grid_sizes, freqs, block_mask = block_mask, ref_target_masks = multitalk_masks, ref_images_count = ref_images_count, standin_phase= standin_phase, lynx_ref_buffer = lynx_ref_buffer, lynx_ref_scale = lynx_ref_scale, sub_x_no = sub_x_no,
                                             residual = x if gated else None, gate = e[2][0])
@@ -1617,6 +1620,31 @@ class WanModel(ModelMixin, ConfigMixin):
         return best_threshold
 
     
+    EMBED_CHUNK_BYTES = 64 << 20  # 16-bit output of the patch embedding per chunk of latent frames (extreme low VRAM)
+
+    def _patch_embed(self, x, dtype):
+        """patch_embedding(x).to(dtype); with extreme low VRAM (forced) by chunks of latent frames written into the output (the temporal
+        kernel is one frame), so that the whole 16-bit embedding never sits beside it (Wan 2.1 720p 81 frames: 0.74 GB less at this
+        peak, the first of a call). The output keeps the convolution's own memory format."""
+        conv = self.patch_embedding
+        if not attention_kit.extreme_low_vram() or conv.kernel_size[0] != 1 or conv.stride[0] != 1 or x.shape[2] < 4:
+            return conv(x).to(dtype)
+        first = conv(x[:, :, :2])
+        layout = torch.channels_last_3d if first.is_contiguous(memory_format=torch.channels_last_3d) and not first.is_contiguous() else torch.contiguous_format
+        out = torch.empty((*first.shape[:2], x.shape[2], *first.shape[3:]), dtype=dtype, device=first.device, memory_format=layout)
+        out[:, :, :2] = first
+        step = max(1, self.EMBED_CHUNK_BYTES // (first[:, :, :1].numel() * first.element_size()))
+        first = None
+        for start in range(2, x.shape[2], step):
+            out[:, :, start:start + step] = conv(x[:, :, start:start + step])
+        return out
+
+    def _plan_extreme(self, x):
+        """attention_kit.plan_extreme for the self-attention of the blocks (Smart Inputs Chunker Auto), x (batch, tokens, dim)."""
+        attn = self.blocks[0].self_attn
+        return attention_kit.plan_extreme(attn, x.device, attn.q.weight.dtype, x.shape[0] * x.shape[1], x.shape[-1], attn.num_heads, attn.num_heads,
+                                          attn.head_dim, (attn.q, attn.k, attn.v), attn.o)
+
     def forward(
         self,
         x,
@@ -1772,7 +1800,7 @@ class WanModel(ModelMixin, ConfigMixin):
                         x = torch.cat([x] + source_tokens, dim=1)
                     source_tokens = cos_parts = sin_parts = None
                 elif not steadydancer:
-                    x = self.patch_embedding(x).to(modulation_dtype)
+                    x = self._patch_embed(x, modulation_dtype)
                     if camera_adapter_features is not None:
                         x += camera_adapter_features
                     if scail2_ref_mask is not None:
@@ -2146,68 +2174,70 @@ class WanModel(ModelMixin, ConfigMixin):
                 for i in range(len(x_list)):
                     if x_should_calc[i]: ori_hidden_states[i] = x_list[i].clone()
 
-        if any(x_should_calc):
-            for block_idx, block in enumerate(self.blocks):
-                offload.shared_state["layer"] = block_idx
-                if callback != None:
-                    callback(-1, None, False, True)
-                if pipeline._interrupt:
-                    return [None] * len(x_list)
+        # Smart Inputs Chunker Auto: the extreme low VRAM mode where the chunked self-attention would not fit
+        with self._plan_extreme(x_list[0]):
+            if any(x_should_calc):
+                for block_idx, block in enumerate(self.blocks):
+                    offload.shared_state["layer"] = block_idx
+                    if callback != None:
+                        callback(-1, None, False, True)
+                    if pipeline._interrupt:
+                        return [None] * len(x_list)
 
-                if standin_x is not None:
-                    if not standin_cache_enabled: get_cache("standin").clear()
-                    standin_x = block(standin_x, context = None, grid_sizes = None, e= standin_e0, freqs = standin_freqs, standin_phase = 1)
+                    if standin_x is not None:
+                        if not standin_cache_enabled: get_cache("standin").clear()
+                        standin_x = block(standin_x, context = None, grid_sizes = None, e= standin_e0, freqs = standin_freqs, standin_phase = 1)
 
-                uni3c_block = block.uni3c if uni3c_x is not None and block_idx < self.uni3c_layers else None
-                if uni3c_block is not None: # shared by all the guidance branches: the ControlNet does not see the text
-                    uni3c_x = uni3c_block(uni3c_x, e, uni3c_condition["freqs"])
+                    uni3c_block = block.uni3c if uni3c_x is not None and block_idx < self.uni3c_layers else None
+                    if uni3c_block is not None: # shared by all the guidance branches: the ControlNet does not see the text
+                        uni3c_x = uni3c_block(uni3c_x, e, uni3c_condition["freqs"])
 
-                if animate2_enabled:
-                    animate2_generation = {
-                        "x_list": x_list,
-                        "contexts": context_list,
-                        "should_calc": x_should_calc,
-                        "unconditional": [i > 0 if joint_pass else x_id > 0 for i in range(len(x_list))],
-                        "e": e0,
-                        "grid_sizes": attention_grid_sizes,
-                        "freqs": freqs,
-                        "log_scale": animate2_log_scale,
-                    }
-                    if animate2_cached:
-                        animate2_ref_handoff = [animate2_load_cached(animate2_cache["blocks"][block_idx], x_list[0].device, modulation_dtype)]
-                        x_list = block(animate2_ref_handoff, e=animate2_ref_e0, context=None, grid_sizes=animate2_ref_grid_sizes, freqs=animate2_ref_freqs, animate2_generation=animate2_generation, animate2_cached=True)
+                    if animate2_enabled:
+                        animate2_generation = {
+                            "x_list": x_list,
+                            "contexts": context_list,
+                            "should_calc": x_should_calc,
+                            "unconditional": [i > 0 if joint_pass else x_id > 0 for i in range(len(x_list))],
+                            "e": e0,
+                            "grid_sizes": attention_grid_sizes,
+                            "freqs": freqs,
+                            "log_scale": animate2_log_scale,
+                        }
+                        if animate2_cached:
+                            animate2_ref_handoff = [animate2_load_cached(animate2_cache["blocks"][block_idx], x_list[0].device, modulation_dtype)]
+                            x_list = block(animate2_ref_handoff, e=animate2_ref_e0, context=None, grid_sizes=animate2_ref_grid_sizes, freqs=animate2_ref_freqs, animate2_generation=animate2_generation, animate2_cached=True)
+                        else:
+                            if animate2_cache is not None and animate2_kv_cache in ("INT8", "RAM"):  # the block stores its reference K/V
+                                cache_device = "cpu" if animate2_kv_cache == "RAM" else animate2_ref_hidden.device
+                                animate2_generation["store_kv"] = lambda ref_kv_list: animate2_cache["blocks"].append(animate2_store_kv(ref_kv_list, cache_device))
+                            elif animate2_cache is not None:
+                                animate2_cache["blocks"].append(animate2_ref_hidden.detach().to(animate2_ref_hidden.device, copy=True))
+                            animate2_ref_handoff = [animate2_ref_hidden]
+                            animate2_ref_hidden = None
+                            animate2_ref_hidden, x_list = block(animate2_ref_handoff, e=animate2_ref_e0, context=animate2_ref_context_emb, grid_sizes=animate2_ref_grid_sizes, freqs=animate2_ref_freqs, animate2_generation=animate2_generation)
+                        animate2_generation = None
+                    elif perturbation_layers is not None and block_idx in perturbation_layers:
+                        if x_id != 0 or not x_should_calc[0]:
+                            continue
+                        x_list[0] = block(x_list[0], context = context_list[0], audio_scale= audio_scale_list[0], e= e0, **kwargs)
                     else:
-                        if animate2_cache is not None and animate2_kv_cache in ("INT8", "RAM"):  # the block stores its reference K/V
-                            cache_device = "cpu" if animate2_kv_cache == "RAM" else animate2_ref_hidden.device
-                            animate2_generation["store_kv"] = lambda ref_kv_list: animate2_cache["blocks"].append(animate2_store_kv(ref_kv_list, cache_device))
-                        elif animate2_cache is not None:
-                            animate2_cache["blocks"].append(animate2_ref_hidden.detach().to(animate2_ref_hidden.device, copy=True))
-                        animate2_ref_handoff = [animate2_ref_hidden]
-                        animate2_ref_hidden = None
-                        animate2_ref_hidden, x_list = block(animate2_ref_handoff, e=animate2_ref_e0, context=animate2_ref_context_emb, grid_sizes=animate2_ref_grid_sizes, freqs=animate2_ref_freqs, animate2_generation=animate2_generation)
-                    animate2_generation = None
-                elif perturbation_layers is not None and block_idx in perturbation_layers:
-                    if x_id != 0 or not x_should_calc[0]:
-                        continue
-                    x_list[0] = block(x_list[0], context = context_list[0], audio_scale= audio_scale_list[0], e= e0, **kwargs)
-                else:
-                    for i, (x, context, hints, audio_scale, multitalk_audio, multitalk_masks, should_calc, motion_vec, lynx_ip_embeds,lynx_ref_buffer) in enumerate(zip(x_list, context_list, hints_list, audio_scale_list, multitalk_audio_list, multitalk_masks_list, x_should_calc,motion_vec_list, lynx_ip_embeds_list,lynx_ref_buffer_list)):
-                        if should_calc:
-                            block_kwargs = kwargs
-                            if bernini_enabled:
-                                block_kwargs = dict(kwargs)
-                                block_kwargs["freqs"] = bernini_freqs_list[i]
-                            elif taomate_audio is not None:
-                                block_kwargs = dict(kwargs, taomate_audio=taomate_audio[i])
-                            x_list[i] = block(x, context = context, hints= hints, audio_scale= audio_scale, multitalk_audio = multitalk_audio, multitalk_masks =multitalk_masks, e= e0,  motion_vec = motion_vec, lynx_ip_embeds= lynx_ip_embeds, lynx_ref_buffer = lynx_ref_buffer, sub_x_no =i,  **block_kwargs)
-                            del x
-                    context = hints = None
+                        for i, (x, context, hints, audio_scale, multitalk_audio, multitalk_masks, should_calc, motion_vec, lynx_ip_embeds,lynx_ref_buffer) in enumerate(zip(x_list, context_list, hints_list, audio_scale_list, multitalk_audio_list, multitalk_masks_list, x_should_calc,motion_vec_list, lynx_ip_embeds_list,lynx_ref_buffer_list)):
+                            if should_calc:
+                                block_kwargs = kwargs
+                                if bernini_enabled:
+                                    block_kwargs = dict(kwargs)
+                                    block_kwargs["freqs"] = bernini_freqs_list[i]
+                                elif taomate_audio is not None:
+                                    block_kwargs = dict(kwargs, taomate_audio=taomate_audio[i])
+                                x_list[i] = block(x, context = context, hints= hints, audio_scale= audio_scale, multitalk_audio = multitalk_audio, multitalk_masks =multitalk_masks, e= e0,  motion_vec = motion_vec, lynx_ip_embeds= lynx_ip_embeds, lynx_ref_buffer = lynx_ref_buffer, sub_x_no =i,  **block_kwargs)
+                                del x
+                        context = hints = None
 
-                if uni3c_block is not None:
-                    uni3c_hint = uni3c_block.proj_out(uni3c_x)
-                    for i, should_calc in enumerate(x_should_calc):
-                        if should_calc: x_list[i] += uni3c_hint
-                    uni3c_hint = None
+                    if uni3c_block is not None:
+                        uni3c_hint = uni3c_block.proj_out(uni3c_x)
+                        for i, should_calc in enumerate(x_should_calc):
+                            if should_calc: x_list[i] += uni3c_hint
+                        uni3c_hint = None
 
         if animate2_enabled:
             animate2_ref_hidden = animate2_ref_context_emb = animate2_ref_e0 = animate2_ref_freqs = None

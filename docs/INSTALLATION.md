@@ -207,7 +207,7 @@ pip install sageattention==1.0.6
 For the recommended PyTorch 2.10 environment (any Python from 3.10). SageGP replaces SageAttention, so remove it first:
 ```
 pip uninstall -y sageattention
-pip install https://github.com/deepbeepmeep/SageGP/releases/download/v1.0.0/sagegp-1.0.0+cu130torch2.10.0andhigher-cp310-abi3-win_amd64.whl
+pip install https://github.com/deepbeepmeep/SageGP/releases/download/v1.0.2/sagegp-1.0.2+cu130torch2.10.0andhigher-cp310-abi3-win_amd64.whl
 ```
 SageGP keeps SageAttention's fastest kernels in the **CUDA Graph** compilation mode on RTX 40XX/50XX.
 
@@ -222,7 +222,7 @@ Prebuilt wheels, no compilation needed. They keep SageAttention's fastest kernel
 For the recommended PyTorch 2.10 / CUDA 13 environment (any Python from 3.10). SageGP replaces SageAttention, so remove it first:
 ```
 pip uninstall -y sageattention
-pip install https://github.com/deepbeepmeep/SageGP/releases/download/v1.0.0/sagegp-1.0.0+cu130torch2.10.0andhigher-cp310-abi3-linux_x86_64.whl
+pip install https://github.com/deepbeepmeep/SageGP/releases/download/v1.0.2/sagegp-1.0.2+cu130torch2.10.0andhigher-cp310-abi3-linux_x86_64.whl
 ```
 The wheel needs a Linux distribution from 2018 or later (glibc 2.28). The 1 click installer picks the right wheel automatically.
 

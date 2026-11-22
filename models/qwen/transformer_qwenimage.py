@@ -391,7 +391,10 @@ class QwenDoubleStreamAttnProcessor2_0:
         encoder_hidden_states_mask: torch.FloatTensor = None,
         attention_mask: Optional[torch.FloatTensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
+        residual=None,
     ) -> torch.FloatTensor:
+        """residual (extreme low VRAM, the image stream an mmgp RowSource): (the image residual, its gate table, segments (start, stop,
+        row) over its rows), into which the kit adds the image's projected and gated attention output: returns (None, text output)."""
 
         hidden_states, encoder_hidden_states = hidden_states_list
         hidden_states_list.clear()
@@ -406,9 +409,14 @@ class QwenDoubleStreamAttnProcessor2_0:
         # cos / sin table of the joined tokens (interleaved pairs, as apply_rotary_emb_qwen_inplace)
         q_segments, k_segments = ([(start, stop, segment[index]) for start, stop, *segment in segments] for index in (0, 1))
         table = None if image_rotary_emb is None else torch.cat((txt_freqs[:seq_txt], img_freqs[:seq_img]), dim=0)[None, :, None]
+        options = {} if residual is None else dict(out_proj=attn.to_out[0], residual=residual[0], gate=residual[1], segments=residual[2], out_stream=1,
+                                                         by_items=True)  # a batch: the items one after another (batch-wide tables: one row)
         joint_hidden_states = attention_kit.joint_qkv_attention(streams, attn.heads, attn.to_q.out_features // attn.heads,
                                                                 lambda query, key, group: _norm_rope_(query, key, segments),
-                                                                fused_quant=lambda query, key, group, core, settings: ops.split_half_norm_rope_quant_(query, key, table, q_segments, k_segments, core, settings, interleaved=True)).flatten(2, 3)
+                                                                fused_quant=lambda query, key, group, core, settings: ops.split_half_norm_rope_quant_(query, key, table, q_segments, k_segments, core, settings, interleaved=True),
+                                                                **options).flatten(2, 3)
+        if residual is not None:  # the image's output already in its residual
+            return None, attn.to_add_out(joint_hidden_states)
 
         # Apply output projections
         img_attn_output = attn.to_out[0](joint_hidden_states[:, seq_txt:])
@@ -485,6 +493,35 @@ class QwenImageTransformerBlock(nn.Module):
         return ops.norm_modulate([x.view(-1, x.shape[-1])], norm, shift, scale, segments).view(x.shape), segments
 
     @staticmethod
+    def _norm_modulate_rows(x, norm, shift, scale, split=None):
+        """_norm_modulate as an mmgp RowSource made by ranges of rows (extreme low VRAM: the attention makes it again for each head
+        group, the FFN chunk by chunk), never whole beside x; with its segments."""
+        batch, tokens = x.shape[:2]
+        regions = ((0, tokens, 0),) if split is None else ((0, split, 0), (split, tokens, batch))
+        segments = [(b * tokens + start, b * tokens + stop, b + offset) for b in range(batch) for start, stop, offset in regions]
+        return ops.norm_modulate_rows(x.view(-1, x.shape[-1]), norm, shift, scale, segments, x.shape), segments
+
+    def _extreme_forward(self, hidden_states, encoder_hidden_states, img_mod_params, txt_mod_params, image_rotary_emb, joint_attention_kwargs, modulate_index):
+        """forward in extreme low VRAM (attention_kit.extreme_low_vram()): the image stream's attention and FFN inputs given by ranges
+        of rows (never whole beside the residual), its attention output projected and gated into hidden_states by the kit."""
+        img_shift1, img_scale1, img_gate1, img_shift2, img_scale2, img_gate2 = img_mod_params.chunk(6, dim=-1)
+        txt_shift1, txt_scale1, txt_gate1, txt_shift2, txt_scale2, txt_gate2 = txt_mod_params.chunk(6, dim=-1)
+        img_rows, img_segments = self._norm_modulate_rows(hidden_states, self.img_norm1, img_shift1, img_scale1, modulate_index)
+        txt_normed, _ = self._norm_modulate(encoder_hidden_states, self.txt_norm1, txt_shift1, txt_scale1)
+        hidden_states_list = [img_rows, txt_normed]
+        img_rows = txt_normed = None
+        _, txt_attn_output = self.attn.processor(self.attn, hidden_states_list=hidden_states_list, image_rotary_emb=image_rotary_emb,
+                                                 residual=(hidden_states, img_gate1, img_segments), **(joint_attention_kwargs or {}))
+        output_list, txt_attn_output = [txt_attn_output], None
+        ops.gated_residual_(encoder_hidden_states, output_list, txt_gate1.unsqueeze(1), fused=True)
+        img_rows, segments = self._norm_modulate_rows(hidden_states, self.img_norm2, img_shift2, img_scale2, modulate_index)
+        self._apply_ffn_chunked(img_rows, self.img_mlp, hidden_states, [(start, stop, img_gate2[row]) for start, stop, row in segments])
+        img_rows = None
+        txt_normed2, _ = self._norm_modulate(encoder_hidden_states, self.txt_norm2, txt_shift2, txt_scale2)
+        self._apply_ffn_chunked(txt_normed2, self.txt_mlp, encoder_hidden_states, ops.gate_segments(txt_gate2.unsqueeze(1), *encoder_hidden_states.shape[:2]))
+        return encoder_hidden_states, hidden_states
+
+    @staticmethod
     def _gated_residual_segments_(residual, x_list, segments):
         """residual += gate * x per segment (start, stop, gate) of the flattened tokens; x handed off in x_list."""
         x, rows = ops.take(x_list).flatten(0, 1), residual.view(-1, residual.shape[-1])
@@ -508,6 +545,8 @@ class QwenImageTransformerBlock(nn.Module):
             temb_txt = temb
         txt_mod_params = self.txt_mod(temb_txt)
 
+        if hidden_states.dtype != torch.float16 and attention_kit.extreme_low_vram():
+            return self._extreme_forward(hidden_states, encoder_hidden_states, img_mod_params, txt_mod_params, image_rotary_emb, joint_attention_kwargs, modulate_index)
         if modulate_index is None:
             # Get modulation parameters for both streams and split into shift, scale, gate
             img_shift1, img_scale1, img_gate1, img_shift2, img_scale2, img_gate2 = img_mod_params.chunk(6, dim=-1)
@@ -727,7 +766,13 @@ class QwenImageTransformer2DModel(nn.Module):
 
         hidden_states = None
 
-        with cuda_graphs.scope():
+        # Smart Inputs Chunker Auto: the extreme low VRAM mode where the chunked attention would not fit (formats probed on the first block)
+        attn, first = self.transformer_blocks[0].attn, hidden_states_list[0]
+        rows = first.shape[0] * (first.shape[1] + encoder_hidden_states_list[0].shape[1])
+        extreme = attention_kit.plan_extreme(attn, first.device, first.dtype, rows, first.shape[-1], attn.heads, attn.heads, attn.to_q.out_features // attn.heads,
+                                             (attn.to_q, attn.to_k, attn.to_v), attn.to_out[0])
+        first = None
+        with extreme, cuda_graphs.scope():
             for index_block, block in enumerate(self.transformer_blocks):
                 if callback != None:
                     callback(-1, None, False, True)

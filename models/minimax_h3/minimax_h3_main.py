@@ -205,6 +205,11 @@ def _load_transformer(filename, dtype, qkv_splitting=True, qkv_layout="interleav
     if pdd and (int(pdd_num_steps) < 1 or int(pdd_block_size) < 1 or int(pdd_num_steps) % int(pdd_block_size)):
         raise ValueError(f"Invalid MiniMax H3 PDD grid={pdd_num_steps}, block={pdd_block_size}")
     control_layers, control_in_dim = probe_h3_control_module(filenames[1:], checkpoint["time_embed_dim"])
+    dwd_steps = None  # pi-H3 DWD module: the step count its blocks and pixel head were trained for
+    for path in filenames[1:]:
+        state_dict, metadata = quant_router.load_metadata_state_dict(path)
+        if "dwd_head.time_table" in state_dict:
+            dwd_steps = int(metadata["num_inference_steps"])
     if veda:
         from .veda.attention import VedaAttention, VedaPolicy, read_metadata
         veda_policy = VedaPolicy(read_metadata(filenames[-1]))
@@ -214,7 +219,7 @@ def _load_transformer(filename, dtype, qkv_splitting=True, qkv_layout="interleav
                                      pdd_block_size=pdd_block_size, vdn=vdn, vsa=vsa, control_layers=control_layers,
                                      control_in_dim=control_in_dim, dropped_blocks=checkpoint.get("dropped_blocks", ()),
                                      endpoint_gate=checkpoint.get("endpoint_gate"), step_heads=checkpoint["step_heads"],
-                                     audio_enabled=checkpoint["audio_enabled"], dtype=dtype, device="meta")
+                                     audio_enabled=checkpoint["audio_enabled"], dwd_head=dwd_steps is not None, dtype=dtype, device="meta")
         if veda:
             transformer.veda_attention = veda_policy
             for layer, block in enumerate(transformer.blocks):
@@ -225,6 +230,8 @@ def _load_transformer(filename, dtype, qkv_splitting=True, qkv_layout="interleav
             transformer.vsa_attention = VSAPolicy(fasth3_inference)
             for layer, block in enumerate(transformer.blocks):
                 block.attn.vsa = VSAAttention(transformer.vsa_attention, layer)
+    if dwd_steps is not None:
+        transformer.dwd_head.refiner.reset_rope()
     qkv_layout = _qkv_layout(filenames, qkv_layout)
     split_map = get_linear_split_map(transformer.attention_inner_size, qkv_layout=qkv_layout) if qkv_splitting and not any(path.lower().endswith(".gguf") for path in filenames) else None
     if split_map is not None:
@@ -241,6 +248,7 @@ def _load_transformer(filename, dtype, qkv_splitting=True, qkv_layout="interleav
                             fused_split_map=split_map)
     transformer.eval().requires_grad_(False)
     transformer.h3_checkpoint_info = checkpoint
+    transformer.dwd_steps = dwd_steps
     transformer.h3_lora_affine_package = lora_affine_package
     transformer.h3_lora_map_checked = hybrid_ref2va_blocks is None
     transformer.split_linear_modules_map = split_map

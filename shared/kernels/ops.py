@@ -130,6 +130,44 @@ def norm_modulate(x_list, norm, shift, scale, segments, *, dtype=None):
     return x
 
 
+def _fused_norm(norm, dtype):
+    """(weight, eps, layer) of a norm shared.kernels.norm_quant_triton computes (RMSNorm; LayerNorm without bias, weightless or with
+    LayerNorm's own forward), None for another."""
+    if isinstance(norm, torch.nn.RMSNorm):
+        return norm.weight, norm.eps if norm.eps is not None else torch.finfo(dtype).eps, False
+    if isinstance(norm, torch.nn.LayerNorm) and norm.bias is None and (norm.weight is None or type(norm).forward is torch.nn.LayerNorm.forward):
+        return norm.weight, norm.eps, True
+    return None
+
+
+def norm_modulate_rows(x, norm, shift, scale, segments, shape=None, dtype=None):
+    """norm_modulate of rows x (rows, dim), borrowed (cast to dtype when given; shift / scale None: norm(x) alone), as an mmgp
+    offload.RowSource of `shape` (x's by default) made by ranges of rows, for inputs only their projections read (an attention that makes
+    them again by head group, an FFN chunk by chunk: attention_kit.extreme_low_vram()): never whole beside x, rows as from the whole
+    (row-wise operations). Its INT8 / FP8 forms come in one pass from the residual where the norm is one shared.kernels.norm_quant_triton
+    computes (RowSource.fill_prepared: the norm and modulation in FP32, rounded once)."""
+    def fill(start, stop):
+        if scale is None:
+            rows = norm(x[start:stop])
+        else:
+            spans = [(max(first, start) - start, min(last, stop) - start, row) for first, last, row in segments if first < stop and last > start]
+            rows = norm_modulate([x[start:stop]], norm, shift, scale, spans)
+        return rows if dtype is None else rows.to(dtype)
+    source = offload.RowSource(x.shape if shape is None else shape, x.dtype if dtype is None else dtype, x.device, fill)
+    fused = _fused_norm(norm, x.dtype) if dtype in (None, x.dtype) else None
+    if fused is not None:
+        source.fill_prepared, source.fill_prepared_at = row_fills(x, fused[0], fused[1], scale, shift, segments, fused[2])
+    return source
+
+
+def row_fills(x, weight, eps, scale, shift, segments, layer=False):
+    """shared.kernels.norm_quant_triton.row_fills (a RowSource's fill_prepared and fill_prepared_at) where Triton is installed, else (None, None)."""
+    if _triton is None:
+        return None, None
+    from . import norm_quant_triton
+    return norm_quant_triton.row_fills(x, weight, eps, scale, shift, segments, layer)
+
+
 def rms_norm_(x, eps, weight=None):
     """x normalized in place over its last dimension by its RMS (times weight), in one Triton pass in FP32 rounded once (as precise as
     the norm then the weight in 16 bits, two roundings, or more); None where it cannot run (no Triton, a layout whose rows are not one

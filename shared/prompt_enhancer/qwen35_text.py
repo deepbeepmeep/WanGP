@@ -29,6 +29,8 @@ try:
 except Exception:  # pragma: no cover
     WeightQBytesTensor = None
 
+from . import chat_formats
+from .assets import INKLING2_MINI_DRAFTER_FILENAME
 from .qwen3_5 import register_qwen35_config
 from .qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 from .qwen35_vl import (
@@ -54,6 +56,7 @@ QWEN35_LLM_PRELOAD_MARGIN_MB = 256  # VRAM the dynamic preload leaves free beyon
 QWEN35_LLM_MAPPED_TOKEN_TABLE = True
 QWEN35_LLM_ACTIVATIONS_MB = 512  # speculative decoding Auto: VRAM the LLM's passes take beside its weights and KV cache (about 330 MB measured for the 27B)
 QWEN4_EXP_PREFILL_CHUNK_TOKENS = 4096  # Qwen3.8 Flash-Next reads prompts by chunks: bounded activations and sparse attention, and each expert out of VRAM crosses the bus once per chunk
+INKLING2_PREFILL_CHUNK_TOKENS = 2048  # Inkling 2 reads prompts by chunks: bounded activations and attention scores
 QWEN4_EXP_EXPERT_MARGIN_MB = 3072  # its experts fill the VRAM: left free for the CUDA graphs of its passes, captured later
 
 QWEN35_GGUF_LLAMACPP_ENV = "WGP_GGUF_LLAMACPP_CUDA"
@@ -162,6 +165,8 @@ def qwen35_mtp_fit(assets_dir: str | None, variant: str | None, backend: str, mo
     from mmgp import allocator, auto_preload, memory_pressure
     from shared.qtypes import gguf
     from shared.qtypes.prism import get_prism_metadata
+    if get_qwen35_variant_spec(variant).get("architecture") == "inkling2":
+        return _inkling2_mtp_fit(_resolve_qwen35_assets_dir(assets_dir, variant=variant), get_qwen35_variant_spec(variant), kv_cache_layout)
     if backend != enhancer_quantization_GGUF:
         return None
     assets_dir = _resolve_qwen35_assets_dir(assets_dir, variant=variant)
@@ -194,6 +199,39 @@ def qwen35_mtp_fit(assets_dir: str | None, variant: str | None, backend: str, mo
     else:
         available = torch.cuda.mem_get_info()[0] + torch.cuda.memory_reserved()
     return weights + work + margin, mtp + 2 * kv_heads * head_dim * 2 * tokens, available
+
+
+# Measured (specs/INKLING2_VRAM_20261122, INKLING2_DRAFT_SPEED_20261122 section 17): with the drafter's 0.87 GiB taken from the experts, a 12 GB card keeps 37 % of them and decodes
+# 51-74 tokens/s against 42-49 without the drafter; an 8 GB card keeps 8 % and decodes 23-39 against 33-36
+INKLING2_DRAFT_EXPERT_SHARE = 0.25
+
+
+def _inkling2_mtp_fit(assets_dir, spec, kv_cache_layout):
+    """qwen35_mtp_fit for Inkling 2: the language model's tensors of its checkpoint (the vision tower has its own file), the paged KV cache
+    and the window rings; its drafter adds its file, its head table and its context cache. None when a file is missing."""
+    import struct
+    from mmgp import allocator, auto_preload, memory_pressure
+    from shared.llm_engines.lmgp.models import inkling2, inkling2_draft
+    paths = [_resolve_qwen35_checkpoint_file(assets_dir, name, error_if_none=False) for name in (spec["text_safetensors_filename"], spec.get("text_mtp_filename", INKLING2_MINI_DRAFTER_FILENAME))]
+    config_path = os.path.join(assets_dir, "config.json")
+    if not all(path and os.path.isfile(path) for path in (*paths, config_path)):
+        return None
+    with open(config_path, "r", encoding="utf-8") as reader:
+        config = inkling2.Inkling2EngineConfig(json.load(reader))
+    with open(paths[0], "rb") as reader:
+        header = json.loads(reader.read(struct.unpack("<Q", reader.read(8))[0]))
+    sizes = {name: info["data_offsets"][1] - info["data_offsets"][0] for name, info in header.items() if name.startswith("model.llm.")}
+    experts = sum(size for name, size in sizes.items() if ".mlp.experts." in name)
+    # the experts follow the VRAM left (the others run on the CPU): the drafter pays while it leaves this share of them in VRAM
+    weights = sum(sizes.values()) - experts + int(INKLING2_DRAFT_EXPERT_SHARE * experts)
+    tokens, c, draft = normalize_deepy_context_tokens(get_deepy_config_value(DEEPY_CONTEXT_TOKENS_KEY)), config.core, config.mtp_config
+    work = inkling2.kv_cache_bytes(c, kv_cache_layout, tokens) + (QWEN35_LLM_ACTIVATIONS_MB << 20)
+    margin = (auto_preload.MARGIN if QWEN35_LLM_PRELOAD_MARGIN_MB is None else QWEN35_LLM_PRELOAD_MARGIN_MB << 20) + memory_pressure.HEADROOM + int(auto_preload.MARGIN_SHARE * work)
+    row = 2 * draft["num_key_value_heads"] * draft["head_dim"] * 2  # keys and values of a position of a drafter layer
+    ring = min(tokens, draft["sliding_window_size"] + inkling2_draft.REWIND_ROWS)
+    mtp = os.path.getsize(paths[1]) + c.vocab * (draft["markov_rank"] + 1) * 2 + row * ((draft["num_hidden_layers"] - len(draft["local_layer_ids"])) * tokens + len(draft["local_layer_ids"]) * ring)
+    available = allocator.stats()["reserved"] + allocator.room() if allocator.active == "vmm" else torch.cuda.mem_get_info()[0] + torch.cuda.memory_reserved()
+    return weights + work + margin, mtp, available
 
 
 def _map_qwen35_token_table(model) -> None:
@@ -400,10 +438,15 @@ def _prompt_thinking_budget(model, prompt_len: int, max_new_tokens: int) -> tupl
     return cap, max_new_tokens + cap + margin
 
 
-def _print_thinking_process(message_index: int, total_messages: int, thinking_text: str) -> None:
+def _console_tag(spec: dict) -> str:
+    """The console prefix of a model's messages: the Qwen family's with the model's name, or the model's own name."""
+    return f"[{spec['display_name']}]" if spec.get("architecture") == "inkling2" else f"[Qwen3.5VL][{spec['display_name']}]"
+
+
+def _print_thinking_process(message_index: int, total_messages: int, thinking_text: str, tag: str = "[Qwen3.5VL]") -> None:
     if len(thinking_text) == 0:
         return
-    print(f"[Qwen3.5VL][Thinking {message_index + 1}/{total_messages}]")
+    print(f"{tag}[Thinking {message_index + 1}/{total_messages}]")
     try:
         print(thinking_text)
     except UnicodeEncodeError:
@@ -512,13 +555,7 @@ class _ThinkingBudgetState:
 
 
 def _build_chat_prompt(tokenizer, message, enable_thinking: bool = False):
-    text = tokenizer.apply_chat_template(
-        message,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=bool(enable_thinking),
-    )
-    return text.rstrip() + "\n"
+    return chat_formats.of(tokenizer).render_prompt(tokenizer, message, enable_thinking)
 
 
 def _resolve_prompt_penalty_mode(model) -> str:
@@ -865,7 +902,7 @@ def _generate_messages_vllm(
     outputs = []
     apply_repetition_penalty = normalize_deepy_repetition_penalty(get_deepy_config_value(DEEPY_REPETITION_PENALTY_KEY, DEEPY_REPETITION_PENALTY_DEFAULT))
     thinking_enabled = _prompt_enhancer_thinking_enabled(self, thinking_enabled=thinking_enabled)
-    progress_desc = "Qwen3.5 prompt enhancement"
+    progress_desc = getattr(self, "_prompt_enhancer_progress_label", "Qwen3.5 prompt enhancement")
     for idx, message in enumerate(tqdm(messages, total=len(messages), desc=progress_desc, dynamic_ncols=True, leave=False)):
         prompt = _build_chat_prompt(tokenizer, message, enable_thinking=thinking_enabled)
         try:
@@ -933,6 +970,7 @@ def _generate_messages_vllm(
                     max_thinking_tokens=thinking_tokens,
                     stop_requested=stop_requested,
                     stream_callback=stream_callback,
+                    decode=None if chat_formats.of(tokenizer) is chat_formats.QWEN else (lambda token_ids: chat_formats.of(tokenizer).decode(tokenizer, token_ids, prompt_token_ids[-1:])),
                 )
             raw_text = response["text"]
             log_llm_io("IN", "local-prompt-enhancer", "qwen-generation", response, prompt_number=idx + 1)
@@ -966,7 +1004,7 @@ def _generate_messages_vllm(
             reset_context()
 
         if thinking_enabled:
-            _print_thinking_process(idx, len(messages), thinking_text)
+            _print_thinking_process(idx, len(messages), thinking_text, getattr(self, "_prompt_enhancer_console_tag", "[Qwen3.5VL]"))
         outputs.append(answer_text)
     return outputs
 
@@ -1091,6 +1129,33 @@ def _load_qwen4_exp_model(model_path: str, config_path: str, assets_dir: str, sp
     for block in model.blk:
         if block.ple is not None:
             block.ple.table = open_ngram_table(table_path, model_path, config)
+    return model
+
+
+def _load_inkling2_model(model_path: str, config_path: str, features: dict, mtp_modules: list | None = None):
+    """Inkling 2 from its safetensors checkpoint, its stored dtypes kept: BF16 dense weights, float32 queries and biases, packed experts.
+    mtp_modules: its DSpark drafter's file, read with it (speculative decoding). The vision tower has its own file and loader."""
+    from shared.llm_engines.lmgp.models import inkling2, inkling2_draft
+    with open(config_path, "r", encoding="utf-8") as reader:
+        config = inkling2.Inkling2EngineConfig(json.load(reader))
+    config._prompt_enhancer_safe_legacy = not features["triton"]
+    with torch.device("meta"):
+        model = inkling2.Inkling2ForCausalLM(config, use_triton=features["triton"])
+        if mtp_modules:
+            model.mtp = inkling2_draft.Inkling2Draft(config.mtp_config, model)
+    offload.load_model_data(model, model_path, preprocess_sd=inkling2.llm_state_dict, postprocess_sd=inkling2_draft.draft_head_tensors(config.vocab_size) if mtp_modules else None, modules=mtp_modules,
+                            writable_tensors=False, default_dtype=None)
+    # the token table (0.86 GiB, its own tensor: the head has another) is read from mapped RAM on every card: same outputs and same speed as in VRAM
+    if "table" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(","):  # comparison switch
+        runtime.map_in_ram(model.embed)
+    if mtp_modules:  # a block drafter of the engine: its 7 drafts come from one pass, with no confidence of their own
+        model._block_draft, model._block_draft_max_tokens = True, model.mtp.block_size - 1
+        model._lm_engine_measured_drafts = True  # an automatic count: the drafts of each window follow the measured passes and acceptance (0 where none pays)
+    if inkling2.ROUTED:
+        inkling2.set_expert_priorities(model)  # the experts kept in VRAM first
+        model._mm_expert_margin = QWEN4_EXP_EXPERT_MARGIN_MB << 20
+    model._convertWeightsFloatTo = None  # the float32 queries and biases stay float32
+    model._model_dtype = torch.bfloat16
     return model
 
 
@@ -1369,12 +1434,15 @@ def load_qwen35_text_prompt_enhancer(
             raise FileNotFoundError(f"Missing Qwen3.5 text prompt enhancer asset: {required_file}")
 
     tokenizer = _load_qwen35_tokenizer(assets_dir)
+    if spec.get("architecture") == "inkling2":
+        tokenizer.chat_format = "inkling2"  # its messages, tool calls and end of turn (chat_formats)
     chat_template_path = _resolve_qwen35_asset_file(text_assets_dir, "chat_template.jinja", error_if_none=False) or os.path.join(text_assets_dir, "chat_template.jinja")
     if os.path.isfile(chat_template_path):
         with open(chat_template_path, "r", encoding="utf-8") as reader:
             tokenizer.chat_template = reader.read()
 
     features = _resolve_llm_features(backend)  # the engine uses whatever the hardware and the installed packages allow
+    flash_next, inkling2 = spec.get("architecture") == "qwen4_exp", spec.get("architecture") == "inkling2"
     safe_legacy_mode = not features["triton"]
     prism_metadata = {}
     if backend == enhancer_quantization_GGUF:
@@ -1385,8 +1453,8 @@ def load_qwen35_text_prompt_enhancer(
     block_draft_method = speculative_decoding if speculative_decoding in BLOCK_DRAFT_METHODS else None
     if block_draft_method is not None and (variant != "27b" or not (features["triton"] and features["flash"])):
         raise ValueError("DSpark, DFlash2 and DSpine require Qwen3.8/Bonsai 27B, Triton and FlashAttention 2.")
-    enable_mtp = bool(speculative_decoding and block_draft_method is None and spec.get("supports_mtp", False))
-    mtp_filename = _qwen35_mtp_filename(spec, backend, model_path, prism_metadata) if enable_mtp else None
+    enable_mtp = bool(speculative_decoding and block_draft_method is None and (spec.get("supports_mtp", False) or inkling2))
+    mtp_filename = (spec.get("text_mtp_filename", INKLING2_MINI_DRAFTER_FILENAME) if inkling2 else _qwen35_mtp_filename(spec, backend, model_path, prism_metadata)) if enable_mtp else None
     mtp_modules = [_resolve_qwen35_checkpoint_file(assets_dir, mtp_filename, variant=variant)] if mtp_filename else None
     postprocess_sd = _add_qwen35_mtp_shared_weights if enable_mtp else None
     if backend == enhancer_quantization_GGUF:
@@ -1406,14 +1474,14 @@ def load_qwen35_text_prompt_enhancer(
         gguf_ssm_param_reordered = False
         gguf_interleave_ssm_ab = False
         if model_path is None:
-            model_path = get_qwen35_text_quanto_int8_path(assets_dir, variant=variant)
+            model_path = _resolve_qwen35_checkpoint_file(assets_dir, spec["text_safetensors_filename"], variant=variant, error_if_none=False) if inkling2 else get_qwen35_text_quanto_int8_path(assets_dir, variant=variant)
         quanto_log_ssm_a = _resolve_quanto_log_ssm_a(model_path, spec)
         preprocess_sd = None
         runtime_model_path = text_assets_dir
 
     if not os.path.isfile(model_path):
         raise FileNotFoundError(f"Qwen3.5 text checkpoint not found: {model_path}")
-    print(f"[Qwen3.5VL][{spec['display_name']}][{backend}] Loading text checkpoint: {model_path}")
+    print(f"{_console_tag(spec)}[{backend}] Loading text checkpoint: {model_path}")
     if backend == enhancer_quantization_GGUF:
         print(
             "[Qwen3.5VL]"
@@ -1425,9 +1493,10 @@ def load_qwen35_text_prompt_enhancer(
     elif quanto_log_ssm_a:
         print(f"[Qwen3.5VL][{spec['display_name']}][quanto_int8] SSM A parameters are stored in log form.")
 
-    flash_next = spec.get("architecture") == "qwen4_exp"
     if flash_next:
         model = _load_qwen4_exp_model(model_path, text_config_path, assets_dir, spec, features, mtp_modules)
+    elif inkling2:
+        model = _load_inkling2_model(model_path, text_config_path, features, mtp_modules)
     else:
         model = _load_local_text_model(
             model_path,
@@ -1454,7 +1523,7 @@ def load_qwen35_text_prompt_enhancer(
         )
     elif quanto_log_ssm_a:
         _configure_qwen35_text_model(model, log_ssm_a=True)
-    if not flash_next:
+    if not flash_next and not inkling2:
         _apply_qwen35_projection_fusions(model, prism=bool(prism_metadata))
     if prism_metadata:
         from shared.qtypes.prism import install_prism_transforms
@@ -1485,7 +1554,7 @@ def load_qwen35_text_prompt_enhancer(
     model._prompt_enhancer_log_ssm_a = bool(quanto_log_ssm_a)
     model._prompt_enhancer_thinking_extra_tokens = QWEN35_PROMPT_THINKING_EXTRA_TOKENS
     model._prompt_enhancer_thinking_max_tokens = QWEN35_PROMPT_THINKING_MAX_TOKENS
-    model._prompt_enhancer_close_think_token_id = tokenizer.convert_tokens_to_ids("</think>")
+    model._prompt_enhancer_close_think_token_id = tokenizer.convert_tokens_to_ids(chat_formats.of(tokenizer).think_close)
     model._prompt_enhancer_stop_token_ids = _collect_stop_token_ids(tokenizer, model.config)
     set_qwen35_prompt_enhancer_thinking(model, QWEN35_PROMPT_ENABLE_THINKING)
     model._prompt_enhancer_suppress_logits_bias = None
@@ -1527,24 +1596,31 @@ def load_qwen35_text_prompt_enhancer(
     if block_draft_method is not None:
         from .block_draft import install_block_draft
         install_block_draft(model, block_draft_method, bonsai=bool(prism_metadata))
+    if inkling2 and enable_mtp:
+        model._prompt_enhancer_speculative_tokens = model._prompt_enhancer_speculative_sampling_tokens = model._block_draft_max_tokens
+        model._prompt_enhancer_speculative_confidence = 0.0
     model._prompt_enhancer_use_vllm = features["cuda"]  # the LM engine with each optimization where supported, else (Apple GPUs) the legacy runner
     model._prompt_enhancer_use_legacy_cuda_runner = not features["cuda"]
     # MMGP manages the weights: its dynamic preload keeps in VRAM all the blocks that fit beside the KV cache and the activations (all of
     # them at first: without its VRAM allocator, the budgets of the profile apply), with CUDA graphs its graphs replay the decoding passes
     model._lm_engine_mmgp = features["cuda"]
     model._lm_engine_mmgp_graphs = features["graphs"]
-    if QWEN35_LLM_MAPPED_TOKEN_TABLE:
+    if QWEN35_LLM_MAPPED_TOKEN_TABLE and not inkling2:
         _map_qwen35_token_table(model)
     from mmgp import allocator
     if allocator.active == "vmm":
         model._budget = 2 * os.path.getsize(model_path)  # beyond the model: every block preloaded
     # MMGP cpuCompute (decoding computes the blocks out of VRAM on the CPU): what the runtime needs beside the weights, for its pinning share
-    kv_bytes = _qwen35_kv_bytes(model.config, model._deepy_kv_cache_layout if kv_cache_int8 else "", QWEN35_LLM_PLANNED_CONTEXT)
+    if inkling2:
+        from shared.llm_engines.lmgp.models.inkling2 import kv_cache_bytes
+        kv_bytes = kv_cache_bytes(model.c, model._deepy_kv_cache_layout if kv_cache_int8 else "", QWEN35_LLM_PLANNED_CONTEXT)
+    else:
+        kv_bytes = _qwen35_kv_bytes(model.config, model._deepy_kv_cache_layout if kv_cache_int8 else "", QWEN35_LLM_PLANNED_CONTEXT)
     model._mm_cpu_compute_reserve = kv_bytes + (2 << 30)  # KV cache, activations, vision tower
     if QWEN35_LLM_MAX_PRELOAD_MB:
         model._budget = model._auto_preload_max = QWEN35_LLM_MAX_PRELOAD_MB << 20
-    if flash_next:
-        model._prefill_chunk_tokens = QWEN4_EXP_PREFILL_CHUNK_TOKENS
+    if flash_next or inkling2:
+        model._prefill_chunk_tokens = QWEN4_EXP_PREFILL_CHUNK_TOKENS if flash_next else INKLING2_PREFILL_CHUNK_TOKENS
     model._mm_graph_keys = 32  # its decoding passes: one token, then 2 to 9 for the speculative verifications
     model._mm_graph_placement_key = True  # only MMGP moves its weights: the key of a whole-model graph is checked in constant time
     model._mm_graph_check_once = True  # its passes of any length read the same state: reads checked, cuBLAS use found, at the first capture
@@ -1554,8 +1630,10 @@ def load_qwen35_text_prompt_enhancer(
     for block in model.blk:
         block._mm_graph_keys = 32
     reset_attention_backend_logs()
-    speculative = f"{block_draft_method} drafts" if block_draft_method else ("native MTP" if enable_mtp else "")
-    print(f"[Qwen3.5VL][{spec['display_name']}] LLM engine: {_describe_llm_features(features, kv_cache_int8, speculative, model._deepy_kv_cache_layout)}")
+    speculative = f"{block_draft_method} drafts" if block_draft_method else ("DSpark drafts" if inkling2 and enable_mtp else "native MTP" if enable_mtp else "")
+    if inkling2:
+        model._prompt_enhancer_console_tag, model._prompt_enhancer_progress_label = _console_tag(spec), f"{spec['display_name']} Prompt Enhancement"
+    print(f"{_console_tag(spec)} LLM engine: {_describe_llm_features(features, kv_cache_int8, speculative, model._deepy_kv_cache_layout)}")
     model.generate_messages = types.MethodType(_generate_messages, model)
     model.unload = types.MethodType(_suspend_prompt_enhancer_text_runtime, model)
     model._offload_hooks = ["forward"]

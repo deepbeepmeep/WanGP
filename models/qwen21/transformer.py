@@ -245,10 +245,18 @@ def _qwenimage21_norm_rope_quant(query, key, attn, rotary_emb, core, settings):
     return kernels.split_half_norm_rope_quant_(query, key, rope, attn.norm_q, attn.norm_k, core, settings, interleaved=True)
 
 
-def _qwenimage21_kit_attention(attn, hidden_states, rotary_emb, layer_cache, kv_cache_mode, segments):
+def _qwenimage21_kit_attention(attn, hidden_states, rotary_emb, layer_cache, kv_cache_mode, segments, residual=None):
     """QwenImage21AttnProcessor without mask nor NAG: the prefix tokens (text and condition images) attended by segments as before,
-    then the target tokens, whose attention to all the keys goes through attention_kit with the prefix keys and values first."""
-    x = hidden_states.pop() if isinstance(hidden_states, list) else hidden_states
+    then the target tokens, whose attention to all the keys goes through attention_kit with the prefix keys and values first.
+    residual (extreme low VRAM, hidden_states [the prefix rows, an mmgp RowSource of the target rows]): (the target rows of the residual
+    (tokens, dim), the gate table, its segments (start, stop, row) over these rows), into which the kit adds the target's projected
+    and gated output; the prefix's output alone is returned (None without prefix)."""
+    target = None
+    if residual is not None:
+        x, target = hidden_states
+        hidden_states.clear()
+    else:
+        x = hidden_states.pop() if isinstance(hidden_states, list) else hidden_states
     outputs, kv_prefix = [], None
     if kv_cache_mode == 'cached':
         kv_prefix = layer_cache.kv_prefix()
@@ -264,13 +272,22 @@ def _qwenimage21_kit_attention(attn, hidden_states, rotary_emb, layer_cache, kv_
                 kv_prefix = (key, value)
             del query, key, value
             rotary_emb = None if rotary_emb is None else rotary_emb[prefix_len:]
-        x = x[:, prefix_len:].contiguous()
-    x_list = [x]
-    del x
+        x = None if target is not None else x[:, prefix_len:].contiguous()
+    x_list = [x if target is None else target]
+    x = target = None
+    options = dict(kv_prefix=kv_prefix, fused_quant=lambda query, key, group, core, settings: _qwenimage21_norm_rope_quant(query, key, attn, rotary_emb, core, settings))
+    callback = lambda query, key, group: _qwenimage21_norm_rope_(query, key, attn, rotary_emb)
+    if residual is not None:  # the target's output projected and gated into the residual by the kit
+        attention_kit.qkv_attention(x_list, attn.to_q, attn.to_k, attn.to_v, attn.heads, attn.inner_dim // attn.heads, callback, out_proj=attn.to_out[0],
+                                    residual=residual[0], gate=residual[1], segments=residual[2], **options)
+        kv_prefix = None
+        if not outputs:
+            return None
+        out = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=1)
+        outputs.clear()
+        return attn.to_out[1](attn.to_out[0](out.flatten(2, 3)))
     if x_list[0].shape[1]:  # the target tokens (none in NAG's negative branch: the prefix alone)
-        outputs.append(attention_kit.qkv_attention(x_list, attn.to_q, attn.to_k, attn.to_v, attn.heads, attn.inner_dim // attn.heads,
-                                                   lambda query, key, group: _qwenimage21_norm_rope_(query, key, attn, rotary_emb), kv_prefix=kv_prefix,
-                                                   fused_quant=lambda query, key, group, core, settings: _qwenimage21_norm_rope_quant(query, key, attn, rotary_emb, core, settings)))
+        outputs.append(attention_kit.qkv_attention(x_list, attn.to_q, attn.to_k, attn.to_v, attn.heads, attn.inner_dim // attn.heads, callback, **options))
     kv_prefix = None
     out = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=1)
     outputs.clear()
@@ -281,9 +298,9 @@ class QwenImage21AttnProcessor:
     _attention_backend = None
     _parallel_config = None
 
-    def __call__(self, attn: 'QwenImage21Attention', hidden_states: torch.Tensor, attention_mask: Any | None=None, rotary_emb: torch.Tensor | None=None, layer_cache: QwenImage21KVLayerCache | None=None, kv_cache_mode: str | None=None, cache_write_slice: slice | None=None, segments: list[tuple[int, int, bool]] | None=None, key_valid: torch.Tensor | None=None, nag_cache=None, nag_parameters=None, nag_target_tokens=None) -> torch.Tensor:
+    def __call__(self, attn: 'QwenImage21Attention', hidden_states: torch.Tensor, attention_mask: Any | None=None, rotary_emb: torch.Tensor | None=None, layer_cache: QwenImage21KVLayerCache | None=None, kv_cache_mode: str | None=None, cache_write_slice: slice | None=None, segments: list[tuple[int, int, bool]] | None=None, key_valid: torch.Tensor | None=None, nag_cache=None, nag_parameters=None, nag_target_tokens=None, residual=None) -> torch.Tensor:
         if nag_cache is None and attention_mask is None and key_valid is None and (kv_cache_mode == 'cached' or segments is not None):
-            return _qwenimage21_kit_attention(attn, hidden_states, rotary_emb, layer_cache, kv_cache_mode, segments)
+            return _qwenimage21_kit_attention(attn, hidden_states, rotary_emb, layer_cache, kv_cache_mode, segments, residual)
         query, key, value, seq_len_q = _qwenimage21_prepare_qkv(attn, hidden_states, rotary_emb, layer_cache, kv_cache_mode, cache_write_slice)
         query_dtype = query.dtype
         alternate = None
@@ -357,8 +374,34 @@ class QwenImage21TransformerBlock(nn.Module):
         scale, gate = mod_params.chunk(2, dim=-1)
         return (_apply_modulation_(hidden_states, scale, target_start), gate)
 
+    def _extreme_forward(self, hidden_states, mod1, mod2, segments, target_start, kv_cache_mode, **attention_args):
+        """forward in extreme low VRAM (attention_kit.extreme_low_vram(), one batch item): the attention's target rows and the FFN's input
+        given by ranges of rows (mmgp RowSources, made again by the attention for each head group and by the FFN chunk by chunk), never
+        whole beside the residual; the target's attention output projected and gated into the residual by the kit."""
+        tokens, dim = hidden_states.shape[1:]
+        rows = hidden_states.view(-1, dim)
+        (scale1, gate1), (scale2, gate2) = mod1.chunk(2, dim=-1), mod2.chunk(2, dim=-1)
+        spans = [(0, tokens, 0)] if target_start is None else [(0, target_start, scale1.shape[0] - 1), (target_start, tokens, 0)]
+        prefix = 0 if kv_cache_mode == 'cached' or not segments else segments[-1][1]
+        target_spans = [(max(start, prefix) - prefix, stop - prefix, row) for start, stop, row in spans if stop > max(start, prefix)]
+        prefix_rows = _apply_modulation_(self.img_norm1(hidden_states[:, :prefix]), scale1, target_start)
+        target = kernels.norm_modulate_rows(rows[prefix:], self.img_norm1, torch.zeros_like(scale1), scale1, target_spans, (1, tokens - prefix, dim))
+        output = self.attn(hidden_states=[prefix_rows, target], segments=segments, kv_cache_mode=kv_cache_mode,
+                           residual=(rows[prefix:], gate1.tanh(), target_spans), **attention_args)
+        prefix_rows = target = None
+        if output is not None:
+            _add_gated_residual_(hidden_states[:, :prefix], output, gate1, target_start)
+        output = None
+        hidden_holder = [kernels.norm_modulate_rows(rows, self.img_norm2, torch.zeros_like(scale2), scale2, spans, hidden_states.shape)]
+        self.img_mlp(hidden_holder, hidden_states, _gate_segments(gate2, *hidden_states.shape[:2], target_start))
+        return hidden_states
+
     def forward(self, hidden_states: torch.Tensor, modulation: torch.Tensor, rotary_emb: torch.Tensor | None=None, attention_mask: Any | None=None, target_token_mask: torch.Tensor | None=None, layer_cache: QwenImage21KVLayerCache | None=None, kv_cache_mode: str | None=None, cache_write_slice: slice | None=None, segments: list[tuple[int, int, bool]] | None=None, key_valid: torch.Tensor | None=None, nag_cache=None, nag_parameters=None, nag_target_tokens=None, target_start=None) -> torch.Tensor:
         mod1, mod2 = modulation.chunk(2, dim=-1)
+        if (hidden_states.shape[0] == 1 and nag_cache is None and attention_mask is None and key_valid is None and (kv_cache_mode == 'cached' or segments is not None)
+                and hidden_states.dtype != torch.float16 and attention_kit.extreme_low_vram()):
+            return self._extreme_forward(hidden_states, mod1, mod2, segments, target_start, kv_cache_mode, rotary_emb=rotary_emb, layer_cache=layer_cache,
+                                         cache_write_slice=cache_write_slice)
         img_modulated, img_gate1 = self._modulate(self.img_norm1(hidden_states), mod1, target_start)
         hidden_holder = [img_modulated]
         del img_modulated
@@ -537,7 +580,11 @@ class QwenImage21Transformer2DModel(ModelMixin, ConfigMixin):
             inputs = [positive]
         prepared = [self._prepare(**item) for item in inputs]
         # the blocks that store K/V in a cache run eagerly: a capture would store tensors of its own memory
-        with cuda_graphs.scope(negative_state is None and all(item['kv_cache_mode'] != 'extract' for item in inputs)):
+        # Smart Inputs Chunker Auto: the extreme low VRAM mode where the chunked attention would not fit (QwenImage21TransformerBlock._extreme_forward)
+        attn, hidden = self.transformer_blocks[0].attn, prepared[0][0]['hidden_states']
+        extreme = attention_kit.plan_extreme(attn, hidden.device, hidden.dtype, hidden.shape[0] * hidden.shape[1], hidden.shape[-1], attn.heads, attn.heads,
+                                             attn.inner_dim // attn.heads, (attn.to_q, attn.to_k, attn.to_v), attn.to_out[0])
+        with extreme, cuda_graphs.scope(negative_state is None and all(item['kv_cache_mode'] != 'extract' for item in inputs)):
             for index, block in enumerate(self.transformer_blocks):
                 if negative_state is not None:
                     check_abort()

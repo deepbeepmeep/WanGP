@@ -355,39 +355,10 @@ def _norm_modulate(norm, hidden, shift_scale, segments):
 def _norm_modulate_rows(norm, hidden, shift_scale, segments, shape=None):
     """_norm_modulate as an mmgp RowSource made by ranges of rows of hidden (rows, dim), of the given shape ((1, rows, dim) for the
     attention kit), for an FFN that reads it chunk by chunk (kernels.mlp) or an attention that makes it again by head group: never
-    whole beside the residual. Rows as from the whole (row-wise operations)."""
+    whole beside the residual (kernels.norm_modulate_rows, its INT8 form made in one pass for the attention)."""
     shift, scale = shift_scale
     shift_scale.clear()
-
-    def fill(start, stop):
-        spans = [(max(first, start) - start, min(last, stop) - start, row) for first, last, row in segments if first < stop and last > start]
-        return kernels.norm_modulate([hidden[start:stop]], norm, shift, scale, spans)
-    source = offload.RowSource(hidden.shape if shape is None else shape, hidden.dtype, hidden.device, fill)
-    if shape is not None:  # an attention input: its INT8 form made in one pass where the norm quantization kernel takes it
-        source.fill_prepared, source.fill_prepared_at = _norm_quantize_fill(norm, hidden, shift, scale, segments)
-    return source
-
-
-def _norm_quantize_fill(norm, hidden, shift, scale, segments):
-    """(fill_prepared, fill_prepared_at) of _norm_modulate_rows's RowSource (shared.kernels.norm_quant_triton: the norm, the modulation
-    and the INT8 quantization of a range in one pass, at given rows or at a CUDA graph loop's), (None, None) where that kernel does not
-    take these rows."""
-    from shared.kernels import norm_quant_triton
-    from shared.kernels.row_loop_triton import segment_runs
-    if (type(norm) is not torch.nn.RMSNorm or not norm_quant_triton.supported(hidden, norm.weight) or scale.dim() != 2 or shift.dim() != 2
-            or scale.stride(1) != 1 or shift.stride(1) != 1):
-        return None, None
-    eps = norm.eps if norm.eps is not None else torch.finfo(hidden.dtype).eps
-    rowmod = torch.empty(hidden.shape[0], dtype=torch.int32, device=hidden.device)  # each row's modulation row
-    for start, stop, row0, offset, span in segment_runs(segments):
-        rowmod[start:stop] = torch.arange(offset, offset + stop - start, dtype=torch.int32, device=hidden.device).floor_divide_(span).add_(row0)
-
-    def fill_prepared(start, stop, group, want_rows):
-        return norm_quant_triton.rms_modulate_quantize(hidden[start:stop], norm.weight, eps, scale, shift, rowmod[start:stop], group, want_rows)
-
-    def fill_prepared_at(counter, first, rows, group, want_rows):
-        return norm_quant_triton.rms_modulate_quantize(hidden, norm.weight, eps, scale, shift, rowmod, group, want_rows, (counter, first, rows))
-    return fill_prepared, fill_prepared_at
+    return kernels.norm_modulate_rows(hidden, norm, shift, scale, segments, shape)
 
 
 def _gated_residual(hidden_list, gate_list, branch_list, segments):
@@ -432,7 +403,7 @@ class DiTBlock(nn.Module):
             # Extreme low VRAM: the attention's and the FFN's inputs given by ranges of rows (RowSources), never whole beside the
             # residual: the attention makes its input again for each head group, the FFN chunk by chunk as it reads it (more kernels
             # in a block's graph: the FFN alone 33 nodes on H3 at 1080p 15 s)
-            extreme, residual = attention_kit.EXTREME_LOW_VRAM, residual_list[0]
+            extreme, residual = attention_kit.extreme_low_vram(), residual_list[0]
             h_list = [_norm_modulate_rows(self.norm1, residual, [shift_msa, scale_msa], segments, (1, *residual.shape)) if extreme
                       else _norm_modulate(self.norm1, residual, [shift_msa, scale_msa], segments)]
             hidden = self.attn(h_list, rope=rope, residual=residual_list[0], gate=gate_msa, segments=segments)
@@ -727,7 +698,7 @@ class MiniMaxH3Model(nn.Module):
                  adaln_curve_grid=None, adaln_dtype=torch.float32, image_model=None,
                  hybrid_ref2va_blocks=None, pdd_num_steps=None, pdd_block_size=None, vdn=False, vsa=False,
                  control_layers=(), control_in_dim=0, dropped_blocks=(), endpoint_gate=None, step_heads=None, audio_enabled=True,
-                 dtype=None, device=None, **kwargs):
+                 dwd_head=False, dtype=None, device=None, **kwargs):
         super().__init__()
         self._interrupt = False
         self.cache = None
@@ -782,6 +753,11 @@ class MiniMaxH3Model(nn.Module):
                                                       sol_attention=self.sol_attention,
                                                       dtype=dtype, device=device)
         fp32_modules = [module for module in (self.video_patch_proj, self.audio_patch_proj, self.final_layer.video_out, self.final_layer.audio_out) if module is not None]
+        self.dwd_head = None
+        if dwd_head:  # pi-H3 Decoding Without Decoder: the last step's video rows go to a pixel head instead of the latent to the VAE
+            from .dwd import MiniMaxH3DWDHead
+            self.dwd_head = MiniMaxH3DWDHead(hidden_size)
+            fp32_modules += [self.dwd_head.adaln_proj, self.dwd_head.refiner.norm_out, self.dwd_head.refiner.proj_out, self.dwd_head.refiner.first_frame_proj_out]
         if self.control_layers:
             self.control_patch_proj = nn.Linear(control_in_dim * math.prod(self.patch_size), hidden_size, bias=True, dtype=torch.float32, device=device)
             fp32_modules.append(self.control_patch_proj)
@@ -1131,7 +1107,7 @@ class MiniMaxH3Model(nn.Module):
 
         # Smart Inputs Chunker Auto: the extreme mode where the chunked attention would not fit (its inputs given by ranges of rows)
         attn = self.blocks[self.kept_blocks[0]].attn
-        extreme = (attention_kit.plan_extreme(attn, device, hidden.shape[0], hidden.shape[-1], attn.heads, attn.heads, attn.head_dim,
+        extreme = (attention_kit.plan_extreme(attn, device, hidden.dtype, hidden.shape[0], hidden.shape[-1], attn.heads, attn.heads, attn.head_dim,
                                               (attn.q_proj, attn.k_proj, attn.v_proj), attn.out_proj)
                    if batch == 1 and hasattr(attn, "q_proj") and not hasattr(attn, "vdn") and not self.sol_attention.use_for_layer(hidden.shape[0])
                    else contextlib.nullcontext())
@@ -1161,6 +1137,8 @@ class MiniMaxH3Model(nn.Module):
                                                            max(audio_t - 1, 0))])
         if spectrum is not None:
             spectrum.observe(hidden[audio_start:], target_audio_rows, self._check_interrupt)
+        dwd_convert = payload.pop("dwd_convert", None)  # the last step of a DWD model: its head reads the video rows the final layer is about to consume
+        dwd_features = None if dwd_convert is None else self.dwd_head.features(hidden[video_start:layout.sequence_length], timestep, video_head_row, dtype)
         h_list = [hidden]
         hidden = None
         final_input, length = temb if final_temb is None else final_temb, layout.sequence_length
@@ -1179,6 +1157,11 @@ class MiniMaxH3Model(nn.Module):
             video = video.index_select(0, target_video_inverse_order)
         video = _to_dtype([video], video_dtype)
         audio = torch.cat([unpack_audio(_to_dtype([audio], audio_dtype)) for audio in audios])
+        if dwd_features is not None:
+            if target_video_inverse_order is not None:
+                dwd_features = dwd_features.index_select(0, target_video_inverse_order)
+            features_list, dwd_features = [dwd_features], None
+            payload["dwd_video"] = self.dwd_head.decode(features_list, (latent_t, latent_h // self.patch_size[1], latent_w // self.patch_size[2]), dwd_convert, self._interrupt)
         return unpatchify_video_tokens(video, latent_t, latent_h, latent_w, self.latents_dim, self.patch_size), audio
 
 

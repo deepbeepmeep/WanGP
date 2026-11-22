@@ -70,7 +70,7 @@ _MESH_VIEWS = ("front", "back", "left", "right", "top", "bottom", "three_quarter
 from postprocessing import catalog as postprocessing_catalog
 from shared.utils import mesh_postprocessing
 from shared.gradio import assistant_chat
-from shared.prompt_enhancer import qwen35_text
+from shared.prompt_enhancer import chat_formats, qwen35_text
 from shared.prompt_enhancer.config import PROMPT_ENHANCER_SPECULATIVE_DECODING_DEFAULT, PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY, normalize_prompt_enhancer_speculative_decoding
 from shared.prompt_enhancer.qwen35_assistant_runtime import (
     Qwen35AssistantRuntime,
@@ -6834,6 +6834,8 @@ _CONTEXT_BAR_TOKENS = 12000  # a conversation being rebuilt: Prime's system prom
 
 
 class AssistantEngine:
+    _chat_format = chat_formats.QWEN  # of the model last loaded: the system prompt's wording is needed while no runtime exists
+
     def __init__(self, session: AssistantSessionState, runtime_hooks: AssistantRuntimeHooks, tool_box: Any, send_cmd, debug_enabled: bool | None = None, thinking_enabled: bool = True, vram_mode: str = DEEPY_VRAM_MODE_UNLOAD, system_prompt: str = ASSISTANT_SYSTEM_PROMPT, custom_system_prompt_key: str = DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY):
         self.session = session
         self.runtime_hooks = runtime_hooks
@@ -7106,7 +7108,7 @@ class AssistantEngine:
         return normalize_deepy_custom_system_prompt(get_deepy_config_value(self.custom_system_prompt_key, ""))
 
     def _build_reset_base_system_prompt(self) -> str:
-        system_prompt = self.system_prompt.rstrip()
+        system_prompt = self._chat_format.system_prompt(self.system_prompt.rstrip())
         custom_system_prompt = self._get_custom_system_prompt()
         system_context_getter = getattr(self.tool_box, "get_system_context", None)
         system_context = str(system_context_getter() or "").strip() if callable(system_context_getter) else ""
@@ -7120,7 +7122,7 @@ class AssistantEngine:
 
     def _current_reset_base_signature(self) -> str:
         speculative_decoding = normalize_prompt_enhancer_speculative_decoding(get_deepy_config_value(PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY, PROMPT_ENHANCER_SPECULATIVE_DECODING_DEFAULT))
-        return _json_dumps({"system_prompt": self._build_reset_base_system_prompt(), "tools": self.tool_box.get_tool_schemas(), "thinking_enabled": bool(self.thinking_enabled), "speculative_decoding": speculative_decoding})
+        return _json_dumps({"system_prompt": self._build_reset_base_system_prompt(), "tools": self.tool_box.get_tool_schemas(), "thinking_enabled": bool(self.thinking_enabled), "speculative_decoding": speculative_decoding, **({} if self._chat_format is chat_formats.QWEN else {"chat_format": self._chat_format.name})})
 
     def _can_preserve_reset_base(self) -> bool:
         return self.vram_mode in (DEEPY_VRAM_MODE_ALWAYS_LOADED, DEEPY_VRAM_MODE_UNLOAD_ON_REQUEST, DEEPY_VRAM_MODE_UNLOAD)
@@ -7249,6 +7251,14 @@ class AssistantEngine:
 
     def _pending_tool_render_contents(self) -> list[str]:
         return [self._message_render_content(message).strip() for message in self._get_pending_render_messages() if str(message.get("role", "")).strip().lower() == "tool" and len(self._message_render_content(message).strip()) > 0]
+
+    def _tool_render_names(self, tool_messages: list[dict[str, Any]]) -> list[str]:
+        """The tool each result answers, for the chat formats that name it: "" for a result without a call (a rejected request)."""
+        names = {tool_call.get("id"): tool_call["function"]["name"] for message in self.session.messages for tool_call in message.get("tool_calls") or []}
+        return [names.get(message.get("tool_call_id"), "") for message in tool_messages]
+
+    def _pending_tool_render_names(self) -> list[str]:
+        return self._tool_render_names([message for message in self._get_pending_render_messages() if str(message.get("role", "")).strip().lower() == "tool" and len(self._message_render_content(message).strip()) > 0])
 
     def _get_runtime_tool_template_label(self, tool_name: str) -> str:
         try:
@@ -7921,6 +7931,7 @@ class AssistantEngine:
                 runner.invalidate_graphs_if_model_storage_changed()
             if self.runtime is None or self.runtime.model is not model:
                 self.runtime = Qwen35AssistantRuntime(model, debug_enabled=self.debug_enabled)
+                self._chat_format = self.runtime.chat_format
             if not self._action_budget_logged:
                 context_window_tokens = self._get_context_window_tokens()
                 action_budget_tokens = assistant_action_budget_tokens(context_window_tokens)
@@ -8547,7 +8558,7 @@ class AssistantEngine:
         self._compaction_thinking_block_id = ""
 
     def _generate_compaction_segment(self, max_new_tokens: int):
-        tool_call_token_id = int(self.runtime.tokenizer.convert_tokens_to_ids("<tool_call>"))
+        tool_call_token_id = int(self.runtime.tokenizer.convert_tokens_to_ids(chat_formats.of(self.runtime.tokenizer).tool_open))
         generated_tokens = 0
         remaining_tokens = max(1, int(max_new_tokens))
         # Thoughts share the bounded output budget; leave at least half for the summary.
@@ -9271,7 +9282,7 @@ class AssistantEngine:
                     return
             if restore_mode in ("reused", "restored") and self._can_append_pending_tool_suffix():
                 thinking_enabled = qwen35_text._prompt_enhancer_thinking_enabled(self.runtime.model, thinking_enabled=self.thinking_enabled)
-                suffix_tokens = render_tool_turn_suffix(runtime.tokenizer, self._pending_tool_render_contents(), thinking_enabled=thinking_enabled)
+                suffix_tokens = render_tool_turn_suffix(runtime.tokenizer, self._pending_tool_render_contents(), thinking_enabled=thinking_enabled, tool_names=self._pending_tool_render_names())
                 if len(suffix_tokens) > 0:
                     prefix_tokens = self._active_sequence_token_count()
                     prefix_tokens = len(self.session.rendered_token_ids) if prefix_tokens is None else prefix_tokens
@@ -9499,7 +9510,7 @@ class AssistantEngine:
         self.runtime._append_action_suffix(suffix)
         active_sequence = self.runtime._get_active_sequence()
         if active_sequence is not None:
-            raw_text = self.runtime.tokenizer.decode(active_sequence.completion_token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+            raw_text = chat_formats.decode_completion(self.runtime.tokenizer, active_sequence)
             self._stream_generation_update(raw_text=raw_text, token_count=0, stop_reason="loop_warning", is_final=True)
             self._checkpoint_completed_thoughts(raw_text)
         else:
@@ -9772,9 +9783,7 @@ class AssistantEngine:
         assistant_content = str(assistant_message.get("content", "") or "").strip()
         if len(user_content) == 0 or len(assistant_content) == 0:
             return None
-        suffix = f"<|im_start|>user\n{user_content}<|im_end|>\n<|im_start|>assistant\n{assistant_content}<|im_end|>\n"
-        token_ids = self.runtime.tokenizer.encode(suffix, add_special_tokens=False)
-        return [int(token_id) for token_id in list(token_ids or [])]
+        return chat_formats.of(self.runtime.tokenizer).render_exchange(self.runtime.tokenizer, user_content, assistant_content)
 
     def _append_target_suffix_from_live_runtime(self, target_tokens: list[int]) -> str | None:
         if self.runtime is None:
@@ -9829,15 +9838,16 @@ class AssistantEngine:
             if state == "tool_expected":
                 if role != "tool":
                     return None
-                tool_contents = []
+                tool_contents, tool_messages = [], []
                 while index < len(pending_messages) and str(pending_messages[index].get("role", "")).strip().lower() == "tool":
                     content = self._message_render_content(pending_messages[index]).strip()
                     if len(content) > 0:
                         tool_contents.append(content)
+                        tool_messages.append(pending_messages[index])
                     index += 1
                 if len(tool_contents) == 0:
                     return None
-                suffix_tokens.extend(render_tool_turn_suffix(self.runtime.tokenizer, tool_contents, thinking_enabled=thinking_enabled))
+                suffix_tokens.extend(render_tool_turn_suffix(self.runtime.tokenizer, tool_contents, thinking_enabled=thinking_enabled, tool_names=self._tool_render_names(tool_messages)))
                 state = "assistant_open"
                 continue
             if state == "assistant_open":
@@ -9943,7 +9953,7 @@ class AssistantEngine:
             add_generation_prompt=bool(add_generation_prompt),
             thinking_enabled=thinking_enabled,
         )
-        user_prefix_tokens = self.runtime.tokenizer.encode("<|im_start|>user\n", add_special_tokens=False)
+        user_prefix_tokens = self.runtime.tokenizer.encode(chat_formats.of(self.runtime.tokenizer).user_header, add_special_tokens=False)
         user_prefix_tokens = [int(token_id) for token_id in list(user_prefix_tokens or [])]
         start_idx = self._find_token_subsequence(rendered_tokens, user_prefix_tokens)
         if start_idx < 0:
@@ -9980,7 +9990,7 @@ class AssistantEngine:
         suffix_tokens = None
         if self._can_append_pending_tool_suffix():
             thinking_enabled = qwen35_text._prompt_enhancer_thinking_enabled(self.runtime.model, thinking_enabled=self.thinking_enabled)
-            suffix_tokens = render_tool_turn_suffix(self.runtime.tokenizer, self._pending_tool_render_contents(), thinking_enabled=thinking_enabled)
+            suffix_tokens = render_tool_turn_suffix(self.runtime.tokenizer, self._pending_tool_render_contents(), thinking_enabled=thinking_enabled, tool_names=self._pending_tool_render_names())
         elif self._can_append_pending_user_suffix():
             thinking_enabled = qwen35_text._prompt_enhancer_thinking_enabled(self.runtime.model, thinking_enabled=self.thinking_enabled)
             suffix_tokens = render_text_user_turn_suffix(self.runtime.tokenizer, self._pending_user_render_content(), thinking_enabled=thinking_enabled)
@@ -10421,7 +10431,7 @@ class AssistantEngine:
                     if loop_action == "stop":
                         self._commit_loop_stop(raw_text, loop_message)
                         break
-                    self._append_tool_generation_error(raw_text, "malformed_tool_call", f"Deepy's tool call was rejected before execution: {tool_structure_error}", runtime_update=loop_message if loop_action == "warn" else "")
+                    self._append_tool_generation_error(raw_text, "malformed_tool_call", f"Deepy's tool call was rejected before execution: {chat_formats.of(self.runtime.tokenizer).tool_error(tool_structure_error)}", runtime_update=loop_message if loop_action == "warn" else "")
                     self._reset_action_stream_state()
                     action_phase = "thought" if self.thinking_enabled else "statement"
                     continuing_response = False

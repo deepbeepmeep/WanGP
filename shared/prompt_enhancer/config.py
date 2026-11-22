@@ -8,13 +8,14 @@ from typing import Any
 PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY = "prompt_enhancer_speculative_decoding"
 PROMPT_ENHANCER_SPECULATIVE_DECODING_AUTO = 2
 PROMPT_ENHANCER_SPECULATIVE_DECODING_DEFAULT = PROMPT_ENHANCER_SPECULATIVE_DECODING_AUTO
-PROMPT_ENHANCER_SPECULATIVE_DECODING_IDS = frozenset((4, 5, 6, 7))
-PROMPT_ENHANCER_SPECULATIVE_DECODING_VRAM_GB = {4: 12, 5: 24, 6: 8, 7: 12}  # Auto when the model's fit in VRAM is unknown (resolve_..., fit)
+PROMPT_ENHANCER_SPECULATIVE_DECODING_IDS = frozenset((4, 5, 6, 7, 8))
+PROMPT_ENHANCER_SPECULATIVE_DECODING_VRAM_GB = {4: 12, 5: 24, 6: 8, 7: 12, 8: 12}  # Auto when the model's fit in VRAM is unknown (resolve_..., fit)
 MTP_AUTO_SLACK = 512 << 20  # Auto: MTP still pays when it leaves this much of the model out of VRAM (with the model in VRAM it decodes about twice as fast)
 MTP_AUTO_FOUR_DRAFTS_VRAM_GB = 24  # Auto on Qwen3.8 27B: 4 draft tokens from this size, from MTP_AUTO_FOUR_DRAFTS_BONSAI_VRAM_GB with Bonsai, 2 otherwise
 MTP_AUTO_FOUR_DRAFTS_BONSAI_VRAM_GB = 12
 MTP_AUTO_LONG_DRAFTS = 7  # an automatic draft count of 4 on Qwen3.8 27B: this many while the recent drafts are accepted (tool calls, summaries, lists), 4 on the rest
 MTP_AUTO_LONG_BACKENDS = ("gguf", "gguf_q3", "gguf_q2", "gguf_ptq1")  # where the long chain was measured faster
+INKLING2_DRAFTS, INKLING2_AUTO_DRAFTS = 7, 3  # Inkling 2's drafter: the drafts of its block, and those an automatic count verifies while the recent ones are not all accepted
 MTP_AUTO_NO_OFFLOAD_VRAM_GB = range(13, 17)  # Auto on GPUs of these sizes: MTP only when the whole model stays in VRAM with it. Below, the fit rule: part of the model often streams there anyway
 OTHER_PROGRAMS_VRAM_GIB = 1.5  # the VRAM the desktop and the other programs are expected to hold: Configuration's estimates count it, and a load that more than it slows down says so (other_programs_vram_advice)
 PROMPT_ENHANCER_SPECULATIVE_DRAFT_COUNTS = (2, 3, 4)
@@ -78,14 +79,19 @@ def split_speculative_decoding(value):
 
 
 def mtp_auto_drafts(enhancer_enabled, qwen_backend, total_vram_gb) -> int:
-    """MTP's automatic draft count: 4 on Qwen3.8 Flash-Next and, from MTP_AUTO_FOUR_DRAFTS_VRAM_GB (MTP_AUTO_FOUR_DRAFTS_BONSAI_VRAM_GB with Bonsai), on Qwen3.8 27B; 2 otherwise."""
+    """MTP's automatic draft count: 4 on Qwen3.8 Flash-Next and, from MTP_AUTO_FOUR_DRAFTS_VRAM_GB (MTP_AUTO_FOUR_DRAFTS_BONSAI_VRAM_GB with Bonsai), on Qwen3.8 27B; 2 otherwise.
+    Inkling 2's drafter gives its 7 drafts in one pass whatever the count: 3 are verified, 7 while they are accepted (mtp_auto_long_drafts)."""
     enhancer_no, vram_gb = int(enhancer_enabled or 0), max(0, int(float(total_vram_gb) + 0.5))
+    if enhancer_no == 8:
+        return INKLING2_AUTO_DRAFTS
     return 4 if enhancer_no == 7 or enhancer_no == 5 and vram_gb >= (MTP_AUTO_FOUR_DRAFTS_BONSAI_VRAM_GB if qwen_backend == "gguf_ptq1" else MTP_AUTO_FOUR_DRAFTS_VRAM_GB) else 2
 
 
 def mtp_auto_long_drafts(enhancer_enabled, qwen_backend, drafts) -> int:
     """The draft tokens of the long chain of an automatic draft count, 0 without one: where it was measured on Deepy's own passes
     (Qwen3.8 27B, RTX 5090: Q4_K_M 7% faster, tool calls 12% and summaries 17%; Q3 2.5%; Bonsai PTQ1 1.6%; prose unchanged)."""
+    if int(enhancer_enabled or 0) == 8:  # RTX 5090: a chat answer's prose 68-75 -> 85-91 tokens/s with 3 drafts verified unless the recent ones were accepted, code unchanged
+        return INKLING2_DRAFTS if int(drafts or 0) == INKLING2_AUTO_DRAFTS else 0
     return MTP_AUTO_LONG_DRAFTS if int(enhancer_enabled or 0) == 5 and qwen_backend in MTP_AUTO_LONG_BACKENDS and int(drafts or 0) == 4 else 0
 
 
@@ -101,6 +107,20 @@ def block_drafters_supported() -> bool:
     return features.triton and features.flash
 
 
+def own_drafter_label(enhancer_enabled) -> str:
+    """The name of a model's own drafter, the setting's "mtp" method: Inkling 2's is its DSpark block drafter, the Qwen models' their MTP layer."""
+    return "DSpark" if int(enhancer_enabled or 0) == 8 else "MTP"
+
+
+def speculative_decoding_info(enhancer_enabled) -> str:
+    """The help line of the Speculative Decoding dropdown for this model."""
+    if int(enhancer_enabled or 0) == 8:
+        return ("Inkling 2 Mini predicts with its own DSpark drafter (about 1 GiB of VRAM with its context cache). Auto loads it unless the GPU has 8 GB or less or the drafter would push too much "
+                "of the model out of VRAM. With Number of Tokens on Auto, each prediction takes 0 to 7 draft tokens, from what they bring on your GPU: many on code and tool calls, few or none on long prose.")
+    return ("Speculative decoding uses extra VRAM. Auto keeps MTP off at 8 GB or less and, from 13 to 16 GB, enables it only when the whole model fits in VRAM with it. "
+            "On Qwen3.8 27B it uses 4 draft tokens from 24 GB (12 GB with Bonsai), 2 below.")
+
+
 def speculative_decoding_ui_state(enhancer_enabled, quantization, value, tokens=None):
     methods = ["auto", "disabled"]
     if prompt_enhancer_supports_speculative_decoding(enhancer_enabled):
@@ -114,6 +134,8 @@ def speculative_decoding_ui_state(enhancer_enabled, quantization, value, tokens=
     if method not in methods:
         method = "auto"
     maximum = SPECULATIVE_MAX_TOKENS.get(method, 0)
+    if method == "mtp" and int(enhancer_enabled or 0) == 8:
+        maximum = INKLING2_DRAFTS
     if method in BLOCK_DRAFT_METHODS:
         from .block_draft import block_draft_spec
         maximum = min(maximum, block_draft_spec(method, bonsai=quantization == "gguf_ptq1")["drafts"])
@@ -124,12 +146,13 @@ def speculative_decoding_ui_state(enhancer_enabled, quantization, value, tokens=
     costs = {
         "auto": "0 to ~1 GiB" if "mtp" in methods else "0 GiB",
         "disabled": "0 GiB",
-        "mtp": "~0.5–1 GiB",
+        "mtp": "~1 GiB" if int(enhancer_enabled or 0) == 8 else "~0.5–1 GiB",
         "dspark": "~3–4 GiB",
         "dflash2": "~2.5 GiB",
         "dspine": "~3 GiB",
     }
-    return [(f"{SPECULATIVE_METHOD_LABELS[item]} [+{costs[item]} VRAM]", item) for item in methods], method, counts, count
+    labels = {**SPECULATIVE_METHOD_LABELS, "mtp": own_drafter_label(enhancer_enabled)}
+    return [(f"{labels[item]} [+{costs[item]} VRAM]", item) for item in methods], method, counts, count
 
 
 def prompt_enhancer_supports_speculative_decoding(enhancer_enabled: Any) -> bool:
@@ -180,12 +203,17 @@ def resolve_prompt_enhancer_speculative_decoding(enhancer_enabled: Any, value: A
             total_vram_gb = 0
     bonsai = enhancer_no == 5 and qwen_backend == "gguf_ptq1"
     detected_vram_gb = max(0, int(float(total_vram_gb) + 0.5))
-    model_label = "Bonsai PTQ1" if bonsai else {4: "Qwen3.5-9B", 6: "Qwen3.8-9B", 7: "Qwen3.8 Flash-Next"}.get(enhancer_no, "Qwen3.8-27B")
+    model_label = "Bonsai PTQ1" if bonsai else {4: "Qwen3.5-9B", 6: "Qwen3.8-9B", 7: "Qwen3.8 Flash-Next", 8: "Inkling 2 Mini"}.get(enhancer_no, "Qwen3.8-27B")
     drafts = mtp_auto_drafts(enhancer_no, qwen_backend, total_vram_gb)
     long_drafts = mtp_auto_long_drafts(enhancer_no, qwen_backend, drafts)
-    enabled, draft_tokens = speculative_decoding_config("mtp", drafts), f"{drafts} draft tokens{f', {long_drafts} on predictable text' if long_drafts else ''}"
+    drafter = own_drafter_label(enhancer_no)
+    enabled = speculative_decoding_config("mtp", drafts)
+    if enhancer_no == 8:  # the runner's measured count (MeasuredDrafts): long_drafts is the block's size
+        draft_tokens = f"0 to {long_drafts} draft tokens per prediction, from the speed measured while it runs"
+    else:
+        draft_tokens = f"{drafts} draft tokens{f', {long_drafts} on predictable text' if long_drafts else ''}"
     if method == "mtp":
-        return enabled, f"MTP draft tokens chosen automatically for {model_label}: {draft_tokens}."
+        return enabled, f"{drafter} draft tokens chosen automatically for {model_label}: {draft_tokens}."
     if float(total_vram_gb) <= 8:  # small GPUs: the drafter, its caches and graphs would take room from the model's blocks
         return 0, f"Speculative Decoding disabled automatically for {model_label}: {max(0.0, float(total_vram_gb)):.2f} GiB VRAM detected (8 GiB or less)."
     enabled_for = f"Speculative Decoding enabled automatically for {model_label} ({draft_tokens})"
@@ -199,15 +227,15 @@ def resolve_prompt_enhancer_speculative_decoding(enhancer_enabled: Any, value: A
         gib = lambda nbytes: f"{nbytes / 2**30:.1f}"
         if detected_vram_gb in MTP_AUTO_NO_OFFLOAD_VRAM_GB:
             if needed + extra <= available:
-                return enabled, f"{enabled_for}: the whole model fits in VRAM with MTP (about {gib(needed + extra)} GiB needed, {gib(available)} GiB available)."
-            return 0, f"Speculative Decoding disabled automatically for {model_label}: with MTP part of the model would stay out of VRAM (about {gib(needed + extra)} GiB needed, {gib(available)} GiB available)."
+                return enabled, f"{enabled_for}: the whole model fits in VRAM with {drafter} (about {gib(needed + extra)} GiB needed, {gib(available)} GiB available)."
+            return 0, f"Speculative Decoding disabled automatically for {model_label}: with {drafter} part of the model would stay out of VRAM (about {gib(needed + extra)} GiB needed, {gib(available)} GiB available)."
         if needed + extra - available <= MTP_AUTO_SLACK:
-            return enabled, f"{enabled_for}: with MTP it needs about {gib(needed + extra)} GiB of VRAM, {gib(available)} GiB available."
+            return enabled, f"{enabled_for}: with {drafter} it needs about {gib(needed + extra)} GiB of VRAM, {gib(available)} GiB available."
         if needed - available <= MTP_AUTO_SLACK:
-            return 0, (f"Speculative Decoding disabled automatically for {model_label}: it fits or nearly fits in VRAM without MTP (about {gib(needed)} GiB needed, "
+            return 0, (f"Speculative Decoding disabled automatically for {model_label}: it fits or nearly fits in VRAM without {drafter} (about {gib(needed)} GiB needed, "
                        f"{gib(available)} GiB available), not with it (+{gib(extra)} GiB would stream part of the model at every pass).")
         return enabled, (f"{enabled_for}: part of the model streams from RAM either way (about {gib(needed)} GiB needed, "
-                   f"{gib(available)} GiB available), and MTP decodes several tokens per pass over it.")
+                   f"{gib(available)} GiB available), and {drafter} decodes several tokens per pass over it.")
     if detected_vram_gb >= required_vram_gb:
         return enabled, f"{enabled_for}: {detected_vram_gb} GB VRAM detected (minimum {required_vram_gb} GB)."
     return 0, f"Speculative Decoding disabled automatically for {model_label}: {detected_vram_gb} GB VRAM detected (minimum {required_vram_gb} GB)."

@@ -10,7 +10,8 @@ from shared.prompt_enhancer.streaming import ThrottledStreamEmitter
 from shared.utils.cancellation import check_cancelled
 
 
-def generate_prompt(llm, prompt, sampling_params, *, stop_token_ids, close_think_token_id, max_thinking_tokens, stop_requested=None, stream_callback=None):
+def generate_prompt(llm, prompt, sampling_params, *, stop_token_ids, close_think_token_id, max_thinking_tokens, stop_requested=None, stream_callback=None, decode=None):
+    # decode: token ids to turn text, for a chat format whose tokens are not that text (chat_formats)
     # Match the engine's request preparation without changing its shared decode path.
     llm._refresh_int8_backend()
     llm.model_runner.ensure_runtime_ready()
@@ -35,7 +36,7 @@ def generate_prompt(llm, prompt, sampling_params, *, stop_token_ids, close_think
 
     def emit(force=False):
         if stream_callback is not None and (force or emitter.is_due()):
-            emitter.emit(stream_callback, raw_text=llm.tokenizer.decode(output_ids, skip_special_tokens=False), token_count=seq.num_completion_tokens,
+            emitter.emit(stream_callback, raw_text=decode(output_ids) if decode else llm.tokenizer.decode(output_ids, skip_special_tokens=False), token_count=seq.num_completion_tokens,
                          max_tokens=sampling_params.max_tokens, prefill_seconds=prefill_seconds,
                          tokens_per_second=decode_tokens / decode_seconds if decode_seconds else 0.0,
                          stop_reason=stop_reason if force else None, is_final=force, force=force)
@@ -84,7 +85,7 @@ def generate_prompt(llm, prompt, sampling_params, *, stop_token_ids, close_think
                 if stop_token_id is not None:
                     break
             emit(force=True)
-        return {"text": llm.tokenizer.decode(output_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False),
+        return {"text": decode(output_ids) if decode else llm.tokenizer.decode(output_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False),
                 "output_token_ids": list(seq.completion_token_ids), "stop_reason": stop_reason, "stop_token_id": stop_token_id}
     finally:
         # Alternate EOS and cancellation can leave a live sequence in the scheduler.

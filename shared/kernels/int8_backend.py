@@ -1181,13 +1181,13 @@ class _WgpRowProjection:
 
     @staticmethod
     def block_form(module, rows):
-        """The ConvRot group of the 'block' form a range of `rows` rows of this module's input is prepared in, whatever its values (an
-        outside quantizer may then make it: offload.prepare_rows), None where the path is chosen on the input."""
+        """The 'block' form (ConvRot group, 128 columns per scale) a range of `rows` rows of this module's input is prepared in, whatever its
+        values (an outside quantizer may then make it: offload.prepare_rows), None where the path is chosen on the input."""
         _, group, precise = _WgpRowProjection.key(module)
-        return group if not precise and rows > _wgp.DECIDE_MAX_ROWS else None
+        return (group, 128) if not precise and rows > _wgp.DECIDE_MAX_ROWS else None
 
     @staticmethod
-    def block_prepared(q, scales, dtype):
+    def block_prepared(module, q, scales, dtype):
         """The prepared input of INT8 rows q and their scales (rows, K / 128), made in the 'block' form by an outside quantizer."""
         return _wgp.Prepared("block", q, None, scales, dtype)
 
@@ -1435,10 +1435,29 @@ class _Int8RowProjection:
     @staticmethod
     def prepare(module, x):
         from shared.qtypes.int8_convrot import _rotate_activation
-        x = _rotate_activation(x, getattr(module, "_convrot_group_size", 0))
-        if (_backend == "triton" and x.is_cuda and not triton._prefer_native_quanto_path(x)):
-            return triton._TRITON_MODULE.prepare_blockscale_input(x, module.out_features)
-        return x
+        group = getattr(module, "_convrot_group_size", 0)
+        if (_backend == "triton" and x.is_cuda and not triton._prefer_native_quanto_path(x)):  # rotated chunk by chunk, never whole in 16 bits
+            return triton._TRITON_MODULE.prepare_blockscale_input(x, module.out_features, (lambda part: _rotate_activation(part, group)) if group else None)
+        return _rotate_activation(x, group)
+
+    @staticmethod
+    def block_form(module, rows):
+        """With the Triton backend, the 'block' form (ConvRot group, the K tile of its GEMM: columns per scale) that prepare() gives `rows`
+        rows of this module's input (prepare_blockscale_input), so that an outside quantizer may make it (offload.prepare_rows: the norm,
+        modulation and quantization of shared.kernels.norm_quant_triton in one pass, the rotation in FP32 rather than 16 bits). None with
+        PyTorch, rows the native path takes, or a group or tile that quantizer does not make."""
+        group = getattr(module, "_convrot_group_size", 0)
+        if (_backend != "triton" or triton._TRITON_MODULE is None or rows <= triton._NATIVE_FALLBACK_MAX_M or group not in (0, 16, 64, 256)
+                or module.in_features % 256):
+            return None
+        block = triton._TRITON_MODULE._select_triton_int8_config(rows, module.in_features, module.out_features, device=module.qweight._data.device, kernel_kind="fused")[2]
+        return (group, block) if block in (64, 128, 256) else None
+
+    @staticmethod
+    def block_prepared(module, q, scales, dtype):
+        """prepare()'s form of INT8 rows q and their scales (rows, K / the K tile), made in the 'block' form by an outside quantizer."""
+        m, k = q.shape
+        return q, scales, dtype, triton._TRITON_MODULE._select_triton_int8_config(m, k, module.out_features, device=q.device, kernel_kind="fused")
 
     @staticmethod
     def slice_input(prepared, start, stop):  # rows of the input (offload.linear_input_rows): every row is computed on its own
@@ -1507,6 +1526,19 @@ class _KitchenRowProjection:
             scales[start:stop].copy_(tile_scales)
             del tile_q, tile_scales
         return q, scales, x.dtype
+
+    @staticmethod
+    def block_form(module, rows):
+        """The 'block' form (ConvRot group, 0: one FP32 scale per row) of prepare(), so that an outside quantizer may make it
+        (offload.prepare_rows: shared.kernels.norm_quant_triton, the norm, modulation, rotation and quantization in one pass, in FP32).
+        The rows count only through supports(), which chose this projection."""
+        convrot = module.weight_qtype.name == "qint8_convrot"
+        return (256 if convrot else 0, 0)
+
+    @staticmethod
+    def block_prepared(module, q, scales, dtype):
+        """prepare()'s form of INT8 rows q and their scales (rows, 1), made in the 'block' form by an outside quantizer."""
+        return q, scales, dtype
 
     @staticmethod
     def slice_input(prepared, start, stop):  # rows of the input (offload.linear_input_rows)

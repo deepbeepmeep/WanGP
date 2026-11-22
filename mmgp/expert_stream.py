@@ -66,7 +66,7 @@ def _copy_batch(staged, batch, pool=None):
     memory = staged.numpy()
     jobs = []
     for name, (offset, size) in zip(batch.bank.expert_tensor_names, batch.sections):
-        source = getattr(batch.bank, name).numpy()
+        source = getattr(batch.bank, name).view(torch.uint8).numpy()  # bytes, whatever the dtype of the checkpoint tensor
         for start in range(0, len(batch.experts), TAKE_EXPERTS):
             part = batch.experts[start:start + TAKE_EXPERTS]
             jobs.append((source, part, memory[offset + start * size:offset + (start + len(part)) * size].reshape(len(part), *source.shape[1:])))

@@ -1,0 +1,25 @@
+{
+    "model": {
+        "name": "MiniMax H3 FL2VA pi-H3 DWD 4-Step 33B",
+        "architecture": "minimax_h3_fl2va",
+        "description": "Video with synchronized audio from text and optional first/last frames in only 4 steps on the full 33B model: no guidance pass, and the last step delivers the frames directly, so there is no video decoding to wait for. Pick it for fast drafts and iteration that still look good; textures are a little softer than with a regular decode.",
+        "URLs": "minimax_h3_fl2va",
+        "modules": [
+            [
+                "https://huggingface.co/DeepBeepMeep/MiniMax-H3/resolve/main/minimax_h3_fl2va_pi_4step_dwd_bf16.safetensors",
+                "https://huggingface.co/DeepBeepMeep/MiniMax-H3/resolve/main/minimax_h3_fl2va_pi_4step_dwd_int8_convrot.safetensors"
+            ]
+        ],
+        "loras": [
+            "https://huggingface.co/DeepBeepMeep/MiniMax-H3/resolve/main/loras/minimax_h3_fl2va_pi_4step_dwd_lora_bf16.safetensors"
+        ],
+        "loras_multipliers": [
+            "1"
+        ],
+        "dwd": 4
+    },
+    "num_inference_steps": 4,
+    "guidance_phases": 1,
+    "sample_solver": "euler",
+    "prompt": "integrated_multimodal_description: [Shot 1] A five-second cinematic single take inside a rain-lashed glass observatory at midnight. A radio astronomer presses an antique transmitter and says clearly (S1) <d>[English] If you can hear me, follow this signal.</d> One brilliant blue pulse races across a translucent star map as the camera slowly pushes closer.\noverall_soundscape: Rain on glass, a low electrical hum, three receiver tones, the synchronized voice, and a short stereo transmission pulse."
+}

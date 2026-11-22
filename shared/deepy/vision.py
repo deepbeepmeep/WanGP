@@ -10,6 +10,7 @@ from PIL import Image
 
 from shared.deepy.image_channels import upright
 from shared.llm_engines.lmgp.models.qwen3_5 import Qwen3_5ForCausalLM
+from shared.llm_engines.lmgp.models.inkling2 import Inkling2ForCausalLM
 from shared.llm_engines.lmgp.models.qwen4_exp import Qwen4ExpForCausalLM
 from shared.prompt_enhancer.qwen35_vl import TEXT_MODEL_ID as _TEXT_MODEL_ID, VISION_MODEL_ID as _VISION_MODEL_ID, _prepare_multimodal_vllm_prompt, vision_beside_text
 from shared.utils.video_decode import decode_video_frame_indices_ffmpeg
@@ -34,7 +35,7 @@ VISION_QA_SYSTEM_PROMPT = "Answer the user's question about the labeled visual i
 
 
 def can_keep_text_resident(runtime, manager) -> bool:
-    if runtime is None or manager is None or not isinstance(runtime.model, (Qwen3_5ForCausalLM, Qwen4ExpForCausalLM)):
+    if runtime is None or manager is None or not isinstance(runtime.model, (Qwen3_5ForCausalLM, Qwen4ExpForCausalLM, Inkling2ForCausalLM)):
         return False
     if manager.models.get(_TEXT_MODEL_ID) is not runtime.model or _TEXT_MODEL_ID not in manager.active_models_ids:
         return False
@@ -191,6 +192,12 @@ def build_image_question_prompt(caption_model: Any, processor: Any, image: Any, 
         content.append({"type": "image", "image": current_image})
     content.append({"type": "text", "text": question})
     messages.append({"role": "user", "content": content})
+    if hasattr(caption_model, "image_prompt"):
+        # a wrapper that writes the prompt and sizes the images itself (one token per cell of its tower): the same cap per image, and the
+        # pixel budget as the cells of a square of that many pixels (the caller's pictures already fit it)
+        from shared.prompt_enhancer.inkling2 import CELL_SIZE
+        max_visual_tokens = VISION_MAX_VISUAL_TOKENS_PER_IMAGE if max_pixels_per_image is None else min(VISION_MAX_VISUAL_TOKENS_PER_IMAGE, math.ceil(math.sqrt(int(max_pixels_per_image)) / CELL_SIZE) ** 2)
+        return caption_model.image_prompt(messages, max_tokens=max_visual_tokens)[:4]
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
     image_size, merge_size, max_visual_tokens = _inspection_image_size(processor, max_pixels_per_image=max_pixels_per_image)
     model_inputs = processor(

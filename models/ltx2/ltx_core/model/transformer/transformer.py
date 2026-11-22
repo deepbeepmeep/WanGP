@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 
 import torch
 from mmgp import offload
+from shared import attention_kit
 
 from ...guidance.perturbations import BatchedPerturbationConfig, PerturbationType
 from .adaln import adaln_embedding_coefficient
@@ -78,7 +79,11 @@ def _norm_scale_shift_source(x: torch.Tensor, scale: torch.Tensor, shift: torch.
 
     def fill_at(first: int, step: int, count: int):  # fill inside a CUDA graph loop, rows from its counter (the fused kernel reads them)
         return (lambda counter: kernels.rms_norm_modulate(rows, eps, count, first, shift, scale, span, counter, step)) if fused else None
-    return offload.RowSource(x.shape, x.dtype, x.device, fill, fill_at)
+    source = offload.RowSource(x.shape, x.dtype, x.device, fill, fill_at)
+    # its INT8 / FP8 forms in one pass from x where the attention makes them by ranges of rows (extreme low VRAM)
+    segments = [(index * span, (index + 1) * span, index) for index in range(batch * groups)]
+    source.fill_prepared, source.fill_prepared_at = kernels.row_fills(rows, None, eps, scale, shift, segments)
+    return source
 
 
 def _rms_norm_source(x: torch.Tensor, eps: float):
@@ -91,7 +96,9 @@ def _rms_norm_source(x: torch.Tensor, eps: float):
 
     def fill_at(first: int, step: int, count: int):  # inside a CUDA graph loop, rows from its counter (the fused kernel reads them)
         return (lambda counter: kernels.rms_norm_modulate(rows, eps, count, first, counter=counter, step=step)) if fused else None
-    return offload.RowSource(x.shape, x.dtype, x.device, fill, fill_at)
+    source = offload.RowSource(x.shape, x.dtype, x.device, fill, fill_at)
+    source.fill_prepared, source.fill_prepared_at = kernels.row_fills(rows, None, eps, None, None, None)  # see _norm_scale_shift_source
+    return source
 
 
 def _apply_gate(hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
@@ -498,7 +505,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
             vshift_mlp = vshift_mlp.to(vx.dtype)
             vscale_mlp = vscale_mlp.to(vx.dtype)
             vgate_mlp = vgate_mlp.to(vx.dtype)
-            vx_scaled = _norm_scale_shift(vx, vscale_mlp, vshift_mlp, self.norm_eps)
+            # extreme low VRAM: the FFN's input by ranges of rows, made chunk by chunk as the FFN reads it, never whole beside vx
+            vx_scaled = (_norm_scale_shift_source if attention_kit.extreme_low_vram() else _norm_scale_shift)(vx, vscale_mlp, vshift_mlp, self.norm_eps)
             vx_list, vx_scaled = [vx_scaled], None
             self._gated_ffn(self.ff, vx_list, vgate_mlp, vx)
 

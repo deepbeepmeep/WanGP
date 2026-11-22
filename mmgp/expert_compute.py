@@ -1,6 +1,6 @@
 # Copyright (c) 2026 DeepBeepMeep - WanGP Community License 2.0 (see LICENSE.txt)
-"""Shared routed-expert execution (SwiGLU, or squared ReLU without a gate). Architecture code supplies routing, not residency, and
-quantization handlers supply the storage formats and their kernels (ExpertFormat)."""
+"""Shared routed-expert execution (SwiGLU, SwiGLU with soft caps, or squared ReLU without a gate). Architecture code supplies routing, not
+residency, and quantization handlers supply the storage formats and their kernels (ExpertFormat)."""
 import ctypes
 import os
 import time
@@ -27,8 +27,13 @@ def _side_stream(device):
     return _side_streams[device]
 
 
-def cpu_threads():
-    return int(os.environ.get("MMGP_CPU_EXPERT_THREADS", min(8, torch.get_num_threads())))
+def cpu_threads(format=None):
+    """The workers of a CPU expert job: MMGP_CPU_EXPERT_THREADS, else 8 at most, which a format may change for the jobs of its decoding passes (ExpertFormat.cpu_threads); prompt
+    passes keep the default (twice the workers read prompts of 37 / 86 tokens 20-25 % slower)."""
+    if "MMGP_CPU_EXPERT_THREADS" in os.environ:
+        return int(os.environ["MMGP_CPU_EXPERT_THREADS"])
+    threads = min(8, torch.get_num_threads())
+    return threads if format is None else format.cpu_threads(threads)
 
 
 _host_launch = None
@@ -53,7 +58,7 @@ class ExpertFormat:
     EXPERT_FORMATS (mmgp.quant_router.expert_formats()); a bank takes the format of the checkpoint tensors it loads. Every tensor
     holds one entry per expert along its first dimension. bank.rotation is the ConvRot group of the activations (0: none), bank.gated
     whether the input projection holds gate then up rows (SwiGLU) or up rows only (squared ReLU), bank.blocks the scale blocks of the
-    input and output projections."""
+    input and output projections, bank.caps the soft caps of the gate and up projections ("swiglu_softcap") or None."""
     name = ""
     reports_usage = False  # its CPU job counts the pairs routed to each expert, in bank.usage (whatever computes them): the placement then adapts to the routing
 
@@ -115,6 +120,10 @@ class ExpertFormat:
         """Whether a short pass may leave some of its experts to the CPU kernels, whose activations are not those of the GPU's."""
         return False
 
+    def cpu_threads(self, threads):
+        """The workers of the CPU jobs of its decoding passes, from MMGP's default count."""
+        return threads
+
     def gpu_pass(self, bank, x, host_ids, probabilities, order, zero=False):
         """A pass of many tokens run by parts, the kernels reading each expert once for all its rows: an object with run(pointers, start, stop) computing the experts [start, stop) of order (an int array, every routed expert
         once) and finish() returning the float32 [tokens, hidden] sum, once all of them have run. host_ids: the routing on the CPU."""
@@ -150,7 +159,7 @@ class _DoorbellJob:
         rows.zero_()
         rows[0] = -1  # an early share: no rows published yet
         self.share = None if bank.cpu_share is None else (bank.gpu_share, view[rows_offset:].view(torch.int64), bank.share_early)
-        self.job, _ = bank.format.cpu_job(bank, self.host.data_ptr(), bank.resident_flags.data_ptr(), self.host.data_ptr() + offset, tokens, topk, cpu_threads(), bank.cpu_share,
+        self.job, _ = bank.format.cpu_job(bank, self.host.data_ptr(), bank.resident_flags.data_ptr(), self.host.data_ptr() + offset, tokens, topk, cpu_threads(bank.format), bank.cpu_share,
                                           self.host.data_ptr() + rows_offset if bank.cpu_share is not None else 0)
         self.ticket = kernels.register(device, function, None, self.job)
 
@@ -201,24 +210,28 @@ def _share_pool():
     return _share_thread
 
 
-ACTIVATIONS = ("swiglu", "relu2")
+ACTIVATIONS = ("swiglu", "relu2", "swiglu_softcap")
 TRITON_PAIRS = 64  # eager calls of more (token, slot) pairs compute their resident experts with the PyTorch path
 STREAMED_GROUP_BYTES = 512 << 20  # experts without a GPU copy uploaded together for a pass of many rows
 RESIDENT_LAUNCH = 128  # experts of a pass of many rows computed together: their scratch stays in the GPU's L2 (5-10% at 8K tokens on a 5090)
 
 
 class RoutedExperts(ExpertBank):
-    """Routed experts: SwiGLU (activation "swiglu", input projection = gate then up rows) or squared ReLU without a gate ("relu2").
+    """Routed experts: SwiGLU (activation "swiglu", input projection = gate and up rows), SwiGLU with soft caps ("swiglu_softcap":
+    softcap(gate, caps[0]) * sigmoid(gate) * softcap(up, caps[1]), softcap(v, c) = c * tanh(v / c)) or squared ReLU without a gate ("relu2").
     Pageable CPU storage in their checkpoint format, plus optional GPU copies. The format is that of the loaded checkpoint tensors (its
     scale blocks read from their shapes), or the registered format named at construction (the bank's tensors are then allocated on
     device, with the given scale blocks or the format's default)."""
     tail_rank = 0  # above 0, in a decoding pass: an expert out of VRAM that no token routes above this rank is left out (formats that support it): faster, less precise
     TAIL_WINDOW = 16  # the most rows of a pass it concerns: prompts are read whole
-    def __init__(self, num_experts, hidden, intermediate, *, activation="swiglu", format=None, blocks=None, device="cpu", use_triton=False):
+    def __init__(self, num_experts, hidden, intermediate, *, activation="swiglu", caps=None, format=None, blocks=None, device="cpu", use_triton=False):
         super().__init__(num_experts, ())
         if activation not in ACTIVATIONS:
             raise ValueError(f"Unsupported expert activation {activation}")
-        self.hidden, self.intermediate, self.activation, self.gated = hidden, intermediate, activation, activation == "swiglu"
+        if (activation == "swiglu_softcap") != (caps is not None):
+            raise ValueError("caps=(gate cap, up cap) goes with the swiglu_softcap activation")
+        self.hidden, self.intermediate, self.activation, self.gated = hidden, intermediate, activation, activation != "relu2"
+        self.caps = None if caps is None else (float(caps[0]), float(caps[1]))
         self.use_triton = use_triton
         self.format, self.rotation, self.blocks = None, 0, None
         # Eager CUDA calls of at least this many (token, slot) pairs (prompt processing) run every selected expert on the GPU, copied
@@ -257,6 +270,15 @@ class RoutedExperts(ExpertBank):
         else:
             raise RuntimeError(f"No registered expert format stores the tensors of {prefix[:-1]}")
         super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
+
+    def activate(self, hidden):
+        """The activation of the PyTorch path: float32 input projection outputs (gate then up columns when gated)."""
+        if not self.gated:
+            return F.relu(hidden).square()
+        gate, up = hidden.chunk(2, dim=-1)
+        if self.caps is None:
+            return F.silu(gate) * up
+        return torch.tanh(gate / self.caps[0]) * self.caps[0] * torch.sigmoid(gate) * (torch.tanh(up / self.caps[1]) * self.caps[1])
 
     def release_execution_cache(self):
         self._pointer_table = None
@@ -322,7 +344,7 @@ class RoutedExperts(ExpertBank):
         if tokens not in self._jobs:
             payload = _locked(packed.numel(), torch.int32)
             result = _locked(tokens * self.hidden, torch.float32).view(tokens, self.hidden)
-            job, function = self.format.cpu_job(self, payload.data_ptr(), self.resident_flags.data_ptr() if self.use_triton else 0, result.data_ptr(), tokens, topk, cpu_threads())
+            job, function = self.format.cpu_job(self, payload.data_ptr(), self.resident_flags.data_ptr() if self.use_triton else 0, result.data_ptr(), tokens, topk, cpu_threads(self.format))
             self._jobs[tokens] = job, function, payload, result
         job, function, payload, result = self._jobs[tokens]
         stream = torch.cuda.current_stream()
@@ -480,13 +502,7 @@ class RoutedExperts(ExpertBank):
                 tensors = resident.get(expert) or {name: getattr(self, name)[expert].to(x.device) for name in self.expert_tensor_names}
                 w13, w2 = self.format.dequantize(self, tensors)
                 tensors = None
-                hidden = F.linear(x[rows].float(), w13)
-                if self.gated:
-                    gate, up = hidden.chunk(2, dim=-1)
-                    hidden = F.silu(gate) * up
-                    gate = up = None
-                else:
-                    hidden = F.relu(hidden).square()
+                hidden = self.activate(F.linear(x[rows].float(), w13))
                 out.index_add_(0, rows, F.linear(hidden, w2) * flat_weights[pairs, None])
                 hidden = w13 = w2 = None
         return out
@@ -557,11 +573,7 @@ class RoutedExperts(ExpertBank):
                         rows, slots = torch.where(cpu_ids == expert)
                         rows, slots = rows.to(x.device), slots.to(x.device)
                         w13, w2 = self.format.dequantize(self, resident[expert])
-                        if self.gated:
-                            gate, up = F.linear(x[rows].float(), w13).chunk(2, dim=-1)
-                            output = F.linear(F.silu(gate) * up, w2)
-                        else:
-                            output = F.linear(F.relu(F.linear(x[rows].float(), w13)).square(), w2)
+                        output = F.linear(self.activate(F.linear(x[rows].float(), w13)), w2)
                         gpu_output.index_add_(0, rows, output * topk_weights[rows, slots, None].float())
             if cuda:
                 result = _HostStaging.buffer("outputs", x_offset, torch.float32)

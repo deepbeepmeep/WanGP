@@ -267,7 +267,13 @@ class Attention(torch.nn.Module):
                 offload._row_store_at(gates, torch.sigmoid(self.to_gate_logits(rows)).mul_(2.0), counter, first, step)
                 return rows
             return run
-        x_list[0] = offload.RowSource(source.shape, source.dtype, source.device, gated, gated_at)
+        gated_source = x_list[0] = offload.RowSource(source.shape, source.dtype, source.device, gated, gated_at)
+        if source.fill_prepared is not None:  # its quantized form in one pass (extreme low VRAM), the gates read from the rows it makes too
+            def gated_prepared(start: int, stop: int, form, want_rows: bool):
+                rows, q, scales = source.fill_prepared(start, stop, form, True)
+                torch.sigmoid(self.to_gate_logits(rows), out=gates[start:stop]).mul_(2.0)
+                return rows if want_rows else None, q, scales
+            gated_source.fill_prepared = gated_prepared
         return head_gate
 
     def forward(

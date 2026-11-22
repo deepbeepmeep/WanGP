@@ -164,7 +164,7 @@ def _stream_handle(stream):
 
 def _copy_moves(base, moves):
     """In a helper thread: (offset in the buffer, source address, bytes). Sources that a drive must read are read first with large requests (touching them would read 64 KiB at a time)."""
-    cold = cold_ranges([(source, nbytes) for _, source, nbytes in moves])
+    cold = cold_ranges(sorted((source, nbytes) for _, source, nbytes in moves))  # by address: the slices of neighbouring experts of a bank merge into long reads
     if cold:
         prefetch_ranges(cold)
     for offset, source, nbytes in moves:
@@ -525,6 +525,7 @@ class Residency:
         if self.pages_thread is not None:
             self.pages_thread.join()
         self.unload()
+        self.release_execution()
         self.pinned, self._pinned_holder, self.pool_parts = {}, None, {}
         for buffer in self.upload_staging + self.stream_staging:
             buffer.release()
@@ -669,7 +670,10 @@ class Residency:
 
     def write_row(self, bank, expert, tensors):
         if self.table_host is not None:
-            self.table_rows[self.first[bank] + expert] = 0 if tensors is None else [tensors.slab.base + tensors.offset + part[1] for part in tensors.parts]
+            row = self.table_rows[self.first[bank] + expert]  # as wide as the bank of the model with the most tensors
+            row[:] = 0
+            if tensors is not None:
+                row[:len(tensors.parts)] = [tensors.slab.base + tensors.offset + part[1] for part in tensors.parts]
             self.table_dirty = True
 
     def flush_table(self):
@@ -919,7 +923,8 @@ class Residency:
             return
         self.changing = True
         try:
-            self._clear_graphs()
+            if not self.elastic:
+                self._clear_graphs()  # (elastic: in place, as its rounds)
             torch.cuda.synchronize()
             keep = set(wanted)
             for item in [item for item in reversed(self.loaded) if item not in keep]:
@@ -995,7 +1000,11 @@ class Residency:
         """A round between decoding passes, outside graph recording: the routing counts decay and take the new pairs; experts the routing asks for take the place of the experts it reads least, of
         any bank (a place is bytes: GPU copies are freed and allocated, the same shapes reuse their memory), and the placement grows into free VRAM or gives it back. Everything in place: the
         graphs read the placement through the table and the flags."""
-        if self.changing or not self.placed_once or cuda_graphs.recording() or torch.cuda.is_current_stream_capturing():
+        if self.changing or cuda_graphs.recording() or torch.cuda.is_current_stream_capturing():
+            return
+        if not self.placed_once:
+            # a model whose passes replay as graphs from its first pass after a load (graphs kept through an unload): no hook sees them, the first placement is asked for here
+            self.place()
             return
         self._land()
         self.plan_round()  # asked for during the last pass by a path that does not call it
@@ -1365,6 +1374,8 @@ class Residency:
         by_size = {}
         for bank, expert in additions:
             by_size.setdefault(int(self.slot_bytes[self.class_of[self.first[bank] + expert]]), []).append((bank, expert))
+        for members in by_size.values():  # in checkpoint order: a batch then reads its experts from long runs of the file, twice as fast as slices of 1 MiB where a drive must read them
+            members.sort(key=lambda item: (self.sources[item[0]][0][1], item[1]))
         transfers = [torch.cuda.Event(), torch.cuda.Event()]
         slot, armed, pool, staged, sent = 0, [False, False], expert_stream._helper_pool(), None, [0]
         from .offload import report_progress
@@ -1538,7 +1549,8 @@ class Residency:
         if self.loaded:
             if self.elastic:
                 self._keep_learned()
-            self._clear_graphs()
+            if not self.elastic:
+                self._clear_graphs()  # (an elastic placement leaves in place, through the table and the flags its graphs read: they stay valid, and may be kept through the unload)
             torch.cuda.synchronize()
             for item in list(reversed(self.loaded)):
                 self._drop(*item)
@@ -1552,24 +1564,33 @@ class Residency:
         if reset:
             self.started = False
             self.pressure_ceiling = None
-            for bank in self.banks:
-                bank.release_execution_cache()
-            if self.elastic and self.table is not None:
-                torch.cuda.synchronize()
-                if self.share is not None and self.manager().verboseLevel >= 1:
-                    held, nbytes, asked, landed, missing, jobs, status = self.share_stats()
-                    ring = self.share[0].stats() if self.share[0] is not None else dict(wait_nanoseconds=0, issued=0, part_nanoseconds=0, parts=0, call_nanoseconds=0, call_max_nanoseconds=0,
-                                                                                        calls_under={}, wake_nanoseconds=0, wakes=0, status=0,
-                                                                                        fraction=float(np.mean([bank.cpu_share.live for bank in self.banks if bank.cpu_share is not None])))
-                    tqdm.write(f"Expert Level 2 - {self.model_id}: {held} Experts in Locked RAM ({nbytes / 2**30:.1f} GiB); of {missing} Experts Missing VRAM over {jobs} Jobs, {asked} Copied, "
-                               f"{landed} in Time for the GPU; a copy waits {ring['wait_nanoseconds'] / max(ring['issued'], 1) / 1e3:.0f} us to be issued, a CPU part lasts "
-                               f"{ring['part_nanoseconds'] / max(ring['parts'], 1) / 1e3:.0f} us; copy call {ring['call_nanoseconds'] / max(ring['issued'], 1) / 1e3:.0f} us (longest "
-                               f"{ring['call_max_nanoseconds'] / 1e6:.1f} ms; calls under {ring['calls_under']}), wake-up {ring['wake_nanoseconds'] / max(ring['wakes'], 1) / 1e3:.0f} us, share now {ring['fraction']:.2f}; "
-                               f"level 2 {self.level2_store.counts}" + (f", Failure {status or ring['status']}" if status or ring['status'] else ""))
-                self._free_share()
-                pinned.retire(self.table_memory)
-                self.table = self.table_host = self.table_memory = None
-                self.table_views, self.table_dirty = {}, False
+            if self.elastic and self.share is not None:
+                self._clear_graphs()  # they read the share's table, which goes with the model
+                self.release_execution()
+            if self.elastic:
                 for buffer in self.round_staging:
                     buffer.release()
                 self.round_events = [None, None]
+
+    def release_execution(self):
+        """What the graphs of the model read of its experts besides their GPU copies: the banks' job buffers and the table of GPU addresses. Released once those graphs are gone
+        (offload: after an unload that kept none of them; close()): graphs kept through an unload replay with the same buffers and the same table, which the next placement fills
+        in place."""
+        for bank in self.banks:
+            bank.release_execution_cache()
+        if self.elastic and self.table is not None:
+            torch.cuda.synchronize()
+            if self.share is not None and self.manager().verboseLevel >= 1:
+                held, nbytes, asked, landed, missing, jobs, status = self.share_stats()
+                ring = self.share[0].stats() if self.share[0] is not None else dict(wait_nanoseconds=0, issued=0, part_nanoseconds=0, parts=0, call_nanoseconds=0, call_max_nanoseconds=0,
+                                                                                    calls_under={}, wake_nanoseconds=0, wakes=0, status=0,
+                                                                                    fraction=float(np.mean([bank.cpu_share.live for bank in self.banks if bank.cpu_share is not None])))
+                tqdm.write(f"Expert Level 2 - {self.model_id}: {held} Experts in Locked RAM ({nbytes / 2**30:.1f} GiB); of {missing} Experts Missing VRAM over {jobs} Jobs, {asked} Copied, "
+                           f"{landed} in Time for the GPU; a copy waits {ring['wait_nanoseconds'] / max(ring['issued'], 1) / 1e3:.0f} us to be issued, a CPU part lasts "
+                           f"{ring['part_nanoseconds'] / max(ring['parts'], 1) / 1e3:.0f} us; copy call {ring['call_nanoseconds'] / max(ring['issued'], 1) / 1e3:.0f} us (longest "
+                           f"{ring['call_max_nanoseconds'] / 1e6:.1f} ms; calls under {ring['calls_under']}), wake-up {ring['wake_nanoseconds'] / max(ring['wakes'], 1) / 1e3:.0f} us, share now {ring['fraction']:.2f}; "
+                           f"level 2 {self.level2_store.counts}" + (f", Failure {status or ring['status']}" if status or ring['status'] else ""))
+            self._free_share()
+            pinned.retire(self.table_memory)
+            self.table = self.table_host = self.table_memory = None
+            self.table_views, self.table_dirty = {}, False

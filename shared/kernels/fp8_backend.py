@@ -237,6 +237,18 @@ class _FP8RowProjection:
         return (*_quantize_activation(x, fp8_dtype), dtype) if mode == "cuda" else x
 
     @staticmethod
+    def block_form(module, rows):
+        """With the CUDA FP8 GEMM (torch._scaled_mm), prepare()'s form of `rows` rows ("fp8", the weight's FP8 dtype: one FP32 scale for
+        all the rows), so that an outside quantizer may make it (offload.prepare_rows: shared.kernels.norm_quant_triton's FP8 form, the norm
+        and modulation computed in FP32 without their 16-bit rows). None otherwise."""
+        _, mode, dtype, fp8_dtype = _FP8RowProjection.key(module)
+        return ("fp8", fp8_dtype) if mode == "cuda" and fp8_dtype in (torch.float8_e4m3fn, torch.float8_e5m2) else None
+
+    @staticmethod
+    def block_prepared(module, q, scales, dtype):
+        return q, scales, _FP8RowProjection.key(module)[2]
+
+    @staticmethod
     def rows(module, prepared, start, stop):
         from shared.qtypes.scaled_fp8 import _scaled_mm_weight_scale
         weight = module.qweight

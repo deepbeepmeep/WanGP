@@ -1497,3 +1497,36 @@ def validate_nvfp4_kernel(
             )
 
     return {"ok": True, "results": results}
+
+
+# ----------------------------------------------------------------------------------------------------------------------------------------
+# Routed experts in NVFP4 rows
+
+from shared.kernels.cpu_experts import NVFP4_ROWS, RowScaledExpertFormat
+
+
+class Nvfp4RowExperts(RowScaledExpertFormat):
+    """Routed experts in NVFP4 whose block scales follow their rows (not the 128x4 tiles of the NVFP4 linears): w13_weight uint8
+    [experts, 2 * intermediate, hidden / 2], rows alternating gate and up (up rows only without a gate), and w2_weight uint8 [experts, hidden, intermediate / 2], two
+    E2M1 codes per byte with the even column in the low nibble; w13_weight_scale and w2_weight_scale E4M3 [experts, rows, columns / 16];
+    w13_factor and w2_factor float32 [experts, 1]. A weight is its E2M1 value times its block scale times the factor of its expert."""
+    name, native, kind, block = "nvfp4_rows", NVFP4_ROWS, 0, 16
+
+    def tensors(self, experts, hidden, intermediate, gated=True, blocks=None):
+        rows, fp8 = (2 if gated else 1) * intermediate, torch.float8_e4m3fn
+        return {"w13_weight": ((experts, rows, hidden // 2), torch.uint8), "w2_weight": ((experts, hidden, intermediate // 2), torch.uint8),
+                "w13_weight_scale": ((experts, rows, hidden // 16), fp8), "w2_weight_scale": ((experts, hidden, intermediate // 16), fp8),
+                "w13_factor": ((experts, 1), torch.float32), "w2_factor": ((experts, 1), torch.float32)}
+
+    def matches(self, tensors):
+        weight, scale = tensors["w13_weight"], tensors["w13_weight_scale"]
+        return weight.dtype == torch.uint8 and _is_float8_dtype(scale.dtype) and weight.shape[-1] == 8 * scale.shape[-1] and tensors["w13_factor"].dtype == torch.float32
+
+    def dequantize_matrix(self, weight, scale, factor):
+        codes = weight.long()
+        table = _get_fp4_lut(weight.device, torch.float32)
+        values = torch.stack((table[codes & 15], table[codes >> 4]), -1).view(weight.shape[0], -1, 16)
+        return (values * scale.float()[:, :, None] * factor.float()).view(weight.shape[0], -1)
+
+
+EXPERT_FORMATS = (Nvfp4RowExperts(),)

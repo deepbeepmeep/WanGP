@@ -38,7 +38,11 @@ _ENV_AUTOTUNE_LOCK_FUSED_BLOCK_K = "WAN2GP_QUANTO_INT8_AUTOTUNE_LOCK_FUSED_BLOCK
 _IS_AVAILABLE = {}
 _CONFIG_LEN = 5
 _CONVROT_KINDS = ("convrot", "convrot_bias")
-_AUTOTUNE_CACHE_VERSION = 3
+_AUTOTUNE_CACHE_VERSION = 4
+# Rows of the scratch tensors of every probe, validation and benchmark (and ConvRot's largest range of rows tuned apart): they were the
+# call's own rows, and ConvRot's slot key its exact row count (H3 1080p, 220k rows: several GB of scratch beside the call at its first
+# step, a peak of 11.2 GiB against 6.5 with WGPKernels)
+TUNE_ROWS = 16384
 _AUTOTUNE_CACHE_LOADED = False
 _AUTOTUNE_CACHE_DIRTY = False
 _AUTOTUNE_CONFIG_CACHE: dict[str, tuple[int, int, int, int, int]] = {}
@@ -453,6 +457,7 @@ def _runtime_probe_shape(
     n: int,
     baseline: tuple[int, int, int, int, int],
 ) -> tuple[int, int, int, tuple[int, int, int, int, int]]:
+    m = min(m, TUNE_ROWS)
     if kind in _CONVROT_KINDS:
         return m, k, min(n, _RUNTIME_PROBE_MAX_N), baseline
     if n <= _RUNTIME_PROBE_MAX_N:
@@ -977,9 +982,10 @@ def _select_triton_int8_config(
         if limit > 0 and limit < _HIGH_SHARED_MEMORY_CONFIG_BYTES:
             baseline = _LOW_SHARED_MEMORY_CONFIG
     slot_id, rep_shapes = _resolve_autotune_slot(m, k, n)
-    if convrot:
-        slot_id = f"shape_{m}_{k}_{n}"
-        rep_shapes = ((m, k, min(n, _RUNTIME_PROBE_MAX_N)),)
+    if convrot:  # one slot per power-of-two range of rows up to CONVROT_TUNE_ROWS, timed on scratch tensors of at most that many rows
+        rows = min(1 << max(0, m - 1).bit_length(), TUNE_ROWS)
+        slot_id = f"convrot_rows_{rows}_{k}_{n}"
+        rep_shapes = ((min(m, rows), k, min(n, _RUNTIME_PROBE_MAX_N)),)
     session_key = (device_index, kernel_kind, slot_id)
     cached = _AUTOTUNE_SESSION_CACHE.get(session_key)
     if cached is not None:
@@ -1271,15 +1277,26 @@ if _TRITON_AVAILABLE:
         tl.store(out + rows[:, None] * n + cols[None, :], acc * weight_scale[None, :], (rows[:, None] < m) & (cols[None, :] < n))
 
 
-def prepare_blockscale_input(x, out_features):
-    """Keep the ordinary fused kernel's K blocks, rounding and launch configuration."""
+TRANSFORM_BYTES = 64 << 20  # 16-bit rows transformed at a time by prepare_blockscale_input (a ConvRot rotation)
+
+
+def prepare_blockscale_input(x, out_features, transform=None):
+    """Keep the ordinary fused kernel's K blocks, rounding and launch configuration. transform: applied to x before the quantization
+    (ConvRot's rotation), by chunks of TRANSFORM_BYTES of rows so that its 16-bit output is never whole: each row is quantized on its
+    own, the same values as the whole input transformed."""
     m, k = x.shape
     config = _select_triton_int8_config(m, k, out_features, device=x.device, kernel_kind="fused")
     bm, _, bk, warps, _ = config
     blocks = triton.cdiv(k, bk)
     q = torch.empty((m, k), dtype=torch.int8, device=x.device)
     scales = torch.empty((m, blocks), dtype=torch.float32, device=x.device)
-    _prepare_blockscale_kernel[(triton.cdiv(m, bm), blocks)](x, q, scales, m, k, blocks, *x.stride(), bm, bk, num_warps=warps)
+    step = m if transform is None else max(bm, TRANSFORM_BYTES // (k * x.element_size()) // bm * bm)
+    for start in range(0, m, step):
+        part = x[start:start + step] if transform is None else transform(x[start:start + step])
+        rows = part.shape[0]
+        _prepare_blockscale_kernel[(triton.cdiv(rows, bm), blocks)](part, q[start:start + rows], scales[start:start + rows], rows, k, blocks,
+                                                                    *part.stride(), bm, bk, num_warps=warps)
+        part = None
     return q, scales, x.dtype, config
 
 

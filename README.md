@@ -82,6 +82,24 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 
 ## 🔥 Latest Updates : 
+## 22nd of November 2026: WanGP v20.10 - To the Extreme… and a Little Further
+
+- **pi-H3 with optional DWD**: new H3 FL2VA variant **2 or 4 steps**, that claims to be the fastest. **pi-H3 DWD** draws the frames in its last step, so it is **Decoding Without a Decoder**. Choose 2 steps for quick experiments and 4 for more detail. The new **pi-H3 FL2VA 2 Steps / 4 Steps** accelerator profiles bring the same step counts to standard and Pruned FL2VA models while keeping the regular video decoder.
+
+- **Extreme Chunker: One More Squeeze of VRAM**: with low VRAM GPU if ordinary chunking is not enough, **Auto** can now switch to **Extreme** for supported models. It processes smaller pieces to lower peak VRAM further, at the cost of speed (10-30% slowdown). Still much faster than spilling to RAM. With Extreme Chunker **H3 1080 15s requires now 5.9 GB of VRAM !**
+
+- **SageGP**: It is a new kernels wheel that is a drop in replacement for Sage2/Sage3. RTX 50XX owners get three attention choices in *Configuration > Performance*: **sage2 gp** for SageAttention 2-level precision with a *10% speed boost*,**sage3 gp** for sage 3 speed but at *twice the precision* and **sage 2/3 adaptative gp** to balance speed and precision with the current content,  **Run the First Denoising Step in Precise**, enabled by default, helps keep the composition closer. Install **SageGP 1.0.2** for the PyTorch 2.10 environment; the adaptive and sage3 modes also need **Triton 3.6+**. [Installation and mode guide](docs/INSTALLATION.md#sagegp-attention-modes-rtx-50xx). SageGP is also installed by WanGP Manager for RTX20xx / RTX30xx / RTX40xx. Although there is no speed up or precision gain for these GPUs, it contains extra kernels used by Extreme Chunker.
+ 
+- **Inkling 2 Mini Joins Deepy**: a new **Uncensored LLM** for **Deepy Zero, Deepy Prime and the Prompt Enhancer**. Choose **Inkling 2 Mini VL Uncensored** in *Configuration > Deepy / Prompt Enhancer*. Checkpoint requires 20GB  but it can run on 10GB-16GB VRAM cards at a speed cost. Its optional **DSpark** speculative decoding adds about 1 GB of VRAM; with **Number of Tokens** on **Auto**, it adjusts how many tokens it predicts ahead. Mini name, grown-up appetite.
+
+### Showrunner: Keep the Cameras Rolling
+
+- **Shots That Pick Up Where You Left Off**: choose a shot's **Start and end** pictures, take a frame from a neighbouring shot, or **Go on from the shot before it** to continue its movement and sound. Shared frames are removed from the new take so the edit avoids a repeated overlap. A long shot with an end picture can be **Split** into connected shots. Choices depend on the video model, and Showrunner flags when a changed neighbouring take or trim means a connected shot needs another render.
+
+- **“And After That…”**: queue your next request with the **clock button** beside Send, or **Ctrl+Enter**, while Showrunner finishes the current task. Requests run in order after successful completion and stay waiting after a pause, stop or error.
+
+- **Upscale this version** on Deliver creates a larger version of the finished edit using an enabled upsampler. **Lyrics as subtitles** is now a separate, **off-by-default** choice for cuts playing the song; spoken dialogue and narration still produce automatic subtitles. [Showrunner guide](docs/SHOWRUNNER.md).
+
 
 ## 17th of November 2026: WanGP v20.00 - VRAM and RAM so Low You Can't Measure Them !
 

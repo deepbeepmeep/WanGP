@@ -525,6 +525,20 @@ HYPERFLOW_DEEPY_INFOS = (" HyperFlow H3 Flash (Video Rebirth's compressed few-st
 H3_RUNTIME_INFOS = H3_PHASE_INFOS + H3_PHASE_ACCELERATOR_INFOS + H3_AUDIO_REFINEMENT_INFOS + H3_SPEED_INFOS + H3_STANDARD_SAMPLER_INFOS + H3_COMMON_RUNTIME_INFOS
 H3_HYPERFLOW_RUNTIME_INFOS = HYPERFLOW_INFOS.rstrip("\n") + H3_COMMON_RUNTIME_INFOS
 H3_PDD_RUNTIME_INFOS = PDD_INFOS + H3_SPEED_INFOS + H3_COMMON_RUNTIME_INFOS
+DWD_INFOS = """
+### pi-H3 DWD (Decoding Without Decoder)
+
+This model generates a video in a fixed, very small number of steps, and its last step draws the frames directly instead of handing a latent to the Video VAE: no separate video decoding phase follows.
+
+- **Steps, sampler and schedule are fixed:** the number of steps shown, the Euler sampler and the model's own schedule. There is no guidance pass, second phase, step skipping or custom sigmas.
+- **Video VAE choice:** it only encodes the start and end images. The VAE upsampler is not available, since the frames do not come from the VAE.
+- **LoRAs:** LoRAs made for H3 FL2VA can be added; they act on the denoising, not on how the frames are drawn. Lower their multipliers if the result degrades.
+- **Limits:** the frames are drawn from a state that is still slightly noisy, so fine texture can differ from a VAE decode of the same generation; its authors mark this variant as experimental. For the same speed with the regular VAE decode, use the **pi-H3** accelerator profiles of the FL2VA models.
+"""
+H3_DWD_RUNTIME_INFOS = DWD_INFOS + H3_SPEED_INFOS + H3_COMMON_RUNTIME_INFOS
+DWD_DEEPY_INFOS = (" pi-H3 DWD: exactly {steps} inference steps, sample_solver=euler, flow_shift=12, guidance_phases=1, guidance_scale=1, custom_sigmas='', "
+                   "skip_steps_cache_type='' (all forced). The last step predicts the frames itself: no VAE decode, no VAE upsampling, no audio refinement. "
+                   "Its built-in LoRA loads automatically; H3 FL2VA LoRAs can be added.")
 H3_FASTH3_RUNTIME_INFOS = FASTH3_INFOS + H3_SPEED_INFOS + H3_COMMON_RUNTIME_INFOS
 
 PRUNED_INFOS = """
@@ -858,8 +872,11 @@ class family_handler:
         hyperflow = model_def.get("hyperflow", False)
         if hyperflow and (not pruned or any(model_def.get(flag, False) for flag in ("pdd", "ptd", "vdn", "veda", "fasth3"))):
             raise ValueError("HyperFlow H3 Flash is declared on the pruned FL2VA or Ref2VA architecture, without other acceleration flags")
-        fixed_schedule = pdd or fasth3 or hyperflow
-        single_phase = pdd or fasth3  # HyperFlow Flash takes a second, higher-resolution phase (Regenerate 2K IC)
+        dwd = model_def.get("dwd", 0)  # pi-H3 Decoding Without Decoder: the step count the model was trained for
+        if dwd and (reference_mode or any(model_def.get(flag, False) for flag in ("pdd", "ptd", "vdn", "veda", "fasth3", "hyperflow"))):
+            raise ValueError("pi-H3 DWD is declared on the FL2VA architectures, without other acceleration flags")
+        fixed_schedule = pdd or fasth3 or hyperflow or bool(dwd)
+        single_phase = pdd or fasth3 or bool(dwd)  # HyperFlow Flash takes a second, higher-resolution phase (Regenerate 2K IC)
         pika_supported = not (fixed_schedule or ptd or vdn or veda)
         text_encoder_variant = model_def.get("text_encoder_variant")
         text_encoder_files = [TEXT_ENCODER_BF16, TEXT_ENCODER_INT8] if text_encoder_variant is None else TEXT_ENCODER_VARIANTS[text_encoder_variant]
@@ -870,7 +887,7 @@ class family_handler:
             "uint8_guides": _uint8_guides,
             "tiny_vae_architecture": REF2VA_ARCHITECTURE,
             "size": "lighter" if pruned else "large",
-            **({"accelerated": "native"} if pdd or vdn or veda or fasth3 or hyperflow else {}),
+            **({"accelerated": "native"} if pdd or vdn or veda or fasth3 or hyperflow or dwd else {}),
             **({"specialities": [{"name": "character consistency", "aliases": ["identity preservation"]}, {"name": "motion transfer", "description": "Transfer motion or camera from reference videos to image-reference characters."}]} if reference_mode else {}),
             "fps": 24,
             "v2i_switch_supported": True,
@@ -920,10 +937,10 @@ class family_handler:
             },
             "inference_steps": True,
             "inference_steps2": not single_phase,
-            "lock_inference_steps": pdd or fasth3,
-            "flow_shift": not hyperflow,
-            "spectrum_cache": not hyperflow,
-            "first_block_cache": not hyperflow,
+            "lock_inference_steps": pdd or fasth3 or bool(dwd),
+            "flow_shift": not hyperflow and not dwd,
+            "spectrum_cache": not hyperflow and not dwd,
+            "first_block_cache": not hyperflow and not dwd,
             "skip_steps_multiplier_choices": FIRST_BLOCK_CACHE_STRENGTHS,
             "skip_steps_multiplier_label": "First Block Cache Threshold",
             "first_block_cache_thresholds": FIRST_BLOCK_CACHE_THRESHOLDS,
@@ -957,7 +974,7 @@ class family_handler:
             "control_video_trim_disabled": True,
             "extract_guide_from_window_start": True,  # sliding windows get pure window-aligned guide frames; continuation comes through input_video
             "prompt_enhancer_picture_labels": True,  # enhancer images are labelled with the <Picture N> the pipeline presents
-            "infos": (H3_FASTH3_RUNTIME_INFOS if fasth3 else (REF2VA_INFOS if reference_mode else FL2VA_INFOS) + (H3_PDD_RUNTIME_INFOS if pdd else H3_HYPERFLOW_RUNTIME_INFOS if hyperflow else H3_RUNTIME_INFOS))
+            "infos": (H3_FASTH3_RUNTIME_INFOS if fasth3 else (REF2VA_INFOS if reference_mode else FL2VA_INFOS) + (H3_PDD_RUNTIME_INFOS if pdd else H3_HYPERFLOW_RUNTIME_INFOS if hyperflow else H3_DWD_RUNTIME_INFOS if dwd else H3_RUNTIME_INFOS))
                      + (PRUNED_INFOS if pruned and not hyperflow else "") + (H3_VDN_INFOS if vdn else "") + model_def.get("infos", ""),
             "prompt_infos": REF2VA_PROMPT_INFOS if reference_mode else FL2VA_PROMPT_INFOS,
             "prompt_enhancer_button_label": "Write",
@@ -979,7 +996,7 @@ class family_handler:
             "image_prompt_enhancer_instructions1": H3_STILL_IMAGE_SYSTEM_PROMPT,
             "text_prompt_enhancer_max_tokens1": 1024,
             "image_prompt_enhancer_max_tokens1": 1024,
-            "profiles_dir": ["minimax_h3_vdn"] if vdn else ["minimax_h3_fasth3"] if fasth3 else [("minimax_h3_hyperflow_ref2va" if reference_mode else "minimax_h3_hyperflow")] if hyperflow else [] if pdd else ["minimax_h3", "minimax_h3_ref2va" if reference_mode else "minimax_h3_fl2va"],
+            "profiles_dir": ["minimax_h3_vdn"] if vdn else ["minimax_h3_fasth3"] if fasth3 else [("minimax_h3_hyperflow_ref2va" if reference_mode else "minimax_h3_hyperflow")] if hyperflow else [] if pdd or dwd else ["minimax_h3", "minimax_h3_ref2va" if reference_mode else "minimax_h3_fl2va"],
             "preset_profiles_dir": [] if fixed_schedule or vdn else ["minimax_h3_presets", "minimax_h3_ref2va_presets"] if reference_mode else ["minimax_h3_presets"],
             "finetune_custom_urls": ["video_vae_file", "audio_vae_file"],
             "vae_upsamplers": {X2_VAE_METHOD: [0, 1, 2]},
@@ -1020,8 +1037,10 @@ class family_handler:
                 "lower_ram": {"name": "Lower RAM", "qkv_splitting": False},
             },
         }
-        if pdd or hyperflow:
+        if pdd or hyperflow or dwd:
             result["custom_settings"] = result["custom_settings"][:1]
+        if dwd:  # its pixel head replaces the VAE decoders
+            del result["vae_upsamplers"]
         if reference_mode:
             result.update({
                 "sliding_window": True,
@@ -1155,6 +1174,8 @@ class family_handler:
             result["deepy_infos"] += " PDD requires exactly 8 inference steps and the Euler sampler. LoRAs trained for the matching base model apply."
         elif hyperflow:
             result["deepy_infos"] += HYPERFLOW_DEEPY_INFOS
+        elif dwd:
+            result["deepy_infos"] += DWD_DEEPY_INFOS.format(steps=dwd)
         else:
             result["deepy_infos"] += " Two-phase generation uses `num_inference_steps2` (default 3) for final enhancement and `switch_threshold` for its starting noise. LoRA Accelerators before `|` with any nonzero phase-2 multiplier replace the automatic LoRA Accelerator (Lightx2v 4 Steps) together, at their specified multipliers; if all are zero, the automatic one is used. `1;0` means phase 1 only, `1;0.6` sets phase 2 to 0.6, and `1` applies to both phases. LoRAs after `|` keep their multipliers."
         if vdn:
@@ -1319,6 +1340,10 @@ class family_handler:
             if inputs["sample_solver"] != "euler":
                 return "MiniMax H3 PDD requires the Euler sampler"
             inputs["num_inference_steps"] = required_steps
+        if model_def.get("dwd", 0):
+            if inputs["sample_solver"] != "euler":
+                return "pi-H3 DWD requires the Euler sampler"
+            inputs.update({"num_inference_steps": model_def["dwd"], "flow_shift": 12.0, "guidance_scale": 1.0, "guidance_phases": 1, "custom_sigmas": "", "skip_steps_cache_type": ""})
         if model_def.get("hyperflow", False):
             if inputs["num_inference_steps"] not in HYPERFLOW_STEPS:
                 return f"HyperFlow H3 Flash runs {', '.join(map(str, HYPERFLOW_STEPS[:-1]))} or {HYPERFLOW_STEPS[-1]} inference steps"
@@ -1775,5 +1800,7 @@ class family_handler:
             ui_defaults.update({"num_inference_steps": FASTH3_STEPS, "flow_shift": FASTH3_VIDEO_SHIFT, "guidance_phases": 1, "sample_solver": "euler"})
         if model_def.get("hyperflow", False):
             ui_defaults.update({"num_inference_steps": HYPERFLOW_DEFAULT_STEPS, "flow_shift": HYPERFLOW_VIDEO_SHIFT, "guidance_phases": 1, "sample_solver": "euler"})
+        if model_def.get("dwd", 0):
+            ui_defaults.update({"num_inference_steps": model_def["dwd"], "guidance_phases": 1, "sample_solver": "euler"})
         if base_model_type in CONTROL_ARCHITECTURES:
             ui_defaults.update({"video_prompt_type": "PV", "control_net_weight": 1.0, "sliding_window_overlap": 22 if H3_CONTROL_LATENT_CONTINUATION else 18})

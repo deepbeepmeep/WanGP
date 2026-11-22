@@ -5,6 +5,7 @@ import math
 
 import torch
 from mmgp import cuda_graphs
+from shared import attention_kit
 from shared.kernels import ops
 from torch import Tensor, nn
 import torch.nn.functional as F
@@ -216,7 +217,7 @@ class Flux(nn.Module):
         else:
             shift, scale = final_layer.adaLN_modulation(vec).chunk(2, dim=1)
         normed_list, normed = [normed], None
-        modulated = ops.scale_shift(normed_list, scale[:, None, :], shift[:, None, :], in_place=False, fused_add=True)
+        modulated = ops.scale_shift(normed_list, scale[:, None, :], shift[:, None, :], fused_add=True)  # over the norm's output: one buffer
         if final_layer.linear is None:
             raise RuntimeError("Final layer projection is not available.")
         base_tokens = final_layer.linear(modulated)
@@ -229,7 +230,7 @@ class Flux(nn.Module):
         normed = final_layer.norm_final(tokens)
         shift, scale = final_layer.adaLN_modulation(vec).chunk(2, dim=1)
         normed_list, normed = [normed], None
-        modulated = ops.scale_shift(normed_list, scale[:, None, :], shift[:, None, :], in_place=False, fused_add=True)
+        modulated = ops.scale_shift(normed_list, scale[:, None, :], shift[:, None, :], fused_add=True)  # over the norm's output: one buffer
 
         proj_dtype = self.proj_out_means.weight.dtype
         modulated = modulated.to(proj_dtype)
@@ -468,7 +469,12 @@ class Flux(nn.Module):
 
         # Extraction writes the cache and its state ring. As in Qwen 2.1, only
         # the following read-only cached steps may be captured/replayed.
-        with cuda_graphs.scope(reference is None):
+        # Smart Inputs Chunker Auto: the extreme low VRAM mode of the single blocks where their chunked attention would not fit (the
+        # formats probed on the first double block's image projections, loaded first)
+        attn, rows = self.double_blocks[0].img_attn, img_list[0].shape[0] * (img_list[0].shape[1] + txt_len)
+        extreme = attention_kit.plan_extreme(attn, img_list[0].device, img_list[0].dtype, rows, img_list[0].shape[-1], self.num_heads, self.num_heads,
+                                             img_list[0].shape[-1] // self.num_heads, (attn.q, attn.k, attn.v), None)
+        with extreme, cuda_graphs.scope(reference is None):
             for i, block in enumerate(self.double_blocks):
                 if self.chroma:
                     vec_list = [( self.get_modulations(mod_vectors, "double_img", idx=i), self.get_modulations(mod_vectors, "double_txt", idx=i))] * sz

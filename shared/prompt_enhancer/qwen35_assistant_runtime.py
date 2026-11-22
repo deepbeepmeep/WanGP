@@ -17,7 +17,7 @@ from shared.llm_engines.lmgp import SamplingParams
 from shared.llm_engines.lmgp.engine.block_manager import BlockManager
 from shared.llm_engines.lmgp.layers.kv_formats import overlay_slots as _kv_overlay_slots
 from shared.llm_engines.lmgp.engine.sequence import Sequence, SequenceStatus
-from shared.prompt_enhancer import qwen35_text
+from shared.prompt_enhancer import chat_formats, qwen35_text
 from shared.prompt_enhancer.streaming import ThrottledStreamEmitter
 
 
@@ -151,62 +151,19 @@ class AssistantActionState:
 
 
 def render_assistant_messages(tokenizer, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None, add_generation_prompt: bool, thinking_enabled: bool) -> list[int]:
-    rendered = tokenizer.apply_chat_template(
-        messages,
-        tools=tools,
-        add_generation_prompt=bool(add_generation_prompt),
-        tokenize=True,
-        enable_thinking=bool(thinking_enabled),
-    )
-    if torch.is_tensor(rendered):
-        rendered = rendered.tolist()
-    return [int(token_id) for token_id in rendered]
+    return chat_formats.of(tokenizer).render_messages(tokenizer, messages, tools, add_generation_prompt, thinking_enabled)
 
 
 def render_text_user_turn_suffix(tokenizer, user_content: str, thinking_enabled: bool) -> list[int]:
-    user_content = str(user_content or "").strip()
-    if len(user_content) == 0:
-        return []
-    suffix = f"<|im_start|>user\n{user_content}<|im_end|>\n<|im_start|>assistant\n"
-    suffix += "<think>\n" if bool(thinking_enabled) else "<think>\n\n</think>\n\n"
-    token_ids = tokenizer.encode(suffix, add_special_tokens=False)
-    if torch.is_tensor(token_ids):
-        token_ids = token_ids.tolist()
-    return [int(token_id) for token_id in token_ids]
+    return chat_formats.of(tokenizer).render_user_turn(tokenizer, user_content, thinking_enabled)
 
 
-def render_tool_turn_suffix(tokenizer, tool_contents: list[str], thinking_enabled: bool) -> list[int]:
-    normalized_contents = [str(content or "").strip() for content in list(tool_contents or []) if len(str(content or "").strip()) > 0]
-    if len(normalized_contents) == 0:
-        return []
-    suffix = "<|im_end|>\n<|im_start|>user"
-    for tool_content in normalized_contents:
-        suffix += f"\n<tool_response>\n{tool_content}\n</tool_response>"
-    suffix += "<|im_end|>\n<|im_start|>assistant\n"
-    suffix += "<think>\n" if bool(thinking_enabled) else "<think>\n\n</think>\n\n"
-    token_ids = tokenizer.encode(suffix, add_special_tokens=False)
-    if torch.is_tensor(token_ids):
-        token_ids = token_ids.tolist()
-    return [int(token_id) for token_id in token_ids]
+def render_tool_turn_suffix(tokenizer, tool_contents: list[str], thinking_enabled: bool, tool_names: list[str] | None = None) -> list[int]:
+    return chat_formats.of(tokenizer).render_tool_turn(tokenizer, tool_contents, thinking_enabled, tool_names)
 
 
 def render_assistant_text_suffix(tokenizer, assistant_content: str, thinking_enabled: bool, prompt_open: bool) -> list[int]:
-    assistant_content = str(assistant_content or "").strip()
-    if len(assistant_content) == 0:
-        return []
-    if prompt_open:
-        if bool(thinking_enabled) and assistant_content.startswith("<think>"):
-            suffix = assistant_content[len("<think>") :]
-            suffix = suffix[2:] if suffix.startswith("\r\n") else suffix[1:] if suffix.startswith("\n") else suffix
-            suffix += "<|im_end|>\n"
-        else:
-            suffix = ("</think>\n\n" if bool(thinking_enabled) else "") + assistant_content + "<|im_end|>\n"
-    else:
-        suffix = f"<|im_start|>assistant\n<think>\n\n</think>\n\n{assistant_content}<|im_end|>\n"
-    token_ids = tokenizer.encode(suffix, add_special_tokens=False)
-    if torch.is_tensor(token_ids):
-        token_ids = token_ids.tolist()
-    return [int(token_id) for token_id in token_ids]
+    return chat_formats.of(tokenizer).render_assistant_text(tokenizer, assistant_content, thinking_enabled, prompt_open)
 
 
 def strip_tool_blocks(raw_text: str) -> str:
@@ -559,6 +516,10 @@ class Qwen35AssistantRuntime:
         self._nvml_clock_event_counters = None
         self._nvml_process_names = {}
         self._last_decode_window = None
+
+    @property
+    def chat_format(self) -> chat_formats.ChatFormat:
+        return chat_formats.of(self.tokenizer)
 
     def _log(self, message: str) -> None:
         if self.debug_enabled:
@@ -970,8 +931,8 @@ class Qwen35AssistantRuntime:
         return [module for module in self._get_live_llm().model_runner.model.blk if module.layer_type == "linear_attention"]
 
     def _get_position_state_modules(self):
-        # state kept by position beside the recurrent layers (the rings of indexed attention and of the n-gram layer)
-        return [module for module in self._get_live_llm().model_runner.model.modules() if hasattr(module, "snapshot_sequence_state") and module.__class__.__name__ in ("IndexedAttention", "Qwen4ExpPLE")]
+        # state kept by position beside the recurrent layers (the rings of indexed attention, of the n-gram layer, of windowed attention and of short convolutions)
+        return [module for module in self._get_live_llm().model_runner.model.modules() if hasattr(module, "snapshot_sequence_state") and module.__class__.__name__ in ("IndexedAttention", "Qwen4ExpPLE", "Inkling2PagedState", "Inkling2WindowState")]
 
     def _snapshot_position_states(self):
         return [module.snapshot_sequence_state() for module in self._get_position_state_modules()]
@@ -1168,7 +1129,7 @@ class Qwen35AssistantRuntime:
     def _chunk_prefill_suffix(self, seq: Sequence, token_ids: list[int], chunk_tokens: int | None = None, processed_tokens: int | None = None) -> Sequence:
         suffix = [int(token_id) for token_id in list(token_ids or [])]
         chunk_tokens = chunk_tokens or self._prefill_chunk_tokens(len(suffix))
-        if suffix and seq.token_ids and suffix[0] == int(seq.token_ids[-1]) == self._single_token_id("<|im_end|>"):
+        if suffix and seq.token_ids and suffix[0] == int(seq.token_ids[-1]) == self._single_token_id(self.chat_format.turn_end):
             suffix = suffix[1:]  # a response that sampled its own end of turn (after parallel tool calls) keeps it once, as the chat format writes it
         if len(suffix) == 0:
             return seq
@@ -1315,7 +1276,7 @@ class Qwen35AssistantRuntime:
                 response = live_engine.generate_embedded(prompt_token_ids=[int(token_id) for token_id in prompt_token_ids], prompt_embeds=prompt_embeds, prompt_position_ids=prompt_position_ids,
                                                          max_tokens=int(max_new_tokens), temperature=temp, top_p=normalized_top_p, top_k=normalized_top_k, cfg_scale=1.0, seed=seed,
                                                          use_tqdm=True, release_vram_after=False, ignore_eos=False, position_offset=int(position_offset or 0))
-            cleaned = qwen35_text._clean_generated_text("" if response is None else response.get("text", ""))
+            cleaned = qwen35_text._clean_generated_text(chat_formats.decode_response(self.tokenizer, response, prompt_token_ids))
             self._log(f"Embedded decode response preview={self._format_preview(cleaned)}")
             return cleaned
         snapshot = self.snapshot_context() or restore_snapshot
@@ -1347,7 +1308,7 @@ class Qwen35AssistantRuntime:
                 ignore_eos=False,
                 position_offset=int(position_offset or 0),
             )
-            cleaned = qwen35_text._clean_generated_text("" if response is None else response.get("text", ""))
+            cleaned = qwen35_text._clean_generated_text(chat_formats.decode_response(self.tokenizer, response, prompt_token_ids))
             self._log(f"Embedded decode response preview={self._format_preview(cleaned)}")
             return cleaned
         finally:
@@ -1525,19 +1486,20 @@ class Qwen35AssistantRuntime:
         return seq, AssistantActionState(phase=phase, limit=generation_limit)
 
     def _append_action_suffix(self, text: str) -> None:
-        token_ids = self.tokenizer.encode(str(text or ""), add_special_tokens=False)
-        if torch.is_tensor(token_ids):
-            token_ids = token_ids.tolist()
+        token_ids = self.chat_format.encode_action_text(self.tokenizer, text)
         if token_ids:
-            self.append_completion_suffix([int(token_id) for token_id in token_ids])
+            self.append_completion_suffix(token_ids)
+
+    def decode_completion(self, seq: Sequence) -> str:
+        """The response being generated as turn text (chat_formats), whatever the model's own tokens for it."""
+        return chat_formats.decode_completion(self.tokenizer, seq)
 
     def tool_call_follows(self, seed: int | None, do_sample: bool, temperature: float | None, top_p: float | None, top_k: int | None, thinking_enabled: bool, stop_requested=None, apply_repetition_penalty: bool = True) -> bool:
         """After a complete tool call, whether the model opens another one in the same response (the chat format of parallel calls).
-        One or two decode steps restricted to the format's choices - a newline then <tool_call>, or the end of the turn - so nothing
+        One or two decode steps restricted to the format's choices - for ChatML a newline then <tool_call>, or the end of the turn - so nothing
         is rewound and no state is snapshotted. A sampled end of turn stays where the format writes it; the tool results' suffix
         does not repeat it (_chunk_prefill_suffix)."""
-        tool_open, turn_end, newline = (self._single_token_id(text) for text in ("<tool_call>", "<|im_end|>", "\n"))
-        for allowed in ((newline, tool_open, turn_end), (tool_open, turn_end)):
+        for allowed in (tuple(self._single_token_id(text) for text in step) for step in self.chat_format.follow_up_steps):
             result = self.generate_action(phase="statement", seed=seed, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k, thinking_enabled=thinking_enabled,
                                           stop_requested=stop_requested, continuing_response=True, apply_repetition_penalty=apply_repetition_penalty, remaining_action_tokens=1, allowed_token_ids=allowed)
             if result.stop_reason != "statement_budget_exhausted":  # a newline uses up the one-token step: the second step decides
@@ -1570,7 +1532,7 @@ class Qwen35AssistantRuntime:
         seq, action = self.start_generation_action(phase=phase, seed=seed, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k, thinking_enabled=thinking_enabled, continuing_response=continuing_response, apply_repetition_penalty=apply_repetition_penalty, remaining_action_tokens=remaining_action_tokens, resume_action=resume_action, allowed_token_ids=allowed_token_ids)
         stop_token_ids = {int(token_id) for token_id in getattr(self.model, "_prompt_enhancer_stop_token_ids", []) or [] if int(token_id) >= 0}
         speculative = bool(getattr(self.model, "_prompt_enhancer_speculative_decoding", False))
-        boundary_markers = ["</think>"] if action.phase == "thought" else ["<tool_call>", *(["<think>"] if thinking_enabled else [])] if action.phase == "statement" else ["</tool_call>"]
+        boundary_markers = self.chat_format.boundary_markers(action.phase, thinking_enabled)
         boundary_token_sequences = []
         for marker in boundary_markers:
             marker_token_ids = self.tokenizer.encode(marker, add_special_tokens=False)
@@ -1584,7 +1546,7 @@ class Qwen35AssistantRuntime:
                     boundary_token_ids.add(int(marker_token_ids[0]))
             seq.speculative_stop_token_ids = boundary_token_ids
         stream_emitter = ThrottledStreamEmitter(stream_interval_seconds) if callable(stream_callback) else None
-        raw_text = self.tokenizer.decode(seq.completion_token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+        raw_text = self.decode_completion(seq)
         baseline_close_think = len(re.findall(r"</think>", raw_text, flags=re.IGNORECASE))
         baseline_open_think = len(re.findall(r"<think>", raw_text, flags=re.IGNORECASE))
         baseline_open_tool = len(re.findall(r"<tool_call>", raw_text, flags=re.IGNORECASE))
@@ -1597,7 +1559,7 @@ class Qwen35AssistantRuntime:
         def finish(stop_reason: str, stop_token_id: int | None = None, current_text: str | None = None) -> AssistantDecodeResult:
             decode_started = time.perf_counter() if decode_telemetry is not None and current_text is None else 0.0
             if current_text is None:
-                current_text = self.tokenizer.decode(seq.completion_token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+                current_text = self.decode_completion(seq)
             decode_seconds = time.perf_counter() - decode_started if decode_started else 0.0
             stream_started = time.perf_counter() if decode_telemetry is not None and stream_emitter is not None else 0.0
             stream_callback_called = False
@@ -1646,7 +1608,7 @@ class Qwen35AssistantRuntime:
             boundary_candidate = canonical_boundary or ">" in probe_text or action.phase == "tool" and "}" in probe_text
             stream_due = stream_emitter is not None and stream_emitter.is_due()
             if boundary_candidate or stream_due:
-                raw_text = self.tokenizer.decode(seq.completion_token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+                raw_text = self.decode_completion(seq)
             decode_seconds = time.perf_counter() - decode_started if decode_telemetry is not None else 0.0
             stream_started = time.perf_counter() if decode_telemetry is not None and stream_due else 0.0
             stream_callback_called = False
@@ -1678,7 +1640,7 @@ class Qwen35AssistantRuntime:
             self._close_exhausted_thought(self.action_budget(action.phase))
             return finish("thought_budget_exhausted")
         if action.phase == "tool":
-            raw_text = self.tokenizer.decode(seq.completion_token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+            raw_text = self.decode_completion(seq)
             if not validate_tool_call_structure(raw_text) and has_complete_tool_call(raw_text):
                 return finish("tool_call", current_text=raw_text)
             return finish("tool_budget_exhausted", current_text=raw_text)
@@ -1693,7 +1655,7 @@ class Qwen35AssistantRuntime:
         speculative = bool(getattr(self.model, "_prompt_enhancer_speculative_decoding", False))
         if speculative:
             seq.speculative_stop_token_ids = stop_token_ids
-        boundary_token_ids = self.tokenizer.encode("</tool_call>", add_special_tokens=False)
+        boundary_token_ids = self.tokenizer.encode(self.chat_format.tool_close, add_special_tokens=False)
         if torch.is_tensor(boundary_token_ids):
             boundary_token_ids = boundary_token_ids.tolist()
         boundary_token_ids = tuple(int(token_id) for token_id in boundary_token_ids)
@@ -1709,7 +1671,7 @@ class Qwen35AssistantRuntime:
             nonlocal raw_text
             decode_started = time.perf_counter() if decode_telemetry is not None and current_text is None else 0.0
             if current_text is None:
-                current_text = self.tokenizer.decode(seq.completion_token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+                current_text = self.decode_completion(seq)
             raw_text = current_text
             decode_seconds = time.perf_counter() - decode_started if decode_started else 0.0
             stream_started = time.perf_counter() if decode_telemetry is not None and stream_emitter is not None else 0.0
@@ -1759,7 +1721,7 @@ class Qwen35AssistantRuntime:
             boundary_candidate = canonical_boundary or ">" in probe_text or "}" in probe_text
             stream_due = stream_emitter is not None and stream_emitter.is_due()
             if boundary_candidate or stream_due:
-                raw_text = self.tokenizer.decode(seq.completion_token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+                raw_text = self.decode_completion(seq)
             decode_seconds = time.perf_counter() - decode_started if decode_telemetry is not None else 0.0
             stream_started = time.perf_counter() if decode_telemetry is not None and stream_due else 0.0
             stream_callback_called = False
@@ -1775,7 +1737,7 @@ class Qwen35AssistantRuntime:
             if stop_reason is not None:
                 return finish(stop_reason, last_token_id, current_text=raw_text)
         seq.max_tokens = existing_completion_tokens + requested_segment_tokens
-        raw_text = self.tokenizer.decode(seq.completion_token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+        raw_text = self.decode_completion(seq)
         return finish("max_tokens", token_count=requested_segment_tokens, current_text=raw_text)
 
     def snapshot_context(self, previous: dict[str, Any] | None = None) -> dict[str, Any] | None:

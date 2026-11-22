@@ -191,6 +191,15 @@ def _norm_modulate(x, norm, mod):
     return ops.norm_modulate([x.view(-1, x.shape[-1])], norm, mod.shift[:, 0], mod.scale[:, 0], segments).view(x.shape)
 
 
+def _norm_modulate_rows(x, norm, mod):
+    """_norm_modulate(x, norm, mod) as an mmgp RowSource made by ranges of rows (extreme low VRAM: an attention that makes it again by
+    head group, an FFN chunk by chunk), never whole beside x."""
+    batch, tokens = x.shape[:2]
+    rows = mod.scale.shape[0]
+    segments = [(b * tokens, (b + 1) * tokens, b if rows > 1 else 0) for b in range(batch)]
+    return ops.norm_modulate_rows(x.view(-1, x.shape[-1]), norm, mod.shift[:, 0], mod.scale[:, 0], segments, x.shape)
+
+
 class SelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int = 8, qkv_bias: bool = False, proj_bias: bool = True):
         super().__init__()
@@ -319,8 +328,10 @@ class DoubleStreamBlock(nn.Module):
             img_mod1, img_mod2 = self.img_mod(vec)
             txt_mod1, txt_mod2 = self.txt_mod(vec)
 
-        # prepare image for attention
-        img_modulated = _norm_modulate(img, self.img_norm1, img_mod1)
+        # prepare image for attention (extreme low VRAM: the image stream given by ranges of rows, made again by each head group, its
+        # attention output projected and gated into img by the kit, the text's returned)
+        extreme = NAG is None and cache_layer is None and attention_kit.extreme_low_vram()
+        img_modulated = (_norm_modulate_rows if extreme else _norm_modulate)(img, self.img_norm1, img_mod1)
 
         if NAG is None:
             txt_modulated = _norm_modulate(txt, self.txt_norm1, txt_mod1)
@@ -329,16 +340,27 @@ class DoubleStreamBlock(nn.Module):
             del txt_modulated, img_modulated
             segments = ((0, txt_len, self.txt_attn.norm), (txt_len, txt_len + img.shape[1], self.img_attn.norm))
             normalize = _kv_norm_rope_ if cache_layer is not None else _norm_rope_
+            options = {}
+            if extreme:
+                batch, tokens = img.shape[:2]
+                gates = img_mod1.gate.reshape(-1, img.shape[-1])
+                item_pe = lambda item: pe if pe.shape[0] == 1 else pe[item:item + 1]  # a batch: the items one after another (their pe rows)
+                options = dict(out_proj=self.img_attn.proj, residual=img, gate=gates, out_stream=1,
+                               segments=[(b * tokens, (b + 1) * tokens, b if gates.shape[0] > 1 else 0) for b in range(batch)],
+                               by_items=lambda item: dict(norm_rope=lambda query, key, group: normalize(query, key, item_pe(item), segments),
+                                                          fused_quant=lambda query, key, group, core, settings: _fused_norm_rope_quant_(query, key, item_pe(item), segments, core, settings)))
             attn = attention_kit.joint_qkv_attention(streams, self.num_heads, head_dim, lambda query, key, group: normalize(query, key, pe, segments), kv_prefix=kv_prefix,
-                                                     fused_quant=lambda query, key, group, core, settings: _fused_norm_rope_quant_(query, key, pe, segments, core, settings)).flatten(2)
+                                                     fused_quant=lambda query, key, group, core, settings: _fused_norm_rope_quant_(query, key, pe, segments, core, settings), **options).flatten(2)
         else:
             img_list, img_modulated = [img_modulated], None
             attn = self._attention_nag(img_list, txt, txt_mod1, pe, NAG)
-        txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1] :]
+        txt_attn, img_attn = (attn, None) if extreme else (attn[:, : txt.shape[1]], attn[:, txt.shape[1] :])
 
-        # calculate the img blocks
-        ops.gated_residual_(img, [self.img_attn.proj(img_attn)], img_mod1.gate, fused=True)
-        ops.mlp([_norm_modulate(img, self.img_norm2, img_mod2)], self.img_mlp[0], self.img_mlp[2], self.mlp_activation,
+        # calculate the img blocks (extreme low VRAM: the FFN's input made chunk by chunk as it reads it)
+        if not extreme:
+            ops.gated_residual_(img, [self.img_attn.proj(img_attn)], img_mod1.gate, fused=True)
+        img_attn = None
+        ops.mlp([(_norm_modulate_rows if attention_kit.extreme_low_vram() else _norm_modulate)(img, self.img_norm2, img_mod2)], self.img_mlp[0], self.img_mlp[2], self.mlp_activation,
                 residual=img, segments=ops.gate_segments(img_mod2.gate, img.shape[0], img.shape[1]))
 
         # calculate the txt blocks
@@ -450,7 +472,8 @@ class SingleStreamBlock(nn.Module):
             mod = vec
         elif self.modulation is not None:
             mod, _ = self.modulation(vec)
-        x_mod = _norm_modulate(x, self.pre_norm, mod)
+        # extreme low VRAM: the attention and the MLP read their input by ranges of rows (made again for each head group, then chunk by chunk)
+        x_mod = (_norm_modulate_rows if NAG is None and attention_kit.extreme_low_vram() else _norm_modulate)(x, self.pre_norm, mod)
 
 
         # x_mod = (1 + mod.scale) * x + mod.shift

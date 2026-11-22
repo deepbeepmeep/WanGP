@@ -1,0 +1,18 @@
+{
+    "model": {
+        "name": "MiniMax H3 FL2VA Pruned pi-H3 DWD 2-Step 20B",
+        "architecture": "minimax_h3_fl2va_pruned",
+        "description": "Video with synchronized audio from text and optional first/last frames in only 2 steps on the lighter 20B model, for less VRAM and faster steps: no guidance pass, and the last step delivers the frames directly, so there is no video decoding to wait for. Pick it when speed matters most (previews, prompt tests); expect less fine detail than the 4-step model.",
+        "URLs": "minimax_h3_fl2va_pruned",
+        "modules": [
+            "minimax_h3_fl2va_pi_dwd_2step"
+        ],
+        "loras": "minimax_h3_fl2va_pi_dwd_2step",
+        "loras_multipliers": "minimax_h3_fl2va_pi_dwd_2step",
+        "dwd": 2
+    },
+    "num_inference_steps": 2,
+    "guidance_phases": 1,
+    "sample_solver": "euler",
+    "prompt": "integrated_multimodal_description: [Shot 1] A five-second cinematic single take inside a rain-lashed glass observatory at midnight. A radio astronomer presses an antique transmitter and says clearly (S1) <d>[English] If you can hear me, follow this signal.</d> One brilliant blue pulse races across a translucent star map as the camera slowly pushes closer.\noverall_soundscape: Rain on glass, a low electrical hum, three receiver tones, the synchronized voice, and a short stereo transmission pulse."
+}

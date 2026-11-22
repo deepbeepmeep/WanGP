@@ -50,6 +50,12 @@ QWEN38_FLASH_NEXT_TEXT_FILENAME = "Qwen3.8-Flash-Next-Uncensored-q8g-main-IQ3_S.
 QWEN38_FLASH_NEXT_NGRAM_FILENAME = "Qwen3.8-Flash-Next-ngram-table-IQ4_NL.gguf"
 QWEN38_FLASH_NEXT_VISION_FILENAME = "Qwen3.8-Flash-Next-vision-BF16.gguf"
 QWEN38_FLASH_NEXT_MTP_FILENAME = "Qwen3.8-Flash-Next-drafter-MTP-Q2_0.safetensors"
+INKLING2_VARIANT_MINI = "inkling2_mini"
+INKLING2_REPO = "DeepBeepMeep/Inkling_2"
+INKLING2_MINI_FOLDER = "Inkling_2_Mini"
+INKLING2_MINI_TEXT_FILENAME = "Inkling-2-Mini-Uncensored-NVFP4.safetensors"  # the language model: BF16 dense weights, NVFP4 / MXFP8 experts
+INKLING2_MINI_VISION_FILENAME = "Inkling-2-Mini-vision-BF16.safetensors"  # the vision tower (model.visual.*), shared by every quantization of the language model
+INKLING2_MINI_DRAFTER_FILENAME = "Inkling-2-Mini-drafter-DSpark-BF16.safetensors"  # the DSpark block drafter
 QWEN35_VARIANT_SPECS = {
     QWEN35_VARIANT_9B: {
         "display_name": "Qwen3.5-9B Abliterated",
@@ -210,11 +216,39 @@ QWEN35_VARIANT_SPECS = {
         "embedding_budget": 2500,
         "llm_budget": 18000,
     },
+    INKLING2_VARIANT_MINI: {
+        # 24 looped blocks of routed experts
+        "display_name": "Inkling 2 Mini",
+        "architecture": "inkling2",
+        "assets_dir_name": INKLING2_MINI_FOLDER,
+        "root_repo": INKLING2_REPO,
+        "repo_subfolder": INKLING2_MINI_FOLDER,
+        "root_files": [
+            "chat_template.jinja",
+            "config.json",
+            "generation_config.json",
+            "processor_config.json",
+            "special_tokens_map.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+        ],
+        "text_repo": None,
+        "text_required_files": [],
+        "gguf_repo": INKLING2_REPO,
+        "text_safetensors_filename": INKLING2_MINI_TEXT_FILENAME,
+        "text_mtp_filename": INKLING2_MINI_DRAFTER_FILENAME,  # the key every model declares its drafter file with
+        "vision_filename": INKLING2_MINI_VISION_FILENAME,
+        "backend": "safetensors",
+        "supports_mtp": True,
+        "tie_word_embeddings": False,
+        "llm_budget": 18000,
+    },
 }
 
 
 QWEN_CHECKPOINTS = {
     "quanto_int8": ("text_int8_filename", "Quanto INT8"),
+    "safetensors": ("text_safetensors_filename", "NVFP4"),
     "gguf": ("text_gguf_filename", "GGUF Q4_K_M"),
     "gguf_q8": ("text_gguf_q8_filename", "GGUF Q8_0"),
     "gguf_q3": ("text_gguf_q3_filename", "GGUF IQ3_S"),
@@ -234,7 +268,7 @@ def qwen_download_defs(spec, backend, speculative_decoding=False):
     folder = spec.get("repo_subfolder", "")
     shared_files = list(spec["root_files"])
     gguf = backend.startswith("gguf")
-    key = QWEN_CHECKPOINTS[backend][0] if gguf else "text_int8_filename"
+    key = QWEN_CHECKPOINTS[backend][0]
     filename = spec[key]
     checkpoint_folder = spec.get("gguf_repo_subfolder", folder) if gguf else folder
     draft_key = {"gguf_q3": "text_gguf_q3_mtp_filename", "gguf_ptq1": "text_gguf_ptq1_mtp_filename"}.get(backend, "text_mtp_filename")
@@ -278,7 +312,7 @@ def checkpoint_inventory():
                     source = definition["sourceFolderList"][0]
                     target = definition.get("targetFolderList", [""])[0]
                     for filename in definition["fileList"][0]:
-                        if filename in (spec[key], spec["vision_filename"]):
+                        if filename in (spec[key], spec.get("vision_filename")):
                             path = "/".join(part for part in (target, source, filename) if part)
                             aliases[path] = [filename, f"{spec['assets_dir_name']}/{filename}"]
                 model = bonsai if backend == "gguf_ptq1" else spec["display_name"]

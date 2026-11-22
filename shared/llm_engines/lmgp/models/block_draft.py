@@ -375,6 +375,10 @@ class BlockDraft(nn.Module):
         full.scatter_(0, candidates, scores)
         return full, None
 
+    def proposal_step(self, index, hidden, logits, previous, state=None):
+        """Draft index of the dependent chain: (scores, confidence, the state its next draft takes: none for this head)."""
+        return (*self.proposal_logits(hidden, logits, previous), None)
+
     def proposal_candidates(self, hidden, logits, previous):
         selector = self.candidate_selector
         unary, candidates = logits.topk(selector.top_k)

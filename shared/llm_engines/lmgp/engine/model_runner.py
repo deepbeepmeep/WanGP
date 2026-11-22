@@ -13,7 +13,7 @@ from ..config import Config
 from .sequence import Sequence
 from ..layers import kv_formats as kvf
 from . import chain_verdicts
-from .draft_sources import SuffixDrafter, WindowCosts
+from .draft_sources import ConfidentDrafts, MeasuredDrafts, SuffixDrafter, WindowCosts
 from .speculative_sampling import bounded_support, capture_sampling_graph, draft_probabilities
 from ..layers import draft_chain
 from ..layers.draft_chain import CompactDrafts, DeviceDrafts
@@ -202,6 +202,7 @@ class ModelRunner:
         self.rebuilt = 0  # executables of its graphs made again from their templates (mmgp.cuda_graphs.Graph)
         self._state_pool = None  # the pool of the models' sequence state (recurrent states, drafter cache), suspended with its contents in RAM
         self._saved_state = []  # while suspended: (storage on the GPU, its contents in RAM)
+        self._saved_graph_pools = []  # while suspended: the graph pools cuda_graphs.suspend_graph_pools suspended, with their contents
         self._graph_cache = {}
         self._graph_cache_order = []
         self._logits_bias_cache = {}
@@ -243,6 +244,7 @@ class ModelRunner:
             model_object._mm_graph_placement_key = True
         self._max_speculative_draft_tokens = min(self._MAX_SPECULATIVE_DRAFT_TOKENS, max(1, int(getattr(self.model, "_prompt_enhancer_speculative_tokens", 2)), self._long_chain_tokens()))
         self.speculative_stats = self._new_speculative_stats()
+        self._window_counts = [0, 0, 0]  # since the last report (suspend_runtime): decoding passes, those that verified drafts, tokens they gave
         self.sampler = Sampler()
         
         # Pre-allocate buffers for sampling (optimization: avoid repeated tensor creation)
@@ -302,9 +304,10 @@ class ModelRunner:
 
     def suspend_runtime(self):
         """The runtime stays prepared and gives its VRAM back, its addresses kept, so that its graphs replay once it resumes
-        (ensure_runtime_ready) instead of being captured again: its KV cache (held buffers, contents lost: the sequences go) and the models'
-        sequence state (its pool, contents copied to RAM and back). The pools of its own graphs stay: some keep state between replays (the MTP
-        drafter's). Without the MMGP VRAM allocator, it is reset."""
+        (ensure_runtime_ready) instead of being captured again: its KV cache (held buffers, contents lost: the sequences go), the models'
+        sequence state (its pool, contents copied to RAM and back) and the pools of its own graphs (cuda_graphs.suspend_graph_pools: the
+        contents of their live allocations, such as the state the MTP drafter keeps between replays, copied to RAM and back). Without the MMGP
+        VRAM allocator, it is reset."""
         if not self._runtime_ready or self._suspended:
             return
         from mmgp import allocator
@@ -319,9 +322,16 @@ class ModelRunner:
             self._saved_state = allocator.save_pool(self._state_pool)
             if not allocator.suspend_pool(self._state_pool):  # it keeps its VRAM, and its contents
                 self._saved_state = []
+        self._saved_graph_pools = cuda_graphs.suspend_graph_pools(self)
         self._suspended = True
         cuda_graphs.owners_changed()  # its graphs idle: their executables give their VRAM to the next graphs made
         self._report(f"suspended: its graphs kept ({self.rebuilt} rebuilt from their templates since it resumed), its KV cache and state out of VRAM")
+        passes, drafted, tokens = self._window_counts
+        self._window_counts = [0, 0, 0]
+        from mmgp import runtime
+        if passes and runtime.verbose_level(self.model) >= 1:  # what the drafts gave since the model was loaded, at each unload
+            from tqdm import tqdm
+            tqdm.write(f"[LM Engine] Speculative decoding since the model was loaded: {passes:,} passes, {100 * drafted / passes:.0f} % of them with drafts, {tokens / passes:.2f} tokens per pass.")
         self.rebuilt = 0
 
     def _resume_runtime(self):
@@ -329,7 +339,9 @@ class ModelRunner:
         self._suspended = False
         held = self._held_state()
         saved, self._saved_state = self._saved_state, []
-        if not all(allocator.resume_held(tensor) for tensor in held) or self._state_pool is not None and not allocator.resume_pool(self._state_pool):
+        graph_pools, self._saved_graph_pools = self._saved_graph_pools, []
+        if (not all(allocator.resume_held(tensor) for tensor in held) or self._state_pool is not None and not allocator.resume_pool(self._state_pool)
+                or not cuda_graphs.resume_graph_pools(graph_pools)):
             self._note_guard("runtime_resume_no_room", "VRAM had no room for the suspended runtime: prepared again, graphs captured again")
             self.reset_runtime_state()
             return
@@ -379,9 +391,13 @@ class ModelRunner:
                                ring_start: torch.Tensor) -> None:
         """MMGP mode, the model in VRAM: the decoding passes run once on dummy pages (as the engine's own graphs are captured), which
         records their MMGP graphs before the first request instead of during its decoding."""
-        from mmgp import runtime
+        from mmgp import allocator, runtime
         for rows, graph_vars in [(self.graph_bs[-1], self.graph_vars), *self.speculative_graph_vars.items()]:
             self._draft_feature_buffer(graph_vars, rows, register=False)  # all made before the state is registered once
+        if _OUTPUT_STAGE and getattr(self.model.output, "lm_engine_graph_forward", None) is not None:
+            for graph_vars in self.speculative_graph_vars.values():  # the logits of the verification windows too: a buffer made at a window's first pass registers the state again, which drops the model's graphs
+                with allocator.pool_allocations(self._state_pool):  # (with the sequence state: out of VRAM while the runtime is suspended)
+                    graph_vars["verify_logits"] = torch.empty_like(self.model.output(graph_vars["outputs"]))
         self._register_graph_state()
         if not runtime.weights_resident(self.model):
             return  # the runs of resident blocks change with the dynamic preload: their graphs are recorded as they run
@@ -715,6 +731,7 @@ class ModelRunner:
             if hasattr(self, name):
                 delattr(self, name)
         self._suspended = False
+        self._saved_state, self._saved_graph_pools = [], []  # (their pools go with the graphs cleared below)
         # CUDA graphs captured against previous model/KV pointers are unsafe after runtime reset.
         # Force recapture on next prepare to avoid stale-pointer illegal memory access.
         try:
@@ -1285,6 +1302,12 @@ class ModelRunner:
         slot_mapping = []
         block_tables = None
         has_previous_state = any(int(getattr(seq, "num_cached_tokens", 0) or 0) > 0 for seq in seqs)
+        if has_previous_state and getattr(self.model, "_lm_engine_adaptive_experts", False):
+            # the suffix of a live context (a turn): its working storage exists, so the experts are placed in VRAM first when the model has just come back, and the pass is
+            # computed as when the model stays loaded (a first prompt keeps its measuring pass: the placement follows it)
+            from mmgp import runtime
+            runtime.ensure_loaded(self.model)  # (its blocks first: the placement waits for them, and a pass replayed as a kept graph would then run before it)
+            runtime.place_experts(self.model)
         for seq in seqs:
             seqlen = len(seq)
             input_ids.extend(seq[seq.num_cached_tokens:])
@@ -1711,8 +1734,8 @@ class ModelRunner:
         return int(self._sample_distribution_tensor(probabilities).item())
 
     def _commit_speculative_target_state(self, processed_tokens: int, verified_tokens: int) -> None:
-        if processed_tokens == verified_tokens:
-            return
+        if processed_tokens == verified_tokens or not self._speculative_commit_destinations and not self._speculative_replay_modules:
+            return  # (a model whose state is kept by position has nothing to commit: its rejected rows are overwritten)
         graph = self.speculative_commit_graphs.get(int(processed_tokens))
         if graph is not None:
             graph.replay()
@@ -1998,6 +2021,8 @@ class ModelRunner:
         entry[0] += 1
         entry[1] += milliseconds
         entry[2] += accepted
+        counts = self._window_counts
+        counts[0], counts[1], counts[2] = counts[0] + 1, counts[1] + (rows > 1), counts[2] + accepted + 1
         lookup = getattr(self, "_window_lookup", 0)
         if lookup:
             stats["lookup_windows"] += 1
@@ -2007,8 +2032,22 @@ class ModelRunner:
             stats["recent_accepted"] = _LONG_CHAIN_FADE * stats["recent_accepted"] + accepted
             stats["recent_verified"] = _LONG_CHAIN_FADE * stats["recent_verified"] + min(accepted + 1, rows - 1)
         costs = self._draft_costs()
+        if rows > 1 and not lookup:
+            self._measured_drafts().observe(rows - 1, accepted)
         costs.observe(rows, milliseconds, accepted, bool(lookup), lookup)
         costs.observe_confidences(getattr(self, "_window_confidences", ()), accepted)
+
+    def _measured_drafts(self) -> MeasuredDrafts:
+        measured = getattr(self, "_measured_draft_counts", None)
+        if measured is None:
+            measured = self._measured_draft_counts = MeasuredDrafts(self._draft_costs(), self._max_speculative_draft_tokens)
+        return measured
+
+    def _confident_drafts(self) -> ConfidentDrafts:
+        confident = getattr(self, "_confident_draft_counts", None)
+        if confident is None:
+            confident = self._confident_draft_counts = ConfidentDrafts(self._measured_drafts())
+        return confident
 
     def _long_chain_rate(self, usual: int, long: int) -> float:
         ratio = self._draft_costs().pass_ratio(usual, long, _LONG_CHAIN_SAMPLES)
@@ -2230,13 +2269,14 @@ class ModelRunner:
             draft_logits = draft_logits[0, -1]
         return torch.cat(draft_tokens) if sample_drafts_on_device and draft_tokens else draft_tokens, cache_length, draft_distributions
 
-    def _run_native_mtp_target_token(self, seq: Sequence, sample_params) -> list[list[int]]:
-        started = time.perf_counter()
+    def _run_native_mtp_target_token(self, seq: Sequence, sample_params, started: float | None = None) -> list[list[int]]:
+        started = time.perf_counter() if started is None else started  # a pass whose drafts were computed then not verified counts their time
         input_ids, positions = self.prepare_decode([seq])
         hidden_states = self._run_decode_hidden(input_ids, positions)
         target_token = self._sample_speculative_target(seq, self.model.compute_logits(hidden_states)[0], sample_params, [])
         self._window_lookup, self._window_confidences = 0, ()
         self._observe_window(1, started, 0)
+        self._measured_drafts().observe_pass(0, 1000.0 * (time.perf_counter() - started))
         self._advance_mtp(seq, [target_token], positions, hidden_states)
         reset_context()
         self.speculative_stats["target_passes"] += 1
@@ -2258,7 +2298,11 @@ class ModelRunner:
             draft_tokens = self.model._prompt_enhancer_speculative_sampling_tokens if seq.top_k != 1 else self.model._prompt_enhancer_speculative_tokens
             method = self.model.mtp.method if getattr(self.model, "_block_draft", False) else "native MTP"
             long_chain = f", {self._long_chain_tokens()} while they are accepted" if self._long_chain_tokens() > draft_tokens else ""
-            print(f"[Deepy][Speculative] method={method} ({sampling_method}, up to {draft_tokens} draft tokens{long_chain}, {execution} verification).")
+            if long_chain and getattr(self.model, "_lm_engine_measured_drafts", False):
+                drafts = f"0 to {self._long_chain_tokens()} draft tokens per window, chosen from the measured passes and acceptance"
+            else:
+                drafts = f"up to {draft_tokens} draft tokens{long_chain}"
+            print(f"[Deepy][Speculative] method={method} ({sampling_method}, {drafts}, {execution} verification).")
             self.model._prompt_enhancer_speculative_method_logged = True
         sample_key = (seq.temperature, seq.cfg_scale, seq.top_k, seq.top_p, seq.min_p, seq.repetition_penalty)
         if self._mtp_sample_params is None or self._mtp_sample_params[0] != sample_key:
@@ -2280,7 +2324,13 @@ class ModelRunner:
             max_drafts = min(max_drafts, max(1, int(getattr(self.model, "_prompt_enhancer_speculative_sampling_tokens", max_drafts))))
         stats = self.speculative_stats
         long_drafts = min(self._max_speculative_draft_tokens, self._long_chain_tokens())
-        if long_drafts > max_drafts:
+        confident = None
+        if long_drafts > max_drafts and getattr(self.model, "_lm_engine_measured_drafts", False) and getattr(self.model.mtp, "confident_drafts", False):
+            confident = self._confident_drafts()
+            max_drafts = confident.span(long_drafts, seq.top_k != 1)  # the chain the count is chosen from, once its drafts' probabilities are known
+        elif long_drafts > max_drafts and getattr(self.model, "_lm_engine_measured_drafts", False):
+            max_drafts = self._measured_drafts().choose(long_drafts)  # an automatic count of a drafter whose block comes in one pass: 0 to all its drafts, by what they bring here
+        elif long_drafts > max_drafts:
             self._record_long_chain(max_drafts, long_drafts, len(seq))
             if stats["recent_accepted"] >= self._long_chain_rate(max_drafts, long_drafts) * stats["recent_verified"] > 0:
                 max_drafts = long_drafts  # predictable text (a tool call, code, a list): the drafts beyond the usual chain are accepted too, often enough for what they cost here
@@ -2301,6 +2351,27 @@ class ModelRunner:
         if len(draft_tokens) == 0:
             self._cancel_mtp_stage_profile(profile)
             return self._run_native_mtp_target_token(seq, sample_params)
+        window_confidences = None
+        if confident is not None and getattr(self, "_draft_confidences", None) is not None:
+            # the window's count from its drafts' probabilities: one readback of the chain's few values, before the verification it sizes
+            values = torch.cat((self._draft_confidences[:len(draft_tokens)], self._draft_valid_length.reshape(1).to(self._draft_confidences.dtype))).tolist()
+            available = min(len(draft_tokens), int(values[-1]))
+            chosen = confident.choose(values[:available], available, seq.top_k != 1)
+            if chosen == 0:
+                self._cancel_mtp_stage_profile(profile)
+                return self._run_native_mtp_target_token(seq, sample_params, started=pass_started)
+            draft_tokens, window_confidences = draft_tokens[:chosen], values[:chosen]
+            draft_distributions = None if draft_distributions is None else draft_distributions[:chosen]
+            self._draft_valid_length = self._draft_valid_length.clamp(max=chosen)
+        elif confident is not None:  # drafts of the reference chain (rules the GPU chain cannot take): the count from the measured history
+            chosen = self._measured_drafts().choose(len(draft_tokens))
+            if chosen == 0:
+                self._cancel_mtp_stage_profile(profile)
+                return self._run_native_mtp_target_token(seq, sample_params, started=pass_started)
+            draft_tokens = draft_tokens[:chosen]
+            draft_distributions = None if draft_distributions is None else draft_distributions[:chosen]
+            if torch.is_tensor(getattr(self, "_draft_valid_length", None)):
+                self._draft_valid_length = self._draft_valid_length.clamp(max=chosen)
         stage_started = window_started = time.perf_counter()
         input_ids, positions = self._prepare_speculative_verify(seq, draft_tokens)
         self._mark_mtp_stage_profile(profile, 2, "verify_setup", stage_started)
@@ -2317,8 +2388,11 @@ class ModelRunner:
         self.speculative_stats["target_passes"] += 1
         emitted, accepted_count = self._sample_verified_block(seq, logits, draft_tokens, draft_distributions, sample_params, profile)
         self._observe_window(len(draft_tokens) + 1, window_started, accepted_count)
+        if window_confidences is not None:
+            confident.observe(window_confidences, len(draft_tokens), accepted_count, seq.top_k != 1)
         if not self._window_lookup:
             self._draft_costs().observe_pass(len(draft_tokens), 1000.0 * (time.perf_counter() - pass_started))
+            self._measured_drafts().observe_pass(len(draft_tokens), 1000.0 * (time.perf_counter() - pass_started))
         stage_started = time.perf_counter()
         self._commit_speculative_target_state(len(emitted), len(draft_tokens) + 1)
         self._mark_mtp_stage_profile(profile, 7, "commit", stage_started)

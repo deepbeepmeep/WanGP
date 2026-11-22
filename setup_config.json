@@ -76,10 +76,10 @@
                 }
             },
             "v220_cu13": {
-                "label": "SageGP 1.0.0: Sage Attention 2.2 + RTX 50XX Precise / Adaptive / Fast (Torch 2.10 / CUDA 13, RTX 30XX+ / Ampere+, Recommended)",
+                "label": "SageGP 1.0.1: Sage Attention 2.2 + RTX 50XX Precise / Adaptive / Fast (Torch 2.10 / CUDA 13, RTX 30XX+ / Ampere+, Recommended)",
                 "cmd": {
-                    "win": "https://github.com/deepbeepmeep/SageGP/releases/download/v1.0.0/sagegp-1.0.0+cu130torch2.10.0andhigher-cp310-abi3-win_amd64.whl",
-                    "linux": "https://github.com/deepbeepmeep/SageGP/releases/download/v1.0.0/sagegp-1.0.0+cu130torch2.10.0andhigher-cp310-abi3-linux_x86_64.whl"
+                    "win": "https://github.com/deepbeepmeep/SageGP/releases/download/v1.0.2/sagegp-1.0.2+cu130torch2.10.0andhigher-cp310-abi3-win_amd64.whl",
+                    "linux": "https://github.com/deepbeepmeep/SageGP/releases/download/v1.0.2/sagegp-1.0.2+cu130torch2.10.0andhigher-cp310-abi3-linux_x86_64.whl"
                 }
             }
         },

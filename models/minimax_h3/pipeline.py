@@ -32,6 +32,7 @@ from .h3_image import (H3_IMAGE_MAX_IMAGES, H3_IMAGE_MODEL, H3_IMAGE_PICTURE_LAB
 from .p_h3_image import p_h3_image_sigmas, reference_size, size_at_area
 from .hyperflow import HYPERFLOW_STEPS, HYPERFLOW_VIDEO_SHIFT, checkpoint_lora_offsets, grid_tail_sigmas, video_sigmas as hyperflow_video_sigmas
 from .pdd import pdd_sampling_plans, pdd_sampling_plans_for_sigmas
+from .dwd import pi_h3_sigmas
 from .pika import PIKA_SOLVER, PIKA_STEPS, PIKA_VIDEO_SHIFT, noise as pika_noise, renoise_ as pika_renoise_, sigma_schedule as pika_sigma_schedule
 from .dmad import DMAD_AUDIO_SHIFT, DMAD_SOLVER, renoise_ as dmad_renoise_
 from .spectrum import MiniMaxH3Spectrum
@@ -892,6 +893,14 @@ class MiniMaxH3Pipeline:
         if self.h3_image and (int(guide_phases) > 1 or any(sigmas is not None for sigmas in custom_sigmas or ()) or starting_sigma is not None
                               or sample_solver != "euler" or self.transformer.cache is not None):
             raise ValueError("H3-Image samples one phase of 6 Euler steps on its own schedule, without custom sigmas or step skipping")
+        dwd = self.transformer.dwd_head is not None  # pi-H3 DWD: the last step's forward also predicts the frames
+        if dwd:
+            if (int(sampling_steps) != self.transformer.dwd_steps or two_phases or sample_solver != "euler" or starting_sigma is not None or refinement_mode or image_mode
+                    or self.transformer.cache is not None or any(sigmas is not None for sigmas in custom_sigmas or ()) or int(batch_size) != 1 or self.vae.upsampling):
+                raise ValueError(f"This pi-H3 DWD model generates videos in one phase of exactly {self.transformer.dwd_steps} Euler steps on its own schedule, "
+                                 "without custom sigmas, step skipping or VAE upsampling")
+            shift = 12.0
+            custom_sigmas = [pi_h3_sigmas(sampling_steps, shift)]
         phase_1_sigmas = (h3_image_sigmas(int(sampling_steps)) if self.h3_image else  # 6 steps: the grid of the output heads; others: the pDMD grid
                           custom_sigmas[0] if custom_sigmas and custom_sigmas[0] is not None else p_h3_image_sigmas(int(sampling_steps)) if self.image_model else VIGGLE_REMAKE_SIGMAS[self.remake_mode] if self.remake_mode
                           else hyperflow_video_sigmas(sampling_steps) if hyperflow_phase_1 else None)
@@ -1477,6 +1486,8 @@ class MiniMaxH3Pipeline:
                                                sigma_video, source_buffer, 1.0 - VISUAL_COND_TIMESTEP)
                     model_sigma_video = condition_control_video(video, sigma_video)
                     payload["endpoint_sigmas"] = (sigma_video_next, stage_sigmas_audio[step + 1])  # where the step lands: HyperFlow's r
+                    if dwd and step == model_steps - 1:  # frames as WGP's uint8 conversion gives them, converted on the GPU
+                        payload["dwd_convert"] = lambda pixels: self.vae._prepare_decoded_chunk(pixels, "truncate")
                     video_velocity, audio_velocity = self.transformer(
                         video, audio, model_sigma_video, stage_sigmas_audio[step:step + 1], context, payload,
                         spectrum=spectrum, first_block_cache=first_block_cache)
@@ -1653,7 +1664,7 @@ class MiniMaxH3Pipeline:
         run_denoising(sigmas_video, sigmas_audio, "H3 phase 1 denoising" if two_phase else "H3 denoising", phase_1_extra, 1 if two_phase else -1,
                       effective_sigmas_video=refinement_sigmas_video)
 
-        decoded_video = None
+        decoded_video = payload.pop("dwd_video")[0, :, :target_frames] if dwd else None
         if two_phase:
             self._use_shared_components()
             if set_progress_status is not None:
@@ -1929,7 +1940,7 @@ class MiniMaxH3Pipeline:
                 saved_phase_1_audio = None
 
         audio_refinement = "none" if self.audio_only or image_outputs else (custom_settings or {}).get(H3_AUDIO_REFINEMENT_SETTING, "none")
-        if pdd or soundtrack or not self.reference_mode and any(flag in (audio_prompt_type or "") for flag in "AK"):
+        if pdd or dwd or soundtrack or not self.reference_mode and any(flag in (audio_prompt_type or "") for flag in "AK"):
             audio_refinement = "none"
         if audio_refinement != "none":
             refinement_steps = H3_AUDIO_REFINEMENT_STEPS

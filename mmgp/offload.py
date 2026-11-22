@@ -4070,14 +4070,19 @@ def lora_active(module):
 
 def lora_rank(modules):
     """Columns of the LoRA products x @ A the active LoRAs of these modules make (the ranks of their distinct input factors: q, k and v
-    of one A count once), 0 without any."""
+    of one A count once; a joined LoRA's factors are theirs side by side), 0 without any. Read from their RAM copies: whether or not the
+    modules' blocks are in VRAM now."""
     factors = {}
     for module in modules:
-        joined = (getattr(module, "_mm_lora_data", None) or {}).get("joined_GPU", None)
-        if joined is not None:
-            factors[id(joined[0])] = joined[0].shape[0]
-        for _, data, _ in _row_lora_adapters(module) or ():
-            if not data[5].get("joined") and data[0] is not None:
+        loras_data = getattr(module, "_mm_lora_data", None)
+        if not loras_data:
+            continue
+        model = module._mm_lora_model
+        for adapter in model._loras_active_adapters:
+            data = loras_data.get(adapter, None)
+            if data is None or data[0] is None or data[3] is not None or data[5].get("type", "lora") != "lora":
+                continue
+            if module._mm_manager._get_lora_scaling(model._loras_scaling, model, adapter) * data[4] != 0:
                 factors[id(data[0])] = data[0].shape[0]
     return builtins.sum(factors.values())
 
@@ -4132,6 +4137,19 @@ ROW_SOURCE_BYTES = 64 << 20  # 16-bit rows of a RowSource made at a time by prep
 PREPARE_IN_PLACE = True  # comparison switch: False prepares every input apart from it (prepare_linear_input)
 
 
+def prepares_in_place(modules, dtype, device):
+    """Whether prepare_linear_input(..., in_place=True) of an input for these modules may prepare it in its own memory: one activation
+    format for all of them, which has prepare_in_place."""
+    probe = torch.empty((128, modules[0].in_features), dtype=dtype, device=device)
+    providers = [_row_projection(module, probe) for module in modules]
+    keys = {None if provider is None else provider.key(module) for module, provider in zip(modules, providers)}
+    return PREPARE_IN_PLACE and None not in providers and len(keys) == 1 and None not in keys and hasattr(providers[0], "prepare_in_place")
+
+
+def _row_probe(source, rows):
+    return torch.empty((builtins.min(source.rows(), rows), source.shape[-1]), dtype=source.dtype, device=source.device)
+
+
 class RowSource:
     """An input of linear modules given by ranges of rows instead of a tensor, so that it is never whole in VRAM (a normalized and
     modulated activation that only its projections read): shape (*, in_features), dtype and device as the tensor's would be, and
@@ -4140,10 +4158,11 @@ class RowSource:
     and prepares it range by range where every weight format of the modules can (its row projection's prepare_into), whole otherwise.
     Its rows must not depend on the ranges asked (row-wise operations). fill_at(first, step, count), when given, is the same inside a
     CUDA graph loop (cuda_graphs.loop): None, or a function(counter) making the rows [first + counter * step, + count) for the turn the
-    loop's counter gives, recorded in the loop's body. fill_prepared(start, stop, group, want_rows), when given, makes those rows already
-    quantized in the 'block' form of the INT8 kernels (ConvRot group `group`), in one pass: (the rows or None, INT8 rows, their scales per
-    128 columns); prepare_rows takes it where every module's format prepares these rows in that form. fill_prepared_at(counter, first,
-    rows, group, want_rows) is the same for the rows first + counter * rows (a CUDA graph loop's turn: prepare_rows_at)."""
+    loop's counter gives, recorded in the loop's body. fill_prepared(start, stop, form, want_rows), when given, makes those rows already
+    quantized in a 'block' form of the INT8 kernels, in one pass: form = (ConvRot group, columns per scale) as the formats' block_form
+    gives it, returning (the rows or None, INT8 rows, their FP32 scales per block of columns); prepare_rows takes it where every module's
+    format prepares these rows in the same form. fill_prepared_at(counter, first, rows, form, want_rows) is the same for the rows
+    first + counter * rows (a CUDA graph loop's turn: prepare_rows_at)."""
     def __init__(self, shape, dtype, device, fill, fill_at=None, fill_prepared=None, fill_prepared_at=None):
         self.shape, self.dtype, self.device, self.fill, self.fill_at = torch.Size(shape), dtype, device, fill, fill_at
         self.fill_prepared, self.fill_prepared_at = fill_prepared, fill_prepared_at
@@ -4167,8 +4186,10 @@ class RowSource:
 
 
 def linear_rows_supported(modules, x):
-    """True when every module can be computed by ranges of output rows from x (*, in_features) or a RowSource, LoRAs included."""
-    x = x.fill(0, builtins.min(x.rows(), 128)) if isinstance(x, RowSource) else x.reshape(-1, x.shape[-1])
+    """True when every module can be computed by ranges of output rows from x (*, in_features) or a RowSource, LoRAs included. A
+    RowSource is probed with an empty tensor of its chunk of rows: what a format claims follows the count of rows (a format may only take
+    inputs above its single call), not their values."""
+    x = _row_probe(x, x.chunk_rows()) if isinstance(x, RowSource) else x.reshape(-1, x.shape[-1])
     return builtins.all(_row_projection(module, x) is not None and _row_lora_adapters(module) is not None for module in modules)
 
 
@@ -4305,16 +4326,18 @@ def _prepare_row_source(source, modules):
 
 
 def _block_group(source, modules, rows):
-    """The ConvRot group of the 'block' form every module's format prepares `rows` rows of this source in, None if they differ."""
+    """The 'block' form (ConvRot group, columns per scale) every module's format prepares `rows` rows of this source in, None if they differ."""
     providers = source.__dict__.get("_providers")
-    if providers is None:
-        providers = source._providers = {module: _row_projection(module, source.fill(0, builtins.min(source.rows(), 128))) for module in modules}
+    if providers is None:  # probed as linear_rows_supported does, at these rows
+        probe = _row_probe(source, rows)
+        providers = source._providers = {module: _row_projection(module, probe) for module in modules}
+        probe = None
     groups = {getattr(provider, "block_form", lambda module, rows: None)(module, rows) for module, provider in providers.items()}
     return next(iter(groups)) if len(groups) == 1 and None not in groups else None
 
 
 def rows_loop_group(source, modules, rows):
-    """While a block is captured: the ConvRot group with which prepare_rows_at can make ranges of `rows` rows of this source inside a
+    """While a block is captured: the 'block' form with which prepare_rows_at can make ranges of `rows` rows of this source inside a
     CUDA graph loop (cuda_graphs.loop: its fill_prepared_at, the formats' block form, the loop's body allocations), else None."""
     from . import cuda_graphs
     if (not torch.cuda.is_current_stream_capturing() or source.fill_prepared_at is None or _row_store_at is None
@@ -4326,7 +4349,7 @@ def rows_loop_group(source, modules, rows):
 def _rows_input(source, modules, made, rows_count, lora=None):
     rows, q, scales = made
     providers = source._providers
-    forms = {provider.key(module): provider.block_prepared(q, scales, source.dtype) for module, provider in providers.items()}
+    forms = {provider.key(module): provider.block_prepared(module, q, scales, source.dtype) for module, provider in providers.items()}
     if rows is not None:
         return prepare_linear_input([rows], modules, forms=forms)
     return LinearInput(torch.Size((rows_count,)), None, forms, dict(providers), lora or {})
@@ -6182,6 +6205,9 @@ class offload:
             self.auto_preload.on_unload([model_id for model_id in self.active_models_ids if model_id not in keep])
         # the graphs kept for the next generations (cuda_graphs.GRAPH_CACHE) give their VRAM back, the others go; so do the slots they read
         kept = {model_id for model_id, graphs in self.cuda_graphs.items() if model_id not in keep and graphs.suspend(keep=self.suspendable)}
+        for model_id, residency in self.expert_residency.items():  # the job buffers and the table of addresses its graphs read: kept with them
+            if model_id not in keep and model_id not in kept:
+                residency.release_execution()
         for model_id in [model_id for model_id in {*self.block_slots, *self.slot_pools} if model_id not in keep]:
             if not (model_id in kept and self._suspend_slots(model_id)):
                 self._drop_slots(model_id)
@@ -6265,43 +6291,31 @@ class offload:
 
 
     def _lora_generic_forward(self, model, submodule, loras_data, func, *args, **kwargs) -> torch.Tensor:
-
-        weight = submodule.weight 
-        bias =  getattr(submodule, "bias", None) 
-        original_weight = None 
-        original_bias = None
-        active_adapters = model._loras_active_adapters
-        loras_scaling = model._loras_scaling
-        first_weight =  True
-        first_bias =  True
-        for active_adapter in active_adapters:
+        """A module other than a linear (a norm, a convolution) with full differences (.diff, stored where a LoRA's B goes, and .diff_b): its
+        weight and bias get them for this call, then their values back in place. They keep their storage: a CUDA graph captured here reads it
+        at each replay, and a copy made during the capture would live in the graph's pool (overwritten after it)."""
+        changes = []
+        for active_adapter in model._loras_active_adapters:
             data = loras_data.get(active_adapter + '_GPU', None)
-            if data == None:
+            if data is None:
                 continue
-            diff_w, _, diff_b, _, alpha = data[:5]
-            scaling = self._get_lora_scaling( loras_scaling, model, active_adapter) * alpha
+            scaling = self._get_lora_scaling(model._loras_scaling, model, active_adapter) * data[4]
             if scaling == 0:
                 continue
-            if first_weight:
-                original_weight= weight.clone() if weight is not None else None
-                first_weight = False
-            if first_bias:
-                original_bias= bias.clone() if bias is not None else None
-                first_bias = False
-
-            if diff_w is not None:
-                weight.add_(diff_w, alpha= scaling)
-                diff_w = None
-            if diff_b is not None:
-                bias.add_(diff_b, alpha= scaling)
-                diff_b = None
-
-        ret = func(*args, **kwargs )
-
-        if original_weight is not None: weight.data  = original_weight    
-        if original_bias is not None: bias.data = original_bias
-
-        return ret
+            if data[5].get("type", "lora") == "diff" and data[1] is not None:
+                changes.append((submodule.weight, data[1], scaling))
+            if data[2] is not None:
+                changes.append((submodule.bias, data[2], scaling))
+        if not changes:
+            return func(*args, **kwargs)
+        saved = {id(tensor): (tensor, tensor.clone()) for tensor, _, _ in changes}
+        for tensor, diff, scaling in changes:
+            tensor.add_(diff, alpha=scaling)
+        try:
+            return func(*args, **kwargs)
+        finally:
+            for tensor, value in saved.values():
+                tensor.copy_(value)
 
 
     def _dora_linear_forward(

@@ -7,7 +7,7 @@ projecting q/k/v and calling pay_attention.
   in 16 bits (with the Triton kernels v stays in fp16); same results as pay_attention.
 - The three projections share one input prepared by mmgp (offload.prepare_linear_input) when their weight format supports it: the
   input is quantized once instead of once per projection, and the 16-bit input is released before the projections.
-- Smart Inputs Chunker (Performance tab: Off, Auto by default, On): long sequences (all batch items together) are attended one group
+- Smart Inputs Chunker (Performance tab: Off, Auto by default, Standard, Extreme): long sequences (all batch items together) are attended one group
   of heads at a time into one output, sized by the Peak Fit analysis (head_partition). q/k/v rows, per-head norms, RoPE and attention
   are per head; norms over all heads get per token statistics computed beforehand. Auto splits only the calls whose whole attention
   would not fit in the card (chunking_needed).
@@ -41,8 +41,8 @@ except ImportError:  # Triton not installed: the PyTorch paths
     _kv_triton = None
 
 CHUNKER_CONFIG_KEY = "inputs_chunker"  # Smart Inputs Chunker (Performance tab): "off", "auto", "on", "extreme"
-CHUNKER_CHOICES = [("Off", "off"), ("Auto: only when the allocated VRAM would run short", "auto"), ("On: always, at the best speed for the VRAM saved", "on"),
-                   ("Extreme: the lowest VRAM, one head at a time (slower)", "extreme")]
+CHUNKER_CHOICES = [("Off", "off"), ("Auto: only when the allocated VRAM would run short (Extreme if it must)", "auto"), ("Standard: always, at the best speed for the VRAM saved", "on"),
+                   ("Extreme: the lowest VRAM, a few heads at a time (slower)", "extreme")]
 CHUNKER_DEFAULT = "auto"
 _TARGET_GROUPS = (1, 4, 8, 16)
 MIN_SPLIT_TOKENS = 8192  # fewer query tokens (all batch items together) are never split: little VRAM to save
@@ -92,11 +92,11 @@ def configure(mode):
 
 # Extreme: the models' blocks run without CUDA graphs. Each block keeps the GPU busy far longer than the host takes to launch it (H3 1080p,
 # 2.5 s per block: the same speed with graphs, which add their capture and 0.13 GiB of reserved VRAM). LM decoders' scopes are not gated.
-cuda_graphs.register_gate(lambda: "the Smart Inputs Chunker is Extreme (blocks long enough to need none)" if EXTREME_LOW_VRAM else None)
+cuda_graphs.register_gate(lambda: "the Smart Inputs Chunker is Extreme (blocks long enough to need none)" if extreme_low_vram() else None)
 
 
 def _last_wave_split(on):
-    """The attention kernels' last-wave splits (SageGP Precise on RTX 50xx, SageAttention 2 sm89 / Triton, the Turing kernel), with the
+    """The attention kernels' last-wave splits (SageGP Precise, Fast and Adaptive on RTX 50xx, SageAttention 2 sm89 / Triton, the Turing kernel), with the
     extreme mode. chunker, part of the CUDA graph keys, tells the graphs of either apart."""
     import importlib
     for name, flag in (("shared.sage1_core", "LAST_WAVE_SPLIT"), ("shared.sage2_core", "LAST_WAVE_SPLIT"), ("sagegp.sm120.dense", "SPLIT_KEYS")):
@@ -118,16 +118,27 @@ AUTO_MARGIN = (512 << 20, 0.10)  # Auto leaves at least this much of the card fr
 _needed = {}  # Auto: kind of call -> whether it is chunked (decided at its first call, kept: a CUDA graph records that decision)
 
 
+def _auto_room(device):
+    """Auto: the bytes new allocations may take: the card (the GPU's VRAM, or the --max-vram card) less AUTO_MARGIN and the VRAM allocated
+    now (weights included), and with the MMGP VRAM allocator never more than what it may still take (its room: the VRAM other programs
+    leave, the --max-vram limit) less AUTO_MARGIN's bytes. Its reserved VRAM not allocated does not count: chunks of earlier phases (the
+    text encoders, the VAE) that a large allocation cannot use (H3 1080p, 0.85 GiB of them: the 1.47 GiB of out_proj's kept input failed)."""
+    card, allocated = torch.cuda.get_device_properties(device).total_memory, torch.cuda.memory_allocated(device)
+    room = card - max(AUTO_MARGIN[0], AUTO_MARGIN[1] * card) - allocated
+    if allocator.active == "vmm":
+        room = min(room, allocator.room(device) - AUTO_MARGIN[0])
+    return room
+
+
 def chunking_needed(device, extra_bytes, kind):
     """Whether a call chunks its inputs (splits its heads, cuts its rows): always with "on", never with "off". With "auto", only where
-    the whole input would not fit: the VRAM allocated now (weights included) plus extra_bytes, what the unchunked path adds, above the
-    card (the GPU's VRAM, or the --max-vram card) less AUTO_MARGIN. Decided once per kind of call (shape, tokens), at its first call."""
+    the whole input would not fit: extra_bytes, what the unchunked path adds, above _auto_room. Decided once per kind of call (shape,
+    tokens), at its first call."""
     if chunker != "auto":
         return chunker in ("on", "extreme")
     needed = _needed.get(kind)
     if needed is None:
-        card = torch.cuda.get_device_properties(device).total_memory if device.type == "cuda" else 0
-        needed = _needed[kind] = bool(card) and torch.cuda.memory_allocated(device) + extra_bytes > card - max(AUTO_MARGIN[0], AUTO_MARGIN[1] * card)
+        needed = _needed[kind] = device.type == "cuda" and extra_bytes > _auto_room(device)
     return needed
 
 
@@ -135,48 +146,91 @@ _extreme_levels = {}  # Auto: (shapes, LoRA ranks) -> the extreme level plan_ext
 
 
 @contextlib.contextmanager
-def plan_extreme(owner, device, rows, hidden, heads, kv_heads, head_dim, projections, out_proj):
+def plan_extreme(owner, device, dtype, rows, hidden, heads, kv_heads, head_dim, projections, out_proj):
     """Auto: the blocks of a model that gives its attentions' inputs by ranges of rows (an mmgp offload.RowSource: EXTREME_LOW_VRAM) run
     in the extreme mode where the chunked attention ("on") would not fit, for the blocks run inside this context: groups of 2 key / value
-    heads where they fit, else of 1 (the lowest VRAM). The estimates follow the shapes: the VRAM allocated now and what a pass over the
-    blocks adds for its weights (mmgp runtime.pass_weight_bytes: streamed blocks' slots, less the preloaded blocks the VRAM pressure
-    releases), plus the attention's peak of each mode: chunked, its normalized input whole (rows x hidden, 16-bit), prepared in place,
-    beside out_proj's kept INT8 input and the q / k / v of its largest group (MOST_GROUPS groups); extreme, out_proj's kept input, a
-    group's q / k / v, half a range of rows (EXTREME_RANGE_BYTES), the LoRA products of every row (q / k / v, and out_proj's in FP32).
-    Against the card less AUTO_MARGIN, as chunking_needed. Decided once per shapes and LoRA ranks; yields the level (0: not extreme).
-    owner: a module of the model (its MMGP manager); projections: the q / k / v linears, out_proj the output projection."""
-    if chunker != "auto" or rows < MIN_SPLIT_TOKENS or device.type != "cuda" or kv_heads < 2:
-        yield 0
+    heads where they fit, else of 1 (the lowest VRAM). Decided at the first extreme_low_vram() inside it (the graph gate at the first
+    graphed block call, or the model's block), once MMGP has loaded that block's weights: their format says what the attention keeps.
+    The estimates follow the shapes: the VRAM allocated then and what a pass over the blocks adds for its weights (mmgp
+    runtime.pass_weight_bytes: streamed blocks' slots, less the preloaded blocks the VRAM pressure releases), plus the attention's peak
+    of each mode: chunked, its normalized input whole (rows x hidden, 16-bit), prepared in place, beside out_proj's kept input (INT8
+    where its format keeps it so: column_input) and the q / k / v of its largest group (MOST_GROUPS groups); extreme, out_proj's kept
+    input, a group's q / k / v, half a range of rows (EXTREME_RANGE_BYTES), the LoRA products of every row (q / k / v, and out_proj's
+    in FP32). The chunked estimate is an upper bound for weight formats that prepare their input beside it (no prepare_in_place:
+    Triton, Comfy Kitchen; H3 1080p: 7.9 GiB above the blocks' start with Triton, 5.1 with Kitchen, 3.2 with WGPKernels).
+    Against _auto_room, as chunking_needed. Decided once per shapes and LoRA ranks.
+    Extreme (forced): the same estimates decide whether the extreme mode pays for these blocks: where it would save less than
+    EXTREME_MIN_SAVING over the chunked attention (images, short videos: inputs of a few hundred MB), they run as Standard (CUDA graphs,
+    the Peak Fit groups) at its speed.
+    owner: a module of the model (its MMGP manager); projections: the q / k / v linears, out_proj the output projection (None: the
+    attention's output is kept whole in 16 bits, read with another stream: Flux's single blocks)."""
+    global _extreme_plan, EXTREME_LOW_VRAM, EXTREME_GROUP_HEADS, EXTREME_LORA_PRODUCTS
+    if chunker not in ("auto", "extreme") or rows < MIN_SPLIT_TOKENS or device.type != "cuda" or kv_heads < 2:
+        yield
         return
-    rank_qkv, rank_out = offload.lora_rank(projections), offload.lora_rank([out_proj])
-    key = (rows, hidden, heads, kv_heads, head_dim, rank_qkv, rank_out)
+    saved = EXTREME_LOW_VRAM, EXTREME_GROUP_HEADS, EXTREME_LORA_PRODUCTS
+    _extreme_plan = (owner, device, dtype, rows, hidden, heads, kv_heads, head_dim, projections, out_proj)
+    cuda_graphs.reset_gates()  # an enclosing scope's graphed calls (a model's preparation) read the gate before this decision
+    try:
+        yield
+    finally:
+        _extreme_plan = None
+        if (EXTREME_LOW_VRAM, EXTREME_GROUP_HEADS, EXTREME_LORA_PRODUCTS) != saved:
+            EXTREME_LOW_VRAM, EXTREME_GROUP_HEADS, EXTREME_LORA_PRODUCTS = saved
+            _last_wave_split(EXTREME_LOW_VRAM)
+
+
+_extreme_plan = None  # plan_extreme's arguments until extreme_low_vram() decides
+
+
+def extreme_low_vram():
+    """EXTREME_LOW_VRAM, after plan_extreme's pending decision (if any) is taken."""
+    global _extreme_plan, EXTREME_LOW_VRAM, EXTREME_GROUP_HEADS, EXTREME_LORA_PRODUCTS
+    if _extreme_plan is None:
+        return EXTREME_LOW_VRAM
+    owner, device, dtype, rows, hidden, heads, kv_heads, head_dim, projections, out_proj = _extreme_plan
+    _extreme_plan = None
+    rank_qkv, rank_out = offload.lora_rank(projections), 0 if out_proj is None else offload.lora_rank([out_proj])
+    key = (rows, hidden, heads, kv_heads, head_dim, rank_qkv, rank_out, dtype)
     level = _extreme_levels.get(key)
     if level is None:
-        card = torch.cuda.get_device_properties(device).total_memory
-        budget = card - max(AUTO_MARGIN[0], AUTO_MARGIN[1] * card) - torch.cuda.memory_allocated(device) - runtime.pass_weight_bytes(owner)
-        kept = rows * heads * head_dim + rows * heads * head_dim // 128 * 4
+        budget = _auto_room(device) - runtime.pass_weight_bytes(owner)
+        inner = rows * heads * head_dim  # out_proj's input: kept in INT8 by its weight format where it can (column_input), else in 16 bits
+        kept = inner + inner // 128 * 4 if out_proj is not None and ops.column_input(out_proj, rows, dtype, device) is not None else inner * 2
         group = lambda h: rows * h * head_dim * 2 * (heads // kv_heads + 2)
         norm = rows * hidden * 2
-        chunked = norm + max(0, kept - norm // 2) + group(-(-kv_heads // MOST_GROUPS))
+        if offload.prepares_in_place(projections, dtype, device):
+            chunked = norm + max(0, kept - norm // 2) + group(-(-kv_heads // MOST_GROUPS))
+        else:  # prepared beside its input (Triton, Comfy Kitchen): an upper bound, the input, a rotated copy and the prepared rows
+            chunked = 3 * norm + kept + group(-(-kv_heads // MOST_GROUPS))
         extreme = lambda h: (kept + group(h) + EXTREME_RANGE_BYTES // 2 + rows * rank_qkv * 2 + rows * rank_out * 4
                              + (rows * head_dim * 2 if kv_heads % h else 0))
-        level = _extreme_levels[key] = 0 if chunked <= budget else 2 if extreme(2) <= budget else 1
+        if chunker == "extreme":  # forced: only where it saves EXTREME_MIN_SAVING (its groups: the floor's)
+            floor = extreme_group_heads(kv_heads, group(1))
+            level = _extreme_levels[key] = floor if chunked - extreme(floor) >= EXTREME_MIN_SAVING else 0
+            if not level:
+                tqdm.write(f"Smart Inputs Chunker Extreme: Standard chunking for these blocks, the extreme mode would save "
+                           f"{max(0, chunked - extreme(floor)) / 2**20:.0f} MB of attention peak")
+            if not level:
+                EXTREME_LOW_VRAM = EXTREME_LORA_PRODUCTS = False
+                _last_wave_split(False)
+            return EXTREME_LOW_VRAM
+        # the largest group up to the floor (at least 2 heads, as before) whose peak fits the room, else 1 head
+        most = extreme_group_heads(kv_heads, group(1), max(2, kv_heads))
+        level = _extreme_levels[key] = 0 if chunked <= budget else next((h for h in range(max(2, most), 1, -1) if (h == 2 or kv_heads % h == 0) and extreme(h) <= budget), 1)
         if level:
             tqdm.write(f"Smart Inputs Chunker Auto: extreme mode, groups of {level} head{'s' if level > 1 else ''} (estimated attention peak "
                        f"{extreme(level) / 2**30:.2f} GiB, chunked {chunked / 2**30:.2f} GiB, room {budget / 2**30:.2f} GiB)")
-    if not level:
-        yield 0
-        return
-    global EXTREME_LOW_VRAM, EXTREME_GROUP_HEADS, EXTREME_LORA_PRODUCTS
-    saved = EXTREME_LOW_VRAM, EXTREME_GROUP_HEADS, EXTREME_LORA_PRODUCTS
-    EXTREME_LOW_VRAM = EXTREME_LORA_PRODUCTS = True
-    EXTREME_GROUP_HEADS = level
-    _last_wave_split(True)
-    try:
-        yield level
-    finally:
-        EXTREME_LOW_VRAM, EXTREME_GROUP_HEADS, EXTREME_LORA_PRODUCTS = saved
-        _last_wave_split(False)
+    if chunker == "extreme":
+        if not level:
+            EXTREME_LOW_VRAM = EXTREME_LORA_PRODUCTS = False
+            _last_wave_split(False)
+        return EXTREME_LOW_VRAM
+    if level:
+        EXTREME_LOW_VRAM = EXTREME_LORA_PRODUCTS = True
+        EXTREME_GROUP_HEADS = level
+        _last_wave_split(True)
+    return EXTREME_LOW_VRAM
 
 
 def _graph_key():  # a block recorded in one mode runs other kernels than in another: part of every CUDA graph key
@@ -243,6 +297,26 @@ EXTREME_GROUP_HEADS = 1  # key / value heads per group with it
 # makes it again range by range, each range prepared, projected through the group's q / k / v columns and dropped. Bytes of 16-bit
 # rows per range (H3 1080p: 128 MiB, ~12.5k rows, -80 MB at the peak against 256 MiB at the same speed; the ranges are turns of a graph loop).
 EXTREME_RANGE_BYTES = 128 << 20
+# The group floor: a group of fewer bytes of q, k and v than this takes more heads (a divisor of the key / value heads). Each group makes
+# its input again and launches its own small kernels: below it (short calls: LTX-2's half-resolution stage, images) these costs
+# dominate; at the sizes that need the extreme mode a head is above it. A generation whose largest call is short pays at most this.
+# Forced Extreme, 2 blocks, RTX 5090 (ms per call for 1 / 2 / 4 / 8 heads): LTX-2.5 half-resolution 160 / 93 / 82 / 79, Wan 480p 81
+# frames 270 / 231 / 216 / 207, Qwen Image 2.1 2048x2048 94 / 77 / 72 / 67 (+20 / +44 / +108 MiB), Flux 2 2048x2048 560 / 290 /
+# 224 / 211: most of the gain by ~40 MB per group.
+EXTREME_GROUP_BYTES = 48 << 20
+# Forced Extreme runs the blocks of a plan_extreme as Standard where its estimated saving over the chunked attention is below this:
+# 2048x2048 images (Qwen Image 2.1, Flux 2: estimated 35 MB, measured 0.1-0.2 GiB, mostly Standard's CUDA graph pool, for 1.5-3x the
+# time) and LTX-2's half-resolution stage (0); long videos keep it (LTX-2.5 1080p 241 frames: estimated 229 MB, measured -0.63 GiB
+# with its FFN input by rows, +29 %). The estimate counts the attention alone.
+EXTREME_MIN_SAVING = 128 << 20
+
+
+def extreme_group_heads(kv_heads, head_bytes, most=None):
+    """Key / value heads per group of the extreme mode: the largest divisor of kv_heads (at most most) whose group of head_bytes per
+    head stays within EXTREME_GROUP_BYTES, EXTREME_GROUP_HEADS at least."""
+    limit = max(EXTREME_GROUP_HEADS, EXTREME_GROUP_BYTES // max(1, head_bytes))
+    limit = limit if most is None else min(limit, most)
+    return max([size for size in range(1, kv_heads + 1) if kv_heads % size == 0 and size <= limit] + [min(EXTREME_GROUP_HEADS, kv_heads)])
 # With it, the LoRA products x @ A of every row (rows x rank per factor: about 170 MB for q / k / v at rank 128 and 220k tokens) made once
 # before the groups (mmgp offload.row_lora_products), while out_proj's kept input is not allocated yet: the groups then read them instead of
 # making the 16-bit rows of each range and x @ A again.
@@ -988,8 +1062,67 @@ def _group_ms(projections, linear_inputs, lengths, batch, head_dim, device, shar
     return total + projection_cost.KERNELS_PER_GROUP * cost.kernel_ms
 
 
-def joint_qkv_attention(streams, *args, **kwargs):
-    """See _joint_qkv_attention; also measures Peak Fit's free room around the call (_Room)."""
+BY_ITEMS = True  # comparison switch: False attends a batch whole in the extreme mode (by_items ignored)
+
+
+def _item_rows(x, item):
+    """Batch item `item` of x (batch, tokens, features), a tensor or an mmgp RowSource (its rows read from the whole one's)."""
+    if not isinstance(x, offload.RowSource):
+        return x[item:item + 1]
+    tokens = x.shape[1]
+    first = item * tokens
+    fill_prepared = None if x.fill_prepared is None else lambda start, stop, form, want_rows: x.fill_prepared(first + start, first + stop, form, want_rows)
+    return offload.RowSource((1, *x.shape[1:]), x.dtype, x.device, lambda start, stop: x.fill(first + start, first + stop), fill_prepared=fill_prepared)
+
+
+def _by_items(streams, args, kwargs, by_items):
+    """joint_qkv_attention one batch item after another (EXTREME_LOW_VRAM, out_proj with a residual: what each item keeps of its
+    attention output for out_proj, its LoRA products and its head groups are one item's, the inputs made again by ranges as before).
+    by_items: True, or item -> keyword arguments of that item (norm_rope, fused_quant reading the item's rows of batch-wide tables)."""
+    inputs = []
+    for x_list, projections in streams:
+        inputs.append((x_list[0], projections))
+        x_list.clear()
+    streams = None
+    batch = inputs[0][0].shape[0]
+    residual, segments = kwargs["residual"], kwargs.get("segments")
+    out_stream = kwargs.get("out_stream")
+    lengths = [x.shape[1] for x, _ in inputs]
+    out_tokens = sum(lengths) if out_stream is None else lengths[out_stream]
+    rows = residual.view(-1, residual.shape[-1])
+    rests = []
+    for item in range(batch):
+        options = dict(kwargs, **({} if by_items is True else by_items(item)))
+        first, last = item * out_tokens, (item + 1) * out_tokens
+        options["residual"] = rows[first:last]
+        if segments is not None:
+            options["segments"] = [(max(start, first) - first, min(stop, last) - first, row) for start, stop, row in segments if stop > first and start < last]
+        for name in ("attention_mask", "head_gate"):
+            value = kwargs.get(name)
+            if torch.is_tensor(value) and value.shape[0] > 1:
+                options[name] = value[item:item + 1]
+        prefix = kwargs.get("kv_prefix")
+        if prefix is not None and not isinstance(prefix, KVPrefix) and prefix[0].shape[0] > 1:
+            options["kv_prefix"] = tuple(tensor[item:item + 1] for tensor in prefix)
+        item_args = list(args)
+        if "norm_rope" in options and len(item_args) > 2:
+            item_args[2] = options.pop("norm_rope")
+        result = joint_qkv_attention([([_item_rows(x, item)], projections) for x, projections in inputs], *item_args, **options)
+        if out_stream is not None:
+            rests.append(result)
+        result = None
+    inputs.clear()
+    return torch.cat(rests) if out_stream is not None else residual
+
+
+def joint_qkv_attention(streams, *args, by_items=None, **kwargs):
+    """See _joint_qkv_attention; also measures Peak Fit's free room around the call (_Room). by_items (models whose callbacks can
+    take one batch item: True, or item -> its keyword arguments): with EXTREME_LOW_VRAM, a batch of several items, an input given by
+    ranges of rows and out_proj with a residual, the items attended one after another (_by_items)."""
+    if (by_items is not None and BY_ITEMS and EXTREME_LOW_VRAM and kwargs.get("out_proj") is not None and kwargs.get("residual") is not None
+            and streams[0][0][0].dim() > 2 and streams[0][0][0].shape[0] > 1 and any(isinstance(x_list[0], offload.RowSource) for x_list, _ in streams)
+            and not isinstance(kwargs.get("kv_prefix"), KVPrefix) and kwargs.get("kv_window") is None and not callable(kwargs.get("attention_mask"))):
+        return _by_items(streams, args, kwargs, by_items)
     # no reference to the inputs here: the call hands them off
     room = _room_begin(streams[0][0][0].device, (sum(x_list[0].shape[-2] for x_list, _ in streams), args[0] if args else kwargs["heads"], args[1] if len(args) > 1 else kwargs["head_dim"]))
     try:
@@ -1006,7 +1139,7 @@ def joint_qkv_attention(streams, *args, **kwargs):
 def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, norm_spans_heads=False, split_heads=True, kv_prefix=None,
                         attention_mask=None, force_attention=None, attention_fn=None, norm_stats=None, _cross=False, norm_v=None, softmax_scale=None,
                         head_split_level=None, fused_quant=None, kv_window=None, out_proj=None, residual=None, gate=None, segments=None, norm_rows=False, head_gate=None,
-                        add_after=False, _room=None, sample_query=None):
+                        add_after=False, _room=None, sample_query=None, out_stream=None):
     """Attention of the q/k/v projections of several streams joined along the tokens in their order: streams is a list of
     (x_list, (q_proj, k_proj, v_proj)), each x handed off in its list, of shape (batch, tokens, features) or (tokens, features), or
     an mmgp offload.RowSource of shape (batch, tokens, features): an input only its projections read, prepared by ranges of tokens
@@ -1057,7 +1190,11 @@ def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, nor
     output is kept as that format reads it instead of one 16-bit (batch, tokens, heads, head_dim) tensor.
     add_after (with residual): the projection's output rounded to its dtype, then added to residual scaled by gate, as projecting the
     returned attention and adding it would (two roundings instead of the projection's residual epilogue), by ADD_AFTER_ROWS rows at a
-    time: neither the whole output nor the per-segment paths of the layer (segments of a few thousand rows: frames)."""
+    time: neither the whole output nor the per-segment paths of the layer (segments of a few thousand rows: frames).
+    out_stream (with out_proj and residual): out_proj, residual, gate and segments apply to that stream's tokens only (residual and
+    segments over its batch * tokens rows); the call returns the other streams' attention (batch, their tokens, heads, head_dim), in
+    their order (MMDiT blocks: the image stream projected into its residual here, the text returned for its own projection).
+    With EXTREME_LOW_VRAM one stream (of norms per head when there are several) may be a RowSource made again by every head group."""
     global _unsplit_notice
     if softmax_scale is not None and (force_attention != "sdpa" or attention_fn is not None):
         raise ValueError("An explicit softmax_scale requires force_attention='sdpa' and no attention_fn")
@@ -1075,11 +1212,18 @@ def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, nor
     kv_heads = kv_heads or heads
     staged = None if attention_fn is not None else sage_staged(inputs[0].device, head_dim, force_attention, attention_mask is not None)
     split_tokens = batch * (max(lengths) if _cross else tokens)
+    if out_stream is not None and (out_proj is None or residual is None or _cross):
+        raise ValueError("out_stream needs out_proj and residual, and joined streams")
+    out_start = 0 if out_stream is None else sum(lengths[:out_stream])  # the tokens out_proj projects
+    out_tokens = tokens if out_stream is None else lengths[out_stream]
     if split_heads and head_split_level is None and split_tokens >= MIN_SPLIT_TOKENS:  # Auto: all heads at once where they fit (their q, k, v and output)
         whole = kv_heads * _head_bytes(_cross, batch, lengths, tokens, heads, kv_heads, head_dim, dtype, staged) + batch * (lengths[0] if _cross else tokens) * heads * head_dim * dtype.itemsize
         split_heads = chunking_needed(device, whole, ("attention", heads, kv_heads, head_dim, batch, tuple(lengths), dtype, _cross))
-    extreme = EXTREME_LOW_VRAM and head_split_level is None and split_tokens >= MIN_SPLIT_TOKENS and kv_heads > EXTREME_GROUP_HEADS
-    extreme_sizes = [min(EXTREME_GROUP_HEADS, kv_heads - start) for start in range(0, kv_heads, EXTREME_GROUP_HEADS)]
+    group_heads = EXTREME_GROUP_HEADS
+    if EXTREME_LOW_VRAM and chunker == "extreme":  # the floor: groups of at least EXTREME_GROUP_BYTES (Auto chose its level with it)
+        group_heads = extreme_group_heads(kv_heads, _head_bytes(_cross, batch, lengths, tokens, heads, kv_heads, head_dim, dtype, staged))
+    extreme = EXTREME_LOW_VRAM and head_split_level is None and split_tokens >= MIN_SPLIT_TOKENS and kv_heads > group_heads
+    extreme_sizes = [min(group_heads, kv_heads - start) for start in range(0, kv_heads, group_heads)]
     sizes = extreme_sizes if extreme else head_partition(kv_heads, split_tokens, head_split_level) if split_heads else [kv_heads]  # the sizes follow the launch probe below, once the inputs are prepared
     groups = len(sizes)
     if (staged is not None and groups == 1 and kv_prefix is None and kv_window is None and attention_mask is None
@@ -1109,21 +1253,25 @@ def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, nor
         raise ValueError("A native cached prefix is attended by the unmasked staged attention it was made for (cache_prefix native=False otherwise)")
     linear_inputs = [None] * len(inputs)
     # EXTREME_LOW_VRAM: the input given by ranges of rows, made again by each group range by range (grouped_rows), never whole
+    # (one stream of several: the others prepared whole as usual, norms over all heads only with a single stream)
     ranged_source, lora_products = None, None
-    if (EXTREME_LOW_VRAM and ROW_SOURCES and groups > 1 and not _cross and len(inputs) == 1 and isinstance(inputs[0], offload.RowSource)
-            and offload.linear_rows_supported(projections[0], inputs[0])):
-        ranged_source, inputs[0] = inputs[0], None
+    ranged_index = next((index for index, x in enumerate(inputs) if isinstance(x, offload.RowSource)), None)
+    if (EXTREME_LOW_VRAM and ROW_SOURCES and groups > 1 and not _cross and ranged_index is not None and (len(inputs) == 1 or not norm_spans_heads)
+            and offload.linear_rows_supported(projections[ranged_index], inputs[ranged_index])):
+        ranged_source, inputs[ranged_index] = inputs[ranged_index], None
         range_rows = max(128, EXTREME_RANGE_BYTES // (ranged_source.shape[-1] * ranged_source.dtype.itemsize) // 128 * 128)
         if EXTREME_LORA_PRODUCTS:
-            lora_products = offload.row_lora_products(ranged_source, tuple(module for module in projections[0] if module is not None), range_rows)
-    out_columns = (ops.column_input(out_proj, batch * tokens, dtype, device, None if add_after else segments, None if add_after else residual)
+            lora_products = offload.row_lora_products(ranged_source, tuple(module for module in projections[ranged_index] if module is not None), range_rows)
+    else:
+        ranged_index = None
+    out_columns = (ops.column_input(out_proj, batch * out_tokens, dtype, device, None if add_after else segments, None if add_after else residual)
                    if out_proj is not None and groups > 1 else None)  # add_after reads it by spans of rows (linear(first, last))
     # one stream projected by groups and read back by out_proj's kept input: its input is prepared in its own memory, which then
     # holds that kept input too (the bytes the preparation frees: out_proj's input is as large as INT8, where its width is the input's)
     in_place = out_columns is not None and hasattr(out_columns, "reuse") and not _cross and len(inputs) == 1 and ranged_source is None
     for index, modules in enumerate(projections):
-        if ranged_source is not None:
-            break
+        if index == ranged_index:
+            continue
         if _cross:
             modules = tuple(module for module in modules if module is not None)
         if shared_kv:
@@ -1142,7 +1290,7 @@ def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, nor
         prepared_room = (allocator.probe_peak(device) - _room[1], allocator.probe_now(device) - _room[1])
         allocator.probe_reset(device)
     # a stream whose projections cannot be computed by groups of heads is projected whole once and sliced, if it is too short to be split
-    if ranged_source is None and groups > 1 and batch * sum(length for length, prepared in zip(lengths, linear_inputs) if prepared is None) >= MIN_SPLIT_TOKENS:
+    if groups > 1 and batch * sum(length for index, (length, prepared) in enumerate(zip(lengths, linear_inputs)) if prepared is None and index != ranged_index) >= MIN_SPLIT_TOKENS:
         if not _unsplit_notice:
             tqdm.write("[Attention] Smart Inputs Chunker: heads not split here, these q/k/v projections cannot be computed by groups of heads (weight format or LoRA type).")
             _unsplit_notice = True
@@ -1195,12 +1343,35 @@ def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, nor
             attention.mul_(head_gate[..., head_range.start:head_range.stop].unsqueeze(-1))
         return attention
 
+    rest = []  # out_stream: the other streams' attention (batch, their tokens, heads, head_dim)
+
+    def stream_rows(attention, head_range):
+        """attention (batch, tokens, heads of head_range, head_dim): with out_stream, the other streams' tokens copied into rest and
+        out_stream's tokens returned (a view where they are contiguous: one batch item); attention itself otherwise."""
+        if out_stream is None:
+            return attention
+        if not rest:
+            rest.append(attention.new_empty((batch, tokens - out_tokens, heads, head_dim)))
+        target, stop = rest[0][:, :, head_range.start:head_range.stop], out_start + out_tokens
+        target[:, :out_start].copy_(attention[:, :out_start])
+        target[:, out_start:].copy_(attention[:, stop:])
+        part = attention[:, out_start:stop]
+        return part if batch == 1 else part.contiguous()
+
     def finish(attention):
         """The attention output (a tensor, or out_proj's column input) through out_proj when it is given."""
         if out_proj is None:
             return attention
+        if out_stream is not None:
+            if torch.is_tensor(attention):
+                attention = stream_rows(attention, range(heads))
+            finish_stream(attention)
+            return rest.pop()
+        return finish_stream(attention)
+
+    def finish_stream(attention):
         if residual is not None and add_after:  # projected by spans of rows, each rounded, then added: never the whole output
-            total, column, rows = batch * tokens, not torch.is_tensor(attention), residual.view(-1, residual.shape[-1])
+            total, column, rows = batch * out_tokens, not torch.is_tensor(attention), residual.view(-1, residual.shape[-1])
             flat = None if column else attention.reshape(total, -1)
             for first in range(0, total, ADD_AFTER_ROWS):
                 last = min(total, first + ADD_AFTER_ROWS)
@@ -1214,16 +1385,33 @@ def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, nor
                 part = None
             return residual
         projected = ops.project(out_proj, [attention.flatten(2) if torch.is_tensor(attention) else attention], residual, gate, segments)
-        return projected if residual is not None else projected.view(batch, tokens, -1)
+        return projected if residual is not None else projected.view(batch, out_tokens, -1)
     whole = {}
 
     ranged = {}  # EXTREME_LOW_VRAM: the projections of the current group, made in one pass over the ranges of rows (grouped_rows)
+
+    def ranged_statistics():
+        """The per token mean squares of q and of k over all heads (HeadGroup.mean_squares) from one pass over the ranges of rows of the
+        input: each range made and prepared (offload.prepare_rows), projected through all of q's and k's columns, reduced and dropped
+        (re-projecting chunks of heads would take a pass over the input per chunk)."""
+        modules, total = projections[ranged_index], ranged_source.rows()
+        present = tuple(module for module in modules if module is not None)
+        squares = [torch.empty(total, dtype=torch.float32, device=device) for _ in range(2)]
+        for first in range(0, total, range_rows):
+            last = min(total, first + range_rows)
+            prepared = offload.prepare_rows(ranged_source, first, last, present, lora_products)
+            for which, width in ((0, heads), (1, kv_heads)):
+                part = offload.linear_rows(modules[which], prepared, 0, width * head_dim)
+                squares[which][first:last] = torch.linalg.vector_norm(part.reshape(last - first, -1), dim=-1, dtype=torch.float32).square_()
+                del part
+            prepared = None
+        return tuple(s.view(batch, -1).div_(width * head_dim).unsqueeze(-1) for s, width in zip(squares, (heads, kv_heads)))
 
     def grouped_rows(wanted):
         """{(which, start, stop): output columns of projection which for these heads} from one pass over the ranges of rows of the input:
         each range made and prepared (offload.prepare_rows: in one pass where the source can), projected and released, so that the
         input is never whole."""
-        modules, total = projections[0], ranged_source.rows()
+        modules, total = projections[ranged_index], ranged_source.rows()
         present = tuple(module for module in modules if module is not None)
         step = range_rows
         full = total // step
@@ -1254,12 +1442,12 @@ def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, nor
 
     def project_stream(index, which, head_range):
         module, linear_input = projections[index][which], linear_inputs[index]
-        if ranged_source is not None:
+        if index == ranged_index:
             key = (which, head_range.start, head_range.stop)
             if key not in ranged:  # the group's projections at its first one; a projection outside the groups on its own
                 current = ranged.pop("group", None)
-                wanted = [(which, head_range)] if current is None else [(w, current.q if w in (0, 3) else current.kv) for w in range(len(projections[0]))
-                                                                       if projections[0][w] is not None and not (shared_kv and w == 2)]
+                wanted = [(which, head_range)] if current is None else [(w, current.q if w in (0, 3) else current.kv) for w in range(len(projections[index]))
+                                                                       if projections[index][w] is not None and not (shared_kv and w == 2)]
                 if (which, head_range) not in wanted:
                     wanted = [(which, head_range)]
                 ranged.update(grouped_rows(wanted))
@@ -1342,6 +1530,8 @@ def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, nor
         kept, mean_squares = _token_qk(projections, linear_inputs, lengths, batch, heads, kv_heads, head_dim, dtype, device, norm_rope, staged, _cross,
                                        list(zip(q_ranges[:count], kv_ranges[:count])), count < groups or split_dense is not None, norm_rows == "heads",
                                        split_dense=split_dense)
+    elif norm_spans_heads and groups > 1 and ranged_source is not None:
+        mean_squares = ranged_statistics()
     elif norm_spans_heads and groups > 1 and norm_stats is not None:
         mean_squares = norm_stats(project)
     elif norm_spans_heads and groups > 1:
@@ -1442,7 +1632,7 @@ def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, nor
             if out_columns is not None:
                 attention = torch.empty((batch, tokens, len(group.q), head_dim), dtype=dtype, device=device)
                 gate_(core.staged_attention(attention, quantized, settings, mask), group.q)
-                attention_list, attention, output = [attention], None, out_columns
+                attention_list, attention, output = [stream_rows(attention, group.q)], None, out_columns
                 out_columns.append(attention_list)
                 continue
             if output is None:
@@ -1472,7 +1662,7 @@ def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, nor
             if groups == 1:
                 return finish(attention)
             if out_columns is not None:
-                attention_list, attention, output = [attention], None, out_columns
+                attention_list, attention, output = [stream_rows(attention, group.q)], None, out_columns
                 out_columns.append(attention_list)
                 continue
             if output is None:
@@ -1538,7 +1728,7 @@ def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, nor
             else:
                 core.staged_attention(query, quantized, settings, mask)
             gate_(query, group.q)
-            query_list, query, output = [query], None, out_columns
+            query_list, query, output = [stream_rows(query, group.q)], None, out_columns
             out_columns.append(query_list)
             continue
         if output is None:
