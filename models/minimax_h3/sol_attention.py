@@ -15,7 +15,7 @@ from shared.kernels import ops as denoiser_kernels
 SOL_ATTN_THRESH_TYPE = "diag"
 SOL_ATTN_MIN_TOKENS = 8192
 # Development switch: "i8" or "fp4" run the CUDA kernels of shared.sol_attn.cuda (GeForce RTX 50xx) instead of the Triton ones
-SOL_ATTN_CUDA = os.environ.get("WGP_SOL_CUDA", "")
+SOL_ATTN_CUDA = os.environ.get("WGP_SOL_CUDA", "i8")
 # the active Sol state of the running forward (tau, sink tokens, CUDA kernels): the blocks pass them to the kernels as numbers, which CUDA graphs
 # record, so they are part of the graph keys
 _graph_state = None

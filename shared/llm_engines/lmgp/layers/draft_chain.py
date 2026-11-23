@@ -224,41 +224,6 @@ class DraftChain:
         _load_q[(rows,)](self.q, self.device_ids, self.device_probs, self.device_counts, self.old_ids, self.old_counts, self.target_vocab, MAX_OUT, num_warps=1)
 
 
-class CompactDrafts:
-    """The draft distributions of a window: entries of the chain's proposals, dense rows only when asked (the reference sampler)."""
-    def __init__(self, chain, count):
-        self.chain, self.count = chain, count
-
-    def __len__(self):
-        return self.count
-
-    def _dense(self, row):
-        chain = self.chain
-        count = int(chain.counts[row])
-        q = torch.zeros(chain.target_vocab, dtype=torch.float32, device=chain.q.device)
-        q[torch.from_numpy(chain.ids[row, :count].copy()).long().to(q.device)] = torch.from_numpy(chain.probs[row, :count].copy()).to(q.device)
-        return q
-
-    def __getitem__(self, index):
-        return [self._dense(row) for row in range(*index.indices(self.count))] if isinstance(index, slice) else self._dense(index)
-
-    def load(self):
-        self.chain.load(self.count)
-
-
-class DeviceDrafts(CompactDrafts):
-    """The draft distributions of a GPU chain: its proposals stay in device memory (read back only for the reference sampler)."""
-    def _dense(self, row):
-        chain = self.chain
-        count = int(chain.device_counts[row])
-        q = torch.zeros(chain.target_vocab, dtype=torch.float32, device=chain.q.device)
-        q[chain.device_ids[row, :count].long()] = chain.device_probs[row, :count]
-        return q
-
-    def load(self):
-        self.chain.load_device(self.count)
-
-
 from shared.kernels.triton_compilation_log import install_triton_compilation_logger  # noqa: E402
 
 install_triton_compilation_logger()

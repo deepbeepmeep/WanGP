@@ -6,7 +6,9 @@ their bits (shift into FP32 bits; round to nearest even as PyTorch's casts, NaN 
   runs FP64 at 1/32 of the FP32 rate) with the inverse square root in FP64, the gated norm of 128 values computes in FP64; SiLU*mul
   reproduces the PyTorch route bit for bit;
 - the paged Q8 attention of decoding and speculative verification, on FP16 tensor cores (sm_75 has no BF16 ones), each K/V page read
-  once for the query heads of a KV head and all the queries of a verification, every row computed alike whatever the query count."""
+  once for the query heads of a KV head and all the queries of a verification, every row computed alike whatever the query count.
+Also helpers for kernels written once for every GPU (the row kernels of Inkling 2): to_float / round_bf16 / convert take BF16 or its
+bits, and portable_supported / reads_bits / bits_view choose them on the host."""
 import functools
 
 import torch
@@ -283,6 +285,61 @@ if triton is not None:
         denominator = tl.sum(tl.load(SUM + row * SPLITS + splits) * weights, 0)
         partial = tl.load(PARTIAL + (row * SPLITS + splits[:, None]) * D + dims[None, :])
         tl.store(OUT + row * D + dims, fp32_to_bf16_bits(tl.div_rn(tl.sum(partial * weights[:, None], 0), tl.maximum(denominator, 1.0e-20))))
+
+
+if triton is not None:
+    # Kernels written once for every GPU: their BF16 tensors arrive as BF16, or as int16 bits where Triton has no BF16 conversions
+    # (reads_bits), and these helpers choose at compile time. With BF16 tensors they are the plain conversions.
+    @triton.jit
+    def to_float(x):
+        """float32 of loaded values: BF16 bits (int16) shifted into place, any other type converted."""
+        if x.dtype == tl.int16:
+            return bf16_bits_to_fp32(x)
+        return x.to(tl.float32)
+
+    @triton.jit
+    def round_bf16(x, BITS: tl.constexpr):
+        """float32 x rounded to BF16, as float32."""
+        if BITS:
+            return bf16_bits_to_fp32(fp32_to_bf16_bits(x))
+        return x.to(tl.bfloat16).to(tl.float32)
+
+    @triton.jit
+    def convert(x, pointer):
+        """x in the element type of pointer, int16 on either side standing for BF16 bits."""
+        if (x.dtype == tl.int16) == (pointer.dtype.element_ty == tl.int16):
+            return x.to(pointer.dtype.element_ty)
+        elif x.dtype == tl.int16:
+            return bf16_bits_to_fp32(x).to(pointer.dtype.element_ty)
+        else:
+            return fp32_to_bf16_bits(x.to(tl.float32))
+
+
+HIP_ARCHS = ("gfx942", "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201")  # AMD GPUs for which Triton compiles the kernels written with the helpers above
+
+
+@functools.cache
+def reads_bits(device) -> bool:
+    """Whether BF16 tensors reach Triton kernels on this CUDA device as their int16 bits: NVIDIA GPUs below compute capability 8.0, whose
+    Triton (3.2 for Turing) has no BF16 conversions."""
+    return torch.version.hip is None and torch.cuda.get_device_capability(device) < (8, 0)
+
+
+@functools.cache
+def portable_supported(device) -> bool:
+    """Whether the kernels written with the helpers above run on device: NVIDIA GPUs from compute capability 7.5 (BF16 bits below 8.0),
+    the AMD architectures of HIP_ARCHS."""
+    device = torch.device(device)
+    if device.type != "cuda" or triton is None:
+        return False
+    if torch.version.hip is not None:
+        return torch.cuda.get_device_properties(device).gcnArchName.split(":")[0] in HIP_ARCHS
+    return torch.cuda.get_device_capability(device) >= (7, 5)
+
+
+def bits_view(tensor, bits):
+    """A BF16 tensor as its int16 bits when bits (reads_bits), any other tensor as it is."""
+    return tensor.view(torch.int16) if bits and tensor.dtype == torch.bfloat16 else tensor
 
 
 def _bits(tensor):

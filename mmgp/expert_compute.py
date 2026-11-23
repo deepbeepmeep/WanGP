@@ -2,6 +2,7 @@
 """Shared routed-expert execution (SwiGLU, SwiGLU with soft caps, or squared ReLU without a gate). Architecture code supplies routing, not
 residency, and quantization handlers supply the storage formats and their kernels (ExpertFormat)."""
 import ctypes
+import glob
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -17,7 +18,11 @@ from . import allocator, pinned
 
 
 _side_streams = {}
+NEAR_COMPLETE = 4  # prompt passes over a bank with at most this many experts out of VRAM keep the device grouping (those experts stream whole); more: the host path, which streams the routed ones only
+DEVICE_GROUPS = "device_groups" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(",")  # prompt passes over a bank whose experts all have a GPU copy: groups built on the device (no host synchronization; the same bits); disabled, on the host
 DOORBELL = "host" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the doorbell jobs of queue_forward, proven: the switch goes with the others at the end
+HIP = torch.version.hip is not None  # ROCm: host functions through the HIP runtime, no doorbell (shared.kernels.host_doorbell is NVIDIA-only)
+COUNT_ON_GPU = "gpu_counts" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # doorbell-free passes count their routing on the device (else not at all)
 
 
 def _side_stream(device):
@@ -39,18 +44,27 @@ def cpu_threads(format=None):
 _host_launch = None
 
 
+def _hip_runtime():
+    """The HIP runtime PyTorch for ROCm ships in torch/lib (amdhip64_<major>.dll on Windows, libamdhip64.so.<major> on Linux), else the system's."""
+    found = sorted(glob.glob(os.path.join(os.path.dirname(torch.__file__), "lib", "amdhip64*.dll" if os.name == "nt" else "libamdhip64.so*")))
+    return found[0] if found else ("amdhip64.dll" if os.name == "nt" else "libamdhip64.so")
+
+
 def launch_host_job(function, job, stream):
     """Queue function(&job) on a CUDA stream (captured as a host node inside a graph capture): it runs when the work queued before it is
-    done, and the work queued after it waits for it. The job (a ctypes structure) must stay alive while it may run or be replayed."""
+    done, and the work queued after it waits for it. The job (a ctypes structure) must stay alive while it may run or be replayed.
+    cuLaunchHostFunc(CUstream, CUhostFn, void *), on ROCm hipLaunchHostFunc(hipStream_t, hipHostFn_t, void *): the same contract."""
     global _host_launch
     if _host_launch is None:
-        driver = ctypes.CDLL("nvcuda.dll" if os.name == "nt" else "libcuda.so.1")
-        driver.cuLaunchHostFunc.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
-        driver.cuLaunchHostFunc.restype = ctypes.c_int
-        _host_launch = driver.cuLaunchHostFunc
+        if HIP:
+            _host_launch = ctypes.CDLL(_hip_runtime()).hipLaunchHostFunc
+        else:
+            _host_launch = ctypes.CDLL("nvcuda.dll" if os.name == "nt" else "libcuda.so.1").cuLaunchHostFunc
+        _host_launch.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        _host_launch.restype = ctypes.c_int
     status = _host_launch(stream.cuda_stream, function, ctypes.addressof(job))
     if status:
-        raise RuntimeError(f"cuLaunchHostFunc failed ({status})")
+        raise RuntimeError(f"{'hipLaunchHostFunc' if HIP else 'cuLaunchHostFunc'} failed ({status})")
 
 
 class ExpertFormat:
@@ -111,6 +125,10 @@ class ExpertFormat:
         """(shared.kernels.host_doorbell, address of a job function returning whether it wrote a result) when its CPU job can run beside the GPU's work on device, asked for by a kernel; None: a host function in
         the stream, which the GPU waits for."""
         return None
+
+    def count_pairs(self, ids, counts):
+        """Graph-safe: counts[expert] += the (token, slot) pairs of ids (int32 [tokens, topk], -1: none) routed to it, on the device (int32 counts at a fixed address, which graphs
+        read in place as the pointer table). Formats whose kernels cannot do it leave the counts unchanged."""
 
     def gpu_pass_supported(self, device):
         """Whether gpu_pass() runs on this device."""
@@ -305,6 +323,17 @@ class RoutedExperts(ExpertBank):
         x = x.reshape(-1, self.hidden).contiguous()
         tokens, topk = topk_ids.shape
         doorbell = self.format.doorbell(x.device) if DOORBELL and self.use_triton else None
+        if (doorbell is not None or HIP and self.use_triton) and self.doorbell_free and self._residency is not None and self._residency().complete():
+            # every expert in VRAM (experts.complete_residencies keys the graphs on it): the job would compute nothing and answer without a result
+            output = torch.empty(tokens, self.hidden, dtype=torch.float32, device=x.device)
+            mid = torch.empty(tokens * topk, self.intermediate, dtype=torch.float32, device=x.device)
+            topk_ids = topk_ids.contiguous()
+            self.format.gpu_forward(self, x, topk_ids, topk_weights.contiguous(), self._pointers(x.device), out=output, mid=mid)
+            if self.reports_usage and COUNT_ON_GPU:  # the routing the job would have counted, on the device: the placement still follows it (Residency.fold_counts)
+                self.format.count_pairs(topk_ids, self._residency().counter(self))
+            if meanwhile is not None:
+                meanwhile()
+            return output.to(dtype=x.dtype).reshape(shape)
         if doorbell is not None:
             # the CPU works beside the GPU's experts of this layer: asked for first, its result joined after them
             kernels, function = doorbell
@@ -383,6 +412,42 @@ class RoutedExperts(ExpertBank):
 
     def _ring_forward(self, stream, x, ids, weights):
         """A pass of many rows whose experts out of VRAM arrive through the stream of the model's Residency: the experts having a GPU copy run first, then the others by batches as they land. None if the format's kernels cannot take it."""
+        if self._flags.all():
+            from shared.kernels import expert_rows_native
+            if expert_rows_native.eligible(self, x):  # prompt passes on Blackwell's block-scaled tensor cores (opt-in: WGP_INKLING2_ENABLE=fp4_prefill)
+                with self.lease():
+                    out = expert_rows_native.forward(self.format.kind, x, ids, weights, self._pointers(x.device), self.caps)
+                if self.reports_usage:
+                    self.add_device_usage(torch.bincount(ids.reshape(-1).long(), minlength=self.num_experts))
+                return out
+        if DEVICE_GROUPS and getattr(self.format, "kind", None) is not None and np.count_nonzero(self._flags == 0) <= NEAR_COMPLETE:
+            # the routing stays on the device: the experts with a GPU copy are read in place, the few others stream whole (whatever the routing: no host round trip) and a second launch computes their pairs
+            from shared.kernels import prefill_fused_triton
+            if self.format.gpu_pass_supported(x.device):  # the grouped kernels of DeviceGroupedPass
+                with self.lease():
+                    missing = np.flatnonzero(self._flags == 0)
+                    batches = []
+                    if len(missing):
+                        wanted = np.zeros(self.num_experts, dtype=bool)
+                        wanted[missing] = True
+                        batches = stream.take(self, wanted)  # (no routing given: no CPU share)
+                        covered = np.zeros(self.num_experts, dtype=bool)
+                        for batch in batches:
+                            covered[batch.experts] = True
+                        if not covered[missing].all():
+                            raise RuntimeError(f"The expert stream left out experts {missing[~covered[missing]].tolist()} of a bank")
+                    job = prefill_fused_triton.DeviceGroupedPass(self.format.kind, x, ids, weights, self.intermediate, self.num_experts, self.caps)
+                    counts = job.run(prefill_fused_triton.padded_pointers(self._pointers(x.device)))
+                    if batches:
+                        table = stream.addresses(self, batches)
+                        for batch in batches:
+                            stream.wait(batch)
+                        job.run(prefill_fused_triton.padded_pointers(table))
+                        for batch in batches:
+                            stream.release(batch)
+                    if self.reports_usage:
+                        self.add_device_usage(counts)
+                    return job.finish()
         host_ids = ids.to("cpu")  # once the router has run: all that follows depends on it
         counts = np.bincount(host_ids.numpy().ravel(), minlength=self.num_experts)
         routed = counts > 0
@@ -463,6 +528,13 @@ class RoutedExperts(ExpertBank):
         residency = None if self._residency is None else self._residency()
         if residency is not None and residency.stream is not None:
             return self._ring_forward(residency.stream, x, ids, weights)
+        if torch.cuda.is_current_stream_capturing() and DEVICE_GROUPS and self._flags.all() and getattr(self.format, "kind", None) is not None and self.format.gpu_pass_supported(device):
+            # a prompt pass recorded in a graph (every expert in VRAM): the device grouping; its routing is not counted (a replay would count nothing)
+            from shared.kernels import prefill_fused_triton
+            with self.lease():
+                job = prefill_fused_triton.DeviceGroupedPass(self.format.kind, x, ids, weights, self.intermediate, self.num_experts, self.caps)
+                job.run(prefill_fused_triton.padded_pointers(self._pointers(device)))
+                return job.finish()
         if self.reports_usage:
             self.add_usage(ids)
         out = self.format.gpu_forward(self, x, ids, weights, self._pointers(device))

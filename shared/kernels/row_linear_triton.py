@@ -12,7 +12,9 @@ programs to read the weights at the card's bandwidth. WGP_INKLING2_DISABLE=tc_li
 (a float32 dot with each token in turn; other rounding).
 
 Optional soft cap of the rounded result (an LM head: cap * tanh(y / cap), float32). The input width is an architecture constant; tokens,
-strides and output rows are runtime arguments. NVIDIA GPUs from compute capability 8.0."""
+strides and output rows are runtime arguments. NVIDIA GPUs from compute capability 8.0 and the AMD architectures of
+shared.kernels.bf16_bits.HIP_ARCHS; NVIDIA GPUs of compute capability 7.5 (no BF16 tensor cores, no BF16 conversions in Triton) run the
+row kernel, on the BF16 tensors' bits."""
 import os
 from functools import cache
 
@@ -22,29 +24,38 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from shared.kernels.bf16_bits import bits_view, convert, portable_supported, reads_bits, round_bf16, to_float
+
 ROWS = 16  # tokens of a pass: beyond, a GEMM reads the weights once for many more rows than a program holds
 TENSOR_CORES = "tc_linear" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(",")
 TILE, UNIT, WARPS, STAGES = 16, 256, 4, 3  # output rows and input columns per step of a program (RTX 5090: the 7 projections of 48 block applications 1.93 ms at 1 row, 2.03 at 8)
+HIP_TILES = dict.fromkeys(("gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"), (16, 256, 4, 1))  # by AMD architecture: (TILE, UNIT, WARPS, STAGES) where those spill (RDNA3: one stage, no scratch)
 SEGMENTS = 4  # weights of one launch
 
 
 @cache
 def supported(device):
-    device = torch.device(device)
-    return device.type == "cuda" and torch.version.hip is None and torch.cuda.get_device_capability(device) >= (8, 0)
+    return portable_supported(device)
+
+
+@cache
+def _tiles(device):
+    if torch.version.hip is not None:
+        return HIP_TILES.get(torch.cuda.get_device_properties(device).gcnArchName.split(":")[0], (TILE, UNIT, WARPS, STAGES))
+    return TILE, UNIT, WARPS, STAGES
 
 
 @triton.jit(do_not_specialize=("TOKENS", "STRIDE", "OUT", "cap", "inverse"), do_not_specialize_on_alignment=("X", "W", "Y"))
-def _linear(X, W, Y, TOKENS, STRIDE, OUT, cap, inverse, IN: tl.constexpr, BLOCK: tl.constexpr, SOFTCAP: tl.constexpr):
+def _linear(X, W, Y, TOKENS, STRIDE, OUT, cap, inverse, IN: tl.constexpr, BLOCK: tl.constexpr, SOFTCAP: tl.constexpr, BITS: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     columns = tl.arange(0, BLOCK)
     inside = columns < IN
-    weights = tl.load(W + row * IN + columns, mask=inside, other=0.0).to(tl.float32)
+    weights = to_float(tl.load(W + row * IN + columns, mask=inside, other=0.0))
     for token in range(TOKENS):  # one token after the other: the same sum for a token whatever the tokens of the pass
-        y = tl.sum(weights * tl.load(X + token * STRIDE + columns, mask=inside, other=0.0).to(tl.float32))
+        y = tl.sum(weights * to_float(tl.load(X + token * STRIDE + columns, mask=inside, other=0.0)))
         if SOFTCAP:
-            y = libdevice.tanh(y.to(tl.bfloat16).to(tl.float32) * inverse) * cap
-        tl.store(Y + token * OUT + row, y.to(Y.dtype.element_ty))
+            y = libdevice.tanh(round_bf16(y, BITS) * inverse) * cap
+        tl.store(Y + token * OUT + row, convert(y, Y))
 
 
 @triton.jit
@@ -96,16 +107,19 @@ def linears(pairs, dtype=None, softcap=None):
         raise ValueError("The row linears take the CUDA rows of a short pass, of one width, and contiguous BF16 weights")
     outs = [torch.empty(tokens, weight.shape[0], dtype=torch.float32 if softcap is not None else dtype or x.dtype, device=x.device) for x, weight in pairs]
     cap, inverse = _cap(softcap)
-    if not TENSOR_CORES:
+    bits = reads_bits(pairs[0][0].device)
+    if not TENSOR_CORES or bits:
         for (x, weight), out in zip(pairs, outs):
-            _linear[(weight.shape[0],)](x, weight, out, tokens, x.stride(0), weight.shape[0], cap, inverse, inputs, triton.next_power_of_2(inputs), softcap is not None, num_warps=4, enable_fp_fusion=False)
+            _linear[(weight.shape[0],)](bits_view(x, bits), bits_view(weight, bits), bits_view(out, bits), tokens, x.stride(0), weight.shape[0], cap, inverse, inputs, triton.next_power_of_2(inputs), softcap is not None, bits,
+                                        num_warps=4, enable_fp_fusion=False)
         return outs
-    starts = np.cumsum([0] + [triton.cdiv(weight.shape[0], TILE) for _, weight in pairs]).tolist()
+    tile, unit, warps, stages = _tiles(pairs[0][0].device)
+    starts = np.cumsum([0] + [triton.cdiv(weight.shape[0], tile) for _, weight in pairs]).tolist()
     last = len(pairs) - 1
     segments = [(*pairs[min(index, last)], outs[min(index, last)]) for index in range(SEGMENTS)]
     bounds = (starts[1:] + [starts[-1]] * SEGMENTS)[:SEGMENTS - 1]
-    _linears[(starts[-1],)](*(t for segment in segments for t in segment), *(x.stride(0) for x, _, _ in segments), *(weight.shape[0] for _, weight, _ in segments), *bounds, tokens, cap, inverse, inputs, TILE, UNIT,
-                            softcap is not None, num_warps=WARPS, num_stages=STAGES)
+    _linears[(starts[-1],)](*(t for segment in segments for t in segment), *(x.stride(0) for x, _, _ in segments), *(weight.shape[0] for _, weight, _ in segments), *bounds, tokens, cap, inverse, inputs, tile, unit,
+                            softcap is not None, num_warps=warps, num_stages=stages)
     return outs
 
 

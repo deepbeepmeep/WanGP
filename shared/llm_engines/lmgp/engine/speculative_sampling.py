@@ -5,7 +5,7 @@ import torch
 
 from mmgp import cuda_graphs
 
-from ..layers.draft_chain import CompactDrafts
+from .draft_sources import CompactDrafts
 
 _COMPACT = "compact_accept" in os.environ.get("WGP_FN_ENABLE", "").split(",")  # the acceptance on the target's top-k support (compact_acceptance), until validated
 
@@ -78,7 +78,8 @@ def sample_verified_block(runner, seq, logits, draft_tokens, draft_distributions
         penalty = 1.  # inside code, quotes or backticks: copied text, not repetition (drafted tokens of the block are approximated as outside)
     exempt = seq.repetition_exempt_ids if penalty != 1 else None
     compact = isinstance(draft_distributions, CompactDrafts)
-    from . import compact_acceptance
+    if _COMPACT:  # Triton kernels
+        from . import compact_acceptance
     support = _COMPACT and seq.top_k != 1 and compact_acceptance.supported(seq, logits)
     key = (n, vocab, logits.dtype, seq.top_k, seq.top_p, seq.min_p, seq.temperature, penalty, exempt,
            tuple(rules["suppressed"]), tuple(rules["thinking_stops"]), tuple(sorted(stop_ids)), compact, support)

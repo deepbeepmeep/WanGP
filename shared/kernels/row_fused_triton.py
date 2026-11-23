@@ -4,8 +4,10 @@ its number of kernels (a few microseconds each inside a CUDA graph, whatever the
 
 Every kernel computes in float32 registers, in the order of the PyTorch expression it replaces, and rounds where that expression stores
 BF16 (ROUND_IN: an input the expression rounds to BF16 first); reductions sum in another order. Widths (hidden size, head size, taps,
-ranks) are architecture constants; rows, tokens and positions are runtime arguments. NVIDIA GPUs from compute capability 8.0 (BF16
-conversions); elsewhere the callers keep their PyTorch path."""
+ranks) are architecture constants; rows, tokens and positions are runtime arguments. NVIDIA GPUs from compute capability 7.5 (below 8.0
+the BF16 tensors as their bits: shared.kernels.bf16_bits) and the AMD architectures of bf16_bits.HIP_ARCHS; elsewhere the callers keep
+their PyTorch path."""
+import os
 from functools import cache
 
 import numpy as np
@@ -14,11 +16,12 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from shared.kernels.bf16_bits import bits_view, convert, portable_supported, reads_bits, round_bf16, to_float
+
 
 @cache
 def supported(device):
-    device = torch.device(device)
-    return device.type == "cuda" and torch.version.hip is None and torch.cuda.get_device_capability(device) >= (8, 0)
+    return portable_supported(device)
 
 
 def _block(width):
@@ -26,24 +29,26 @@ def _block(width):
 
 
 @triton.jit
-def _bf16(x, ROUND: tl.constexpr):
+def _bf16(x, ROUND: tl.constexpr, BITS: tl.constexpr):
     """float32 x, through BF16 when the replaced expression stores it there."""
+    if BITS:
+        return round_bf16(to_float(x), True) if ROUND else to_float(x)
     if ROUND:
         return x.to(tl.bfloat16).to(tl.float32)
     return x.to(tl.float32)
 
 
 @triton.jit(do_not_specialize=("eps", "STRIDE"), do_not_specialize_on_alignment=("X", "W", "Y"))
-def _rms(X, W, Y, eps, STRIDE, N: tl.constexpr, HAS_WEIGHT: tl.constexpr, ROUND_IN: tl.constexpr, BLOCK: tl.constexpr):
+def _rms(X, W, Y, eps, STRIDE, N: tl.constexpr, HAS_WEIGHT: tl.constexpr, ROUND_IN: tl.constexpr, BLOCK: tl.constexpr, BITS: tl.constexpr):
     # y = x * rsqrt(mean(x^2) + eps) [* weight], a row of N values per program
     row = tl.program_id(0).to(tl.int64)
     columns = tl.arange(0, BLOCK)
     inside = columns < N
-    x = _bf16(tl.load(X + row * STRIDE + columns, mask=inside, other=0.0), ROUND_IN)
+    x = _bf16(tl.load(X + row * STRIDE + columns, mask=inside, other=0.0), ROUND_IN, BITS)
     y = x * tl.rsqrt(tl.div_rn(tl.sum(x * x), N * 1.0) + eps)
     if HAS_WEIGHT:
-        y = tl.load(W + columns, mask=inside, other=0.0).to(tl.float32) * y
-    tl.store(Y + row * N + columns, y.to(Y.dtype.element_ty), mask=inside)
+        y = to_float(tl.load(W + columns, mask=inside, other=0.0)) * y
+    tl.store(Y + row * N + columns, convert(y, Y), mask=inside)
 
 
 def rms(x, eps, weight=None, dtype=torch.float32, round_input=False):
@@ -52,23 +57,25 @@ def rms(x, eps, weight=None, dtype=torch.float32, round_input=False):
     if not x.is_contiguous() and not (x.dim() == 2 and x.stride(1) == 1):
         x = x.contiguous()
     out = torch.empty(x.shape, dtype=dtype, device=x.device)
-    _rms[(x.numel() // width,)](x, x if weight is None else weight, out, eps, x.stride(0) if x.dim() == 2 else width, width, weight is not None, round_input, _block(width), num_warps=4 if width > 512 else 1, enable_fp_fusion=False)
+    bits = reads_bits(x.device)
+    _rms[(x.numel() // width,)](bits_view(x, bits), bits_view(x if weight is None else weight, bits), bits_view(out, bits), eps, x.stride(0) if x.dim() == 2 else width, width, weight is not None, round_input, _block(width), bits,
+                                num_warps=4 if width > 512 else 1, enable_fp_fusion=False)
     return out
 
 
 @triton.jit(do_not_specialize=("threshold", "STRIDE"), do_not_specialize_on_alignment=("X", "S", "TAU", "Y"))
-def _clip(X, S, TAU, Y, threshold, STRIDE, GROUPS: tl.constexpr, N: tl.constexpr, HAS_SCALE: tl.constexpr, HAS_TAU: tl.constexpr, ROUND_IN: tl.constexpr, BLOCK: tl.constexpr):
+def _clip(X, S, TAU, Y, threshold, STRIDE, GROUPS: tl.constexpr, N: tl.constexpr, HAS_SCALE: tl.constexpr, HAS_TAU: tl.constexpr, ROUND_IN: tl.constexpr, BLOCK: tl.constexpr, BITS: tl.constexpr):
     # y = l2_clip(x * scale, threshold) rounded to BF16 [then * tau of its token, rounded again]: a group of N values per program
     row = tl.program_id(0).to(tl.int64)
     columns = tl.arange(0, BLOCK)
     inside = columns < N
-    x = _bf16(tl.load(X + (row // GROUPS) * STRIDE + (row % GROUPS) * N + columns, mask=inside, other=0.0), ROUND_IN)
+    x = _bf16(tl.load(X + (row // GROUPS) * STRIDE + (row % GROUPS) * N + columns, mask=inside, other=0.0), ROUND_IN, BITS)
     if HAS_SCALE:
-        x = x * tl.load(S + (row % GROUPS) * N + columns, mask=inside, other=0.0).to(tl.float32)
+        x = x * to_float(tl.load(S + (row % GROUPS) * N + columns, mask=inside, other=0.0))
     y = x * tl.minimum(tl.div_rn(threshold, tl.sqrt_rn(tl.sum(x * x)) + 1e-6), 1.0)
     if HAS_TAU:
-        y = y.to(tl.bfloat16).to(tl.float32) * tl.load(TAU + row // GROUPS)
-    tl.store(Y + row * N + columns, y.to(Y.dtype.element_ty), mask=inside)
+        y = round_bf16(y, BITS) * tl.load(TAU + row // GROUPS)
+    tl.store(Y + row * N + columns, convert(y, Y), mask=inside)
 
 
 def clip(x, threshold, scale=None, tau=None, dtype=torch.bfloat16, round_input=False):
@@ -77,15 +84,21 @@ def clip(x, threshold, scale=None, tau=None, dtype=torch.bfloat16, round_input=F
     if not x.is_contiguous():
         x = x.contiguous()
     out = torch.empty(x.shape, dtype=dtype, device=x.device)
-    _clip[(tokens * groups,)](x, x if scale is None else scale, out if tau is None else tau, out, threshold, groups * width, groups, width, scale is not None, tau is not None, round_input, _block(width), num_warps=1, enable_fp_fusion=False)
+    bits = reads_bits(x.device)
+    x_, out_ = bits_view(x, bits), bits_view(out, bits)
+    _clip[(tokens * groups,)](x_, x_ if scale is None else bits_view(scale, bits), out_ if tau is None else tau, out_, threshold, groups * width, groups, width, scale is not None, tau is not None, round_input, _block(width), bits,
+                              num_warps=1, enable_fp_fusion=False)
     return out
 
 
-@triton.jit(do_not_specialize=("RING", "eps", "threshold", "inverse"), do_not_specialize_on_alignment=("X", "R", "W", "POS", "Y"))
-def _causal(X, R, W, DYN, POS, Y, RING, eps, threshold, inverse, C: tl.constexpr, TAPS: tl.constexpr, N: tl.constexpr, POST: tl.constexpr, DYNAMIC: tl.constexpr, BLOCK: tl.constexpr):
+@triton.jit(do_not_specialize=("RING", "eps", "threshold", "inverse", "STORE_RING"), do_not_specialize_on_alignment=("X", "R", "W", "POS", "Y", "RES", "STORE"))
+def _causal(X, R, W, DYN, POS, Y, RES, STORE, RING, eps, threshold, inverse, STORE_RING, C: tl.constexpr, TAPS: tl.constexpr, N: tl.constexpr, POST: tl.constexpr, DYNAMIC: tl.constexpr,
+            BLOCK: tl.constexpr, ROUND_OUT: tl.constexpr, RESIDUAL: tl.constexpr, HAS_STORE: tl.constexpr, BITS: tl.constexpr):
     # Causal depthwise convolution with its residual over the rows of a pass and the rows before them, kept by position in the ring R (which takes
     # the rows of the pass); a program: N channels of a token. POST 0: nothing; 1: the BF16 result clipped (l2_clip); 2: normalized (rms).
     # DYNAMIC: the taps W [TAPS, C], by backward distance, plus those of the token and of its group of N channels, DYN [tokens, groups * TAPS].
+    # ROUND_OUT (POST 0): the result rounded to BF16, then (RESIDUAL) added to the float32 value of RES [tokens, C], stored in Y's dtype.
+    # HAS_STORE: the result also written at row position % STORE_RING of STORE [STORE_RING, C] (a ring of keys or values by position).
     token = tl.program_id(0).to(tl.int64)
     channels = tl.program_id(1) * N + tl.arange(0, BLOCK)
     inside = tl.arange(0, BLOCK) < N
@@ -95,59 +108,76 @@ def _causal(X, R, W, DYN, POS, Y, RING, eps, threshold, inverse, C: tl.constexpr
     for tap in tl.static_range(TAPS):
         source = position - tap if DYNAMIC else position - (TAPS - 1) + tap
         if source >= first:
-            value = tl.load(X + (source - first) * C + channels, mask=inside, other=0.0).to(tl.float32)
+            value = to_float(tl.load(X + (source - first) * C + channels, mask=inside, other=0.0))
         else:
-            value = tl.load(R + (source % RING) * C + channels, mask=inside & (source >= 0), other=0.0).to(tl.float32)
+            value = to_float(tl.load(R + (source % RING) * C + channels, mask=inside & (source >= 0), other=0.0))
         if DYNAMIC:
-            total += value * (tl.load(W + tap * C + channels, mask=inside, other=0.0).to(tl.float32) + tl.load(DYN + (token * (C // N) + tl.program_id(1)) * TAPS + tap).to(tl.float32))
+            total += value * (to_float(tl.load(W + tap * C + channels, mask=inside, other=0.0)) + to_float(tl.load(DYN + (token * (C // N) + tl.program_id(1)) * TAPS + tap)))
         else:
-            total += value * tl.load(W + channels * TAPS + tap, mask=inside, other=0.0).to(tl.float32)
+            total += value * to_float(tl.load(W + channels * TAPS + tap, mask=inside, other=0.0))
     x = tl.load(X + token * C + channels, mask=inside, other=0.0)
-    y = (total + x.to(tl.float32)) * inverse  # PyTorch divides by a scalar this way
-    tl.store(R + (position % RING) * C + channels, x.to(R.dtype.element_ty), mask=inside)
+    y = (total + to_float(x)) * inverse  # PyTorch divides by a scalar this way
+    tl.store(R + (position % RING) * C + channels, convert(x, R), mask=inside)
     if POST == 1:
-        y = y.to(tl.bfloat16).to(tl.float32)
+        y = round_bf16(y, BITS)
         y = y * tl.minimum(tl.div_rn(threshold, tl.sqrt_rn(tl.sum(y * y)) + 1e-6), 1.0)
     if POST == 2:
-        y = y.to(tl.bfloat16).to(tl.float32)
+        y = round_bf16(y, BITS)
         y = y * tl.rsqrt(tl.div_rn(tl.sum(y * y), N * 1.0) + eps)
-    tl.store(Y + token * C + channels, y.to(Y.dtype.element_ty), mask=inside)
+    if ROUND_OUT:
+        y = round_bf16(y, BITS)
+        if RESIDUAL:
+            y = to_float(tl.load(RES + token * C + channels, mask=inside, other=0.0)) + y
+    tl.store(Y + token * C + channels, convert(y, Y), mask=inside)
+    if HAS_STORE:
+        tl.store(STORE + (position % STORE_RING) * C + channels, convert(convert(y, Y), STORE), mask=inside)
 
 
 CAUSAL_ROWS = 16  # tokens of a pass whose convolutions run fused: its rows must not reach the ring rows it reads
 
 
-def causal_conv(x, ring, weight, positions, dtype, group=None, post=0, eps=0.0, threshold=0.0, dynamic=None):
+def causal_conv(x, ring, weight, positions, dtype, group=None, post=0, eps=0.0, threshold=0.0, dynamic=None, residual=None, out_dtype=None, store=None):
     """((taps over the rows before each token, the last on the token itself) * weight + x) / sqrt(taps + 1) in dtype, x [tokens, channels] of consecutive
     positions; ring [rows, channels] keeps the inputs by position (zeros before position 0) and takes x. weight [channels, 1, taps]. group: channels of a
     program (a head: post 1 clips its BF16 result to threshold, post 2 normalizes it with eps). dynamic [tokens, groups * taps]: weight is [taps, channels]
-    by backward distance, a token's group adds its own taps, and the divisor is sqrt(2 taps + 1)."""
+    by backward distance, a token's group adds its own taps, and the divisor is sqrt(2 taps + 1). out_dtype (post 0): the result in dtype, then plus residual [tokens, channels]
+    when given (in float32), in out_dtype: what (residual.float() + result.float()).to(out_dtype) gives, in the same kernel. store [rows, channels] (contiguous, a ring by position, as many rows
+    as at least the tokens): the result also written at row position % rows, as store[positions % rows] = result does."""
     tokens, channels = x.shape
     taps = weight.shape[-1] if dynamic is None else weight.shape[0]
     if tokens > min(CAUSAL_ROWS, ring.shape[0] - taps + 1) or not x.is_contiguous():
         raise ValueError("The fused convolution takes the contiguous rows of a short pass")
     group = group or min(channels, 256)
-    out = torch.empty(x.shape, dtype=dtype, device=x.device)
+    if out_dtype is not None and (post or dtype != torch.bfloat16 or residual is not None and (residual.shape != x.shape or not residual.is_contiguous())):
+        raise ValueError("The fused convolution adds a contiguous residual to its BF16 result")
+    out = torch.empty(x.shape, dtype=dtype if out_dtype is None else out_dtype, device=x.device)
     inverse = float(np.float32(1.0) / np.float32(((taps + 1) if dynamic is None else (2 * taps + 1)) ** 0.5))
-    _causal[(tokens, channels // group)](x, ring, weight, x if dynamic is None else dynamic, positions, out, ring.shape[0], eps, threshold, inverse, channels, taps, group, post, dynamic is not None, _block(group),
-                                         num_warps=1, enable_fp_fusion=False)
+    if store is not None and (not store.is_contiguous() or store.numel() // store.shape[0] != channels or store.shape[0] < tokens):
+        raise ValueError("The fused convolution writes its rows into a contiguous ring of its channels")
+    bits = reads_bits(x.device)
+    x_, out_ = bits_view(x, bits), bits_view(out, bits)
+    _causal[(tokens, channels // group)](x_, bits_view(ring, bits), bits_view(weight, bits), x_ if dynamic is None else bits_view(dynamic, bits), positions, out_, x_ if residual is None else bits_view(residual, bits),
+                                         out_ if store is None else bits_view(store, bits), ring.shape[0], eps, threshold, inverse, 0 if store is None else store.shape[0], channels, taps, group, post, dynamic is not None,
+                                         _block(group), out_dtype is not None, residual is not None, store is not None, bits, num_warps=1, enable_fp_fusion=False)
+    if store is not None:
+        torch.autograd.graph.increment_version(store)
     torch.autograd.graph.increment_version(ring)
     return out
 
 
 @triton.jit(do_not_specialize=("eps", "STRIDE_A", "STRIDE_B"), do_not_specialize_on_alignment=("A", "B", "W", "G"))
-def _gate_down(A, B, W, G, eps, STRIDE_A, STRIDE_B, H: tl.constexpr, RANK: tl.constexpr, BLOCK: tl.constexpr):
+def _gate_down(A, B, W, G, eps, STRIDE_A, STRIDE_B, H: tl.constexpr, RANK: tl.constexpr, BLOCK: tl.constexpr, BITS: tl.constexpr):
     # g = W [rank, 2H] (BF16) times [rms(a) | rms(b)] rounded to BF16, itself rounded to BF16: a rank row of a token per program
     token = tl.program_id(0).to(tl.int64)
     rank = tl.program_id(1)
     columns = tl.arange(0, BLOCK)
     inside = columns < H
-    a = tl.load(A + token * STRIDE_A + columns, mask=inside, other=0.0).to(tl.float32)
-    b = tl.load(B + token * STRIDE_B + columns, mask=inside, other=0.0).to(tl.float32)
-    a = (a * tl.rsqrt(tl.div_rn(tl.sum(a * a), H * 1.0) + eps)).to(tl.bfloat16).to(tl.float32)
-    b = (b * tl.rsqrt(tl.div_rn(tl.sum(b * b), H * 1.0) + eps)).to(tl.bfloat16).to(tl.float32)
-    total = tl.sum(a * tl.load(W + rank * (2 * H) + columns, mask=inside, other=0.0).to(tl.float32)) + tl.sum(b * tl.load(W + rank * (2 * H) + H + columns, mask=inside, other=0.0).to(tl.float32))
-    tl.store(G + token * RANK + rank, total.to(tl.bfloat16).to(tl.float32))
+    a = to_float(tl.load(A + token * STRIDE_A + columns, mask=inside, other=0.0))
+    b = to_float(tl.load(B + token * STRIDE_B + columns, mask=inside, other=0.0))
+    a = round_bf16(a * tl.rsqrt(tl.div_rn(tl.sum(a * a), H * 1.0) + eps), BITS)
+    b = round_bf16(b * tl.rsqrt(tl.div_rn(tl.sum(b * b), H * 1.0) + eps), BITS)
+    total = tl.sum(a * to_float(tl.load(W + rank * (2 * H) + columns, mask=inside, other=0.0))) + tl.sum(b * to_float(tl.load(W + rank * (2 * H) + H + columns, mask=inside, other=0.0)))
+    tl.store(G + token * RANK + rank, round_bf16(total, BITS))
 
 
 @triton.jit(do_not_specialize=("STRIDE_A", "STRIDE_B"), do_not_specialize_on_alignment=("A", "B", "G", "F", "N", "Y"))
@@ -157,10 +187,10 @@ def _gate_mix(A, B, G, F, N, Y, STRIDE_A, STRIDE_B, H: tl.constexpr, RANK: tl.co
     channels = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
     g = tl.load(G + token * RANK + tl.arange(0, RANK))[None, :]
     place = channels[:, None] * RANK + tl.arange(0, RANK)[None, :]
-    forget = libdevice.tanh(tl.sum(tl.load(F + place).to(tl.float32) * g, axis=1))
-    gain = libdevice.tanh(tl.sum(tl.load(N + place).to(tl.float32) * g, axis=1))
-    a = tl.load(A + token * STRIDE_A + channels).to(tl.float32)
-    b = tl.load(B + token * STRIDE_B + channels).to(tl.float32)
+    forget = libdevice.tanh(tl.sum(to_float(tl.load(F + place)) * g, axis=1))
+    gain = libdevice.tanh(tl.sum(to_float(tl.load(N + place)) * g, axis=1))
+    a = to_float(tl.load(A + token * STRIDE_A + channels))
+    b = to_float(tl.load(B + token * STRIDE_B + channels))
     tl.store(Y + token * H + channels, (1.0 - forget) * a + gain * b)
 
 
@@ -171,6 +201,9 @@ def _rows(x):
     return x, x.stride(0)
 
 
+GATE_ROWS, GATE_WARPS = 64 if "gate_tile" in os.environ.get("WGP_INKLING2_DISABLE", "").split(",") else 16, 4  # channels of a program of the gate's mix, its warps (from 64: 144 programs a token instead of 36, the same bits; RTX 5090, 96 gates at one row 0.90 -> 0.60 ms)
+
+
 def message_gate(hidden, message, down, forget, gain, eps):
     """(1 - tanh(forget g)) hidden + tanh(gain g) message in float32, g = down [rms(hidden) | rms(message)] with its inputs and itself rounded to BF16.
     hidden, message [tokens, width] (rows with a stride); down [rank, 2 width], forget and gain [width, rank] in BF16."""
@@ -179,8 +212,10 @@ def message_gate(hidden, message, down, forget, gain, eps):
     rank = down.shape[0]
     g = torch.empty(tokens, rank, dtype=torch.float32, device=hidden.device)
     out = torch.empty(tokens, width, dtype=torch.float32, device=hidden.device)
-    _gate_down[(tokens, rank)](hidden, message, down, g, eps, stride_a, stride_b, width, rank, _block(width), num_warps=4, enable_fp_fusion=False)
-    _gate_mix[(tokens, width // 64)](hidden, message, g, forget, gain, out, stride_a, stride_b, width, rank, 64, num_warps=4, enable_fp_fusion=False)
+    bits = reads_bits(hidden.device)
+    hidden, message = bits_view(hidden, bits), bits_view(message, bits)
+    _gate_down[(tokens, rank)](hidden, message, bits_view(down, bits), g, eps, stride_a, stride_b, width, rank, _block(width), bits, num_warps=4, enable_fp_fusion=False)
+    _gate_mix[(tokens, width // GATE_ROWS)](hidden, message, g, bits_view(forget, bits), bits_view(gain, bits), out, stride_a, stride_b, width, rank, GATE_ROWS, num_warps=GATE_WARPS, enable_fp_fusion=False)
     return out
 
 
@@ -191,7 +226,7 @@ def _router_scores(X, W, S, STRIDE, H: tl.constexpr, EXPERTS: tl.constexpr, BLOC
     expert = tl.program_id(1)
     columns = tl.arange(0, BLOCK)
     inside = columns < H
-    total = tl.sum(tl.load(X + token * STRIDE + columns, mask=inside, other=0.0).to(tl.float32) * tl.load(W + expert * H + columns, mask=inside, other=0.0).to(tl.float32))
+    total = tl.sum(to_float(tl.load(X + token * STRIDE + columns, mask=inside, other=0.0)) * to_float(tl.load(W + expert * H + columns, mask=inside, other=0.0)))
     tl.store(S + token * EXPERTS + expert, tl.div_rn(1.0, 1.0 + libdevice.exp(-total)))
 
 
@@ -224,7 +259,8 @@ def route(x, weight, bias, top_k, scaling):
     scores = torch.empty(tokens, experts, dtype=torch.float32, device=x.device)
     ids = torch.empty(tokens, top_k, dtype=torch.int32, device=x.device)
     weights = torch.empty(tokens, top_k, dtype=torch.float32, device=x.device)
-    _router_scores[(tokens, experts)](x, weight, scores, stride, width, experts, _block(width), num_warps=4, enable_fp_fusion=False)
+    bits = reads_bits(x.device)
+    _router_scores[(tokens, experts)](bits_view(x, bits), bits_view(weight, bits), scores, stride, width, experts, _block(width), num_warps=4, enable_fp_fusion=False)
     _router_top[(tokens,)](scores, bias, ids, weights, scaling, experts, top_k, _block(experts), num_warps=1, enable_fp_fusion=False)
     return ids, weights
 
@@ -247,7 +283,7 @@ def _mix(S, P, QUERY, Y, STATES, eps, scale, STRIDE, QUERIES, H: tl.constexpr, Q
         scores = tl.where(slots == state, tl.sum(query * values[None, :], axis=1)[:, None], scores)
     partial = tl.zeros((BLOCK,), tl.float32)
     if HAS_PARTIAL:
-        partial = tl.load(P + token * STRIDE + columns, mask=inside, other=0.0).to(tl.float32)
+        partial = to_float(tl.load(P + token * STRIDE + columns, mask=inside, other=0.0))
         partial = partial * tl.rsqrt(tl.div_rn(tl.sum(partial * partial), H * 1.0) + eps)
         scores = tl.where(slots == STATES, tl.sum(query * partial[None, :], axis=1)[:, None], scores)
     scores = scores * scale
@@ -273,7 +309,7 @@ def mix(query, states, partial=None, eps=0.0):
     if partial is not None:
         partial, stride = _rows(partial)
     out = torch.empty(tokens, queries, width, dtype=torch.float32, device=states.device)
-    _mix[(tokens,)](states, states if partial is None else partial, query, out, count, eps, float(np.float32(width ** -0.5)), 0 if partial is None else stride, queries, width, triton.next_power_of_2(queries), partial is not None, MIX_STATES, _block(width),
+    _mix[(tokens,)](states, states if partial is None else bits_view(partial, reads_bits(states.device)), query, out, count, eps, float(np.float32(width ** -0.5)), 0 if partial is None else stride, queries, width, triton.next_power_of_2(queries), partial is not None, MIX_STATES, _block(width),
                     num_warps=8, enable_fp_fusion=False)
     return out
 

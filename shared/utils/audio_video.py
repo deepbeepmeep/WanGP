@@ -371,8 +371,8 @@ def _validate_video_save_settings(codec_type, container, tensor):
 
 
 def _video_frame_tensor_to_uint8(frame, normalize=True, value_range=(-1, 1)):
-    if frame.dtype == torch.uint8:
-        return frame.detach().cpu().contiguous().numpy()
+    if frame.dtype == torch.uint8:  # NumPy copies on this thread alone: PyTorch's CPU copy wakes its pool of threads, which spin while a generation runs beside a background save
+        return np.ascontiguousarray(frame.detach().cpu().numpy())
     frame = frame.detach().to(dtype=torch.float32, copy=True)
     if normalize:
         value_min, value_max = min(value_range), max(value_range)
@@ -841,8 +841,10 @@ def save_video(tensor,
                 nrow=8,
                 normalize=True,
                 value_range=(-1, 1),
-                retry=5):
-    """Save tensor as video with configurable codec and container options."""
+                retry=5,
+                hardware=None):
+    """Save tensor as video with configurable codec and container options. hardware: encode on NVENC when available (None: the Hardware Video
+    Encoding config); the windows of one video are encoded alike so that they join by copy."""
         
     if torch.is_tensor(tensor) and len(tensor.shape) == 4:
         tensor = tensor.unsqueeze(0)
@@ -855,7 +857,7 @@ def save_video(tensor,
         cache_file = osp.splitext(cache_file)[0] + suffix
     
     # Configure codec parameters
-    codec_params = _get_codec_params(codec_type, container)
+    codec_params = _get_codec_params(codec_type, container, hardware)
     if float(fps) != int(fps):  # the writer rounds a rate to 2 decimals: 23.98 for 23.976 drifts from the sound. A later -r replaces it
         codec_params = {**codec_params, "input_params": ["-r", f"{fps:.9f}"]}
     
@@ -975,9 +977,9 @@ def save_hdr_video(
     raise error or RuntimeError(f"Failed to save HDR video: {save_file}")
 
 
-def _get_codec_params(codec_type, container):
+def _get_codec_params(codec_type, container, hardware=None):
     """Get codec parameters based on codec type and container."""
-    return get_imageio_codec_params(codec_type, container)
+    return get_imageio_codec_params(codec_type, container, hardware)
 
 
 

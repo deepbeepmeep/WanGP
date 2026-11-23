@@ -28,7 +28,9 @@ class BlockDraftRunner(ModelRunner):
                 end = min(count, start + chunk)
                 seq.token_ids, seq.num_tokens, seq.num_cached_tokens = tokens[:end], end, start
                 ids, positions, embeds = self.prepare_prefill([seq])
-                hidden = self.model(input_ids=ids, positions=positions, inputs_embeds=embeds)
+                hidden = self._prompt_graph_pass(ids, embeds)  # (a short pass replayed as a graph, or None)
+                if hidden is None:
+                    hidden = self.model(input_ids=ids, positions=positions, inputs_embeds=embeds)
                 keep = end - start - int(end == count)
                 self.model.mtp.append_context(self.model._draft_features[:, :keep], positions[..., :keep])
                 reset_context()
@@ -48,7 +50,9 @@ class BlockDraftRunner(ModelRunner):
         if pending is not None:
             self.model.mtp.append_context(pending["features"], pending["positions"])
         ids, positions, embeds = self.prepare_prefill([seq])
-        hidden = self.model(input_ids=ids, positions=positions, inputs_embeds=embeds)
+        hidden = self._prompt_graph_pass(ids, embeds)  # (a short pass replayed as a graph, or None)
+        if hidden is None:
+            hidden = self.model(input_ids=ids, positions=positions, inputs_embeds=embeds)
         self.model.mtp.append_context(self.model._draft_features[:, :-1], positions[..., :-1])
         self._store_speculative_pending(seq, self.model.compute_logits(hidden)[0], hidden, positions)
         seq.clear_prompt_data()

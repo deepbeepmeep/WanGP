@@ -82,7 +82,7 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 
 ## 🔥 Latest Updates : 
-## 22nd of November 2026: WanGP v20.10 - To the Extreme… and a Little Further
+## 23rd of November 2026: WanGP v20.12 - To the Extreme… and a Little Further
 
 - **pi-H3 with optional DWD**: new H3 FL2VA variant **2 or 4 steps**, that claims to be the fastest. **pi-H3 DWD** draws the frames in its last step, so it is **Decoding Without a Decoder**. Choose 2 steps for quick experiments and 4 for more detail. The new **pi-H3 FL2VA 2 Steps / 4 Steps** accelerator profiles bring the same step counts to standard and Pruned FL2VA models while keeping the regular video decoder.
 

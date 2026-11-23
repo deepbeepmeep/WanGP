@@ -23,6 +23,7 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from shared.kernels import kernel_policy
+from shared.kernels.bf16_bits import portable_supported, reads_bits
 from shared.kernels.expert_gguf_triton import _four_activations
 from shared.kernels.fp8_w8a16_triton import _decode_e4m3  # the block scales of the NVFP4 tiles
 from shared.kernels.nvfp4_w4a16_triton import _decode_e2m1
@@ -36,7 +37,11 @@ _NVIDIA = tl.constexpr(torch.version.hip is None)
 TENSORS = {NVFP4: 6, MXFP8: 4}  # columns of the pointer table a kind reads
 _UNIT = tl.constexpr(64)  # columns per step of the grouped kernels (UNIT): whole scale blocks of both kinds
 GROUP_TILES = {True: (128, 32, 8), False: (64, 16, 4)}  # rows and pairs per program, warps of the grouped kernels: BF16 activation for the output projection, float32 (RTX 5090, 512 tokens)
+HIP_GROUP_TILES = {"gfx1200": (32, 32, 8), "gfx1201": (32, 32, 8), "gfx942": (64, 32, 8),  # by AMD architecture: (rows, pairs, warps) of the grouped kernels in both modes, where
+                   **dict.fromkeys(("gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"), (32, 32, 8))}  # GROUP_TILES spill (the least scratch: tests/inkling2_port sweeps)
 GROUPED_PAIRS = 256  # eager calls of this many (token, slot) pairs run by groups
+DOWN_PAIRS = "down_pairs" not in _DISABLED  # windows of DOWN_PAIR_TOKENS tokens or more: _down_rows with two output rows a program (the bits of _down_row)
+DOWN_PAIR_TOKENS = 8
 SHARED_ROWS = 16  # tokens of a decoding pass (a speculative verification) whose rows read an expert they share once
 SHARED_PROGRAM = 1  # rows of a projection per program there (8 measured slower on an RTX 5090: 265 + 148 against 157 + 123 microseconds per layer at 8 tokens)
 
@@ -130,14 +135,25 @@ def _rsum(x):
 
 
 @triton.jit
-def _lane_dot(w, x):
-    return _radd(_radd(_radd(w[0] * x[0], w[1] * x[1]), w[2] * x[2]), w[3] * x[3]) * w[4]
+def _lane_dot(w0, w1, w2, w3, block, x0, x1, x2, x3):
+    """A lane's 4 weights and block scale (_lane_weights) times its 4 activations (_four_activations), as values: Triton 3.2 (Turing) passes no tuple to a function."""
+    return _radd(_radd(_radd(w0 * x0, w1 * x1), w2 * x2), w3 * x3) * block
 
 
 @triton.jit
 def _gate_up_step(gate, up, weights, scales, activations, step, lanes, WIDTH: tl.constexpr, SCALES: tl.constexpr, KIND: tl.constexpr):
-    x = _four_activations(activations + step * 128, 0)
-    return _radd(gate, _lane_dot(_lane_weights(weights, scales, step, lanes, KIND), x)), _radd(up, _lane_dot(_lane_weights(weights + WIDTH, scales + SCALES, step, lanes, KIND), x))
+    x0, x1, x2, x3 = _four_activations(activations + step * 128, 0)
+    w0, w1, w2, w3, block = _lane_weights(weights, scales, step, lanes, KIND)
+    gate = _radd(gate, _lane_dot(w0, w1, w2, w3, block, x0, x1, x2, x3))
+    w0, w1, w2, w3, block = _lane_weights(weights + WIDTH, scales + SCALES, step, lanes, KIND)
+    return gate, _radd(up, _lane_dot(w0, w1, w2, w3, block, x0, x1, x2, x3))
+
+
+@triton.jit
+def _down_step(value, weights, scales, activations, step, lanes, KIND: tl.constexpr):
+    w0, w1, w2, w3, block = _lane_weights(weights, scales, step, lanes, KIND)
+    x0, x1, x2, x3 = _four_activations(activations + step * 128, 0)
+    return _radd(value, _lane_dot(w0, w1, w2, w3, block, x0, x1, x2, x3))
 
 
 @triton.jit
@@ -160,10 +176,10 @@ def _down_lanes(weights, scales, activations, lanes, I: tl.constexpr, KIND: tl.c
     value = tl.zeros((32,), tl.float32)
     if UNROLLED:
         for step in tl.static_range(I // 128):
-            value = _radd(value, _lane_dot(_lane_weights(weights, scales, step, lanes, KIND), _four_activations(activations + step * 128, 0)))
+            value = _down_step(value, weights, scales, activations, step, lanes, KIND)
     else:
         for step in range(I // 128):
-            value = _radd(value, _lane_dot(_lane_weights(weights, scales, step, lanes, KIND), _four_activations(activations + step * 128, 0)))
+            value = _down_step(value, weights, scales, activations, step, lanes, KIND)
     return value
 
 
@@ -171,6 +187,8 @@ def _down_lanes(weights, scales, activations, lanes, I: tl.constexpr, KIND: tl.c
 def _gate_up_row(X, IDs, PTR, Mid, STRIDE, CAP_GATE, CAP_UP, H: tl.constexpr, I: tl.constexpr, K: tl.constexpr, KIND: tl.constexpr, SOFTCAP: tl.constexpr):
     # One row of the gate and up projections of one (token, slot) pair.
     pair = tl.program_id(0)
+    if not _NVIDIA:  # 64-bit offsets from the pair: Triton 3.6's AMD buffer-op conversion fails on this kernel's 32-bit ones (TritonAMDGPUConvertToBufferOps)
+        pair = pair.to(tl.int64)
     index = tl.program_id(1)
     expert = tl.load(IDs + pair).to(tl.int64)
     row = PTR + tl.maximum(expert, 0) * STRIDE
@@ -213,6 +231,34 @@ def _down_row(Mid, IDs, Probs, PTR, Out, STRIDE, H: tl.constexpr, I: tl.constexp
                 probability = probability * (tl.load(tl.load(row + 5).to(tl.pointer_type(tl.float32))) * 256.0)
             total = _radd(total, _rsum(value * probability))
     tl.store(Out + token * H + index + tl.arange(0, 1), total)
+
+
+@triton.jit(do_not_specialize=("STRIDE",), do_not_specialize_on_alignment=("Mid", "IDs", "Probs", "PTR", "Out"))
+def _down_rows(Mid, IDs, Probs, PTR, Out, STRIDE, H: tl.constexpr, I: tl.constexpr, K: tl.constexpr, KIND: tl.constexpr, R: tl.constexpr):
+    # _down_row for R output rows a program: the slot's activations of a step loaded once for the R rows; each row keeps _down_row's lanes, steps and adds (the same bits)
+    token = tl.program_id(0)
+    index = tl.program_id(1) * R + tl.arange(0, R)
+    lanes = tl.arange(0, 32)
+    total = tl.zeros((R, 1), tl.float32)
+    WIDTH: tl.constexpr = I // 2 if KIND == 0 else I
+    SCALES: tl.constexpr = I // 16 if KIND == 0 else I // 32
+    for slot in range(K):
+        pair = token * K + slot
+        expert = tl.load(IDs + pair).to(tl.int64)
+        row = PTR + tl.maximum(expert, 0) * STRIDE
+        address = tl.where(expert >= 0, tl.load(row + 1), 0)
+        if address != 0:
+            weights = address.to(tl.pointer_type(tl.uint8)) + (index * WIDTH)[:, None]
+            scales = tl.load(row + 3).to(tl.pointer_type(tl.uint8)) + (index * SCALES)[:, None]
+            activations = Mid + pair * I + lanes * 4
+            value = tl.zeros((R, 32), tl.float32)
+            for step in tl.static_range(I // 128):
+                value = _down_step(value, weights, scales, activations, step, lanes[None, :], KIND)
+            probability = tl.load(Probs + pair).to(tl.float32)
+            if KIND == 0:
+                probability = probability * (tl.load(tl.load(row + 5).to(tl.pointer_type(tl.float32))) * 256.0)
+            total = _radd(total, tl.reduce(value * probability, 1, _radd, keep_dims=True))
+    tl.store(Out + token * H + index[:, None], total)
 
 
 # Decoding passes of a few tokens (verification windows) run the row kernels above over all their pairs in one launch by default (WINDOW_ROWS): the pairs of a row index run side
@@ -378,9 +424,17 @@ def _needs_fp32_inputs(device):
 
 
 @cache
+def group_tiles(device, approximate):
+    """(rows, pairs, warps) of the grouped kernels on device: GROUP_TILES, or HIP_GROUP_TILES on the AMD architectures that have them."""
+    if torch.version.hip is not None:
+        return HIP_GROUP_TILES.get(torch.cuda.get_device_properties(device).gcnArchName.split(":")[0], GROUP_TILES[approximate])
+    return GROUP_TILES[approximate]
+
+
+@cache
 def pass_supported(device):
-    """The grouped kernels: BF16 tensor cores, from compute capability 8.0 (AMD: not validated)."""
-    return torch.version.hip is None and torch.cuda.get_device_capability(device) >= (8, 0)
+    """The grouped kernels: BF16 tensor cores, NVIDIA GPUs from compute capability 8.0 and the AMD architectures of bf16_bits.HIP_ARCHS (compiled, not run there)."""
+    return portable_supported(device) and not reads_bits(device)
 
 
 def _check(kind, pointers, hidden, intermediate, *tensors):
@@ -418,7 +472,7 @@ class GroupedPass:
         self.tokens, self.hidden = x.shape
         self.topk = ids.shape[-1]
         approximate = kernel_policy.allow_approximate()
-        self.rows, self.group, self.warps = GROUP_TILES[approximate]
+        self.rows, self.group, self.warps = group_tiles(x.device, approximate)
         if order is None:
             order = np.unique(ids.numpy())
             order = order[order >= 0]
@@ -488,8 +542,29 @@ def forward(kind, x, ids, probabilities, pointers, intermediate, caps=None, out=
         return out
     # (no contraction of a product and a sum: a token gets the same result in passes of any rows and in either kernel family)
     _gate_up_row[(tokens * topk, intermediate)](x, ids, pointers, mid, pointers.shape[1], cap_gate, cap_up, hidden, intermediate, topk, kind, caps is not None, num_warps=1, enable_fp_fusion=False)
-    _down_row[(tokens, hidden)](mid, ids, probabilities, pointers, out, pointers.shape[1], hidden, intermediate, topk, kind, num_warps=1, enable_fp_fusion=False)
+    if DOWN_PAIRS and tokens >= DOWN_PAIR_TOKENS and UNROLLED:  # a wide window: two output rows a program read a slot's activations once (5 % faster at 8 rows, slower below)
+        _down_rows[(tokens, hidden // 2)](mid, ids, probabilities, pointers, out, pointers.shape[1], hidden, intermediate, topk, kind, 2, num_warps=1, enable_fp_fusion=False)
+    else:
+        _down_row[(tokens, hidden)](mid, ids, probabilities, pointers, out, pointers.shape[1], hidden, intermediate, topk, kind, num_warps=1, enable_fp_fusion=False)
     return out
+
+
+@triton.jit(do_not_specialize=("PAIRS",), do_not_specialize_on_alignment=("IDs", "Counts"))
+def _count_pairs(IDs, Counts, PAIRS, BLOCK: tl.constexpr):
+    pairs = tl.arange(0, BLOCK)
+    expert = tl.load(IDs + pairs, mask=pairs < PAIRS, other=-1)
+    tl.atomic_add(Counts + tl.maximum(expert, 0), tl.full((BLOCK,), 1, tl.int32), mask=(pairs < PAIRS) & (expert >= 0))  # integer adds: the counts do not depend on their order
+
+
+COUNT_BLOCK = 1024  # (token, slot) pairs of a decoding or verification pass at most
+
+
+def count_pairs(ids, counts):
+    """counts[e] += the pairs of ids routed to expert e (int32 or int64 ids, -1 for none; int32 counts), in one program: graph-safe, no host synchronization."""
+    if ids.numel() > COUNT_BLOCK or ids.dtype not in (torch.int32, torch.int64) or counts.dtype != torch.int32 or not ids.is_contiguous():
+        raise ValueError("The pair counts take the int32 / int64 ids of a short pass")  # int64: the PyTorch router's (fused row kernels off)
+    _count_pairs[(1,)](ids, counts, ids.numel(), COUNT_BLOCK, num_warps=4)
+    torch.autograd.graph.increment_version(counts)
 
 
 from shared.kernels.triton_compilation_log import install_triton_compilation_logger  # noqa: E402

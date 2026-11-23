@@ -38,6 +38,9 @@ PROMPT_VRAM_MARGIN = 768 << 20  # left free by a prompt pass beside its ring: a 
 ATTENTION_ELEMENTS = 1 << 21  # queries x keys attended together (per head: scores, their float32 softmax and the probabilities)
 ROUTED = "routed" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(",")  # the experts in MMGP's routed-expert banks (GPU and CPU kernels on the packed rows, elastic placement); disabled: the PyTorch reference below (Inkling2PackedExperts), for comparisons
 STREAMED = ROUTED and "stream" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(",")  # prompt passes: the experts out of VRAM stream through MMGP's ring; disabled, each bank uploads its own (a comparison)
+FUSED_RING = "fused_ring" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(",")  # short passes: the key / value convolutions of a window slot write its ring rows (the same bits); disabled: index writes in keep()
+FUSED_RESIDUAL = "fused_residual" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(",")  # short passes: the attention and expert convolutions add their block's residual in their own kernel (the same bits); disabled: PyTorch adds
+DOORBELL_FREE = "doorbell_free" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(",")  # with every expert in VRAM, decoding passes leave out the CPU expert job (its ask, wait and read kernels); disabled: the job runs in every pass (the same bits)
 EXPERT_CACHE = 128  # interim experts: decoded experts kept in VRAM between eager passes, all layers together (16 MiB each in BF16)
 MIX_EPS = 1e-6  # of the norm of the states the learned queries read
 FUSED = "fused" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(",")  # comparison switch of the fused row kernels (shared.kernels.row_fused_triton)
@@ -45,7 +48,9 @@ FUSED_ATTENTION = FUSED and "fused_attention" not in os.environ.get("WGP_INKLING
 SHARED_TILES = "shared_tiles" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(",")  # the tokens of a short pass share the key / value tiles of the one-kernel attention (one read and dequantization for a verification window); disabled, a program per token (the previous path, other rounding)
 FUSED_LINEAR = FUSED and "fused_linear" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(",")  # and of the linears computed row by row (shared.kernels.row_linear_triton)
 GROUPED_LINEAR = "grouped_linear" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(",")  # the projections of one attention input in one launch of the row linears (each row as alone; disabled: a launch per weight)
-_KERNELS = _ATTENTION = _LINEAR = None  # those modules, once a model with the Triton feature exists
+PREFILL_ATTENTION = "prefill_attention" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(",")  # prompt passes: the attention without its scores in memory (shared.kernels.prefill_attention_triton); disabled, the PyTorch attend below
+PREFILL_IN_PLACE = True  # the full-attention slots' pages read in place by the prompt attention; False: the rows append gathers (a comparison, the same values)
+_KERNELS = _ATTENTION = _LINEAR = _PREFILL_ATTENTION = None  # those modules, once a model with the Triton feature exists
 
 
 def linear(x, weight):
@@ -53,6 +58,20 @@ def linear(x, weight):
     if _LINEAR is not None and x.is_cuda and x.shape[0] <= _LINEAR.ROWS and _LINEAR.supported(x.device):
         return _LINEAR.linear(x, weight)
     return F.linear(x, weight)
+
+
+PREFILL_FUSED = "prefill_fused" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(",")  # prompt passes: convolutions and message gates in fused kernels with the PyTorch path's rounding (shared.kernels.prefill_fused_triton); disabled, the PyTorch expressions
+PREFILL_ROWS = "prefill_rows" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(",")  # prompt passes: the router's selection in one kernel (the experts listed highest first: their weights summed in another order); disabled, sigmoid_bias_topk (the learned-query mixes stay in PyTorch: the decoding kernel's error against FP64 is a little larger there)
+PREFILL_MIX = "prefill_mix" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(",")  # short prompt passes: the learned-query mixes in one kernel with float64 sums (less error than the PyTorch path's); disabled, PyTorch
+_PREFILL_FUSED = None
+_PROMPT_REAL = None  # during a padded prompt pass (a graph of a short prompt, Inkling2ForCausalLM.lm_engine_prompt_rows): int32 [1] on the device, its real rows; the others write no state
+PROMPT_GRAPH_ROWS = (32, 64, 128, 256)  # the padded sizes of the short prompt passes the engine may replay as graphs (lm_engine_prompt_graph_rows)
+PROMPT_GRAPHS = "prompt_graphs" in os.environ.get("WGP_INKLING2_ENABLE", "").split(",")  # short prompt passes replayed as CUDA graphs of padded sizes (opt-in while it is validated); off, eager
+
+
+def _prefill_fused(x):
+    """The fused kernels of prompt passes (more than CONV_FUSED_ROWS rows) on x's device, None where the PyTorch path runs."""
+    return _PREFILL_FUSED if _PREFILL_FUSED is not None and PREFILL_FUSED and x.is_cuda and _PREFILL_FUSED.supported(x.device) else None
 
 
 def _fused(x):
@@ -122,6 +141,9 @@ def mix(query, states, partial=None):
     kernels = _fused(states)
     if kernels is not None and states.shape[0] <= CONV_FUSED_ROWS:
         return kernels.mix(query, states, partial, MIX_EPS)
+    prefill = _prefill_fused(states) if PREFILL_MIX else None
+    if prefill is not None and states.shape[0] <= prefill.MIX_ROWS:  # a short prompt pass: one kernel, float64 sums (bound by its launches, not by these)
+        return prefill.mix(query, states, partial, MIX_EPS)
     if partial is not None:
         states = with_state(states, partial)
     weights = torch.softmax((query.float() @ states.transpose(-1, -2)) * states.shape[-1] ** -0.5, -1)
@@ -194,10 +216,12 @@ class Inkling2WindowState(_SlotState, nn.Module):
     def release_sequence_state(self):
         self.conv = self.keys = self.values = None
 
-    def keep(self, k, v, positions):
-        """Keeps the keys and values of a short pass; returns what the one-kernel attention reads: (keys, values, no page table, the positions a query reads)."""
-        rows = positions % self.ring
-        self.keys[rows], self.values[rows] = k, v
+    def keep(self, k, v, positions, stored=False):
+        """Keeps the keys and values of a short pass (stored: its convolutions wrote them already); returns what the one-kernel attention reads: (keys, values, no page table,
+        the positions a query reads)."""
+        if not stored:
+            rows = positions % self.ring
+            self.keys[rows], self.values[rows] = k, v
         return self.keys, self.values, None, self.window
 
     def append(self, k, v, positions):
@@ -205,9 +229,13 @@ class Inkling2WindowState(_SlotState, nn.Module):
         previous = positions[0] - (self.window - 1) + torch.arange(self.window - 1, device=k.device)
         rows = previous % self.ring
         keys, values = torch.cat([self.keys[rows], k]), torch.cat([self.values[rows], v])
-        written = min(k.shape[0], self.ring)
-        rows = positions[-written:] % self.ring
-        self.keys[rows], self.values[rows] = k[-written:], v[-written:]
+        if _PROMPT_REAL is not None:  # a padded pass: the ring takes the real rows only
+            _PREFILL_FUSED.ring_rows_store(k, self.keys, positions, _PROMPT_REAL)
+            _PREFILL_FUSED.ring_rows_store(v, self.values, positions, _PROMPT_REAL)
+        else:
+            written = min(k.shape[0], self.ring)
+            rows = positions[-written:] % self.ring
+            self.keys[rows], self.values[rows] = k[-written:], v[-written:]
         return keys, values, torch.cat([previous, positions])
 
 
@@ -261,6 +289,8 @@ def attend(c, q, rel_logits, sinks, keys, values, positions, key_positions, wind
     values [keys, kv_heads, dim] at key_positions: [tokens, heads * dim]. Scores and probabilities are rounded to q's dtype around a
     float32 softmax over the keys and the sink, as the reference does."""
     tokens, count, group, dtype = q.shape[0], keys.shape[0], c.heads // c.kv_heads, q.dtype
+    live = ((key_positions >= 0) & (key_positions <= positions[-1]))[:, None, None]  # rows beyond the context (pages not written yet, ring slots before position 0) may hold anything, NaN included:
+    keys, values = torch.where(live, keys, 0), torch.where(live, values, 0)  # their weights are 0, and 0 times NaN would still be NaN
     keys, values = keys.permute(1, 2, 0), values.transpose(0, 1)  # [kv_heads, dim, keys], [kv_heads, keys, dim]
     step, outputs = max(1, ATTENTION_ELEMENTS // max(count, 1)), []
     for start in range(0, tokens, step):
@@ -320,27 +350,46 @@ class Inkling2Attention(nn.Module):
             q, rel, sink, gate = linear(q_in, self.wq_du.weight), linear(q_in, self.wr_du.weight), None, None
         q = clipped(q.view(tokens, c.heads, c.head_dim), c.qk_clip, self.q_l2_clip.scale, tau)
         rel = clipped(rel.view(tokens, c.heads, c.d_rel), c.rel_clip, self.rel_l2_clip.scale, tau)
-        kernels = _fused(q_in) if tokens <= CONV_FUSED_ROWS else None
+        kernels = _fused(q_in) if tokens <= CONV_FUSED_ROWS else _prefill_fused(q_in)
         if kernels is not None:  # the convolution of each head and its clip or norm in one kernel
             if batched:
                 k, v, *dynamic = _LINEAR.linears([(k_in, self.wk_dv.weight), (v_in, self.wv_dv.weight)] + ([(k_in, self.k_sconv.weight_proj), (v_in, self.v_sconv.weight_proj)] if self.full else []))
             else:
                 k, v, dynamic = linear(k_in, self.wk_dv.weight), linear(v_in, self.wv_dv.weight), [linear(k_in, self.k_sconv.weight_proj), linear(v_in, self.v_sconv.weight_proj)] if self.full else []
             taps = (lambda weights, dynamic: dict(weight=weights.static_w, dynamic=dynamic)) if self.full else (lambda weights, dynamic: dict(weight=weights.weight))
-            k = kernels.causal_conv(k, state.conv["k"], positions=positions, dtype=dtype, group=c.head_dim, post=1, threshold=c.qk_clip, **taps(self.k_sconv, dynamic[0] if self.full else None)).view(tokens, c.kv_heads, c.head_dim)
-            v = kernels.causal_conv(v, state.conv["v"], positions=positions, dtype=dtype, group=c.head_dim, post=2, eps=c.eps, **taps(self.v_sconv, dynamic[1] if self.full else None)).view(tokens, c.kv_heads, c.head_dim)
+            padded = {} if _PROMPT_REAL is None else dict(real=_PROMPT_REAL)  # (a padded prompt pass: the prompt kernels)
+            stored = FUSED_RING and not self.full and tokens <= CONV_FUSED_ROWS and _ATTENTION is not None and q.is_cuda and tokens <= _ATTENTION.ROWS and _ATTENTION.supported(q.device)
+            ring = (lambda name: dict(store=getattr(state, name))) if stored else (lambda name: {})  # a window slot of a short pass: its keys and values into the ring by the convolutions
+            k = kernels.causal_conv(k, state.conv["k"], positions=positions, dtype=dtype, group=c.head_dim, post=1, threshold=c.qk_clip, **taps(self.k_sconv, dynamic[0] if self.full else None), **padded, **ring("keys")).view(tokens, c.kv_heads, c.head_dim)
+            v = kernels.causal_conv(v, state.conv["v"], positions=positions, dtype=dtype, group=c.head_dim, post=2, eps=c.eps, **taps(self.v_sconv, dynamic[1] if self.full else None), **padded, **ring("values")).view(tokens, c.kv_heads, c.head_dim)
         else:
+            stored = False
             k = self._conv(state, "k", linear(k_in, self.wk_dv.weight), k_in, self.k_sconv, positions)
             v = self._conv(state, "v", linear(v_in, self.wv_dv.weight), v_in, self.v_sconv, positions)
             k = clipped(k.view(tokens, c.kv_heads, c.head_dim), c.qk_clip, rounded=True)
             v = norm(v.view(tokens, c.kv_heads, c.head_dim), c.eps, None, dtype, True)
         fused = _ATTENTION if _ATTENTION is not None and q.is_cuda and tokens <= _ATTENTION.ROWS and _ATTENTION.supported(q.device) else None
-        source = state.keep(k, v, positions) if fused is not None else None
+        source = (state.keep(k, v, positions, stored=True) if stored else state.keep(k, v, positions)) if fused is not None else None
         if source is not None:  # the positions of the context read once, in place
             keys, values, table, window, *quantized = source
             sink, gate = (sink, gate) if batched else (linear(q_in, self.attn_sink_proj.weight), linear(q_in, self.gate_attn.weight))
             return linear(fused.attend(q, rel, self.rel_logits_proj.proj, sink, keys, values, positions, c.head_dim ** -0.5, window, table, gate, dtype,
                                        *quantized, shared=SHARED_TILES), self.wo_ud.weight)
+        prefill = _PREFILL_ATTENTION if _PREFILL_ATTENTION is not None and PREFILL_ATTENTION and tokens > CONV_FUSED_ROWS and q.is_cuda and _PREFILL_ATTENTION.supported(q.device) else None
+        if prefill is not None:  # the cache's pages read in place, the window rows as append gives them (consecutive positions)
+            sink, gate = (sink, gate) if batched else (linear(q_in, self.attn_sink_proj.weight), linear(q_in, self.gate_attn.weight))
+            bias = rel @ self.rel_logits_proj.proj
+            if self.full and PREFILL_IN_PLACE:
+                keys, values, table, _, *quantized = state.keep(k, v, positions)
+                output = prefill.attend(q, bias, sink, keys, values, positions, c.head_dim ** -0.5, gate, table=table, context=int(get_context().max_seqlen_k), quantized=quantized[0] if quantized else None, dtype=dtype, real=_PROMPT_REAL)
+            elif self.full:  # (a comparison: the rows append reads, from position 0)
+                keys, values, _ = state.append(k, v, positions)
+                output = prefill.attend(q, bias, sink, keys, values, positions, c.head_dim ** -0.5, gate, key_shift=int(positions[0]), context=int(get_context().max_seqlen_k), dtype=dtype)
+            else:
+                keys, values, _ = state.append(k, v, positions)
+                output = prefill.attend(q, bias, sink, keys, values, positions, c.head_dim ** -0.5, gate, window=c.window, key_shift=c.window - 1, dtype=dtype, real=_PROMPT_REAL)
+            k = v = keys = values = bias = None
+            return linear(output, self.wo_ud.weight)
         keys, values, key_positions = state.append(k, v, positions)
         k = v = None
         output = attend(c, q, rel @ self.rel_logits_proj.proj, sink if batched else linear(q_in, self.attn_sink_proj.weight), keys, values, positions, key_positions, None if self.full else c.window)
@@ -350,9 +399,9 @@ class Inkling2Attention(nn.Module):
 
 def static_conv_to(state, name, x, weight, positions, dtype):
     """static_conv in dtype: one kernel for the rows of a short pass."""
-    kernels = _fused(x) if x.shape[0] <= CONV_FUSED_ROWS else None
+    kernels = _fused(x) if x.shape[0] <= CONV_FUSED_ROWS else _prefill_fused(x)
     if kernels is not None:
-        return kernels.causal_conv(x, state.conv[name], weight, positions, dtype)
+        return kernels.causal_conv(x, state.conv[name], weight, positions, dtype, **({} if _PROMPT_REAL is None else dict(real=_PROMPT_REAL)))
     return static_conv(state, name, x, weight, positions).to(dtype)
 
 
@@ -367,6 +416,9 @@ def message_gate(controller, hidden, message):
     """A stream of a loop pass gated with its message from the previous pass (float32)."""
     down, eps, kernels = controller.down_weight, 1e-6, _fused(hidden)
     if kernels is not None and hidden.shape[0] <= CONV_FUSED_ROWS:  # a short pass: two kernels (its programs read their rows once per rank row)
+        return kernels.message_gate(hidden, message, down, controller.forget_weight, controller.gain_weight, eps)
+    kernels = _prefill_fused(hidden) if hidden.shape[0] > CONV_FUSED_ROWS else None
+    if kernels is not None:  # a prompt pass: the norms in one kernel, the products as below, the tanh mix in one kernel
         return kernels.message_gate(hidden, message, down, controller.forget_weight, controller.gain_weight, eps)
     hidden, message = hidden.float(), message.float()
     g = F.linear(torch.cat([rms(hidden, eps), rms(message, eps)], -1).to(down.dtype), down).float()
@@ -467,6 +519,7 @@ class Inkling2MoE(nn.Module):
         if ROUTED:  # the format of the bank is that of the tensors it loads (NVFP4 or MXFP8 rows)
             self.experts = RoutedExperts(c.experts, c.hidden, c.intermediate, activation="swiglu_softcap", caps=(c.gate_softcap, c.up_softcap), use_triton=use_triton)
             self.experts.streamed_pairs = 1 if use_triton else None  # prompt passes run every routed expert on the GPU
+            self.experts.doorbell_free = DOORBELL_FREE
         else:
             self.experts = Inkling2PackedExperts(c)
 
@@ -474,6 +527,8 @@ class Inkling2MoE(nn.Module):
         kernels = _fused(x)
         if kernels is not None and x.shape[0] <= CONV_FUSED_ROWS:  # the passes whose experts are queued: no routing returns to the host
             ids, weights = kernels.route(x, self.gate.weight, self.gate.bias, self.c.top_k, self.c.route_scale)
+        elif PREFILL_ROWS and x.shape[0] > CONV_FUSED_ROWS and (prefill := _prefill_fused(x)) is not None:  # a prompt pass: the product as below, the selection in one kernel
+            ids, weights = prefill.route(x, self.gate.weight, self.gate.bias, self.c.top_k, self.c.route_scale)
         else:
             ids, weights = sigmoid_bias_topk(F.linear(x.float(), self.gate.weight.float()), self.gate.bias, self.c.top_k, True, self.c.route_scale)
         return routed_experts(self.experts, x, ids, weights) if ROUTED else self.experts(x, ids, weights)
@@ -525,16 +580,24 @@ class Inkling2Block(nn.Module):
         q_h = k_h = v_h = mixed = None
         attn = self.attn(state, q_in, k_in, v_in, positions)
         q_in = k_in = v_in = None
-        attn = static_conv_to(state, "attn", attn, self.attn_sconv.weight, positions, dtype).float()
-        if self.boundary:  # the residual stream restarts from the attention; the block's input stays readable among the states
-            normed, residual = with_state(normed, hidden), attn
+        kernels = _fused(attn) if FUSED_RESIDUAL and dtype == torch.bfloat16 and attn.shape[0] <= CONV_FUSED_ROWS else None
+        if kernels is not None:  # the convolution, its BF16 rounding and the residual add in one kernel (the same bits)
+            residual = kernels.causal_conv(attn, state.conv["attn"], self.attn_sconv.weight, positions, dtype, residual=None if self.boundary else hidden.contiguous(), out_dtype=torch.float32)
+            if self.boundary:
+                normed = with_state(normed, hidden)
         else:
-            residual = hidden.float() + attn
+            attn = static_conv_to(state, "attn", attn, self.attn_sconv.weight, positions, dtype).float()
+            if self.boundary:  # the residual stream restarts from the attention; the block's input stays readable among the states
+                normed, residual = with_state(normed, hidden), attn
+            else:
+                residual = hidden.float() + attn
         hidden = attn = None
         mlp_in = mix(mlp_query.view(-1, c.hidden), normed, residual)[:, 0]
         if messages is not None:
             mlp_in = message_gate(self.controllers["mlp"], mlp_in, messages[:, 3])
         mlp = self.mlp(norm(mlp_in, eps, self.mlp_norm.weight, dtype))
+        if kernels is not None:
+            return [kernels.causal_conv(mlp, state.conv["mlp"], self.mlp_sconv.weight, positions, dtype, residual=residual, out_dtype=dtype), normed]
         mlp = static_conv_to(state, "mlp", mlp, self.mlp_sconv.weight, positions, dtype)
         return [(residual + mlp.float()).to(dtype), normed]
 
@@ -571,12 +634,14 @@ class Inkling2ForCausalLM(nn.Module):
         self.config, self.c = config, config.core
         c = self.c
         if use_triton and FUSED:
-            global _KERNELS, _ATTENTION, _LINEAR
+            global _KERNELS, _ATTENTION, _LINEAR, _PREFILL_FUSED, _PREFILL_ATTENTION
             from shared.kernels import row_fused_triton as _KERNELS
+            from shared.kernels import prefill_fused_triton as _PREFILL_FUSED
             if FUSED_ATTENTION:
                 from shared.kernels import ring_attention_triton as _ATTENTION
             if FUSED_LINEAR:
                 from shared.kernels import row_linear_triton as _LINEAR
+            from shared.kernels import prefill_attention_triton as _PREFILL_ATTENTION
         self.embed = nn.Embedding(c.vocab_rows, c.hidden, dtype=torch.bfloat16)
         self.embed_norm, self.norm = _Tensors(weight=(c.hidden,)), _Tensors(weight=(c.hidden,))
         self.attn_res = _locked(nn.Module())
@@ -678,6 +743,28 @@ class Inkling2ForCausalLM(nn.Module):
     def lm_engine_graph_forward(self, input_ids, positions, outputs, draft_features=None):
         """A decoding pass of the engine (cuda_graphs.run stage): the hidden states of input_ids written into outputs."""
         outputs.copy_(self(input_ids, positions, draft_features=draft_features).view(outputs.shape))
+
+    @property
+    def lm_engine_prompt_graph_rows(self):
+        """The padded sizes of the short prompt passes the engine may replay as graphs (none without the prompt kernels)."""
+        return PROMPT_GRAPH_ROWS if PROMPT_GRAPHS and _PREFILL_FUSED is not None and _PREFILL_ATTENTION is not None and ROUTED else ()
+
+    def lm_engine_prompt_graph_ready(self):
+        """Whether a short prompt pass may replay its graph now: the prompt kernels on (the PyTorch paths would write the padded rows' state) and every expert in VRAM (a graph
+        streams nothing)."""
+        from mmgp import expert_compute
+        return (PROMPT_GRAPHS and PREFILL_FUSED and PREFILL_ATTENTION and PREFILL_IN_PLACE and expert_compute.DEVICE_GROUPS
+                and all(bool(block.mlp.experts.resident_flags.all()) for block in self.layers))
+
+    def lm_engine_prompt_forward(self, input_ids, positions, outputs, real, draft_features=None):
+        """A padded short prompt pass (cuda_graphs.run stage): its hidden states into outputs; real (int32 [1], on the device): the rows that are the prompt's, the others write
+        no state (KV slots of -1 from the engine, the rings and the window keys of the real rows only)."""
+        global _PROMPT_REAL
+        _PROMPT_REAL = real
+        try:
+            outputs.copy_(self(input_ids, positions, draft_features=draft_features).view(outputs.shape))
+        finally:
+            _PROMPT_REAL = None
 
     def compute_logits(self, hidden_states):
         context = get_context()

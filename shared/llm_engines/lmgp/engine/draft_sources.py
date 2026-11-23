@@ -2,6 +2,8 @@
 # Drafts from repeated text and the choice of a verification window, for any model that verifies drafts, with ideas of Strata (MIT License, https://github.com/Niko1221/Strata).
 """When a text repeats (an edit of code, a quotation), what followed its earlier occurrence is a free draft: no weights, no GPU. A verification checks these drafts like those of a drafter, so
 the output does not depend on them. The measured time of a verification by rows and the measured acceptance decide whether a window pays."""
+import torch
+
 
 MATCH_BUCKETS = (6, 12, 24)  # match lengths: the longer, the likelier its continuation
 PRIOR_RATE = (0.75, 0.88, 0.93, 0.96)  # the rate of a bucket before its measures, worth PRIOR_WEIGHT of them
@@ -321,3 +323,38 @@ class ConfidentDrafts:
             group, cell = min(index, 1), self._bin(confidences[index])
             self.held[sampled][group][cell] = CONFIDENT_FADE * self.held[sampled][group][cell] + (index < accepted)
             self.reached[sampled][group][cell] = CONFIDENT_FADE * self.reached[sampled][group][cell] + 1.0
+
+
+class CompactDrafts:
+    """The draft distributions of a window: entries of the chain's proposals, dense rows only when asked (the reference sampler)."""
+    def __init__(self, chain, count):
+        self.chain, self.count = chain, count
+
+    def __len__(self):
+        return self.count
+
+    def _dense(self, row):
+        chain = self.chain
+        count = int(chain.counts[row])
+        q = torch.zeros(chain.target_vocab, dtype=torch.float32, device=chain.q.device)
+        q[torch.from_numpy(chain.ids[row, :count].copy()).long().to(q.device)] = torch.from_numpy(chain.probs[row, :count].copy()).to(q.device)
+        return q
+
+    def __getitem__(self, index):
+        return [self._dense(row) for row in range(*index.indices(self.count))] if isinstance(index, slice) else self._dense(index)
+
+    def load(self):
+        self.chain.load(self.count)
+
+
+class DeviceDrafts(CompactDrafts):
+    """The draft distributions of a GPU chain: its proposals stay in device memory (read back only for the reference sampler)."""
+    def _dense(self, row):
+        chain = self.chain
+        count = int(chain.device_counts[row])
+        q = torch.zeros(chain.target_vocab, dtype=torch.float32, device=chain.q.device)
+        q[chain.device_ids[row, :count].long()] = chain.device_probs[row, :count]
+        return q
+
+    def load(self):
+        self.chain.load_device(self.count)

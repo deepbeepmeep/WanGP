@@ -13,6 +13,7 @@ import os
 import uuid
 
 from .audio_video import FrameChunks, join_video_streams, video_stream_facts
+from .video_codecs import hardware_video_encoding_enabled
 from .video_decode import _read_rate, _resample_frame_indices, probe_video_stream_metadata, video_needs_corrected_decode
 from .virtual_media import get_virtual_media_entry, parse_virtual_media_path
 
@@ -128,8 +129,12 @@ class ContinuedVideo:
     (video_source None otherwise: the first window opens the file).
 
     read_frames(start, count) gives frames_count frames of the Source Video at the size and rate of the generation, as a (frames, H, W, C)
-    uint8 tensor; encode(frames, path) writes frames (a list of tensors or FrameChunks) to a video file without sound and returns its
-    path; fps is the rate of the output. Working files go to work_dir and are listed in temp_files until they are removed.
+    uint8 tensor; encode(frames, path, hardware) writes frames (a list of tensors or FrameChunks) to a video file without sound and returns
+    its path, on NVENC when hardware is True and it is available; fps is the rate of the output. Working files go to work_dir and are
+    listed in temp_files until they are removed.
+
+    The encoder is chosen once (the Hardware Video Encoding config) so that every window joins by copy, and turned to the other one when
+    only that keeps the pictures of the Source Video copied (a video encoded on the CPU continued with NVENC on, or the reverse).
 
     With post-processing on, process(read_frames, frames_count) gives the frames of the Source Video gone through it, as FrameChunks
     whose aborted tells that the user stopped it, and copied_frames is the number of pictures a Source Video that already went
@@ -139,6 +144,7 @@ class ContinuedVideo:
         self.video_source, self.frames_count, self.fps, self.process = video_source, frames_count, fps, process
         self.copied_frames = frames_count if copied_frames is None else copied_frames
         self.read_frames, self.encode, self.notify, self.temp_files = read_frames, encode, notify, temp_files
+        self.hardware = hardware_video_encoding_enabled()
         self.work_prefix, self.container, self.work_no = os.path.join(work_dir, f"tmp{uuid.uuid4().hex[:8]}_continue"), container, 0
         self.source_file, self.source_frames = None, 0  # the Source Video as the new frames can follow it (itself or its encoded copy) and its pictures, kept for every sample
         self.file, self.file_frames = None, 0  # the video made so far for the current sample
@@ -166,11 +172,27 @@ class ContinuedVideo:
             frames = FrameChunks(self.read_frames, self.frames_count, max(8, min(256, CHUNK_BYTES // (metadata["display_width"] * metadata["display_height"] * 3))))
         else:
             frames = self.process(self.read_frames, self.frames_count)
-        path = self.encode(frames, self._work_path())
+        path = self.encode(frames, self._work_path(), self.hardware)
         if getattr(frames, "aborted", False):
             self._remove(path)
             return None
         return path, video_stream_facts(path)["frames"]
+
+    def _encoder_of_source(self, frames, segment, segment_facts):
+        """The first window encoded by the other encoder when only that lets the Source Video open the output by copy; the encoder of the
+        generation then becomes that one."""
+        width, height = segment_facts["encoding"][3:5]
+        if not copy_obstacles(self.video_source, self.copied_frames, self.fps, width, height, segment_facts):
+            return segment, segment_facts
+        other = self.encode(frames, self._work_path(), not self.hardware)
+        other_facts = video_stream_facts(other)
+        if other_facts["encoding"] == segment_facts["encoding"] or copy_obstacles(self.video_source, self.copied_frames, self.fps, width, height, other_facts):
+            self._remove(other)
+            return segment, segment_facts
+        self._remove(segment)
+        self.hardware = not self.hardware
+        self.notify(f"[Continue Video] The Source Video was encoded {'on NVENC' if self.hardware else 'on the CPU'}: the new frames are encoded the same way, so that its pictures are copied.")
+        return other, other_facts
 
     def start_sample(self):
         """A new sample continues the Source Video again: the video of the previous one is dropped."""
@@ -181,13 +203,14 @@ class ContinuedVideo:
     def append(self, frames):
         """Add the new frames of a window and return the file holding the whole video so far (pictures only), valid until the next call.
         None when the user stopped the post-processing of the Source Video."""
-        segment = self.encode(frames, self._work_path())
+        segment = self.encode(frames, self._work_path(), self.hardware)
         if self.file is None and self.video_source is None:  # nothing before the first window: its own file opens the video
             self.file, self.file_frames = segment, video_stream_facts(segment)["frames"]
             return segment
         segment_facts = video_stream_facts(segment)
         if self.file is None:
             if self.source_file is None:
+                segment, segment_facts = self._encoder_of_source(frames, segment, segment_facts)
                 resolved = self._resolve_source_file(segment_facts)
                 if resolved is None:
                     self._remove(segment)

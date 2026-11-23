@@ -117,11 +117,50 @@ def _fp8(x):
     return table[x.view(torch.uint8).long()]
 
 
-class Inkling2Core:
-    """Eager forward over a dict of checkpoint tensors (`model.llm.` prefix removed), all on one device."""
+# ---- activation quantization of the routed experts' inputs (opt-in): the checkpoint's hf_quant_config.json rules, as SGLang and vLLM
+# implement them on Blackwell (SGLang routed_quant.cuh / inkling2_experts_sm90.py, vLLM inkling2/nvidia/ops/nvfp4.py, mxfp8.py). FP32, dequantized.
+FLT_MAX = 3.4028234663852886e38
 
-    def __init__(self, config, tensors, expert_cache=64):
-        self.c, self.w = config, tensors
+
+def _e2m1(x):
+    """Nearest E2M1 value, ties to the even code, saturating at 6 (cvt.rn.satfinite.e2m1x2.f32)."""
+    a = x.abs(); i = (a > 0.25).long() + (a >= 0.75) + (a > 1.25) + (a >= 1.75) + (a > 2.5) + (a >= 3.5) + (a > 5.0)
+    return torch.tensor(E2M1[:8], device=x.device)[i].copysign(x)
+
+
+def nvfp4_activation(x):
+    """NVFP4 rows (float32, last dim a multiple of 16), "fouroversix_mae": a per-row (per-token) outer scale amax / 1536; per block of 16 an
+    E4M3 scale mapping the block maximum to 6 or to 4 of the E2M1 grid, whichever gives the smaller sum of absolute errors (ties: 6)."""
+    amax = x.abs().amax(-1, keepdim=True); encoder = (amax.new_full(amax.shape, 1536.0) / amax).clamp(max=FLT_MAX)
+    decoder, outer = (1.0 / encoder)[..., None], (amax * (1.0 / 1536.0))[..., None]
+    blocks = x.unflatten(-1, (-1, 16)); bmax = blocks.abs().amax(-1, keepdim=True); out = []
+    for d in (1.0 / 6.0, 0.25):
+        scale = (bmax * (encoder[..., None] * d)).clamp(max=448.0).to(torch.float8_e4m3fn).float()
+        values = _e2m1(blocks * (1.0 / (scale * decoder)).clamp(max=FLT_MAX)) * scale
+        err = ((values * outer) - blocks).abs()
+        for _ in range(4): err = err[..., 0::2] + err[..., 1::2]  # the pairwise order of the reference kernels
+        out.append((values, err))
+    (v6, e6), (v4, e4) = out
+    return (torch.where(e4 < e6, v4, v6) * outer).flatten(-2)
+
+
+def mxfp8_activation(x):
+    """MXFP8 rows (float32, last dim a multiple of 32): per block of 32 a power-of-two scale 2^ceil(log2(amax / 448)) (UE8M0, floor 2^-127),
+    values rounded to E4M3 (nearest even) after clamping to +-448."""
+    blocks = x.unflatten(-1, (-1, 32)); raw = blocks.abs().amax(-1, keepdim=True) * (1.0 / 448.0)
+    e = torch.where(raw <= 2.0 ** -127, 0, (((raw.view(torch.int32) + 0x7FFFFF) & 0x7F800000) >> 23).clamp(max=254))
+    scale = (e << 23).view(torch.float32).clamp(min=2.0 ** -127); inverse = torch.where(e == 0, 2.0 ** 127, 1.0 / scale)
+    return ((blocks * inverse).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).float() * scale).flatten(-2)
+
+
+class Inkling2Core:
+    """Eager forward over a dict of checkpoint tensors (`model.llm.` prefix removed), all on one device.
+    act_quant: quantize the routed experts' inputs as hf_quant_config.json requires (NVFP4 / MXFP8 per layer; the inputs of w13 and w2,
+    routing weight applied before w2's quantization, BF16 rounding points of the reference kernels when the tensors are BF16); off by
+    default (BF16 / FP32 activations, as the Transformers reference). Its products are exact only with FP32 tensors (experts decoded to FP32)."""
+
+    def __init__(self, config, tensors, expert_cache=64, act_quant=False):
+        self.c, self.w = config, tensors; self.act_quant = act_quant
         self.schedule = config.schedule(); self.expert_cache = expert_cache; self._experts = {}
         self.picks = None  # set to a list to record (slot, expert indices) of every block application
 
@@ -218,8 +257,15 @@ class Inkling2Core:
         weights = scores.gather(1, picks); weights = weights / (weights.sum(-1, keepdim=True) + 1e-20) * c.route_scale
         if self.picks is not None: self.picks.append((slot, picks.cpu()))
         out = torch.zeros_like(x, dtype=torch.float32)
+        quant = (nvfp4_activation if p + "experts.w13_weight_amax" in w else mxfp8_activation) if self.act_quant else None
+        if quant is not None: xq = quant(x.float())  # per token, shared by its experts
         for index in picks.unique().tolist():
             token, rank = torch.where(picks == index); w13, w2 = self._expert(layer, index)
+            if quant is not None:
+                gate_up = (xq[token] @ w13.float().T).to(x.dtype).float(); gate, up = gate_up[:, 0::2], gate_up[:, 1::2]
+                act = (softcap(gate, c.gate_softcap) * torch.sigmoid(gate) * softcap(up, c.up_softcap) * weights[token, rank, None]).to(x.dtype).float()
+                out.index_add_(0, token, (quant(act) @ w2.float().T).to(x.dtype).float())
+                continue
             gate_up = (x[token] @ w13.T).float(); gate, up = gate_up[:, 0::2], gate_up[:, 1::2]
             act = (softcap(gate, c.gate_softcap) * torch.sigmoid(gate) * softcap(up, c.up_softcap)).to(x.dtype)
             out.index_add_(0, token, ((act @ w2.T) * weights[token, rank, None]).float())

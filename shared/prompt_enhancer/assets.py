@@ -276,7 +276,7 @@ def qwen_download_defs(spec, backend, speculative_decoding=False):
     defs = []
     if spec["root_repo"] == spec["gguf_repo"]:
         if checkpoint_folder != folder:
-            defs.append(_files(spec["gguf_repo"], checkpoint_folder, [filename], spec["assets_dir_name"]))
+            defs.append(_files(spec["gguf_repo"], checkpoint_folder, [filename]))
         shared_files.append(spec["vision_filename"])
         if checkpoint_folder == folder:
             shared_files.append(filename)
@@ -334,6 +334,12 @@ def checkpoint_inventory():
             installed = [path for path in paths if installed_copies(path)]
             if installed:
                 yield {"name": spec["display_name"], "variant": label, "files": installed}
+    # Qwen3.8-9B GGUFs downloaded before 11-23 went one folder too deep, where Deepy never read them
+    spec = QWEN35_VARIANT_SPECS[QWEN38_VARIANT_9B]
+    for key, label in [("text_gguf_filename", "GGUF Q4_K_M (earlier location)"), ("text_gguf_q8_filename", "GGUF Q8_0 (earlier location)")]:
+        installed = installed_copies(f"{spec['assets_dir_name']}/{spec['gguf_repo_subfolder']}/{spec[key]}")
+        if installed:
+            yield {"name": spec["display_name"], "variant": label, "files": installed}
 
 
 def query_prompt_enhancer_download_defs() -> list[dict[str, Any]]:

@@ -28,6 +28,7 @@ COMMUNITY_PLUGINS_URL = "https://github.com/deepbeepmeep/Wan2GP/raw/refs/heads/m
 PLUGIN_CATALOG_FILENAME = "plugins.json"
 PLUGIN_LOCAL_CATALOG_FILENAME = "plugins_local.json"
 PLUGIN_METADATA_FILENAME = "plugin_info.json"
+GIT_NO_PROMPT = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}  # a removed or private repository fails instead of asking for a GitHub sign-in
 PLUGIN_TYPE_CHOICES = ("app", "extension", "processor", "model")
 PLUGIN_SPATIAL_UPSAMPLER_HANDLERS_KEY = "spatial_upsampler_handlers"
 PLUGIN_TEMPORAL_UPSAMPLER_HANDLERS_KEY = "temporal_upsampler_handlers"
@@ -1543,6 +1544,7 @@ class PluginManager:
             origin = repo.remotes.origin
             
             if progress is not None: progress(0.2, desc=f"Fetching updates for '{plugin_id}'...")
+            repo.git.update_environment(**GIT_NO_PROMPT)
             origin.fetch()
 
             local_commit = repo.head.commit
@@ -1664,7 +1666,7 @@ class PluginManager:
                 return f"[Warning] Plugin '{repo_name}' already exists. Please remove it manually to reinstall."
 
             if progress is not None: progress(0.1, desc=f"Cloning '{repo_name}'...")
-            git.Repo.clone_from(cleaned_url, target_dir)
+            git.Repo.clone_from(cleaned_url, target_dir, env=GIT_NO_PROMPT)
 
             return self._finalize_local_plugin_install(repo_name, target_dir, progress=progress, remove_invalid=True, source_url=cleaned_url)
 
@@ -1673,7 +1675,7 @@ class PluginManager:
             stderr = (e.stderr or str(e)).strip()
             lowered = stderr.lower()
             if any(token in lowered for token in ("not found", "repository", "fatal", "could not read from remote")):
-                return "[Error] Invalid URL."
+                return f"[Error] Could not download {cleaned_url}: the repository does not exist or is private."
             return f"[Error] Git clone failed: {stderr}"
         except Exception as e:
             traceback.print_exc()

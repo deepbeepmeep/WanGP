@@ -1,8 +1,10 @@
 """Public GitHub sources, pinned revisions and bounded source downloads."""
 
+import functools
 import hashlib
 import json
 import re
+import ssl
 import stat
 import time
 import uuid
@@ -35,9 +37,17 @@ def commit_id(value):
     return value
 
 
+@functools.cache
+def tls_context():
+    """Certificates checked by the operating system: a fresh Windows fetches its root certificates when it first meets them, which
+    Python's copy of the store misses (CERTIFICATE_VERIFY_FAILED). truststore comes with pip, in the Manager's runtime too."""
+    from pip._vendor import truststore
+    return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+
 def response(url):
     request = Request(url, headers={"User-Agent": "WanGP-Manager/0.1", "Accept": "application/vnd.github+json"})
-    return urlopen(request, timeout=30)
+    return urlopen(request, timeout=30, context=tls_context())
 
 
 def get_json(url, runner, *, optional=False):

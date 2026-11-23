@@ -1469,7 +1469,7 @@ class BlockGraphs:
                 # outside it, as _escape moves outputs: the scratch of those graphs may lie on the pool's free memory, which their replays
                 # overwrite (a buffer that its argument keeps, e.g. a RoPE table, is not filled again before the next replays)
                 from . import allocator
-                late = arguments and bool(self.entries) and self.pool is not None
+                late = arguments and bool(self.entries) and self.pool is not None and allocator.active == "vmm"  # only the VMM allocator shares a pool's free memory
                 pooled = (GRAPH_CACHE > 0 or self.keeping) and allocator.active == "vmm" and not late
                 if pooled and self.pool is None:
                     self.pool = torch.cuda.graph_pool_handle()

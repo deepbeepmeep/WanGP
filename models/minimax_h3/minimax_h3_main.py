@@ -60,6 +60,9 @@ def _hybrid_ref2va_blocks(filename):
 
 def _strip_wrappers(state_dict, quantization_map=None, tied_weights_map=None, pdd=False, ref2va_adaln_t_table=None):
     prefixes = ("model.diffusion_model.", "diffusion_model.")
+    # ComfyUI GGUFs pack the step heads in final_layer's projections, [num_steps * out, in]: head 0, then the others already relative to it
+    video_out, width = (next((value for key, value in state_dict.items() if key.endswith(name)), None) for name in ("final_layer.video_out.weight", "video_patch_proj.weight"))
+    packed = pdd and video_out is not None and width is not None and video_out.shape[0] > width.shape[1]
 
     def strip(mapping):
         if mapping is None:
@@ -76,7 +79,7 @@ def _strip_wrappers(state_dict, quantization_map=None, tied_weights_map=None, pd
                 key = "blocks." + key[len("transformer_blocks."):].replace(".attn.softmax_gate.", ".attn.vdn.softmax_gate.")
             elif key.startswith("transformer_blocks.") and ".attn.to_out_linear." in key:
                 key = "blocks." + key[len("transformer_blocks."):].replace(".attn.to_out_linear.", ".attn.vdn.to_out_linear.")
-            if pdd and (key.startswith("final_layer.video_out.") or key.startswith("final_layer.audio_out.") or
+            if pdd and not packed and (key.startswith("final_layer.video_out.") or key.startswith("final_layer.audio_out.") or
                         key in ("final_layer.video_out", "final_layer.audio_out")):
                 continue
             if pdd and key.startswith("pdd_heads."):
@@ -90,6 +93,11 @@ def _strip_wrappers(state_dict, quantization_map=None, tied_weights_map=None, pd
                     for suffix in ("weight", "bias") if f"final_layer.{head}.{suffix}" in state_dict]:
             head, suffix = key.rsplit(".", 1)
             stacked = state_dict.pop(key)
+            if packed:
+                rows = state_dict[f"{head.split('.')[1].removesuffix('_out')}_patch_proj.weight"].shape[1]
+                stacked = stacked.as_subclass(torch.Tensor).float()
+                state_dict[f"{head}.linear.{suffix}"], state_dict[f"{head}.{'heads' if suffix == 'weight' else 'head_biases'}"] = stacked[:rows], stacked[rows:].unflatten(0, (-1, rows))
+                continue
             base = stacked[0].float()
             state_dict[f"{head}.linear.{suffix}"], state_dict[f"{head}.{'heads' if suffix == 'weight' else 'head_biases'}"] = base, stacked[1:].float() - base
     if ref2va_adaln_t_table is not None:
@@ -117,7 +125,10 @@ def probe_h3_checkpoint(filename):
     separate_qkv = any(key.endswith((".attn.q_proj.weight", ".attn.q_proj.down.weight")) for key in normalized)
     # H3-Image: no audio stream, and one output head per step of its fixed schedule, stacked in the checkpoint
     heads = normalized.get("pdd_heads.video_out.weight")
-    stream = {"audio_enabled": "audio_patch_proj.weight" in normalized, "step_heads": None if heads is None else int(heads.shape[0])}
+    packed = normalized.get("final_layer.video_out.weight") if heads is None else None  # ComfyUI GGUFs: the heads packed in one projection
+    width = None if packed is None else normalized["video_patch_proj.weight"].shape[1]
+    step_heads = int(heads.shape[0]) if heads is not None else packed.shape[0] // width if packed is not None and packed.shape[0] > width else None
+    stream = {"audio_enabled": "audio_patch_proj.weight" in normalized, "step_heads": step_heads}
     table = next((tensor for key, tensor in normalized.items() if key == "adaln_t_table"), None)
     if table is None:
         if hybrid_ref2va_blocks is not None:

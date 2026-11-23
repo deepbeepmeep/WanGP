@@ -154,8 +154,8 @@
             "light2xv": { 
                 "label": "Light2xv NVFP4 (RTX 50xx)", 
                 "cmd": {
-                    "win": "https://github.com/deepbeepmeep/kernels/releases/download/Light2xv/lightx2v_kernel-0.0.2+torch2.10.0-cp311-abi3-win_amd64.whl",
-                    "linux": "https://github.com/deepbeepmeep/kernels/releases/download/Light2xv/lightx2v_kernel-0.0.2+torch2.10.0-cp311-abi3-linux_x86_64.whl"
+                    "win": "https://github.com/deepbeepmeep/kernels/releases/download/Light2xv/lightx2v_kernel-0.0.3+torch2.10.0-cp311-abi3-win_amd64.whl",
+                    "linux": "https://github.com/deepbeepmeep/kernels/releases/download/Light2xv/lightx2v_kernel-0.0.3+torch2.10.0-cp311-abi3-linux_x86_64.whl"
                 }
             },
             "gguf": {

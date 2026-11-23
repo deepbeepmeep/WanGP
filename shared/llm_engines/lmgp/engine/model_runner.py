@@ -3,6 +3,7 @@
 # Modifications Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import functools
 import gc
+import importlib.util
 import os
 import time
 import math
@@ -13,12 +14,10 @@ from ..config import Config
 from .sequence import Sequence
 from ..layers import kv_formats as kvf
 from . import chain_verdicts
-from .draft_sources import ConfidentDrafts, MeasuredDrafts, SuffixDrafter, WindowCosts
+from .draft_sources import CompactDrafts, ConfidentDrafts, DeviceDrafts, MeasuredDrafts, SuffixDrafter, WindowCosts
 from .speculative_sampling import bounded_support, capture_sampling_graph, draft_probabilities
-from ..layers import draft_chain
-from ..layers.draft_chain import CompactDrafts, DeviceDrafts
 from ..layers.sampler import Sampler, _REPETITION_INCREMENT_LIMIT, apply_min_p_mask_, apply_sparse_repetition_penalty_
-from ..utils.context import set_context, get_context, reset_context
+from ..utils.context import set_context, get_context, reset_context, use_context
 
 _OUTPUT_STAGE = "output_stage" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the logits of a window in a graph, until the switches are removed
 _DRAFT = "draft" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the drafter of models with routed experts as MMGP stages (decoding A/B: specs/QWEN38_FLASH_NEXT_STRATA_DRAFT.md)
@@ -26,6 +25,7 @@ _SUFFIX = "suffix" in os.environ.get("WGP_FN_ENABLE", "").split(",")  # drafts f
 _FIRST_ALWAYS = "firstdraft" in os.environ.get("WGP_FN_ENABLE", "").split(",")  # measuring only: the first draft always goes out, another while the one before was sure
 _CHAIN = "chain" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the drafts of a window read from mapped RAM, the switch goes with the others at the end
 _DRAFT_COSTS = "draftcost" in os.environ.get("WGP_FN_ENABLE", "").split(",")  # a greedy window's drafts decided by what they bring at the measured costs, until proven
+_TRITON = importlib.util.find_spec("triton") is not None  # its kernels (sampling, draft chains, the single decode's context) are optional
 _SINGLE_DECODE = "host_py" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # _prepare_single_decode and its kept sampling parameters, proven: the switch goes with the others at the end
 _GPU_CHAIN = "gpu_chain" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # a sampled window's drafts drawn on the GPU in one graph, no host wait per draft: MTP-4 on Deepy's prose 17.1 -> 16.75 ms per pass
 _LONG_CHAIN = "long_chain" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the model's long draft chain while its recent drafts are accepted (Qwen3.8 27B Q4_K_M on Deepy's tool calls: 4.6 -> 5.8 tokens per pass, 12% faster)
@@ -62,6 +62,9 @@ def long_chain_rate(usual: int, long: int, cost_ratio: float) -> float:
 _DRAFT_PREFETCH = "draft_prefetch" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the n-gram rows of a window read while its drafts are computed: Deepy's context 141 -> 147 tok/s, a short prompt 168 -> 184 (drive calm); the switch goes with the others at the end
 
 
+
+_PROMPT_GRAPH_MIN_SIZE = 0  # (a comparison: the smallest padded size a prompt pass may take, to measure what more padding changes)
+_PROMPT_GRAPHS = "prompt_graphs" not in os.environ.get("WGP_LMGP_DISABLE", "").split(",")  # short prompt passes of the models that offer it padded and replayed as MMGP graphs (lm_engine_prompt_graph_rows)
 
 class _DraftStage:
     """A pass of a drafter as an MMGP stage, under the replay() of the graphs it stands for."""
@@ -163,7 +166,7 @@ class ModelRunner:
         
         self.config = config
         hf_config = config.hf_config
-        self.use_triton_sampling = not bool(getattr(hf_config, "_prompt_enhancer_safe_legacy", False))
+        self.use_triton_sampling = _TRITON and not bool(getattr(hf_config, "_prompt_enhancer_safe_legacy", False))
         self.block_size = config.kvcache_block_size
         self.kv_layout = kvf.layout_of(config)  # None: BF16 cache; otherwise the body formats and exact overlays
         self.enforce_eager = config.enforce_eager
@@ -367,7 +370,8 @@ class ModelRunner:
             return
         from mmgp import cuda_graphs
         tensors = [getattr(self, name, None) for name in ("kv_cache", "kv_cache_scales", "kv_cache_mins", "kv_overlay", "kv_overlay_scales", "kv_index_pool")]
-        for graph_vars in (getattr(self, "graph_vars", None) or {}, *(getattr(self, "speculative_graph_vars", None) or {}).values(), getattr(self, "_tree_graph_vars", None) or {}):
+        for graph_vars in (getattr(self, "graph_vars", None) or {}, *(getattr(self, "speculative_graph_vars", None) or {}).values(), getattr(self, "_tree_graph_vars", None) or {},
+                           *(getattr(self, "prompt_graph_vars", None) or {}).values()):
             tensors.extend(graph_vars.values())
         if isinstance(getattr(self, "mtp_graph", None), _DraftStage):
             for graph_vars in (self.mtp_graph_vars, *self.mtp_refresh_graphs.values()):
@@ -377,6 +381,60 @@ class ModelRunner:
                 if name not in ("_parameters", "_buffers", "_modules", "_hf_hook") and not name.startswith("_mm_"):  # MMGP's own records hold the weights
                     tensors.extend(_state_tensors(value))
         cuda_graphs.register_state(self.model, "lmgp", tensors)
+
+    def _prompt_graph_pass(self, input_ids: torch.Tensor | None, inputs_embeds: torch.Tensor | None) -> torch.Tensor | None:
+        """MMGP mode: a short prompt pass of a model with prompt graphs (lm_engine_prompt_graph_rows) padded to the smallest of its sizes and replayed as an MMGP graph, recorded at
+        its first use: the hidden states of its real rows [1, rows, hidden]; None where it runs eagerly (another model, embeddings, a pass longer than the largest size, the model
+        not ready: experts out of VRAM). The padded rows write nothing: their KV slots are -1 and the model's rings take the real rows only (real)."""
+        buckets = getattr(self, "prompt_graph_vars", None)
+        stats = self.__dict__.setdefault("prompt_graph_stats", {})  # why each prompt pass ran as it did (diagnostics)
+        if not buckets or inputs_embeds is not None or input_ids is None:
+            stats["no buckets or embeddings"] = stats.get("no buckets or embeddings", 0) + 1
+            return None
+        rows = input_ids.numel()
+        size = next((size for size in sorted(buckets) if size >= rows and size >= _PROMPT_GRAPH_MIN_SIZE), None)
+        context = get_context()
+        if size is None or context.block_tables is None or context.cu_seqlens_q is None or context.cu_seqlens_q.numel() != 2:
+            stats["size or context"] = stats.get("size or context", 0) + 1
+            return None
+        from mmgp import runtime
+        if not runtime.weights_resident(self.model) or not self.model.lm_engine_prompt_graph_ready():
+            stats["not resident"] = stats.get("not resident", 0) + 1
+            return None
+        with cuda_graphs.scope(gated=False):
+            ready = cuda_graphs.is_enabled(self.model)
+        if not ready:  # no graph manager now (released, being rebuilt): run() would run the pass eagerly in its scope, where the blocks capture their own graphs
+            stats["graphs off"] = stats.get("graphs off", 0) + 1
+            return None
+        stats[size] = stats.get(size, 0) + 1
+        graph_vars = buckets[size]
+        graph_vars["input_ids"][:rows].copy_(input_ids.reshape(-1))
+        graph_vars["slot_mapping"].fill_(-1)
+        graph_vars["slot_mapping"][:rows].copy_(context.slot_mapping)
+        graph_vars["overlay_mapping"].fill_(-1)
+        if context.overlay_mapping is not None:
+            graph_vars["overlay_mapping"][:rows].copy_(context.overlay_mapping)
+            graph_vars["overlay_base"].copy_(context.overlay_base[:1])
+            graph_vars["ring_start"].copy_(context.ring_start[:1])
+        else:
+            graph_vars["overlay_base"].fill_(-1)
+            graph_vars["ring_start"].fill_(1 << 30)
+        table = context.block_tables[0]
+        graph_vars["block_tables"][0, :table.shape[0]].copy_(table)
+        graph_vars["cu_seqlens_k"].copy_(context.cu_seqlens_k)
+        graph_vars["cu_seqlens_k"][1:].add_(size - rows)  # the padded rows after the real ones: the first position stays
+        graph_vars["real"].fill_(rows)
+        draft_features = self._draft_feature_buffer(graph_vars, size, register=False)
+        set_context(True, graph_vars["cu_seqlens_q"], graph_vars["cu_seqlens_k"], size, self.config.max_model_len, graph_vars["slot_mapping"], None, graph_vars["block_tables"],
+                    has_previous_state=context.has_previous_state, overlay_mapping=graph_vars["overlay_mapping"], overlay_base=graph_vars["overlay_base"], ring_start=graph_vars["ring_start"])
+        try:
+            with cuda_graphs.scope(gated=False):
+                cuda_graphs.run(self.model, graph_vars["input_ids"], graph_vars["positions"], graph_vars["outputs"], graph_vars["real"], draft_features, method="lm_engine_prompt_forward")
+        finally:
+            use_context(context)
+        if draft_features is not None:
+            self.model._draft_features = draft_features[:, :rows]
+        return graph_vars["outputs"][:, :rows].clone()
 
     def _run_target_stage(self, input_ids: torch.Tensor, positions: torch.Tensor, outputs: torch.Tensor, draft_features: torch.Tensor | None = None) -> None:
         """MMGP mode: a decoding pass of the target model into outputs, one MMGP graph while its weights are all in VRAM; otherwise its
@@ -1377,7 +1435,8 @@ class ModelRunner:
     def prefill_only(self, seqs: list[Sequence]) -> None:
         self.ensure_runtime_ready()
         input_ids, positions, inputs_embeds = self.prepare_prefill(seqs)
-        self.run_model(input_ids, positions, True, inputs_embeds=inputs_embeds)
+        if self._prompt_graph_pass(input_ids, inputs_embeds) is None:  # (a short prompt pass replayed as a graph: its logits are not read here)
+            self.run_model(input_ids, positions, True, inputs_embeds=inputs_embeds)
         for seq in seqs:
             seq.clear_prompt_data()
         reset_context()
@@ -1402,7 +1461,7 @@ class ModelRunner:
     def _single_decode_supported(self) -> bool:
         if self._single_decode is None:
             from shared.kernels import host_doorbell
-            self._single_decode = self.mmgp_graphs and not self.enforce_eager and self.graph_vars["input_ids"].shape[0] == 1 and host_doorbell.supported(self._get_runtime_device())
+            self._single_decode = _TRITON and self.mmgp_graphs and not self.enforce_eager and self.graph_vars["input_ids"].shape[0] == 1 and host_doorbell.supported(self._get_runtime_device())
         return self._single_decode
 
     def _prepare_single_decode(self, seq: Sequence):
@@ -1834,7 +1893,9 @@ class ModelRunner:
         previous_pending = self._speculative_pending.pop(seq.seq_id, None)
         seq.num_cached_tokens = previous_token_count if previous_pending is not None else previous_token_count - 1
         input_ids, positions, inputs_embeds = self.prepare_prefill([seq])
-        hidden_states = self.model(input_ids=input_ids, positions=positions, inputs_embeds=inputs_embeds)
+        hidden_states = self._prompt_graph_pass(input_ids, inputs_embeds)
+        if hidden_states is None:
+            hidden_states = self.model(input_ids=input_ids, positions=positions, inputs_embeds=inputs_embeds)
         target_logits = self.model.compute_logits(hidden_states)[0]
         suffix_ids = torch.tensor(seq.token_ids[previous_token_count:], dtype=torch.long, device=hidden_states.device).unsqueeze(0)
         if previous_pending is None:
@@ -2170,8 +2231,10 @@ class ModelRunner:
             device = self._get_runtime_device()
             vocab = int(graph_vars["logits"].shape[-1])
             self._draft_chain = False
-            if _CHAIN and not (_SUFFIX or _DRAFT_COSTS or _FIRST_ALWAYS) and self.use_triton_sampling and draft_chain.supported(device, vocab):
-                self._draft_chain = draft_chain.DraftChain(device, vocab, target_vocab, self._max_speculative_draft_tokens)
+            if _CHAIN and not (_SUFFIX or _DRAFT_COSTS or _FIRST_ALWAYS) and self.use_triton_sampling:
+                from ..layers import draft_chain  # Triton kernels
+                if draft_chain.supported(device, vocab):
+                    self._draft_chain = draft_chain.DraftChain(device, vocab, target_vocab, self._max_speculative_draft_tokens)
         return self._draft_chain is not False
 
     def _build_mtp_drafts(self, seq: Sequence, sample_params, draft_count: int, start_position: int, profile: dict | None = None) -> tuple[list[int] | torch.Tensor, int, list[torch.Tensor] | None]:
@@ -2764,6 +2827,7 @@ class ModelRunner:
                 self.graph_bs = cached["bs"]
                 self.speculative_graphs = cached.get("speculative_graphs", {})
                 self.speculative_graph_vars = cached.get("speculative_vars", {})
+                self.prompt_graph_vars = cached.get("prompt_vars", {})
                 self.speculative_commit_graphs = cached.get("speculative_commit_graphs", {})
                 self.mtp_graph = cached.get("mtp_graph")
                 self.mtp_graph_pool = cached.get("mtp_pool")
@@ -2973,9 +3037,21 @@ class ModelRunner:
                 self.model.mtp._cache.cache_seqlens.zero_()
                 if self._speculative_replay_modules and defer_commits:
                     capture_commits(self.mtp_graph_pool)
+        self.prompt_graph_vars = {}
+        if self.mmgp_graphs and _PROMPT_GRAPHS:
+            for rows in getattr(self.model, "lm_engine_prompt_graph_rows", ()):  # short prompt passes padded to these sizes: MMGP graphs recorded at their first use
+                graph_vars = self.prompt_graph_vars[rows] = dict(
+                    input_ids=torch.zeros(rows, dtype=torch.int64, device=model_device), positions=torch.zeros(rows, dtype=torch.int64, device=model_device),
+                    slot_mapping=torch.full((rows,), -1, dtype=torch.int32, device=model_device), cu_seqlens_q=torch.tensor([0, rows], dtype=torch.int32, device=model_device),
+                    cu_seqlens_k=torch.tensor([0, rows], dtype=torch.int32, device=model_device), block_tables=torch.full((1, max_num_blocks), -1, dtype=torch.int32, device=model_device),
+                    overlay_mapping=torch.full((rows,), -1, dtype=torch.int32, device=model_device), overlay_base=torch.full((1,), -1, dtype=torch.int32, device=model_device),
+                    ring_start=torch.full((1,), 1 << 30, dtype=torch.int32, device=model_device), real=torch.zeros(1, dtype=torch.int32, device=model_device),
+                    outputs=torch.zeros(1, rows, output_size, device=model_device, dtype=self.dtype))
+                self._draft_feature_buffer(graph_vars, rows, register=False)
         if self.mmgp_graphs:
             self._capture_target_stages(slot_mapping, context_lens, block_tables, overlay_mapping, overlay_base, ring_start)
         self._graph_cache[cache_key] = {
+            "prompt_vars": self.prompt_graph_vars,
             "graphs": self.graphs,
             "pool": self.graph_pool,
             "vars": self.graph_vars,

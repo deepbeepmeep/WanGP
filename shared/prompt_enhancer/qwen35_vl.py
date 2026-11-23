@@ -252,7 +252,9 @@ def _load_qwen35_image_processor(assets_dir: str):
 def get_qwen35_text_gguf_path(assets_dir: str, variant: str | None = None, backend: str = enhancer_quantization_GGUF) -> str:
     spec = get_qwen35_variant_spec(variant)
     filename = _get_qwen35_gguf_filename(spec, get_qwen35_quantization(backend, variant=variant))
-    return _resolve_qwen35_checkpoint_file(assets_dir, filename, variant=variant, error_if_none=False)
+    # where the download puts it (the 9B: the GGUF folder of the 27B, beside the 27B's), else beside the tokenizer or at a checkpoint root
+    downloaded = fl.locate_file(f"{spec['gguf_repo_subfolder']}/{filename}", error_if_none=False) if "gguf_repo_subfolder" in spec else None
+    return downloaded or _resolve_qwen35_checkpoint_file(assets_dir, filename, variant=variant, error_if_none=False)
 
 
 def _build_qwen35_vl_gguf_preprocess_sd(patch_shape):

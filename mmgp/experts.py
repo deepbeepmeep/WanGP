@@ -85,6 +85,9 @@ class ExpertBank(nn.Module):
         self.usage = torch.zeros(self.num_experts, dtype=torch.uint32, device="cpu")
         self._usage = self.usage.numpy()
         self.gpu_branch = False  # graphs run its GPU branch even when it has no GPU copy at capture: the elastic placement may give it some later, in place
+        # set by the model before MMGP takes it over: while every expert of its residency is in VRAM, its compute backend may leave out the CPU's part of decoding passes
+        # (complete_residencies keys the graphs on it). Its routing is then not counted: the placement has nothing to follow
+        self.doorbell_free = False
 
     def _apply(self, fn, recurse=True):
         # the checkpoint tensors stay in RAM in their stored dtypes whatever moves or casts the model (to("cuda"), half()): the residency owns the GPU copies
@@ -130,12 +133,33 @@ class ExpertBank(nn.Module):
         self._flags[old], self._flags[new] = 0, 1
         self.residency_version += 1
 
+    def add_device_usage(self, counts):
+        """Counts of a pass kept on the device (int64 [experts]), added to the usage at flush_device_usage: a pass whose routing never reaches the host."""
+        self._device_usage = counts if getattr(self, "_device_usage", None) is None else self._device_usage.add_(counts)
+
+    def flush_device_usage(self, counts=None):
+        if getattr(self, "_device_usage", None) is not None:
+            self._usage += (self._device_usage.cpu().numpy() if counts is None else counts).astype(np.uint32)
+            self._device_usage = None
+            residency = None if self._residency is None else self._residency()
+            if residency is not None:
+                residency.adapt_due = True
+
     def add_usage(self, ids):
         """Counts a pass that its compute backend does not count: a prompt chunk, whose routing announces what decoding will read."""
         self._usage += np.bincount(ids.reshape(-1).cpu().numpy(), minlength=self.num_experts).astype(np.uint32)
         residency = None if self._residency is None else self._residency()
         if residency is not None:
             residency.adapt_due = True
+
+
+def flush_device_usage(banks):
+    """The usage the banks of a pass kept on the device, read back in one copy."""
+    pending = list({id(bank): bank for bank in banks if getattr(bank, "_device_usage", None) is not None}.values())
+    if pending:
+        counts = torch.stack([bank._device_usage.to(torch.int64) for bank in pending]).cpu().numpy()
+        for bank, row in zip(pending, counts):
+            bank.flush_device_usage(row)
 
 
 def banks(model):
@@ -483,6 +507,18 @@ class _Slot:
         return [(name, self[name]) for name in self]
 
 
+_residencies = weakref.WeakSet()
+
+
+def complete_residencies():
+    """Graph key: the models whose banks skip their doorbell jobs while every expert is in VRAM (RoutedExperts.doorbell_free) and that have them all there now. Their decoding
+    graphs are captured without the CPU's part, so a placement that lets one expert out leads to other graphs."""
+    return tuple(sorted(residency.model_id for residency in _residencies if residency.doorbell_free and residency.complete()))
+
+
+cuda_graphs.register_key(complete_residencies)
+
+
 class Residency:
     def __init__(self, manager, model_id, expert_banks, budget, dynamic):
         self.manager = weakref.ref(manager)
@@ -520,8 +556,37 @@ class Residency:
         if self.elastic:
             self._init_elastic()
         memory_pressure.register(self, priority=0)
+        self.doorbell_free = any(bank.doorbell_free for bank in self.banks) and self.elastic
+        self.counts = self.counts_host = self.counts_memory = self.counts_event = None
+        self.count_views = {}
+        _residencies.add(self)
+
+    def counter(self, bank):
+        """int32 [experts] on the device: the pairs routed to each expert of the bank by passes without a doorbell job, since the last fold_counts()."""
+        return self.count_views[bank]
+
+    def fold_counts(self):
+        """Between passes: the device counts into the routing counts the rounds read (all_usage), as the CPU jobs would have added them. Asynchronous: the copy of the counts
+        to locked RAM is read at a later call once its event has passed (the counts lag by a few passes), the device counts restart from zero after the copy, in stream order."""
+        if self.counts is None:
+            return
+        if self.counts_event is not None:
+            if not self.counts_event.query():
+                return
+            self.all_usage += self.counts_host.numpy().astype(np.uint32)
+            self.counts_event = None
+        with torch.inference_mode():
+            self.counts_host.copy_(self.counts, non_blocking=True)  # read only after counts_event: a synchronized path into locked RAM
+            self.counts.zero_()
+        self.counts_event = torch.cuda.Event()
+        self.counts_event.record()
+
+    def complete(self):
+        """Every expert of its banks has its GPU copy, its flag and its row of the address table (they change together, between passes)."""
+        return len(self.loaded) == len(self.ranking)
 
     def close(self):
+        _residencies.discard(self)
         if self.pages_thread is not None:
             self.pages_thread.join()
         self.unload()
@@ -610,7 +675,15 @@ class Residency:
                 self.table_host = memory.view(torch.int64).view(rows, names)
                 with allocator.normal_allocations():
                     self.table = torch.empty(rows, names, dtype=torch.int64, device=device)
+                    if self.doorbell_free:  # the routing of the passes without a doorbell job, counted on the device (fold_counts); read by the graphs in place, as the table
+                        self.counts = torch.zeros(rows, dtype=torch.int32, device=device)
                 self.table_views = {item: self.table[self.first[item]:self.first[item] + item.num_experts] for item in self.banks}
+                if self.doorbell_free:
+                    self.counts_memory = pinned.empty(rows * 4, "experts")
+                    if self.counts_memory is None:
+                        raise RuntimeError(f"Unable to lock {rows * 4} bytes of RAM for the expert counts of {self.model_id}")
+                    self.counts_host = self.counts_memory.view(torch.int32)
+                    self.count_views = {item: self.counts[self.first[item]:self.first[item] + item.num_experts] for item in self.banks}
             self.table_rows = self.table_host.numpy()
             self.table_rows[:] = 0
             for (item, expert) in self.loaded:
@@ -758,6 +831,7 @@ class Residency:
         finally:
             stream, self.stream = self.stream, None
             stream.close()
+            flush_device_usage(banks)
 
     def release_copied_pages(self, wait=False):
         """RAM short: the checkpoint pages of the experts having a GPU copy leave the working set, first of all (nothing reads them while the copy lives), so that the RAM goes to the experts the CPU reads and to the pinned pool. The pages of the experts out of VRAM stay:
@@ -1006,6 +1080,8 @@ class Residency:
             # a model whose passes replay as graphs from its first pass after a load (graphs kept through an unload): no hook sees them, the first placement is asked for here
             self.place()
             return
+        if self.adapt_calls % ELASTIC_EVERY == 0:
+            self.fold_counts()
         self._land()
         self.plan_round()  # asked for during the last pass by a path that does not call it
         batch = self.batch
@@ -1592,5 +1668,8 @@ class Residency:
                            f"level 2 {self.level2_store.counts}" + (f", Failure {status or ring['status']}" if status or ring['status'] else ""))
             self._free_share()
             pinned.retire(self.table_memory)
+            pinned.retire(self.counts_memory)
             self.table = self.table_host = self.table_memory = None
+            self.counts = self.counts_host = self.counts_memory = self.counts_event = None
+            self.count_views = {}
             self.table_views, self.table_dirty = {}, False

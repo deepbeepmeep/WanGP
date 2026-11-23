@@ -73,9 +73,8 @@ def install(vram_gb, limit_gb=None, ram_gb=None):
         index = torch.cuda.current_device() if device is None or torch.device(device).index is None else torch.device(device).index
         handle = nvml_handles.get(index)
         if handle is None:
-            properties = real_properties(index)
             pynvml.nvmlInit()
-            handle = nvml_handles[index] = pynvml.nvmlDeviceGetHandleByPciBusId(f"{properties.pci_domain_id:08X}:{properties.pci_bus_id:02X}:{properties.pci_device_id:02X}.0")
+            handle = nvml_handles[index] = pynvml.nvmlDeviceGetHandleByUUID(f"GPU-{real_properties(index).uuid}")  # PyTorch 2.7 has no PCI ids
         return int(real_nvml_memory(handle).free)
 
     def mem_get_info(device=None):  # (the VRAM allocator answers free with its room once installed, which takes NVML's figure too)

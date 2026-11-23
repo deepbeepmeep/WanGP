@@ -27,7 +27,7 @@ from shared.gradio.hierarchy_selector import HierarchySelector
 from shared import notifications
 from shared.utils import prompt_parser
 from shared.gradio.model_selector_toolbar import unload_models_from_ram
-from shared.utils.video_codecs import RGBA_VIDEO_OUTPUT_CHOICES, SDR_VIDEO_CODEC_CHOICES, VIDEO_CONTAINER_CHOICES, validate_video_output_settings
+from shared.utils.video_codecs import HARDWARE_VIDEO_ENCODING_CHOICES, RGBA_VIDEO_OUTPUT_CHOICES, SDR_VIDEO_CODEC_CHOICES, VIDEO_CONTAINER_CHOICES, set_hardware_video_encoding, validate_video_output_settings
 from shared.deepy.config import (
     DEEPY_ALLOW_READ_FILE_SYSTEM_DEFAULT,
     DEEPY_ALLOW_READ_FILE_SYSTEM_KEY,
@@ -170,6 +170,14 @@ QWEN_PROMPT_ENHANCER_IDS = (3, 4, 5, 6, 7, 8)  # the local models of the LM engi
 QWEN35_QUANTIZATION_CHOICES = [("Quanto Int8 (recommended, better quality)", "quanto_int8"), ("GGUF Q4 (less VRAM/RAM & faster if kernels are installed, but worse quality)", "gguf")]
 QWEN38_9B_QUANTIZATION_CHOICES = [("GGUF Uncensored Q4_K_M (default, fits 8 GB of VRAM)", "gguf"), ("GGUF Uncensored Q8_0 (closest to full precision, needs about 12 GB of VRAM)", "gguf_q8")]
 QWEN38_QUANTIZATION_CHOICES = [("GGUF Uncensored Q4 (highest quality and VRAM/RAM use, for 24 GB of VRAM or more)", "gguf"), ("GGUF Uncensored IQ3_S (Q3, middle quality and VRAM/RAM use, for 16 GB of VRAM or more)", "gguf_q3"), ("GGUF Uncensored Q2 (lower quality and VRAM/RAM use)", "gguf_q2"), ("Bonsai 2 Abliterated PTQ1_0 (Q1, ternary, lowest VRAM/RAM use, for less than 16 GB of VRAM, requires kernels 1.0.22+)", "gguf_ptq1")]
+
+
+def background_nvenc_warning(hardware_encoding, background_save):
+    """The VRAM NVENC takes during a generation when videos are encoded on it in the background (measured: 490 to 570 MB from 720p to 1080p, 800 to
+    960 MB at 4K)."""
+    if hardware_encoding == "off" or not background_save:
+        return ""
+    return "**With both options on, NVENC may take about 550 MB of VRAM (up to 1 GB at 4K) while the next window or sample is generated. If a generation runs out of VRAM, turn one of them off.**"
 
 
 def prompt_enhancer_quantization_ui_state(enhancer_enabled, quantization):
@@ -372,7 +380,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                         value=self.server_config.get("display_stats", 0), label="Display real-time RAM/VRAM stats (requires restart)"
                     )
                     self.max_frames_multiplier_choice = gr.Dropdown(
-                        choices=[("Default", 1), ("x2", 2), ("x3", 3), ("x4", 4), ("x5", 5), ("x6", 6), ("x7", 7)],
+                        choices=[("Default", 1), *[(f"x{multiplier}", multiplier) for multiplier in range(2, 21)]],
                         value=self.server_config.get("max_frames_multiplier", 1), label="Max Frames / Duration Multiplier (requires restart)"
                     )
                     with gr.Row():
@@ -539,6 +547,11 @@ class ConfigTabPlugin(WAN2GPPlugin):
                         value=self.server_config.get("max_reserved_loras", -1),
                         step=1,
                         label="Max Amount of Loras (in MB) to be Pinned To Reserved Memory (set it to 0-500MB if Out of Memory when starting Gen, -1= No limit)"
+                    )
+                    self.keep_loras_loaded_choice = gr.Dropdown(
+                        choices=[("Auto: kept while at least 10% of the RAM is free", "auto"), ("On: always kept", "on"), ("Off: loaded again for each task", "off")],
+                        value=self.server_config.get("keep_loras_loaded", "auto"), label="Keep Loras Loaded Between Tasks",
+                        info="When the next task uses the same model with the same Loras (only their multipliers may change), they are not read again from disk, which saves one to a few seconds per task. Kept Loras stay in RAM until the model or the Loras change.",
                     )
                     self.vae_config_choice = gr.Dropdown(
                         choices=[("Auto - All the VRAM that other programs leave free", 0), ("Up to 3/4 of the VRAM - Fastest, Best Quality", 1),
@@ -897,6 +910,13 @@ class ConfigTabPlugin(WAN2GPPlugin):
                 with gr.Tab("Outputs"):
                     self.video_container_choice = gr.Dropdown(choices=VIDEO_CONTAINER_CHOICES, value=self.server_config.get("video_container", "mp4"), label="Video Container")
                     self.video_output_codec_choice = gr.Dropdown(choices=SDR_VIDEO_CODEC_CHOICES, value=self.server_config.get("video_output_codec", "libx264_8"), label="SDR Video Codec")
+                    self.video_hardware_encoding_choice = gr.Dropdown(choices=HARDWARE_VIDEO_ENCODING_CHOICES, value=self.server_config.get("video_hardware_encoding", "auto"), label="Hardware Video Encoding",
+                        info="Encodes the x264 and x265 choices on the NVIDIA GPU's video encoder (NVENC): about 3 times faster than the CPU at the same quality. The lossless 4:4:4, ProRes, DNxHR and HDR codecs stay on the CPU.")
+                    self.background_video_save_choice = gr.Checkbox(value=bool(self.server_config.get("background_video_save", False)), label="Save Videos in the Background",
+                        info="The next item (sliding window, sample or queued task) is generated while a video is encoded and saved with its sound, metadata and side files. It may use up to about 0.8 GB more RAM per 5 seconds of 1080p video (3 GB at 4K, four times more with models that return float frames).")
+                    self.background_nvenc_warning_md = gr.Markdown(value=background_nvenc_warning(self.video_hardware_encoding_choice.value, self.background_video_save_choice.value))
+                    for control in (self.video_hardware_encoding_choice, self.background_video_save_choice):
+                        control.input(fn=background_nvenc_warning, inputs=[self.video_hardware_encoding_choice, self.background_video_save_choice], outputs=[self.background_nvenc_warning_md], queue=False, show_progress="hidden")
                     self.rgba_video_output_choice = gr.Dropdown(choices=RGBA_VIDEO_OUTPUT_CHOICES, value=self.server_config.get("rgba_video_output", "png_zip"), label="RGBA Video Output", info="Alpha models save transparency beside the gallery video as lossless PNG frames in a ZIP, or as a ProRes 4444 MOV for video editors. This choice is independent of the gallery codec and container.")
                     self.hdr_video_crf_choice = gr.Dropdown(
                         choices=[
@@ -1115,7 +1135,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             self.video_profile_choice, self.image_profile_choice, self.audio_profile_choice, self.video_preload_choice, self.image_preload_choice, self.audio_preload_choice,
             self.video_preload_mode_choice, self.image_preload_mode_choice, self.audio_preload_mode_choice,
             self.postprocessor_preload_mode_choice, self.postprocessor_preload_choice,
-            self.smart_memory_pinning_choice, self.perc_reserved_mem_max_choice, self.vram_allocator_choice, self.ram_allocator_choice, self.max_reserved_loras_choice,
+            self.smart_memory_pinning_choice, self.perc_reserved_mem_max_choice, self.vram_allocator_choice, self.ram_allocator_choice, self.max_reserved_loras_choice, self.keep_loras_loaded_choice,
             self.llm_cpu_compute_choice, self.deepy_llm_engine_choice,
             *self.codex_config_ui.save_components,
             *self.claude_config_ui.save_components,
@@ -1125,7 +1145,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             self.matanyone_version_choice, self.whisper_model_choice, self.background_removal_model_choice,
             self.deepy_type_choice, self.deepy_vram_mode_choice, self.deepy_voice_language_choice, self.voice_mode_choice, self.deepy_allow_read_file_system_choice, self.deepy_file_system_paths_choice, self.deepy_read_everywhere_choice,
             self.deepy_context_tokens_choice, self.deepy_kv_cache_quantization_choice, self.deepy_kv_cache_exact_choice, self.deepy_compaction_type_choice, self.deepy_repetition_penalty_choice, self.deepy_kept_kv_caches_choice, self.deepy_route_tail_skip_choice, self.deepy_fast_context_reading_choice, self.deepy_zero_custom_system_prompt_choice, self.deepy_prime_custom_system_prompt_choice, self.deepy_prime_mcp_servers_choice, self.deepy_mcp_auto_discover_paths_choice, self.deepy_python_sandbox_choice, self.python_apps_choice, self.deepy_web_search_choice, self.deepy_advanced_transcription_choice, self.deepy_transcription_terms_choice, self.civitai_api_key_choice, self.civitai_api_key_secure_choice, self.huggingface_token_choice, self.huggingface_token_secure_choice,
-            self.video_container_choice, self.video_output_codec_choice, self.rgba_video_output_choice, self.hdr_video_crf_choice, self.image_output_codec_choice, self.audio_output_codec_choice, self.audio_stand_alone_output_codec_choice,
+            self.video_container_choice, self.video_output_codec_choice, self.video_hardware_encoding_choice, self.background_video_save_choice, self.rgba_video_output_choice, self.hdr_video_crf_choice, self.image_output_codec_choice, self.audio_output_codec_choice, self.audio_stand_alone_output_codec_choice,
             self.metadata_choice, self.embed_source_images_choice,
             self.video_save_path_choice, self.image_save_path_choice, self.audio_save_path_choice, self.mesh_save_path_choice,
             self.workspace_storage_choice, self.workspaces_root_choice, self.mcp_workspace_mode_choice, self.mcp_port_choice, self.mcp_webui_choice, self.mcp_workspace_visibility_choice, self.mcp_visual_inspection_choice,
@@ -1233,7 +1253,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             video_profile_choice, image_profile_choice, audio_profile_choice, video_preload_choice, image_preload_choice, audio_preload_choice,
             video_preload_mode_choice, image_preload_mode_choice, audio_preload_mode_choice,
             postprocessor_preload_mode_choice, postprocessor_preload_choice,
-            smart_memory_pinning_choice, perc_reserved_mem_max_choice, vram_allocator_choice, ram_allocator_choice, max_reserved_loras_choice,
+            smart_memory_pinning_choice, perc_reserved_mem_max_choice, vram_allocator_choice, ram_allocator_choice, max_reserved_loras_choice, keep_loras_loaded_choice,
             llm_cpu_compute_choice, deepy_llm_engine_choice,
             codex_executable_choice, codex_model_choice, codex_reasoning_effort_choice,
             claude_executable_choice, claude_model_choice, claude_reasoning_effort_choice,
@@ -1243,7 +1263,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             matanyone_version_choice, whisper_model_choice, background_removal_model_choice,
             deepy_type_choice, deepy_vram_mode_choice, deepy_voice_language_choice, voice_mode_choice, deepy_allow_read_file_system_choice, deepy_file_system_paths_choice, deepy_read_everywhere_choice,
             deepy_context_tokens_choice, deepy_kv_cache_quantization_choice, deepy_kv_cache_exact_choice, deepy_compaction_type_choice, deepy_repetition_penalty_choice, deepy_kept_kv_caches_choice, deepy_route_tail_skip_choice, deepy_fast_context_reading_choice, deepy_zero_custom_system_prompt_choice, deepy_prime_custom_system_prompt_choice, deepy_prime_mcp_servers_choice, deepy_mcp_auto_discover_paths_choice, deepy_python_sandbox_choice, python_apps_choice, deepy_web_search_choice, deepy_advanced_transcription_choice, deepy_transcription_terms_choice, civitai_api_key_choice, civitai_api_key_secure_choice, huggingface_token_choice, huggingface_token_secure_choice,
-            video_container_choice, video_output_codec_choice, rgba_video_output_choice, hdr_video_crf_choice, image_output_codec_choice, audio_output_codec_choice, audio_stand_alone_output_codec_choice,
+            video_container_choice, video_output_codec_choice, video_hardware_encoding_choice, background_video_save_choice, rgba_video_output_choice, hdr_video_crf_choice, image_output_codec_choice, audio_output_codec_choice, audio_stand_alone_output_codec_choice,
             metadata_choice, embed_source_images_choice,
             save_path_choice, image_save_path_choice, audio_save_path_choice, mesh_save_path_choice,
             workspace_storage_choice, workspaces_root_choice, mcp_workspace_mode_choice, mcp_port_choice, mcp_webui_choice, mcp_workspace_visibility_choice, mcp_visual_inspection_choice,
@@ -1398,8 +1418,9 @@ class ConfigTabPlugin(WAN2GPPlugin):
             "max_frames_multiplier": max_frames_multiplier_choice, "display_stats": display_stats_choice,
             "keep_resolution_on_model_switch": keep_resolution_on_model_switch_choice,
             "enable_4k_resolutions": enable_4k_resolutions_choice,
-            "max_reserved_loras": max_reserved_loras_choice,
+            "max_reserved_loras": max_reserved_loras_choice, "keep_loras_loaded": keep_loras_loaded_choice,
             "video_output_codec": video_output_codec_choice, "hdr_video_crf": hdr_video_crf_choice,
+            "video_hardware_encoding": video_hardware_encoding_choice, "background_video_save": bool(background_video_save_choice),
             "rgba_video_output": rgba_video_output_choice,
             "image_output_codec": image_output_codec_choice,
             "audio_output_codec": audio_output_codec_choice,
@@ -1517,7 +1538,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             "prompt_enhancer_temperature", "prompt_enhancer_top_p", "prompt_enhancer_randomize_seed", "prompt_enhancer_quantization", PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY, "enhancer_mode",
             DEEPY_ENABLED_KEY, DEEPY_TYPE_KEY, DEEPY_VRAM_MODE_KEY, DEEPY_ALLOW_READ_FILE_SYSTEM_KEY, DEEPY_FILE_SYSTEM_PATHS_KEY, DEEPY_READ_EVERYWHERE_KEY, DEEPY_CONTEXT_TOKENS_KEY, DEEPY_KV_CACHE_QUANTIZATION_KEY, DEEPY_ROUTE_TAIL_SKIP_KEY, DEEPY_FAST_CONTEXT_READING_KEY, DEEPY_COMPACTION_TYPE_KEY, DEEPY_COMPACTION_THINKING_KEY, DEEPY_REPETITION_PENALTY_KEY, DEEPY_KEPT_KV_CACHES_KEY, DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY, DEEPY_PRIME_CUSTOM_SYSTEM_PROMPT_KEY, DEEPY_PRIME_MCP_SERVERS_KEY, DEEPY_MCP_AUTO_DISCOVER_PATHS_KEY, PYTHON_APPS_KEY, DEEPY_ADVANCED_TRANSCRIPTION_KEY, DEEPY_TRANSCRIPTION_TERMS_KEY,
             LLM_CONFIG_KEY,
-            "max_frames_multiplier", "display_stats", "keep_resolution_on_model_switch", "enable_4k_resolutions", "max_reserved_loras", "video_output_codec", "hdr_video_crf", "video_container",
+            "max_frames_multiplier", "display_stats", "keep_resolution_on_model_switch", "enable_4k_resolutions", "max_reserved_loras", "keep_loras_loaded", "video_output_codec", "video_hardware_encoding", "background_video_save", "hdr_video_crf", "video_container",
             "embed_source_images", "image_output_codec", "audio_output_codec", "audio_stand_alone_output_codec", "checkpoints_paths", "loras_root", "save_queue_if_crash",
             "UI_theme", "floating_generate_button", "queue_color_scheme", gradio_queue_focus_patch.FOCUS_QUEUE_SERVER_CONFIG_KEY, "prevent_power_throttling",
             COMPUTE_CACHE_KEY, COMPUTE_CACHE_PATH_KEY,
@@ -1526,6 +1547,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
         needs_reload = not all(change in no_reload_keys for change in changes)
 
         self.set_global("attention_mode", new_server_config["attention_mode"])
+        set_hardware_video_encoding(new_server_config["video_hardware_encoding"])
         self.set_global("default_profile", new_server_config["profile"])
         self.set_global("default_profile_video", new_server_config["video_profile"])
         self.set_global("default_profile_image", new_server_config["image_profile"])

@@ -15,9 +15,11 @@ class GpuBackend:
 class NvmlBackend(GpuBackend):
     def __init__(self):
         import pynvml
+        import torch
         pynvml.nvmlInit()
         self._nvml = pynvml
-        self._handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        # NVML numbers every card of the machine, whatever CUDA_VISIBLE_DEVICES selects: the card WanGP runs on is found by its UUID
+        self._handle = pynvml.nvmlDeviceGetHandleByUUID(f"GPU-{torch.cuda.get_device_properties(torch.cuda.current_device()).uuid}")
 
     def query(self):
         util = self._nvml.nvmlDeviceGetUtilizationRates(self._handle)

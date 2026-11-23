@@ -31,6 +31,7 @@
       // Otherwise suspended tabs can dispatch a whole backlog concurrently.
       galleryPending = true;
       galleryDirty = false;
+      WAC.setBridgeValue('#wangp-gallery-stale textarea', window.WanGPGallerySelection?.stale() ? '1' : '');
       click('deepy_hybrid_gallery_sync');
     }
     function requestGallery() {
@@ -39,6 +40,7 @@
       // snapshot/restoration/focus notifications from the same browser task.
       if (galleryTask === null) galleryTask = setTimeout(() => {galleryTask = null; flushGallery();}, 0);
     }
+    WAC.repairGallery = requestGallery;
     let errorSequence = 0;
     function showError(data) {
       // Let Gradio render its native popup, including duration/title/visibility.

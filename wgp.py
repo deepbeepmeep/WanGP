@@ -6,7 +6,7 @@ _restart_launch = supervise() if __name__ == "__main__" else False
 for _stream in (sys.stdout, sys.stderr): _stream.reconfigure(encoding="utf-8", errors="replace")
 from tqdm import tqdm
 
-WanGP_version = "20.11"
+WanGP_version = "20.12"
 _welcome_message = f" WanGP v{WanGP_version} - Copyright (c) 2024-2026 DeepBeepMeep "
 tqdm.write(f"\033[1m\033[93m{_welcome_message:*^100}\033[0m")
 
@@ -97,6 +97,8 @@ from shared.utils.video_decode import decode_video_frames_ffmpeg, probe_video_st
 from shared.utils.video_metadata import extract_source_images  # also a plugin global (Queue Editor)
 from shared.utils.virtual_media import get_virtual_image, get_virtual_media_entry, get_virtual_media_vsource, media_source_exists, padded_virtual_media, parse_virtual_media_path, replace_virtual_media_source, strip_virtual_media_suffix
 from shared.utils import video_continuation
+from shared.utils.background_save import BackgroundSaver
+from shared.utils.video_codecs import nvenc_in_use, set_hardware_video_encoding
 from shared.utils.frame_scheduler import resolve_window_geometry, SLASH_BLOCK_RE, build_default_window_plan, build_extension_window, build_frame_scheduler, fit_video_length, floor_frame_count, has_slash_commands, normalize_frame_count, set_video_length_rounding, prepare_loras_mult_windows
 from shared.match_archi import match_nvidia_architecture
 from shared.attention import ATTENTION_MODE_AVAILABILITY, sagegp_ready, sage_gp_redirect, get_attention_modes, get_supported_attention_modes, get_default_attention_mode, get_override_attention_modes, get_supported_override_attention_modes
@@ -138,6 +140,7 @@ from shared import config_groups as model_config_groups
 from shared import resolutions as resolution_utils
 import torch
 import gc
+import psutil
 import traceback
 import math 
 import typing
@@ -294,10 +297,25 @@ def clear_gen_cache():
 
 
 _deepy_hybrid = None
+kept_loras = None  # the Loras the last task left loaded for the next one (keep_loras_loaded): their models, files and MMGP adapters
+
+def unload_task_loras(models):
+    global kept_loras
+    for model in models:
+        if model is not None: offload.unload_loras_from_model(model)
+    kept_loras = None
+
+def keep_loras_loaded():
+    mode = server_config.get("keep_loras_loaded", "auto")
+    if mode == "auto":
+        memory = psutil.virtual_memory()  # the RAM budget's figures when one is set
+        return memory.available >= 0.1 * memory.total
+    return mode == "on"
 
 def release_model():
     global wan_model, offloadobj, reload_needed
     released = transformer_type if wan_model is not None or offloadobj is not None else None
+    if kept_loras is not None: unload_task_loras(kept_loras["models"])
     wan_model = None
     clear_gen_cache()
     if "_cache" in offload.shared_state:
@@ -2918,9 +2936,12 @@ if not Path(config_load_filename).is_file():
         attention_kit.CHUNKER_CONFIG_KEY: attention_kit.CHUNKER_DEFAULT,
         "clear_file_list" : 5,
         "keep_intermediate_sliding_windows": 1,
+        "video_hardware_encoding": "auto",
+        "background_video_save": False,
         "keep_resolution_on_model_switch": True,
         "enable_4k_resolutions": 0,
         "max_reserved_loras": -1,
+        "keep_loras_loaded": "auto",
         "video_preload_mode": "default",
         "image_preload_mode": "default",
         "audio_preload_mode": "default",
@@ -3790,6 +3811,9 @@ image_save_path = server_config.get("image_save_path", os.path.join(os.getcwd(),
 audio_save_path = server_config.get("audio_save_path", save_path)
 mesh_save_path = server_config.get("mesh_save_path", save_path)
 if not "video_output_codec" in server_config: server_config["video_output_codec"]= "libx264_8"
+if not "video_hardware_encoding" in server_config: server_config["video_hardware_encoding"]= "auto"
+if not "background_video_save" in server_config: server_config["background_video_save"]= False
+set_hardware_video_encoding(server_config["video_hardware_encoding"])
 if not "hdr_video_crf" in server_config: server_config["hdr_video_crf"] = 8
 if not "video_container" in server_config: server_config["video_container"]= "mp4"
 if not "embed_source_images" in server_config: server_config["embed_source_images"]= False
@@ -4767,12 +4791,16 @@ def get_gen_info(state):
         state["gen"] = cache
     return cache
 
-def queued_model_type_after(gen, task):
-    # the model type of the task queued after this one (the UI, API and CLI runners keep the running task first in gen["queue"]), None at
-    # the end of the queue or for a runner that keeps no queue there
+def queued_task_after(gen, task):
+    # the task queued after this one (the UI, API and CLI runners keep the running task first in gen["queue"]), None at the end of the queue
+    # or for a runner that keeps no queue there
     queue = list(gen.get("queue", []))
     position = next((index for index, entry in enumerate(queue) if entry is task), None)
-    return None if position is None or position + 1 >= len(queue) else queue[position + 1]["params"].get("model_type")
+    return None if position is None or position + 1 >= len(queue) else queue[position + 1]
+
+def queued_model_type_after(gen, task):
+    next_task = queued_task_after(gen, task)
+    return None if next_task is None else next_task["params"].get("model_type")
 
 def build_callback(state, pipe, send_cmd, status, num_inference_steps, preview_meta=None, tiny_preview=None):
     gen = get_gen_info(state)
@@ -5095,6 +5123,14 @@ def can_extend_sample(params):
     preprocess_all = resolve_model_preprocess_all(model_def, base_model_type=base_model_type, video_prompt_type=params.get("video_prompt_type", ""), image_prompt_type=params.get("image_prompt_type", ""), audio_prompt_type=params.get("audio_prompt_type", ""), custom_settings=params.get("custom_settings", {}), params=params)
     return test_any_sliding_window(base_model_type) and not preprocess_all
 
+
+def refresh_gallery_outside_view(state):
+    """refresh_gallery for callbacks outside the shared view refresh: that refresh alone renders the galleries
+    (gallery, last choice, strip galleries), with the view its clicks resolve through."""
+    updates = refresh_gallery(state)
+    if service_for(state) is None:
+        return updates
+    return *updates[:2], *[gr.update()] * (2 + 3 * len(STRIP_SOURCES)), *updates[4 + 3 * len(STRIP_SOURCES):]
 
 def refresh_gallery(state): #, msg
     service = service_for(state)
@@ -6528,6 +6564,36 @@ def get_available_filename(target_path, video_source, suffix = "", force_extensi
             return full_path
         counter += 1
 
+def encode_video_output(continued_video, frames, path, fps, hdr, container):
+    """The call that encodes the new frames of an output to path (the video made so far for a generation gathered in a file, whose path it
+    returns, None when the user stopped the post-processing of its Source Video). The list of frames is copied: a generation keeping its
+    frames in memory adds the next window's to it while this one is saved."""
+    if continued_video is not None:
+        return partial(continued_video.append, frames)
+    if hdr:
+        return partial(save_hdr_video, tensor=list(frames), save_file=path, fps=fps, codec_type=server_config.get("hdr_video_crf", 8), container=container)
+    return partial(save_video, tensor=list(frames), save_file=path, fps=fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type=server_config.get("video_output_codec", None), container=container)
+
+def copy_video_output(encode_output, video_path, from_continued_video):
+    """Write a video without sound: False when the user stopped the post-processing of the Source Video."""
+    encoded_path = encode_output()
+    if from_continued_video:
+        if encoded_path is None:
+            return False
+        shutil.copyfile(encoded_path, video_path)
+    return True
+
+def mux_video_output(encode_output, video_tmp_path, from_continued_video, mux_output, temp_audio_files, temp_audio_tracks):
+    """Mux the pictures of video_tmp_path (encoded first by encode_output when given) with the sound, then remove the working files."""
+    if encode_output is not None:
+        encoded_path = encode_output()
+        if from_continued_video:
+            video_tmp_path = encoded_path
+    mux_output(video_tmp_path)
+    if not from_continued_video: os.remove(video_tmp_path)
+    for path in temp_audio_files: os.remove(path)
+    cleanup_temp_audio_files(temp_audio_tracks)
+
 def set_seed(seed):
     import random
     seed = random.randint(0, 999999999) if seed == None or seed < 0 else seed
@@ -7685,8 +7751,13 @@ def generate_media(
         gen["progress_phase"] = (phase_text, -1)
         send_cmd("progress", [0, get_latest_status(state, phase_text)])
 
-    global wan_model, offloadobj, reload_needed, loaded_config
+    global wan_model, offloadobj, reload_needed, loaded_config, kept_loras
     gen = get_gen_info(state)
+    # videos saved while the next window, sample or queued task is generated; the previous task's last outputs may still be saved
+    saver = gen.get("background_saver")
+    if saver is not None and (not server_config.get("background_video_save", False) or saver.writes_any(task["params"].values())):
+        saver.wait(raise_error=False)  # turned off, or this task reads one of them
+    saver = gen.setdefault("background_saver", BackgroundSaver()) if server_config.get("background_video_save", False) else None
     output_paths = workspace_storage.output_config(server_config, state=state)
     save_path, image_save_path, audio_save_path, mesh_save_path = (output_paths[key] for key in workspace_storage.OUTPUT_KEYS)
     api_return_video_uint8, api_return_audio = get_api_output_options(plugin_data)
@@ -7795,6 +7866,8 @@ def generate_media(
     profile = compute_profile(override_profile, output_type)
     compilation = compute_compile(override_values.get("compilation", ""), compile)
     if model_type != transformer_type or reload_needed or profile != loaded_profile or config != loaded_config or compilation != loaded_compile or compute_quantization(override_values) != loaded_quantization:
+        if saver is not None and saver.pending() and nvenc_in_use(server_config.get("video_output_codec", None)):
+            saver.wait(raise_error=False)  # NVENC's VRAM would be read as another program's by the loading decisions (preload)
         release_model()
         send_cmd("status", "Loading...")
         def loading_progress(phase, completed, total, model_id):
@@ -7929,6 +8002,25 @@ def generate_media(
         errors = check_loras_exist(model_type, loras_selected, True, send_cmd, gen=gen)
         if len(errors) > 0 : raise gr.Error(errors)
         loras_selected = [ get_lora_local_path(lora_dir, lora) for lora in loras_selected]
+        lora_files = [(path, os.stat(path).st_size, os.stat(path).st_mtime_ns) for path in loras_selected]
+        # the first files are those the previous task loaded first too, unchanged and still in the model (another loader, such as a
+        # post-processor's, replaces MMGP's adapters): they stay loaded
+        keep_loras = 0
+        if kept_loras is not None and kept_loras["models"] == (trans_lora, trans2_lora) and kept_loras["pinning"] == server_config.get("max_reserved_loras", -1) and trans_lora._loras_adapters is kept_loras["adapters"]:
+            while keep_loras < min(len(lora_files), len(kept_loras["files"])) and lora_files[keep_loras] == kept_loras["files"][keep_loras]:
+                keep_loras += 1
+        reuse_loras = keep_loras > 0 and keep_loras == len(lora_files) == len(kept_loras["files"])
+    else:
+        keep_loras, reuse_loras = 0, False
+    if keep_loras == 0:
+        unload_task_loras((trans_lora, trans2_lora))
+    elif not reuse_loras and trans2_lora is not None:  # the second transformer holds the adapters of the first (sync_models_loras)
+        offload.unload_loras_from_model(trans2_lora, keep=set(list(trans_lora._loras_adapters)[:keep_loras]))
+    if reuse_loras:
+        offload.activate_loras(trans_lora, list(trans_lora._loras_adapters), loras_list_mult_choices_nums)
+        if trans2_lora is not None:
+            offload.sync_models_loras(trans_lora, trans2_lora)
+    elif len(loras_selected) > 0:
         pinnedLora = not is_mps and loaded_profile !=5  # and transformer_loras_filenames == None False # # #
         preprocess_target = trans_lora if trans_lora is not None else trans
         split_linear_modules_map = getattr(preprocess_target, "split_linear_modules_map", None)
@@ -7941,6 +8033,7 @@ def generate_media(
             pinnedLora=pinnedLora,
             maxReservedLoras=server_config.get("max_reserved_loras", -1),
             split_linear_modules_map=split_linear_modules_map,
+            keep_loras=keep_loras,
         )
         errors = trans_lora._loras_errors
         if len(errors) > 0:
@@ -7952,6 +8045,7 @@ def generate_media(
             for lora_model in (trans_lora, trans2_lora):
                 if lora_model is not None:
                     offloadobj.refresh_loras(lora_model)
+        kept_loras = {"models": (trans_lora, trans2_lora), "files": lora_files, "pinning": server_config.get("max_reserved_loras", -1), "adapters": trans_lora._loras_adapters}
         
     seed = None if seed == -1 else seed
     # negative_prompt = "" # not applicable in the inference
@@ -8303,7 +8397,7 @@ def generate_media(
         src_video = src_video2 = src_video3 = src_mask = src_mask2 = src_faces = sparse_video_image = full_generated_audio =None
         prefix_video = pre_video_frame = None
         source_stays_in_file = False # the Source Video is continued from its file: only its last frames are loaded
-        if continued_video is not None: continued_video.start_sample()
+        if continued_video is not None: (continued_video.start_sample() if saver is None else saver.submit(continued_video.start_sample, output=False))
         if loaded_source_plan is not None and loaded_source_plan["kept"]: loaded_source_plan["new_frames"] = video_length
         source_video_overlap_frames_count = 0 # number of frames overalapped in source video for first window
         source_video_frames_count = 0  # number of frames to use in source video (processing starts source_video_overlap_frames_count frames before )
@@ -8499,7 +8593,7 @@ def generate_media(
                     prefix_video  = prefix_video.permute(3, 0, 1, 2)
                     if source_stays_in_file and continued_video is None:
                         frames_growth = chunking.growth(temporal_upsampling)[0]
-                        encode_video_frames = lambda frames, path: save_video(tensor=frames, save_file=path, fps=fps * frames_growth, nrow=1, normalize=True, value_range=(-1, 1), codec_type=server_config.get("video_output_codec", None), container=server_config.get("video_container", "mp4"))
+                        encode_video_frames = lambda frames, path, hardware: save_video(tensor=frames, save_file=path, fps=fps * frames_growth, nrow=1, normalize=True, value_range=(-1, 1), codec_type=server_config.get("video_output_codec", None), container=server_config.get("video_container", "mp4"), hardware=hardware)
                         # the Source Video goes through the post-processing of the generation a chunk at a time, unless it already went through it
                         process_source_video = lambda read_frames, frames_count, source_width=prefix_video.shape[-1], source_height=prefix_video.shape[-2]: chunked_postprocessing(read_frames, frames_count, source_width, source_height, fps, temporal_upsampling, spatial_upsampling, film_grain_intensity, film_grain_saturation,
                             dict(seed=seed, vae_tile_size=VAE_tile_size, fps=fps * frames_growth, prompt=prompt, negative_prompt=negative_prompt, source_audio_path=source_audio_tracks[0] if source_audio_tracks else None, reference_images=original_image_refs[nb_frames_positions:] if original_image_refs is not None else None, image_refs_relative_size=image_refs_relative_size, parameter_values=parameter_ui.runtime_values(spatial_postprocessing_parameters, postprocessing_reference_images)),
@@ -9039,6 +9133,7 @@ def generate_media(
                 callback.close(cancel=True)
                 upsampler_api.release_vae_upsampler(vae_upsampler_handler, vae_upsampler_session)
                 vae_upsampler_session = None
+                if saver is not None: saver.wait(raise_error=False)  # the save in progress reads the working files removed below
                 if len(control_audio_tracks) > 0 or len(source_audio_tracks) > 0:
                     cleanup_temp_audio_files(control_audio_tracks + source_audio_tracks)
                 remove_temp_filenames(temp_filenames_list)
@@ -9048,9 +9143,7 @@ def generate_media(
                 trans.cache = None 
                 if trans2 is not None: 
                     trans2.cache = None 
-                offload.unload_loras_from_model(trans_lora)
-                if trans2_lora is not None: 
-                    offload.unload_loras_from_model(trans2_lora)
+                unload_task_loras((trans_lora, trans2_lora))
                 skip_steps_cache = None
                 # if compile:
                 #     cache_size = torch._dynamo.config.cache_size_limit                                      
@@ -9325,7 +9418,7 @@ def generate_media(
                 else:
                     if continued_video is None and not (sample_is_hdr or api_return_video_uint8 or return_flashvsr_continue_cache):
                         # no Source Video kept in its file: the windows are gathered in a file all the same, each one encoded alone and joined to the video made so far
-                        continued_video = video_continuation.ContinuedVideo(None, 0, output_fps, None, lambda frames, path, segment_fps=output_fps: save_video(tensor=frames, save_file=path, fps=segment_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type=server_config.get("video_output_codec", None), container=server_config.get("video_container", "mp4")),
+                        continued_video = video_continuation.ContinuedVideo(None, 0, output_fps, None, lambda frames, path, hardware, segment_fps=output_fps: save_video(tensor=frames, save_file=path, fps=segment_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type=server_config.get("video_output_codec", None), container=server_config.get("video_container", "mp4"), hardware=hardware),
                                                                             save_path, server_config.get("video_container", "mp4"), temp_filenames_list, notify=tqdm.write)
                     if continued_video is not None:  # the frames before this window are in that file: memory keeps none of them
                         frames_already_processed = []
@@ -9371,9 +9464,18 @@ def generate_media(
                     prompt_name = sanitize_file_name(truncate_for_filesystem(save_prompt)).strip()
                     file_name = f"{time_flag}_seed{seed}{'_' + prompt_name if prompt_name else ''}.{extension}"
                 video_path = os.path.join(output_dir, file_name)
+                # a video is encoded, muxed and recorded on the save thread while the next window or sample is generated; outputs whose saving runs models or that are returned to an API caller stay here
+                background_save = saver is not None and not (is_image or audio_only or mesh_outputs or world_only or video_file is not None or any_soundtrack_processor or api_return_video_uint8 or api_return_audio or return_flashvsr_continue_cache) \
+                    and not (continued_video is not None and continued_video.process is not None and continued_video.source_file is None)  # the Source Video goes through the post-processing with the first window
+                if background_save:
+                    video_path = saver.reserve(video_path)
+                    file_name = os.path.basename(video_path)
+                elif saver is not None:
+                    saver.wait()
+                write_output = None  # what the save thread writes before recording the output
                 saving_status = f"Saving File {file_name if len(file_name) <= 50 else file_name[:12] + '...' + file_name[-35:]}"
 
-                if not is_image:
+                if not is_image and not background_save:
                     set_progress_status(saving_status)
                 if video_file is not None:
                     os.makedirs(output_dir, exist_ok=True)
@@ -9413,15 +9515,14 @@ def generate_media(
                 elif len(control_audio_tracks) > 0 or len(source_audio_tracks) > 0 or output_new_audio_filepath is not None or any_soundtrack_processor or output_new_audio_data is not None or audio_source is not None:
                     video_path = os.path.join(save_path, file_name)
                     save_path_tmp = video_path.rsplit('.', 1)[0] + f"_tmp.{container}"
-                    if continued_video is not None:  # the new frames are encoded alone and follow the video made so far, kept in a file of its own
-                        save_path_tmp = continued_video.append(output_video_frames)
-                        if save_path_tmp is None:  # stopped while the Source Video was post-processed
-                            abort = True
-                            break
-                    elif sample_is_hdr:
-                        save_hdr_video(tensor=output_video_frames, save_file=save_path_tmp, fps=output_fps, codec_type=server_config.get("hdr_video_crf", 8), container=container)
-                    else:
-                        save_video( tensor=output_video_frames, save_file=save_path_tmp, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type = server_config.get("video_output_codec", None), container=container)
+                    encode_output = encode_video_output(continued_video, output_video_frames, save_path_tmp, output_fps, sample_is_hdr, container)
+                    if not background_save:
+                        encoded_path = encode_output()
+                        if continued_video is not None:  # the new frames are encoded alone and follow the video made so far, kept in a file of its own
+                            if encoded_path is None:  # stopped while the Source Video was post-processed
+                                abort = True
+                                break
+                            save_path_tmp = encoded_path
                     output_new_audio_temp_filepath = None
                     new_audio_tracks_are_pretrimmed = False
                     saved_audio_tail_seconds = 0.0
@@ -9487,37 +9588,23 @@ def generate_media(
                         saved_audio_tail_seconds = model_def["audio_tail_ms"] / 1000
                     mux_audio_sampling_rate = resolve_mux_audio_sampling_rate(output_audio_sampling_rate, source_audio_metadata, new_audio_tracks)
 
-                    set_progress_status(saving_status)
-                    combine_and_concatenate_video_with_audio_tracks(
-                        video_path,
-                        save_path_tmp,
-                        source_audio_tracks,
-                        new_audio_tracks,
-                        source_audio_duration,
-                        mux_audio_sampling_rate,
-                        new_audio_from_start=new_audio_added_from_audio_start,
-                        source_audio_metadata=source_audio_metadata,
-                        audio_codec_key=server_config.get("audio_output_codec", "aac_128"),
-                        pad_audio_to_video=audio_window_alignment and full_generated_audio is not None,
-                        verbose=verbose_level >= 2,
-                        audio_tail_seconds=saved_audio_tail_seconds,
-                    )
-                    if continued_video is None: os.remove(save_path_tmp)
-                    if output_new_audio_temp_filepath is not None: os.remove(output_new_audio_temp_filepath)
-                    cleanup_temp_audio_files(trimmed_mux_audio_tracks)
-                    cleanup_temp_audio_files(replace_voice_temp_audio_tracks)
+                    mux_output = partial(combine_and_concatenate_video_with_audio_tracks, video_path, source_audio_tracks=list(source_audio_tracks), new_audio_tracks=list(new_audio_tracks), source_audio_duration=source_audio_duration,
+                                         audio_sampling_rate=mux_audio_sampling_rate, new_audio_from_start=new_audio_added_from_audio_start, source_audio_metadata=source_audio_metadata, audio_codec_key=server_config.get("audio_output_codec", "aac_128"),
+                                         pad_audio_to_video=audio_window_alignment and full_generated_audio is not None, verbose=verbose_level >= 2, audio_tail_seconds=saved_audio_tail_seconds)
+                    temp_audio_files = [output_new_audio_temp_filepath] if output_new_audio_temp_filepath is not None else []
+                    write_output = partial(mux_video_output, None if not background_save else encode_output, save_path_tmp, continued_video is not None, mux_output, temp_audio_files, trimmed_mux_audio_tracks + replace_voice_temp_audio_tracks)
+                    if not background_save:
+                        set_progress_status(saving_status)
+                        write_output()
+                        write_output = None
 
                 else:
-                    if continued_video is not None:
-                        continued_video_path = continued_video.append(output_video_frames)
-                        if continued_video_path is None:  # stopped while the Source Video was post-processed
+                    write_output = partial(copy_video_output, encode_video_output(continued_video, output_video_frames, video_path, output_fps, sample_is_hdr, container), video_path, continued_video is not None)
+                    if not background_save:
+                        if not write_output():  # stopped while the Source Video was post-processed
                             abort = True
                             break
-                        shutil.copyfile(continued_video_path, video_path)
-                    elif sample_is_hdr:
-                        video_path = save_hdr_video(tensor=output_video_frames, save_file=video_path, fps=output_fps, codec_type=server_config.get("hdr_video_crf", 8), container=container)
-                    else:
-                        save_video( tensor=output_video_frames, save_file=video_path, fps=output_fps, nrow=1, normalize=True, value_range=(-1, 1),  codec_type= server_config.get("video_output_codec", None), container= container)
+                        write_output = None
 
                 end_time = time.time()
 
@@ -9557,53 +9644,65 @@ def generate_media(
                 configs["creation_timestamp"] = int(end_time)
                 # if sample_is_image: configs["is_image"] = True
                 keep_intermediate_windows = server_config.get("keep_intermediate_sliding_windows", 1)
-                record_file_metadata(video_path, configs, is_image, audio_only and video_file is None, gen, embedded_images=embedded_images, replaced_file=None if keep_intermediate_windows else previous_window_path, notify_generation=not sliding_window or keep_intermediate_windows or window_no == total_windows, output_role="intermediate" if sliding_window and window_no < total_windows else "final")
+                record_kwargs = dict(embedded_images=embedded_images, replaced_file=None if keep_intermediate_windows else previous_window_path, notify_generation=not sliding_window or keep_intermediate_windows or window_no == total_windows, output_role="intermediate" if sliding_window and window_no < total_windows else "final")
                 if sliding_window: previous_window_path = video_path  # removed once the next window's file is written, unless every window is kept
-                output_side_files = process_side_files(video_path[0] if isinstance(video_path, list) else video_path, side_files, return_files=api_return_side_files)
-                for side_name in output_side_files:  # a saved world file joins the Worlds gallery
-                    side_path = os.path.join(os.path.dirname(video_path[0] if isinstance(video_path, list) else video_path), side_name)
-                    if has_world_file_extension(side_name) and os.path.isfile(side_path):
-                        record_file_metadata(side_path, configs, False, False, gen, notify_generation=False, record_notification=False)
-                if api_return_video_uint8 or api_return_audio or return_flashvsr_continue_cache or (api_return_side_files and output_side_files):
-                    media_type = "audio" if audio_only and video_file is None else "3d" if mesh_outputs else "world" if world_only else ("image" if is_image else "video")
-                    artifact_audio = output_new_audio_data if api_return_audio else None
-                    if artifact_audio is None and api_return_audio and audio_only and sample is not None:
-                        artifact_audio = sample.squeeze(0).detach().cpu().float().numpy()
-                    artifact_video = output_video_frames if api_return_video_uint8 else None
-                    store_api_output_artifact(gen, client_id, video_path, media_type, artifact_video, artifact_audio, output_audio_sampling_rate, output_fps if not audio_only else None, hdr=bool(sample_is_hdr), flashvsr_continue_cache=flashvsr_continue_cache if return_flashvsr_continue_cache else None, side_files=output_side_files if api_return_side_files else None)
-                side_files = output_side_files = None
-                embedded_images = None
-                # Play notification sound for single video
-                try:
-                    if server_config.get("notification_sound_enabled", 0):
-                        volume = server_config.get("notification_sound_volume", 50)
-                        notification_sound.notify_video_completion(
-                            video_path=video_path, 
-                            volume=volume
-                        )
-                except Exception as e:
-                    print(f"Error playing notification sound for individual video: {e}")
-
-                send_cmd("output")
+                def record_output(write_output=write_output, video_path=video_path, configs=configs, record_kwargs=record_kwargs, side_files=side_files, output_video_frames=output_video_frames, sample=sample, output_new_audio_data=output_new_audio_data, flashvsr_continue_cache=flashvsr_continue_cache):
+                    if write_output is not None: write_output()
+                    record_file_metadata(video_path, configs, is_image, audio_only and video_file is None, gen, **record_kwargs)
+                    output_side_files = process_side_files(video_path[0] if isinstance(video_path, list) else video_path, side_files, return_files=api_return_side_files)
+                    for side_name in output_side_files:  # a saved world file joins the Worlds gallery
+                        side_path = os.path.join(os.path.dirname(video_path[0] if isinstance(video_path, list) else video_path), side_name)
+                        if has_world_file_extension(side_name) and os.path.isfile(side_path):
+                            record_file_metadata(side_path, configs, False, False, gen, notify_generation=False, record_notification=False)
+                    if api_return_video_uint8 or api_return_audio or return_flashvsr_continue_cache or (api_return_side_files and output_side_files):
+                        media_type = "audio" if audio_only and video_file is None else "3d" if mesh_outputs else "world" if world_only else ("image" if is_image else "video")
+                        artifact_audio = output_new_audio_data if api_return_audio else None
+                        if artifact_audio is None and api_return_audio and audio_only and sample is not None:
+                            artifact_audio = sample.squeeze(0).detach().cpu().float().numpy()
+                        artifact_video = output_video_frames if api_return_video_uint8 else None
+                        store_api_output_artifact(gen, client_id, video_path, media_type, artifact_video, artifact_audio, output_audio_sampling_rate, output_fps if not audio_only else None, hdr=bool(sample_is_hdr), flashvsr_continue_cache=flashvsr_continue_cache if return_flashvsr_continue_cache else None, side_files=output_side_files if api_return_side_files else None)
+                    # Play notification sound for single video
+                    try:
+                        if server_config.get("notification_sound_enabled", 0):
+                            volume = server_config.get("notification_sound_volume", 50)
+                            notification_sound.notify_video_completion(
+                                video_path=video_path,
+                                volume=volume
+                            )
+                    except Exception as e:
+                        print(f"Error playing notification sound for individual video: {e}")
+                    send_cmd("output")
+                if background_save:
+                    saver.submit(record_output, video_path)
+                else:
+                    record_output()
+                side_files = embedded_images = record_output = write_output = None
 
         seed = set_seed(-1)
     gen_state = plugin_data = None
     gen["loaded_source_plan"] = None
     clear_status(state)
     trans.cache = None
-    offload.unload_loras_from_model(trans_lora)
-    if not trans2_lora is None:
-        offload.unload_loras_from_model(trans2_lora)
+    if kept_loras is None or gen.get("abort", False) or not keep_loras_loaded():
+        unload_task_loras((trans_lora, trans2_lora))
 
     if not trans2 is None:
        trans2.cache = None
     if model_def.get("no_model_swap", False) and (gen.get("abort", False) or queued_model_type_after(gen, task) != model_type):
         offloadobj.unload_all()  # kept loaded only for the next queued task of the same model
  
-    if len(control_audio_tracks) > 0 or len(source_audio_tracks) > 0:
-        cleanup_temp_audio_files(control_audio_tracks + source_audio_tracks)
-
-    remove_temp_filenames(temp_filenames_list)
+    def remove_generation_files(audio_tracks=control_audio_tracks + source_audio_tracks, temp_filenames_list=temp_filenames_list):
+        cleanup_temp_audio_files(audio_tracks)
+        remove_temp_filenames(temp_filenames_list)
+    next_task = queued_task_after(gen, task)
+    if saver is not None and not client_id and not gen.get("abort", False) and next_task is not None and next_task.get("workspace_id") == task.get("workspace_id") and not task.get("workspace_background"):
+        # the next queued task starts while the last outputs of this one are saved (a task of an API caller ends with its files written), in the
+        # same workspace: another one would take the gallery lists these outputs are recorded in
+        saver.submit(remove_generation_files, output=False)  # the working files they read are removed after them
+        saver.detach()
+    else:
+        if saver is not None: saver.wait()  # the last saves read the sound tracks and working files removed here
+        remove_generation_files()
     return True
 
 def prepare_generate_media(state):
@@ -11085,7 +11184,10 @@ def eject_video_from_gallery(state, input_file_list, choice):
         file_settings_list.extend(extend_list)
         choice = min(choice, len(file_list) - 1)
     set_file_choice(gen, file_list, choice)
-    return gallery_update(file_list, choice), gr.update() if len(file_list) >0 else get_default_video_info(), gr.Row(visible= len(file_list) > 0)
+    service = service_for(state)
+    if service is not None:
+        service.host_changed()  # the shared view refresh renders the gallery
+    return gallery_update(file_list, choice) if service is None else gr.update(), gr.update() if len(file_list) >0 else get_default_video_info(), gr.Row(visible= len(file_list) > 0)
 
 def eject_from_strip_gallery(state, source_id, input_file_list, choice):
     gen = get_gen_info(state)
@@ -11103,7 +11205,10 @@ def eject_from_strip_gallery(state, source_id, input_file_list, choice):
         file_settings_list.extend(extend_list)
         choice = min(choice, len(file_list)-1)
     set_file_choice(gen, file_list, choice, source_id)
-    return *pack_strip_gallery_state(file_list, choice), gr.update() if len(file_list) >0 else get_default_video_info(), gr.Row(visible= len(file_list) > 0)
+    service = service_for(state)
+    if service is not None:
+        service.host_changed()  # the shared view refresh renders the gallery
+    return *(pack_strip_gallery_state(file_list, choice) if service is None else [gr.update()] * 3), gr.update() if len(file_list) >0 else get_default_video_info(), gr.Row(visible= len(file_list) > 0)
 
 
 def _import_source(file_path):
@@ -11188,8 +11293,12 @@ def add_videos_to_gallery(state, input_file_list, choice, files_to_load):
     gen['current_gallery_source'] = last_source.id
     service = service_for(state)
     if service is not None:
+        # The shared view refresh renders the galleries with the view its clicks resolve through.
         service.host_changed()
-    return *gallery_tab_updates(last_source.id), gallery_update(gen.get("file_list", []), choices[VIDEO.id], preview=True), *pack_strip_galleries(gen, choices), gr.Files(value=[]),  gr.Tabs(selected="video_info"), last_source.id
+        galleries = [gr.update()] * (1 + 3 * len(STRIP_SOURCES))
+    else:
+        galleries = [gallery_update(gen.get("file_list", []), choices[VIDEO.id], preview=True), *pack_strip_galleries(gen, choices)]
+    return *gallery_tab_updates(last_source.id), *galleries, gr.Files(value=[]),  gr.Tabs(selected="video_info"), last_source.id
 
 def get_model_settings(state, model_type):
     all_settings = state.get("all_settings", None)    
@@ -14420,7 +14529,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                 from shared.gradio import world_explorer
                 world_explorer.bind(state, lambda state_value: workspace_storage.output_config(server_config, state=state_value)['save_path'], get_model_def, get_model_handler, explore_world_outside_queue,
                                     server_config, lambda choices: update_config(server_config, server_config_filename, {"world_explorer": choices}), world_memory_profile)
-                output_trigger.change(refresh_gallery,
+                output_trigger.change(refresh_gallery_outside_view,
                     inputs = [state], 
                     outputs = [gallery_tabs, current_gallery_tab, output, last_choice, *strip_states, gen_info, generate_btn, add_to_queue_btn, current_gen_column, current_gen_buttons_row, queue_html, abort_btn, earlystop_btn, onemorewindow_btn, gen_info_accordion],
                     show_progress="hidden"

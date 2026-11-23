@@ -71,6 +71,9 @@ def render(doc: dict[str, Any], resolve, out: str | Path, *, video_args: list[st
     if not clips:
         raise ValueError("The edit has no shot with a take yet.")
     started = time.time()
+    if layout["copy"]:  # pictures are copied only from takes encoded alike: an x264 take and an NVENC one share a codec name, not their parameter sets
+        from shared.utils.audio_video import video_stream_facts
+        layout["copy"] = len({video_stream_facts(clip["path"])["encoding"] for clip in clips}) == 1
     if layout["copy"]:
         with tempfile.TemporaryDirectory() as folder:
             listing = Path(folder) / "clips.txt"

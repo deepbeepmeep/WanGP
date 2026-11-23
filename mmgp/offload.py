@@ -2592,7 +2592,9 @@ def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 2*
     print(f"Quantization of model '{model_id}' done")
 
     return True
-def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_loras = True, check_only = False, ignore_model_variations = False, pinnedLora = False, maxReservedLoras = -1, split_linear_modules_map = None, preprocess_sd = None, verboseLevel = -1,):
+def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_loras = True, check_only = False, ignore_model_variations = False, pinnedLora = False, maxReservedLoras = -1, split_linear_modules_map = None, preprocess_sd = None, verboseLevel = -1, keep_loras = 0):
+    # keep_loras: the first LoRAs loaded before stay as they are (the caller checked that they are the first files of lora_path, unchanged); the
+    # others are removed and the rest of lora_path is loaded
     verboseLevel = _compute_verbose_level(verboseLevel)
 
     loras_model_data = getattr(model, "_loras_model_data", None)
@@ -2631,8 +2633,9 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
         else:
             raise Exception(f"No Loras has been declared for this model while creating the corresponding offload object")
     
+    kept = list(model._loras_adapters or {})[:keep_loras] if keep_loras and not check_only else []
     if not check_only:
-        unload_loras_from_model(model)
+        unload_loras_from_model(model, keep=set(kept))
 
     modules_dict = {k: v for k,v in model.named_modules()}
     module_names = {v: k for k, v in modules_dict.items()}
@@ -2783,11 +2786,19 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
     new_lora_path = []
     errors  = []
     adapters = {}
-    adapter_no = 0
+    adapter_no = 1 + builtins.max(int(name) for name in kept) if kept else 0
     pinned_sd_list = []
     pinned_names_list = []
     pinned_tied_weights_list = []
     for i, path in enumerate(lora_path):
+        if i < len(kept):
+            if model._loras_adapters[kept[i]] != path:
+                raise ValueError(f"Lora '{path}' is not the Lora {i + 1} that was kept ('{model._loras_adapters[kept[i]]}')")
+            adapters[kept[i]] = path
+            loras_nos.append(kept[i])
+            new_lora_path.append(path)
+            loras_multi.append(1.0 if i > (len(lora_multi) -1) else lora_multi[i])
+            continue
         adapter_name = str(adapter_no)
         error_msg = ""
         if not os.path.isfile(path):
@@ -3164,8 +3175,9 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
     model._loras_errors = errors
     if not check_only:
         transposed = _prepare_joined_loras(loras_model_data) if len(adapters) > 1 else {}
-        if pinnedLora and len(pinned_sd_list) > 0:
-            _pin_sd_to_memory(pinned_sd_list, pinned_names_list, pinned_tied_weights_list, transposed=transposed)
+        # each LoRA in locked RAM of its own, released with it when a later load no longer uses it
+        for sd, name, tied_weights in zip(pinned_sd_list, pinned_names_list, pinned_tied_weights_list):
+            _pin_sd_to_memory(sd, name, tied_weights, transposed=transposed)
         _transpose_in_ram(transposed)
         model._loras_adapters = adapters
     if activate_all_loras:
@@ -3190,9 +3202,22 @@ def sync_models_loras(model, model2):
     model2._loras_adapters = model._loras_adapters
     model2._loras_scaling = model._loras_scaling 
 
-def unload_loras_from_model(model):
+def unload_loras_from_model(model, keep=()):
+    # keep: names of adapters whose LoRAs stay in RAM (their copies in VRAM go, as for the others: a load makes them again)
     if model is None: return
     if not hasattr(model, "_loras_model_data"): return
+    if keep:
+        for v in model._loras_model_data.values():
+            for name in [name for name in v if name not in keep]:
+                del v[name]
+        for v in model._loras_model_shortcuts.values():
+            for name in [name for name in v if name not in keep]:
+                del v[name]
+        model._loras_active_adapters = [name for name in model._loras_active_adapters if name in keep]
+        model._loras_scaling = {name: value for name, value in (model._loras_scaling or {}).items() if name in keep}
+        model._loras_adapters = {name: path for name, path in model._loras_adapters.items() if name in keep}
+        model._loras_errors = None
+        return
     for _, v in model._loras_model_data.items():
         v.clear()
     for _, v in model._loras_model_shortcuts.items():
@@ -4523,8 +4548,9 @@ def _prepare_joined_loras(loras_model_data):
         adapters = [data for name, data in lora_module.items() if not name.endswith("_GPU")]
         if len(adapters) > 1 and builtins.all(data[3] is None and data[5].get("type", "lora") == "lora" and data[0] is not None and torch.is_tensor(data[1]) for data in adapters):
             for data in adapters:
-                factors[id(data[1])] = data[1]
-                data[5]["joined"] = True
+                if not data[5].get("joined"):  # LoRAs kept from a previous load may be joined already
+                    factors[id(data[1])] = data[1]
+                    data[5]["joined"] = True
     return factors
 
 
@@ -4537,7 +4563,12 @@ def _transpose_in_ram(factors):
     if factors:
         with ThreadPoolExecutor(max_workers=_staging_copy_threads()) as executor:
             for factor, out in zip(factors.values(), executor.map(transposed, factors.values())):
-                factor.data = out
+                if factor.is_pinned():  # a LoRA kept from a previous load, now joined: transposed in its locked RAM
+                    from .transfer import ram_copy_
+                    ram_copy_(factor.data.view(-1), out.view(-1))
+                    factor.data = factor.data.view(out.shape)
+                else:
+                    factor.data = out
     factors.clear()
 
 

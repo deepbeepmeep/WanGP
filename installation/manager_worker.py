@@ -158,8 +158,9 @@ def run_action(action, args, data, runtime, cancelled, emit, request_id):
         return {"root": str(root), **installation_environments(root)}
     if action == "manager_update":
         from urllib.request import Request, urlopen
+        from .sources import tls_context
         request = Request("https://api.github.com/repos/deepbeepmeep/WanGP/releases/latest", headers={"Accept": "application/vnd.github+json", "User-Agent": "WanGP-Manager"})
-        with urlopen(request, timeout=20) as response:
+        with urlopen(request, timeout=20, context=tls_context()) as response:
             release = json.load(response)
         tag = release["tag_name"]
         if not tag.startswith("manager-v"):

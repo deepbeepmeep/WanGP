@@ -347,12 +347,12 @@ These kernels will offer optimized INT4 / FP4 dequantization.
 ### Lightx2v NVP4 Kernels Wheels for Python 3.11 / Pytorch 2.10 / Cuda 13 (RTX 50xx / sm120+ only !)
 - Windows
    ```
-  pip install https://github.com/deepbeepmeep/kernels/releases/download/Light2xv/lightx2v_kernel-0.0.2+torch2.10.0-cp311-abi3-win_amd64.whl
+  pip install https://github.com/deepbeepmeep/kernels/releases/download/Light2xv/lightx2v_kernel-0.0.3+torch2.10.0-cp311-abi3-win_amd64.whl
    ```
 
 - Linux
    ```
-  pip install https://github.com/deepbeepmeep/kernels/releases/download/Light2xv/lightx2v_kernel-0.0.2+torch2.10.0-cp311-abi3-linux_x86_64.whl
+  pip install https://github.com/deepbeepmeep/kernels/releases/download/Light2xv/lightx2v_kernel-0.0.3+torch2.10.0-cp311-abi3-linux_x86_64.whl
    ```
 
 

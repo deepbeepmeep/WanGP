@@ -534,7 +534,8 @@ class Qwen35AssistantRuntime:
 
                 pynvml.nvmlInit()
                 self._nvml_module = pynvml
-                self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
+                # NVML numbers every card of the machine, whatever CUDA_VISIBLE_DEVICES selects: found by its UUID
+                self._nvml_handle = pynvml.nvmlDeviceGetHandleByUUID(f"GPU-{torch.cuda.get_device_properties(torch.cuda.current_device()).uuid}")
             nvml = self._nvml_module
             utilization = nvml.nvmlDeviceGetUtilizationRates(self._nvml_handle)
             temperature = nvml.nvmlDeviceGetTemperature(self._nvml_handle, nvml.NVML_TEMPERATURE_GPU)

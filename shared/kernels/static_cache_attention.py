@@ -139,17 +139,22 @@ _TENSOR_SPLITS_PER_SM = 1  # at about 100 KB of shared memory, two blocks per SM
 _TENSOR = "draft_tensor" not in os.environ.get("WGP_FN_DISABLE", "").split(",")  # until the switches are removed
 
 
+def _shared_memory(device):  # AMD GPUs have no opt-in shared memory (ROCm's PyTorch has no such property): their limit per block is the LDS
+    properties = torch.cuda.get_device_properties(device)
+    return properties.shared_memory_per_block if torch.version.hip else properties.shared_memory_per_block_optin
+
+
 def _fits(config, head_dim, device):
     # the FP32 query and key tiles, plus a little per key (Triton 3.2 and 3.6 for sm_75, head_dim 256: 33.9 / 51.3 / 86.1 KB for 16 / 32 /
     # 64 keys, whatever the stages): Turing's 64 KB take up to 32 keys
     shared = (_BLOCK_R + config[0]) * head_dim * 4 + 128 * config[0]
-    return shared <= torch.cuda.get_device_properties(device).shared_memory_per_block_optin
+    return shared <= _shared_memory(device)
 
 
 def _fits_tensor(config, head_dim, device):
     # BF16 key and value tiles per stage, BF16 query and FP32 sum (Triton 3.6 for sm_120, head_dim 256, (64, 8, 2): 143 KB)
     shared = 4 * config[0] * head_dim * config[2] + 6 * _BLOCK_R * head_dim
-    return shared <= torch.cuda.get_device_properties(device).shared_memory_per_block_optin
+    return shared <= _shared_memory(device)
 
 
 def usable(query, cache):
@@ -170,8 +175,10 @@ def attention(query, key_cache, value_cache, seqlens, scale):
     bits = (lambda t: t.view(torch.uint16)) if bf16 else (lambda t: t)
     q, k, v = bits(query), bits(key_cache), bits(value_cache)
     tensor = _TENSOR and bf16 and kernel_policy.allow_approximate() and torch.cuda.get_device_capability(query.device) >= (8, 0)
+    candidates = [config for config in _TENSOR_CONFIGS if _fits_tensor(config, head_dim, query.device)] if tensor else []
+    tensor = bool(candidates)  # none fits 64 KB of shared memory at head_dim 256 (AMD's LDS): the FP32 tiles then
+    candidates = candidates or [config for config in _CONFIGS if _fits(config, head_dim, query.device)]
     splits = max(1, torch.cuda.get_device_properties(query.device).multi_processor_count * (_TENSOR_SPLITS_PER_SM if tensor else _SPLITS_PER_SM) // (kv_heads * row_blocks))
-    candidates = [config for config in _TENSOR_CONFIGS if _fits_tensor(config, head_dim, query.device)] if tensor else [config for config in _CONFIGS if _fits(config, head_dim, query.device)]
 
     def launch(pm, pl, pacc, config):
         block_n, warps, stages = config

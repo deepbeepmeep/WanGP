@@ -5,7 +5,21 @@
     const value = document.querySelector('#wangp-gallery-view textarea')?.value;
     return value ? JSON.parse(value) : null;
   }
-  let sequence = 0, pendingView = null, acceptedView = null, viewing = null;
+  let sequence = 0, pendingView = null, acceptedView = null, viewing = null, repairedView = null;
+  // File names, as thumbnail URLs (served path, cached copy, preview query) and view paths share them.
+  function fileName(path) {
+    try {path = decodeURIComponent(path);} catch {}
+    return path.split('?')[0].split(/[\\/]/).pop().replace(/^file=/, '');
+  }
+  // True when the gallery shows other files than the view its clicks resolve through
+  // (a gallery value written by another response than the view refresh).
+  function stale(state = view()) {
+    if (!state || !document.querySelector('#gallery')) return false;
+    const thumb = document.querySelector('#gallery .thumbnail-item');
+    const sources = thumb ? [...thumb.parentElement.querySelectorAll('.thumbnail-item')].map(node => node.querySelector('img, video')?.getAttribute('src')) : [];
+    if (sources.some(source => !source)) return false;
+    return sources.length !== state.video.length || sources.some((source, index) => fileName(source) !== fileName(state.video[index]));
+  }
   // `index`: position in the whole gallery `source`.
   function request(state, source, index, path) {
     pendingView = state;
@@ -16,6 +30,16 @@
     if (!state) return;
     const paths = state[source];
     if (index !== null && (index < 0 || index >= paths.length)) return;
+    if (source === 'video' && index !== null && stale(state)) {
+      // The clicked thumbnail is not view.video[index]: render the gallery again rather than select
+      // another file. Once per view, so that an unforeseen difference never blocks selection.
+      const value = document.querySelector('#wangp-gallery-view textarea').value;
+      if (value !== repairedView && window.__wangpAssistantChatNS?.repairGallery) {
+        repairedView = value;
+        window.__wangpAssistantChatNS.repairGallery();
+        return;
+      }
+    }
     request(state, source, index === null ? null : index + state[source + '_offset'], index === null ? null : paths[index]);
   }
   function selectedSource() {
@@ -58,6 +82,7 @@
     return sources[(index + step + sources.length) % sources.length].id;
   }
   window.WanGPGallerySelection = {
+    stale: () => stale(),
     // A strip gallery thumbnail click: index in the visible window of gallery `source`.
     select: (source, index) => {const state = view(); if (state) select(source, Number(index) - state[source + '_offset']);},
     acceptView(value) {

@@ -20,6 +20,25 @@ RGBA_VIDEO_OUTPUT_CHOICES = [
     ("ProRes 4444 (MOV)", "prores_4444"),
 ]
 
+HARDWARE_VIDEO_ENCODING_CHOICES = [
+    ("Auto (NVIDIA NVENC when available)", "auto"),
+    ("Off (CPU encoders only)", "off"),
+]
+
+# NVENC settings giving the quality and size of the CPU encoder they replace (Y-PSNR on 1920x1056 footage: x264 CRF 10 52.4 dB, NVENC CQ 10
+# 52.5 dB, same size, 3x faster; x264 CRF 0 and NVENC lossless both lossless; x265 CRF 8 / 18 / 28 51.2 / 45.3 / 39.6 dB, HEVC NVENC CQ 10 / 21
+# / 31 51.3 / 45.6 / 40.5 dB, 5 % smaller to 5 % larger). The other choices (x264 4:4:4 or FFV1 lossless, ProRes, DNxHR) stay on the CPU.
+_NVENC_QUALITY = ["-tune", "hq", "-rc", "vbr", "-b:v", "0", "-maxrate", "500M"]
+NVENC_VIDEO_CODECS = {
+    "libx264_8": ("h264_nvenc", [*_NVENC_QUALITY, "-cq", "10", "-profile:v", "high"]),
+    "libx264_10": ("h264_nvenc", ["-tune", "lossless"]),
+    "libx265_28": ("hevc_nvenc", [*_NVENC_QUALITY, "-cq", "31"]),
+    "libx265_18": ("hevc_nvenc", [*_NVENC_QUALITY, "-cq", "21"]),
+    "libx265_8": ("hevc_nvenc", [*_NVENC_QUALITY, "-cq", "10"]),
+}
+_hardware_video_encoding = "auto"
+_nvenc_probes = {}
+
 SUPPORTED_VIDEO_CONTAINERS = {"mkv", "mov", "mp4"}
 CONFIG_VIDEO_CONTAINERS = {value for _, value in VIDEO_CONTAINER_CHOICES}
 PROFESSIONAL_VIDEO_CODECS = {"prores_422", "dnxhr_hq"}
@@ -43,9 +62,44 @@ def get_video_container_extension(container: str | None) -> str:
     return f".{container}" if container in SUPPORTED_VIDEO_CONTAINERS else ".mp4"
 
 
-def _get_video_codec_spec(codec_key: str | None, container: str | None) -> tuple[str, str, list[str]]:
+def set_hardware_video_encoding(mode: str | None) -> None:
+    """The Hardware Video Encoding config: "auto" encodes on the GPU's NVENC the choices it can take, when the ffmpeg build and the GPU have it."""
+    global _hardware_video_encoding
+    _hardware_video_encoding = "off" if mode == "off" else "auto"
+
+
+def hardware_video_encoding_enabled() -> bool:
+    return _hardware_video_encoding != "off"
+
+
+def nvenc_available(ffmpeg_exe: str, encoder: str) -> bool:
+    """Whether ffmpeg_exe encodes with encoder on this machine: a two-frame encode, tried once per binary and encoder (a build without NVENC, a
+    GPU or driver it does not support fail it)."""
+    key = (ffmpeg_exe, encoder)
+    if key not in _nvenc_probes:
+        import subprocess
+        try:
+            result = subprocess.run([ffmpeg_exe, "-v", "error", "-f", "lavfi", "-i", "color=s=256x256:r=24", "-frames:v", "2", "-c:v", encoder, "-f", "null", "-"],
+                                    stdin=subprocess.DEVNULL, capture_output=True, timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            _nvenc_probes[key] = result.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            _nvenc_probes[key] = False
+    return _nvenc_probes[key]
+
+
+def nvenc_in_use(codec_key: str | None) -> bool:
+    """Whether the videos WanGP saves with codec_key are encoded on NVENC (the Hardware Video Encoding config, the codec and the machine)."""
+    import imageio_ffmpeg
+    return _get_video_codec_spec(codec_key, "mp4", None, imageio_ffmpeg.get_ffmpeg_exe())[0].endswith("_nvenc")
+
+
+def _get_video_codec_spec(codec_key: str | None, container: str | None, hardware: bool | None = None, ffmpeg_exe: str | None = None) -> tuple[str, str, list[str]]:
+    """hardware: encode on NVENC when ffmpeg_exe can (None: the Hardware Video Encoding config)."""
     codec_key = normalize_video_codec(codec_key)
     container = normalize_video_container(container)
+    nvenc = NVENC_VIDEO_CODECS.get(codec_key)
+    if nvenc is not None and (hardware_video_encoding_enabled() if hardware is None else hardware) and nvenc_available(ffmpeg_exe, nvenc[0]):
+        return nvenc[0], "yuv420p", ["-preset", "p5", *nvenc[1]]
     if codec_key == "libx264_8":
         return "libx264", "yuv420p", ["-crf", "10"]
     if codec_key == "libx264_10":
@@ -69,13 +123,17 @@ def _get_video_codec_spec(codec_key: str | None, container: str | None) -> tuple
     return "libx264", "yuv420p", ["-crf", "10"]
 
 
-def get_video_encode_args(codec_key: str | None, container: str | None) -> list[str]:
-    codec, pixel_format, output_params = _get_video_codec_spec(codec_key, container)
+def get_video_encode_args(codec_key: str | None, container: str | None, hardware: bool | None = None) -> list[str]:
+    """Encoder arguments for WanGP's ffmpeg binary (ffmpeg_bins)."""
+    from .video_decode import resolve_media_binary
+    codec, pixel_format, output_params = _get_video_codec_spec(codec_key, container, hardware, resolve_media_binary("ffmpeg") or "ffmpeg")
     return ["-c:v", codec, *output_params, "-pix_fmt", pixel_format]
 
 
-def get_imageio_codec_params(codec_key: str | None, container: str | None) -> dict:
-    codec, pixel_format, output_params = _get_video_codec_spec(codec_key, container)
+def get_imageio_codec_params(codec_key: str | None, container: str | None, hardware: bool | None = None) -> dict:
+    """Writer parameters for imageio, which runs its own ffmpeg binary."""
+    import imageio_ffmpeg
+    codec, pixel_format, output_params = _get_video_codec_spec(codec_key, container, hardware, imageio_ffmpeg.get_ffmpeg_exe())
     # Alpha mattes must stay pixel-aligned with their source after VAE padding
     # is cropped away. ImageIO's default macroblock resizing breaks that alignment.
     return {"codec": codec, "quality": None, "pixelformat": pixel_format, "macro_block_size": 1, "output_params": [*output_params, "-hide_banner", "-nostats"]}

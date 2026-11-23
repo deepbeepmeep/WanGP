@@ -139,6 +139,10 @@ class RowScaledExpertFormat(NativeExpertFormat):
             raise ValueError(f"The {self.name} experts take widths that are multiples of 128, not {hidden} and {intermediate}")
         return super().blocks(hidden, intermediate, tensors)
 
+    def count_pairs(self, ids, counts):
+        from shared.kernels import expert_rows_triton
+        expert_rows_triton.count_pairs(ids, counts)
+
     def gpu_forward(self, bank, x, ids, probabilities, pointers, out=None, mid=None):
         from shared.kernels import expert_rows_triton
         if bank.rotation or not bank.gated:
