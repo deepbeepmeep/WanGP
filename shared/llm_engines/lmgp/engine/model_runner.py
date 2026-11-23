@@ -394,7 +394,7 @@ class ModelRunner:
         from mmgp import allocator, runtime
         for rows, graph_vars in [(self.graph_bs[-1], self.graph_vars), *self.speculative_graph_vars.items()]:
             self._draft_feature_buffer(graph_vars, rows, register=False)  # all made before the state is registered once
-        if _OUTPUT_STAGE and getattr(self.model.output, "lm_engine_graph_forward", None) is not None:
+        if _OUTPUT_STAGE and getattr(getattr(self.model, "output", None), "lm_engine_graph_forward", None) is not None:
             for graph_vars in self.speculative_graph_vars.values():  # the logits of the verification windows too: a buffer made at a window's first pass registers the state again, which drops the model's graphs
                 with allocator.pool_allocations(self._state_pool):  # (with the sequence state: out of VRAM while the runtime is suspended)
                     graph_vars["verify_logits"] = torch.empty_like(self.model.output(graph_vars["outputs"]))
