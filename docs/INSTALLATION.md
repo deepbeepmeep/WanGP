@@ -322,7 +322,7 @@ The CUDA 13 builds contain native GPU code for SM75 through the architectures su
 
 ### Experimental AMD HIP wheel: Python 3.12 / PyTorch 2.13 / ROCm 10
 
-For RDNA4 GPUs (`gfx1200`, `gfx1201`, RX 9060/9070 series), the WanGP installer adds this wheel to its AMD environment (Python 3.12, PyTorch 2.13.0+rocm10.0.0). To install it manually in that environment:
+For RDNA3 GPUs (`gfx1100`, `gfx1101`, `gfx1102`, `gfx1103`: RX 7600 to 7900 series, Radeon 780M / 760M) and RDNA4 GPUs (`gfx1200`, `gfx1201`, RX 9060/9070 series), the WanGP installer adds this wheel to its AMD environment (Python 3.12, PyTorch 2.13.0+rocm10.0.0). To install it manually in that environment:
 
 Windows:
 ```bash

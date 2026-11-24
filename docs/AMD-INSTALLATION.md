@@ -44,6 +44,8 @@ clinfo | findstr gfx
 
 For RDNA4 (`gfx1200`, `gfx1201`), it also installs the experimental WGPKernels INT8 wheel for PyTorch 2.13.0 / ROCm 10.0. See [WGPKernels Installation](INSTALLATION.md#wgpkernels-installation) for manual commands and validation limitations. Other AMD targets keep their existing supported INT8 backends.
 
+For RDNA3 (`gfx1100` to `gfx1103`) and RDNA4, it installs the experimental GGUF kernels for the same stack. Without them, GGUF models such as the Deepy and Prompt Enhancer Qwen checkpoints run every layer through a slow, memory-hungry fallback: a 27B model may not fit a 24 GB card. See [GGUF llama.cpp CUDA Kernels](INSTALLATION.md#gguf-llamacpp-cuda-kernels) for manual commands.
+
 Environments created by older versions of the installer or of this guide (the `rocm65` option, or the per-family `rocm.nightlies.amd.com/v2/gfx...` indexes) should be replaced: create a new environment with `install.bat` and make it the active one with `manage.bat`.
 
 ## Manual Installation

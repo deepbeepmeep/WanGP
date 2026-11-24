@@ -173,7 +173,7 @@
                 }
             },
             "gguf_rocm10": {
-                "label": "GGUF llama.cpp HIP Kernels (PyTorch 2.13 / ROCm 10, RDNA4, experimental)",
+                "label": "GGUF llama.cpp HIP Kernels (PyTorch 2.13 / ROCm 10, RDNA3 and RDNA4, experimental)",
                 "cmd": {
                     "win": "--no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.30/llamacpp_gguf_cuda-1.0.30%2Btorch213rocm100py312-cp312-cp312-win_amd64.whl",
                     "linux": "--no-deps https://github.com/deepbeepmeep/kernels/releases/download/gguf-v1.0.30/llamacpp_gguf_cuda-1.0.30%2Btorch213rocm100py312-cp312-cp312-linux_x86_64.whl"

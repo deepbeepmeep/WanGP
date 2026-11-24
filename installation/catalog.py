@@ -97,13 +97,19 @@ def select_profile(data, key):
         raise CatalogError(f"Unknown hardware profile {key!r}; choose from {', '.join(data['gpu_profiles'])}") from None
 
 
+RDNA3_TARGETS = ("gfx1100", "gfx1101", "gfx1102", "gfx1103")
+RDNA4_TARGETS = ("gfx1200", "gfx1201")
+
+
 def kernel_variant(key, torch_key, python_key, amd_targets=()):
     """The existing installer's wheel-family routing, shared with planning."""
     if key in ("wgpkernels", "wgpkernels_cu128", "wgpkernels_rocm10"):
         key = {"cu130": "wgpkernels", "cu128": "wgpkernels_cu128", "rocm10": "wgpkernels_rocm10"}.get(torch_key)
     elif key in ("gguf", "gguf_cu128", "gguf_rocm10"):
         key = {("cu130", "3.11"): "gguf", ("cu128", "3.10"): "gguf_cu128", ("rocm10", "3.12"): "gguf_rocm10"}.get((torch_key, python_key))
-    if key in ("wgpkernels_rocm10", "gguf_rocm10") and not set(amd_targets).intersection(("gfx1200", "gfx1201")):
+    if key == "wgpkernels_rocm10" and not set(amd_targets).intersection(RDNA4_TARGETS):
+        return None
+    if key == "gguf_rocm10" and not set(amd_targets).intersection(RDNA3_TARGETS + RDNA4_TARGETS):
         return None
     return key
 
