@@ -123,11 +123,6 @@ def _with_data_context(data: dict[str, Any] | None, **context: Any) -> dict[str,
     return merged
 
 
-def _get_context_get_max_frames(context: dict[str, Any]) -> Callable[[int], int]:
-    callback = context.get("get_max_frames", None)
-    return callback if callable(callback) else (lambda frames: int(frames))
-
-
 def _context_model_type(context: dict[str, Any]) -> str:
     return str(context.get("model_type", "") or "").strip().lower()
 
@@ -344,14 +339,13 @@ def _sliding_window_size_min(model_def: dict[str, Any] | None, _context: dict[st
         return 5
 
 
-def _sliding_window_size_max(model_def: dict[str, Any] | None, context: dict[str, Any]) -> int:
+def _sliding_window_size_max(model_def: dict[str, Any] | None, _context: dict[str, Any]) -> int:
     defaults = _sliding_window_defaults(model_def)
     raw_max = defaults.get("window_max", 257)
     try:
-        raw_max = int(raw_max)
+        return int(raw_max)
     except Exception:
-        raw_max = 257
-    return int(_get_context_get_max_frames(context)(raw_max))
+        return 257
 
 
 def _sliding_window_size_step(model_def: dict[str, Any] | None, _context: dict[str, Any]) -> int:

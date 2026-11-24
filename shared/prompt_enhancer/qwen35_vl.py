@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import types
@@ -52,6 +53,7 @@ enhancer_quantization_GGUF = "gguf"
 enhancer_quantization_GGUF_Q3 = "gguf_q3"
 enhancer_quantization_GGUF_Q2 = "gguf_q2"
 enhancer_quantization_GGUF_PTQ1 = "gguf_ptq1"
+enhancer_quantization_GGUF_PTQ1_25 = "gguf_ptq1_25"
 enhancer_quantization_GGUF_Q8 = "gguf_q8"
 enhancer_quantization_SAFETENSORS = "safetensors"
 enhancer_quantization_QUANTO_INT8 = "quanto_int8"
@@ -100,10 +102,9 @@ def get_qwen35_prompt_enhancer_variant(model_no) -> str:
 
 def get_qwen35_quantization(backend: str, variant: str | None = None) -> str:
     spec = get_qwen35_variant_spec(variant)
-    if backend in (enhancer_quantization_GGUF_Q2, enhancer_quantization_GGUF_Q3, enhancer_quantization_GGUF_PTQ1, enhancer_quantization_GGUF_Q8):
-        quantization = backend.rsplit("_", 1)[-1]
-        if f"text_gguf_{quantization}_filename" not in spec:
-            raise ValueError(f"{spec['display_name']} does not provide a GGUF {quantization.upper()} checkpoint.")
+    if backend in (enhancer_quantization_GGUF_Q2, enhancer_quantization_GGUF_Q3, enhancer_quantization_GGUF_PTQ1, enhancer_quantization_GGUF_PTQ1_25, enhancer_quantization_GGUF_Q8):
+        if QWEN_CHECKPOINTS[backend][0] not in spec:
+            raise ValueError(f"{spec['display_name']} does not provide a GGUF {backend.removeprefix('gguf_').upper()} checkpoint.")
         return backend
     return spec.get("backend", backend)
 
@@ -923,7 +924,21 @@ def _captions_beside(self, offload_manager) -> bool:
             and offload_manager.models.get(TEXT_MODEL_ID) is text_model and TEXT_MODEL_ID in offload_manager.active_models_ids)
 
 
-def _generate_image_captions_vllm(self, images, *, image_contexts=None, offload_manager=None, enhancement_progress=None, beside=False):
+def _resize_image_for_vision(image: Image.Image, max_pixels: int) -> Image.Image:
+    # a model's vision stage (images.vision_settings): read at up to max_pixels, e.g. to read small text, never enlarged
+    if image.width * image.height <= max_pixels:
+        return image
+    scale = math.sqrt(max_pixels / (image.width * image.height))
+    return image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))), Image.Resampling.LANCZOS)
+
+
+def _vision_message(vision, content):
+    # the model's instructions as system prompt, with the user's request where they ask for it ({{request}}: a request beside the images
+    # can bias what the vision stage reports, e.g. a transcript corrected towards the intended wording)
+    return [{"role": "system", "content": vision["instructions"].replace("{{request}}", vision["request"])}, {"role": "user", "content": content}]
+
+
+def _generate_image_captions_vllm(self, images, *, image_contexts=None, offload_manager=None, enhancement_progress=None, beside=False, vision=None):
     qwen35_text_mod = _get_qwen35_text_runtime_helpers()
     text_model = self._prompt_enhancer_text_model
     tokenizer = self._prompt_enhancer_tokenizer
@@ -949,13 +964,15 @@ def _generate_image_captions_vllm(self, images, *, image_contexts=None, offload_
             if not group_images:
                 prepared.append(None)
                 continue
-            caption_tokens = 128 if labels is None else 128 * len(group_images) + 128
+            caption_tokens = vision["max_tokens"] if vision is not None else 128 if labels is None else 128 * len(group_images) + 128
             content = []
             for index, image in enumerate(group_images):
                 if labels is not None:
                     content.append({"type": "text", "text": labels[index]})
                 content.append({"type": "image", "image": image})
-            if labels is None:
+            if vision is not None:
+                message = _vision_message(vision, content)
+            elif labels is None:
                 message = [{"role": "user", "content": content + [{"type": "text", "text": "Describe this image accurately in one concise paragraph, focusing on the main subject, setting, and notable objects. Output only the description."}]}]
             else:
                 names = "; ".join(labels)
@@ -963,8 +980,11 @@ def _generate_image_captions_vllm(self, images, *, image_contexts=None, offload_
                 headings = "\n".join(f"{label}: <visible details>" for label in labels)
                 content.append({"type": "text", "text": f"Describe all {len(labels)} separate still images in the order shown. Use each heading below exactly once, without renaming, adding or omitting any heading. Describe only visible details; do not infer movement from still images.\n{headings}"})
                 message = [{"role": "system", "content": instructions}, {"role": "user", "content": content}]
+            resize = _resize_image_for_caption if vision is None else lambda image: _resize_image_for_vision(image, vision["max_pixels"])
             if inkling2:
-                prompt_token_ids, prompt_embeds, prompt_position_ids, position_offset, text = self.image_prompt(message, max_tokens=INKLING2_CAPTION_MAX_IMAGE_TOKENS, features=features, resize=_resize_image_for_caption, progress=progress, image_count=image_count)
+                from .inkling2 import CELL_SIZE
+                image_tokens = INKLING2_CAPTION_MAX_IMAGE_TOKENS if vision is None else math.ceil(math.sqrt(vision["max_pixels"]) / CELL_SIZE) ** 2
+                prompt_token_ids, prompt_embeds, prompt_position_ids, position_offset, text = self.image_prompt(message, max_tokens=image_tokens, features=features, resize=resize, progress=progress, image_count=image_count)
                 prepared.append((prompt_token_ids, prompt_embeds.to("cpu"), prompt_position_ids.to("cpu"), position_offset, caption_tokens, message, text))
                 del prompt_embeds, prompt_position_ids
                 continue
@@ -979,7 +999,7 @@ def _generate_image_captions_vllm(self, images, *, image_contexts=None, offload_
             with torch.device("cpu"):
                 model_inputs = processor(
                     text=[text],
-                    images=[_resize_image_for_caption(image) for image in group_images],
+                    images=[resize(image) for image in group_images],
                     return_tensors="pt",
                     padding=True,
                     return_mm_token_type_ids=True,
@@ -1070,7 +1090,7 @@ def _generate_image_captions_vllm(self, images, *, image_contexts=None, offload_
     return outputs
 
 
-def _generate_image_captions(self, images, *, image_contexts=None, offload_manager=None, stop_requested=None, enhancement_progress=None):
+def _generate_image_captions(self, images, *, image_contexts=None, offload_manager=None, stop_requested=None, enhancement_progress=None, vision=None):
     qwen35_text_mod = _get_qwen35_text_runtime_helpers()
     if qwen35_text_mod._use_vllm_prompt_enhancer(self._prompt_enhancer_text_model) or qwen35_text_mod._use_legacy_cuda_runner_prompt_enhancer(self._prompt_enhancer_text_model):
         def check_stop():
@@ -1080,7 +1100,7 @@ def _generate_image_captions(self, images, *, image_contexts=None, offload_manag
         beside = _captions_beside(self, offload_manager)
         try:
             with cancellation_context(check_stop) if stop_requested is not None else nullcontext():
-                return _generate_image_captions_vllm(self, images, image_contexts=image_contexts, offload_manager=offload_manager, enhancement_progress=enhancement_progress, beside=beside)
+                return _generate_image_captions_vllm(self, images, image_contexts=image_contexts, offload_manager=offload_manager, enhancement_progress=enhancement_progress, beside=beside, vision=vision)
         except BaseException:
             if not beside:  # beside, the tower is already released and the assistant's context stays
                 self._prompt_enhancer_text_model.unload()
@@ -1090,11 +1110,12 @@ def _generate_image_captions(self, images, *, image_contexts=None, offload_manag
         finally:
             for hook in hooks:
                 hook.remove()
-    images = [_resize_image_for_caption(image) for image in images]
+    images = [_resize_image_for_caption(image) if vision is None else _resize_image_for_vision(image, vision["max_pixels"]) for image in images]
     outputs = []
     processor = self._prompt_enhancer_processor
+    caption_tokens = 128 if vision is None else vision["max_tokens"]
     for image in images:
-        message = [
+        message = _vision_message(vision, [{"type": "image", "image": image}]) if vision is not None else [
             {
                 "role": "user",
                 "content": [
@@ -1127,12 +1148,12 @@ def _generate_image_captions(self, images, *, image_contexts=None, offload_manag
                 "image": media_descriptor(image),
                 "input_token_ids": model_inputs["input_ids"].tolist(),
                 "known_token_ids": known_token_ids(self._prompt_enhancer_tokenizer),
-                "generation": {"max_new_tokens": 128, "do_sample": False},
+                "generation": {"max_new_tokens": caption_tokens, "do_sample": False},
             })
         decoded = _generate_and_decode(
             self,
             model_inputs,
-            max_new_tokens=128,
+            max_new_tokens=caption_tokens,
             do_sample=False,
             temperature=None,
             top_p=None,
@@ -1305,6 +1326,7 @@ __all__ = [
     "enhancer_quantization_GGUF_Q3",
     "enhancer_quantization_GGUF_Q2",
     "enhancer_quantization_GGUF_PTQ1",
+    "enhancer_quantization_GGUF_PTQ1_25",
     "enhancer_quantization_GGUF_Q8",
     "enhancer_quantization_SAFETENSORS",
     "enhancer_quantization_QUANTO_INT8",

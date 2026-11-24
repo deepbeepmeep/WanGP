@@ -37,6 +37,7 @@ DEEPY_KV_CACHE_QUANTIZATION_KEY = "deepy_kv_cache_quantization"
 DEEPY_KEPT_KV_CACHES_KEY = "deepy_kept_kv_caches"
 DEEPY_FAST_CONTEXT_READING_KEY = "deepy_fast_context_reading"  # local Qwen with a quantized KV cache: contexts are read through dense FP16 keys and values (faster, more VRAM while reading)
 DEEPY_ROUTE_TAIL_SKIP_KEY = "deepy_route_tail_skip"  # Qwen3.8 Flash-Next: low-ranked experts missing from VRAM are left out of decoding (faster, slightly less precise)
+DEEPY_LOOP_CONTRAST_KEY = "deepy_loop_contrast"  # Inkling 2 Mini: loop contrastive decoding (the loop's last pass extrapolated away from its first; no extra work)
 DEEPY_COMPACTION_TYPE_KEY = "deepy_compaction_type"
 DEEPY_COMPACTION_THINKING_KEY = "deepy_compaction_thinking"
 DEEPY_REPETITION_PENALTY_KEY = "deepy_repetition_penalty"
@@ -764,6 +765,7 @@ def get_deepy_default_runtime_config() -> dict[str, Any]:
         DEEPY_REPETITION_PENALTY_KEY: DEEPY_REPETITION_PENALTY_DEFAULT,
         DEEPY_KEPT_KV_CACHES_KEY: DEEPY_KEPT_KV_CACHES_DEFAULT,
         DEEPY_ROUTE_TAIL_SKIP_KEY: False,
+        DEEPY_LOOP_CONTRAST_KEY: False,
         DEEPY_FAST_CONTEXT_READING_KEY: False,
         DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY: "",
         DEEPY_PRIME_CUSTOM_SYSTEM_PROMPT_KEY: DEEPY_PRIME_GUIDANCE_DEFAULT,

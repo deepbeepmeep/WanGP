@@ -14,8 +14,8 @@ import torch
 from PIL import Image
 
 from preprocessing.dwpose.pose import convert_to_numpy, draw_pose
+from preprocessing.dwpose.native import pose_models
 from preprocessing.dwpose.wholebody import HWC3, Wholebody, resize_image
-from shared.utils import files_locator as fl
 from shared.utils.utils import process_images_multithread
 from shared.utils.utils import convert_tensor_to_image, convert_image_to_tensor
 
@@ -318,18 +318,8 @@ class PoseDetection:
 
 
 class PoseAligner:
-    def __init__(self, detect_resolution: int = 1024, device: str = None, detection_workers: int = 2) -> None:
-        from preprocessing.dwpose.assets import query_download_def
-        from shared.utils.download import process_files_def_if_needed
-
-        process_files_def_if_needed(query_download_def())
-        det_model = fl.locate_file("pose/yolox_l.onnx")
-        pose_model = fl.locate_file("pose/dw-ll_ucoco_384.onnx")
-        resolved_device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
-        self.det_model = det_model
-        self.pose_model = pose_model
-        self.device = resolved_device
-        self.pose_estimation = Wholebody(det_model, pose_model, device=resolved_device)
+    def __init__(self, detect_resolution: int = 1024, detection_workers: int = 1) -> None:
+        self.pose_estimation = Wholebody()
         self.detection_workers = max(1, int(detection_workers))
         self.detect_resolution = detect_resolution
 
@@ -505,7 +495,11 @@ class PoseAligner:
         )
         return align_args, offset
 
-    def align(
+    def align(self, *args, **kwargs) -> Dict[str, torch.Tensor]:
+        with pose_models():
+            return self._align(*args, **kwargs)
+
+    def _align(
         self,
         ref_video_frames: List[ArrayImage],
         ref_image: ArrayImage,
@@ -601,7 +595,7 @@ class PoseAligner:
         # instantiate additional detectors for parallel processing
         detectors = [self.pose_estimation]
         for _ in range(max(1, self.detection_workers) - 1):
-            detectors.append(Wholebody(self.det_model, self.pose_model, device=self.device))
+            detectors.append(Wholebody())
 
         sequential_done = False
         pending = []

@@ -202,6 +202,7 @@ class AutoRegressiveCudaGraphKit:
         self._runners.clear()
         for stage in self._stages.values():
             self._resident.__dict__.pop(stage.attribute, None)
+            stage.fn = None  # MMGP may keep the step function as a key (per-method caches): its caller's state must not stay reachable
         self._stages.clear()
         if self._state_registered:
             from mmgp import cuda_graphs

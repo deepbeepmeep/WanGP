@@ -21,7 +21,7 @@ from ..layers.linear import ColumnParallelLinear, RowParallelLinear
 from ..layers.moe import routed_experts, softmax_topk
 from ..layers.ngram_table import QUEUED_ROWS
 from ..utils.context import get_context
-from .qwen3_5 import Qwen3_5Block, Qwen3_5RMSNormGated, Qwen3_5StaticCache, Qwen3_5TextRotaryEmbedding, _build_mrope_freq_cache, _fla_fused_norm_gate
+from .qwen3_5 import Qwen3_5Block, Qwen3_5RMSNormGated, Qwen3_5StaticCache, Qwen3_5TextRotaryEmbedding, _fla_fused_norm_gate
 from shared.kernels.dispatch import triton_dtype_supported
 
 try:
@@ -43,7 +43,7 @@ def _rotary_tables(rotary, positions):
     hook gives its float32 arguments the model's compute dtype."""
     if positions.ndim == 1:
         positions = positions.unsqueeze(0)
-    table = _build_mrope_freq_cache(positions.device, max_position=rotary.max_position_embeddings, rotary_dim=rotary.rotary_dim, rope_theta=rotary.rope_theta)
+    table = rotary.freq_table(positions.device, rotary.max_position_embeddings)
     if positions.ndim == 2:  # text: the same position on the three axes, which their interleaving keeps
         freqs = table[positions.long()]
     else:

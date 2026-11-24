@@ -41,6 +41,7 @@ class DependencyInputs:
         self.torch_index = None
         self.torch_requirements = []
         self.torch_packages = []
+        self.index_packages = {}  # package -> the extra index it comes from for the target Python (route_extra_index_dependencies)
 
     def add_index(self, option, url):
         url = source_url(url)
@@ -135,6 +136,15 @@ class DependencyInputs:
         lines.extend(["[[index]]", 'name = "wangp-torch"', f"url = {quote(self.torch_index)}", "default = true"])
         return "\n".join(lines) + "\n"
 
+    def regular_configuration(self):
+        """The extra indexes and the default one, all searched for every package (route_extra_index_dependencies)."""
+        quote = lambda value: json.dumps(value, ensure_ascii=True)
+        lines = []
+        for index, url in enumerate(dict.fromkeys(self.indexes)):
+            lines.extend(["[[index]]", f'name = "wangp-extra-{index}"', f"url = {quote(url)}"])
+        lines.extend(["[[index]]", 'name = "wangp-default"', f"url = {quote(self.default_index or PYPI_INDEX)}", "default = true"])
+        return "\n".join(lines) + "\n"
+
     def index_configuration(self):
         quote = lambda value: json.dumps(value, ensure_ascii=True)
         lines = []
@@ -142,8 +152,8 @@ class DependencyInputs:
             lines.append("constraint-dependencies = [" + ", ".join(map(quote, self.constraints)) + "]")
         if self.torch_index:
             lines.extend(["[[index]]", 'name = "wangp-torch"', f"url = {quote(self.torch_index)}", "explicit = true"])
-        for index, url in enumerate(dict.fromkeys(self.indexes)):
-            lines.extend(["[[index]]", f'name = "wangp-extra-{index}"', f"url = {quote(url)}"])
+        for index, url in enumerate(dict.fromkeys(self.indexes)):  # explicit: each serves only the packages bound to it
+            lines.extend(["[[index]]", f'name = "wangp-extra-{index}"', f"url = {quote(url)}", "explicit = true"])
         if self.default_index:
             lines.extend(["[[index]]", 'name = "wangp-default"', f"url = {quote(self.default_index)}", "default = true"])
         return "\n".join(lines) + "\n"
@@ -155,12 +165,15 @@ class DependencyInputs:
         lines.append("]")
         if self.constraints:
             lines.extend(["[tool.uv]", "constraint-dependencies = [" + ", ".join(map(quote, self.constraints)) + "]"])
-        if self.torch_index:
+        sources = {name: "wangp-torch" for name in self.torch_packages} if self.torch_index else {}
+        sources.update(self.index_packages)
+        if sources:
             lines.append("[tool.uv.sources]")
-            lines.extend(f'{quote(name)} = {{ index = "wangp-torch" }}' for name in dict.fromkeys(self.torch_packages))
+            lines.extend(f'{quote(name)} = {{ index = "{index}" }}' for name, index in sources.items())
+        if self.torch_index:
             lines.extend(["[[tool.uv.index]]", 'name = "wangp-torch"', f"url = {quote(self.torch_index)}", "explicit = true"])
         for index, url in enumerate(dict.fromkeys(self.indexes)):
-            lines.extend(["[[tool.uv.index]]", f'name = "wangp-extra-{index}"', f"url = {quote(url)}"])
+            lines.extend(["[[tool.uv.index]]", f'name = "wangp-extra-{index}"', f"url = {quote(url)}", "explicit = true"])
         if self.default_index:
             lines.extend(["[[tool.uv.index]]", 'name = "wangp-default"', f"url = {quote(self.default_index)}", "default = true"])
         return "\n".join(lines) + "\n"
@@ -217,6 +230,30 @@ def route_torch_dependencies(inputs, destination, runtime, runner, python):
             inputs.torch_packages.append(name)
 
 
+def route_extra_index_dependencies(inputs, destination, runtime, runner, python):
+    """Under first-index, a package that an extra index serves would always come from it, even when the version the target Python needs is
+    only on the default index (onnxruntime-gpu 1.22.0 for Python 3.10, beside the CUDA 13 nightly feed). The direct requirements are matched
+    across the regular indexes as pip does; those that resolve from an extra index are bound to it, and the extra indexes serve only them."""
+    folder = destination / "extra-index-dependencies"
+    folder.mkdir()
+    requirements = [value for value in dict.fromkeys(inputs.requirements) if package_name(value) not in inputs.torch_packages]
+    (folder / "requirements.txt").write_text("\n".join(requirements) + "\n", encoding="utf-8")
+    (folder / "uv.toml").write_text(inputs.regular_configuration(), encoding="utf-8")
+    output = folder / "requirements.lock"
+    arguments = runtime.command("pip", "compile", str(folder / "requirements.txt"), "--python-version", python, "--no-header", "--no-annotate", "--emit-index-annotation", "--no-deps", "--index-strategy", "unsafe-best-match", "--output-file", str(output))
+    arguments[arguments.index("--no-config"):arguments.index("--no-config") + 1] = ["--config-file", str(folder / "uv.toml")]
+    for location in dict.fromkeys(inputs.find_links):
+        arguments.extend(("--find-links", location))
+    runner.run(arguments, env=runtime.environment(), cwd=folder)
+    extras = {url.rstrip("/"): f"wangp-extra-{index}" for index, url in enumerate(dict.fromkeys(inputs.indexes))}
+    name = None
+    for line in output.read_text(encoding="utf-8").splitlines():
+        if not line.startswith(" "):
+            name = package_name(line)
+        elif (index := extras.get(line.strip().removeprefix("# from ").rstrip("/"))) is not None:
+            inputs.index_packages[name] = index
+
+
 def resolve_dependencies(plan, destination, runtime, *, extra_requirements=(), runner=None, installed=None):
     if plan["platform"] != os_key():
         raise InstallError("platform_mismatch", "Resolve on the target operating system")
@@ -226,6 +263,8 @@ def resolve_dependencies(plan, destination, runtime, *, extra_requirements=(), r
     runner = runner or ProcessRunner(destination / "resolve.log")
     if inputs.torch_index and not inputs.no_index:
         route_torch_dependencies(inputs, destination, runtime, runner, plan["python"])
+    if inputs.indexes and not inputs.no_index:
+        route_extra_index_dependencies(inputs, destination, runtime, runner, plan["python"])
     project = destination / "pyproject.toml"
     project.write_text(inputs.project(plan["python"]), encoding="utf-8")
     configuration = destination / "uv.toml"

@@ -8,10 +8,8 @@ import torch
 import numpy as np
 from . import util
 from .wholebody import Wholebody, HWC3, resize_image
+from .native import pose_models
 from PIL import Image
-import onnxruntime as ort
-from concurrent.futures import ThreadPoolExecutor
-import threading
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
@@ -388,58 +386,9 @@ def _build_single_person_pose(candidate, subset):
     return {"bodies": {"candidate": body, "subset": subset_out}, "hands": hands, "faces": faces}
 
 
-class OptimizedWholebody:
-    """Optimized version of Wholebody for faster serial processing"""
-    def __init__(self, onnx_det, onnx_pose, device='cuda:0'):
-        providers = ['CPUExecutionProvider'] if device == 'cpu' else ['CUDAExecutionProvider']
-        self.session_det = ort.InferenceSession(path_or_bytes=onnx_det, providers=providers)
-        self.session_pose = ort.InferenceSession(path_or_bytes=onnx_pose, providers=providers)
-        self.device = device
-        
-        # Get input names once to avoid repeated lookups
-        self.det_input_name = self.session_det.get_inputs()[0].name
-        self.pose_input_name = self.session_pose.get_inputs()[0].name
-        self.pose_output_names = [out.name for out in self.session_pose.get_outputs()]
-    
-    def __call__(self, ori_img):
-        from .onnxdet import inference_detector
-        from .onnxpose import inference_pose
-        
-        det_result = inference_detector(self.session_det, ori_img)
-        keypoints, scores = inference_pose(self.session_pose, det_result, ori_img)
-
-        keypoints_info = np.concatenate(
-            (keypoints, scores[..., None]), axis=-1)
-        # compute neck joint
-        neck = np.mean(keypoints_info[:, [5, 6]], axis=1)
-        # neck score when visualizing pred
-        neck[:, 2:4] = np.logical_and(
-            keypoints_info[:, 5, 2:4] > 0.3,
-            keypoints_info[:, 6, 2:4] > 0.3).astype(int)
-        new_keypoints_info = np.insert(
-            keypoints_info, 17, neck, axis=1)
-        mmpose_idx = [
-            17, 6, 8, 10, 7, 9, 12, 14, 16, 13, 15, 2, 1, 4, 3
-        ]
-        openpose_idx = [
-            1, 2, 3, 4, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17
-        ]
-        new_keypoints_info[:, openpose_idx] = \
-            new_keypoints_info[:, mmpose_idx]
-        keypoints_info = new_keypoints_info
-
-        keypoints, scores = keypoints_info[
-            ..., :2], keypoints_info[..., 2]
-        
-        return keypoints, scores, det_result
-
-
 class PoseAnnotator:
-    def __init__(self, cfg, device=None):
-        onnx_det = cfg['DETECTION_MODEL']
-        onnx_pose = cfg['POSE_MODEL']
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if device is None else device
-        self.pose_estimation = Wholebody(onnx_det, onnx_pose, device=self.device)
+    def __init__(self, cfg):
+        self.pose_estimation = Wholebody()
         self.resize_size = cfg.get("RESIZE_SIZE", 1024)
         self.use_body = cfg.get('USE_BODY', True)
         self.use_face = cfg.get('USE_FACE', True)
@@ -531,16 +480,7 @@ class PoseAnnotator:
 
 
 class OptimizedPoseAnnotator(PoseAnnotator):
-    """Optimized version using improved Wholebody class"""
-    def __init__(self, cfg, device=None):
-        onnx_det = cfg['DETECTION_MODEL']
-        onnx_pose = cfg['POSE_MODEL']
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu") if device is None else device
-        self.pose_estimation = OptimizedWholebody(onnx_det, onnx_pose, device=self.device)
-        self.resize_size = cfg.get("RESIZE_SIZE", 1024)
-        self.use_body = cfg.get('USE_BODY', True)
-        self.use_face = cfg.get('USE_FACE', True)
-        self.use_hand = cfg.get('USE_HAND', True)
+    """Kept name: the annotators of the video classes."""
 
 
 class PoseBodyFaceAnnotator(PoseAnnotator):
@@ -556,189 +496,24 @@ class PoseBodyFaceAnnotator(PoseAnnotator):
 
 
 class OptimizedPoseBodyFaceVideoAnnotator:
-    """Optimized video annotator with multiple optimization strategies"""
-    def __init__(self, cfg, num_workers=2, chunk_size=8):
-        self.cfg = cfg
-        self.num_workers = num_workers
-        self.chunk_size = chunk_size
+    """Hands, body and face map of each frame. Frames run one after the other in the calling thread: worker threads only slow the
+    GPU pose models down (per-thread CUDA handles, and the drawing code holds the GIL between their kernel launches)."""
+    def __init__(self, cfg):
+        self.annotator = OptimizedPoseAnnotator(cfg)
         self.use_body, self.use_face, self.use_hand = True, True, True
-        
-        # Initialize one annotator per worker to avoid ONNX session conflicts
-        self.annotators = []
-        for _ in range(num_workers):
-            annotator = OptimizedPoseAnnotator(cfg)
-            annotator.use_body, annotator.use_face, annotator.use_hand = True, True, True
-            self.annotators.append(annotator)
-        
-        self._current_worker = 0
-        self._worker_lock = threading.Lock()
-    
-    def _get_annotator(self):
-        """Get next available annotator in round-robin fashion"""
-        with self._worker_lock:
-            annotator = self.annotators[self._current_worker]
-            self._current_worker = (self._current_worker + 1) % len(self.annotators)
-            return annotator
-    
-    def _process_single_frame(self, frame_data):
-        """Process a single frame with error handling"""
-        frame, frame_idx = frame_data
-        try:
-            annotator = self._get_annotator()
-            
-            # Convert frame
-            frame = convert_to_numpy(frame)
-            input_image = HWC3(frame[..., ::-1])
-            resized_image = resize_image(input_image, annotator.resize_size)
-            
-            # Process
-            ret_data, _ = annotator.process(resized_image, frame.shape[:2])
-            
-            if 'detected_map_handbodyface' in ret_data:
-                return frame_idx, ret_data['detected_map_handbodyface']
-            else:
-                # Create empty frame if no detection
-                h, w = frame.shape[:2]
-                return frame_idx, np.zeros((h, w, 3), dtype=np.uint8)
-                
-        except Exception as e:
-            print(f"Error processing frame {frame_idx}: {e}")
-            # Return empty frame on error
-            h, w = frame.shape[:2] if hasattr(frame, 'shape') else (480, 640)
-            return frame_idx, np.zeros((h, w, 3), dtype=np.uint8)
-    
+
+    def _process_frame(self, frame):
+        frame = convert_to_numpy(frame)
+        ret_data, _ = self.annotator.process(resize_image(HWC3(frame[..., ::-1]), self.annotator.resize_size), frame.shape[:2])
+        return ret_data.get('detected_map_handbodyface', np.zeros((*frame.shape[:2], 3), dtype=np.uint8))
+
     def forward(self, frames):
-        """Process video frames with optimizations"""
-        if len(frames) == 0:
-            return []
-        
-        # For small number of frames, use serial processing to avoid threading overhead
-        if len(frames) <= 4:
-            annotator = self.annotators[0]
-            ret_frames = []
-            for frame in frames:
-                frame = convert_to_numpy(frame)
-                input_image = HWC3(frame[..., ::-1])
-                resized_image = resize_image(input_image, annotator.resize_size)
-                ret_data, _ = annotator.process(resized_image, frame.shape[:2])
-                
-                if 'detected_map_handbodyface' in ret_data:
-                    ret_frames.append(ret_data['detected_map_handbodyface'])
-                else:
-                    h, w = frame.shape[:2]
-                    ret_frames.append(np.zeros((h, w, 3), dtype=np.uint8))
-            return ret_frames
-        
-        # For larger videos, use parallel processing
-        frame_data = [(frame, idx) for idx, frame in enumerate(frames)]
-        results = [None] * len(frames)
-        
-        # Process in chunks to manage memory
-        for chunk_start in range(0, len(frame_data), self.chunk_size * self.num_workers):
-            chunk_end = min(chunk_start + self.chunk_size * self.num_workers, len(frame_data))
-            chunk_data = frame_data[chunk_start:chunk_end]
-            
-            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-                chunk_results = list(executor.map(self._process_single_frame, chunk_data))
-            
-            # Store results in correct order
-            for frame_idx, result in chunk_results:
-                results[frame_idx] = result
-        
-        return results
+        with pose_models():
+            return [self._process_frame(frame) for frame in frames]
 
 
-class OptimizedPoseBodyFaceHandVideoAnnotator:
-    """Optimized video annotator that includes hands, body, and face"""
-    def __init__(self, cfg, num_workers=2, chunk_size=8):
-        self.cfg = cfg
-        self.num_workers = num_workers
-        self.chunk_size = chunk_size
-        self.use_body, self.use_face, self.use_hand = True, True, True  # Enable hands
-        
-        # Initialize one annotator per worker to avoid ONNX session conflicts
-        self.annotators = []
-        for _ in range(num_workers):
-            annotator = OptimizedPoseAnnotator(cfg)
-            annotator.use_body, annotator.use_face, annotator.use_hand = True, True, True
-            self.annotators.append(annotator)
-        
-        self._current_worker = 0
-        self._worker_lock = threading.Lock()
-    
-    def _get_annotator(self):
-        """Get next available annotator in round-robin fashion"""
-        with self._worker_lock:
-            annotator = self.annotators[self._current_worker]
-            self._current_worker = (self._current_worker + 1) % len(self.annotators)
-            return annotator
-    
-    def _process_single_frame(self, frame_data):
-        """Process a single frame with error handling"""
-        frame, frame_idx = frame_data
-        try:
-            annotator = self._get_annotator()
-            
-            # Convert frame
-            frame = convert_to_numpy(frame)
-            input_image = HWC3(frame[..., ::-1])
-            resized_image = resize_image(input_image, annotator.resize_size)
-            
-            # Process
-            ret_data, _ = annotator.process(resized_image, frame.shape[:2])
-            
-            if 'detected_map_handbodyface' in ret_data:
-                return frame_idx, ret_data['detected_map_handbodyface']
-            else:
-                # Create empty frame if no detection
-                h, w = frame.shape[:2]
-                return frame_idx, np.zeros((h, w, 3), dtype=np.uint8)
-                
-        except Exception as e:
-            print(f"Error processing frame {frame_idx}: {e}")
-            # Return empty frame on error
-            h, w = frame.shape[:2] if hasattr(frame, 'shape') else (480, 640)
-            return frame_idx, np.zeros((h, w, 3), dtype=np.uint8)
-    
-    def forward(self, frames):
-        """Process video frames with optimizations"""
-        if len(frames) == 0:
-            return []
-        
-        # For small number of frames, use serial processing to avoid threading overhead
-        if len(frames) <= 4:
-            annotator = self.annotators[0]
-            ret_frames = []
-            for frame in frames:
-                frame = convert_to_numpy(frame)
-                input_image = HWC3(frame[..., ::-1])
-                resized_image = resize_image(input_image, annotator.resize_size)
-                ret_data, _ = annotator.process(resized_image, frame.shape[:2])
-                
-                if 'detected_map_handbodyface' in ret_data:
-                    ret_frames.append(ret_data['detected_map_handbodyface'])
-                else:
-                    h, w = frame.shape[:2]
-                    ret_frames.append(np.zeros((h, w, 3), dtype=np.uint8))
-            return ret_frames
-        
-        # For larger videos, use parallel processing
-        frame_data = [(frame, idx) for idx, frame in enumerate(frames)]
-        results = [None] * len(frames)
-        
-        # Process in chunks to manage memory
-        for chunk_start in range(0, len(frame_data), self.chunk_size * self.num_workers):
-            chunk_end = min(chunk_start + self.chunk_size * self.num_workers, len(frame_data))
-            chunk_data = frame_data[chunk_start:chunk_end]
-            
-            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-                chunk_results = list(executor.map(self._process_single_frame, chunk_data))
-            
-            # Store results in correct order
-            for frame_idx, result in chunk_results:
-                results[frame_idx] = result
-        
-        return results
+class OptimizedPoseBodyFaceHandVideoAnnotator(OptimizedPoseBodyFaceVideoAnnotator):
+    """Video annotator that includes hands, body, and face"""
 
 
 class AlignedPoseBodyFaceVideoAnnotator:
@@ -786,6 +561,10 @@ class AlignedPoseBodyFaceVideoAnnotator:
     def forward(self, frames):
         if len(frames) == 0:
             return []
+        with pose_models():
+            return self._forward(frames)
+
+    def _forward(self, frames):
         if self.ref_image is None:
             return self._fallback_forward(frames)
 
@@ -845,8 +624,6 @@ class PoseBodyFaceVideoAnnotator(AlignedPoseBodyFaceVideoAnnotator):
 # Option 2: Body + Face + Hands (if you want hands)
 class PoseBodyFaceHandVideoAnnotator(OptimizedPoseBodyFaceHandVideoAnnotator):
     """Video annotator with hands, body, and face"""
-    def __init__(self, cfg):
-        super().__init__(cfg, num_workers=2, chunk_size=4)
 
 
 # Keep the existing utility functions

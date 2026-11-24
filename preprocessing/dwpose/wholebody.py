@@ -2,9 +2,9 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import cv2
 import numpy as np
-import onnxruntime as ort
-from .onnxdet import inference_detector
-from .onnxpose import inference_pose
+from .detection import inference_detector
+from .estimation import inference_pose
+from .native import pose_models
 
 def HWC3(x):
     assert x.dtype == np.uint8
@@ -38,19 +38,13 @@ def resize_image(input_image, resolution):
     return img
 
 class Wholebody:
-    def __init__(self, onnx_det, onnx_pose, device = 'cuda:0'):
+    """Person boxes, then 133 whole-body keypoints per person (DWPose). Hold `native.pose_models()` around a loop of calls to keep
+    the models on the GPU between frames."""
 
-        providers = ['CPUExecutionProvider'
-                 ] if device == 'cpu' else ['CUDAExecutionProvider']
-        # onnx_det = 'annotator/ckpts/yolox_l.onnx'
-        # onnx_pose = 'annotator/ckpts/dw-ll_ucoco_384.onnx'
-
-        self.session_det = ort.InferenceSession(path_or_bytes=onnx_det, providers=providers)
-        self.session_pose = ort.InferenceSession(path_or_bytes=onnx_pose, providers=providers)
-    
     def __call__(self, ori_img):
-        det_result = inference_detector(self.session_det, ori_img)
-        keypoints, scores = inference_pose(self.session_pose, det_result, ori_img)
+        with pose_models() as models:
+            det_result = inference_detector(models, ori_img)
+            keypoints, scores = inference_pose(models, det_result, ori_img)
 
         keypoints_info = np.concatenate(
             (keypoints, scores[..., None]), axis=-1)

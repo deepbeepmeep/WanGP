@@ -36,20 +36,12 @@ from .modeling_omnivoice import (
 from .utils.duration import RuleDurationEstimator
 from .utils.text import add_punctuation
 from .utils.voice_design import _INSTRUCT_VALID_EN, _INSTRUCT_VALID_ZH
+from .settings import (OMNIVOICE_ADJUST_SPEED_SETTING_ID, OMNIVOICE_ASSET_DIR, OMNIVOICE_AUDIO_TOKENIZER_DIR, OMNIVOICE_AUDIO_TOKENIZER_WEIGHTS, OMNIVOICE_AUTO_END_TRIM_FLAG,  # noqa: F401 (also read from here)
+                       OMNIVOICE_AUTO_SPLIT_MAX_SECONDS, OMNIVOICE_AUTO_SPLIT_MIN_SECONDS, OMNIVOICE_AUTO_SPLIT_SETTING_ID, OMNIVOICE_CONFIG_NAME, OMNIVOICE_DEFAULT_VOICE_INSTRUCTION,
+                       OMNIVOICE_LEGACY_DEFAULT_VOICE_INSTRUCTION, is_omnivoice_voice_instruction, normalize_omnivoice_voice_instruction)
 
 
-OMNIVOICE_ASSET_DIR = "omnivoice"
-OMNIVOICE_AUDIO_TOKENIZER_DIR = "omnivoice/audio_tokenizer"
-OMNIVOICE_CONFIG_NAME = "config.json"
-OMNIVOICE_AUDIO_TOKENIZER_WEIGHTS = "audio_tokenizer_bf16.safetensors"
-OMNIVOICE_DEFAULT_VOICE_INSTRUCTION = ""
-OMNIVOICE_LEGACY_DEFAULT_VOICE_INSTRUCTION = "female, warm tone, clear articulation"
 OMNIVOICE_SIGNATURE_CHUNK_SIZE = 65536
-OMNIVOICE_AUTO_END_TRIM_FLAG = "E"
-OMNIVOICE_AUTO_SPLIT_SETTING_ID = "auto_split_every_s"
-OMNIVOICE_ADJUST_SPEED_SETTING_ID = "adjust_speed_to_max_duration"
-OMNIVOICE_AUTO_SPLIT_MIN_SECONDS = 5.0
-OMNIVOICE_AUTO_SPLIT_MAX_SECONDS = 90.0
 OMNIVOICE_TRAILING_SILENCE_WINDOW_SECONDS = 0.02
 OMNIVOICE_TRAILING_SILENCE_KEEP_SECONDS = 0.20
 OMNIVOICE_TRAILING_SILENCE_RELATIVE_RMS = 0.015
@@ -89,17 +81,6 @@ def _read_text_or_file(value: Optional[str], label: str) -> str:
     return value
 
 
-def normalize_omnivoice_voice_instruction(text: str) -> str:
-    if text.strip().lower() == OMNIVOICE_LEGACY_DEFAULT_VOICE_INSTRUCTION:
-        return ""
-    return text
-
-
-def is_omnivoice_voice_instruction(text: str) -> bool:
-    parts = [part.strip() for part in re.split(r"[,\uff0c]", text or "") if part.strip()]
-    if not parts:
-        return False
-    return all(part.lower() in _INSTRUCT_VALID_EN or part in _INSTRUCT_VALID_ZH for part in parts)
 
 
 def _reference_audio_signature(ref_audio) -> tuple:

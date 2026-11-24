@@ -6,7 +6,7 @@ hidden textbox and receives JSON responses through another one:
   from the world's manifest, the task settings from the model's menus),
   or, while a generation runs, explores at once by taking the GPU from it (the generation pauses until the viewer leaves), and answers
   once the world is ready ({"action": "ready"}), which takes the model loading when it is not loaded;
-- {"action": "move", "path", "keys", "text", "seconds", "steps", "memory"}: one move (held keys as "w+left", key names of the world
+- {"action": "move", "path", "keys", "text", "seconds", "steps", "memory", "seq"}: one move (held keys as "w+left", key names of the world
   model's explorer controls, such as "jump" for game worlds; optional text event,
   denoising steps, history frames seen), answered with the URL of its clip and the move's GPU statistics ({"action": "clip", "url",
   "stats"});
@@ -26,7 +26,7 @@ type, manifest, memory) every world model (model def "world_outputs") implements
 controls its model understands (shared.utils.world_instructions.CONTROLS: the keys the explorer captures, its help, whether it offers text
 events), "seconds": [(value, label, frames)], "steps": [(value, label)] (one choice: no Quality menu), "memory": [(value, video seconds,
 needs)] (value in the frames unit of "seconds"), "memory_title", "defaults": {"seconds", "steps", "memory"}, "task": settings of the
-exploration task}."""
+exploration task, optionally "queue_moves": True (the keys pressed while a move is generated make the next moves, in order)}."""
 import json
 import os
 import shutil
@@ -97,12 +97,13 @@ def _submit(state, settings):
     return session.submit_task(settings)
 
 
-def _wait(exploration, kinds, timeout, job=None):
-    """The next event of kinds; with the exploration's queued task (job), an error event when the task ends without one."""
+def _wait(exploration, kinds, timeout, job=None, seq=None):
+    """The next event of kinds (seq: of that move only); with the exploration's queued task (job), an error event when the task ends
+    without one."""
     waited = 0.0
     while waited < timeout and not exploration.left.is_set():
         finished = job is not None and job.done  # SessionJob.done: a property
-        event = exploration.next_event(0.5)
+        event = exploration.next_event(0.5, seq)
         waited += 0.5
         if event is not None and event["type"] in kinds:
             return event
@@ -191,18 +192,18 @@ def handle_request(state, request, outputs_folder, explore_now=None):
         output = add_exploration_world(service_for(state), path, event["data"], event["moves"])
         _saved.add(path)
         return json.dumps({"action": "saved", "path": path, "recorded": output.name})
-    keys = request.get("keys") or ""
-    exploration.move({"keys": keys} if keys else None, request.get("text") or "", float(request["seconds"]), int(request["steps"]), int(request["memory"]))
-    event = _wait(exploration, ("clip", "ended"), _MOVE_TIMEOUT)
+    keys, seq = request.get("keys") or "", request.get("seq")
+    exploration.move({"keys": keys} if keys else None, request.get("text") or "", float(request["seconds"]), int(request["steps"]), int(request["memory"]), seq)
+    event = _wait(exploration, ("clip", "ended"), _MOVE_TIMEOUT, seq=seq)
     if event is None or event["type"] == "ended":
         return json.dumps({"action": "ended", "path": path})
     folder = Path(outputs_folder) / CLIP_FOLDER
     folder.mkdir(parents=True, exist_ok=True)
     clips = _clips.setdefault(path, [])
-    clip = str(folder / f"{exploration.token}_{len(clips):04d}.mp4")
+    clip = str(folder / f"{exploration.token}_{len(clips) if seq is None else seq:04d}.mp4")  # moves sent ahead write their clips at once
     iio.imwrite(clip, event["frames"], fps=event["fps"], codec="libx264", quality=8)
     clips.append(clip)
-    return json.dumps({"action": "clip", "path": path, "url": gradio_file_url(clip), "stats": event.get("stats")})
+    return json.dumps({"action": "clip", "path": path, "url": gradio_file_url(clip), "stats": event.get("stats"), "seq": seq})
 
 
 def clear_clip_folder(outputs_folder):

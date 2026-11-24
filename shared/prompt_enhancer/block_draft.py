@@ -2,7 +2,7 @@
 """Optional parallel draft checkpoints for Qwen3.8/Bonsai 27B."""
 import json
 
-from .config import BLOCK_DRAFT_METHODS
+from .config import BLOCK_DRAFT_METHODS, BONSAI_QUANTIZATIONS
 
 
 BLOCK_DRAFT_ASSETS = {
@@ -26,8 +26,8 @@ def draft_download_def(spec):
 
 def ensure_block_draft_assets(process_files_def, method, variant, backend):
     if variant != "27b":
-        raise ValueError("Parallel draft models require Qwen3.8-27B or Bonsai 2 27B.")
-    spec = block_draft_spec(method, bonsai=backend == "gguf_ptq1")
+        raise ValueError("Parallel draft models require Qwen3.8-27B or Bonsai 27B.")
+    spec = block_draft_spec(method, bonsai=backend in BONSAI_QUANTIZATIONS)
     process_files_def(**draft_download_def(spec))
 
 

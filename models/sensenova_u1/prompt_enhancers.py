@@ -57,3 +57,44 @@ The user also provides one image, represented by an image caption. First infer i
 - For a new infographic guided by the reference, extract and describe the reusable design grammar: canvas organization, focal path, section geometry, whitespace, palette, texture, illustration and icon style, chart treatment, typography, and information hierarchy. Apply that grammar to the user's new topic rather than copying the reference's subjects or prose.
 - If the role is ambiguous, use the image as the primary subject and composition reference. The user's explicit facts and requested copy take priority over uncertain caption details.
 - Do not reproduce incidental watermarks, signatures, account names, QR codes, source branding, or unrelated reference text. Include source-specific text or branding only when the user explicitly requires it."""
+
+
+# Text Fix Edit (U1.6): the box-located text edits that SenseNova-U1.6 writes when it reviews its own image (native self-correction) and
+# applies in edit mode. Local enhancers: the vision stage transcribes every line of text with its box (no judgment: small vision models
+# loop or drift when asked to proofread too), the rewrite proofreads the transcript and writes the fixes in that syntax.
+SENSENOVA_TEXT_FIX_VISION_PROMPT = """Transcribe all the text in this image, line by line, in reading order (top to bottom, then left to right). For each line of text output exactly one line: its box as four numbers, then its text in double quotes. For example, for a title near the top left of an image:
+[112, 40, 486, 72] "SUMMER SALE"
+
+- Copy the letters exactly as they appear, including misspellings, malformed or merged letters, gibberish and duplicated words. Do not correct anything: a later step compares your transcript with the intended wording.
+- Coordinates are integers from 0 to 1000 (write 616, never 0.616) relative to the image: x from the left edge (0) to the right edge (1000), y from the top edge (0) to the bottom edge (1000); [x1, y1] is the top-left and [x2, y2] the bottom-right corner of a tight box around that single line.
+- One entry per line: a paragraph over several lines gives several entries. Each line once, never repeat an entry.
+- Output nothing else. After the last line, output: END"""
+
+SENSENOVA_TEXT_FIX_PROMPT = """# Role
+You write the text-fix edit instruction for SenseNova-U1.6, an image model that corrects lettering inside an existing image from box-located instructions. You receive the user's request and either the image itself or, in place of an image caption, a transcript of every line of text in the image from a vision pass, one per line: [x1, y1, x2, y2] "text", ended by END.
+
+# Method
+- If you see the image itself, first transcribe every line of text with a tight box, as that vision pass would. Use each distinct transcript line once: skip repeated lines and a line cut off at the end.
+- Proofread each line against the user's request. The request may be the full prompt that produced the image (the intended wording in quotes), a short instruction such as "fix the spelling", or explicit replacements. A line needs a fix when it has misspelled, garbled or gibberish words, malformed or merged letters, duplicated or missing words or broken numbering, when its wording differs from the wording the request gives for it, or when the user asks to change or remove it. Leave correct lines out.
+- The fix uses the request's wording when it gives one, exactly as quoted. Otherwise write the obviously intended wording in the image's language, keeping its capitalization and punctuation style; when the intended words cannot be recovered with confidence, keep the line's readable words and drop the garbled ones rather than inventing new words. Gibberish with no recoverable meaning, filling a text area, is removed unless the request gives its wording.
+- Coordinates are integers from 0 to 1000 relative to the image: x from left (0) to right (1000), y from top (0) to bottom (1000); [x1, y1, x2, y2] = top-left then bottom-right corner. Keep the transcript's boxes, but write fractions between 0 and 1 as integers by multiplying them by 1000 (0.616 becomes 616).
+- Name the area of each box from its center: x below 333 is left, above 667 is right, otherwise center; y below 333 is upper, above 667 is lower, otherwise middle.
+- Keep the current text exactly as transcribed, errors included: the model finds it by its box and its letters.
+- Write a clause only for a line that changes: never one whose new text equals its current text. Use only boxes given by the transcript (or, when you see the image, boxes you measured): never invent or generalize a box; a line without a box is left out.
+
+# Output syntax
+English (the default, and for any request not written in Chinese), one clause per line of text, clauses joined by "; " and ended with ".":
+in the <area> area [x1, y1, x2, y2], replace "<current>" with "<fix>"
+in the <area> area [x1, y1, x2, y2], remove the extra "<current>"
+where <area> is one of: upper-left, upper, upper-right, left, center, right, lower-left, lower, lower-right.
+
+Chinese requests use the same clauses in Chinese, joined by "、" and ended with "。":
+把<区域>[x1, y1, x2, y2]内的“<current>”改为“<fix>”
+去掉<区域>[x1, y1, x2, y2]内多余的“<current>”
+where <区域> is one of: 左上角, 上方, 右上角, 左侧, 中部, 右侧, 左下角, 下方, 右下角.
+
+Example (English):
+in the left area [299, 382, 370, 400], replace "Paioad fairing" with "Payload fairing"; in the right area [616, 432, 836, 455], replace "Stage separatee is/ separation" with "Stage separation, orbital insertion,"; in the lower-left area [32, 836, 274, 844], remove the extra "Dnilamoog adg aent".
+
+# Output
+Return only the instruction, every clause complete, with straight double quotes in English and “ ” in Chinese. No other sentence, heading, list, comment or Markdown. If no line needs a fix, return exactly: Keep the image unchanged."""

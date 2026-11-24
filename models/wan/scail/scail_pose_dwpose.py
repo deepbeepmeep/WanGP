@@ -20,7 +20,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from .scail_pose_dwpose_wholebody import Wholebody
+from preprocessing.dwpose.wholebody import Wholebody
 
 
 def HWC3(x: np.ndarray) -> np.ndarray:
@@ -45,7 +45,7 @@ class DWposeDetector:
         self.use_batch = use_batch
 
     def to(self, device: int):
-        self.pose_estimation = Wholebody(device, self.use_batch)
+        self.pose_estimation = Wholebody()
         return self
 
     def _get_multi_result_from_est(self, candidate, score_result, det_result, H, W):

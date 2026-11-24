@@ -90,7 +90,8 @@ class WorkspaceStore:
                 raise ValueError(f'Invalid workspace storage: {path.name}')
             if record.get('storage_mode') == 'dedicated':
                 directory = self._directory(record)
-                record = self._map_paths(record, lambda value: str(owned_path(directory, value)))
+                resolved = directory.resolve()  # once for the workspace's files
+                record = self._map_paths(record, lambda value: str(owned_path(directory, value, resolved)))
             else:
                 converted = _convert_references(path, record, references)
                 record = converted

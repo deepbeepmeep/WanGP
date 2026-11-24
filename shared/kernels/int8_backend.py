@@ -46,7 +46,7 @@ _rotated_triton = None  # fused ConvRot Triton kernels for large inputs (Triton 
 _column_triton = None  # the same kernels' quantizer writing in place into a ColumnInput, when WGPKernels is the backend
 _blockwise_triton = None
 _blockwise_required = False
-_kitchen_dlpack_export = None  # (Kitchen module, its own DLPack exporter) while the direct exporter replaces it
+_kitchen_dlpack_export = None  # (Kitchen module, its own DLPack exporter, its own Hadamard builder) while WanGP's replace them
 _prepared_capture_streams = set()
 # Bump when changes to INT8 custom operators invalidate compiled graphs.
 _COMPILE_CACHE_VERSION = 4
@@ -113,6 +113,11 @@ def _probe_kitchen():
 
 
 def _probe_wgpkernels():
+    from shared.kernels import startup_probes
+    return startup_probes.result("int8", _selftest_wgpkernels)
+
+
+def _selftest_wgpkernels():
     if not torch.cuda.is_available():
         return None, "requires a GPU"
     if torch.version.hip is not None and not torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx1201"):
@@ -1576,7 +1581,7 @@ def configure(selection, verbose_level=0, *, resolved=None):
     kernel_policy.configure_families(selection)
     previous_backend = _backend
     if _kitchen_dlpack_export is not None:
-        _kitchen_dlpack_export[0]._wrap_for_dlpack = _kitchen_dlpack_export[1]
+        _kitchen_dlpack_export[0]._wrap_for_dlpack, _kitchen_dlpack_export[0]._build_hadamard = _kitchen_dlpack_export[1:]
         _kitchen_dlpack_export = None
     if _original_forward is not None:
         from optimum.quanto.tensor.weights import qbytes
@@ -1611,8 +1616,12 @@ def configure(selection, verbose_level=0, *, resolved=None):
         _kitchen = module
         _kitchen_hip = torch.version.hip is not None
         if not _kitchen_hip:
-            _kitchen_dlpack_export = (module, module._wrap_for_dlpack)
+            from shared.qtypes.int8_convrot import _regular_hadamard
+            _kitchen_dlpack_export = (module, module._wrap_for_dlpack, module._build_hadamard)
             module._wrap_for_dlpack = _export_dlpack
+            # Kitchen's unfused ConvRot route (Turing's 48 KiB shared memory, k >= 4096) reads a Hadamard from its own cache, which CUDA
+            # graphs reject: WanGP's is the same matrix, registered as a graph constant
+            module._build_hadamard = _regular_hadamard
         if not _kitchen_hip and not module._DISABLE_CUTLASS_INT8:
             capability = torch.cuda.get_device_capability()
             _sm120_cutlass = capability == (12, 0)

@@ -1,0 +1,15 @@
+Face analysis networks for WanGP (native PyTorch, no ONNX Runtime)
+
+InsightFace buffalo_l: SCRFD-10G detector (det_10g), 2D-106 landmarks (2d106det), ArcFace IResNet-50 (w600k_r50).
+https://github.com/deepinsight/insightface
+nets.py rebuilds the three networks from their released ONNX graphs; insightface_ops.py adapts the python
+package's pre- and post-processing (v0.7.3). The code is MIT: LICENSE_INSIGHTFACE.
+Model terms: InsightFace states that its training data and the models trained on it, buffalo_l included, are
+available for non-commercial research purposes only; contact InsightFace for other licensing. The MIT license of
+the code does not change these model terms.
+
+facexlib ArcFace IR-SE50 (recognition_arcface_ir_se50.pth), used by Lynx.
+https://github.com/xinntao/facexlib
+ir_se.py adapts facexlib/recognition/arcface_arch.py (MIT: LICENSE_FACEXLIB).
+
+Checkpoints: the released weights of these networks, repacked as BF16 safetensors (DeepBeepMeep/Wan2.1, face_analysis/).

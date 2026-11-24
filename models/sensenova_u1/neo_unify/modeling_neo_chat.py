@@ -1,4 +1,4 @@
-from shared.utils.phase_progress import text_encoding_progress, set_phase_status
+from shared.utils.phase_progress import PhaseProgress, text_encoding_progress, set_phase_status
 from typing import List, Optional, Tuple, Union
 import math
 import os
@@ -15,10 +15,14 @@ from transformers.utils import logging
 from .configuration_neo_chat import NEOChatConfig, NEOMoELLMConfig
 from .conversation import get_conv_template
 from .modeling_neo_vit import NEOVisionModel
-from .modeling_qwen3 import Qwen3ForCausalLM, create_block_causal_mask
+from .modeling_qwen3 import Qwen3ForCausalLM, StaticKVCache, create_block_causal_mask
+from mmgp import cuda_graphs
+from shared.llm_engines.cudagraph_kit import AutoRegressiveCudaGraphKit
 from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .modeling_fm_modules import PositionEmbedding, TimestepEmbedder, FlowMatchingHead, RMSNorm, NerfEmbedder, SimpleMLPAdaLN, ConvDecoder
-from .utils import load_image_native, SYSTEM_MESSAGE_FOR_GEN
+from .utils import load_image_native, smart_resize, SYSTEM_MESSAGE_FOR_GEN
+
+REVIEW_MAX_PIXELS = 2048 * 2048  # a drawn image is read back at most at the size of the reference images (the understanding branch's range)
 
 logger = logging.get_logger(__name__)
 
@@ -108,10 +112,9 @@ class NEOChatModel(PreTrainedModel):
         "Qwen3DecoderLayer",
         "Qwen3MoeDecoderLayer",
     ]
-    _offload_separate_blocks = (  # mmgp loads them only while they run: the prompt's embedding and the thinking text's head, not while denoising
-        "language_model.model.embed_tokens",
-        "language_model.lm_head",
-    )
+    # mmgp loads it only while it runs: the head of written text (Think, self-correction), not while denoising. The token table is looked up on
+    # the CPU (sensenova_u1_main: runtime.lookup_on_cpu), never in VRAM: otherwise each written token would also reload its 1.24 GB
+    _offload_separate_blocks = ("language_model.lm_head",)
 
     # support transformers 4.51.+
     _tp_plan = ''
@@ -1610,6 +1613,220 @@ class NEOChatModel(PreTrainedModel):
         if think_mode:
             return image_prediction, think_text
         return image_prediction
+
+    @torch.no_grad()
+    def self_correction_generate(self, tokenizer, prompt, images=None, cfg_scale=4.0, timestep_shift=3.0, image_size=(1024, 1024), num_steps=50, seed=0, callback=None, max_images=4, max_text_tokens=1024,
+                                 always_review=False, IMG_START_TOKEN='<img>', IMG_END_TOKEN='</img>', IMG_CONTEXT_TOKEN='<IMG_CONTEXT>'):
+        """Native self-correction (upstream examples/interleave/self_correction.py: interleave_gen without Think): the model draws the image,
+        writes a critique of it (text fixes located by boxes) and draws a revision with the prompt, its draft and the critique in context, and
+        may review that revision again, until it ends its answer or max_images were drawn (upstream: 10; each round is a whole generation).
+        max_text_tokens: per critique.
+        always_review: the model may not end its answer right after the draft (it may otherwise stop with visible errors left: an 8-step 4K
+        infographic draft, end token 78-99 % whatever the review size, gave an exact critique and a corrected revision once forced).
+        Returns (images in the order drawn, text segments written before each image and after the last)."""
+        self.img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+        self.img_start_token_id = img_start_id = tokenizer.convert_tokens_to_ids(IMG_START_TOKEN)
+        img_end_id = tokenizer.convert_tokens_to_ids(IMG_END_TOKEN)
+        eos_id = tokenizer.convert_tokens_to_ids(get_conv_template(self.template).sep.strip())
+        self._notify_layer_offload_phase("prefix")
+        images = images or []
+        pixel_values = grid_hw = None
+        if images:
+            if len(images) > prompt.count('<image>'):
+                prompt = "<image>\n" * (len(images) - prompt.count('<image>')) + prompt
+            loaded = [load_image_native(image, self.patch_size, self.downsample_ratio, min_pixels=512 * 512, max_pixels=min(2048 * 2048, (4096 * 4096) // len(images)), upscale=False) for image in images]
+            pixel_values = torch.cat([values.to(self.device, torch.bfloat16) for values, _ in loaded])
+            grid_hw = torch.cat([hw.to(self.device) for _, hw in loaded])
+            del loaded
+
+        def prefix_inputs(query):
+            for i in range(0 if grid_hw is None else grid_hw.shape[0]):
+                query = query.replace('<image>', IMG_START_TOKEN + IMG_CONTEXT_TOKEN * int(grid_hw[i, 0] * grid_hw[i, 1] * self.downsample_ratio**2) + IMG_END_TOKEN, 1)
+            embeds, indexes, mask = self._build_it2i_inputs(tokenizer, query, pixel_values, grid_hw)
+            return [embeds], indexes, mask
+
+        # condition: the generation system message, no Think; text-unconditioned branch (CFG): the references only, default system message.
+        # Caches sized for a draft and one fix, both read back with a critique each (the model reviews its fix too, then usually ends), grown
+        # only for further rounds
+        model = self.language_model.model
+        factor = self.patch_size * int(1 / self.downsample_ratio)
+        review_h, review_w = self._review_size(image_size[1], image_size[0])
+        review_tokens = (review_h // factor) * (review_w // factor) + 1  # with </img>
+        rotary, rotary_hw = model.layers[0].self_attn.rotary_emb, model.layers[0].self_attn.rotary_emb_hw
+        device = self.device
+        # the prompts end with <img>, as in t2i_generate / it2i_generate: the draft is always drawn, as the plain generation draws it
+        embeds_list, indexes, mask = prefix_inputs(self._build_t2i_query(prompt, system_message=SYSTEM_MESSAGE_FOR_GEN, append_text='<think>\n\n</think>\n\n' + IMG_START_TOKEN))
+        cache_cond = StaticKVCache(model.config, indexes.shape[1] + 2 + 2 * review_tokens + 2 * max_text_tokens, rotary_hw, device)
+        with text_encoding_progress(model.layers):
+            model(inputs_embeds_list=embeds_list, indexes=indexes, attention_mask=mask, past_key_values=cache_cond, use_cache=True)
+        t_cond = indexes[0].max().item()
+        del embeds_list, indexes, mask
+        cache_tu = t_tu = None
+        if cfg_scale != 1:
+            embeds_list, indexes, mask = prefix_inputs(self._build_t2i_query('<image>' * len(images), append_text=IMG_START_TOKEN))
+            t_tu = indexes[0].max().item()
+            cache_tu = StaticKVCache(model.config, indexes.shape[1] + 2 + 2 * review_tokens, rotary_hw, device)  # no written text
+            with text_encoding_progress(model.layers):
+                model(inputs_embeds_list=embeds_list, indexes=indexes, attention_mask=mask, past_key_values=cache_tu, use_cache=True)
+            del embeds_list, indexes, mask
+        del pixel_values, grid_hw
+
+        # the written tokens of the conditioned branch: graphed decode steps (MMGP stage: one graph per step with the layers in VRAM, else a
+        # graph per layer); the text-unconditioned branch only gets the image starts, eagerly
+        kit = AutoRegressiveCudaGraphKit("sensenova_self_correction", owner=self, resident=model)
+        kit.register_state(cache_cond)  # a no-op when the model has no CUDA graphs
+
+        def write_token(cache, t_idx, token_id, graphed):  # one token into a branch's cache at time position t_idx + 1, its final hidden state
+            embeds = self.language_model.get_input_embeddings()(torch.tensor([[token_id]], device="cpu"))  # looked up in RAM
+            cos, sin = rotary(embeds, torch.full((1, 1), t_idx + 1, dtype=torch.long, device=device))
+            cache.begin_decode()
+            with cuda_graphs.scope(gated=False):
+                graphed = graphed and cuda_graphs.is_enabled(self)  # the model's graphs (off: eager, not the kit's own graphs)
+            hidden = kit.run("decode", lambda e, c, s: model.decode_step(e, c, s, cache), embeds, cos, sin) if graphed else model.decode_step(embeds, cos, sin, cache)
+            cache.end_decode()
+            return hidden
+
+        def next_logits(hidden):
+            return self.language_model.lm_head(hidden)[:, -1]
+
+        generator = torch.Generator(device).manual_seed(seed)
+        drawn, segments, token_ids = [], [], []
+        progress = bar = None  # the written text's progress (UI bar and abort checks at each token, tqdm), up to max_text_tokens
+
+        def end_writing():
+            nonlocal progress, bar
+            if progress is not None:
+                bar.close()
+                progress.__exit__(None, None, None)
+                progress = bar = None
+
+        try:
+            draw = True  # the draft first: both caches end with <img>
+            while True:
+                if not draw:
+                    token_id = torch.argmax(logits, dim=-1).item()
+                    if token_id != img_start_id:
+                        if token_id == eos_id or len(token_ids) >= max_text_tokens:
+                            break
+                        if progress is None:
+                            progress = PhaseProgress(max_text_tokens, "Writing Critique", "tokens").__enter__()
+                            bar = tqdm(total=max_text_tokens, desc="Writing Critique", unit="tok", leave=False)
+                        token_ids.append(token_id)
+                        logits = next_logits(write_token(cache_cond, t_cond, token_id, True))
+                        t_cond += 1
+                        bar.update(1)
+                        progress.advance()
+                        continue
+                    end_writing()
+                    write_token(cache_cond, t_cond, token_id, True)
+                    t_cond += 1
+                    if cache_tu is not None:
+                        write_token(cache_tu, t_tu, token_id, False)
+                        t_tu += 1
+                draw = False
+                segments.append(tokenizer.decode(token_ids, skip_special_tokens=True).strip())
+                token_ids = []
+                branches = [(cache_cond, t_cond)] + ([(cache_tu, t_tu)] if cache_tu is not None else [])
+                set_phase_status("Drawing Revision" if drawn else "Drawing Draft")
+                drawn.append(self._self_correction_denoise(branches, image_size, num_steps, timestep_shift, cfg_scale, generator, callback))
+                if len(drawn) == max_images:
+                    break
+                self._notify_layer_offload_phase("prefix")
+                set_phase_status("Reviewing Revision" if len(drawn) > 1 else "Reviewing Draft")
+                if cache_cond.reserve(review_tokens + max_text_tokens + 1):  # a further round: this image, a critique, the next image start
+                    kit.register_state(cache_cond)
+                logits = self._append_drawn_image(cache_cond, t_cond, drawn[-1], img_end_id)
+                if always_review and len(drawn) == 1:  # the model may not end its answer right after the draft: it writes its review
+                    logits[:, eos_id] = float("-inf")
+                t_cond += 2
+                if cache_tu is not None:
+                    cache_tu.reserve(review_tokens + 1)
+                    self._append_drawn_image(cache_tu, t_tu, drawn[-1], img_end_id)
+                    t_tu += 2
+            end_writing()
+        finally:
+            if bar is not None:  # aborted while writing
+                bar.close()
+            kit.release()  # forgets the cache, with the model's graphs that read it
+        segments.append(tokenizer.decode(token_ids, skip_special_tokens=True).strip())
+        return drawn, segments
+
+    def _self_correction_denoise(self, branches, image_size, num_steps, timestep_shift, cfg_scale, generator, callback):
+        """Draws one image of the interleaved sequence on the conditioned branch and, with CFG, the text-unconditioned one (both caches end with <img>)."""
+        merge_size = int(1 / self.downsample_ratio)
+        token_h, token_w = image_size[1] // (self.patch_size * merge_size), image_size[0] // (self.patch_size * merge_size)
+        grid_h, grid_w = image_size[1] // self.patch_size, image_size[0] // self.patch_size
+        device = self.device
+        dtype = branches[0][0].layers[0].keys.dtype
+        branches = [(self._build_t2i_image_indexes(token_h, token_w, t_idx + 1, device=device), {"full_attention": None}, cache) for cache, t_idx in branches]
+        grid_hw = torch.tensor([[grid_h, grid_w]], device=device)
+        noise_scale = self.noise_scale
+        if self.noise_scale_mode in ("resolution", "dynamic", "dynamic_sqrt"):
+            noise_scale = math.sqrt((grid_h * grid_w) / (merge_size**2) / float(self.noise_scale_base_image_seq_len)) * float(self.noise_scale)
+            if self.noise_scale_mode == 'dynamic_sqrt':
+                noise_scale = math.sqrt(noise_scale)
+        noise_scale = min(noise_scale, self.noise_scale_max_value)
+        image_prediction = noise_scale * torch.randn((1, 3, image_size[1], image_size[0]), device=device, dtype=dtype, generator=generator)
+        timesteps = self._apply_time_schedule(torch.linspace(0.0, 1.0, num_steps + 1, device=device), token_h * token_w, timestep_shift)
+        self._notify_layer_offload_phase("denoise")
+        if callback is not None:
+            callback(-1, None)
+        for step_i in tqdm(range(num_steps), total=num_steps, desc="SenseNova-U1 denoising"):
+            t, t_next = timesteps[step_i], timesteps[step_i + 1]
+            z = self.patchify(image_prediction, self.patch_size * merge_size)
+            image_input = self.patchify_list([image_prediction], self.patch_size, channel_first=True)
+            del image_prediction
+            pixel_values_list = [image_input.view(grid_h * grid_w, -1)]
+            del image_input
+            image_embeds = self.extract_feature_list(pixel_values_list, gen_model=True, grid_hw=grid_hw).view(1, token_h * token_w, -1)
+            image_embeds.add_(self._broadcast_timestep_embedding(t, noise_scale, 1, token_h * token_w))
+            image_embeds_list = [image_embeds]
+            del image_embeds
+            predictions = self._t2i_predict_v_joint(image_embeds_list, branches, t, z, image_token_num=token_h * token_w, image_size=image_size)
+            v_pred = predictions[0] if len(predictions) == 1 else predictions[1].mul_(1 - cfg_scale).add_(predictions[0], alpha=cfg_scale)
+            del predictions
+            z = self._euler_step([v_pred], z, t, t_next)
+            del v_pred
+            image_prediction = self.unpatchify_list([z], self.patch_size * merge_size, image_size[1], image_size[0])
+            del z
+            if callback is not None:
+                callback(step_i, image_prediction)
+        return image_prediction
+
+    def _review_size(self, height, width):
+        if height * width <= REVIEW_MAX_PIXELS:
+            return height, width
+        return smart_resize(height, width, factor=self.patch_size * int(1 / self.downsample_ratio), max_pixels=REVIEW_MAX_PIXELS)
+
+    def _append_drawn_image(self, cache, t_idx, image, img_end_id):
+        """Appends a drawn image, re-encoded by the understanding branch and closed by </img>, to a branch's cache (upstream interleave_gen);
+        returns the logits of the next token. Above REVIEW_MAX_PIXELS the image is read back downscaled: at 16 MP the model ends its answer
+        without reviewing the draft (end token 99.7 % after the draft), at 4 MP it writes its critique."""
+        device = image.device
+        size = self._review_size(*image.shape[-2:])
+        if size != tuple(image.shape[-2:]):
+            image = torch.nn.functional.interpolate(image[:1].float(), size=size, mode="bicubic", antialias=True)
+        und = image[0].to(torch.bfloat16) * 0.5 + 0.5
+        und = (und - torch.tensor([0.485, 0.456, 0.406], dtype=und.dtype, device=device).view(3, 1, 1)) / torch.tensor([0.229, 0.224, 0.225], dtype=und.dtype, device=device).view(3, 1, 1)
+        channels, height, width = und.shape
+        ps = self.patch_size
+        pixel_values = und.view(channels, height // ps, ps, width // ps, ps).permute(1, 3, 0, 2, 4).reshape((height // ps) * (width // ps), channels * ps * ps)
+        del und
+        grid_hw = torch.tensor([[height // ps, width // ps]], device=device)
+        vit_embeds = self.extract_feature(pixel_values, grid_hw=grid_hw).unsqueeze(0)
+        count = vit_embeds.shape[1]
+        embeds = torch.cat([vit_embeds, self.language_model.get_input_embeddings()(torch.tensor([[img_end_id]], device=device))], dim=1)
+        del vit_embeds
+        abs_w, abs_h = build_abs_positions_from_grid_hw(grid_hw // int(1 / self.downsample_ratio), device=device)
+        t_indexes = torch.full((count + 1,), t_idx + 1, dtype=torch.long, device=device)
+        t_indexes[count] = t_idx + 2
+        h_indexes = torch.zeros(count + 1, dtype=torch.long, device=device)
+        w_indexes = torch.zeros(count + 1, dtype=torch.long, device=device)
+        h_indexes[:count], w_indexes[:count] = abs_h, abs_w
+        past = cache.get_seq_length()
+        mask = torch.zeros(1, 1, count + 1, past + count + 1, device=device)
+        mask[0, 0, :count, past + count] = float('-inf')  # the image tokens do not see </img>
+        return self.language_model(inputs_embeds=embeds, indexes=torch.stack([t_indexes, h_indexes, w_indexes]), attention_mask={"full_attention": mask}, past_key_values=cache, use_cache=True, logits_to_keep=1).logits[:, -1]
 
     @torch.no_grad()
     def t2i_generate(self, tokenizer, prompt, cfg_scale=1, timestep_shift=1, enable_timestep_shift=True, cfg_norm='none', image_size=(256, 256), num_steps=30, IMG_START_TOKEN='<img>', IMG_END_TOKEN='</img>', IMG_CONTEXT_TOKEN='<IMG_CONTEXT>', method='euler', cfg_interval=(0, 1), batch_size=1, t_eps=0.02, think_mode=False, seed=0, callback=None):

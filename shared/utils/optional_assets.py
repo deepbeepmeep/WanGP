@@ -10,9 +10,11 @@ def _builtin_entries():
     from preprocessing.processors import depth_checkpoint_inventory, query_preprocessor_download_def
     from preprocessing.depth_anything_v3.assets import query_download_def as depth_v3
     from preprocessing.matanyone.utils.model_assets import MATANYONE_SETTINGS_KEY, MATANYONE_VERSION_LABELS, query_matanyone_download_def
-    from preprocessing.speaker_separator.assets import query_speaker_separator_download_def
+    from preprocessing.speaker_separator import assets as speaker_separator
     from preprocessing.rembg import assets as rembg
-    from preprocessing.roformer.assets import query_download_def as roformer
+    from preprocessing.dwpose import assets as dwpose
+    from preprocessing.face_analysis import assets as face_analysis
+    from preprocessing.roformer import assets as roformer
     from models.hyvideo.data_kits.assets import query_download_def as face
     from models.wan.fantasytalking.assets import query_download_def as wav2vec
     from models.wan.multitalk.assets import query_download_def as chinese_wav2vec
@@ -21,7 +23,9 @@ def _builtin_entries():
         yield {"family": "Deepy / Prompt Enhancer", **entry}
     for name, definition in WHISPER_DOWNLOAD_DEFS.items():
         yield {"family": "Audio Preprocessors", "name": "Whisper", "variant": name, "download_defs": [definition]}
-    for kind, label in [("pose", "DWPose"), ("scribble", "Scribble"), ("flow", "RAFT Optical Flow")]:
+    for entry in dwpose.query_checkpoint_inventory():
+        yield {"family": "Video Preprocessors", **entry}
+    for kind, label in [("scribble", "Scribble"), ("flow", "RAFT Optical Flow")]:
         yield {"family": "Video Preprocessors", "name": label, "download_defs": [query_preprocessor_download_def(kind)]}
     for entry in depth_checkpoint_inventory():
         yield {"family": "Video Preprocessors", **entry}
@@ -32,8 +36,12 @@ def _builtin_entries():
         yield {"family": "Video Preprocessors", **model, "download_defs": [query_matanyone_download_def({MATANYONE_SETTINGS_KEY: version})]}
     for entry in rembg.query_checkpoint_inventory():
         yield {"family": "Image Preprocessors", **entry}
-    for name, defs in [("Vocals Separation", [roformer()]), ("Speaker Separation", query_speaker_separator_download_def())]:
-        yield {"family": "Audio Preprocessors", "name": name, "download_defs": defs}
+    for entry in face_analysis.query_checkpoint_inventory():
+        yield {"family": "Image Preprocessors", **entry}
+    for entry in roformer.query_checkpoint_inventory():
+        yield {"family": "Audio Preprocessors", **entry}
+    for entry in speaker_separator.query_checkpoint_inventory():
+        yield {"family": "Audio Preprocessors", **entry}
     for variant, definition in [("Standard", wav2vec()), ("Chinese", chinese_wav2vec())]:
         yield {"family": "Audio Preprocessors", "name": "Wav2Vec", "variant": variant, "download_defs": [definition]}
     for name, decoder in REGISTRY["decoders"].items():

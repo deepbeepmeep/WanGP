@@ -146,9 +146,16 @@ def speaks_its_lines(entry: dict[str, Any] | None) -> bool:
     return bool(entry and entry.get("spoken_line") and not entry["audio"])
 
 
+def own_audio(shot: dict[str, Any]) -> bool:
+    """The shot follows audio of the user's: its own audio_guide (Use my audio), or their recording of a line said by someone it shows."""
+    return bool((shot["generation"].get("settings") or {}).get("audio_guide") and not shot.get("audio_slice")
+                or any(line.get("own") and line.get("audio") and line.get("speaker") in (shot.get("cast") or []) for line in shot.get("dialogue") or []))
+
+
 def model_speaks(doc: dict[str, Any], shot: dict[str, Any], entry: dict[str, Any] | None) -> bool:
-    """The user's Voices choice holds for this shot: its own model says its lines, and nothing is recorded. A cut on the song has lyrics, and a shot given its own audio follows it."""
-    return bool(doc["brief"].get("voices_from_model")) and speaks_its_lines(entry) and not cut_on_the_song(doc) and not shot.get("audio_slice") and not (shot["generation"].get("settings") or {}).get("audio_guide")
+    """The user's Voices choice holds for this shot: its own model says its lines, and nothing is recorded. A cut on the song has lyrics, and a shot given audio of its own
+    (an audio_guide, or the user's recording of a line) follows it."""
+    return bool(doc["brief"].get("voices_from_model")) and speaks_its_lines(entry) and not cut_on_the_song(doc) and not shot.get("audio_slice") and not own_audio(shot)
 
 
 def voicing_template(doc: dict[str, Any], catalog: list[dict[str, Any]], shown: bool) -> str | None:
@@ -254,7 +261,7 @@ def whole_take(doc: dict[str, Any], catalog: list[dict[str, Any]], shot: dict[st
     would lose the end of its action. A speaking shot ends after its line (the model fills what follows with invented words), the song decides the cuts of a music video
     (its bars and lines are often shorter, and a lip-synced shot only loses the silence after its slice), and what the user set stays."""
     entry = resolve(catalog, shot["generation"].get("template"))
-    if entry is None or entry["task"] not in VIDEO_TASKS or shot.get("locked") or shot.get("updated_by") == "user" or cut_on_the_song(doc) or shot.get("audio_slice"):
+    if entry is None or entry["task"] not in VIDEO_TASKS or shot.get("locked") or shot.get("updated_by") == "user" or cut_on_the_song(doc) or shot.get("audio_slice") or own_audio(shot):
         return 0.0
     speaks = entry["audio"] or entry["soundtrack"] and any(line.get("speaker") in (shot.get("cast") or []) for line in shot.get("dialogue") or [])
     if speaks and shot.get("dialogue") and not shot.get("audio_slice") and not model_speaks(doc, shot, entry):
@@ -276,11 +283,11 @@ def soundtrack_choice(model_def: dict[str, Any]) -> str:
 
 def soundtrack_letters(shot: dict[str, Any], entry: dict[str, Any] | None, settings: dict[str, Any]) -> str:
     """The audio choice a shot's settings take from its model, "" to keep theirs: the one that keeps the driving audio as the soundtrack,
-    always on a shot driven by the song (whatever a template or the director chose, its lips must follow the song the cut plays), and on a
-    reference template given audio with no audio choice."""
+    always on a shot driven by the song or by audio of the user's (whatever a template or the director chose, its lips must follow the sound the
+    cut plays: a template's audio references would take it for a voice to imitate), and on a reference template given audio with no audio choice."""
     if entry is None or not entry["soundtrack"] or not settings.get("audio_guide"):
         return ""
-    return entry["soundtrack"] if shot.get("audio_slice") or not entry["audio"] and not settings.get("audio_prompt_type") else ""
+    return entry["soundtrack"] if shot.get("audio_slice") or own_audio(shot) or not entry["audio"] and not settings.get("audio_prompt_type") else ""
 
 
 def shot_entry(doc: dict[str, Any], shot: dict[str, Any], catalog: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -390,6 +397,9 @@ def lint(doc: dict[str, Any], catalog: list[dict[str, Any]], shot_ids: list[str]
             suggestion = lip_synced_with_cast(picks, catalog) if entry["audio"] else picks.get("image_edits") if entry["task"] == "gen_image" else picks.get("cast_shots")
             warnings.append(f"{shot['id']} shows {', '.join(sorted(shown))} but its template {entry_name(entry)} takes no reference images"
                             + (f": use {suggestion} with their pictures as references." if suggestion else "."))
+        elif own_audio(shot) and not (entry["audio"] or entry["soundtrack"]):  # the user's audio would be left out
+            able = lip_synced_with_cast(picks, catalog) if shown else picks.get("cast_shots_lip_synced")
+            warnings.append(f"{shot['id']} follows the user's own audio, but its template {entry_name(entry)} follows no audio" + (f": use {able}." if able else "."))
         elif driven and not settings.get("audio_guide") and not shot.get("audio_slice") and not lines:  # render speaks and joins a shot's lines itself
             warnings.append(f"{shot['id']} is driven by audio but has none: " + ("give its audio_slice and the song as audio_guide." if doc["brief"].get("song")
                             else "write its dialogue (render speaks it) or give an audio_guide."))
@@ -429,6 +439,8 @@ def template_for(doc: dict[str, Any], shot: dict[str, Any], catalog: list[dict[s
     shown = set(cast_with_pictures(doc)) & set(shot.get("cast") or [])
     if doc["brief"]["kind"] == "story":
         return picks.get("image_edits" if shown else "images")
+    if own_audio(shot):  # the user's audio: a template that follows it
+        return (lip_synced_with_cast(picks, catalog) if shown else None) or picks.get("cast_shots_lip_synced")
     if doc["brief"].get("voices_from_model") and shot.get("dialogue") and not shot.get("audio_slice") and not cut_on_the_song(doc) and (template := voicing_template(doc, catalog, bool(shown))):
         return template
     if shot.get("audio_slice") or shot.get("dialogue") and not model.on_the_song(doc):

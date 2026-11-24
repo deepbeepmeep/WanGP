@@ -6,6 +6,5 @@
     "num_inference_steps": 2,
     "guidance_phases": 1,
     "custom_sigmas": "",
-    "guidance_scale": 1,
-    "sample_solver": "euler"
+    "guidance_scale": 1
 }

@@ -358,6 +358,8 @@ class ShowrunnerToolbox:
         lines = model.spoken_lines(doc, shot) if spoken else shot.get("dialogue") or []
         if entry is None or model.on_the_song(doc) or templates.model_speaks(doc, shot, entry):  # on a cut that plays the song, lines are lyrics: the song drives the lips, they only give the subtitles
             return []
+        if doc["brief"].get("voices_from_model") and templates.speaks_its_lines(entry):  # the video model says lines, nobody records them: only the user's own recordings drive the shot
+            lines = [line for line in lines if line.get("own") and line.get("audio")]
         shown = [line for line in lines if line.get("speaker") in shot.get("cast", [])]
         return shown if entry["soundtrack"] and not entry["audio"] else shown or lines if entry["audio"] else []
 
@@ -758,6 +760,10 @@ class ShowrunnerToolbox:
             settings["audio_guide"] = ctx.virtualize(str(media.audio_slice(song, float(start_s), float(end_s), target.folder / "media" / "slices")))
         elif settings.get("audio_guide") and shot.get("duration_s"):  # a line shorter than its shot: silence after it, or the model invents more speech
             guide = ctx.resolve(settings["audio_guide"])
+            if (part := shot.get("audio_part")) and (shot["generation"].get("settings") or {}).get("audio_guide"):  # a part of a split shot: its seconds of the shot's audio
+                end_s = float(part[1]) if part[1] is not None else media.probe(guide)["duration_s"]
+                guide = media.audio_slice(guide, float(part[0]), end_s, target.folder / "media" / "slices")
+                settings["audio_guide"] = ctx.virtualize(str(guide))
             spoken = media.probe(guide)["duration_s"] or 0.0
             start, end = (list(shot.get("trim") or [0.0, None]) + [None, None])[:2]
             if end is not None and end < spoken + 0.1:  # a trim from an older, shorter line (a new voice, a rewritten line) would cut the end of this one

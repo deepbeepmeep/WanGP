@@ -30,7 +30,7 @@ except Exception:  # pragma: no cover
     WeightQBytesTensor = None
 
 from . import chat_formats
-from .assets import INKLING2_MINI_DRAFTER_FILENAME
+from .assets import INKLING2_MINI_DRAFTER_FILENAME, QWEN_CHECKPOINTS, qwen_draft_key, qwen_extra_files
 from .qwen3_5 import register_qwen35_config
 from .qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 from .qwen35_vl import (
@@ -150,11 +150,29 @@ def _qwen35_kv_bytes(config, kv_cache_layout: str, tokens: int) -> int:
     return layout.body_bytes_per_token(layers, kv_heads, head_dim) * tokens + layout.overlay_bytes(layers, kv_heads, head_dim, 256, 1)
 
 
+def _qwen35_checkpoint_quantization(spec, model_path):
+    # the quantization whose checkpoint the file is, None for a file of another name
+    name = os.path.basename(str(model_path or "")).lower()
+    return next((quantization for quantization, (key, _) in QWEN_CHECKPOINTS.items() if str(spec.get(key, "")).lower() == name), None)
+
+
 def _qwen35_mtp_filename(spec, backend, model_path, prism_metadata):
-    # the MTP drafter's own checkpoint, None when the text checkpoint holds it
-    q3_filename = spec.get("text_gguf_q3_filename")
-    uses_separate_q3_mtp = backend == enhancer_quantization_GGUF and q3_filename and os.path.basename(str(model_path or "")).lower() == q3_filename.lower()
-    return spec["text_gguf_ptq1_mtp_filename"] if prism_metadata else spec.get("text_gguf_q3_mtp_filename" if uses_separate_q3_mtp else "text_mtp_filename")
+    # the MTP drafter's own checkpoint, None when the text checkpoint holds it: Bonsai 2.5 has its own head, other Bonsai files take Bonsai 2's
+    quantization = _qwen35_checkpoint_quantization(spec, model_path) if backend == enhancer_quantization_GGUF else None
+    if prism_metadata:
+        return spec[qwen_draft_key(quantization if quantization == "gguf_ptq1_25" else "gguf_ptq1")]
+    return spec.get("text_gguf_q3_mtp_filename" if quantization == "gguf_q3" else "text_mtp_filename")
+
+
+def _install_refusal_projection(model, path, use_triton):
+    # the uncensoring direction of a checkpoint, removed at the output of every block's attention and FFN (DirectionProjection)
+    from safetensors import safe_open
+    from shared.llm_engines.lmgp.models.qwen3_5 import DirectionProjection
+    with safe_open(path, framework="pt", device="cpu") as reader:
+        direction, scale = reader.get_tensor("direction"), float(reader.metadata()["scale"])
+    for block in model.blk:
+        block.refusal_projection = DirectionProjection(direction.clone(), scale, use_triton)
+    print(f"[Qwen3.5VL] Uncensored: refusal direction projected out of {2 * len(model.blk)} residual writers (scale {scale:g}).")
 
 
 def qwen35_mtp_fit(assets_dir: str | None, variant: str | None, backend: str, model_path: str | None, kv_cache_layout: str):
@@ -1135,6 +1153,7 @@ def _load_qwen4_exp_model(model_path: str, config_path: str, assets_dir: str, sp
 def _load_inkling2_model(model_path: str, config_path: str, features: dict, mtp_modules: list | None = None):
     """Inkling 2 from its safetensors checkpoint, its stored dtypes kept: BF16 dense weights, float32 queries and biases, packed experts.
     mtp_modules: its DSpark drafter's file, read with it (speculative decoding). The vision tower has its own file and loader."""
+    from shared.deepy.config import DEEPY_LOOP_CONTRAST_KEY, get_deepy_runtime_config
     from shared.llm_engines.lmgp.models import inkling2, inkling2_draft
     with open(config_path, "r", encoding="utf-8") as reader:
         config = inkling2.Inkling2EngineConfig(json.load(reader))
@@ -1151,6 +1170,8 @@ def _load_inkling2_model(model_path: str, config_path: str, features: dict, mtp_
     if mtp_modules:  # a block drafter of the engine: its 7 drafts come from one pass, with no confidence of their own
         model._block_draft, model._block_draft_max_tokens = True, model.mtp.block_size - 1
         model._lm_engine_measured_drafts = True  # an automatic count: the drafts of each window follow the measured passes and acceptance (0 where none pays)
+    if get_deepy_runtime_config().get(DEEPY_LOOP_CONTRAST_KEY, False):
+        model.loop_contrast = inkling2.LOOP_CONTRAST
     if inkling2.ROUTED:
         inkling2.set_expert_priorities(model)  # the experts kept in VRAM first
         model._mm_expert_margin = QWEN4_EXP_EXPERT_MARGIN_MB << 20
@@ -1531,6 +1552,9 @@ def load_qwen35_text_prompt_enhancer(
         if features["triton"]:
             from shared.qtypes.prism import install_prism_decode
             install_prism_decode(model)
+        refusal_files = [name for name in qwen_extra_files(spec, _qwen35_checkpoint_quantization(spec, model_path) or "gguf") if name.endswith("-direction.safetensors")]
+        if refusal_files:
+            _install_refusal_projection(model, _resolve_qwen35_checkpoint_file(assets_dir, refusal_files[0], variant=variant), features["triton"])
     # The sm80+ decode fusions were validated on the 27B GGUF; Turing's recurrence takes head counts, layouts and A / log A from the blocks
     # (27B, 9B, 4B; GGUF and Quanto INT8)
     if features["triton"] and (backend == enhancer_quantization_GGUF and variant in ("27b", "flash_next") or torch.cuda.get_device_capability(0) < (8, 0)):

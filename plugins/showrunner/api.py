@@ -275,7 +275,7 @@ def create_app(showrunner, *, title: str = "Showrunner") -> FastAPI:
     @app.post("/api/productions/{production_id}/upload")
     async def upload(production_id: str, file: UploadFile = File(...), role: str = Form("bin"), target: str | None = Form(None)):
         production(production_id)
-        if role not in ("bin", "song", "source", "reference", "cast", "take", "shot", "painted", "track", "subtitles", "start", "end", "line"):
+        if role not in ("bin", "song", "source", "reference", "cast", "take", "shot", "painted", "track", "subtitles", "start", "end", "line", "audio"):
             raise HTTPException(400, "Unknown upload role.")
         with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename or "").suffix) as handle:
             shutil.copyfileobj(file.file, handle)

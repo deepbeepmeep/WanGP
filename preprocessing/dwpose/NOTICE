@@ -1,0 +1,17 @@
+Native DWPose inference for WanGP
+
+The detector and whole-body keypoint networks run in PyTorch; ONNX Runtime is not used.
+
+YOLOX-L person detector (yolox.py): Megvii YOLOX, Apache-2.0.
+https://github.com/Megvii-BaseDetection/YOLOX
+
+RTMPose-L whole-body estimator (rtmpose.py): OpenMMLab mmpose and mmdet (CSPNeXt backbone, RTMCC head), Apache-2.0.
+https://github.com/open-mmlab/mmpose
+https://github.com/open-mmlab/mmdetection
+
+DWPose (dw-ll_ucoco_384 weights, pre/post-processing in detection.py, estimation.py, wholebody.py, util.py), Apache-2.0.
+https://github.com/IDEA-Research/DWPose
+
+WanGP changes: batch norms folded into the convolutions, as in the released ONNX exports; inference-only modules; weights
+converted from the released ONNX graphs into FP16 safetensors (checked against ONNX Runtime FP32 on COCO val2017 photos);
+crops of one frame estimated in one batch. LICENSE (Apache-2.0) accompanies the code.

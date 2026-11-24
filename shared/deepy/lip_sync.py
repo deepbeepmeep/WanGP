@@ -21,25 +21,20 @@ def decode_voice(path) -> np.ndarray:
     return np.frombuffer(raw, dtype=np.float32).copy()
 
 
-def load_models() -> tuple:
-    """The pose model's detector and landmarks, downloaded the first time, on the GPU where there is one (about 1.2 GB, released with the tuple)."""
-    import onnxruntime as ort
-    from preprocessing.dwpose.assets import query_download_def
-    from shared.utils import files_locator as fl
-    from shared.utils.download import process_files_def_if_needed
+def measure(video, start_s: float, frames: int, fps: float, voice: np.ndarray, voice_at: float) -> dict[str, Any] | None:
+    """r_at_0: the correlation of what the mouth and the voice do faster than a second; best_r, lag_s: where it is best, positive when the mouth comes after the voice. None without a face or below SHORTEST_FRAMES.
+    The pose models (downloaded the first time) stay on the GPU while it runs."""
+    from preprocessing.dwpose.native import pose_models
 
-    process_files_def_if_needed(query_download_def())
-    providers = [provider for provider in ("CUDAExecutionProvider", "CPUExecutionProvider") if provider in ort.get_available_providers()]
-    return tuple(ort.InferenceSession(fl.locate_file(f"pose/{name}"), providers=providers) for name in ("yolox_l.onnx", "dw-ll_ucoco_384.onnx"))
+    with pose_models() as models:
+        return _measure(video, start_s, frames, fps, voice, voice_at, models)
 
 
-def measure(video, start_s: float, frames: int, fps: float, voice: np.ndarray, voice_at: float, models) -> dict[str, Any] | None:
-    """r_at_0: the correlation of what the mouth and the voice do faster than a second; best_r, lag_s: where it is best, positive when the mouth comes after the voice. None without a face or below SHORTEST_FRAMES."""
+def _measure(video, start_s, frames, fps, voice, voice_at, models):
     import cv2
-    from preprocessing.dwpose.onnxdet import inference_detector
-    from preprocessing.dwpose.onnxpose import inference_pose
+    from preprocessing.dwpose.detection import inference_detector
+    from preprocessing.dwpose.estimation import inference_pose
 
-    detector, pose = models
     capture = cv2.VideoCapture(str(video))
     capture.set(cv2.CAP_PROP_POS_MSEC, start_s * 1000)
     opening, heights = [], []
@@ -48,10 +43,10 @@ def measure(video, start_s: float, frames: int, fps: float, voice: np.ndarray, v
         if not success:
             break
         best = None
-        boxes = inference_detector(detector, frame)
+        boxes = inference_detector(models, frame)
         if len(boxes):
             boxes = np.array(sorted(boxes, key=lambda box: -(box[2] - box[0]) * (box[3] - box[1]))[:2])
-            points, scores = inference_pose(pose, boxes, frame)
+            points, scores = inference_pose(models, boxes, frame)
             for person, score in zip(points, scores):
                 face, sure = person[23:91], score[23:91]
                 height = float(np.linalg.norm(face[27] - face[8]))
@@ -99,7 +94,7 @@ def check(video, start_s: float = 0.0, duration_s: float | None = None, voice=No
     if length > LONGEST_S:
         raise ValueError(f"This covers {length:.0f} s: check one shot at a time, with start_s and duration_s (at most {LONGEST_S:.0f} s).")
     frames = round(length * fps)
-    measured = measure(video, start_s, frames, fps, decode_voice(voice or video), start_s if voice_start_s is None else voice_start_s, load_models())
+    measured = measure(video, start_s, frames, fps, decode_voice(voice or video), start_s if voice_start_s is None else voice_start_s)
     result = {"verdict": verdict(measured), "frames": frames}
     if measured:
         result.update(face_height_px=round(measured["face_px"]), face_seen=round(measured["seen"], 2), voice_present=round(measured["voiced"], 2), correlation_at_0=round(measured["r_at_0"], 3),

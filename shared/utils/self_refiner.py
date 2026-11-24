@@ -1,6 +1,5 @@
 import torch
 import copy
-from diffusers.utils.torch_utils import randn_tensor
 
 def is_int_string(s: str) -> bool:
     try:
@@ -218,6 +217,7 @@ class PnPHandler:
         return latents_next
 
     def perturb_latents(self, latents, buffer_latent, sigma, generator=None, device=None, noise_mask=None):
+        from diffusers.utils.torch_utils import randn_tensor  # here: importing diffusers with this module would load it at WanGP's startup
         noise = randn_tensor(latents.shape, generator=generator, device=device, dtype=latents.dtype)
 
         if noise_mask is None:

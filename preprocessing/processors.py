@@ -42,11 +42,7 @@ def get_preprocessor(process_type, inpaint_color, pre_video_guide=None, server_c
     process_files_def_if_needed(query_preprocessor_download_def(process_type, server_config))
     if process_type in ["pose", "pose_align"]:
         from preprocessing.dwpose.pose import PoseBodyFaceVideoAnnotator
-        cfg_dict = {
-            "DETECTION_MODEL": fl.locate_file("pose/yolox_l.onnx"),
-            "POSE_MODEL": fl.locate_file("pose/dw-ll_ucoco_384.onnx"),
-            "RESIZE_SIZE": 1024
-        }
+        cfg_dict = {"RESIZE_SIZE": 1024}
         if process_type == "pose_align" and torch.is_tensor(pre_video_guide) and pre_video_guide.ndim == 4 and pre_video_guide.shape[1] > 0:
             cfg_dict["REF_IMAGE"] = pre_video_guide[:, -1]
         anno_ins = lambda img: PoseBodyFaceVideoAnnotator(cfg_dict).forward(img)

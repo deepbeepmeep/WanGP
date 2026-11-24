@@ -24,6 +24,29 @@ def enabled(server_config, mode):
     return MULTI_IMAGE_PROMPT_ENHANCEMENT and "I" in mode and (enhancer in (3, 4, 5, 6, 7, 8) or enhancer > 0 and is_remote_engine(resolve_role_engine(server_config, "prompt_enhancer")))
 
 
+VISION_MAX_PIXELS = 1024 * 1024  # the reading resolution of a model's vision stage, as Deepy's vision reads images
+VISION_HIGHRES_MAX_PIXELS = 2048 * 2048  # highres: small text stays readable (e.g. the lettering of a 4K poster)
+
+
+def vision_settings(model_def, mode):
+    """A model's own vision stage for an enhancer mode with images, None if it has none: model def image_prompt_enhancer_vision_instructions{N}
+    (N: the mode's profile digit, none for profile 0) replaces the image captions of the local vision-language enhancers. It reads the
+    images with these instructions as system prompt ({{request}} in them: the user's request, otherwise the vision stage does not see it),
+    and its answer takes the caption's place for the rewrite
+    (image_prompt_enhancer_instructions{N}). Optional: image_prompt_enhancer_vision_max_tokens{N} (default 1024), and
+    image_prompt_enhancer_vision_highres{N}, which reads the images at up to VISION_HIGHRES_MAX_PIXELS. Remote engines see the images
+    themselves: they use the rewrite instructions only."""
+    if "I" not in mode:
+        return None
+    digit = next((letter for letter in mode if letter.isdigit()), "0")
+    suffix = "" if digit == "0" else digit
+    instructions = model_def.get(f"image_prompt_enhancer_vision_instructions{suffix}")
+    if instructions is None:
+        return None
+    highres = model_def.get(f"image_prompt_enhancer_vision_highres{suffix}", False)
+    return {"instructions": instructions, "max_tokens": model_def.get(f"image_prompt_enhancer_vision_max_tokens{suffix}", 1024), "max_pixels": VISION_HIGHRES_MAX_PIXELS if highres else VISION_MAX_PIXELS}
+
+
 def image_list(images):
     return [] if images is None else images if isinstance(images, list) else [images]
 

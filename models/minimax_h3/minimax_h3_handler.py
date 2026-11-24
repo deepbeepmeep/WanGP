@@ -22,7 +22,7 @@ from .constants import (H3_AUDIO_REFINEMENT_SETTING, H3_CONTROL_LATENT_CONTINUAT
                         H3_MASK_MODE_SHARED_TIMESTEP, H3_MASK_MODE_SETTING, H3_PHASE_2_NOISE_LEVEL_START_DEFAULT, H3_REGENERATE_LORA,
                         H3_VEDA_FULL_LAYERS_CHOICES, H3_VEDA_FULL_LAYERS_SETTING, h3_grouped_masking_enabled, h3_veda_full_layers)
 from .dialogue import H3_DIALOGUE_GENERATION, H3_DIALOGUE_MAX_TOTAL_SECONDS, H3_DIALOGUE_PROMPT_INFOS, load_dialogue_whisper
-from .minimax_h3_main import (AUDIO_VAE_FILE, LATENT_UPSCALER_FILE, LATENT_UPSCALER_FOLDER, TEXT_ENCODER_FOLDER,
+from .constants import (AUDIO_VAE_FILE, LATENT_UPSCALER_FILE, LATENT_UPSCALER_FOLDER, TEXT_ENCODER_FOLDER,
                               VIDEO_VAE_FILE, VIDEO_VAE_FP8MIX_FILE, VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_FILE, VIDEO_VAE_LIGHT_INT8_FILE,
                               VIDEO_VAE_SOL_INT8_FILE)
 from .p_h3_image import (P_H3_IMAGE_ARCHITECTURE, P_H3_IMAGE_FOLDER, P_H3_IMAGE_MAX_IMAGES, P_H3_IMAGE_REPO_ID, P_H3_IMAGE_STEPS, P_H3_IMAGE_SWITCH_THRESHOLD,
@@ -33,7 +33,7 @@ from .h3_image import (H3_IMAGE_ARCHITECTURE, H3_IMAGE_ARCHITECTURES, H3_IMAGE_F
 from .hyperflow import HYPERFLOW_DEFAULT_STEPS, HYPERFLOW_STEPS, HYPERFLOW_VIDEO_SHIFT
 from .pdd import PDD_BLOCK_SIZE, PDD_NUM_STEPS
 from .pika import PIKA_SOLVER, PIKA_STEPS, PIKA_VIDEO_SHIFT
-from .dmad import DMAD_SOLVER
+from .dmad import DMAD_SOLVER, LCM_SOLVER
 from .ptd import PTD_FOLDER, PTD_HEAD_FILE, PTD_INFOS, PTD_DEEPY_INFOS
 from .vae_upsampler import X2_VAE_DESCRIPTION, X2_VAE_FILE, X2_VAE_INT8_FILE, X2_VAE_METHOD, X2_VAE_VALUE, query_x2_vae_files
 from .viggle import (VIGGLE_ARCHITECTURE, VIGGLE_ASSET_FOLDER, VIGGLE_INFOS, VIGGLE_PROMPT_FILE, VIGGLE_REMAKE_ARCHITECTURE, VIGGLE_REMAKE_DEEPY_INFOS, VIGGLE_REMAKE_DEEPY_PROMPT_INFOS,
@@ -329,10 +329,12 @@ A kept soundtrack stays in the saved output, but visible speech also depends on 
 
 The branch is guidance-distilled: keep **Guidance** at 1. Upstream demonstrations use 40 steps; 20 steps already give usable results. Keep each window within 15 seconds (362 frames), the duration the control branch was trained on. Two-phase generation and text-to-image are not available with this model.
 
+The FL2VA LoRA Accelerator profiles apply, including **Pika H3 Flex FL2VA 6 Steps** and **DMAD 8 Steps** / **DMAD 4 Steps** with their re-noise samplers. With a control video, DMAD stays closest to the control's motion but can smear fast movement, such as flying hair or fabric edges. Pika gives a clean picture but follows the control more loosely, for example raising arms that the source keeps down.
+
 See the [ControlNet-Union 2.0 model card](https://huggingface.co/alibaba-pai/MiniMax-H3-Fun-Controlnet-Union-2.0) for upstream details.
 """
 
-CONTROL_DEEPY_INFOS = f"""Generate video and stereo sound from `prompt` guided by a control video (`video_guide`) through the ControlNet-Union branch; the output uses the control video's aspect ratio. `video_prompt_type`: `PV` = Open Pose motion, `DV` = depth, `EV` = Canny edges, `SV` = soft shapes/scribble, `CV` = grayscale recolorize, `V` = video already a control map (HED, MLSD, layout...), `MV` = inpainting only. Add `A` (masked area) or `NA` (non-masked area) with `video_mask` to regenerate only part of the frame; masks need a preprocessing mode or `V` with spatial outpainting enabled. `control_net_weight` (0-2, default 1) sets control strength. Long control videos are split across sliding windows (max 362 frames each). {CONTROL_CONTINUATION_INFOS} `image_start` / `image_end` / `video_source` anchor frames and should match the control video. `audio_prompt_type`: empty = generate audio; `AS` = keep `audio_guide` as soundtrack; `KS` = keep the control video's soundtrack; `A` or `K` alone mean the same. For visible speech in soundtrack mode, identify the speaker and explicitly request `speaking with natural lip movements synchronized` or equivalent lip-sync wording, without mentioning a supplied audio track or its language. Do not write the spoken words (no `<d>` dialogue); face pose and gestures compete with speech, and exact lip sync is not guaranteed. Guidance stays 1. Read `prompt_infos` for H3's structured prompt syntax."""
+CONTROL_DEEPY_INFOS = f"""Generate video and stereo sound from `prompt` guided by a control video (`video_guide`) through the ControlNet-Union branch; the output uses the control video's aspect ratio. `video_prompt_type`: `PV` = Open Pose motion, `DV` = depth, `EV` = Canny edges, `SV` = soft shapes/scribble, `CV` = grayscale recolorize, `V` = video already a control map (HED, MLSD, layout...), `MV` = inpainting only. Add `A` (masked area) or `NA` (non-masked area) with `video_mask` to regenerate only part of the frame; masks need a preprocessing mode or `V` with spatial outpainting enabled. `control_net_weight` (0-2, default 1) sets control strength. Long control videos are split across sliding windows (max 362 frames each). {CONTROL_CONTINUATION_INFOS} `image_start` / `image_end` / `video_source` anchor frames and should match the control video. `audio_prompt_type`: empty = generate audio; `AS` = keep `audio_guide` as soundtrack; `KS` = keep the control video's soundtrack; `A` or `K` alone mean the same. For visible speech in soundtrack mode, identify the speaker and explicitly request `speaking with natural lip movements synchronized` or equivalent lip-sync wording, without mentioning a supplied audio track or its language. Do not write the spoken words (no `<d>` dialogue); face pose and gestures compete with speech, and exact lip sync is not guaranteed. Guidance stays 1. FL2VA accelerator profiles apply: Lightx2v (euler), `pika_renoise` 6 steps and `dmad_renoise` 8 / 4 steps with their LoRAs; with a control video dmad follows the control's motion most closely but smears fast movement, pika is clean but follows the control loosely. Read `prompt_infos` for H3's structured prompt syntax."""
 
 CONTROL_DEEPY_INFOS += """\n\nSpatial outpainting: use `video_prompt_type: V` (Use Control Video as is), the original RGB `video_guide`, and `video_guide_outpainting` as four space-separated percentages (top bottom left right), e.g. `0 0 25 25`. No `video_mask` is needed for borders alone. Alternatively, set `video_guide_outpainting_ratio`, e.g. `16:9`, with `video_guide_outpainting: 0 0 0 0` for balanced expansion; `#` disables expansion. `resolution` is the final canvas. Enabling expansion routes the visible source and automatic border mask through ControlNet inpainting, not FL2VA denoising; no Grouped Rows requirement. With expansion disabled, `V` retains its normal prepared-control-map behavior. For simultaneous interior edits, use `VA` or `MVA` plus `video_mask`; masked pose/depth/edge/shape/grayscale modes also support expansion. Describe the completed scene and new surroundings; the original rectangle is guided, not copied pixel for pixel."""
 
@@ -828,7 +830,6 @@ class family_handler:
             pruned = base_model_type == CONTROL_PRUNED_ARCHITECTURE
             result = family_handler.query_model_def(FL2VA_PRUNED_ARCHITECTURE if pruned else FL2VA_ARCHITECTURE, model_def)
             result.pop("resolution_budget_tiled", None)
-            result["sample_solvers"] = [choice for choice in result["sample_solvers"] if choice[1] not in (PIKA_SOLVER, DMAD_SOLVER)]
             for key in ("guide_custom_choices", "custom_frames_injection", "one_image_ref_only", "switch_threshold"):
                 result.pop(key)
             result.update({
@@ -837,8 +838,8 @@ class family_handler:
                                   "description": "Drive motion and structure with a pose, depth, edge, shape or grayscale control video."},
                                  {"name": "video inpainting", "description": "Regenerate a masked area of a video."},
                                  {"name": "video outpainting", "description": "Extend the video canvas using ControlNet's visible-source and border-mask conditioning."}],
-                "infos": CONTROL_INFOS + H3_SPEED_INFOS + H3_STANDARD_SAMPLER_INFOS + H3_COMMON_RUNTIME_INFOS + (PRUNED_INFOS if pruned else ""),
-                "deepy_infos": CONTROL_DEEPY_INFOS,
+                "infos": CONTROL_INFOS + H3_SPEED_INFOS + H3_STANDARD_SAMPLER_INFOS + PIKA_INFOS + DMAD_INFOS + H3_COMMON_RUNTIME_INFOS + (PRUNED_INFOS if pruned else ""),
+                "deepy_infos": CONTROL_DEEPY_INFOS + PIKA_DEEPY_INFOS + DMAD_DEEPY_INFOS,
                 "prompt_infos": FL2VA_PROMPT_INFOS, "deepy_prompt_infos": FL2VA_DEEPY_PROMPT_INFOS,
                 "v2i_switch_supported": False, "image_outputs": False,
                 "guidance_max_phases": 1, "lock_guidance_phases": True, "lora_multiplier_phases": 1, "phase_2_spatial_tiling": False, "inference_steps2": False,
@@ -1047,7 +1048,7 @@ class family_handler:
                 "video_continuation": True,
                 "deepy_infos": REF2VA_DEEPY_INFOS,
                 "deepy_prompt_infos": REF2VA_DEEPY_PROMPT_INFOS,
-                "sliding_window_defaults": {"window_min": 124, "window_max": 481, "window_step": 17, "window_default": 362,
+                "sliding_window_defaults": {"window_min": 124, "window_max": 736, "window_step": 17, "window_default": 362,
                                             "overlap_min": 1, "overlap_max": 120, "overlap_step": 17, "overlap_offset": 1, "overlap_default": 18,
                                             "discard_step": 1},
                 "frames_selection_maximum": 737,
@@ -1126,7 +1127,7 @@ class family_handler:
                 "video_continuation": True,
                 "deepy_infos": FL2VA_DEEPY_INFOS,
                 "deepy_prompt_infos": FL2VA_DEEPY_PROMPT_INFOS,
-                "sliding_window_defaults": {"window_min": 124, "window_max": 481, "window_step": 17, "window_default": 362,
+                "sliding_window_defaults": {"window_min": 124, "window_max": 736, "window_step": 17, "window_default": 362,
                                             "overlap_min": 1, "overlap_max": 120, "overlap_step": 17, "overlap_offset": 1, "overlap_default": 18,
                                             "discard_step": 1},
                 "image_prompt_types_allowed": "TSEVL",
@@ -1222,7 +1223,32 @@ class family_handler:
                 "spectrum_cache": False, "first_block_cache": False, "flow_shift": False,
                 "custom_settings": [setting for setting in result["custom_settings"] if setting["id"] != H3_AUDIO_REFINEMENT_SETTING],
             })
+        if model_def.get("world_outputs", False):  # a pi-H3 world (models/minimax_h3/world.py): segments continued from their own latents
+            if not dwd or reference_mode:
+                raise ValueError("pi-H3 worlds are declared on a pi-H3 DWD FL2VA model")
+            from .world_texts import H3_WORLD_DEEPY_INFOS, H3_WORLD_DEEPY_PROMPT_INFOS, H3_WORLD_INFOS, H3_WORLD_PROMPT_INFOS
+            for key in ("sliding_window_defaults", "guide_custom_choices", "audio_prompt_type_sources", "mask_preprocessing", "video_guide_outpainting",
+                        "video_guide_outpainting_label", "custom_frames_injection", "audio_prompt_choices", "any_audio_prompt", "prompt_enhancer_def",
+                        "prompt_enhancer_button_label", "spoken_line_prompt", "end_frames_always_enabled", "output_audio_is_input_audio", "audio_guide_label",
+                        "audio_guide_window_slicing", "video_length_not_limited_by_audio", "video_guide_label", "one_image_ref_only"):
+                result.pop(key, None)
+            result.update({
+                "world_outputs": True, "recycle_latents": "frames", "sliding_window": False, "video_continuation": False, "v2i_switch_supported": False,
+                # no CUDA graphs: each move's prompt has its own length, a new graph capture (+1.6 s) for every new key combination or event,
+                # against 0.1 s saved per pass once captured (5090, 832x480)
+                "cuda_graphs": [],
+                "image_prompt_types_allowed": "TS",  # a new world starts from text or a start image; a continued world from its own latents
+                "custom_guide": {"id": "custom_guide", "name": "World", "label": "Continue a World (.wgpworld of the Worlds gallery)", "type": "file", "default": None,
+                                 "required": False, "file_types": [".wgpworld"]},
+                "custom_settings": [],
+                "infos": H3_WORLD_INFOS, "prompt_infos": H3_WORLD_PROMPT_INFOS, "deepy_infos": H3_WORLD_DEEPY_INFOS, "deepy_prompt_infos": H3_WORLD_DEEPY_PROMPT_INFOS,
+            })
         return result
+
+    @staticmethod
+    def query_world_explorer(base_model_type, manifest, memory):
+        from .world import explorer_menus
+        return explorer_menus(manifest)
 
     @staticmethod
     def validate_generative_settings(base_model_type, model_def, inputs):
@@ -1238,8 +1264,8 @@ class family_handler:
         if base_model_type == P_H3_IMAGE_ARCHITECTURE:
             if len(inputs["image_refs"] or []) > P_H3_IMAGE_MAX_IMAGES:
                 return f"P-H3-Image edits with at most {P_H3_IMAGE_MAX_IMAGES} images"
-            if inputs["sample_solver"] != "euler":
-                return "P-H3-Image requires the Euler sampler"
+            if inputs["sample_solver"] not in ("euler", LCM_SOLVER):
+                return "P-H3-Image samples with Euler or LCM"
             return None
         if base_model_type == VIGGLE_REMAKE_ARCHITECTURE:
             if inputs["video_guide"] is None:
@@ -1271,15 +1297,15 @@ class family_handler:
             return None
         pika = inputs["sample_solver"] == PIKA_SOLVER
         if pika:
-            if base_model_type not in (FL2VA_ARCHITECTURE, FL2VA_PRUNED_ARCHITECTURE, REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE) or any(model_def.get(flag, False) for flag in ("pdd", "ptd", "vdn", "veda", "fasth3", "hyperflow")):
-                return "Pika H3 Flex requires a standard FL2VA or Ref2VA model"
+            if base_model_type not in (FL2VA_ARCHITECTURE, FL2VA_PRUNED_ARCHITECTURE, REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE, *CONTROL_ARCHITECTURES) or any(model_def.get(flag, False) for flag in ("pdd", "ptd", "vdn", "veda", "fasth3", "hyperflow")):
+                return "Pika H3 Flex requires a standard FL2VA, Ref2VA or ControlNet-Union model"
             if inputs["num_inference_steps"] != PIKA_STEPS or inputs["flow_shift"] != PIKA_VIDEO_SHIFT or inputs["guidance_phases"] != 1:
                 return "Pika H3 Flex requires 6 steps, flow shift 12 and one generation phase; apply its matching accelerator profile"
             if inputs["custom_sigmas"] or inputs["skip_steps_cache_type"]:
                 return "Pika H3 Flex requires empty Custom Sigmas and No Skipping"
         if inputs["sample_solver"] == DMAD_SOLVER:
-            if base_model_type not in (FL2VA_ARCHITECTURE, FL2VA_PRUNED_ARCHITECTURE, REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE) or any(model_def.get(flag, False) for flag in ("pdd", "ptd", "vdn", "veda", "fasth3", "hyperflow")):
-                return "The DMAD re-noise sampler requires a standard FL2VA or Ref2VA model"
+            if base_model_type not in (FL2VA_ARCHITECTURE, FL2VA_PRUNED_ARCHITECTURE, REF2VA_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE, *CONTROL_ARCHITECTURES) or any(model_def.get(flag, False) for flag in ("pdd", "ptd", "vdn", "veda", "fasth3", "hyperflow")):
+                return "The DMAD re-noise sampler requires a standard FL2VA, Ref2VA or ControlNet-Union model"
             if inputs["skip_steps_cache_type"]:
                 return "The DMAD re-noise sampler requires No Skipping"
         if model_def.get("ptd", False):
@@ -1344,6 +1370,16 @@ class family_handler:
             if inputs["sample_solver"] != "euler":
                 return "pi-H3 DWD requires the Euler sampler"
             inputs.update({"num_inference_steps": model_def["dwd"], "flow_shift": 12.0, "guidance_scale": 1.0, "guidance_phases": 1, "custom_sigmas": "", "skip_steps_cache_type": ""})
+        if model_def.get("world_outputs", False):
+            from shared.utils.world_instructions import split_instructions
+            from .world import WORLD_CONTROLS
+            try:
+                description = split_instructions(inputs["prompt"], WORLD_CONTROLS)[0]
+            except ValueError as error:
+                return str(error)
+            if inputs["custom_guide"] is None and not description:
+                return "A new pi-H3 world needs a description of the scene before its moves"
+            return None
         if model_def.get("hyperflow", False):
             if inputs["num_inference_steps"] not in HYPERFLOW_STEPS:
                 return f"HyperFlow H3 Flash runs {', '.join(map(str, HYPERFLOW_STEPS[:-1]))} or {HYPERFLOW_STEPS[-1]} inference steps"
@@ -1639,6 +1675,10 @@ class family_handler:
                                  fixed_prompt_filename=os.path.join(VIGGLE_ASSET_FOLDER, VIGGLE_PROMPT_FILE) if viggle else None,
                                  image_model=image_model, distilled_text_encoder=distilled_text_encoder, remake_mode=remake_mode)
         pipeline.ptd = model_def.get("ptd", False)
+        pipeline.recycle_latents = model_def.get("recycle_latents", False)
+        if model_def.get("world_outputs", False):
+            from .world import H3World
+            pipeline.world = H3World(pipeline, model_type)
         pipe = {"transformer": pipeline.transformer}
         if image_model:
             pipe.update({"vae": pipeline.video_decoder, "video_encoder": pipeline.video_encoder, "text_encoder": pipeline.text_encoder.language_model,
@@ -1672,7 +1712,15 @@ class family_handler:
             pipe = BorrowingPipe(pipe)
             pipe.update({name: shared_h3_offloadobj.models[name] for name in borrowed_names})
             pipe._mmgp_ignore_models = borrowed_names
-        return pipeline, {"pipe": pipe, "pinnedMemory": False} if disable_pinning else pipe
+        offload_kwargs = {"pipe": pipe, **({"pinnedMemory": False} if disable_pinning else {})}
+        if shared_h3_pipeline is None and (sys.modules["wgp"].server_config.get("keep_models_loaded", False) or model_def.get("world_outputs", False)):
+            # Keep Models in VRAM: the audio VAE decodes beside the transformer, whose preloaded blocks stay for the next sample (models
+            # without a video decoding, such as pi-H3 DWD, then keep only the transformer between samples); a world's segments alternate
+            # them within one generation
+            offload_kwargs["coTenantsMap"] = {"audio_vae": ["transformer"], "transformer": ["audio_vae"]}
+            if model_def.get("recycle_latents") == "frames":  # each continuation encodes its overlap beside the transformer
+                offload_kwargs["coTenantsMap"] = {"audio_vae": ["transformer", "video_encoder"], "video_encoder": ["transformer", "audio_vae"], "transformer": ["audio_vae", "video_encoder"]}
+        return pipeline, offload_kwargs
 
     @staticmethod
     def fix_settings(base_model_type, settings_version, model_def, ui_defaults):
@@ -1802,5 +1850,8 @@ class family_handler:
             ui_defaults.update({"num_inference_steps": HYPERFLOW_DEFAULT_STEPS, "flow_shift": HYPERFLOW_VIDEO_SHIFT, "guidance_phases": 1, "sample_solver": "euler"})
         if model_def.get("dwd", 0):
             ui_defaults.update({"num_inference_steps": model_def["dwd"], "guidance_phases": 1, "sample_solver": "euler"})
+        if model_def.get("world_outputs", False):
+            ui_defaults.update({"video_length": 107, "resolution": "832x480", "image_prompt_type": "T", "video_prompt_type": "", "audio_prompt_type": "", "prompt_enhancer": "",
+                                "multi_prompts_gen_type": "FG"})  # the whole prompt is one world description, whatever its lines
         if base_model_type in CONTROL_ARCHITECTURES:
             ui_defaults.update({"video_prompt_type": "PV", "control_net_weight": 1.0, "sliding_window_overlap": 22 if H3_CONTROL_LATENT_CONTINUATION else 18})

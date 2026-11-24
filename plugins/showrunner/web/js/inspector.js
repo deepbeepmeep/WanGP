@@ -101,10 +101,11 @@ export function mountInspector(root) {
           ${rendering || remake ? '' : `<button class="btn" id="i-own-take" title="A video or a picture of yours as this shot's take, instead of rendering one">${icon('upload')} Use my video…</button>`}</div>`}
       ${remake ? '<div class="together-note" id="i-together" hidden></div>' : ''}
       <div class="field"><div class="label">${icon('sparkles')} What happens</div><textarea class="textarea" id="i-intent" rows="3" placeholder="${{ music_video: 'The singer turns to the camera as the chorus starts…', ad: 'The product in use, close up, the moment it pays off…', story: 'The fox finds the lantern at the edge of the wood…', remake: 'What changes in this shot: who replaces whom, what is removed or restyled…' }[doc.brief.kind] || 'She hears the radio crackle and turns to the window…'}">${esc(shot.intent)}</textarea></div>
-      <div class="field"${notForRemake}><div class="label">${icon('chat')} Dialogue <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">${doc.brief.voices_from_model && !['music_video', 'story'].includes(doc.brief.kind) ? 'the video model says these words: they join the prompt when the shot renders' : 'words spoken or sung in this shot'}</span></div>
+      <div class="field"${notForRemake}><div class="label">${icon('chat')} Dialogue <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">${settings.audio_guide && !shot.audio_slice ? 'the words of your audio, for the subtitles' : doc.brief.voices_from_model && !['music_video', 'story'].includes(doc.brief.kind) ? 'the video model says these words: they join the prompt when the shot renders' : 'words spoken or sung in this shot'}</span></div>
         <div class="dialogue" id="i-dialogue">${(shot.dialogue || []).map(item => lineRow(item, doc)).join('')}</div>
         <button class="btn small ghost" id="i-add-line" style="align-self:flex-start">${icon('plus')} Line</button>
-        ${doc.brief.voices_from_model && !['music_video', 'story'].includes(doc.brief.kind) && (shot.dialogue || []).length ? `<label class="row muted" style="font-size:12.5px;cursor:pointer;gap:10px" title="After each take, the shot starts just before its first line and ends just before any word the model adds after its last line. Turn it off for a shot that should run on."><span class="toggle ${shot.cut_extra_words !== false ? 'on' : ''}" id="i-cut-words"></span>Cut words that are not in these lines</label>` : ''}</div>
+        ${doc.brief.voices_from_model && !['music_video', 'story'].includes(doc.brief.kind) && (shot.dialogue || []).length && !(settings.audio_guide && !shot.audio_slice) ? `<label class="row muted" style="font-size:12.5px;cursor:pointer;gap:10px" title="After each take, the shot starts just before its first line and ends just before any word the model adds after its last line. Turn it off for a shot that should run on."><span class="toggle ${shot.cut_extra_words !== false ? 'on' : ''}" id="i-cut-words"></span>Cut words that are not in these lines</label>` : ''}</div>
+      ${remake || shot.generation?.template === 'draw_svg' ? '' : ownAudioField(shot)}
       <details class="details" id="i-prompt-box" ${promptOpen ? 'open' : ''}><summary>${icon('chevron')} Prompt <span class="muted" id="i-count" style="font-weight:500">${remake ? 'what the model reads' : 'made from what happens, the camera and the cast'} · ${(settings.prompt || '').length} chars</span></summary>
         <textarea class="textarea" id="i-prompt" rows="6" style="margin-top:8px" placeholder="The showrunner writes the full generation prompt here. Render now makes one from what you wrote above.">${esc(settings.prompt || '')}</textarea></details>
       <div class="insp-grid">
@@ -267,11 +268,21 @@ export function mountInspector(root) {
       if (event.target.closest('[data-record-line]')) {
         saveShot.flush();  // the line as written, before the recording is tied to its words
         const files = await pickFiles('audio/*', false);
-        if (files.length && (await actions.upload(files, 'line', `${id}:${index}`)).length) toast('Your recording drives this line.', 'ok');
+        const [done] = files.length ? await actions.upload(files, 'line', `${id}:${index}`) : [];
+        if (done) toast(`Your recording drives this line.${done.template ? ` The shot now renders with ${done.template}, which follows audio.` : ''}`, 'ok', done.template ? 6000 : undefined);
       } else if (event.target.closest('[data-unrecord-line]')) {
         actions.ops([{ op: 'update_shot', shot: id, fields: { dialogue: shot.dialogue.map((line, number) => number === index ? { ...line, audio: null } : line) } }]);
       }
     });
+    const ownAudio = root.querySelector('#i-own-audio');
+    if (ownAudio) ownAudio.onclick = async () => {
+      saveShot.flush();
+      const files = await pickFiles('audio/*', false);
+      const [done] = files.length ? await actions.upload(files, 'audio', id) : [];
+      if (done) toast(`The shot follows your audio.${done.template ? ` It now renders with ${done.template}, which follows audio.` : ''}`, 'ok', done.template ? 6000 : undefined);
+    };
+    const noAudio = root.querySelector('#i-no-audio');
+    if (noAudio) noAudio.onclick = () => actions.ops([{ op: 'update_shot', shot: id, fields: { audio_part: null, generation: { settings: { audio_guide: null } } } }]).catch(error => toast(error.message, 'error', 7000));
     root.querySelector('#i-add-line').onclick = () => {  // saved once it has words
       const box = root.querySelector('#i-dialogue');
       box.insertAdjacentHTML('beforeend', lineRow({ speaker: shot.cast[0] || 'NARRATOR', line: '', note: '' }, state.doc));
@@ -534,6 +545,18 @@ function soundField(shot, take, doc) {
 
 function check(ok, text) { return `<div class="check ${ok ? 'ok' : 'todo'}">${icon(ok ? 'check' : 'clock')}<span>${esc(text)}</span></div>`; }
 function stat(value, label, color) { return `<div class="panel" style="padding:12px;text-align:center"><div style="font-size:22px;font-weight:750;color:${color}">${value}</div><div class="muted" style="font-size:11.5px">${label}</div></div>`; }
+
+// The shot's own audio: a sound file of the user's (speech in any language, made with any voice model) that the picture follows and the shot keeps as its sound.
+function ownAudioField(shot) {
+  const guide = shot.generation?.settings?.audio_guide, part = shot.audio_part;
+  const label = `<div class="label">${icon('audio')} Its audio <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">${shot.audio_slice ? 'its part of the song' : 'a sound file the picture follows, kept as its sound'}</span></div>`;
+  if (shot.audio_slice) return `<div class="field">${label}<div class="muted" style="font-size:12.5px">The song from ${(+shot.audio_slice[0]).toFixed(1)} s to ${(+shot.audio_slice[1]).toFixed(1)} s: its lips follow it.</div></div>`;
+  if (!guide) return `<div class="field">${label}<div class="row"><button class="btn small ghost" id="i-own-audio" title="A sound file of yours for the whole shot (dialogue made with another voice model, in another language…): the picture follows it, the lips on its words, and it stays the shot's sound. It replaces the lines' recordings and what the video model would say">${icon('upload')} Use my audio…</button></div></div>`;
+  return `<div class="field">${label}<div class="row" style="gap:6px"><audio controls preload="none" src="${actions.file(guide)}" style="height:28px;flex:1;min-width:0"></audio>
+      <button class="btn small ghost" id="i-own-audio" title="Another sound file of yours in its place">${icon('upload')} Replace…</button>
+      <button class="btn small ghost" id="i-no-audio" title="The shot follows its lines again, or what its model says">${icon('x')} Remove</button></div>
+    ${part ? `<div class="muted" style="font-size:12px">A part of a split shot: it plays ${(+part[0]).toFixed(1)} s to ${part[1] == null ? 'the end' : `${(+part[1]).toFixed(1)} s`} of this audio.</div>` : ''}</div>`;
+}
 
 function lineRow(item, doc) {
   const speakers = [...doc.cast.map(member => [member.id, member.name || member.id]), ['NARRATOR', 'Narrator']];

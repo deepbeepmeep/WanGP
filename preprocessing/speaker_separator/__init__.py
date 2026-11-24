@@ -1,3 +1,3 @@
-from .separator import OptimizedPyannote31SpeakerSeparator, extract_dual_audio
+from .separator import SpeakerSeparator, extract_dual_audio
 
-__all__ = ["OptimizedPyannote31SpeakerSeparator", "extract_dual_audio"]
+__all__ = ["SpeakerSeparator", "extract_dual_audio"]

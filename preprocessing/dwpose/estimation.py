@@ -4,7 +4,6 @@ from typing import List, Tuple
 
 import cv2
 import numpy as np
-import onnxruntime as ort
 
 def preprocess(
     img: np.ndarray, out_bbox, input_size: Tuple[int, int] = (192, 256)
@@ -51,67 +50,16 @@ def preprocess(
     return out_img, out_center, out_scale
 
 
-def inference(sess: ort.InferenceSession, img: np.ndarray) -> np.ndarray:
-    """Inference RTMPose model.
-
-    Args:
-        sess (ort.InferenceSession): ONNXRuntime session.
-        img (np.ndarray): Input image in shape.
-
-    Returns:
-        outputs (np.ndarray): Output of RTMPose model.
-    """
-    all_out = []
-    # build input
-    for i in range(len(img)):
-        input = [img[i].transpose(2, 0, 1)]
-
-        # build output
-        sess_input = {sess.get_inputs()[0].name: input}
-        sess_output = []
-        for out in sess.get_outputs():
-            sess_output.append(out.name)
-
-        # run model
-        outputs = sess.run(sess_output, sess_input)
-        all_out.append(outputs)
-
-    return all_out
-
-
-def postprocess(outputs: List[np.ndarray],
+def postprocess(simcc_x: np.ndarray, simcc_y: np.ndarray,
                 model_input_size: Tuple[int, int],
-                center: Tuple[int, int],
-                scale: Tuple[int, int],
+                center: List[np.ndarray],
+                scale: List[np.ndarray],
                 simcc_split_ratio: float = 2.0
                 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Postprocess for RTMPose model output.
-
-    Args:
-        outputs (np.ndarray): Output of RTMPose model.
-        model_input_size (tuple): RTMPose model Input image size.
-        center (tuple): Center of bbox in shape (x, y).
-        scale (tuple): Scale of bbox in shape (w, h).
-        simcc_split_ratio (float): Split ratio of simcc.
-
-    Returns:
-        tuple:
-        - keypoints (np.ndarray): Rescaled keypoints.
-        - scores (np.ndarray): Model predict scores.
-    """
-    all_key = []
-    all_score = []
-    for i in range(len(outputs)):
-        # use simcc to decode
-        simcc_x, simcc_y = outputs[i]
-        keypoints, scores = decode(simcc_x, simcc_y, simcc_split_ratio)
-
-        # rescale keypoints
-        keypoints = keypoints / model_input_size * scale[i] + center[i] - scale[i] / 2
-        all_key.append(keypoints[0])
-        all_score.append(scores[0])
-
-    return np.array(all_key), np.array(all_score)
+    """Decode the SimCC outputs of all boxes and map the keypoints back to the image (center / scale of each box, shape (2,))."""
+    keypoints, scores = decode(simcc_x, simcc_y, simcc_split_ratio)
+    center, scale = np.array(center)[:, None], np.array(scale)[:, None]
+    return keypoints / model_input_size * scale + center - scale / 2, scores
 
 
 def bbox_xyxy2cs(bbox: np.ndarray,
@@ -352,11 +300,8 @@ def decode(simcc_x: np.ndarray, simcc_y: np.ndarray,
     return keypoints, scores
 
 
-def inference_pose(session, out_bbox, oriImg):
-    h, w = session.get_inputs()[0].shape[2:]
-    model_input_size = (w, h)
+def inference_pose(models, out_bbox, oriImg):
+    model_input_size = models.pose_input_size
     resized_img, center, scale = preprocess(oriImg, out_bbox, model_input_size)
-    outputs = inference(session, resized_img)
-    keypoints, scores = postprocess(outputs, model_input_size, center, scale)
-
-    return keypoints, scores
+    simcc_x, simcc_y = models.estimate(np.stack(resized_img).transpose(0, 3, 1, 2).astype(np.float32))
+    return postprocess(simcc_x, simcc_y, model_input_size, center, scale)

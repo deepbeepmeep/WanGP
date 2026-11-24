@@ -31,3 +31,15 @@ def prevent_power_throttling() -> bool:
     kernel32.SetProcessInformation.restype = wintypes.BOOL
     state = _ThrottlingState(_THROTTLING_VERSION, _EXECUTION_SPEED | _IGNORE_TIMER_RESOLUTION, 0)  # controlled, and never throttled
     return bool(kernel32.SetProcessInformation(kernel32.GetCurrentProcess(), _PROCESS_POWER_THROTTLING, ctypes.byref(state), ctypes.sizeof(state)))
+
+
+def apply_startup_power_throttling(argv, config_filename) -> bool:
+    """At the start of wgp.py, before the imports that take several seconds and that a console in the background would run throttled: the
+    launch options override Configuration / Performance (on by default). Returns True if the opt-out was applied."""
+    if "--no-prevent-power-throttling" in argv:
+        return False
+    if "--prevent-power-throttling" not in argv:
+        from shared.cuda_memory import _config_value
+        if not _config_value(argv, config_filename, "prevent_power_throttling", True):
+            return False
+    return prevent_power_throttling()

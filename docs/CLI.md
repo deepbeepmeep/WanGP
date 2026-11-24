@@ -288,6 +288,10 @@ You can also change **Configuration / Performance / Prevent Windows Background P
 
 The option keeps this cache in a folder of its own: `ComputeCache` in the WanGP folder, or the *Compute Cache Folder* you choose (relative to the WanGP folder, or a full path). The code of each model is completed over its first few launches (the driver optimizes a limited amount per launch). After that, the first generation after a restart starts sooner, and nothing more is written to the disk at launch, which spares the SSD. It may take up to 2 GB of disk space. The setting applies when WanGP starts.
 
+### Purge Triton Cache
+
+If generation is slower than expected, try **Configuration → Performance → Purge Triton Cache on Next Start**, then restart WanGP when your current work is finished. The button takes effect without saving your settings. At startup WanGP clears Triton's compiled kernels and saved performance probe results. Kernels compile and probes run again as each workload needs them, so the first generation can take longer. Other applications using the same Triton cache will also recompile kernels they use.
+
 ### Smart Memory Pinning
 *Configuration / RAM/VRAM Management / Smart Memory Pinning* (On by default) speeds up the models that the memory profile does not keep in Reserved RAM: the text encoders with Profile 4, every model with Profile 5, and the part of a model that does not fit when *Reserved RAM for Pinning* is low. With it, they reach the GPU almost as fast as the models kept in Reserved RAM, for about 1-2 GB of Reserved RAM.
 

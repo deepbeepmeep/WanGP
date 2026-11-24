@@ -5,10 +5,12 @@ as its prompt; the task finds the open Exploration and serves its requests until
 generated and its frames handed back to the viewer. An exploration task whose Exploration is gone (the viewer left before the task
 started) ends at once.
 
-Requests (next_request): {"keys", "text", "seconds", "steps", "memory"} for a move (the explorer's menus: the model's own units), {"render":
-record} for the whole video explored so far, {"save": True} for the world as explored so far (a new world file), None when the viewer
-left. Events the model publishes: "ready" (world loaded), "clip"
-(frames, fps, stats), "rendered" (frames, fps, record, moves), "saved" (data: the world file's bytes, moves), "ended"."""
+Requests (next_request): {"keys", "text", "seconds", "steps", "memory", "seq"} for a move (the explorer's menus: the model's own units; seq:
+the move's number when the explorer sends moves ahead, None otherwise), {"render": record} for the whole video explored so far, {"save": True}
+for the world as explored so far (a new world file), None when the viewer left. Events the model publishes: "ready" (world loaded), "clip"
+(frames, fps, stats, and the move's seq), "rendered" (frames, fps, record, moves), "saved" (data: the world file's bytes, moves), "ended".
+A model whose explorer sends moves ahead (handler menus "queue_moves") takes the next move as soon as it has published a clip, while that
+clip is written for the viewer: each move's request waits for the clip of its own seq."""
 import os
 import queue
 import threading
@@ -22,11 +24,11 @@ _lock = threading.Lock()
 class Exploration:
     def __init__(self, world_path):
         self.world_path, self.token = world_path, uuid.uuid4().hex
-        self.requests, self.events = queue.Queue(), queue.Queue()
+        self.requests, self._events, self._published = queue.Queue(), [], threading.Condition()
         self.left = threading.Event()
 
-    def move(self, keys, text, seconds, steps, memory):
-        self.requests.put({"keys": keys, "text": text, "seconds": seconds, "steps": steps, "memory": memory})
+    def move(self, keys, text, seconds, steps, memory, seq=None):
+        self.requests.put({"keys": keys, "text": text, "seconds": seconds, "steps": steps, "memory": memory, "seq": seq})
 
     def render(self, record):
         """The whole video explored so far (the world's own video, then the moves), to record in the Video gallery or to replay."""
@@ -48,13 +50,20 @@ class Exploration:
         return self.requests.get(timeout=timeout)
 
     def publish(self, kind, **data):
-        self.events.put({"type": kind, **data})
+        with self._published:
+            self._events.append({"type": kind, **data})
+            self._published.notify_all()
 
-    def next_event(self, timeout):
-        try:
-            return self.events.get(timeout=timeout)
-        except queue.Empty:
-            return None
+    def next_event(self, timeout, seq=None):
+        """The next event, None after timeout; with seq (a move sent ahead), the clip of that move or an event of no move ("ended" reaches
+        every waiter)."""
+        def first():
+            return next((index for index, event in enumerate(self._events) if seq is None or event.get("seq") in (None, seq)), None)
+        with self._published:
+            if not self._published.wait_for(lambda: first() is not None, timeout):
+                return None
+            index = first()
+            return self._events[index] if self._events[index]["type"] == "ended" else self._events.pop(index)
 
 
 def _key(world_path):

@@ -34,11 +34,11 @@ from shared.remote_llm.config import ENGINE_QWEN38_27B, LLM_CONFIG_KEY, local_en
 
 DEEPY_PRIME_Q3_MIN_VRAM_GB = 16
 DEEPY_PRIME_Q4_MIN_VRAM_GB = 24
-QWEN38_QUANTIZATIONS = {"gguf_ptq1": "Bonsai Q1", "gguf_q2": "Q2", "gguf_q3": "Q3", "gguf": "Q4"}  # the most compressed first
+QWEN38_QUANTIZATIONS = {"gguf_ptq1": "Bonsai 2.0 Q1", "gguf_ptq1_25": "Bonsai 2.5 Q1", "gguf_q2": "Q2", "gguf_q3": "Q3", "gguf": "Q4"}  # the most compressed first (both Bonsai on one level)
 BONSAI_MIN_GGUF_KERNELS_VERSION = "1.0.22"
 DEEPY_FULL_CONTEXT_TOKENS = 64000  # a production's conversation is long, and below this Deepy keeps condensing it
 DEEPY_FULL_CONTEXT_MIN_VRAM_GB = 10  # below, Bonsai no longer fits in VRAM with this context
-QWEN38_VRAM_GIB = {"gguf_ptq1": 6.3, "gguf_q2": 9.8, "gguf_q3": 12.1, "gguf": 15.8}  # each version without its KV cache: the weights the GPU holds, activations and margins
+QWEN38_VRAM_GIB = {"gguf_ptq1": 6.3, "gguf_ptq1_25": 6.35, "gguf_q2": 9.8, "gguf_q3": 12.1, "gguf": 15.8}  # each version without its KV cache: the weights the GPU holds, activations and margins
 MTP_WEIGHTS_VRAM_GIB = 0.42
 MTP_KV_VRAM_GIB_PER_TOKEN = 4 / 2**20  # its own BF16 KV cache
 BLOCK_DRAFTER_VRAM_GIB = 3.0  # DSpark, DFlash2 and DSpine at 32K context: weights, their window-capped cache (DSpark's grows 20 KiB per token) and buffers
@@ -73,7 +73,7 @@ def deepy_prime_hardware_profile(vram_gb: float | None = None) -> tuple[str, str
         return "Q4", "gguf", reported_vram_gb
     if reported_vram_gb >= DEEPY_PRIME_Q3_MIN_VRAM_GB:
         return "Q3", "gguf_q3", reported_vram_gb
-    return ("Bonsai Q1", "gguf_ptq1", reported_vram_gb) if reported_vram_gb > 0 and bonsai_kernels_installed() else None
+    return ("Bonsai 2.0 Q1", "gguf_ptq1", reported_vram_gb) if reported_vram_gb > 0 and bonsai_kernels_installed() else None
 
 
 def qwen38_recommended_quantization(vram_gb: float | None = None) -> str | None:
@@ -122,8 +122,8 @@ def performance_warnings(server_config: dict[str, Any], vram_gb: float | None = 
     chosen = server_config.get("prompt_enhancer_quantization")
     if reported_vram_gb <= 0 or normalize_llm_config(server_config)["deepy"] != ENGINE_QWEN38_27B or chosen not in QWEN38_QUANTIZATIONS:
         return []
-    warnings, recommended, order = [], qwen38_recommended_quantization(reported_vram_gb), list(QWEN38_QUANTIZATIONS)
-    if order.index(chosen) > order.index(recommended):
+    warnings, recommended, order = [], qwen38_recommended_quantization(reported_vram_gb), [quantization for quantization in QWEN38_QUANTIZATIONS if quantization != "gguf_ptq1_25"]
+    if order.index(chosen.replace("gguf_ptq1_25", "gguf_ptq1")) > order.index(recommended):
         warnings.append(("⚠️", f"Qwen3.8 {QWEN38_QUANTIZATIONS[chosen]} may perform poorly on your GPU", f"with {reported_vram_gb} GB of VRAM, part of the model may not fit and Deepy and the Prompt Enhancer can become very slow. For this GPU, select {QWEN38_QUANTIZATIONS[recommended]} under Qwen LLM Quantization"))
     mode = speculative_decoding_runtime(server_config.get(PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY, PROMPT_ENHANCER_SPECULATIVE_DECODING_DEFAULT))[0]
     if mode == PROMPT_ENHANCER_SPECULATIVE_DECODING_AUTO:

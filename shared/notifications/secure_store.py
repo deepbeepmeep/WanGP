@@ -23,12 +23,27 @@ def _keyring():
         raise SecureStorageError(f"OS credential storage is unavailable ({type(error).__name__}): no usable credential service was found. {STORAGE_HELP}") from error
 
 
-def availability_error() -> str:
+def _check_availability() -> str:
     try:
         _keyring()
     except SecureStorageError as error:
         return str(error)
     return ""
+
+
+def _start_availability_check():
+    # keyring and its OS backend take a few tenths of a second to load: checked while WanGP goes on starting, for the settings UI
+    import concurrent.futures
+    pool = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="keyring_check")
+    _startup_check.append(pool.submit(_check_availability))
+    pool.shutdown(wait=False)
+
+
+_startup_check = []
+
+
+def availability_error() -> str:
+    return _startup_check.pop().result() if _startup_check else _check_availability()
 
 
 def load_urls(credential_id: str) -> list[str]:
@@ -64,3 +79,6 @@ def delete_urls(credential_id: str) -> None:
         raise
     except Exception as error:
         raise SecureStorageError(f"Could not remove notification destinations from OS credential storage ({type(error).__name__}).") from error
+
+
+_start_availability_check()

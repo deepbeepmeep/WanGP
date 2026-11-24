@@ -1,4 +1,4 @@
-"""Person detector for NLF (ONNX-based YOLOX)."""
+"""Person detector for NLF (DWPose's YOLOX-L, shared with preprocessing.dwpose)."""
 from typing import List, Optional
 
 import torch
@@ -6,34 +6,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.ops
 
-try:
-    import onnxruntime as ort
-except Exception:
-    ort = None
+from preprocessing.dwpose.native import pose_models
 
 
-class PersonDetectorONNX(nn.Module):
-    """ONNXRuntime-based person detector using YOLOX."""
+class PersonDetector(nn.Module):
+    """YOLOX person detector run through the shared DWPose models."""
 
-    def __init__(self, model_path: str, providers: Optional[List[str]] = None):
-        if ort is None:
-            raise ImportError(
-                "onnxruntime is required for PersonDetectorONNX. Install with `pip install onnxruntime-gpu` "
-                "or `pip install onnxruntime`."
-            )
+    def __init__(self):
         nn.Module.__init__(self)
         self.input_size = 640
         self.person_class_id = '0'
-
-        if providers is None:
-            providers = [
-                'CUDAExecutionProvider',
-                'CPUExecutionProvider',
-            ]
-        self.session = ort.InferenceSession(model_path, providers=providers)
-        self.input_name = self.session.get_inputs()[0].name
-        self.output_name = self.session.get_outputs()[0].name
-        self._input_batch_dim = self.session.get_inputs()[0].shape[0]
 
         strides = [8, 16, 32]
         grids = []
@@ -188,17 +170,8 @@ class PersonDetectorONNX(nn.Module):
 
     def call_model(self, images):
         device = images.device
-        images_np = (images.detach().to(device='cpu', dtype=torch.float32) * 255.0).numpy()
-        if self._input_batch_dim == 1 and images_np.shape[0] != 1:
-            import numpy as np
-            outs = [
-                self.session.run([self.output_name], {self.input_name: images_np[i : i + 1]})[0]
-                for i in range(images_np.shape[0])
-            ]
-            out = np.concatenate(outs, axis=0)
-        else:
-            out = self.session.run([self.output_name], {self.input_name: images_np})[0]
-        preds = torch.from_numpy(out).to(device=device)
+        with pose_models() as models:
+            preds = models.detect_tensor(images.detach() * 255.0).to(device=device)
         grid = self._grid.to(device=device, dtype=preds.dtype)
         stride = self._stride.to(device=device, dtype=preds.dtype)
         xy = (preds[..., :2] + grid) * stride

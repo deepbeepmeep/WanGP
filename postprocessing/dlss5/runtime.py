@@ -133,8 +133,7 @@ def _missing(files: tuple[Path, ...]) -> list[Path]:
     return [path for path in files if not path.is_file()]
 
 
-@lru_cache(maxsize=1)
-def dlssg_capabilities() -> dict:
+def _probe_dlssg() -> dict:
     if _missing(DLSSG_FILES) or (os.name != "nt" and not DLSSG_LINUX):
         return {}
     try:
@@ -145,8 +144,31 @@ def dlssg_capabilities() -> dict:
         return {}
 
 
+# The worker's probe (and nvidia-smi for the GPU series) take most of a second: started when this module loads, they run while WanGP
+# goes on starting, and the UI that lists the DLSS choices reads their results.
+_startup_probes = {}
+
+
+def _start_probes():
+    import concurrent.futures
+    pool = concurrent.futures.ThreadPoolExecutor(2, thread_name_prefix="dlss_probe")
+    _startup_probes.update(dlssg=pool.submit(_probe_dlssg), gpu_series=pool.submit(_read_gpu_series))
+    pool.shutdown(wait=False)
+
+
+@lru_cache(maxsize=1)
+def dlssg_capabilities() -> dict:
+    probe = _startup_probes.pop("dlssg", None)
+    return _probe_dlssg() if probe is None else probe.result()
+
+
 @lru_cache(maxsize=1)
 def _gpu_series() -> int:
+    probe = _startup_probes.pop("gpu_series", None)
+    return _read_gpu_series() if probe is None else probe.result()
+
+
+def _read_gpu_series() -> int:
     if os.name != "nt" and not NR_WSL:
         return 0
     try:
@@ -641,3 +663,6 @@ def frame_generate(sample: torch.Tensor, previous_last_frame: torch.Tensor | Non
         output = output[1:]
     result = _from_rgba_frames(output, dtype, device, channels)
     return result, next_previous, fps * scale
+
+
+_start_probes()

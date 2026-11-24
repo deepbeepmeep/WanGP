@@ -193,12 +193,13 @@ def workspace_generation(function=None, *, headless=None):
     return run
 
 
-def owned_path(root, relative):
+def owned_path(root, relative, resolved_root=None):
+    """resolved_root: root.resolve(), when a caller maps many paths of one folder."""
     path = Path(relative)
     if path.is_absolute() or '..' in path.parts or ':' in str(relative):
         raise ValueError('Invalid relative workspace path.')
     resolved = (root / path).resolve()
-    if not resolved.is_relative_to(root.resolve()):
+    if not resolved.is_relative_to(resolved_root or root.resolve()):
         raise ValueError('Workspace path escapes its media folder.')
     return resolved
 

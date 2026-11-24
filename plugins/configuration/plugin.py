@@ -1,5 +1,5 @@
 from postprocessing import memory as processor_memory
-from shared.kernels import fp8_backend, int8_backend, kernel_policy
+from shared.kernels import fp8_backend, int8_backend, kernel_policy, triton_cache
 from shared import attention_kit, model_dropdowns
 from shared.attention import sagegp_ready
 from shared.cuda_memory import COMPUTE_CACHE_KEY, COMPUTE_CACHE_PATH_DEFAULT, COMPUTE_CACHE_PATH_KEY, RAM_ALLOCATOR_DEFAULT, RAM_ALLOCATOR_KEY, compute_cache_folder, compute_cache_useful
@@ -22,7 +22,7 @@ from shared.deepy.config import DEEPY_VOICE_LANGUAGE_KEY, deepy_voice_language_c
 from shared.deepy.assets import WHISPER_MODEL_CHOICES, WHISPER_MODEL_KEY
 from shared.deepy.voice import VOICE_MODE_KEY, VOICE_MODE_CHOICES, voice_mode
 from shared.deepy.engine import get_or_create_assistant_session
-from shared.gradio import assistant_chat, gradio_queue_focus_patch, model_output_filter, ui_studio
+from shared.gradio import assistant_chat, gradio_queue_focus_patch, media_cache, model_output_filter, ui_studio
 from shared.gradio.hierarchy_selector import HierarchySelector
 from shared import notifications
 from shared.utils import prompt_parser
@@ -169,7 +169,8 @@ INKLING2_MINI_PROMPT_ENHANCER_ID = 8
 QWEN_PROMPT_ENHANCER_IDS = (3, 4, 5, 6, 7, 8)  # the local models of the LM engine
 QWEN35_QUANTIZATION_CHOICES = [("Quanto Int8 (recommended, better quality)", "quanto_int8"), ("GGUF Q4 (less VRAM/RAM & faster if kernels are installed, but worse quality)", "gguf")]
 QWEN38_9B_QUANTIZATION_CHOICES = [("GGUF Uncensored Q4_K_M (default, fits 8 GB of VRAM)", "gguf"), ("GGUF Uncensored Q8_0 (closest to full precision, needs about 12 GB of VRAM)", "gguf_q8")]
-QWEN38_QUANTIZATION_CHOICES = [("GGUF Uncensored Q4 (highest quality and VRAM/RAM use, for 24 GB of VRAM or more)", "gguf"), ("GGUF Uncensored IQ3_S (Q3, middle quality and VRAM/RAM use, for 16 GB of VRAM or more)", "gguf_q3"), ("GGUF Uncensored Q2 (lower quality and VRAM/RAM use)", "gguf_q2"), ("Bonsai 2 Abliterated PTQ1_0 (Q1, ternary, lowest VRAM/RAM use, for less than 16 GB of VRAM, requires kernels 1.0.22+)", "gguf_ptq1")]
+QWEN38_QUANTIZATION_CHOICES = [("GGUF Uncensored Q4 (highest quality and VRAM/RAM use, for 24 GB of VRAM or more)", "gguf"), ("GGUF Uncensored IQ3_S (Q3, middle quality and VRAM/RAM use, for 16 GB of VRAM or more)", "gguf_q3"), ("GGUF Uncensored Q2 (lower quality and VRAM/RAM use)", "gguf_q2"), ("Bonsai 2.0 Abliterated PTQ1_0 (Q1, ternary, lowest VRAM/RAM use, for less than 16 GB of VRAM, requires kernels 1.0.22+)", "gguf_ptq1"), ("Bonsai 2.5 Uncensored PTQ1_0 (Q1, ternary, as light as 2.0 and better at multi-step tasks and tool calls, requires kernels 1.0.22+)", "gguf_ptq1_25")]
+QWEN38_QUANTIZATIONS = tuple(value for _, value in QWEN38_QUANTIZATION_CHOICES)
 
 
 def background_nvenc_warning(hardware_encoding, background_save):
@@ -183,7 +184,7 @@ def background_nvenc_warning(hardware_encoding, background_save):
 def prompt_enhancer_quantization_ui_state(enhancer_enabled, quantization):
     enhancer_enabled = int(enhancer_enabled)
     if enhancer_enabled == QWEN38_PROMPT_ENHANCER_ID:
-        value = quantization if quantization in ("gguf", "gguf_q3", "gguf_q2", "gguf_ptq1") else qwen38_recommended_quantization() or "gguf"
+        value = quantization if quantization in QWEN38_QUANTIZATIONS else qwen38_recommended_quantization() or "gguf"
         return QWEN38_QUANTIZATION_CHOICES, value, True
     if enhancer_enabled == QWEN38_9B_PROMPT_ENHANCER_ID:
         return QWEN38_9B_QUANTIZATION_CHOICES, quantization if quantization in ("gguf", "gguf_q8") else "gguf", True
@@ -191,7 +192,7 @@ def prompt_enhancer_quantization_ui_state(enhancer_enabled, quantization):
         return [("GGUF IQ3_S", "gguf_q3")], "gguf_q3", True
     if enhancer_enabled == INKLING2_MINI_PROMPT_ENHANCER_ID:
         return [("Single version, as released (about 20 GB of VRAM with its context)", "safetensors")], "safetensors", True
-    value = "gguf" if quantization in ("gguf", "gguf_q3", "gguf_q2", "gguf_ptq1") else "quanto_int8"
+    value = "gguf" if quantization in QWEN38_QUANTIZATIONS else "quanto_int8"
     return QWEN35_QUANTIZATION_CHOICES, value, enhancer_enabled in QWEN35_PROMPT_ENHANCER_IDS
 
 
@@ -324,8 +325,8 @@ class ConfigTabPlugin(WAN2GPPlugin):
                     with gr.Group():
                         model_selection_label = "Selectable Generative Models: whole families, models with all their finetunes, or single finetunes (leave empty for all)"
                         gr.HTML(
-                            f'<div class="ckpt-selection-heading"><span>{model_selection_label}</span>'
-                            f'<button type="button" class="wangp-model-manager-link" data-app-route="plugin_model_manager" title="Open the Models Manager [Alt+M]">'
+                            f'<div class="configuration-action-row ckpt-selection-heading"><span>{model_selection_label}</span>'
+                            f'<button type="button" class="wangp-action-pill" data-app-route="plugin_model_manager" title="Open the Models Manager [Alt+M]">'
                             f'{app_icon("models_manager")} <span>Manage Models &amp; Disk Space</span> <kbd>Alt+M</kbd></button></div>'
                         )
                         self.transformer_types_choices = HierarchySelector(
@@ -485,6 +486,13 @@ class ConfigTabPlugin(WAN2GPPlugin):
                             info="Relative to the WanGP folder, or a full path.", visible=compute_cache, interactive=not self.args.lock_config,
                         )
                     self.compute_cache_choice.change(fn=lambda enabled: gr.update(visible=enabled), inputs=[self.compute_cache_choice], outputs=[self.compute_cache_path_choice], show_progress="hidden")
+                    with gr.Row(elem_classes="configuration-action-row"):
+                        purge_triton = gr.Button("Purge Triton Cache on Next Start", elem_id="triton-cache-purge", elem_classes="wangp-action-pill",
+                                                 size="sm", min_width=0, interactive=not self.args.lock_config)
+                        gr.Markdown("Try this if generation is slower than expected. On restart, WanGP clears cached Triton kernels and performance probe results. The first generation may take longer as kernels recompile and probes run again.")
+                    if triton_cache.last_purge:
+                        gr.Markdown(triton_cache.last_purge)
+                    purge_triton.click(self._request_triton_purge, show_progress="hidden", api_name=False)
 
                 with gr.Tab("RAM/VRAM Management"):
                     self.ram_allocator_choice = gr.Dropdown(
@@ -553,6 +561,8 @@ class ConfigTabPlugin(WAN2GPPlugin):
                         value=self.server_config.get("keep_loras_loaded", "auto"), label="Keep Loras Loaded Between Tasks",
                         info="When the next task uses the same model with the same Loras (only their multipliers may change), they are not read again from disk, which saves one to a few seconds per task. Kept Loras stay in RAM until the model or the Loras change.",
                     )
+                    self.keep_models_loaded_choice = gr.Checkbox(value=bool(self.server_config.get("keep_models_loaded", False)), label="Keep Models in VRAM Between Samples and Tasks (Experimental)",
+                        info="A model stays in VRAM after each sample and for the next queued task of the same model instead of being unloaded, so its next run starts without transferring its weights again; other models and processors take that VRAM back as they need it. Needs a VRAM Preload (Automatic, Memory Profiles 1 and 3, or a manual preload) and helps most models that run their transformer alone, such as pi-H3 once its prompt is encoded: a model that loads its VAE or text encoder after its transformer keeps little.")
                     self.vae_config_choice = gr.Dropdown(
                         choices=[("Auto - All the VRAM that other programs leave free", 0), ("Up to 3/4 of the VRAM - Fastest, Best Quality", 1),
                                  ("Up to 1/2 of the VRAM - Medium", 2), ("Up to 1/3 of the VRAM - Slowest, Lowest Quality", 3)],
@@ -978,6 +988,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                     self.image_save_path_choice = gr.Textbox(label="Shared Image Output Folder (requires restart)", value=self.image_save_path)
                     self.audio_save_path_choice = gr.Textbox(label="Shared Audio Output Folder (requires restart)", value=self.audio_save_path)
                     self.mesh_save_path_choice = gr.Textbox(label="Shared 3D Output Folder (requires restart)", value=self.mesh_save_path)
+                    self.gradio_cache_cleanup_choice = media_cache.create_controls(self.server_config, self.state.value, locked=self.args.lock_config)
 
                 with gr.Tab("Notifications"):
                     self.notification_sound_enabled_choice = gr.Dropdown(choices=[("On", 1), ("Off", 0)], value=self.server_config.get("notification_sound_enabled", 0), label="Notification Sound")
@@ -1135,7 +1146,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             self.video_profile_choice, self.image_profile_choice, self.audio_profile_choice, self.video_preload_choice, self.image_preload_choice, self.audio_preload_choice,
             self.video_preload_mode_choice, self.image_preload_mode_choice, self.audio_preload_mode_choice,
             self.postprocessor_preload_mode_choice, self.postprocessor_preload_choice,
-            self.smart_memory_pinning_choice, self.perc_reserved_mem_max_choice, self.vram_allocator_choice, self.ram_allocator_choice, self.max_reserved_loras_choice, self.keep_loras_loaded_choice,
+            self.smart_memory_pinning_choice, self.perc_reserved_mem_max_choice, self.vram_allocator_choice, self.ram_allocator_choice, self.max_reserved_loras_choice, self.keep_loras_loaded_choice, self.keep_models_loaded_choice,
             self.llm_cpu_compute_choice, self.deepy_llm_engine_choice,
             *self.codex_config_ui.save_components,
             *self.claude_config_ui.save_components,
@@ -1148,6 +1159,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             self.video_container_choice, self.video_output_codec_choice, self.video_hardware_encoding_choice, self.background_video_save_choice, self.rgba_video_output_choice, self.hdr_video_crf_choice, self.image_output_codec_choice, self.audio_output_codec_choice, self.audio_stand_alone_output_codec_choice,
             self.metadata_choice, self.embed_source_images_choice,
             self.video_save_path_choice, self.image_save_path_choice, self.audio_save_path_choice, self.mesh_save_path_choice,
+            self.gradio_cache_cleanup_choice,
             self.workspace_storage_choice, self.workspaces_root_choice, self.mcp_workspace_mode_choice, self.mcp_port_choice, self.mcp_webui_choice, self.mcp_workspace_visibility_choice, self.mcp_visual_inspection_choice,
             self.notification_sound_enabled_choice, self.notification_sound_volume_choice, self.notification_apprise_urls_choice, self.notification_secure_storage_choice, self.notification_on_generation_choice, self.notification_on_queue_complete_choice, self.notification_on_queue_interrupted_choice,
             *self.audio_processor_config_components,
@@ -1217,6 +1229,15 @@ class ConfigTabPlugin(WAN2GPPlugin):
         self.release_RAM_btn.click(fn=release_ram_and_notify, inputs=[self.state])
         return [self.release_RAM_btn]
 
+    def _request_triton_purge(self):
+        if self.args.lock_config:
+            raise gr.Error("Configuration is locked by command-line arguments.")
+        try:
+            triton_cache.request_purge(os.path.dirname(self.server_config_filename))
+        except OSError as exc:
+            raise gr.Error(f"Unable to schedule the Triton cache purge: {exc}") from exc
+        gr.Info("Triton cache purge scheduled. Restart WanGP when you are ready.")
+
     def _save_changes(self, state, *args, overrides=""):
         gen_in_progress = self.is_generation_in_progress()
         # return "<div style='color:red; text-align:center;'>Unable to change config when a generation is in progress.</div>", *[gr.update()]*5
@@ -1253,7 +1274,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             video_profile_choice, image_profile_choice, audio_profile_choice, video_preload_choice, image_preload_choice, audio_preload_choice,
             video_preload_mode_choice, image_preload_mode_choice, audio_preload_mode_choice,
             postprocessor_preload_mode_choice, postprocessor_preload_choice,
-            smart_memory_pinning_choice, perc_reserved_mem_max_choice, vram_allocator_choice, ram_allocator_choice, max_reserved_loras_choice, keep_loras_loaded_choice,
+            smart_memory_pinning_choice, perc_reserved_mem_max_choice, vram_allocator_choice, ram_allocator_choice, max_reserved_loras_choice, keep_loras_loaded_choice, keep_models_loaded_choice,
             llm_cpu_compute_choice, deepy_llm_engine_choice,
             codex_executable_choice, codex_model_choice, codex_reasoning_effort_choice,
             claude_executable_choice, claude_model_choice, claude_reasoning_effort_choice,
@@ -1266,6 +1287,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             video_container_choice, video_output_codec_choice, video_hardware_encoding_choice, background_video_save_choice, rgba_video_output_choice, hdr_video_crf_choice, image_output_codec_choice, audio_output_codec_choice, audio_stand_alone_output_codec_choice,
             metadata_choice, embed_source_images_choice,
             save_path_choice, image_save_path_choice, audio_save_path_choice, mesh_save_path_choice,
+            gradio_cache_cleanup_choice,
             workspace_storage_choice, workspaces_root_choice, mcp_workspace_mode_choice, mcp_port_choice, mcp_webui_choice, mcp_workspace_visibility_choice, mcp_visual_inspection_choice,
             notification_sound_enabled_choice, notification_sound_volume_choice, notification_apprise_urls_choice, notification_secure_storage_choice, notification_on_generation_choice, notification_on_queue_complete_choice, notification_on_queue_interrupted_choice,
             last_resolution_choice
@@ -1294,8 +1316,8 @@ class ConfigTabPlugin(WAN2GPPlugin):
             enhancer_enabled_choice = local_enhancer_id(deepy_llm_engine_choice, enhancer_enabled_choice)
         qwen_local = not deepy_remote and enhancer_enabled_choice in QWEN_PROMPT_ENHANCER_IDS
 
-        if not deepy_remote and int(enhancer_enabled_choice) == QWEN38_PROMPT_ENHANCER_ID and enhancer_quantization_choice not in ("gguf", "gguf_q3", "gguf_q2", "gguf_ptq1"):
-            error = "Qwen3.8-27B is available only as GGUF. Select GGUF Q2, Q3, Q4, or Bonsai PTQ1_0 as the Qwen LLM quantization."
+        if not deepy_remote and int(enhancer_enabled_choice) == QWEN38_PROMPT_ENHANCER_ID and enhancer_quantization_choice not in QWEN38_QUANTIZATIONS:
+            error = "Qwen3.8-27B is available only as GGUF. Select GGUF Q2, Q3, Q4, or a Bonsai PTQ1_0 as the Qwen LLM quantization."
             gr.Info(f"Configuration was not saved: {error}")
             return f"<div style='color:red; text-align:center;'>Configuration was not saved: {error}</div>", *[gr.update()]*9
         if not deepy_remote and int(enhancer_enabled_choice) == QWEN38_9B_PROMPT_ENHANCER_ID and enhancer_quantization_choice not in ("gguf", "gguf_q8"):
@@ -1319,6 +1341,8 @@ class ConfigTabPlugin(WAN2GPPlugin):
 
         try:
             mcp_port_choice = server_port(mcp_port_choice)
+            if gradio_cache_cleanup_choice not in media_cache.POLICIES:
+                raise ValueError("Choose a valid automatic Gradio cache cleanup policy.")
             if mcp_workspace_mode_choice not in ('shared', 'per_agent'):
                 raise ValueError('Choose an MCP Agent Workspace option.')
             if deepy_enabled_choice:
@@ -1385,6 +1409,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             "generation_preview": generation_preview_choice,
             "text_encoder_quantization": text_encoder_quantization_choice, "save_path": save_path_choice,
             "image_save_path": image_save_path_choice, "audio_save_path": audio_save_path_choice, "mesh_save_path": mesh_save_path_choice,
+            media_cache.CONFIG_KEY: gradio_cache_cleanup_choice,
             'workspace_storage_mode': workspace_storage_choice, 'workspaces_dir': workspaces_root_choice.strip() or 'workspaces', 'mcp_workspace_mode': mcp_workspace_mode_choice, 'mcp_port': mcp_port_choice, 'mcp_webui': mcp_webui_choice, 'mcp_workspace_visibility': mcp_workspace_visibility_choice, 'mcp_visual_inspection': mcp_visual_inspection_choice,
             "compile": compile_choice, "profile": video_profile_choice,
             "video_profile": video_profile_choice, "image_profile": image_profile_choice, "audio_profile": audio_profile_choice,
@@ -1418,7 +1443,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             "max_frames_multiplier": max_frames_multiplier_choice, "display_stats": display_stats_choice,
             "keep_resolution_on_model_switch": keep_resolution_on_model_switch_choice,
             "enable_4k_resolutions": enable_4k_resolutions_choice,
-            "max_reserved_loras": max_reserved_loras_choice, "keep_loras_loaded": keep_loras_loaded_choice,
+            "max_reserved_loras": max_reserved_loras_choice, "keep_loras_loaded": keep_loras_loaded_choice, "keep_models_loaded": bool(keep_models_loaded_choice),
             "video_output_codec": video_output_codec_choice, "hdr_video_crf": hdr_video_crf_choice,
             "video_hardware_encoding": video_hardware_encoding_choice, "background_video_save": bool(background_video_save_choice),
             "rgba_video_output": rgba_video_output_choice,
@@ -1541,7 +1566,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             "max_frames_multiplier", "display_stats", "keep_resolution_on_model_switch", "enable_4k_resolutions", "max_reserved_loras", "keep_loras_loaded", "video_output_codec", "video_hardware_encoding", "background_video_save", "hdr_video_crf", "video_container",
             "embed_source_images", "image_output_codec", "audio_output_codec", "audio_stand_alone_output_codec", "checkpoints_paths", "loras_root", "save_queue_if_crash",
             "UI_theme", "floating_generate_button", "queue_color_scheme", gradio_queue_focus_patch.FOCUS_QUEUE_SERVER_CONFIG_KEY, "prevent_power_throttling",
-            COMPUTE_CACHE_KEY, COMPUTE_CACHE_PATH_KEY,
+            COMPUTE_CACHE_KEY, COMPUTE_CACHE_PATH_KEY, media_cache.CONFIG_KEY,
         ]
 
         needs_reload = not all(change in no_reload_keys for change in changes)

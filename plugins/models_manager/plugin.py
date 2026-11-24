@@ -81,7 +81,7 @@ class modelsManagerPlugin(WAN2GPPlugin):
 
     def create_model_ui(self):
         with gr.Column():
-            gr.HTML(f'<div class="ckpt-heading"><div><h3>Models Manager</h3><p>Shared files are used by multiple models or variants and count once in each total.</p></div><button type="button" class="wangp-model-manager-link" data-app-route="plugin_configuration" data-ckpt-return title="Back to Configuration [Alt+M]">{app_icon("back")} <span>Back to Configuration</span> <kbd>Alt+M</kbd></button></div>')
+            gr.HTML(f'<div class="ckpt-heading"><div><h3>Models Manager</h3><p>Shared files are used by multiple models or variants and count once in each total.</p></div><button type="button" class="wangp-action-pill" data-app-route="plugin_configuration" data-ckpt-return title="Back to Configuration [Alt+M]">{app_icon("back")} <span>Back to Configuration</span> <kbd>Alt+M</kbd></button></div>')
             with gr.Row():
                 with gr.Column(scale=5):
                     self.stats_html = gr.HTML()

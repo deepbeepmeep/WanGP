@@ -623,9 +623,9 @@ _old_safe_open = safetensors.safe_open
 safetensors.safe_open = safe_open
 accelerate.utils.modeling.safe_open = safe_open
 accelerate.utils.modeling.safe_load_file = torch_load_file
-try:
-    import transformers
-    transformers.modeling_utils.safe_open = safe_open
-    transformers.modeling_utils.safe_load_file = torch_load_file
-except:
-    pass
+def _patch_transformers_loading(modeling_utils):
+    modeling_utils.safe_open = safe_open
+    modeling_utils.safe_load_file = torch_load_file
+
+from .import_hooks import after_import
+after_import("transformers.modeling_utils", _patch_transformers_loading)  # when transformers loads it: importing it here would load most of transformers

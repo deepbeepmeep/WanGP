@@ -6,7 +6,7 @@ _restart_launch = supervise() if __name__ == "__main__" else False
 for _stream in (sys.stdout, sys.stderr): _stream.reconfigure(encoding="utf-8", errors="replace")
 from tqdm import tqdm
 
-WanGP_version = "20.12"
+WanGP_version = "20.20"
 _welcome_message = f" WanGP v{WanGP_version} - Copyright (c) 2024-2026 DeepBeepMeep "
 tqdm.write(f"\033[1m\033[93m{_welcome_message:*^100}\033[0m")
 
@@ -17,14 +17,20 @@ os.environ.setdefault("TRITON_DEFAULT_FP_FUSION", "1")
 os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
 # OpenBLAS (NumPy, SciPy) commits a 32 MiB buffer per thread at import: 1.5 GB with 24 threads, unused by WanGP's PyTorch computations
 os.environ.setdefault("OPENBLAS_NUM_THREADS", str(min(8, os.cpu_count() or 8)))
+# Set until now at startup by modules that load on first use (the Wan configs, SCAIL, sklearn): Hugging Face tokenizers without their
+# thread pool, and two OpenMP runtimes in one process allowed (else "OMP: Error #15" ends WanGP)
+for _name, _value in (("TOKENIZERS_PARALLELISM", "false"), ("KMP_DUPLICATE_LIB_OK", "TRUE"), ("KMP_INIT_AT_FORK", "FALSE")): os.environ.setdefault(_name, _value)
 if "--offline" in sys.argv:  # before any Hugging Face library reads it at import: no download, a missing file is an error (shared/utils/download.py)
     os.environ["HF_HUB_OFFLINE"] = "1"
 p = os.path.dirname(os.path.abspath(__file__))
 if p not in sys.path:
     sys.path.insert(0, p)
+from shared import startup_imports; startup_imports.install()  # before any library: parts of them WanGP does not use at startup load on first use
+import logging; logging.basicConfig()  # libraries log warnings and above to the console: one configuring INFO logging of its own (mcp's server) then leaves it as it is
 from shared.native_runtime import preload_preferred_libstdcxx
 preload_preferred_libstdcxx()
 from shared.default_device import set_default_cuda_device_from_arg; set_default_cuda_device_from_arg("gpu")
+from shared.utils.power_throttling import apply_startup_power_throttling; apply_startup_power_throttling(sys.argv, "wgp_config.json")  # before the imports below, which a background console would run throttled
 # # os.environ.pop("TORCH_LOGS", None)  # make sure no env var is suppressing/overriding
 # os.environ["TORCH_LOGS"]= "recompiles"
 import torch._logging as tlog
@@ -54,13 +60,12 @@ from shared.utils.download_progress import DownloadCancelled, check_download_can
 from shared.utils.download import DownloadError, generation_downloads
 from shared.utils.media_control import MediaProcessingAborted, controlled_model_loading, media_abort_requested
 from shared.utils.default_device import call_with_default_device
-from shared.utils.power_throttling import prevent_power_throttling
 from shared.gradio import metadata_events
 from shared.utils.config_store import config_lock, read_config, write_config, write_config_deferred, update_config
 import warnings
 warnings.filterwarnings('ignore', message='Failed to find.*', module='triton')
 warnings.filterwarnings("ignore", message=r"Failed to launch Triton kernels, likely due to missing CUDA toolkit; falling back to a slower .* implementation\.\.\.", category=UserWarning, module=r"whisper\.timing")
-from mmgp import offload, safetensors2, profile_type , quant_router, cuda_graphs, transfer
+from mmgp import offload, safetensors2, profile_type , quant_router, cuda_graphs, transfer, memory_pressure
 try:
     import triton
 except ImportError:
@@ -168,8 +173,6 @@ try:
 except ImportError:
     RangeSlider = None
 import re
-from transformers.utils import logging
-logging.set_verbosity_error
 import requests
 from shared.gradio.gallery import AdvancedMediaGallery, get_gradio_file_path
 from shared.gradio.hierarchy_selector import HierarchySelector, build_choices_hierarchy
@@ -231,6 +234,11 @@ app = None
 ATTACHMENT_KEYS = ["image_start", "image_end", "image_refs", "image_guide", "image_mask",
                    "video_guide", "video_guide2", "video_guide3", "video_mask", "video_source", "audio_guide", "audio_guide2", "audio_guide3", "audio_source", "replace_voice_sample", "replace_voice_sample2", "custom_guide"]
 PRESERVE_MEDIA_ON_SETTINGS_IMPORT = True
+# The objects alive once a model is loaded (its modules, parameters, hooks: a very large number) leave Python's cyclic garbage collection
+# until the model is released (gc.freeze / gc.unfreeze): each gc.collect() then walks only what was made since, about 0.2 s less per
+# collection with H3 loaded. Every MMGP offload release unfreezes them, so that the models it releases are collected; they are set aside
+# again at the start of the next generation. Cyclic garbage of objects frozen that are not released through MMGP waits for that release.
+GC_FREEZE_LOADED_MODELS = True
 
 lock = threading.Lock()
 current_task_id = None
@@ -312,10 +320,22 @@ def keep_loras_loaded():
         return memory.available >= 0.1 * memory.total
     return mode == "on"
 
+def keeps_models_loaded(model_def):
+    """The models of a generation may stay in VRAM (parked) after each sample and for the next queued task of the same model: those whose
+    generation never swaps modules (no_model_swap), or any model with the experimental Keep Models in VRAM config."""
+    return model_def.get("no_model_swap", False) or server_config.get("keep_models_loaded", False)
+
+def park_models(model_def):
+    """After a sample: park the models instead of unloading them (other models and processors take their VRAM back as they need it), when
+    they are kept loaded and, for the config, something is preloaded (without a VRAM Preload a streamed model keeps little in VRAM)."""
+    return keeps_models_loaded(model_def) and (model_def.get("no_model_swap", False) or offloadobj.preloaded_bytes() > 0) and offloadobj.park()
+
 def release_model():
     global wan_model, offloadobj, reload_needed
     released = transformer_type if wan_model is not None or offloadobj is not None else None
     if kept_loras is not None: unload_task_loras(kept_loras["models"])
+    if GC_FREEZE_LOADED_MODELS:
+        gc.unfreeze()  # the model's objects are collected again: what the release leaves as cyclic garbage goes with the collection below
     wan_model = None
     clear_gen_cache()
     if "_cache" in offload.shared_state:
@@ -1296,7 +1316,7 @@ def validate_settings(state, model_type, single_prompt, inputs, silent=False):
                     return err(f"Custom Sigmas phase {index + 1} crosses a phase switch. This model uses one descending schedule across all phases.")
     # Explicit schedules have already validated their derived counts and switches.
     # Slider ranges constrain manual values, not custom sigma values (e.g. H3 < 0.7).
-    extra_settings_error = extra_settings.validate_inputs({key: value for key, value in inputs.items() if key not in sigma_overrides}, model_def, get_max_frames=get_max_frames)
+    extra_settings_error = extra_settings.validate_inputs({key: value for key, value in inputs.items() if key not in sigma_overrides}, model_def)
     if len(extra_settings_error) > 0:
         return err(extra_settings_error)
 
@@ -2942,6 +2962,7 @@ if not Path(config_load_filename).is_file():
         "enable_4k_resolutions": 0,
         "max_reserved_loras": -1,
         "keep_loras_loaded": "auto",
+        "keep_models_loaded": False,
         "video_preload_mode": "default",
         "image_preload_mode": "default",
         "audio_preload_mode": "default",
@@ -2979,9 +3000,7 @@ if not Path(config_load_filename).is_file():
 else:
     server_config = read_config(config_load_filename)
 
-server_config.setdefault("prevent_power_throttling", True)
-if args.prevent_power_throttling is None: args.prevent_power_throttling = server_config["prevent_power_throttling"]
-if args.prevent_power_throttling: prevent_power_throttling()
+server_config.setdefault("prevent_power_throttling", True)  # applied at the start of this file (apply_startup_power_throttling)
 
 server_config.setdefault("clear_file_list", 5)
 server_config.setdefault("prompt_enhancer_quantization", "quanto_int8")
@@ -4685,6 +4704,9 @@ def load_models(model_type, override_profile = -1, output_type="video", config_i
         loaded_config = config_id or ""
         loaded_compile = compilation
         loaded_quantization = (transformer_qtype, text_encoder_qtype)
+    if GC_FREEZE_LOADED_MODELS:
+        gc.collect()  # the loading's garbage first, then what stays alive is set aside
+        gc.freeze()
     return wan_model, offloadobj
 
 if not "P" in preload_model_policy:
@@ -6012,6 +6034,17 @@ def select_media(state, current_gallery_tab, input_file_list, file_selected, str
     tab_updates = [gr.Tabs(selected="video_info"), "video_info"] if not late_tabs.get(video_info_tab, True) else [gr.update(), video_info_tab]
     return choice if source == VIDEO.id else gr.update(), html_content, *action_rows, *deleted_rows, gr.update(visible=visible and is_audio), gr.update(visible=visible and (is_video or is_image or is_mesh)) , gr.update(visible=visible and is_video), post_temporal_update,post_temporal_method_update, post_temporal_multiplier_update, post_spatial_update, post_spatial_method_update, post_spatial_ratio_update, *late_parameter_updates, *tab_updates
 
+def select_page_media(state, current_gallery_tab, input_file_list, file_selected, strip_selected, source, current_spatial_upsampling, current_spatial_parameters, current_temporal_parameters, spatial_help_target_id, current_temporal_upsampling, video_info_tab, event_data: gr.EventData):
+    """A gallery event of this page. With a shared gallery its gesture reaches the shared selection by another message, which may arrive
+    later: the gallery refresh that applies it describes the media instead (select_shared_media)."""
+    if service_for(state) is not None:
+        return gr.skip()
+    return select_media(state, current_gallery_tab, input_file_list, file_selected, strip_selected, source, current_spatial_upsampling, current_spatial_parameters, current_temporal_parameters, spatial_help_target_id, current_temporal_upsampling, video_info_tab, event_data)
+
+def select_shared_media(selection, state, current_gallery_tab, input_file_list, file_selected, current_spatial_upsampling, current_spatial_parameters, current_temporal_parameters, spatial_help_target_id, current_temporal_upsampling, video_info_tab):
+    """`selection`: the media the shared gallery shows, set by its refresh once a selection is applied."""
+    return select_media(state, current_gallery_tab, input_file_list, file_selected, -1, json.loads(selection)["source"], current_spatial_upsampling, current_spatial_parameters, current_temporal_parameters, spatial_help_target_id, current_temporal_upsampling, video_info_tab, None)
+
 def convert_image(image, keep_alpha=False):
 
     from PIL import ImageOps
@@ -6568,11 +6601,17 @@ def encode_video_output(continued_video, frames, path, fps, hdr, container):
     """The call that encodes the new frames of an output to path (the video made so far for a generation gathered in a file, whose path it
     returns, None when the user stopped the post-processing of its Source Video). The list of frames is copied: a generation keeping its
     frames in memory adds the next window's to it while this one is saved."""
-    if continued_video is not None:
-        return partial(continued_video.append, frames)
     if hdr:
         return partial(save_hdr_video, tensor=list(frames), save_file=path, fps=fps, codec_type=server_config.get("hdr_video_crf", 8), container=container)
-    return partial(save_video, tensor=list(frames), save_file=path, fps=fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type=server_config.get("video_output_codec", None), container=container)
+    encode = partial(continued_video.append, frames) if continued_video is not None else partial(save_video, tensor=list(frames), save_file=path, fps=fps, nrow=1, normalize=True, value_range=(-1, 1), codec_type=server_config.get("video_output_codec", None), container=container)
+    if not nvenc_in_use(server_config.get("video_output_codec", None)):
+        return encode
+    def nvenc_encode():  # NVENC's session takes VRAM outside the allocator, which parked models give first
+        memory_pressure.make_room_parked(NVENC_SESSION_VRAM, torch.cuda.current_device())
+        return encode()
+    return nvenc_encode
+
+NVENC_SESSION_VRAM = 1 << 30  # measured 490-570 MB at 720p-1080p, 800-960 MB at 4K
 
 def copy_video_output(encode_output, video_path, from_continued_video):
     """Write a video without sound: False when the user stopped the post-processing of the Source Video."""
@@ -7233,6 +7272,7 @@ def process_prompt_enhancer(model_type, model_def, prompt_enhancer, original_pro
             duration_instructions=duration_instructions,
             thinking_enabled = "K" in prompt_enhancer_mode,
             generation_callbacks=(enhancer_kwargs or {}).get("generation_callbacks"),
+            vision=prompt_enhancer_images.vision_settings(model_def, prompt_enhancer_mode),
         )
         return prompt_enhancer_images.restore_window_commands(prompts, window_commands)
 
@@ -8041,7 +8081,7 @@ def generate_media(
             raise gr.Error("Error while loading Loras: " + ", ".join(error_files))
         if trans2_lora is not None: 
             offload.sync_models_loras(trans_lora, trans2_lora)
-        if model_def.get("no_model_swap", False):  # blocks kept in VRAM by the previous task (only the LoRAs changed): their GPU copies
+        if keeps_models_loaded(model_def):  # blocks kept in VRAM by the previous task: the GPU copies of the Loras loaded since
             for lora_model in (trans_lora, trans2_lora):
                 if lora_model is not None:
                     offloadobj.refresh_loras(lora_model)
@@ -8351,6 +8391,8 @@ def generate_media(
     os.makedirs(image_save_path, exist_ok=True)
     os.makedirs(audio_save_path, exist_ok=True)
     gc.collect()
+    if GC_FREEZE_LOADED_MODELS and gc.get_freeze_count() == 0:
+        gc.freeze()  # set aside again once a release (MMGP's offload release unfreezes) has let its models be collected
     torch.cuda.empty_cache()
     wan_model._interrupt = False
     abort = False
@@ -9187,7 +9229,7 @@ def generate_media(
             drop_generated_audio = False
             audio_repair_samples = 0
             side_files = {}
-            meshes = splats = video_file = None
+            meshes = splats = video_file = image_suffixes = None
             post_decode_pre_trim = 0
             output_audio_sampling_rate= audio_sampling_rate
             sample_is_hdr = False
@@ -9206,6 +9248,7 @@ def generate_media(
                         elif input_fills_window:
                             output_new_audio_filepath = None
                     post_decode_pre_trim = samples.get("post_decode_pre_trim", 0) 
+                    image_suffixes = samples.get("image_suffixes", None)  # an image model's filename suffix per output image (e.g. "_fixed")
                     meshes = samples.get("meshes", None)
                     splats = samples.get("splats", None)
                     video_file = samples.get("video_file", None)  # a finished video made by the model (a temporary file it hands over), saved instead of "x"
@@ -9217,7 +9260,7 @@ def generate_media(
             clear_gen_cache()
             # a model whose generation never swaps models stays loaded (parked: other models and programs reclaim its VRAM as they need it)
             # for the next sample of this task, or for the next queued task of the same model (decided at the end of the task)
-            if not (model_def.get("no_model_swap", False) and offloadobj.park()):
+            if not park_models(model_def):
                 offloadobj.unload_all()
             gc.collect()
             torch.cuda.empty_cache()
@@ -9506,7 +9549,7 @@ def generate_media(
                     sample =  sample.transpose(1,0)  #c f h w -> f c h w 
                     new_image_path = []
                     for no, img in enumerate(sample):  
-                        img_path = get_available_filename(output_dir, image_path, "" if no == 0 else f"_{no}")
+                        img_path = get_available_filename(output_dir, image_path, image_suffixes[no] if image_suffixes is not None else "" if no == 0 else f"_{no}")
                         img_name = os.path.basename(img_path)
                         set_progress_status(f"Saving File {img_name if len(img_name) <= 50 else img_name[:12] + '...' + img_name[-35:]}")
                         new_image_path.append(save_image(img, save_file = img_path, quality = server_config.get("image_output_codec", None)))
@@ -9523,7 +9566,7 @@ def generate_media(
                                 abort = True
                                 break
                             save_path_tmp = encoded_path
-                    output_new_audio_temp_filepath = None
+                    output_new_audio_temp_filepath = written_audio_path = None  # written_audio_path: the audio written below at output_audio_sampling_rate
                     new_audio_tracks_are_pretrimmed = False
                     saved_audio_tail_seconds = 0.0
                     new_audio_added_from_audio_start = reset_control_aligment or (full_generated_audio is not None and len(control_audio_tracks) == 0) # if not beginning of audio will be skipped
@@ -9573,6 +9616,7 @@ def generate_media(
                         if full_generated_audio is not None and audio_tail is not None and len(audio_tail):
                             audio_data_to_write, saved_audio_tail_seconds = np.concatenate([audio_data_to_write, audio_tail]), len(audio_tail) / output_audio_sampling_rate
                         write_wav_file(output_new_audio_filepath, audio_data_to_write, output_audio_sampling_rate)
+                        written_audio_path = output_new_audio_filepath
                     if output_new_audio_filepath is not None:
                         new_audio_tracks = [output_new_audio_filepath]
                     else:
@@ -9586,7 +9630,7 @@ def generate_media(
                     if generated_audio is not None: output_new_audio_filepath = None
                     if full_generated_audio is None and output_new_audio_filepath is not None and model_def.get("audio_tail_ms"):  # a kept soundtrack runs on past the last frame as a generated one does: a cut there (a merge, a continuation) falls inside real sound
                         saved_audio_tail_seconds = model_def["audio_tail_ms"] / 1000
-                    mux_audio_sampling_rate = resolve_mux_audio_sampling_rate(output_audio_sampling_rate, source_audio_metadata, new_audio_tracks)
+                    mux_audio_sampling_rate = resolve_mux_audio_sampling_rate(output_audio_sampling_rate, source_audio_metadata, [path for path in new_audio_tracks if path != written_audio_path])
 
                     mux_output = partial(combine_and_concatenate_video_with_audio_tracks, video_path, source_audio_tracks=list(source_audio_tracks), new_audio_tracks=list(new_audio_tracks), source_audio_duration=source_audio_duration,
                                          audio_sampling_rate=mux_audio_sampling_rate, new_audio_from_start=new_audio_added_from_audio_start, source_audio_metadata=source_audio_metadata, audio_codec_key=server_config.get("audio_output_codec", "aac_128"),
@@ -9688,7 +9732,7 @@ def generate_media(
 
     if not trans2 is None:
        trans2.cache = None
-    if model_def.get("no_model_swap", False) and (gen.get("abort", False) or queued_model_type_after(gen, task) != model_type):
+    if keeps_models_loaded(model_def) and (gen.get("abort", False) or queued_model_type_after(gen, task) != model_type):
         offloadobj.unload_all()  # kept loaded only for the next queued task of the same model
  
     def remove_generation_files(audio_tracks=control_audio_tracks + source_audio_tracks, temp_filenames_list=temp_filenames_list):
@@ -12920,10 +12964,10 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
     preset_to_load = lora_preselected_preset if lora_preset_model == model_type else "" 
 
     def get_setting_def(key, **context):
-        return extra_settings.get_def(key, model_def, model_type=model_type, get_max_frames=get_max_frames, **context)
+        return extra_settings.get_def(key, model_def, model_type=model_type, **context)
 
     def get_container_def(key, **context):
-        return extra_settings.get_container_def(key, model_def, model_type=model_type, get_max_frames=get_max_frames, **context)
+        return extra_settings.get_container_def(key, model_def, model_type=model_type, **context)
 
     def setting_slider(key, *, value=None, visible=None, label=None, minimum=None, maximum=None, step=None, setting_context=None, respect_setting_visibility=True, **kwargs):
         setting_def = get_setting_def(key, **({} if setting_context is None else setting_context))
@@ -14056,19 +14100,19 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                         gr.Markdown("<B>A Sliding Window allows you to generate video with a duration not limited by the Model</B>")
                         gr.Markdown("<B>It is automatically turned on if the number of frames to generate is higher than the Window Size</B>")
                         if diffusion_forcing:
-                            sliding_window_size = setting_slider("sliding_window_size", minimum=37, maximum=get_max_frames(257), value=ui_defaults.get("sliding_window_size", 129), step=20, label="  (recommended to keep it at 97)", visible=True, respect_setting_visibility=False)
+                            sliding_window_size = setting_slider("sliding_window_size", minimum=37, value=ui_defaults.get("sliding_window_size", 129), step=20, label="  (recommended to keep it at 97)", visible=True, respect_setting_visibility=False)
                             sliding_window_overlap = setting_slider("sliding_window_overlap", minimum=17, maximum=97, value=ui_defaults.get("sliding_window_overlap", 17), step=20, visible=True, respect_setting_visibility=False)
                             sliding_window_color_correction_strength = setting_slider("sliding_window_color_correction_strength", value=0, visible=False)
                             sliding_window_overlap_noise = setting_slider("sliding_window_overlap_noise", value=ui_defaults.get("sliding_window_overlap_noise", 20), maximum=100, visible=True)
                             sliding_window_discard_last_frames = setting_slider("sliding_window_discard_last_frames", value=ui_defaults.get("sliding_window_discard_last_frames", 0), visible=False)
                         elif ltxv:
-                            sliding_window_size = setting_slider("sliding_window_size", minimum=41, maximum=get_max_frames(257), value=ui_defaults.get("sliding_window_size", 129), step=8, visible=True, respect_setting_visibility=False)
+                            sliding_window_size = setting_slider("sliding_window_size", minimum=41, value=ui_defaults.get("sliding_window_size", 129), step=8, visible=True, respect_setting_visibility=False)
                             sliding_window_overlap = setting_slider("sliding_window_overlap", minimum=1, maximum=97, value=ui_defaults.get("sliding_window_overlap", 9), step=8, visible=True, respect_setting_visibility=False)
                             sliding_window_color_correction_strength = setting_slider("sliding_window_color_correction_strength", value=0, visible=False)
                             sliding_window_overlap_noise = setting_slider("sliding_window_overlap_noise", value=ui_defaults.get("sliding_window_overlap_noise", 20), maximum=100, visible=False)
                             sliding_window_discard_last_frames = setting_slider("sliding_window_discard_last_frames", value=ui_defaults.get("sliding_window_discard_last_frames", 0), step=8, visible=True)
                         elif hunyuan_video_custom_edit:
-                            sliding_window_size = setting_slider("sliding_window_size", minimum=5, maximum=get_max_frames(257), value=ui_defaults.get("sliding_window_size", 129), step=4, visible=True, respect_setting_visibility=False)
+                            sliding_window_size = setting_slider("sliding_window_size", minimum=5, value=ui_defaults.get("sliding_window_size", 129), step=4, visible=True, respect_setting_visibility=False)
                             sliding_window_overlap = setting_slider("sliding_window_overlap", minimum=1, maximum=97, value=ui_defaults.get("sliding_window_overlap", 5), step=4, visible=True, respect_setting_visibility=False)
                             sliding_window_color_correction_strength = setting_slider("sliding_window_color_correction_strength", value=0, visible=False)
                             sliding_window_overlap_noise = setting_slider("sliding_window_overlap_noise", value=ui_defaults.get("sliding_window_overlap_noise", 20), visible=False)
@@ -14462,10 +14506,10 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
             # Media information refreshed by select_media: action rows per media kind (MEDIA_ACTION_KINDS), deleted file rows per gallery (GALLERY_SOURCES)
             select_media_outputs = [last_choice, video_info, video_buttons_row, image_buttons_row, audio_buttons_row, mesh_buttons_row, world_buttons_row, app_buttons_row, deleted_video_buttons_row, deleted_audio_buttons_row, deleted_mesh_buttons_row, deleted_world_buttons_row, deleted_app_buttons_row, audio_postprocessing_tab, video_postprocessing_tab, audio_remuxing_tab, PP_temporal_upsampling, PP_temporal_upsampling_method, PP_temporal_upsampling_multiplier, PP_spatial_upsampling, PP_spatial_upsampling_method, PP_spatial_upsampling_ratio, *PP_spatial_upsampler_media_outputs, *PP_postprocessing_parameter_media_outputs, PP_film_grain_row, video_info_tabs, video_info_tab]
             video_info_add_videos_btn.click(fn=add_videos_to_gallery, inputs =[state, output, last_choice, files_to_load], outputs = [gallery_tabs, current_gallery_tab, output, *strip_states, files_to_load, video_info_tabs, gallery_source] ).then(
-                fn=select_media, inputs=[state, current_gallery_tab, output, last_choice, gr.State(-1), gallery_source, PP_spatial_upsampling, PP_spatial_postprocessing_parameters, PP_temporal_postprocessing_parameters, PP_spatial_upsampler_help_target, PP_temporal_upsampling, video_info_tab], outputs=select_media_outputs, show_progress="hidden").then(fn=None, inputs=None, outputs=None, js=PROMPT_TOOLS_ATTACH_JS)
+                fn=select_page_media, inputs=[state, current_gallery_tab, output, last_choice, gr.State(-1), gallery_source, PP_spatial_upsampling, PP_spatial_postprocessing_parameters, PP_temporal_postprocessing_parameters, PP_spatial_upsampler_help_target, PP_temporal_upsampling, video_info_tab], outputs=select_media_outputs, show_progress="hidden").then(fn=None, inputs=None, outputs=None, js=PROMPT_TOOLS_ATTACH_JS)
             video_info_tabs.select(fn=set_video_info_tab, outputs=[video_info_tab], show_progress="hidden")
             gallery_tabs.select(fn=set_gallery_tab, inputs=[state, video_info_tab], outputs=[current_gallery_tab, gallery_source, video_info_tabs, video_info_tab]).then(
-                fn=select_media, inputs=[state, current_gallery_tab, output, last_choice, gr.State(-1), gallery_source, PP_spatial_upsampling, PP_spatial_postprocessing_parameters, PP_temporal_postprocessing_parameters, PP_spatial_upsampler_help_target, PP_temporal_upsampling, video_info_tab], outputs=select_media_outputs, show_progress="hidden").then(fn=None, inputs=None, outputs=None, js=PROMPT_TOOLS_ATTACH_JS)
+                fn=select_page_media, inputs=[state, current_gallery_tab, output, last_choice, gr.State(-1), gallery_source, PP_spatial_upsampling, PP_spatial_postprocessing_parameters, PP_temporal_postprocessing_parameters, PP_spatial_upsampler_help_target, PP_temporal_upsampling, video_info_tab], outputs=select_media_outputs, show_progress="hidden").then(fn=None, inputs=None, outputs=None, js=PROMPT_TOOLS_ATTACH_JS)
             gr.on(triggers=[video_length.release, force_fps.change, video_guide.change, video_source.change], fn=refresh_video_length_label, inputs=[state, video_length, force_fps, video_guide, video_source] , outputs = video_length, trigger_mode="always_last", show_progress="hidden"  )
             video_source.change(fn=refresh_video_input_label, inputs=[video_source, gr.State(video_source_label)], outputs=video_source, show_progress="hidden")
             video_guide.change(fn=refresh_video_input_label, inputs=[video_guide, gr.State(video_guide_label)], outputs=video_guide, show_progress="hidden")
@@ -14508,10 +14552,10 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
             video_guide_outpainting_checkbox.input(fn=refresh_video_guide_outpainting_row, inputs=[video_guide_outpainting_checkbox, video_guide_outpainting], outputs= [video_guide_outpainting_row, video_guide_outpainting_ratio, video_guide_outpainting])
             show_advanced.change(fn=switch_advanced, inputs=[state, show_advanced, lset_name], outputs=[advanced_row, preset_buttons_rows, refresh_lora_btn, refresh2_row ,lset_name]).then(
                 fn=switch_prompt_type, inputs = [state, wizard_prompt_activated_var, wizard_variables_var, prompt, wizard_prompt, *prompt_vars], outputs = [wizard_prompt_activated_var, wizard_variables_var, prompt, wizard_prompt, prompt_column_advanced, prompt_column_wizard, prompt_column_wizard_vars, *prompt_vars]).then(fn=None, inputs=None, outputs=None, js=PROMPT_TOOLS_ATTACH_JS)
-            gr.on( triggers=[output.change, output.select],fn=select_media, inputs=[state, current_gallery_tab, output, last_choice, gr.State(-1), gr.State("video"), PP_spatial_upsampling, PP_spatial_postprocessing_parameters, PP_temporal_postprocessing_parameters, PP_spatial_upsampler_help_target, PP_temporal_upsampling, video_info_tab], outputs=select_media_outputs, show_progress="hidden").then(fn=None, inputs=None, outputs=None, js=PROMPT_TOOLS_ATTACH_JS)
+            gr.on( triggers=[output.change, output.select],fn=select_page_media, inputs=[state, current_gallery_tab, output, last_choice, gr.State(-1), gr.State("video"), PP_spatial_upsampling, PP_spatial_postprocessing_parameters, PP_temporal_postprocessing_parameters, PP_spatial_upsampler_help_target, PP_temporal_upsampling, video_info_tab], outputs=select_media_outputs, show_progress="hidden").then(fn=None, inputs=None, outputs=None, js=PROMPT_TOOLS_ATTACH_JS)
             # gr.on( triggers=[output.change, output.select], fn=select_media, inputs=[state, output, last_choice, audio_files_paths, audio_file_selected, gr.State("video")], outputs=[last_choice, video_info, video_buttons_row, image_buttons_row, audio_buttons_row, video_postprocessing_tab, audio_remuxing_tab], show_progress="hidden")
             for strip_source, strip_gallery in zip(STRIP_SOURCES, strip_galleries.values()):
-                strip_gallery.state_selected.change(fn=select_media, inputs=[state, current_gallery_tab, output, last_choice, strip_gallery.state_selected, gr.State(strip_source.id), PP_spatial_upsampling, PP_spatial_postprocessing_parameters, PP_temporal_postprocessing_parameters, PP_spatial_upsampler_help_target, PP_temporal_upsampling, video_info_tab], outputs=select_media_outputs, show_progress="hidden").then(fn=None, inputs=None, outputs=None, js=PROMPT_TOOLS_ATTACH_JS)
+                strip_gallery.state_selected.change(fn=select_page_media, inputs=[state, current_gallery_tab, output, last_choice, strip_gallery.state_selected, gr.State(strip_source.id), PP_spatial_upsampling, PP_spatial_postprocessing_parameters, PP_temporal_postprocessing_parameters, PP_spatial_upsampler_help_target, PP_temporal_upsampling, video_info_tab], outputs=select_media_outputs, show_progress="hidden").then(fn=None, inputs=None, outputs=None, js=PROMPT_TOOLS_ATTACH_JS)
 
             preview_trigger.change(refresh_preview, inputs= [state], outputs= [preview], show_progress="hidden")
             WangpProgress.bind(download_lora_btn.click, download_lora, inputs=[state, lora_url], outputs=[lora_url], component=lora_progress).then(fn=refresh_lora_list, inputs=[state, lset_name,loras_choices], outputs=[lset_name, loras_choices], show_progress="hidden")
@@ -14525,7 +14569,8 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
 
             if tab_id == 'generate':
                 from shared.deepy.hybrid_ui import bind_gallery_sync
-                bind_gallery_sync(_deepy_hybrid, state, refresh_gallery, [gallery_tabs, current_gallery_tab, output, last_choice, *strip_states, gen_info, generate_btn, add_to_queue_btn, current_gen_column, current_gen_buttons_row, queue_html, abort_btn, earlystop_btn, onemorewindow_btn, gen_info_accordion], gallery=output, strip_states=strip_states, main=main)
+                shared_selection = bind_gallery_sync(_deepy_hybrid, state, refresh_gallery, [gallery_tabs, current_gallery_tab, output, last_choice, *strip_states, gen_info, generate_btn, add_to_queue_btn, current_gen_column, current_gen_buttons_row, queue_html, abort_btn, earlystop_btn, onemorewindow_btn, gen_info_accordion], gallery=output, strip_states=strip_states, main=main)
+                shared_selection.change(fn=select_shared_media, inputs=[shared_selection, state, current_gallery_tab, output, last_choice, PP_spatial_upsampling, PP_spatial_postprocessing_parameters, PP_temporal_postprocessing_parameters, PP_spatial_upsampler_help_target, PP_temporal_upsampling, video_info_tab], outputs=select_media_outputs, show_progress="hidden").then(fn=None, inputs=None, outputs=None, js=PROMPT_TOOLS_ATTACH_JS)
                 from shared.gradio import world_explorer
                 world_explorer.bind(state, lambda state_value: workspace_storage.output_config(server_config, state=state_value)['save_path'], get_model_def, get_model_handler, explore_world_outside_queue,
                                     server_config, lambda choices: update_config(server_config, server_config_filename, {"world_explorer": choices}), world_memory_profile)
@@ -15686,6 +15731,7 @@ if __name__ == "__main__":
             url = "http://" + server_name
         webbrowser.open(url + ":" + str(server_port), new = 0, autoraise = True)
     from shared.deepy.hybrid import launch_gradio
+    startup_imports.end_startup()
     launch_gradio(demo, _deepy_hybrid, args,
         favicon_path="favicon.png",
         server_name=server_name,

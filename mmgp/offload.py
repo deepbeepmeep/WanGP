@@ -33,7 +33,7 @@ import functools
 import types
 import inspect
 
-from mmgp import safetensors2, runtime, row_views, pinned, memory_pressure
+from mmgp import safetensors2, runtime, row_views, pinned, memory_pressure, import_hooks
 from .read_ahead import MAX_RANGES, COLD_PIECE, cold_ranges, prefetch_ranges
 from mmgp import __version__, profile_type
 from .quant_router import (
@@ -74,6 +74,21 @@ class QEmbedding(QModuleMixin, torch.nn.Embedding):
 
 
 
+def _compiler_disabled(fn):
+    """torch.compiler.disable() resolved at the first call after torch._dynamo has loaded: applied when the method is defined, it would load
+    the compiler (with sympy and networkx) with mmgp. Before torch._dynamo loads nothing is compiling, and the method runs as it is."""
+    disabled = None
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        nonlocal disabled
+        if disabled is None:
+            if "torch._dynamo" not in sys.modules:
+                return fn(*args, **kwargs)
+            disabled = torch._dynamo.disable(fn)
+        return disabled(*args, **kwargs)
+    return wrapper
+
+
 def cudacontext(device):
     def decorator(func):
         @wraps(func)
@@ -85,29 +100,25 @@ def cudacontext(device):
 
     return _orig_get_parameter_device(parameter)
 
-try:
-    import transformers.modeling_utils as mu # Transfomers v4
-    _orig_get_parameter_device = mu.get_parameter_device
-    def _patched_get_parameter_device(parameter):
-        forced = getattr(parameter, "_force_device", None)
-        if forced is not None:
-            return torch.device(forced)
-        return _orig_get_parameter_device(parameter)    
-    mu.get_parameter_device = _patched_get_parameter_device	
-except:
-    pass
-
-try:
-    import transformers.modeling_utils as mu # Transfomers v5
-    _orig_device = mu.ModuleUtilsMixin.device.fget
+def _patch_transformers_device(mu):
+    # a module's _force_device is its device (applied when transformers loads modeling_utils: importing it here would load most of transformers)
+    if hasattr(mu, "get_parameter_device"): # Transfomers v4
+        _orig_get_parameter_device = mu.get_parameter_device
+        def _patched_get_parameter_device(parameter):
+            forced = getattr(parameter, "_force_device", None)
+            if forced is not None:
+                return torch.device(forced)
+            return _orig_get_parameter_device(parameter)
+        mu.get_parameter_device = _patched_get_parameter_device
+    _orig_device = mu.ModuleUtilsMixin.device.fget # Transfomers v5
     def _device(self):
         forced = getattr(self, "_force_device", None)
         if forced is not None:
             return torch.device(forced)
-        return _orig_device(self)    
+        return _orig_device(self)
     mu.ModuleUtilsMixin.device = property(_device)
-except:
-    pass
+
+import_hooks.after_import("transformers.modeling_utils", _patch_transformers_device)
 
 
 shared_state = {}
@@ -4999,13 +5010,12 @@ class offload:
             staged = None
         moved = self._move_block(stream, entry_name, staged if staged is not None and staged[1] else None) # no items: its state alone was staged
         if moved is None and self.ring is None and stream is self.transfer_stream and self.needs_staging(entry_name):
-            blocks_params = self.blocks_of_modules[entry_name]
             def staged_transfer():
-                cpu_to_gpu(stream, blocks_params, self.is_main_waiting)
+                cpu_to_gpu(stream, entry_name, self.is_main_waiting)
                 return stream.record_event()
             self.submit_prefetch(entry_name, staged_transfer)
             return self.prefetch_futures[entry_name]
-        cpu_to_gpu(stream, self.blocks_of_modules[entry_name], moved=moved)
+        cpu_to_gpu(stream, entry_name, moved=moved)
         if staged is None:
             return stream.record_event()
         region = staged[0]
@@ -5856,14 +5866,15 @@ class offload:
             if loras_modules:
                 self._move_loras(loras_active_adapters, loras_modules, True, model)
             
-    @torch.compiler.disable()
+    @_compiler_disabled
     def gpu_load_blocks(self, model_id, blocks_name, preload = False):
         # cl = clock.start()
 
 
         entry_name = model_id if blocks_name is None else model_id + "/" + blocks_name
         
-        def copy_block(stream_to_use, blocks_params, parallel_staging, moved): # moved: parameters already on the GPU, by index
+        def copy_block(stream_to_use, copied, parallel_staging, moved): # copied: the entry of the block copied (this one or one transferred ahead); moved: parameters already on the GPU, by index
+            blocks_params, copied_name = self.blocks_of_modules[copied], None if copied == model_id else copied[len(model_id) + 1:]
             model = self.models[model_id]
             loras_modules = {}
             loras_active_adapters =  getattr(model ,"_loras_active_adapters", None)
@@ -5873,10 +5884,10 @@ class offload:
                 loras_model_data =  getattr(model, "_loras_model_data", None)
 
             from . import allocator
-            if moved is None and self._held_blocks(model_id) and self._kept_in_vram(model_id, blocks_name):
-                moved = self._held_views(stream_to_use, entry_name)  # as a block moved as one buffer: the same tensors at each load
+            if moved is None and self._held_blocks(model_id) and self._kept_in_vram(model_id, copied_name):
+                moved = self._held_views(stream_to_use, copied)  # as a block moved as one buffer: the same tensors at each load
             # a base or block kept in VRAM whose model's CUDA graphs may be kept: its tensors moved one by one are the same at each load
-            kept = self._kept_tensors(model_id, entry_name, blocks_params) if moved is None or len(moved) < len(blocks_params) else None
+            kept = self._kept_tensors(model_id, copied, blocks_params) if moved is None or len(moved) < len(blocks_params) else None
             pool = self.slot_pools.get(model_id) if kept is not None else None
             with torch.cuda.stream(stream_to_use), allocator.weight_allocations(): # weights: the attention kit's measures of VRAM leave them out
                 for i, param in enumerate(blocks_params):
@@ -5917,8 +5928,8 @@ class offload:
                 if len(loras_modules) > 0:
                     self._move_loras(loras_active_adapters, loras_modules, True, model, skip_idle=not preload)
 
-        def cpu_to_gpu(stream_to_use, blocks_params, parallel_staging=lambda: True, moved=None):
-            return copy_block(stream_to_use, blocks_params, parallel_staging, moved)
+        def cpu_to_gpu(stream_to_use, copied, parallel_staging=lambda: True, moved=None):
+            return copy_block(stream_to_use, copied, parallel_staging, moved)
 
         if self.ring is not None and self.pool_models and not preload and blocks_name is not None and self._ring_unused():
             self._release_ring(on_demand=True) # once, when the pinned pool holds every block streamed: unlocking the ring waits for the GPU
@@ -5968,7 +5979,7 @@ class offload:
                         tqdm.write(f"Preloading model {entry_name} ({model_name}) in GPU")
                     else:
                         tqdm.write(f"Loading model {entry_name} ({model_name}) in GPU")
-                cpu_to_gpu(torch.cuda.current_stream(), self.blocks_of_modules[entry_name])
+                cpu_to_gpu(torch.cuda.current_stream(), entry_name)
 
             torch.cuda.synchronize()
             if not first:
@@ -5978,14 +5989,14 @@ class offload:
                 if self.verboseLevel >=2:
                     tqdm.write(f"Prefetching model {next_blocks_entry} ({model_name}) in GPU")
                 if self.needs_staging(next_blocks_entry):
-                    self.submit_prefetch(next_blocks_entry, cpu_to_gpu, self.transfer_stream, self.blocks_of_modules[next_blocks_entry], self.is_main_waiting)
+                    self.submit_prefetch(next_blocks_entry, cpu_to_gpu, self.transfer_stream, next_blocks_entry, self.is_main_waiting)
                 else:
-                    cpu_to_gpu(self.transfer_stream, self.blocks_of_modules[next_blocks_entry]) #, self.default_stream
+                    cpu_to_gpu(self.transfer_stream, next_blocks_entry) #, self.default_stream
 
         else:
             if self.verboseLevel >=2:
                 tqdm.write(f"Loading model {entry_name} ({model_name}) in GPU")
-            cpu_to_gpu(self.default_stream, self.blocks_of_modules[entry_name])
+            cpu_to_gpu(self.default_stream, entry_name)
             torch.cuda.synchronize()
         if not preload:
             self.loaded_blocks[model_id] = blocks_name
@@ -6000,7 +6011,7 @@ class offload:
         # block whose small modules all joined the base has none)
         return builtins.all(getattr(parent_module, n).is_cuda for parent_module, n, *_ in self.blocks_of_modules[model_id + "/" + blocks_name][-1:])
 
-    @torch.compiler.disable()
+    @_compiler_disabled
     def gpu_unload_blocks(self, model_id, blocks_name, keep_buffer=False):
         # keep_buffer: the model unloads, a block kept in VRAM keeps its buffer and tensors for its next load (kept_buffers)
         # cl = clock.start()
@@ -6146,6 +6157,11 @@ class offload:
 
     def last_used(self):
         return builtins.max((self.used.get(model_id, 0) for model_id in self.active_models_ids), default=0)
+
+    def preloaded_bytes(self):
+        """VRAM of the preloaded blocks (a manual VRAM Preload or the automatic preload) of the models loaded now: what park() would keep
+        for their next call beyond their bases."""
+        return builtins.sum(size for model_id in self.active_models_ids for name, size in self.preloaded_blocks_per_model[model_id].items() if self.block_in_vram(model_id, name))
 
     def parked_bytes(self):
         """VRAM the parked models would give back (park), for the plans of the other models: their preloaded blocks, with release "models" or
@@ -6885,7 +6901,7 @@ class offload:
 
 
 
-    @torch._dynamo.disable
+    @_compiler_disabled
     def _pre_check(self, module):
         model_id    = getattr(module, "_mm_model_id", None)
         blocks_name = getattr(module, "_mm_blocks_name", None)
@@ -7191,6 +7207,10 @@ def {fname}(module, *args, **kwargs):
         if self.models is None:
             return
 
+        if gc.get_freeze_count():
+            # objects set aside by gc.freeze() (a caller's, e.g. after a model load) are collected again: the models released here,
+            # which their owners drop after this call and which reference cycles keep alive, go at the next collection
+            gc.unfreeze()
         self.unload_all()
         runtime._released(self)  # the owners of state kept beside its models (an engine suspended with them) free it
         for model_id in builtins.list({*self.block_slots, *self.slot_pools}): # slots and buffers kept with CUDA graphs for the next generations

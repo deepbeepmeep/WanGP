@@ -10,7 +10,7 @@ from shared.deepy.assets import whisper_download_def
 from shared.mps import mps_device_or
 from shared.utils import files_locator as fl
 
-from .omnivoice.pipeline import (
+from .omnivoice.settings import (
     OMNIVOICE_ASSET_DIR,
     OMNIVOICE_AUDIO_TOKENIZER_DIR,
     OMNIVOICE_AUDIO_TOKENIZER_WEIGHTS,
@@ -24,7 +24,6 @@ from .omnivoice.pipeline import (
     is_omnivoice_voice_instruction,
     normalize_omnivoice_voice_instruction,
 )
-from .omnivoice.modeling_omnivoice import _resolve_instruct
 from .omnivoice.utils.voice_design import _INSTRUCT_VALID_EN, _INSTRUCT_VALID_ZH, _ZH_RE
 from .prompt_enhancers import TTS_MONOLOGUE_PROMPT, TTS_QWEN3_DIALOGUE_PROMPT
 
@@ -132,6 +131,7 @@ def _read_omnivoice_text_input(value):
 
 
 def _validate_omnivoice_instruction(instruction, target_text):
+    from .omnivoice.modeling_omnivoice import _resolve_instruct  # here: the model code is heavy to import
     try:
         _resolve_instruct(instruction, use_zh=bool(target_text and _ZH_RE.search(target_text)))
     except ValueError as error:

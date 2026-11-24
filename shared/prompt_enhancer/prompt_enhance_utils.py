@@ -244,7 +244,10 @@ def generate_cinematic_prompt(
     template_context=None,
     inject_duration=True,
     duration_instructions="",
+    vision=None,
 ) -> List[str]:
+    """vision: a model's own vision stage for an enhancer mode (shared.prompt_enhancer.images.vision_settings), which replaces the image
+    captions: its instructions, given each request, the answer's token budget and the reading resolution."""
     prompts = [prompt] if isinstance(prompt, str) else prompt
     check_cancelled()
 
@@ -296,6 +299,7 @@ def generate_cinematic_prompt(
             template_context=template_context,
             inject_duration=inject_duration,
             duration_instructions=duration_instructions,
+            vision=vision,
         )
 
     return prompts
@@ -413,8 +417,14 @@ def _generate_i2v_prompt(
     template_context=None,
     inject_duration=True,
     duration_instructions="",
+    vision=None,
 ) -> List[str]:
-    if hasattr(image_caption_model, "generate_image_captions"):
+    if vision is not None and hasattr(image_caption_model, "generate_image_captions"):
+        # the model's vision stage reads the images for each request (its answer takes the caption's place)
+        image_captions = ["\n\n".join(image_caption_model.generate_image_captions(first_frames or [], image_contexts=None if image_contexts is None else [image_contexts[index]], offload_manager=offload_manager,
+                          stop_requested=(generation_callbacks or {}).get("stop_requested"), enhancement_progress=(generation_callbacks or {}).get("enhancement_progress"), vision=dict(vision, request=prompt)))
+                          for index, prompt in enumerate(prompts)]
+    elif hasattr(image_caption_model, "generate_image_captions"):
         image_captions = image_caption_model.generate_image_captions(first_frames or [], image_contexts=image_contexts, offload_manager=offload_manager, stop_requested=(generation_callbacks or {}).get("stop_requested"), enhancement_progress=(generation_callbacks or {}).get("enhancement_progress"))
     else:
         image_captions = _generate_image_captions(

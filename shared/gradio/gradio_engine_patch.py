@@ -7,6 +7,8 @@ import tempfile
 from functools import lru_cache, wraps
 from pathlib import Path
 
+from shared.utils.media_settings import MediaSettings
+
 
 def _updateable(fn):
     from gradio.component_meta import get_local_contexts
@@ -63,6 +65,8 @@ def _snapshot_traverse(value, func, is_root):
         # Snapshot entries before recursion/file I/O can let that worker resize
         # the mapping. Keep the original leaves and file-cache processing.
         return {key: _snapshot_traverse(item, func, is_root) for key, item in list(value.items())}
+    if isinstance(value, MediaSettings):  # entries not read yet hold no file data: reading every one would load each gallery item's metadata
+        return value.map_loaded(lambda item: _snapshot_traverse(item, func, is_root))
     if isinstance(value, (list, tuple)):
         return [_snapshot_traverse(item, func, is_root) for item in value]
     return value

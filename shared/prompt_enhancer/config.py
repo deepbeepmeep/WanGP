@@ -14,7 +14,9 @@ MTP_AUTO_SLACK = 512 << 20  # Auto: MTP still pays when it leaves this much of t
 MTP_AUTO_FOUR_DRAFTS_VRAM_GB = 24  # Auto on Qwen3.8 27B: 4 draft tokens from this size, from MTP_AUTO_FOUR_DRAFTS_BONSAI_VRAM_GB with Bonsai, 2 otherwise
 MTP_AUTO_FOUR_DRAFTS_BONSAI_VRAM_GB = 12
 MTP_AUTO_LONG_DRAFTS = 7  # an automatic draft count of 4 on Qwen3.8 27B: this many while the recent drafts are accepted (tool calls, summaries, lists), 4 on the rest
-MTP_AUTO_LONG_BACKENDS = ("gguf", "gguf_q3", "gguf_q2", "gguf_ptq1")  # where the long chain was measured faster
+BONSAI_QUANTIZATIONS = ("gguf_ptq1", "gguf_ptq1_25")  # Qwen3.8 27B as Bonsai 2 and Bonsai 2.5: ternary PTQ1_0 weights in a Hadamard basis
+QWEN38_27B_QUANTIZATIONS = ("gguf", "gguf_q3", "gguf_q2", *BONSAI_QUANTIZATIONS)
+MTP_AUTO_LONG_BACKENDS = QWEN38_27B_QUANTIZATIONS  # where the long chain was measured faster
 INKLING2_DRAFTS, INKLING2_AUTO_DRAFTS = 7, 3  # Inkling 2's drafter: the drafts of its block, and those an automatic count verifies while the recent ones are not all accepted
 MTP_AUTO_NO_OFFLOAD_VRAM_GB = range(13, 17)  # Auto on GPUs of these sizes: MTP only when the whole model stays in VRAM with it. Below, the fit rule: part of the model often streams there anyway
 OTHER_PROGRAMS_VRAM_GIB = 1.5  # the VRAM the desktop and the other programs are expected to hold: Configuration's estimates count it, and a load that more than it slows down says so (other_programs_vram_advice)
@@ -84,7 +86,7 @@ def mtp_auto_drafts(enhancer_enabled, qwen_backend, total_vram_gb) -> int:
     enhancer_no, vram_gb = int(enhancer_enabled or 0), max(0, int(float(total_vram_gb) + 0.5))
     if enhancer_no == 8:
         return INKLING2_AUTO_DRAFTS
-    return 4 if enhancer_no == 7 or enhancer_no == 5 and vram_gb >= (MTP_AUTO_FOUR_DRAFTS_BONSAI_VRAM_GB if qwen_backend == "gguf_ptq1" else MTP_AUTO_FOUR_DRAFTS_VRAM_GB) else 2
+    return 4 if enhancer_no == 7 or enhancer_no == 5 and vram_gb >= (MTP_AUTO_FOUR_DRAFTS_BONSAI_VRAM_GB if qwen_backend in BONSAI_QUANTIZATIONS else MTP_AUTO_FOUR_DRAFTS_VRAM_GB) else 2
 
 
 def mtp_auto_long_drafts(enhancer_enabled, qwen_backend, drafts) -> int:
@@ -125,8 +127,8 @@ def speculative_decoding_ui_state(enhancer_enabled, quantization, value, tokens=
     methods = ["auto", "disabled"]
     if prompt_enhancer_supports_speculative_decoding(enhancer_enabled):
         methods.append("mtp")
-    if int(enhancer_enabled or 0) == 5 and quantization in ("gguf", "gguf_q3", "gguf_q2", "gguf_ptq1") and block_drafters_supported():
-        methods.extend(method for method in BLOCK_DRAFT_METHODS if method != "dspine" or quantization != "gguf_ptq1")
+    if int(enhancer_enabled or 0) == 5 and quantization in QWEN38_27B_QUANTIZATIONS and block_drafters_supported():
+        methods.extend(method for method in BLOCK_DRAFT_METHODS if method != "dspine" or quantization not in BONSAI_QUANTIZATIONS)
     if isinstance(value, str) and value in SPECULATIVE_METHOD_LABELS:
         method, count = value, tokens
     else:
@@ -138,7 +140,7 @@ def speculative_decoding_ui_state(enhancer_enabled, quantization, value, tokens=
         maximum = INKLING2_DRAFTS
     if method in BLOCK_DRAFT_METHODS:
         from .block_draft import block_draft_spec
-        maximum = min(maximum, block_draft_spec(method, bonsai=quantization == "gguf_ptq1")["drafts"])
+        maximum = min(maximum, block_draft_spec(method, bonsai=quantization in BONSAI_QUANTIZATIONS)["drafts"])
     count = (min(maximum, int(count)) if count else SPECULATIVE_AUTO_TOKENS) if maximum else None  # a method just selected starts on the automatic count
     counts = [("Auto", SPECULATIVE_AUTO_TOKENS), *[(str(item), item) for item in range(1, maximum + 1)]] if maximum else []
     # Additional residency near 32K context, including draft weights/cache/state.
@@ -166,7 +168,7 @@ def validate_prompt_enhancer_speculative_decoding(enhancer_enabled: Any, value: 
     enabled = normalize_prompt_enhancer_speculative_decoding(value)
     runtime_mode, _ = speculative_decoding_runtime(enabled)
     if runtime_mode in BLOCK_DRAFT_METHODS and int(enhancer_enabled or 0) != 5:
-        raise ValueError("DSpark, DFlash2 and DSpine require Qwen3.8-27B (DSpark and DFlash2 also Bonsai 2 27B).")
+        raise ValueError("DSpark, DFlash2 and DSpine require Qwen3.8-27B (DSpark and DFlash2 also Bonsai 27B).")
     if runtime_mode not in (0, PROMPT_ENHANCER_SPECULATIVE_DECODING_AUTO) and not prompt_enhancer_supports_speculative_decoding(enhancer_enabled):
         if int(enhancer_enabled or 0) == 3:
             raise ValueError("Speculative decoding is not available with Qwen3.5-4B.")
@@ -201,9 +203,9 @@ def resolve_prompt_enhancer_speculative_decoding(enhancer_enabled: Any, value: A
             total_vram_gb = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / (1024 ** 3)
         except Exception:
             total_vram_gb = 0
-    bonsai = enhancer_no == 5 and qwen_backend == "gguf_ptq1"
+    bonsai = enhancer_no == 5 and qwen_backend in BONSAI_QUANTIZATIONS
     detected_vram_gb = max(0, int(float(total_vram_gb) + 0.5))
-    model_label = "Bonsai PTQ1" if bonsai else {4: "Qwen3.5-9B", 6: "Qwen3.8-9B", 7: "Qwen3.8 Flash-Next", 8: "Inkling 2 Mini"}.get(enhancer_no, "Qwen3.8-27B")
+    model_label = ("Bonsai 2.5 PTQ1" if qwen_backend == "gguf_ptq1_25" else "Bonsai 2.0 PTQ1") if bonsai else {4: "Qwen3.5-9B", 6: "Qwen3.8-9B", 7: "Qwen3.8 Flash-Next", 8: "Inkling 2 Mini"}.get(enhancer_no, "Qwen3.8-27B")
     drafts = mtp_auto_drafts(enhancer_no, qwen_backend, total_vram_gb)
     long_drafts = mtp_auto_long_drafts(enhancer_no, qwen_backend, drafts)
     drafter = own_drafter_label(enhancer_no)
@@ -221,7 +223,7 @@ def resolve_prompt_enhancer_speculative_decoding(enhancer_enabled: Any, value: A
     if sizes is None and bonsai:
         if float(total_vram_gb) > 10:
             return enabled, f"{enabled_for}: {float(total_vram_gb):.2f} GiB VRAM detected (more than 10 GiB)."
-        return 0, f"Speculative Decoding disabled automatically for Bonsai PTQ1: {float(total_vram_gb):.2f} GiB VRAM detected (10 GiB or less)."
+        return 0, f"Speculative Decoding disabled automatically for {model_label}: {float(total_vram_gb):.2f} GiB VRAM detected (10 GiB or less)."
     if sizes is not None:
         needed, extra, available = sizes
         gib = lambda nbytes: f"{nbytes / 2**30:.1f}"

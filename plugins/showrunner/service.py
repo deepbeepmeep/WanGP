@@ -90,8 +90,21 @@ class Showrunner:
                 facts["strip"] = production.rel(media.filmstrip(path, production.folder / "cache" / f"{key}-strip.jpg"))
         return facts
 
+    def _follow_own_audio(self, production, shot_id: str) -> str | None:
+        """A shot given audio of the user's whose model follows no audio takes the template that does (the one it would get with no model chosen): the template's label, when it changed."""
+        doc = production.snapshot()
+        shot, catalog = model.find(doc["shots"], shot_id, "shot"), self.catalog(doc)
+        entry = templates.resolve(catalog, shot["generation"].get("template"))
+        if shot["generation"].get("template") == "gen_video" or entry is None or entry["audio"] or entry["soundtrack"] or not templates.own_audio(shot):
+            return None
+        able = templates.resolve(catalog, templates.template_for(doc, shot, catalog))
+        if able is None or not (able["audio"] or able["soundtrack"]):
+            return None
+        production.apply([{"op": "update_shot", "shot": shot_id, "fields": {"generation": {"template": templates.entry_name(able)}}}])
+        return able.get("label") or able["name"]
+
     def upload(self, production_id: str, filename: str, data_path: Path, role: str = "bin", target: str | None = None) -> dict[str, Any]:
-        """Import a dropped file into the production's media folder, then use it as: bin, song, reference, cast (target = cast id or new), start / end (target = shot id: the picture it starts or ends on), line (target = "shot:index": the user's recording of that dialogue line), take (target = shot id; a sound
+        """Import a dropped file into the production's media folder, then use it as: bin, song, reference, cast (target = cast id or new), start / end (target = shot id: the picture it starts or ends on), line (target = "shot:index": the user's recording of that dialogue line), audio (target = shot id: the user's own audio, which the shot follows as its soundtrack), take (target = shot id; a sound
         plays over the edit from that shot), shot (a video or a picture as a new shot, target = its position or the end), painted (target = "shot:frame",
         a remake's painted frame), track (narration, score or effects over the edit, from shot target or 0 s) or subtitles (an SRT file)."""
         production = self.store.get(production_id)
@@ -143,6 +156,20 @@ class Showrunner:
             line = dialogue[int(index)]
             line.update(audio=relative, own=True, voice="", spoken=model.line_key(line), duration_s=facts["duration_s"])
             production.apply([{"op": "update_shot", "shot": shot_id, "fields": {"dialogue": dialogue}}])
+            if template := self._follow_own_audio(production, shot_id):
+                facts["template"] = template
+        elif role == "audio":  # the user's own audio for a shot (target its id): its soundtrack, which the picture follows, the lips on the words
+            if facts["kind"] != "audio":
+                raise ValueError("A shot's audio is a sound file.")
+            shot = model.find(production.snapshot()["shots"], target, "shot")
+            if shot.get("audio_slice"):
+                raise ValueError(f"{shot['title'] or shot['id']} follows its part of the song: its lips sing it.")
+            fields = {"generation": {"settings": {"audio_guide": relative}}, "audio_part": None}
+            if (length := round(float(facts["duration_s"] or 0.0) + 0.1, 2)) > float(shot["duration_s"] or 0.0):  # the shot holds all of it
+                fields["duration_s"] = length
+            production.apply([{"op": "update_shot", "shot": shot["id"], "fields": fields}])
+            if template := self._follow_own_audio(production, shot["id"]):
+                facts["template"] = template
         elif role in ("start", "end"):  # a picture the shot starts or ends on, in place of a frame of another shot or the shot before it
             if facts["kind"] != "image":
                 raise ValueError("A start or end picture is an image.")
@@ -639,8 +666,9 @@ class Showrunner:
             raise ValueError("This shot has no take with saved settings yet: use Render now.")
         tier = take.get("tier")
         ends = {"image_start", "image_end"}
-        if shot.get("continues") or shot.get("start_from") or shot.get("end_on") or ends & set(take["settings"]) or ends & set(shot["generation"].get("settings") or {}):
-            self.render_directly(production_id, [shot_id], final=tier == "final", new_seed=True)  # its start and end as they are now: another shot's new take, a new picture
+        if shot.get("continues") or shot.get("start_from") or shot.get("end_on") or ends & set(take["settings"]) or ends & set(shot["generation"].get("settings") or {}) or templates.own_audio(shot):
+            # its start, end and the user's audio as they are now: another shot's new take, a new picture, new audio or its part of a split shot's
+            self.render_directly(production_id, [shot_id], final=tier == "final", new_seed=True)
             return {"shot": shot_id, "status": "rendering"}
         settings = production.resolve_settings(take["settings"])
         settings.update({key: value for key, value in shot["generation"].get("settings", {}).items() if key in ("prompt", "alt_prompt", "negative_prompt")})

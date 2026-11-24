@@ -111,8 +111,9 @@ def normalize_shot(shot: dict[str, Any]) -> dict[str, Any]:
     for key, value in {"title": "", "section": "", "intent": "", "camera": "", "cast": [], "dialogue": [], "duration_s": 5.0, "audio_slice": None, "generation": {},
                        "status": "planned", "locked": False, "included": True, "takes": [], "chosen_take": None, "trim": [0.0, None], "speed": 1.0, "sound": True,
                        "transition": {"type": "cut", "duration_s": 0.0}, "notes": "", "updated_by": "", "updated_rev": 0, "cut_extra_words": True, "line_cut": None,
-                       "rendering_with": None, "continues": False, "start_from": None, "end_on": None}.items():  # rendering_with: the shot whose render renders this one too, while it runs
+                       "rendering_with": None, "continues": False, "start_from": None, "end_on": None, "audio_part": None}.items():  # rendering_with: the shot whose render renders this one too, while it runs
         # continues: the shot goes on from the one before it in the edit; start_from / end_on: {shot, at: start|end}, a frame of another shot's take as its first or last frame
+        # audio_part: [start_s, end_s | None], the seconds of its own audio_guide a part of a split shot plays (None: all of it)
         shot.setdefault(key, copy.deepcopy(value))
     generation = shot["generation"]
     generation.setdefault("template", "gen_video")
@@ -144,7 +145,7 @@ def shot_times(shot: dict[str, Any]) -> dict[str, Any]:
     """A shot's times as numbers: a director may write them as text ("12.5", or a range "42.0-48.1" for a [start, end] pair), which the song
     alignment after every take cannot subtract."""
     shot["duration_s"] = _seconds(shot["duration_s"], "duration_s")
-    for key in ("audio_slice", "trim", "line_cut"):
+    for key in ("audio_slice", "trim", "line_cut", "audio_part"):
         if isinstance(shot[key], str):
             pair = re.fullmatch(r"\s*\[?\s*([\d.]+)\s*s?\s*(?:-|–|to|,)\s*([\d.]+|null|None)?\s*s?\s*\]?\s*", shot[key])
             if pair is None:
@@ -639,7 +640,7 @@ def planned_length(shot: dict[str, Any]) -> float:
     """How long a shot without a take will play: its planned length, or less when someone it shows speaks, as the shot ends after the line (about 0.37 s a word until the line is spoken)."""
     planned = float(shot.get("duration_s") or 0.0)
     lines = [line for line in shot.get("dialogue") or [] if line.get("line") and line.get("speaker") in (shot.get("cast") or [])]
-    if not lines or not planned:
+    if not lines or not planned or (shot.get("generation") or {}).get("settings", {}).get("audio_guide") and not shot.get("audio_slice"):  # a shot given audio plays all of it
         return planned
     spoken = sum(float(line.get("duration_s") or 0.37 * len(_lyric_words(line["line"]))) for line in lines)
     return min(planned, spoken + BETWEEN_LINES * (len(lines) - 1) + AFTER_LINE)
@@ -870,7 +871,7 @@ def shot_range_words(doc: dict[str, Any]) -> str:
     return f"{low:g} to {high:g} s" if low and high else f"at least {low:g} s" if low else f"at most {high:g} s" if high else ""
 GENERATION_SHORTHAND = {"prompt", "negative_prompt", "audio_guide", "image_refs", "image_start", "video_length", "seed", "template", "settings"}
 SHOT_FIELDS = {"title", "section", "intent", "camera", "cast", "dialogue", "duration_s", "audio_slice", "generation", "status", "locked", "included", "chosen_take", "trim", "speed", "sound",
-               "transition", "notes", "cut_extra_words", "source_range", "source_poster", "painted_frames", "seen", "looked", "rendering_with", "continues", "start_from", "end_on"}
+               "transition", "notes", "cut_extra_words", "source_range", "source_poster", "painted_frames", "seen", "looked", "rendering_with", "continues", "start_from", "end_on", "audio_part"}
 SPEEDS = (0.25, 4.0)  # what a browser plays with its sound and the export's filters handle
 CAST_FIELDS = {"name", "role", "description", "images", "master", "voice", "voice_description", "voice_text", "lora", "locked", "looks"}
 MEDIA_SETTINGS = {"image_refs", "image_start", "image_end", "image_guide", "image_mask", "video_guide", "video_mask", "video_source", "audio_guide", "audio_guide2",
@@ -923,6 +924,9 @@ def _set_shot_fields(shot: dict[str, Any], fields: dict[str, Any], by: str, revi
     if unknown:
         raise OperationError(f"Unknown shot fields: {', '.join(sorted(unknown))}.")
     changed = []
+    if "audio_part" not in fields and ((fields.get("generation") or {}).get("settings") or {}).get("audio_guide", shot["generation"].get("settings", {}).get("audio_guide")) \
+            != shot["generation"].get("settings", {}).get("audio_guide"):  # other audio is played whole
+        fields["audio_part"] = None
     for key, value in fields.items():
         if key == "generation":
             generation = shot["generation"]
@@ -1248,6 +1252,9 @@ def _op_split_shot(doc, op, by, revision, base_revision):
     if shot.get("audio_slice"):
         start, end = shot["audio_slice"]
         fields["audio_slice"], shot["audio_slice"] = [round(start + at, 3), end], [start, round(start + at, 3)]
+    elif settings.get("audio_guide"):  # its own audio: the second part follows what comes after the cut, the first part what comes before it
+        start, end = shot.get("audio_part") or [0.0, None]
+        fields["audio_part"], shot["audio_part"] = [round(start + at, 3), end], [start, round(start + at, 3)]
     second = _new_shot(doc, fields, by, revision)
     shot["duration_s"], shot["end_on"] = round(at, 3), None
     settings.pop("image_end", None)

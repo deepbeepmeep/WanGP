@@ -14,7 +14,7 @@ import torchvision.models
 from . import field as nlf_field
 from .nlf_model import NLFModel, NLFModelConfig
 from .multiperson_model import MultipersonNLF
-from .person_detector import PersonDetectorONNX
+from .person_detector import PersonDetector
 
 
 class MeanStdPreproc(nn.Module):
@@ -334,7 +334,6 @@ def _load_safetensors_checkpoint(checkpoint_path: Path) -> Tuple[Dict[str, torch
 def load_multiperson_nlf_eager(
     *,
     checkpoint_path: str | Path,
-    yolox_onnx_path: str | Path,
     device: str | torch.device = 'cuda',
 ) -> MultipersonNLF:
     checkpoint_path = Path(checkpoint_path)
@@ -362,7 +361,7 @@ def load_multiperson_nlf_eager(
 
     body_models, fitters = _build_body_models_and_fitters(state_dict)
 
-    detector = PersonDetectorONNX(str(yolox_onnx_path))
+    detector = PersonDetector()
 
     skeleton_infos = meta['skeleton_infos']
     pad_white_pixels = bool(meta.get('pad_white_pixels', True))

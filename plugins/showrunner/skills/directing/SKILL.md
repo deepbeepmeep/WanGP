@@ -97,6 +97,12 @@ advice's automatic picks.
 - A shot made from another (continued, or a frame of it) goes stale when that shot gets another take or cut: its `stale` says so, and so do
   the warnings and render's `now_stale`. Render it again after the shot it comes from, or tell the user.
 - A dialogue line with `own: true` holds the user's own recording: it drives the shot whatever its speaker's voice, and `speak` keeps it.
+  It drives its shot even with `voices_from_model` (when its speaker is in the shot's cast): render sends only the user's recordings as the
+  soundtrack and writes no line into that shot's prompt.
+- A shot whose settings hold an `audio_guide` and no `audio_slice` follows that audio (the user's Use my audio, or one you gave): it is
+  the shot's soundtrack, kept as its sound, in place of recordings and of the lines the video model would say. Never replace or remove
+  the user's audio; keep its dialogue lines written for the subtitles. `split_shot` gives each part its `audio_part` ([start_s, end_s]
+  of that audio); a continued part hears the end of the part before it first.
   A music video carries no lyrics subtitles unless the user asks for them (`edit(song_subtitles=true)`).
 - A lip-synced shot also takes its exact slice of the song as driving audio, with the template of `cast_shots_lip_synced`: set its
   `audio_slice`. On a cut that plays the song, a shot's `dialogue` holds the lyric sung under it, for the subtitles: `render` never speaks it. Give a shot that shows the singer singing its slice. `render` takes the brief's song, cuts the slice and makes the

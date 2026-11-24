@@ -1,0 +1,23 @@
+Native speaker separation for WanGP
+
+Diarization pipeline: sherpa-onnx v1.13.2 (Xiaomi Corporation, Apache-2.0),
+https://github.com/k2-fsa/sherpa-onnx
+sherpa-onnx/csrc/offline-speaker-diarization-pyannote-impl.h, fast-clustering.cc,
+offline-speaker-diarization-result.cc and speaker-embedding-extractor-general-impl.h,
+reimplemented in PyTorch in diarization.py (same windows, powerset decoding, embeddings
+per chunk and speaker, complete-linkage clustering and segment post-processing). The
+Kaldi filterbank features follow kaldi-native-fbank (Apache-2.0). ONNX Runtime is not used.
+LICENSE_APACHE-2.0 accompanies the implementation.
+
+Segmentation model: pyannote.audio 3.3.2 PyanNet and SincNet (CNRS, MIT),
+https://github.com/pyannote/pyannote-audio, in pyannet.py; SincNet filters computed with
+the asteroid-filterbanks ParamSincFB formula (MIT). Weights: pyannote/segmentation-3.0
+(MIT), https://huggingface.co/pyannote/segmentation-3.0, stored with the SincNet
+filterbank precomputed. LICENSE_PYANNOTE accompanies the code and weights.
+
+Speaker embedding model: 3D-Speaker ERes2Net (Alibaba DAMO Academy, Apache-2.0),
+https://github.com/modelscope/3D-Speaker, in eres2net.py (Res2Net adapted there from
+wenet-e2e/wespeaker, Apache-2.0). Weights: iic/speech_eres2net_base_sv_zh-cn_3dspeaker_16k
+(Apache-2.0), https://www.modelscope.cn/models/iic/speech_eres2net_base_sv_zh-cn_3dspeaker_16k,
+taken from the sherpa-onnx export with its BatchNorm layers folded into the convolutions.
+LICENSE_APACHE-2.0 accompanies the code and weights.

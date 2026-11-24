@@ -1,0 +1,22 @@
+Native BS-RoFormer vocal separation for WanGP
+
+Architecture: lucidrains/BS-RoFormer (MIT, Copyright (c) 2023 Phil Wang).
+https://github.com/lucidrains/BS-RoFormer
+LICENSE_BS_ROFORMER accompanies the code. Rotary positions follow
+rotary-embedding-torch (MIT, Copyright (c) 2021 Phil Wang).
+
+Inference code and chunked separation: audio-separator 0.36.1
+(MIT, Copyright (c) 2023 karaokenerds), separator/uvr_lib_v5/roformer and
+separator/architectures/mdxc_separator.py.
+https://github.com/nomadkaraoke/python-audio-separator
+LICENSE_AUDIO_SEPARATOR accompanies the code.
+
+Changes: inference only (training loss, linear attention and dropout removed),
+the configuration of the one checkpoint WanGP uses fixed in model.py, separate
+q/k/v projections through WanGP's attention kit and shared kernels, weights
+managed by MMGP. audio-separator and ONNX Runtime are not used.
+
+Weights: model_bs_roformer_ep_317_sdr_12.9755 (BS-RoFormer vocals model by
+viperx, distributed with Ultimate Vocal Remover and audio-separator), repacked
+as model_bs_roformer_ep_317_sdr_12.9755_bf16.safetensors: WanGP key names,
+the fused q/k/v projection stored as three matrices, BF16 weights.

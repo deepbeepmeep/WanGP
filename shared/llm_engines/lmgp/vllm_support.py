@@ -21,6 +21,11 @@ def _is_mps_available():
 
 
 def _check_triton_runtime_smoke():
+    from shared.kernels import startup_probes
+    return startup_probes.result("triton", _run_triton_runtime_smoke)
+
+
+def _run_triton_runtime_smoke():
     global _TRITON_SMOKE_CACHE, tl  # Older Triton resolves kernel names from function globals.
     if _TRITON_SMOKE_CACHE is not None:
         return _TRITON_SMOKE_CACHE

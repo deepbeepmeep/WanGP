@@ -9,6 +9,7 @@ import torch
 
 DMAD_SOLVER = "dmad_renoise"
 DMAD_AUDIO_SHIFT = 2.0  # the students' audio grid; video keeps the selected flow shift (12 upstream)
+LCM_SOLVER = "lcm"  # ComfyUI's LCM sampler takes the same step on flow models, on the model's own noise grid
 
 
 def renoise_(sample, denoised, sigma_next, generator, final=False):

@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 
 DRAFT_FEATURES = (5, 23, 41)  # block applications whose input the DSpark drafter reads, with the final hidden states
+REFERENCE_SLOTS = 1000  # offset of the slots of the blocks after the loop when they run on the first pass's states (LoopCD-Logits)
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
 
 
@@ -306,18 +307,31 @@ class Inkling2Core:
 
     # ---- forward ------------------------------------------------------------------------------------------------
     @torch.no_grad()
-    def forward(self, embeds, state, hidden_states=None, features=None):
+    def forward(self, embeds, state, hidden_states=None, features=None, contrast=0.0, reference=None):
         """Runs the new tokens (tokens x hidden) through every block application; returns the final normalized hidden states.
         features: a list that receives the drafter's target features, tokens x 4 x hidden (the states entering the applications
-        DRAFT_FEATURES and the returned states)."""
+        DRAFT_FEATURES and the returned states).
+        contrast: loop contrastive decoding of the hidden states (LoopCD-Hidden, arXiv 2610.02185): the blocks after the loop read its
+        last pass's states extrapolated away from its first pass's, n + contrast * (n - n_first), on the normalized states they read.
+        reference: a list that receives the final normalized hidden states of the blocks after the loop run on the first pass's states
+        (LoopCD-Logits: their own keys, values and convolution inputs, slots offset by REFERENCE_SLOTS)."""
         c = self.c; tokens = embeds.shape[0]; start, end = c.loop
         positions = torch.arange(tokens, device=embeds.device) + state.position
-        hidden = embeds; blocks = embeds.new_zeros(tokens, 0, c.hidden); pre = previous = None
+        hidden = embeds; blocks = embeds.new_zeros(tokens, 0, c.hidden); pre = previous = first = None
         taps = []
         for application, (layer, slot, loop_pass, index) in enumerate(self.schedule):
             if layer == start and index == 0:
                 if loop_pass == 0: pre = (hidden, blocks)
-                else: previous = (blocks[:, pre[1].shape[1] + 1:], hidden); hidden, blocks = pre
+                else:
+                    previous = (blocks[:, pre[1].shape[1] + 1:], hidden); hidden, blocks = pre
+                    if loop_pass == 1: first = previous
+            if layer == end:  # the loop's exit: the states of its last pass are blocks[:, own:] and hidden
+                own = pre[1].shape[1] + 1
+                if reference is not None: exit_first = (torch.cat([blocks[:, :own], first[0]], -2), first[1])
+                if contrast:
+                    last = rms(torch.cat([blocks[:, own:], hidden.unsqueeze(-2)], -2), 1e-6)
+                    guided = last + contrast * (last - rms(torch.cat([first[0], first[1].unsqueeze(-2)], -2), 1e-6))
+                    blocks, hidden = torch.cat([blocks[:, :own], guided[:, :-1].to(blocks.dtype)], -2), guided[:, -1].to(hidden.dtype)
             if features is not None and application in DRAFT_FEATURES: taps.append(hidden)
             messages = self._messages(previous[0], previous[1], index) if loop_pass else None
             new_hidden, _ = self._block(layer, slot, state, hidden, blocks, positions, messages)
@@ -325,7 +339,17 @@ class Inkling2Core:
             hidden = new_hidden
             if hidden_states is not None: hidden_states.append(hidden)
         state.position += tokens
-        final = self._mix(self.w["attn_res.output_query"].view(-1, c.hidden), blocks, hidden)[:, 0]
-        final = rms(final, c.eps, self.w["norm.weight"]).to(embeds.dtype)
+        final = self._final(blocks, hidden, embeds.dtype)
         if features is not None: features.append(torch.stack(taps + [final], 1))
+        if reference is not None:
+            blocks, hidden = exit_first
+            for layer in range(end, c.layers):
+                new_hidden, _ = self._block(layer, layer + REFERENCE_SLOTS, state, hidden, blocks, positions)
+                if layer % c.block == 0: blocks = torch.cat([blocks, hidden.unsqueeze(-2)], -2)
+                hidden = new_hidden
+            reference.append(self._final(blocks, hidden, embeds.dtype))
         return final
+
+    def _final(self, blocks, hidden, dtype):
+        final = self._mix(self.w["attn_res.output_query"].view(-1, self.c.hidden), blocks, hidden)[:, 0]
+        return rms(final, self.c.eps, self.w["norm.weight"]).to(dtype)

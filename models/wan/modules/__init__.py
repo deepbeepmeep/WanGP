@@ -1,9 +1,4 @@
-from shared.attention import pay_attention
-from .model import WanModel
-from .t5 import T5Decoder, T5Encoder, T5EncoderModel, T5Model
-from .tokenizers import HuggingfaceTokenizer
-from .vae import WanVAE
-from .vae2_2 import Wan2_2_VAE
+from shared.startup_imports import lazy_exports
 
 __all__ = [
     'WanVAE',
@@ -15,3 +10,7 @@ __all__ = [
     'HuggingfaceTokenizer',
     'pay_attention',
 ]
+
+# on first use: importing one submodule (posemb_layers for SCAIL 2's handler) would otherwise load the whole model code
+__getattr__ = lazy_exports(__name__, {'pay_attention': 'shared.attention', 'WanModel': '.model', 'T5Decoder': '.t5', 'T5Encoder': '.t5', 'T5EncoderModel': '.t5', 'T5Model': '.t5',
+                                      'HuggingfaceTokenizer': '.tokenizers', 'WanVAE': '.vae', 'Wan2_2_VAE': '.vae2_2'})

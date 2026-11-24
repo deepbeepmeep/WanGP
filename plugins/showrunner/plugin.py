@@ -113,10 +113,9 @@ class WanGPHost:
         return True
 
     def lip_reader(self):
-        """How a shot's lips follow the voice: a function for the shots of one review, whose model goes with it."""
+        """How a shot's lips follow the voice: a function for the shots of one review (the pose models stay in RAM between shots)."""
         from shared.deepy import lip_sync
-        models = lip_sync.load_models()
-        return lambda video, start_s, frames, fps, voice, voice_at: lip_sync.measure(video, start_s, frames, fps, voice, voice_at, models)
+        return lip_sync.measure
 
     def speaker_turns(self, ctx, path) -> list[tuple[str, str]]:
         """Who is heard in a version, as (speaker number, words) turns, when Nemotron is enabled in the Deepy configuration; [] otherwise."""

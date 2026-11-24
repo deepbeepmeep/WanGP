@@ -45,7 +45,9 @@ icons = {
     'Resume': '<path d="m8 4 12 8-12 8Z"/>',
     'Early Stop': '<path d="m4 5 10 7-10 7Z"/><path d="M19 5v14"/>',
     'Add New Prompt To Queue': '<path d="M4 5h11M4 10h11M4 15h6M17 13v8m-4-4h8"/>',
+    'Check Cache Size': '<path d="M3 17a9 9 0 1 1 18 0H3Zm9-5 4-4M5 12l2 1m5-8v2m7 5-2 1"/><circle cx="12" cy="13" r="1"/>',
 }
+icons['Clear Cache Now'] = icons['Delete']
 icon_css = []
 for index, (label, paths) in enumerate(icons.items()):
     svg = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">{paths}</svg>'

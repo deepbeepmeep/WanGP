@@ -10,7 +10,7 @@ const trackKey = track => `${track.path}|${track.start_s}`;
 function plannedLength(shot, songDriven) {
   const planned = shot.duration_s || 4;
   const lines = songDriven ? [] : (shot.dialogue || []).filter(line => line.line && (shot.cast || []).includes(line.speaker));
-  if (!lines.length) return planned;
+  if (!lines.length || (shot.generation?.settings?.audio_guide && !shot.audio_slice)) return planned;  // a shot given audio plays all of it
   const spoken = lines.reduce((total, line) => total + (line.duration_s || 0.37 * (line.line.match(/[\w']+/g) || []).length), 0);
   return Math.min(planned, spoken + 0.3 * (lines.length - 1) + 0.35);
 }

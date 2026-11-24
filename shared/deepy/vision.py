@@ -9,10 +9,6 @@ import torch
 from PIL import Image
 
 from shared.deepy.image_channels import upright
-from shared.llm_engines.lmgp.models.qwen3_5 import Qwen3_5ForCausalLM
-from shared.llm_engines.lmgp.models.inkling2 import Inkling2ForCausalLM
-from shared.llm_engines.lmgp.models.qwen4_exp import Qwen4ExpForCausalLM
-from shared.prompt_enhancer.qwen35_vl import TEXT_MODEL_ID as _TEXT_MODEL_ID, VISION_MODEL_ID as _VISION_MODEL_ID, _prepare_multimodal_vllm_prompt, vision_beside_text
 from shared.utils.video_decode import decode_video_frame_indices_ffmpeg
 
 
@@ -35,6 +31,11 @@ VISION_QA_SYSTEM_PROMPT = "Answer the user's question about the labeled visual i
 
 
 def can_keep_text_resident(runtime, manager) -> bool:
+    # the model classes and the Qwen 3.5 VL helpers load with the first model: imported at Deepy's import, they would load every LM engine at startup
+    from shared.llm_engines.lmgp.models.inkling2 import Inkling2ForCausalLM
+    from shared.llm_engines.lmgp.models.qwen3_5 import Qwen3_5ForCausalLM
+    from shared.llm_engines.lmgp.models.qwen4_exp import Qwen4ExpForCausalLM
+    from shared.prompt_enhancer.qwen35_vl import TEXT_MODEL_ID as _TEXT_MODEL_ID, VISION_MODEL_ID as _VISION_MODEL_ID
     if runtime is None or manager is None or not isinstance(runtime.model, (Qwen3_5ForCausalLM, Qwen4ExpForCausalLM, Inkling2ForCausalLM)):
         return False
     if manager.models.get(_TEXT_MODEL_ID) is not runtime.model or _TEXT_MODEL_ID not in manager.active_models_ids:
@@ -73,6 +74,7 @@ def resident_inspection(runtime, caption_model, manager):
     is lent to the tower: the context goes to RAM and comes back afterwards."""
     from mmgp import runtime as mmgp_runtime
     from shared.prompt_enhancer.qwen35_assistant_runtime import _ASSISTANT_PREFILL_CHUNK_TOKENS
+    from shared.prompt_enhancer.qwen35_vl import vision_beside_text
 
     model = runtime.model
     lend = not mmgp_runtime.dynamic_preload(model)
@@ -130,12 +132,23 @@ def prepare_inspection_image(image: Any, max_edge: int | None = None, max_pixels
         right = max(left + 1, min(width, math.ceil(x_max * width / 1000)))
         bottom = max(top + 1, min(height, math.ceil(y_max * height / 1000)))
         prepared = prepared.crop((left, top, right, bottom))
+    prepared.info["inspection_source_size"] = prepared.size  # before any shrink: how much detail the inspector loses (resize and thumbnail keep info)
     if max_pixels is not None and prepared.width * prepared.height > int(max_pixels):
         scale = math.sqrt(int(max_pixels) / (prepared.width * prepared.height))
         prepared = prepared.resize((max(1, math.floor(prepared.width * scale)), max(1, math.floor(prepared.height * scale))), Image.Resampling.LANCZOS)
     elif max_edge is not None:
         prepared.thumbnail((int(max_edge), int(max_edge)), Image.Resampling.LANCZOS)
     return prepared
+
+
+def inspection_shrink(images: list[Image.Image], max_pixels: int | None = None) -> float:
+    """The largest linear shrink from a prepared image's source region to what the inspector reads (at most max_pixels each)."""
+    shrinks = [math.sqrt(math.prod(image.info.get("inspection_source_size", image.size)) / min(image.width * image.height, max_pixels or math.inf)) for image in images]
+    return round(max(shrinks, default=1.0), 2)
+
+
+def local_inspection_pixels(processor: Any, max_pixels_per_image: int | None = None) -> int:
+    return _inspection_image_size(processor, max_pixels_per_image)[0]["longest_edge"]
 
 
 def resize_inspection_image(image: Any, max_edge: int) -> Image.Image:
@@ -173,6 +186,7 @@ def _inspection_image_size(processor: Any, max_pixels_per_image: int | None = No
 
 
 def build_image_question_prompt(caption_model: Any, processor: Any, image: Any, question: str, system_prompt: str | None = None, image_labels: list[str] | None = None, *, max_images: int = VISION_MAX_IMAGES, max_pixels_per_image: int | None = None, resident: bool = False):
+    from shared.prompt_enhancer.qwen35_vl import _prepare_multimodal_vllm_prompt
     question = str(question or "").strip()
     if len(question) == 0:
         raise ValueError("Vision question is empty.")

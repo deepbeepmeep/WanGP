@@ -226,7 +226,7 @@ def _regular_hadamard(size, device, dtype):
         h = torch.kron(h, h4)
         current_size *= 4
     h = h.mul(size ** -0.5)
-    _HADAMARD_CACHE[key] = cuda_graphs.register_constant(h)  # kept for the process: CUDA graphs read it at its address
+    h = _HADAMARD_CACHE[key] = cuda_graphs.register_constant(h)  # kept for the process: CUDA graphs read it at its address
     return h
 
 

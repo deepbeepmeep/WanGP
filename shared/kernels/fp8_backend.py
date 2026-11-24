@@ -59,6 +59,11 @@ def resolve_backend(selection):
 
 
 def _probe_wgp_fp8():
+    from shared.kernels import startup_probes
+    return startup_probes.result("fp8", _selftest_wgp_fp8)
+
+
+def _selftest_wgp_fp8():
     """wgpkernels.fp8 when installed with its library and its selftest passes on this GPU, else None."""
     import importlib
     try:

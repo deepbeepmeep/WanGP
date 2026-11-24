@@ -1062,6 +1062,10 @@ class family_handler():
             from preprocessing.depth_anything_v3.assets import query_download_def as query_depth_files
 
             download_def.append(query_depth_files(metric=True))
+        elif test_lynx(base_model_type):
+            from preprocessing.face_analysis.assets import query_download_def as query_face_files
+
+            download_def.append(query_face_files(("detection", "recognition_ir_se50")))
 
         return download_def
 

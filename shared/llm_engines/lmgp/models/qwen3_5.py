@@ -642,6 +642,7 @@ class Qwen3_5TextRotaryEmbedding(nn.Module):
         self.max_position_embeddings = int(getattr(config, "max_position_embeddings", 32768))
         self.rope_theta = rope_theta
         self.rotary_dim = rotary_dim
+        self._freq_cache = None
 
     def prepare_sequence_state(self, max_batch_size: int, device: torch.device, dtype: torch.dtype):
         # the table the decoding graphs read, made before their capture and held as engine state while the runtime lives
@@ -649,6 +650,14 @@ class Qwen3_5TextRotaryEmbedding(nn.Module):
 
     def release_sequence_state(self):
         self._freq_cache = None
+
+    def freq_table(self, device, max_position):
+        """The engine's registered table when it covers max_position: the shared cache may have been cleared since (an engine closed while
+        another was prepared) and a new table there is no state of the graphs, which would read it at an address they do not know."""
+        table = self._freq_cache
+        if table is None or table.device != device or table.shape[0] < max_position:
+            table = _build_mrope_freq_cache(device, max_position=max_position, rotary_dim=self.rotary_dim, rope_theta=self.rope_theta)
+        return table
 
     def apply_interleaved_mrope(self, freqs: torch.Tensor) -> torch.Tensor:
         freqs_t = freqs[0]
@@ -666,12 +675,7 @@ class Qwen3_5TextRotaryEmbedding(nn.Module):
         max_position = self.max_position_embeddings
         if not (position_ids.is_cuda and torch.cuda.is_current_stream_capturing()):
             max_position = max(max_position, int(position_ids.max().item()) + 1)
-        freq_cache = _build_mrope_freq_cache(
-            position_ids.device,
-            max_position=max_position,
-            rotary_dim=self.rotary_dim,
-            rope_theta=self.rope_theta,
-        )
+        freq_cache = self.freq_table(position_ids.device, max_position)
         freqs = torch.stack([freq_cache[position_ids[axis].long()] for axis in range(3)], dim=0)
         freqs = self.apply_interleaved_mrope(freqs)
         emb = torch.cat((freqs, freqs), dim=-1)
@@ -796,9 +800,28 @@ def _flash_attention(
     return padded
 
 
+class DirectionProjection(nn.Module):
+    """Removes scale times their component along a unit direction from the rows of a residual writer's output, in place: the rank-one
+    uncensoring adapter B (A x) with B = -r, A = r^T W of Bonsai 2.5 (y - scale * r (r . y)), whatever the basis of the layer's input."""
+
+    def __init__(self, direction: torch.Tensor, scale: float, use_triton: bool):
+        super().__init__()
+        self.register_buffer("direction", direction.to(torch.float32))
+        self.scale, self.use_triton = float(scale), use_triton
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.use_triton and x.is_cuda:
+            from shared.kernels.direction_projection_triton import project_out_
+            return project_out_(x, self.direction, self.scale)
+        flat = x.view(-1, x.shape[-1])
+        flat.sub_(torch.outer(flat.float() @ self.direction * self.scale, self.direction).to(x.dtype))
+        return x
+
+
 class Qwen3_5Block(nn.Module):
     def __init__(self, config, layer_idx: int):
         super().__init__()
+        self.refusal_projection = None  # a DirectionProjection of the outputs of attention and FFN, set by the loader of an uncensored checkpoint
         self._owner = None  # a weak reference to the model, which sets it: its residency decides the concurrent projections (_branches)
         triton_kernels = _triton_kernels(config)
         self.layer_type = str(config.layer_types[layer_idx])
@@ -1301,7 +1324,10 @@ class Qwen3_5Block(nn.Module):
             z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
             # the dense BF16 alpha/beta projection of a speculative verification row by row through the single-token GEMV (_rows_linear)
             ab_rows = 1 < batch_size * seq_len <= _AB_ROWS_GEMV_MAX and _slow_bf16_gemm(hidden_states)
-            a, b = (_rows_linear(self.ssm_ab, hidden_states) if ab_rows else self.ssm_ab(hidden_states)).chunk(2, dim=-1)
+            # Bonsai 2 stores alpha/beta in BF16, Bonsai 2.5 in FP32: an FP32 pair reads FP32 rows, as llama.cpp computes it
+            ab_input = hidden_states if self.ssm_ab.weight.dtype == hidden_states.dtype else hidden_states.to(self.ssm_ab.weight.dtype)
+            a, b = (_rows_linear(self.ssm_ab, ab_input) if ab_rows else self.ssm_ab(ab_input)).to(hidden_states.dtype).chunk(2, dim=-1)
+            ab_input = None
         elif self.attn_gate_ab is None:
             mixed_qkv_input = self.attn_qkv(hidden_states)
             z = self.attn_gate(hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
@@ -1617,6 +1643,8 @@ class Qwen3_5Block(nn.Module):
             x_list = [hidden_states]
             hidden_states = None
             hidden_states = self._forward_linear_attention(x_list, layer_idx, past_key_values, attention_mask)
+        if self.refusal_projection is not None:
+            self.refusal_projection(hidden_states)
 
         norm_state_list = [hidden_states, residual]
         hidden_states = residual = None
@@ -1631,6 +1659,8 @@ class Qwen3_5Block(nn.Module):
             hidden_states = self.ffn_down(gate_up_list)
         else:
             hidden_states = self.ffn_down(self.mlp_act_fn.forward_list(gate_up_list))
+        if self.refusal_projection is not None:
+            self.refusal_projection(hidden_states)
         return hidden_states, residual
 
 

@@ -43,6 +43,7 @@ FUSED_RESIDUAL = "fused_residual" not in os.environ.get("WGP_INKLING2_DISABLE", 
 DOORBELL_FREE = "doorbell_free" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(",")  # with every expert in VRAM, decoding passes leave out the CPU expert job (its ask, wait and read kernels); disabled: the job runs in every pass (the same bits)
 EXPERT_CACHE = 128  # interim experts: decoded experts kept in VRAM between eager passes, all layers together (16 MiB each in BF16)
 MIX_EPS = 1e-6  # of the norm of the states the learned queries read
+LOOP_CONTRAST = 0.3  # the strength of loop contrastive decoding when it is on (Deepy option deepy_loop_contrast): arXiv 2610.02185's range for generation
 FUSED = "fused" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(",")  # comparison switch of the fused row kernels (shared.kernels.row_fused_triton)
 FUSED_ATTENTION = FUSED and "fused_attention" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(",")  # and of the one-kernel attention of short passes (shared.kernels.ring_attention_triton)
 SHARED_TILES = "shared_tiles" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(",")  # the tokens of a short pass share the key / value tiles of the one-kernel attention (one read and dequantization for a verification window); disabled, a program per token (the previous path, other rounding)
@@ -657,6 +658,7 @@ class Inkling2ForCausalLM(nn.Module):
         self.unembed = Inkling2Head(c)
         self.schedule = c.schedule()
         self.mtp = None  # the DSpark drafter (inkling2_draft.Inkling2Draft on mtp.safetensors), when speculative decoding is on
+        self.loop_contrast = 0.0  # loop contrastive decoding (LoopCD-Hidden, arXiv 2610.02185): the strength of the extrapolation of the loop's last pass away from its first; 0: off
         self._block_draft, self._block_draft_tree, self._draft_features = False, None, None  # its drafts verify as a chain
 
     @property
@@ -702,12 +704,12 @@ class Inkling2ForCausalLM(nn.Module):
     def forward(self, input_ids=None, positions=None, inputs_embeds=None, draft_features=None, **_kwargs):
         c = self.c
         hidden = self.embed_ids(input_ids.reshape(-1)) if inputs_embeds is None else inputs_embeds.reshape(-1, c.hidden)
-        tokens, start = hidden.shape[0], c.loop[0]
+        tokens, (start, end) = hidden.shape[0], c.loop
         sequence = self._sequence_positions(tokens, hidden.device)
         if draft_features is None and self._block_draft:  # an eager pass (a prompt chunk): the drafter's features of its tokens, for the runner
             draft_features = self._draft_features = torch.empty(1, tokens, (len(DRAFT_FEATURES) + 1) * c.hidden, dtype=hidden.dtype, device=hidden.device)
         carry = [hidden, torch.zeros(tokens, 0, c.hidden, dtype=torch.float32, device=hidden.device)]
-        hidden = before = message_states = message_query = None
+        hidden = before = message_states = message_query = first = None
         queries, kv_queries = self.middle_cycle_cross_pass_queries.unflatten(0, (-1, 2)), self.middle_cycle_cross_pass_kv_queries.unflatten(0, (-1, 2))
         # a prompt pass: the experts out of VRAM stream ahead of their use (mmgp.expert_stream), a stream per walk over the banks: the loop reads its banks three times
         streamed = STREAMED and tokens > CONV_FUSED_ROWS and carry[0].is_cuda and not torch.cuda.is_current_stream_capturing()
@@ -722,7 +724,13 @@ class Inkling2ForCausalLM(nn.Module):
                         before = list(carry)
                     else:  # the next pass restarts from the loop's input and reads the previous pass: its states since its first boundary
                         message_states = with_state(carry[1][:, before[1].shape[1] + 1:], carry[0])
+                        if loop_pass == 1 and self.loop_contrast: first = message_states
                         carry = list(before)
+                if layer == end and self.loop_contrast:  # the loop's exit: the blocks after it read its last pass's normalized states extrapolated away from its first pass's
+                    own = before[1].shape[1] + 1
+                    guided = torch.lerp(first, with_state(carry[1][:, own:], carry[0]), 1.0 + self.loop_contrast)
+                    carry = [guided[:, -1].to(carry[0].dtype).contiguous(), torch.cat([carry[1][:, :own], norm(guided[:, :-1].contiguous(), MIX_EPS)], -2)]
+                    first = guided = None
                 if draft_features is not None and application in DRAFT_FEATURES:
                     self._tap(draft_features, DRAFT_FEATURES.index(application), carry[0])
                 if loop_pass:

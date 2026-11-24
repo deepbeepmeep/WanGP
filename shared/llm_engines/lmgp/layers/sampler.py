@@ -257,6 +257,8 @@ class Sampler(nn.Module):
         probs = torch.softmax(logits, dim=-1)
         noise = torch.empty_like(probs).exponential_(1, generator=generator).clamp_min_(1e-10)
         sample_tokens = probs.div_(noise).argmax(dim=-1).reshape(-1)
+        if top_ks is not None:  # greedy rows (top_k 1): the first token at the largest logit, as the verification of drafts takes it; the mask keeps every token of an exact tie (BF16 logits tie)
+            sample_tokens = torch.where(top_ks.reshape(-1) == 1, logits.argmax(dim=-1).reshape(-1), sample_tokens)
         return sample_tokens
 
 

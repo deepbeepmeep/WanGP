@@ -148,7 +148,7 @@ footer .built-with > img {
     color: var(--studio-disabled-text) !important;
     box-shadow: none !important;
 }
-.wangp-studio-button:not(.resolution-picker-toggle, [id="wangp_finetune_editor_close"]) {
+.wangp-studio-button:not(.resolution-picker-toggle, .wangp-action-pill, [id="wangp_finetune_editor_close"]) {
     --button-secondary-background-fill: var(--studio-button);
     --button-secondary-background-fill-hover: var(--studio-button-hover);
     --button-secondary-text-color: var(--studio-button-text);
@@ -267,9 +267,9 @@ footer .built-with > img {
 .wangp-studio-icon::before {
     content: "";
     display: block;
-    flex: 0 0 12px;
-    width: 12px;
-    height: 12px;
+    flex: 0 0 var(--studio-icon-size, 12px);
+    width: var(--studio-icon-size, 12px);
+    height: var(--studio-icon-size, 12px);
     background: currentColor;
     mask: var(--studio-icon) center / contain no-repeat;
     pointer-events: none;

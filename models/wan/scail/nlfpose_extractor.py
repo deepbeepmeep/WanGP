@@ -81,8 +81,6 @@ class NLFPoseExtractor:
         from shared.utils.download import process_files_def_if_needed
 
         process_files_def_if_needed(query_download_def())
-        self.det_model_path = fl.locate_file("pose/yolox_l.onnx")
-        self.pose_model_path = fl.locate_file("pose/dw-ll_ucoco_384.onnx")
 
         # Try to locate NLFPose model
         self.nlfpose_model_path = self._locate_nlfpose_model()
@@ -127,11 +125,7 @@ class NLFPoseExtractor:
     def wholebody(self) -> Wholebody:
         """Lazy load DWPose/YOLOX detector."""
         if self._wholebody is None:
-            self._wholebody = Wholebody(
-                self.det_model_path,
-                self.pose_model_path,
-                device=self.device
-            )
+            self._wholebody = Wholebody()
         return self._wholebody
 
     @property

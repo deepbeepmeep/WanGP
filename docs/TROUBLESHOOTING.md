@@ -209,6 +209,12 @@ python wgp.py --attention sage2 --profile 4 --fp16
 
 ### Gradio Interface Problems
 
+#### Gradio Media Cache Uses Too Much Disk Space
+
+Open **Configuration → Outputs → Gradio Media Cache** and select **Check Cache Size**. **Clear Cache Now** removes eligible temporary media copies and video previews. WanGP keeps saved outputs, uploads from the current run, and files used as component defaults. Run manual cleanup with an empty generation queue.
+
+Automatic cleanup defaults to **Manual only**. Choose **Clear on startup** to remove copies from earlier runs, or choose a retention period to remove older copies at startup and every 30 minutes. Select **Save Settings** to apply the policy. The panel shows the cache folder used by Gradio, including a custom `GRADIO_TEMP_DIR`. Other apps using the same folder may need to reload media after cleanup.
+
 #### Port Already in Use
 **Problem**: "Port 7860 is already in use"
 **Solution**:

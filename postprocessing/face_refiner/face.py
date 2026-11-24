@@ -10,7 +10,6 @@ import gc
 import heapq
 import json
 import math
-import os
 
 import numpy as np
 import torch
@@ -148,53 +147,10 @@ def _continuity_cost(box, previous) -> float:
     return math.hypot(cx - previous[0], cy - previous[1]) + abs(size - previous[2]) * 2.0
 
 
-def _estimate_insightface_norm(lmk, image_size=112, mode="arcface"):
-    from insightface.utils import face_align
+def _insightface_app(allowed_modules=None):
+    from preprocessing.face_analysis.analysis import FaceAnalysis
 
-    assert lmk.shape == (5, 2)
-    assert image_size % 112 == 0 or image_size % 128 == 0
-    ratio = image_size / (112.0 if image_size % 112 == 0 else 128.0)
-    dst = face_align.arcface_dst * ratio
-    if image_size % 112 != 0:
-        dst[:, 0] += 8.0 * ratio
-    transform = face_align.trans.SimilarityTransform
-    if hasattr(transform, "from_estimate"):
-        return transform.from_estimate(lmk, dst).params[:2]
-    legacy = transform()
-    legacy.estimate(lmk, dst)
-    return legacy.params[:2]
-
-
-def _insightface_app(allowed_modules=None, model_dir=None):
-    import onnxruntime
-    from insightface.app import FaceAnalysis
-    from insightface.model_zoo import model_zoo
-    from insightface.utils import face_align
-
-    available = set(onnxruntime.get_available_providers())
-    providers = [provider for provider in ("CUDAExecutionProvider", "CPUExecutionProvider") if provider in available]
-    onnxruntime.set_default_logger_severity(3)
-    face_align.estimate_norm = _estimate_insightface_norm
-    required = {"det_10g.onnx": "detection", "2d106det.onnx": "landmark_2d_106", "w600k_r50.onnx": "recognition"}
-    missing = [filename for filename in required if not os.path.isfile(os.path.join(model_dir, filename))]
-    if missing:
-        raise FileNotFoundError(f"Missing WanGP-managed InsightFace assets: {', '.join(missing)}")
-    allowed_modules = allowed_modules or ["detection", "recognition"]
-    app = FaceAnalysis.__new__(FaceAnalysis)
-    app.models = {}
-    app.model_dir = model_dir
-    for filename, expected_task in required.items():
-        if expected_task not in allowed_modules:
-            continue
-        model = model_zoo.get_model(os.path.join(model_dir, filename), providers=providers)
-        if model is None or model.taskname != expected_task:
-            raise RuntimeError(f"Unexpected InsightFace model in {filename}")
-        app.models[model.taskname] = model
-    if "detection" not in app.models:
-        raise RuntimeError("WanGP-managed InsightFace assets do not contain a face detector")
-    app.det_model = app.models["detection"]
-    app.prepare(ctx_id=0 if "CUDAExecutionProvider" in providers else -1, det_size=(640, 640))
-    return app
+    return FaceAnalysis(allowed_modules or ["detection", "recognition"])
 
 
 def _embeddings(app, frame: torch.Tensor):
@@ -207,21 +163,10 @@ def _embeddings(app, frame: torch.Tensor):
 
 
 def _release_insightface(app) -> bool:
-    if app is None:
-        return False
-    models = list(app.models.values())
-    app.det_model = None
-    app.models.clear()
-    for model in models:
-        model.session = None
-        center_cache = getattr(model, "center_cache", None)
-        if center_cache is not None:
-            center_cache.clear()
-    models.clear()
-    return True
+    return app is not None and app.release()
 
 
-def select_reference_frame(frames, face_boxes, max_candidates=120, insightface_model_dir=None) -> int:
+def select_reference_frame(frames, face_boxes, max_candidates=120) -> int:
     import cv2
 
     detected = [(index, box) for index, box in enumerate(face_boxes) if box is not None]
@@ -236,7 +181,7 @@ def select_reference_frame(frames, face_boxes, max_candidates=120, insightface_m
     app = None
     observations = []
     try:
-        app = _insightface_app(["detection", "landmark_2d_106"], insightface_model_dir)
+        app = _insightface_app(["detection", "landmark_2d_106"])
         for index, box in candidates:
             faces = app.get(_bgr(frames[index]))
             if not faces:
@@ -269,7 +214,7 @@ def select_reference_frame(frames, face_boxes, max_candidates=120, insightface_m
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         if released:
-            print("[FaceRefine] Unloaded InsightFace ONNX sessions before decoding")
+            print("[FaceRefine] Unloaded face analysis models before decoding")
 
     if not observations:
         return largest_index
@@ -373,13 +318,13 @@ def _detect(frames, detector_path, confidence, abort_callback=None, progress_cal
     return detections
 
 
-def _select_track(frames, detections, identity_track=True, identity_threshold=0.28, identity_reference=None, select="largest", insightface_model_dir=None):
+def _select_track(frames, detections, identity_track=True, identity_threshold=0.28, identity_reference=None, select="largest"):
     use_identity = identity_track and bool(detections and (len(detections[0]) > 1 or identity_reference is not None))
     app = anchor = None
     identity_matches = continuity_matches = conflicts = 0
     if use_identity:
         try:
-            app = _insightface_app(model_dir=insightface_model_dir)
+            app = _insightface_app()
             if identity_reference is not None:
                 candidates = _embeddings(app, identity_reference)
                 if candidates:
@@ -443,7 +388,7 @@ def _select_track(frames, detections, identity_track=True, identity_threshold=0.
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         if released:
-            print("[FaceRefine] Unloaded InsightFace ONNX sessions before refinement")
+            print("[FaceRefine] Unloaded face analysis models before refinement")
     return selected, identity_matches, continuity_matches, conflicts
 
 
@@ -684,7 +629,7 @@ def _associate_tracks(detections, frame_embeddings, identity_threshold=0.28, sho
 
 
 def _select_tracks(frames, detections, face_count=1, identity_threshold=0.28, reference_images=None,
-                   auto_min_face_height=32, auto_min_presence=0.2, insightface_model_dir=None,
+                   auto_min_face_height=32, auto_min_presence=0.2,
                    abort_callback=None, progress_callback=None):
     app = None
     shot_boundaries = _shot_boundaries(frames)
@@ -693,7 +638,7 @@ def _select_tracks(frames, detections, face_count=1, identity_threshold=0.28, re
     frame_embeddings = [[None] * len(boxes) for boxes in detections]
     references = list(reference_images or [])
     try:
-        app = _insightface_app(model_dir=insightface_model_dir)
+        app = _insightface_app()
         for frame_index, boxes in enumerate(detections):
             if callable(abort_callback) and abort_callback():
                 return None
@@ -717,7 +662,7 @@ def _select_tracks(frames, detections, face_count=1, identity_threshold=0.28, re
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         if released:
-            print("[FaceRefine] Unloaded InsightFace ONNX sessions before refinement")
+            print("[FaceRefine] Unloaded face analysis models before refinement")
 
     matches = []
     for reference_index, embedding in enumerate(reference_embeddings):
@@ -806,9 +751,9 @@ def crop_face_track(frames, transform, start=0, stop=None, *, uint8_storage=Fals
     return crops
 
 
-def best_reference_crop(frames, transform, insightface_model_dir=None):
+def best_reference_crop(frames, transform):
     """The track's best face as its stabilized crop: (frame index, uint8 (3, height, width)), chosen by select_reference_frame (large, frontal, mouth closed, sharp)."""
-    frame = select_reference_frame(frames, transform["raw_face_boxes"], insightface_model_dir=insightface_model_dir)
+    frame = select_reference_frame(frames, transform["raw_face_boxes"])
     return frame, crop_face_track(frames, transform, frame, frame + 1, uint8_storage=True)[:, 0]
 
 
@@ -924,11 +869,11 @@ def track_and_crop(frames, detector_path, *, confidence=0.35, crop_factor=2.5, c
                    size_mode="per_frame", identity_track=True, identity_threshold=0.28, identity_reference=None, select="largest",
                    fallback_detector_path=None, fallback_head_frac=0.5, strength_small_face=0.85,
                    strength_large_face=0.85, scale_mode="absolute_px", face_px_small=30.0, face_px_large=120.0,
-                   strength_gamma=1.0, strength_smooth_frames=9, insightface_model_dir=None, abort_callback=None, progress_callback=None):
+                   strength_gamma=1.0, strength_smooth_frames=9, abort_callback=None, progress_callback=None):
     detections = _detect(frames, detector_path, confidence, abort_callback, progress_callback)
     if detections is None:
         return None
-    selected, identity_matches, continuity_matches, conflicts = _select_track(frames, detections, identity_track, identity_threshold, identity_reference, select, insightface_model_dir)
+    selected, identity_matches, continuity_matches, conflicts = _select_track(frames, detections, identity_track, identity_threshold, identity_reference, select)
     print(f"[FaceRefine] tracking: {continuity_matches} by continuity, {conflicts} ambiguous ({identity_matches} resolved by face identity)")
     return _crop_track(frames, selected, confidence=confidence, crop_factor=crop_factor, canvas_width=canvas_width, canvas_height=canvas_height,
                        canvas_mode=canvas_mode, smooth_window=smooth_window, size_smooth_window=size_smooth_window, smooth_method=smooth_method,
@@ -943,11 +888,11 @@ def track_faces(frames, detector_path, *, face_count=1, reference_images=None, c
                 smooth_method="gaussian", size_mode="per_frame", identity_threshold=0.28, fallback_detector_path=None,
                 auto_min_face_height=32, auto_min_presence=0.2, fallback_head_frac=0.5, strength_small_face=0.85, strength_large_face=0.85, scale_mode="absolute_px",
                 face_px_small=30.0, face_px_large=120.0, strength_gamma=1.0, strength_smooth_frames=9,
-                insightface_model_dir=None, abort_callback=None, progress_callback=None):
+                abort_callback=None, progress_callback=None):
     detections = _detect(frames, detector_path, confidence, abort_callback, progress_callback)
     if detections is None:
         return None
-    tracks = _select_tracks(frames, detections, face_count, identity_threshold, reference_images, auto_min_face_height, auto_min_presence, insightface_model_dir,
+    tracks = _select_tracks(frames, detections, face_count, identity_threshold, reference_images, auto_min_face_height, auto_min_presence,
                             abort_callback, progress_callback)
     if tracks is None:
         return None

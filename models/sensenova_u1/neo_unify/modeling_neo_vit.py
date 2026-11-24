@@ -139,6 +139,8 @@ class NEOVisionEmbeddings(nn.Module):
         self.register_buffer("cos_cached_y", None, persistent=False)
         self.register_buffer("sin_cached_y", None, persistent=False)
 
+    cpu_rope_tables = False  # model def `vision_rope_cpu_tables` (U1.6): FP32 tables computed on the CPU like the checkpoint's training code, then moved
+
     def _ensure_rope_cache(self, device: torch.device) -> None:
         if self.cos_cached_x is not None and self.cos_cached_x.device == device:
             return
@@ -147,8 +149,9 @@ class NEOVisionEmbeddings(nn.Module):
             self.rope_dim_part,
             self.max_position_embeddings_vision,
             base=self.rope_theta_vision,
-            device=device,
+            device="cpu" if self.cpu_rope_tables else device,
         )
+        cos, sin = cos.to(device), sin.to(device)
         self.cos_cached_x = cos
         self.sin_cached_x = sin
         self.cos_cached_y = cos

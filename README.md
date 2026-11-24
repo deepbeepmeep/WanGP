@@ -82,7 +82,21 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 
 ## 🔥 Latest Updates : 
-## 23rd of November 2026: WanGP v20.12 - To the Extreme… and a Little Further
+
+
+## 24th of November 2026: WanGP v20.20 - No Time to Wait for a Gen
+
+- **Faster WanGP Startup**: WanGP should be twice as fast to launch
+
+- **Less Time Between Gens**: unchanged LoRAs remains loaded in RAM between two gens, output video can be saved asynchronously when starting a new gen, Hardware NVidia encoding for faster h264/h265 video save. Thanks to *@space3* for the suggestions.
+
+- **Maintenance Tools**: In **Config > Performance** purge your Triton cache (sometime solves performance issues), **Config > Outputs > Gradio Media Cache**, purge temp gradio files, thanks to *@JedsDeadBaby* for the original PlugIn
+
+- **Inkling 2 Mini SpeedUp**: up to 50% faster
+
+- **Qwen3.8 27B - Bonsai 2.5**: the smallest Qwen 3.8 used by Deepy Prime has been upgraded and now is much smarter while still being able to run with 8GB of VRAM
+
+## 22nd of November 2026: WanGP v20.12 - To the Extreme… and a Little Further
 
 - **pi-H3 with optional DWD**: new H3 FL2VA variant **2 or 4 steps**, that claims to be the fastest. **pi-H3 DWD** draws the frames in its last step, so it is **Decoding Without a Decoder**. Choose 2 steps for quick experiments and 4 for more detail. The new **pi-H3 FL2VA 2 Steps / 4 Steps** accelerator profiles bring the same step counts to standard and Pruned FL2VA models while keeping the regular video decoder.
 
@@ -312,12 +326,11 @@ See full changelog: **[Changelog](docs/CHANGELOG.md)**
 
 ## 🚀 Quick Start
 
-Choose one of these four guided installation methods:
+Choose a guided installation method from the list below.
 
 1. **[Bat/SH scripts](#one-click-batsh-script-auto-installer)** — install and maintain WanGP from the included scripts.
 2. **[Pinokio](#one-click-installers)** — use the community installer in Pinokio.
-3. **[Wan2GP Desktop](#one-click-installers)** — use GKArtist's desktop launcher.
-4. **[WanGP Manager](#wangp-manager-experimental-windows)** — the experimental official Windows app for guided installation, launching, updates and rollback.
+3. **[WanGP Manager](#wangp-manager-experimental-windows)** — the experimental official Windows app for guided installation, launching, updates and rollback.
 
 Manual installation instructions follow these options below.
 
@@ -372,16 +385,12 @@ Use this script to manage and switch between your sandboxed environments safely.
 ---
 
 ### One-click Installers
-- Pinokio installer
-Get started instantly with [Pinokio App](https://pinokio.computer/)\
-It is recommended to use in Pinokio the Community Scripts *wan2gp* or *wan2gp-amd* by **Morpheus** rather than the official Pinokio install.
 
-- Wan2GP Desktop by GKArtist
-[Wan2GP Desktop](https://github.com/GKartist75/Wan2GP-Desktop-Tauri) is a desktop launcher for Wan2GP that installs, updates, and runs it from one window — handling Git, Python, CUDA, and PyTorch setup so you don't have to configure them manually.
+In [Pinokio](https://pinokio.computer/), use the *wan2gp* or *wan2gp-amd* community script by **Morpheus**.
 
 ### WanGP Manager (Experimental, Windows)
 
-**The fourth installation method is an experimental Windows x64 app.** WanGP Manager guides you through choosing an installation folder, a WanGP version and the recommended profile for your detected GPU. It installs Python and dependencies for you, then lets you launch WanGP in its own app window or your browser. You can also update a managed installation, try an older build or roll back to a saved version.
+**WanGP Manager is an experimental Windows x64 app.** It guides you through choosing an installation folder, a WanGP version and the recommended profile for your detected GPU. It installs Python and dependencies for you, then lets you launch WanGP in its own app window or your browser. You can also update a managed installation, try an older build or roll back to a saved version.
 
 **Download:** [WanGPManager.exe](https://github.com/deepbeepmeep/WanGP/releases/latest/download/WanGPManager.exe). This permanent link downloads the latest Manager release.
 
@@ -529,7 +538,7 @@ This automated script will:
 
 ## 📦 Installation
 
-See the [four guided installation methods](#-quick-start), including **[WanGP Manager (Experimental, Windows)](#wangp-manager-experimental-windows)** and its permanent download link. The guides below cover manual installation and optional components.
+See the [guided installation methods](#-quick-start), including **[WanGP Manager (Experimental, Windows)](#wangp-manager-experimental-windows)** and its permanent download link. The guides below cover manual installation and optional components.
 
 ### Nvidia
 For detailed installation instructions for different GPU generations:

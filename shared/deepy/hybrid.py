@@ -386,7 +386,9 @@ class HybridService(DeepyService):
 
     @asynccontextmanager
     async def lifespan(self, app, *, base_url, auth=None, voice_language=None, https_port=None):
+        from anyio import create_task_group
         from shared.deepy.server import create_app
+        from shared.gradio.media_cache import scheduled_cleanup
         from shared.utils.plugin_navigation import mount_web_apps
         from starlette.concurrency import run_in_threadpool
         app.mount('/deepy', create_app(self, auth=auth, voice_language=voice_language, https_port=https_port))
@@ -396,7 +398,12 @@ class HybridService(DeepyService):
         try:
             await run_in_threadpool(self._deps.load_queue_action, None, self._state, SimpleNamespace(target=None))
             self.start_generation()
-            yield
+            async with create_task_group() as tasks:
+                tasks.start_soon(scheduled_cleanup, app.get_blocks(), self._deps.get_server_config, self._state)
+                try:
+                    yield
+                finally:
+                    tasks.cancel_scope.cancel()
         finally:
             self.close()
 

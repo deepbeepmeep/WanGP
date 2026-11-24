@@ -1,4 +1,3 @@
---extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ort-cuda-13-nightly/pypi/simple/
 # mmgp is bundled in the mmgp folder; its dependencies:
 optimum-quanto==0.2.7
 safetensors
@@ -14,7 +13,6 @@ tqdm
 imageio
 imageio-ffmpeg
 einops
-rotary-embedding-torch>=0.5.3
 sentencepiece
 tiktoken
 fugashi>=1.2.0
@@ -34,11 +32,7 @@ soundfile
 mutagen
 pyloudnorm
 librosa==0.11.0
-speechbrain==1.0.3
 openai-whisper==20250625
-audio-separator==0.36.1
-pyannote.audio==3.3.2
-sherpa-onnx==1.13.2
 torchcodec==0.10.0
 einshape==1.0
 jax
@@ -62,21 +56,12 @@ ultralytics
 scipy
 pycocotools
 segment-anything
-rembg[gpu]==2.0.65; platform_system != "Darwin"
-rembg==2.0.65; platform_system == "Darwin"
-onnxruntime-gpu==1.22.0; python_version < "3.11" and platform_system != "Darwin"
-onnxruntime-gpu==1.25.0.dev20260210001; python_version >= "3.11" and platform_system != "Darwin"
-onnxruntime>=1.22.0; platform_system == "Darwin"
+pymatting  # alpha matting of the background remover
 decord; sys_platform == "win32"
 # Same files as PyPI's decord 0.6.0 Linux wheel, whose metadata wrongly declares Python 3.6 only
 decord @ https://github.com/deepbeepmeep/kernels/releases/download/decord/decord-0.6.0%2Bwheeltag-py3-none-manylinux2010_x86_64.whl ; sys_platform == "linux"
 timm
 iopath>=0.1.10
-insightface @ https://github.com/deepbeepmeep/insightface/releases/download/insightface/insightface-0.7.3-cp310-cp310-win_amd64.whl ; sys_platform == "win32" and python_version == "3.10"
-insightface @ https://github.com/deepbeepmeep/insightface/releases/download/insightface/insightface-0.7.3-cp311-cp311-win_amd64.whl ; sys_platform == "win32" and python_version == "3.11"
-insightface @ https://github.com/deepbeepmeep/insightface/releases/download/insightface/insightface-0.7.3-cp312-cp312-win_amd64.whl ; sys_platform == "win32" and python_version == "3.12"
-insightface==0.7.3 ; sys_platform == "linux"
-facexlib==0.3.0
 taichi
 vector_quantize_pytorch==1.27.19 
 
@@ -137,6 +122,5 @@ apprise==1.12.0
 keyring==25.7.0
 # Optional / commented out
 # transformers==4.46.3  # for llamallava pre-patch
-# rembg==2.0.65         # non-GPU fallback
 huggingface_hub[hf_xet]
 hf_xet>=1.5.2  # Required for cancellable Xet downloads

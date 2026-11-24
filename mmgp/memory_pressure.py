@@ -92,6 +92,24 @@ def make_room(size, device):
     return allocator.room(device) > room
 
 
+def make_room_parked(size, device):
+    """From any thread: room for size bytes that another program is about to take (a hardware video encoder's session), freed from the
+    parked models only (the models running keep theirs). Returns whether any VRAM was freed. Nothing without the VMM allocator."""
+    if allocator.active != "vmm":
+        return False
+    room = allocator.room(device)
+    need = size + HEADROOM - room
+    if need <= 0 or not parked():
+        return False
+    freed = 0
+    for manager in sorted(parked(), key=lambda manager: manager.last_used()):
+        freed += manager.reclaim_parked(need - freed)
+        if freed >= need:
+            break
+    torch.cuda.empty_cache()
+    return allocator.room(device) > room
+
+
 def helper_thread():
     """Marks the calling thread as a helper (a thread pool's initializer)."""
     _helpers.add(threading.get_ident())

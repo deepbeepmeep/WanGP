@@ -6,7 +6,7 @@ from typing import Any
 
 from PIL import Image
 
-from postprocessing.face_refiner.bridge import ASSET_DOWNLOAD_DEF, FaceRefineJob, FaceRefinerBridge, FaceSegment, UNDETECTED_FRAMES_CHOICES, face_count_parameter, face_reference_images_parameter, face_strength_parameter
+from postprocessing.face_refiner.bridge import ASSET_DOWNLOAD_DEFS, FaceRefineJob, FaceRefinerBridge, FaceSegment, UNDETECTED_FRAMES_CHOICES, face_count_parameter, face_reference_images_parameter, face_strength_parameter
 from postprocessing.spatial_upsamplers import PARAMETER_UI_LATE_POSTPROCESSING, POSTPROCESSING_CATEGORY_REFINER, UPSAMPLER_PROFILE_VIDEO, UPSAMPLER_TYPE_POSTPROCESSING
 
 from .runtime import DEFAULT_MODEL_TYPE, DEFAULT_WINDOW_FRAMES, DEFAULT_WINDOW_OVERLAP, MAX_WINDOW_FRAMES, RUNTIME_NAME, TEMPORAL_STRIDE, TEXT_ENCODER_CONFIG
@@ -51,7 +51,7 @@ class H3Engine:
         for track_index, (transform, strengths, matched_reference) in enumerate(tracked_faces):
             track_references = [matched_reference] if INJECT_REFERENCE_IMAGE and matched_reference is not None else None
             if INJECT_REFERENCE_IMAGE and track_references is None and self.reference_mode:
-                reference_frame, reference_crop = best_reference_crop(job.frames, transform, job.insightface_model_dir)
+                reference_frame, reference_crop = best_reference_crop(job.frames, transform)
                 track_references = [Image.fromarray(reference_crop.permute(1, 2, 0).numpy())]
                 print(f"[FaceRefine] Face track {track_index + 1}: using stabilized single-face crop from pose-aware source frame {reference_frame + 1} as reference")
             track_prompt = self.prompt if not track_references or "<Picture 1>" in self.prompt else REFERENCE_BINDING + "\n" + self.prompt
@@ -193,7 +193,7 @@ class H3FaceRefinerBridge(FaceRefinerBridge):
         from models.minimax_h3.minimax_h3_handler import REF2VA_PRUNED_ARCHITECTURE, family_handler
 
         model_def = family_handler.query_model_def(REF2VA_PRUNED_ARCHITECTURE, {})
-        return family_handler.query_model_files(lambda filename: [os.path.basename(filename)], REF2VA_PRUNED_ARCHITECTURE, model_def) + [ASSET_DOWNLOAD_DEF]
+        return family_handler.query_model_files(lambda filename: [os.path.basename(filename)], REF2VA_PRUNED_ARCHITECTURE, model_def) + ASSET_DOWNLOAD_DEFS
 
     @staticmethod
     def _private_model_def(wgp):

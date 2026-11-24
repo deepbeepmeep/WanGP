@@ -17,7 +17,7 @@ def _languages():
 
 
 def _custom_settings():
-    from .pipeline import DEFAULT_VOICE, VOICES
+    from .voices import DEFAULT_VOICE, VOICES
     return [
         {"id": "voice", "name": "Voice", "label": "Voice", "type": "dropdown", "default": DEFAULT_VOICE, "audio_prompt_type_not": "A",
          "choices": [(f"{name} ({language}, {style})", key) for key, (name, language, style) in VOICES.items()]},

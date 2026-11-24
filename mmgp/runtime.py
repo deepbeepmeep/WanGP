@@ -10,6 +10,7 @@ import torch
 _owners = weakref.WeakKeyDictionary()
 _resources = weakref.WeakKeyDictionary()
 _resource_users = {}
+_pending_releases = set()  # resources whose last owner unloaded while CUDA graphs that may have captured their addresses lived: released once none does
 _execution_checkpoint = ContextVar("mmgp_execution_checkpoint", default=None)
 
 
@@ -43,6 +44,7 @@ def _released(manager):
         for module in model.modules():
             for callback in _release_callbacks.pop(module, ()):
                 callback()
+    _release_pending()
 
 
 def register_resource(module, prepare, release):
@@ -62,7 +64,9 @@ def _load_resources(manager, model_id):
         users = _resource_users.setdefault(resource, weakref.WeakSet())
         first = not users
         users.add(model)  # an interrupted preparation is cleaned up by unload_all too
-        if first:
+        if first and resource in _pending_releases:  # never released: the graphs kept meanwhile replay at its addresses
+            _pending_releases.discard(resource)
+        elif first:
             from . import allocator
             with allocator.normal_allocations():
                 resource[0](torch.device("cuda", torch.cuda.current_device()))
@@ -77,8 +81,17 @@ def _unload_resources(manager, model_ids):
                 continue
             users.discard(model)
             if not users:
-                resource[1]()
                 del _resource_users[resource]
+                _pending_releases.add(resource)
+    _release_pending()
+
+
+def _release_pending():
+    from . import allocator
+    if _pending_releases and (allocator.active != "vmm" or allocator.no_graphs()):  # graphs outlive their model's load with the VMM allocator only
+        for resource in list(_pending_releases):
+            _pending_releases.discard(resource)
+            resource[1]()
 
 
 def _register(manager, models):
@@ -398,11 +411,12 @@ def plan_experts(module):
 
 
 def free_vram():
-    """VRAM free now on the current GPU, in bytes: what an allocation can still take without pressure on anyone."""
-    from . import allocator
+    """VRAM free now on the current GPU, in bytes: what an allocation can still take without pressure on a model running, the VRAM of parked
+    models included (offload.park: they give it back first, as allocations need it)."""
+    from . import allocator, memory_pressure
     if allocator.active == "vmm":
         state = allocator.stats()
-        return allocator.room() + state["reserved"] - state["allocated"]
+        return allocator.room() + state["reserved"] - state["allocated"] + memory_pressure.reclaimable()
     return torch.cuda.mem_get_info()[0]
 
 

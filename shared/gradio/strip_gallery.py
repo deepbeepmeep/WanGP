@@ -547,7 +547,6 @@ for (const id of __STRIP_GALLERY_IDS__) SG.whenElement('#' + id + '_gallery_html
             .world-viewer {{ display: block; position: relative; border-radius: 8px; background: #000; overflow: hidden; }}
             .world-viewer-empty {{ background: var(--studio-input); }}
             .world-viewer .world-video {{ position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; }}
-            .world-viewer .world-video.world-buffer {{ visibility: hidden; }}  /* the next clip, loading */
             .world-viewer:fullscreen {{ height: 100vh !important; width: 100vw; border-radius: 0; }}
             /* controls drawn over the video: light on dark whatever the theme (selectors outrank Gradio's .prose * and button resets) */
             .world-viewer .world-viewer-actions {{
@@ -1526,7 +1525,7 @@ class WorldGallery(StripGallery):
         memory_items = "".join(f'<div role="option" data-value="{value}" aria-selected="{str(value == chosen["memory"]).lower()}">{moves(value)} ({video_seconds} s) · {needs}</div>'
                                for value, video_seconds, needs in menus["memory"])
         event_box = '<form class="world-event"><input type="text" placeholder="Type something that happens, then Enter" aria-label="World Event"></form>' if "event" in menus["controls"] else ""
-        return f"""<wangp-world-viewer class="world-viewer" data-world="{html.escape(path)}" data-video="{video_url}" data-controls="{html.escape(json.dumps(cls._controls_layout(menus["controls"])))}" style="height:{cls.viewer_height}px">
+        return f"""<wangp-world-viewer class="world-viewer" data-world="{html.escape(path)}" data-video="{video_url}" data-controls="{html.escape(json.dumps({**cls._controls_layout(menus["controls"]), "queue": bool(menus.get("queue_moves"))}))}" style="height:{cls.viewer_height}px">
 <video class="world-video" src="{video_url}"{poster} autoplay loop muted playsinline></video>
 <div class="world-hud" aria-live="polite"><span class="world-status"></span><span class="world-keys"></span></div>
 {event_box}
@@ -1573,6 +1572,7 @@ window.WangpWorld = window.WangpWorld || (function () {
   const learned = {};  // key name -> label of this keyboard, kept from one exploration to the next
   let session = null;  // {viewer, path, layout, held, pressed, busy, ready, text, seconds, steps, memory, moves}
   let requests = 0;  // numbers every request: two identical moves in a row must still change the textbox value
+  const MAX_QUEUED_MOVES = 8, MOVES_AHEAD = 2, HOLD_MS = 400, ESC_TWICE_MS = 400;
 
   function send(payload) {
     const box = document.querySelector('#wangp_world_request textarea, #wangp_world_request input');
@@ -1586,7 +1586,7 @@ window.WangpWorld = window.WangpWorld || (function () {
   function fill(text) { return text.replace(/\{(\w+)\}/g, (_, key) => label(key)); }
   function hold() { return session.layout.hint.map(fill).join(', '); }
   function showHelp() {
-    session.viewer.querySelector('.world-help').textContent = [...session.layout.help.map(fill), 'G: GPU Stats', 'H: Hide Controls', 'Esc: Leave'].join(' · ');
+    session.viewer.querySelector('.world-help').textContent = [...session.layout.help.map(fill), 'G: GPU Stats', 'H: Hide Controls', 'Esc: Leave', 'Esc Esc: Pause'].join(' · ');
   }
   function showStats() {
     // live GPU / RAM (refreshed every second while shown), then the last move's memory and timing
@@ -1660,8 +1660,26 @@ window.WangpWorld = window.WangpWorld || (function () {
     const viewer = session.viewer;
     session.clips = (session.clips || Promise.resolve()).then(() => presentClip(viewer, url));
   }
+  function lastFrameShown(video) {
+    // resolves when the video's last frame has been on screen for one frame: its 'ended' event comes later (a visible hitch between
+    // clips); a video already ended or paused (the world's own video at its end) resolves at once
+    return new Promise((resolve) => {
+      if (video.ended || video.paused && !(session && session.resumed)) { resolve(); return; }
+      video.addEventListener('ended', resolve, {once: true});
+      if (!video.requestVideoFrameCallback) return;
+      let previous = null;
+      const check = (now, meta) => {
+        const step = previous === null || meta.mediaTime <= previous ? 1 / 24 : meta.mediaTime - previous;
+        previous = meta.mediaTime;
+        if (meta.mediaTime + step * 1.5 >= video.duration) setTimeout(resolve, step * 1000);
+        else video.requestVideoFrameCallback(check);
+      };
+      video.requestVideoFrameCallback(check);
+    });
+  }
   function presentClip(viewer, url) {
-    // the clip loads in a hidden second video and replaces the shown one once loaded and once the shown clip has ended: no blank frame.
+    // the clip loads in a second video under the shown one and takes its place once loaded and once the shown clip's last frame has
+    // been shown: no blank or stale frame, no pause between clips; nothing changes while the viewer paused (double Esc).
     // The hidden video never plays before its turn: the world's own video, which serves as the second one from the second move on,
     // autoplays, and would otherwise run the clip while hidden and show it from its middle or its end
     if (!session || session.viewer !== viewer) return;
@@ -1670,24 +1688,69 @@ window.WangpWorld = window.WangpWorld || (function () {
     if (!next) {
       next = document.createElement('video');
       next.className = 'world-video world-buffer'; next.muted = true; next.playsInline = true;
-      shown.after(next);
+      shown.before(next);
     }
     next.autoplay = false; next.loop = false;
     const loaded = new Promise((resolve) => { next.addEventListener('loadeddata', resolve, {once: true}); next.addEventListener('error', resolve, {once: true}); });
-    const ended = shown.ended || shown.paused ? Promise.resolve() : new Promise((resolve) => shown.addEventListener('ended', resolve, {once: true}));
+    const ended = lastFrameShown(shown);
     next.src = url;
-    return Promise.all([loaded, ended]).then(() => {
+    return Promise.all([loaded, ended]).then(() => session && session.viewer === viewer && session.resumed).then(() => {
       if (!session || session.viewer !== viewer || next.getAttribute('src') !== url || next.error) return;
       shown.pause(); shown.classList.add('world-buffer'); next.classList.remove('world-buffer');
+      next.before(shown);  // the next clip loads underneath (painted before it in the page): never a stale frame of a hidden video at a switch
       next.play().catch(() => {});
     });
   }
   function showKeys() {
     if (!session) return;
-    session.viewer.querySelector('.world-keys').textContent = [...session.held].map(label).join(' ');
+    const queued = session.queue.map((keys) => keys.map(label).join('+'));
+    session.viewer.querySelector('.world-keys').textContent = [...session.held].map(label).join(' ') + (queued.length ? ' · next: ' + queued.join(' ') : '');
+  }
+  function sendAhead() {
+    // a model whose menus queue moves (queue_moves): up to MOVES_AHEAD moves on their way, so that the model starts the next one as soon
+    // as a move is generated, while its clip is written for the viewer. Keys pressed during a move make the next moves, in order; a key
+    // held for HOLD_MS keeps the walk going (a tap makes one move)
+    while (session.inflight < MOVES_AHEAD) {
+      const queued = session.queue.length ? session.queue.shift() : null;
+      const held = session.held.size && Date.now() - session.heldSince >= HOLD_MS ? [...session.held] : null;
+      const keys = queued || (session.inflight ? held : [...new Set([...session.held, ...session.pressed])]) || [], text = session.text;
+      if (!keys.length && !text) {
+        if (!session.inflight) status(session.moves ? '' : 'Hold ' + hold());
+        if (session.held.size && !session.holdTimer) session.holdTimer = setTimeout(() => { if (session) { session.holdTimer = null; maybeMove(); } }, HOLD_MS);
+        break;
+      }
+      session.inflight += 1; session.pressed.clear(); session.text = '';
+      status(text ? 'Generating: ' + text : 'Generating…');
+      send({action: 'move', path: session.path, keys: keys.join('+'), text: text, seconds: session.seconds, steps: session.steps, memory: session.memory, seq: ++session.seq});
+    }
+    showKeys();
+  }
+  function pause() {
+    // double Esc: the moves still to send are dropped (those already sent finish and wait), the shown clip pauses until a move key
+    if (session.resumed) return;
+    session.queue = []; session.held.clear(); session.pressed.clear(); session.text = '';
+    clearTimeout(session.holdTimer); session.holdTimer = null;
+    session.resumed = new Promise((resolve) => { session.resume = resolve; });
+    const shown = session.viewer.querySelector('.world-video:not(.world-buffer)');
+    if (shown) shown.pause();
+    status('Paused: press a move key to go on, Esc to leave');
+    showKeys();
+  }
+  function resume() {
+    const resolve = session.resume;
+    session.resumed = session.resume = null;
+    const shown = session.viewer.querySelector('.world-video:not(.world-buffer)');
+    if (shown && !shown.ended && shown.currentTime < shown.duration - 0.01) shown.play().catch(() => {});
+    status('');
+    resolve();
+  }
+  function lockEscape() {
+    // in full screen Esc would leave it at once: kept for the explorer's own Esc / double Esc (a long press still leaves full screen)
+    if (navigator.keyboard && navigator.keyboard.lock) navigator.keyboard.lock(['Escape']).catch(() => {});
   }
   function maybeMove() {
-    if (!session || !session.ready || session.busy || session.replay) return;
+    if (!session || !session.ready || session.busy || session.replay || session.resumed) return;
+    if (session.layout.queue) { sendAhead(); return; }
     const keys = [...new Set([...session.held, ...session.pressed])], text = session.text;
     if (!keys.length && !text) { status(session.moves ? '' : 'Hold ' + hold()); return; }
     session.busy = true; session.pressed.clear(); session.text = '';
@@ -1708,6 +1771,13 @@ window.WangpWorld = window.WangpWorld || (function () {
       return;
     }
     if (event.target.closest && event.target.closest('.world-event')) return;  // typing an event
+    if (event.code === 'Escape') {  // Esc leaves; twice quickly, the queued moves are dropped and the view pauses (a move key goes on)
+      event.preventDefault(); event.stopPropagation();
+      if (event.type !== 'keydown' || event.repeat) return;
+      if (session.escTimer) { clearTimeout(session.escTimer); session.escTimer = null; pause(); }
+      else session.escTimer = setTimeout(() => { if (session) { session.escTimer = null; leave(); } }, ESC_TWICE_MS);
+      return;
+    }
     if (event.code === 'KeyH' || event.code === 'KeyG') {
       event.preventDefault(); event.stopPropagation();
       if (event.type === 'keydown' && !event.repeat) {
@@ -1723,7 +1793,13 @@ window.WangpWorld = window.WangpWorld || (function () {
       learned[key] = event.key.toUpperCase();
       showHelp();
     }
-    if (event.type === 'keydown') { session.held.add(key); session.pressed.add(key); maybeMove(); }
+    if (event.type === 'keydown') {
+      if (session.resumed) resume();
+      if (!session.held.size) session.heldSince = Date.now();
+      session.held.add(key); session.pressed.add(key);
+      if (session.layout.queue && session.inflight && !event.repeat && session.queue.length < MAX_QUEUED_MOVES) session.queue.push([...session.held]);
+      maybeMove();
+    }
     else session.held.delete(key);
     showKeys();
   }
@@ -1731,7 +1807,7 @@ window.WangpWorld = window.WangpWorld || (function () {
   function start(viewer) {
     if (session) leave();
     const choice = (name) => viewer.querySelector('.world-' + name + ' select').value;
-    session = {viewer: viewer, path: viewer.dataset.world, layout: JSON.parse(viewer.dataset.controls), held: new Set(), pressed: new Set(), busy: true, ready: false, text: '',
+    session = {viewer: viewer, path: viewer.dataset.world, layout: JSON.parse(viewer.dataset.controls), held: new Set(), pressed: new Set(), queue: [], inflight: 0, seq: 0, nextClip: 1, clipUrls: {}, heldSince: 0, holdTimer: null, busy: true, ready: false, text: '',
                seconds: parseFloat(choice('seconds')), steps: parseInt(choice('steps')), memory: parseInt(choice('memory')), moves: 0};
     viewer.classList.add('exploring');
     const video = viewer.querySelector('.world-video');  // the exploration continues from the world's last frame
@@ -1746,7 +1822,7 @@ window.WangpWorld = window.WangpWorld || (function () {
     document.addEventListener('fullscreenchange', onFullscreen);
     showHelp();
     learnLayout();
-    if (viewer.requestFullscreen) viewer.requestFullscreen().catch(() => {});
+    if (viewer.requestFullscreen) viewer.requestFullscreen().then(lockEscape).catch(() => {});
     status('Preparing the world… (the model loads the first time)');
     send({action: 'start', path: session.path, seconds: session.seconds, steps: session.steps, memory: session.memory});
   }
@@ -1755,7 +1831,9 @@ window.WangpWorld = window.WangpWorld || (function () {
     if (session.replay) stopReplay();
     const current = session;
     session = null;
-    clearTimeout(current.errorTimer);
+    clearTimeout(current.errorTimer); clearTimeout(current.holdTimer); clearTimeout(current.escTimer);
+    if (current.resume) current.resume();
+    if (navigator.keyboard && navigator.keyboard.unlock) navigator.keyboard.unlock();
     refreshStats();
     document.removeEventListener('keydown', onKey, true);
     document.removeEventListener('keyup', onKey, true);
@@ -1764,10 +1842,13 @@ window.WangpWorld = window.WangpWorld || (function () {
     const [video, ...buffers] = current.viewer.querySelectorAll('.world-video');
     buffers.forEach((buffer) => buffer.remove());
     video.classList.remove('world-buffer');
-    video.loop = true; video.autoplay = !suspend;
-    if (!suspend && current.viewer.dataset.video) video.src = current.viewer.dataset.video;
-    if (!suspend && window.__meshGalleryNS.visible(current.viewer)) video.play().catch(() => {});
-    else video.pause();
+    // back to where the exploration started: the world's video paused at its last frame, or its poster (a world saved without video)
+    video.loop = true; video.autoplay = false;
+    video.pause();
+    if (!suspend && current.viewer.dataset.video) {
+      video.src = current.viewer.dataset.video;
+      video.addEventListener('loadedmetadata', () => { video.currentTime = Math.max(0, video.duration - 0.05); }, {once: true});
+    } else if (!suspend) { video.removeAttribute('src'); video.load(); }
     if (document.fullscreenElement === current.viewer) document.exitFullscreen().catch(() => {});
     send({action: 'leave', path: current.path});
   }
@@ -1782,10 +1863,14 @@ window.WangpWorld = window.WangpWorld || (function () {
       refreshStats();
       maybeMove();
     } else if (response.action === 'clip') {
-      session.busy = false; session.moves += 1;
-      showClip(response.url);
+      session.moves += 1;
+      if (response.seq == null) { session.busy = false; showClip(response.url); }
+      else {  // moves sent ahead: their clips are shown in their order, whatever order their answers come in
+        session.inflight -= 1; session.clipUrls[response.seq] = response.url;
+        while (session.clipUrls[session.nextClip]) { showClip(session.clipUrls[session.nextClip]); delete session.clipUrls[session.nextClip++]; }
+      }
       if (response.stats) { session.moveStats = session.live = response.stats; showStats(); }
-      status('');
+      status(session.inflight ? 'Generating…' : '');
       maybeMove();
     } else if (response.action === 'saved') {
       session.busy = false;
@@ -1808,7 +1893,7 @@ window.WangpWorld = window.WangpWorld || (function () {
   }
   function render(record) {
     // the world's own video and the moves made so far, decoded by the model: recorded in the Video gallery, or replayed here
-    if (!session || !session.ready || session.busy || session.replay) return;
+    if (!session || !session.ready || session.busy || session.inflight || session.replay) return;
     if (!record && session.replayUrl && session.replayMoves === session.moves) { startReplay(session.replayUrl); return; }
     session.busy = true;
     status(record ? 'Recording the video of the world and your moves…' : 'Preparing the replay…');
@@ -1829,7 +1914,7 @@ window.WangpWorld = window.WangpWorld || (function () {
     if (!session || !session.replay) return;
     session.replay.remove();
     session.replay = null;
-    if (navigator.keyboard && navigator.keyboard.unlock) navigator.keyboard.unlock();
+    lockEscape();  // the explorer keeps its Esc
     status('');
     maybeMove();
   }
@@ -1846,7 +1931,7 @@ window.WangpWorld = window.WangpWorld || (function () {
   });
   function saveWorld() {
     // the world and the moves made so far, as a new world of the Worlds gallery (shown there once the viewer leaves)
-    if (!session || !session.ready || session.busy || session.replay) return;
+    if (!session || !session.ready || session.busy || session.inflight || session.replay) return;
     if (!session.moves) { status('Make a move first: the saved world is this world followed by your moves'); return; }
     session.busy = true;
     status('Saving the world and your moves…');

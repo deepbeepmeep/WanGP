@@ -547,5 +547,6 @@ class BlockDraftRunner(ModelRunner):
         self._tree_graph_vars = None
         self._tree_commit_graphs = None
         self._dspark_sampling_graphs = {}
+        self._dspark_chain_pool = None  # its pool goes with its graphs (PyTorch's allocator frees it with the last one)
         self._draft_valid_length = None
         self.model._draft_features = None

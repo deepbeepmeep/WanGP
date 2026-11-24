@@ -31,6 +31,12 @@ class MediaSettings(list):
     def __iter__(self):
         return (self[index] for index in range(len(self)))
 
+    def map_loaded(self, transform):
+        """A copy with transform applied to the entries already read; the others stay unread."""
+        copy = MediaSettings()
+        list.extend(copy, (item if isinstance(item, _Pending) else transform(item) for item in list.__iter__(self)))
+        return copy
+
 
 def peek_settings(settings, index):
     """Inspect already available metadata; identity/catalog scans never probe files."""

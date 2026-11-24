@@ -9,7 +9,6 @@ an engine with:
 from __future__ import annotations
 
 import gc
-import os
 import sys
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -17,6 +16,7 @@ from typing import Any, Callable
 import torch
 
 from postprocessing.spatial_upsamplers import PARAMETER_UI_LATE_POSTPROCESSING, PARAMETER_UI_MEDIA_FLOW, PARAMETER_UI_POSTPROCESSING, SimpleScaleSuffixMixin
+from preprocessing.face_analysis.assets import query_download_def as face_analysis_download_def
 from shared.utils import offload_registry
 
 ASSET_REPO = "DeepBeepMeep/MiniMax-H3"
@@ -25,8 +25,8 @@ DETECTOR_FILE = "face_yolov8m.pt"
 FALLBACK_DETECTOR_FILE = "person_yolov8m-seg.safetensors"
 DETECTOR_PATH = f"{ASSET_FOLDER}/{DETECTOR_FILE}"
 FALLBACK_DETECTOR_PATH = f"{ASSET_FOLDER}/{FALLBACK_DETECTOR_FILE}"
-INSIGHTFACE_FILES = ("det_10g.onnx", "2d106det.onnx", "w600k_r50.onnx")
-ASSET_DOWNLOAD_DEF = {"repoId": ASSET_REPO, "sourceFolderList": [ASSET_FOLDER], "fileList": [[DETECTOR_FILE, FALLBACK_DETECTOR_FILE, *INSIGHTFACE_FILES]]}
+ASSET_DOWNLOAD_DEFS = [{"repoId": ASSET_REPO, "sourceFolderList": [ASSET_FOLDER], "fileList": [[DETECTOR_FILE, FALLBACK_DETECTOR_FILE]]},
+                       face_analysis_download_def(("detection", "landmark_2d_106", "recognition"))]
 UNDETECTED_FRAMES_CHOICES = [("Fade out", "fade_out"), ("Skip", "skip"), ("Composite anyway", "composite_anyway")]
 
 
@@ -114,7 +114,6 @@ class FaceRefineJob:
     vae_tile_size: Any
     vae_config: int
     loaded_model_context: Any
-    insightface_model_dir: str
     abort_callback: Callable | None
     progress_callback: Callable | None
     parameters: dict[str, Any]  # the refiner's own declared parameters
@@ -265,14 +264,12 @@ class FaceRefinerBridge(SimpleScaleSuffixMixin):
         reference_images = wgp.clean_image_list(reference_images or []) or []
         detector_path = self.files_locator.locate_file(DETECTOR_PATH)
         fallback_detector_path = None if config["fallback_detector"] == "none" else self.files_locator.locate_file(FALLBACK_DETECTOR_PATH)
-        insightface_model_path = self.files_locator.locate_file(f"{ASSET_FOLDER}/{INSIGHTFACE_FILES[0]}")
-        insightface_model_dir = os.path.dirname(os.path.abspath(insightface_model_path))
         tracked_faces = track_faces(frames, detector_path, face_count=max(0, min(5, int(face_count))), reference_images=reference_images,
                                     confidence=config["detector_confidence"], crop_factor=config["crop_factor"],
                                     canvas_width=config["canvas_width"], canvas_height=config["canvas_height"], canvas_mode=config["canvas_mode"], canvas_tiers=config["canvas_tiers"],
                                     smooth_window=config["smooth_window"], size_smooth_window=config["size_smooth_window"], smooth_method=config["smooth_method"],
                                     size_mode=config["size_mode"], identity_threshold=config["identity_threshold"], auto_min_face_height=config["auto_min_face_height"],
-                                    auto_min_presence=config["auto_min_presence"], fallback_detector_path=fallback_detector_path, insightface_model_dir=insightface_model_dir,
+                                    auto_min_presence=config["auto_min_presence"], fallback_detector_path=fallback_detector_path,
                                     fallback_head_frac=config["fallback_head_frac"], strength_small_face=strength,
                                     strength_large_face=strength, strength_smooth_frames=1, abort_callback=abort_callback,
                                     progress_callback=progress_callback)
@@ -285,7 +282,7 @@ class FaceRefinerBridge(SimpleScaleSuffixMixin):
             progress_callback("Loading Model")
         job = FaceRefineJob(wgp=wgp, detector_path=detector_path, config=config, frames=frames, prompt=prompt, seed=int(seed), fps=fps, frame_offset=frame_offset, strength=strength,
                             audio_waveform=audio_waveform, audio_sample_rate=audio_sample_rate, source_audio_path=source_audio_path, image_refs_relative_size=image_refs_relative_size,
-                            vae_tile_size=vae_tile_size, vae_config=vae_config, loaded_model_context=loaded_model_context, insightface_model_dir=insightface_model_dir,
+                            vae_tile_size=vae_tile_size, vae_config=vae_config, loaded_model_context=loaded_model_context,
                             abort_callback=abort_callback, progress_callback=progress_callback, parameters=kwargs)
         engine = self.open_engine(job)
         try:
@@ -336,5 +333,5 @@ class FaceRefinerBridge(SimpleScaleSuffixMixin):
         self.release_private_runtime()
 
 
-__all__ = ["ASSET_DOWNLOAD_DEF", "ASSET_FOLDER", "DETECTOR_FILE", "DETECTOR_PATH", "FALLBACK_DETECTOR_FILE", "FALLBACK_DETECTOR_PATH", "FaceRefineJob", "FaceRefinerBridge", "FaceSegment", "INSIGHTFACE_FILES", "PrivateRuntime",
+__all__ = ["ASSET_DOWNLOAD_DEFS", "ASSET_FOLDER", "DETECTOR_FILE", "DETECTOR_PATH", "FALLBACK_DETECTOR_FILE", "FALLBACK_DETECTOR_PATH", "FaceRefineJob", "FaceRefinerBridge", "FaceSegment", "PrivateRuntime",
            "UNDETECTED_FRAMES_CHOICES", "face_count_parameter", "face_progress_callback", "face_reference_images_parameter", "face_strength_parameter", "model_step_callback"]

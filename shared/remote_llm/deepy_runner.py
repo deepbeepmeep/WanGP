@@ -143,7 +143,7 @@ def _visual_query_without_running_loop(server_config: dict[str, Any], media_reco
             answer = backend.one_shot(labeled_question, system_prompt=deepy_vision.VISION_QA_SYSTEM_PROMPT, images=paths, max_output_tokens=deepy_vision.VISION_ANSWER_MAX_NEW_TOKENS, should_stop=should_stop)
     finally:
         backend.close()
-    result = {"status": "done", "media_ids": [item["media_id"] for item in inspected], "media": inspected, "question": question, "answer": answer, "error": ""}
+    result = {"status": "done", "media_ids": [item["media_id"] for item in inspected], "media": inspected, "question": question, "answer": answer, "error": "", "_inspection_shrink": deepy_vision.inspection_shrink(images)}
     if len(inspected) == 1:
         result.update(inspected[0])
     return result

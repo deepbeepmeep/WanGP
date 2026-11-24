@@ -91,6 +91,10 @@ class TextEncoderCache:
 
         return results
 
+    def __contains__(self, cache_key: Hashable) -> bool:
+        """Whether an encoding is cached (encode would reuse it)."""
+        return cache_key in self._entries
+
     def _store(self, cache_key: Hashable, encoded: Any, device: torch.device | str | None) -> Any:
         cached_value = self._detach_to_cpu(encoded)
         size_bytes = self._estimate_size_bytes(cached_value)

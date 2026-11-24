@@ -42,3 +42,16 @@ def h3_grouped_masking_enabled(custom_settings):
     if mode not in H3_MASK_MODES:
         raise ValueError(f"Unsupported MiniMax H3 mask denoising mode {mode!r}")
     return mode == H3_MASK_MODE_GROUPED_ROWS
+
+
+# checkpoint names: here, so that the handler reads them without importing the model
+VIDEO_VAE_FILE = "MiniMax-H3-video_vae_fp16.safetensors"
+VIDEO_VAE_FP8MIX_FILE = "minimax_h3_video_vae_fp8mix.safetensors"
+VIDEO_VAE_INT8_FILE = "minimax_h3/minimax_h3_video_vae_int8_convrot.safetensors"
+VIDEO_VAE_LIGHT_FILE = "minimax_h3/minimax_h3_lightvae_lite_bf16.safetensors"
+VIDEO_VAE_LIGHT_INT8_FILE = "minimax_h3/minimax_h3_lightvae_lite_int8_convrot.safetensors"
+VIDEO_VAE_SOL_INT8_FILE = "minimax_h3/minimax_h3_sol_vae_int8_convrot.safetensors"  # the H3 encoder with Sol-H3-VAE's decoder
+AUDIO_VAE_FILE = "MiniMax-H3-audio_vae_fp32.safetensors"
+LATENT_UPSCALER_FOLDER = "minimax_h3"
+LATENT_UPSCALER_FILE = "minimax_h3_latent_upscaler_3d_bf16.safetensors"
+TEXT_ENCODER_FOLDER = "Qwen3-VL-32B-Instruct"

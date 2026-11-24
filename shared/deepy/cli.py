@@ -10,18 +10,22 @@ import traceback
 from threading import Event, Thread
 from typing import Any
 import ctypes
+import functools
 
 try:
     import msvcrt
 except Exception:  # pragma: no cover
     msvcrt = None
 
-try:
-    from prompt_toolkit import PromptSession
-    from prompt_toolkit.key_binding import KeyBindings
-except Exception:  # pragma: no cover
-    PromptSession = None
-    KeyBindings = None
+@functools.lru_cache(maxsize=1)
+def _prompt_toolkit():
+    """(PromptSession, KeyBindings), or Nones without prompt_toolkit: imported when a terminal session starts, not with WanGP's server."""
+    try:
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.key_binding import KeyBindings
+    except Exception:  # pragma: no cover
+        return None, None
+    return PromptSession, KeyBindings
 
 from shared.deepy import chat as assistant_chat, tool_settings as deepy_tool_settings, ui_settings as deepy_ui_settings
 from shared.deepy.engine import get_or_create_assistant_session
@@ -491,6 +495,7 @@ class DeepyCliSession(GenerationRuntime):
             self._print(line)
 
     def _build_prompt_session(self, input=None, output=None):
+        PromptSession, KeyBindings = _prompt_toolkit()
         if PromptSession is None or KeyBindings is None:
             return None
         bindings = KeyBindings()
@@ -829,7 +834,7 @@ class DeepyCliSession(GenerationRuntime):
             warmed_vllm = bool((preload_result or {}).get("warmed_vllm", False)) if isinstance(preload_result, dict) else False
             self._print("[Deepy] Prompt enhancer and vLLM are ready." if warmed_vllm else "[Deepy] Prompt enhancer is ready.")
         self._print("Deepy CLI session. Use /help for commands.")
-        if self._interactive and PromptSession is not None:
+        if self._interactive and _prompt_toolkit()[0] is not None:
             self._print("Multiline input: Enter sends, Ctrl+Enter or Alt+Enter inserts a newline, Ctrl+S stops the active turn.")
         while True:
             try:

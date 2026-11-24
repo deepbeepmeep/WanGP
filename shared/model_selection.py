@@ -110,7 +110,8 @@ def rank_models(records, specialities, preferences, main_output=None):
     exact = any(item[0] == len(terms) for item in ranked)
     if exact:
         ranked = [item for item in ranked if item[0] == len(terms)]
-    ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], -item[3], item[4]["name"].casefold(), item[4]["model_type"]))
+    # model-def priority breaks ties between otherwise equal models (a newer release before its predecessor)
+    ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], -item[3], -item[4].get("priority", 0), item[4]["name"].casefold(), item[4]["model_type"]))
     result = []
     for _, _, _, _, record, matched, word_matches, substring_matches in ranked:
         item = dict(record)

@@ -12,7 +12,6 @@ from tqdm import tqdm
 from mmgp import offload, quant_router, runtime
 from shared.utils import files_locator as fl
 
-from .audio_vae import MiniMaxH3AudioVAE
 from .convrot_layout import get_convrot_layout
 from .hyperflow import replace_low_rank_linears
 from .latent_upscaler import MiniMaxH3LatentUpscaler
@@ -26,17 +25,9 @@ from .viggle import load_fixed_prompt
 from .vae_upsampler import X2_VAE_FILE, X2_VAE_INT8_FILE, X2_VAE_VALUE
 
 
-VIDEO_VAE_FILE = "MiniMax-H3-video_vae_fp16.safetensors"
-VIDEO_VAE_FP8MIX_FILE = "minimax_h3_video_vae_fp8mix.safetensors"
-VIDEO_VAE_INT8_FILE = "minimax_h3/minimax_h3_video_vae_int8_convrot.safetensors"
-VIDEO_VAE_LIGHT_FILE = "minimax_h3/minimax_h3_lightvae_lite_bf16.safetensors"
-VIDEO_VAE_LIGHT_INT8_FILE = "minimax_h3/minimax_h3_lightvae_lite_int8_convrot.safetensors"
-VIDEO_VAE_SOL_INT8_FILE = "minimax_h3/minimax_h3_sol_vae_int8_convrot.safetensors"  # the H3 encoder with Sol-H3-VAE's decoder
+from .constants import (AUDIO_VAE_FILE, LATENT_UPSCALER_FILE, LATENT_UPSCALER_FOLDER, TEXT_ENCODER_FOLDER, VIDEO_VAE_FILE, VIDEO_VAE_FP8MIX_FILE, VIDEO_VAE_INT8_FILE,  # noqa: F401 (also read from here)
+                        VIDEO_VAE_LIGHT_FILE, VIDEO_VAE_LIGHT_INT8_FILE, VIDEO_VAE_SOL_INT8_FILE)
 VIDEO_VAE_SPLIT_INT8 = True  # comparison switch: the INT8 VAEs split their q / k / v projections too (decoder attention through the attention kit)
-AUDIO_VAE_FILE = "MiniMax-H3-audio_vae_fp32.safetensors"
-LATENT_UPSCALER_FOLDER = "minimax_h3"
-LATENT_UPSCALER_FILE = "minimax_h3_latent_upscaler_3d_bf16.safetensors"
-TEXT_ENCODER_FOLDER = "Qwen3-VL-32B-Instruct"
 ADALN_CURVE_DIM = 8
 NUM_TRANSFORMER_BLOCKS = 50
 
@@ -222,8 +213,10 @@ def _load_transformer(filename, dtype, qkv_splitting=True, qkv_layout="interleav
         if "dwd_head.time_table" in state_dict:
             dwd_steps = int(metadata["num_inference_steps"])
     if veda:
-        from .veda.attention import VedaAttention, VedaPolicy, read_metadata
-        veda_policy = VedaPolicy(read_metadata(filenames[-1]))
+        from .veda.attention import FORMAT as VEDA_FORMAT, VedaAttention, VedaPolicy, read_metadata
+        # the predictor among the modules, whatever follows it (PTD's step heads); read_metadata names the file when none is
+        veda_file = next((path for path in filenames[1:] if quant_router.load_metadata_state_dict(path)[1].get("format") == VEDA_FORMAT), filenames[-1])
+        veda_policy = VedaPolicy(read_metadata(veda_file))
     with init_empty_weights(include_buffers=True):
         transformer = MiniMaxH3Model(adaln_curve_grid=checkpoint["adaln_curve_grid"], time_embed_dim=checkpoint["time_embed_dim"], adaln_dtype=checkpoint["adaln_dtype"],
                                      hybrid_ref2va_blocks=hybrid_ref2va_blocks, pdd_num_steps=pdd_num_steps,
@@ -330,6 +323,7 @@ def _load_video_vae(filename, qkv_splitting=True, upsampling=False, single_frame
 
 
 def _load_audio_vae(filename):
+    from .audio_vae import MiniMaxH3AudioVAE  # here: built on diffusers' model classes, which the handler's import would load at startup
     filename = fl.locate_file(filename)
     with init_empty_weights(include_buffers=False):
         vae = MiniMaxH3AudioVAE()

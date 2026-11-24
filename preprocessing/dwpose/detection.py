@@ -3,7 +3,6 @@
 import cv2
 import numpy as np
 
-import onnxruntime
 
 def nms(boxes, scores, nms_thr):
     """Single class NMS implemented in Numpy."""
@@ -97,13 +96,12 @@ def preprocess(img, input_size, swap=(2, 0, 1)):
     padded_img = np.ascontiguousarray(padded_img, dtype=np.float32)
     return padded_img, r
 
-def inference_detector(session, oriImg):
+def inference_detector(models, oriImg):
     input_shape = (640,640)
     img, ratio = preprocess(oriImg, input_shape)
 
-    ort_inputs = {session.get_inputs()[0].name: img[None, :, :, :]}
-    output = session.run(None, ort_inputs)
-    predictions = demo_postprocess(output[0], input_shape)[0]
+    output = models.detect(img[None, :, :, :])
+    predictions = demo_postprocess(output, input_shape)[0]
 
     boxes = predictions[:, :4]
     scores = predictions[:, 4:5] * predictions[:, 5:]

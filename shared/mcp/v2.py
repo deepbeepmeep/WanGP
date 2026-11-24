@@ -6,6 +6,7 @@ import copy
 import difflib
 import functools
 import json
+import re
 import time
 from itertools import zip_longest
 from pathlib import Path
@@ -204,7 +205,65 @@ def signature(name, definition) -> str:
     return f"{name}(" + ", ".join(f"{key}{'*' if key in required else ''}: {call_shape(schema)}" for key, schema in parameters["properties"].items()) + ")"
 
 
-def invocation(actions, action, arguments, *, signatures=False):
+def validation_failure(action, definition, arguments, errors):
+    """Raise the most useful message for a call that failed its schema."""
+    if isinstance(arguments, dict) and list(arguments) == ["arguments"] and "arguments" not in definition["parameters"]["properties"]:
+        raise ValueError(f"arguments is nested twice: pass the inner object itself, {{\"action\": \"{action}\", \"arguments\": {{...}}}}. Nothing was executed.")
+    error = errors[0]
+    if error.validator == "anyOf":  # report the branch the value's type matched, such as a value outside its enum
+        error = max((item for item in error.context if item.validator != "type"), key=lambda item: len(item.absolute_path), default=error)
+    path = ".".join(map(str, error.absolute_path)) or "arguments"
+    properties = list(definition["parameters"]["properties"])
+    def unknown_hints(names):  # close names of unknown arguments, and measured values that are returned rather than requested
+        close = [f"{match[0]} for {name}" for name in names if name not in properties and (match := difflib.get_close_matches(name, properties, n=1, cutoff=0.6)
+                                                                                                 or [alias for alias in ARGUMENT_ALIASES.get(name, ()) if alias in properties][:1])]
+        measured = [name for name in names if name not in properties and name.removesuffix("_seconds") in ("black_ranges", "cut_times", "quiet_ranges", "sound_ends")]
+        return (f" Did you mean {', '.join(close)}?" if close else "") + (f" {', '.join(measured)}: measured and returned in the result whenever present, not requested: drop {'them' if len(measured) > 1 else 'it'}." if measured else "")
+    root = {item.validator for item in errors if not item.absolute_path}
+    if {"required", "additionalProperties"} <= root and isinstance(arguments, dict):  # a guessed call: report every top-level mistake at once
+        missing = [name for name in definition["parameters"].get("required", []) if name not in arguments]
+        unknown = [name for name in arguments if name not in properties]
+        note = ('For several frames: media_inputs=[{"media_id": "visual:VIDEO", "time_s": 3}, ...], or inspect_video for a range.' if action == "inspect_media" and any("time" in name or "frame" in name or "second" in name for name in unknown)
+                else "inspect_audio answers no question: for spoken words use transcribe_media." if action == "inspect_audio" and "question" in unknown else "")
+        hint = f"Call structure: {json.dumps(definition['example'], ensure_ascii=False)}" if "example" in definition else f"To read the contract, repeat this call with action={action!r} and arguments=null."
+        raise ValueError(f"arguments: missing {', '.join(missing)}; not allowed: {', '.join(unknown)}.{unknown_hints(unknown)} {note} Allowed arguments: {', '.join(properties)}. Nothing was executed. {hint}".replace("  ", " "))
+    if action == "inspect_media" and error.validator == "oneOf":
+        raise ValueError("inspect_media requires exactly one of media_id (one visual), media_ids (a list), or media_inputs (selected frames), inside arguments alongside question."
+                         " To read its contract instead, pass arguments=null (the entire object, not null values inside it).")
+    if action == "inspect_media" and "media_inputs" in error.path and error.validator == "type":
+        raise ValueError(f"{path}: {error.message}. media_inputs items are objects such as {{\"media_id\": \"visual:VIDEO\", \"time_s\": 2.5}} (or frame_no, or view for 3D, with an optional bbox); for a list of media use media_ids.")
+    if action == "remux_media" and list(error.absolute_path) == ["ducking"] and error.validator == "type" and not isinstance(error.instance, str):
+        raise ValueError('ducking is an object, not a flag: {"tracks": [indexes in audio_ids of what dips, e.g. the music], "under": [indexes of the voices it dips under]} (0 = the first file; "video" = the soundtrack of the video), optional "depth_db". Nothing was executed.')
+    if action == "remux_media" and list(error.absolute_path)[:1] == ["ducking"] and list(error.absolute_path)[1:2] in (["tracks"], ["under"]):
+        raise ValueError(f"{path}: ducking tracks and under are indexes into audio_ids (0 = the first file), not media ids, e.g. {{\"tracks\": [1], \"under\": [0]}}; \"video\" in tracks or under is the video's own soundtrack (with include_video_audio), e.g. under: [\"video\"] for the speech of lip-synced shots.")
+    if action == "write_text" and list(error.absolute_path) == ["mode"] and str(error.instance).startswith("append"):
+        raise ValueError("write_text creates or overwrites a file; to add to the end of one, call the append_text action with the same path and text.")
+    if action == "inspect_audio" and error.validator == "additionalProperties" and "question" in error.instance:
+        raise ValueError("inspect_audio measures audio (levels, loudness, clipping, silence intervals) and answers no question: omit question. For spoken words use transcribe_media.")
+    if action == "inspect_media" and error.validator == "additionalProperties" and isinstance(error.instance, dict) and {"times", "timestamps", "times_s", "frames", "frame_nos"} & set(error.instance):
+        raise ValueError('inspect_media reads several frames in one call: media_inputs=[{"media_id": "visual:VIDEO", "time_s": 3}, {"media_id": "visual:VIDEO", "time_s": 12}, ...] (one item per frame, or frame_no), beside question. Nothing was executed.')
+    if action == "inspect_media" and path in ("time_s", "frame_no") and isinstance(error.instance, list):
+        raise ValueError(f"{path} takes one value. For several frames, pass media_inputs=[{{\"media_id\": \"visual:VIDEO\", \"{path}\": value}}, ...] (one item per frame), or use inspect_video for a time range.")
+    if action == "inspect_media" and "bbox" in error.path:
+        raise ValueError(f"{path}: {error.message}. bbox=[x_min,y_min,x_max,y_max], integers 0..1000 relative to the full image; x_max>x_min and y_max>y_min.")
+    if error.validator == "type" and isinstance(error.instance, list) and f"{path}s" in definition["parameters"]["properties"]:  # media_id / media_ids, path / paths
+        raise ValueError(f"{path} takes one value; pass several in {path}s: {{\"{path}s\": {json.dumps(error.instance, ensure_ascii=False)}}}. Nothing was executed.")
+    if error.validator == "maxItems":
+        raise ValueError(f"{path} has {len(error.instance)} items; this action takes at most {error.validator_value}: split them across calls (they may follow one another in one response). Nothing was executed.")
+    if error.validator == "type" and (problem := json_string_problem(path, error.instance)):
+        raise ValueError(problem)
+    required = ", ".join(definition["parameters"].get("required", [])) or "none"
+    expected = f"Allowed arguments: {', '.join(definition['parameters']['properties'])}." if error.validator == "additionalProperties" else f"Required arguments: {required}."
+    if error.validator == "additionalProperties" and isinstance(error.instance, dict) and not error.absolute_path:
+        expected += unknown_hints(error.instance)
+    if error.validator == "required" and not error.absolute_path and "example" not in definition:  # an agent reading a contract often sends what it knows, not null: the call answers with it
+        raise ValueError(f"{path}: {error.message}. Nothing was executed. The contract of {action}: {json.dumps(action_contract(definition), ensure_ascii=False)}")
+    if "example" in definition:
+        raise ValueError(f"{path}: {error.message}. {expected} Call structure: {json.dumps(definition['example'], ensure_ascii=False)}")
+    raise ValueError(f"{path}: {error.message}. {expected} To read the contract, repeat this call with action={action!r} and arguments=null (the entire object, not a nested value).")
+
+
+def invocation(actions, action, arguments, *, signatures=False, seen=None):
     if action == "":  # an empty action is an omitted one; with empty arguments the call is discovery
         action, arguments = None, None if arguments == {} else arguments
     if action is None:
@@ -232,55 +291,21 @@ def invocation(actions, action, arguments, *, signatures=False):
                  or sorted(difflib.get_close_matches(action, actions, n=3, cutoff=0.6) or [name for name in actions if action in name or name in action.split("_")][:3]))
         raise ValueError(f"Unknown or unavailable action: {action}. " + (f"Did you mean {' or '.join(close)}? Omit action to discover available actions." if close else f"Available actions: {', '.join(actions)}. Omit action to list them with their descriptions."))
     definition = actions[action]
+    key = (next(iter(actions)), action)  # toolboxes share action names (list, search): the first action names the toolbox
     if arguments is None:
+        if seen is not None:
+            seen.add(key)
         return {"status": "schema", "action": {"name": action, **action_contract(definition)}}
     errors = sorted(Draft202012Validator(definition["parameters"]).iter_errors(arguments), key=lambda error: str(list(error.path)))
     if errors:
-        if isinstance(arguments, dict) and list(arguments) == ["arguments"] and "arguments" not in definition["parameters"]["properties"]:
-            raise ValueError(f"arguments is nested twice: pass the inner object itself, {{\"action\": \"{action}\", \"arguments\": {{...}}}}. Nothing was executed.")
-        error = errors[0]
-        if error.validator == "anyOf":  # report the branch the value's type matched, such as a value outside its enum
-            error = max((item for item in error.context if item.validator != "type"), key=lambda item: len(item.absolute_path), default=error)
-        path = ".".join(map(str, error.absolute_path)) or "arguments"
-        if action == "inspect_media" and error.validator == "oneOf":
-            raise ValueError("inspect_media requires exactly one of media_id (one visual), media_ids (a list), or media_inputs (selected frames), inside arguments alongside question."
-                             " To read its contract instead, pass arguments=null (the entire object, not null values inside it).")
-        if action == "inspect_media" and "media_inputs" in error.path and error.validator == "type":
-            raise ValueError(f"{path}: {error.message}. media_inputs items are objects such as {{\"media_id\": \"visual:VIDEO\", \"time_s\": 2.5}} (or frame_no, or view for 3D, with an optional bbox); for a list of media use media_ids.")
-        if action == "remux_media" and list(error.absolute_path) == ["ducking"] and error.validator == "type" and not isinstance(error.instance, str):
-            raise ValueError('ducking is an object, not a flag: {"tracks": [indexes in audio_ids of what dips, e.g. the music], "under": [indexes of the voices it dips under]} (0 = the first file; "video" = the soundtrack of the video), optional "depth_db". Nothing was executed.')
-        if action == "remux_media" and list(error.absolute_path)[:1] == ["ducking"] and list(error.absolute_path)[1:2] in (["tracks"], ["under"]):
-            raise ValueError(f"{path}: ducking tracks and under are indexes into audio_ids (0 = the first file), not media ids, e.g. {{\"tracks\": [1], \"under\": [0]}}; \"video\" in tracks or under is the video's own soundtrack (with include_video_audio), e.g. under: [\"video\"] for the speech of lip-synced shots.")
-        if action == "write_text" and list(error.absolute_path) == ["mode"] and str(error.instance).startswith("append"):
-            raise ValueError("write_text creates or overwrites a file; to add to the end of one, call the append_text action with the same path and text.")
-        if action == "inspect_audio" and error.validator == "additionalProperties" and "question" in error.instance:
-            raise ValueError("inspect_audio measures audio (levels, loudness, clipping, silence intervals) and answers no question: omit question. For spoken words use transcribe_media.")
-        if action == "inspect_media" and error.validator == "additionalProperties" and isinstance(error.instance, dict) and {"times", "timestamps", "times_s", "frames", "frame_nos"} & set(error.instance):
-            raise ValueError('inspect_media reads several frames in one call: media_inputs=[{"media_id": "visual:VIDEO", "time_s": 3}, {"media_id": "visual:VIDEO", "time_s": 12}, ...] (one item per frame, or frame_no), beside question. Nothing was executed.')
-        if action == "inspect_media" and path in ("time_s", "frame_no") and isinstance(error.instance, list):
-            raise ValueError(f"{path} takes one value. For several frames, pass media_inputs=[{{\"media_id\": \"visual:VIDEO\", \"{path}\": value}}, ...] (one item per frame), or use inspect_video for a time range.")
-        if action == "inspect_media" and "bbox" in error.path:
-            raise ValueError(f"{path}: {error.message}. bbox=[x_min,y_min,x_max,y_max], integers 0..1000 relative to the full image; x_max>x_min and y_max>y_min.")
-        if error.validator == "type" and isinstance(error.instance, list) and f"{path}s" in definition["parameters"]["properties"]:  # media_id / media_ids, path / paths
-            raise ValueError(f"{path} takes one value; pass several in {path}s: {{\"{path}s\": {json.dumps(error.instance, ensure_ascii=False)}}}. Nothing was executed.")
-        if error.validator == "maxItems":
-            raise ValueError(f"{path} has {len(error.instance)} items; this action takes at most {error.validator_value}: split them across calls (they may follow one another in one response). Nothing was executed.")
-        if error.validator == "type" and (problem := json_string_problem(path, error.instance)):
-            raise ValueError(problem)
-        required = ", ".join(definition["parameters"].get("required", [])) or "none"
-        expected = f"Allowed arguments: {', '.join(definition['parameters']['properties'])}." if error.validator == "additionalProperties" else f"Required arguments: {required}."
-        if error.validator == "additionalProperties" and isinstance(error.instance, dict) and not error.absolute_path:
-            properties = list(definition["parameters"]["properties"])
-            close = [f"{match[0]} for {name}" for name in error.instance if name not in properties and (match := difflib.get_close_matches(name, properties, n=1, cutoff=0.6)
-                                                                                                     or [alias for alias in ARGUMENT_ALIASES.get(name, ()) if alias in properties][:1])]
-            expected += f" Did you mean {', '.join(close)}?" if close else ""
-            measured = [name for name in error.instance if name not in properties and name.removesuffix("_seconds") in ("black_ranges", "cut_times", "quiet_ranges", "sound_ends")]
-            expected += f" {', '.join(measured)}: measured and returned in the result whenever present, not requested: drop {'them' if len(measured) > 1 else 'it'}." if measured else ""
-        if error.validator == "required" and not error.absolute_path and "example" not in definition:  # an agent reading a contract often sends what it knows, not null: the call answers with it
-            raise ValueError(f"{path}: {error.message}. Nothing was executed. The contract of {action}: {json.dumps(action_contract(definition), ensure_ascii=False)}")
-        if "example" in definition:
-            raise ValueError(f"{path}: {error.message}. {expected} Call structure: {json.dumps(definition['example'], ensure_ascii=False)}")
-        raise ValueError(f"{path}: {error.message}. {expected} To read the contract, repeat this call with action={action!r} and arguments=null (the entire object, not a nested value).")
+        try:
+            validation_failure(action, definition, arguments, errors)
+        except ValueError as exc:
+            if seen is None or key in seen:
+                raise
+            seen.add(key)  # a guessed call that fails gets the contract once, instead of the call needed to read it
+            message = re.split(r" (?:Call structure: |To read |The contract of )", str(exc), maxsplit=1)[0]
+            raise ValueError(f"{message} The contract of {action}: {json.dumps(action_contract(definition), ensure_ascii=False)}") from None
     return None
 
 
@@ -307,6 +332,7 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
 
     pages = ResultPages()
     mcp._wangp_pages = pages
+    contracts_seen = set()  # actions whose contract this server's agent has received (Prime: one server per chat session)
     mcp._wangp_jobs = jobs
     mcp._wangp_allow_async = allow_async
     mcp._wangp_wait_interrupted = lambda: False
@@ -363,7 +389,7 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
             if action is not None or arguments is not None:
                 raise ValueError("Pass query alone, or use action='search' with query inside arguments alongside advanced filters.")
             action, arguments = "search", {"query": query}
-        response = invocation({"search": search_def, "lookup": lookup_def, "specialities": specialities_def}, action, arguments, signatures=signatures)
+        response = invocation({"search": search_def, "lookup": lookup_def, "specialities": specialities_def}, action, arguments, signatures=signatures, seen=contracts_seen)
         if response is not None:
             return response
         if action == "lookup":
@@ -456,7 +482,7 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
                 raise ValueError(f"{action}: id and setting_id must not specify different values.")
         if action == "definition" and isinstance(arguments, dict) and arguments.get("property") == "profiles" and "profiles" not in session.get_model_def(model_type):
             action, arguments = "profiles", {}  # like the defaults/capabilities properties, a request for the action of that name
-        response = invocation(actions, action, arguments, signatures=signatures)
+        response = invocation(actions, action, arguments, signatures=signatures, seen=contracts_seen)
         if response is not None:
             if response["status"] == "discovery":  # model reads run without arguments: name their optional parameters here
                 if not signatures:
@@ -753,7 +779,7 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
                     if name in arguments and arguments[name] != value:
                         raise ValueError(f"{action}: {name} and its legacy alias {alias} must not specify different values.")
                     arguments[name] = value
-        response = invocation(io_actions, action, arguments, signatures=signatures)
+        response = invocation(io_actions, action, arguments, signatures=signatures, seen=contracts_seen)
         if response is not None:
             if action is None:
                 response["roots"] = policy.roots()
@@ -1017,7 +1043,7 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
             from postprocessing import catalog
             if action in {process["id"] for kind in ("image", "video", "audio", "3d") for process in catalog.query_processes(kind)}:
                 raise ValueError(f'{action} is a wangp_postprocess treatment, not a toolbox action: call wangp_postprocess with the media, "action": "{action}" and its arguments.')
-        response = invocation(actions, action, arguments, signatures=signatures)
+        response = invocation(actions, action, arguments, signatures=signatures, seen=contracts_seen)
         if response is not None:
             return response
         if action in ("inspect_media", "inspect_video") and extended and not deepy_help:  # the inspector configured now, remote or local
@@ -1077,7 +1103,7 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
         else:
             result = public_media_result(operations["wangp_toolbox"](action, arguments), get_toolbox().session.media_registry, compact=True, virtualize=virtualize)
         if action == "inspect_media" and "media_inputs" not in arguments and any(item.get("media_type") == "video" for item in result.get("media", [])):  # a video named by id is one frame
-            result["note"] = "A video given by media_id is read as one frame (its first). For motion or change over time use inspect_video, which samples a time range."
+            result["note"] = " ".join(filter(None, ["A video given by media_id is read as one frame (its first). For motion or change over time use inspect_video, which samples a time range.", result.get("note")]))
         if "_mcp_images" in result:
             from mcp.types import CallToolResult, TextContent
 
@@ -1243,7 +1269,7 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
             raise ValueError(f'Pass the media ID or path as the top-level media, not inside arguments: {{"media": "<media_id>", "action": "{action}", "arguments": {{...}}}}. Nothing was executed.')
         if action and action not in actions and action in {item["name"] for item in core._toolbox_discovery(get_toolbox(), policy.read_enabled)} | {"remux_media", "media_settings", "draw_svg"}:
             raise ValueError(f'{action} is a wangp_toolbox action, not a post-processing treatment: call wangp_toolbox with {{"action": "{action}", "arguments": {{...}}}}.')
-        response = invocation(actions, action, arguments, signatures=signatures)
+        response = invocation(actions, action, arguments, signatures=signatures, seen=contracts_seen)
         if response is not None:
             response["media_type"] = kind
             return response
@@ -1282,7 +1308,7 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
     @mcp.tool()
     def wangp_session(action: str | None = None, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
         """Track or cancel generation and post-processing jobs, send configured notifications, and transfer authorized files or Gallery media when supported."""
-        response = invocation(session_actions, action, arguments, signatures=signatures)
+        response = invocation(session_actions, action, arguments, signatures=signatures, seen=contracts_seen)
         if response is not None:
             return response
         if action == "list_queue":
@@ -1331,7 +1357,7 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
                       "new_app": "app_new", "create_app": "app_new", "open_app": "app_open", "edit_app": "app_open", "check_app": "app_check", "test_app": "app_check", "publish_app": "app_publish", "app_log": "app_logs", "logs": "app_logs"}.get(action, action)
             if action in ("app_check", "app_logs", "app_publish") and isinstance(arguments, dict) and "name" in arguments and "app" not in arguments:
                 arguments = {"app": arguments["name"], **{key: value for key, value in arguments.items() if key != "name"}}  # results call the app "app"
-            response = invocation(python_actions, action, arguments, signatures=signatures)
+            response = invocation(python_actions, action, arguments, signatures=signatures, seen=contracts_seen)
             if response is not None:
                 if action is None or action == "":
                     response.update(python_sandbox.describe())
@@ -1353,7 +1379,7 @@ def register_v2(mcp, session, operations, jobs, policy, get_toolbox, *, download
                 action = "open" if isinstance(arguments.get("url"), str) else "search" if isinstance(arguments.get("query"), str) else action
             action = {"text": "search", "web": "search", "web_search": "search", "google": "search", "lookup": "search", "fetch": "open", "read": "open", "get": "open", "browse": "open", "page": "open", "open_page": "open", "read_page": "open", "open_url": "open", "image": "images", "image_search": "images", "video": "videos", "video_search": "videos", "news_search": "news", "capture": "screenshot", "snapshot": "screenshot", "screen_shot": "screenshot", "screen": "screenshot", "render": "screenshot",
                       "save": "download", "download_file": "download", "get_file": "download", "fetch_file": "download", "cookie": "cookies", "session": "cookies", "login": "cookies", "import_cookies": "cookies"}.get(action, action)
-            response = invocation(web_actions, action, arguments, signatures=signatures)
+            response = invocation(web_actions, action, arguments, signatures=signatures, seen=contracts_seen)
             if response is not None:
                 if not action:
                     response.update(web_search.describe())

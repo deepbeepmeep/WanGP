@@ -95,6 +95,7 @@ ASSISTANT_DEBUG = False
 _ENABLE_INCOMPLETE_STOP_ANSWER_HEURISTICS = False
 _THROUGHPUT_BUCKET_SECONDS = 1.0
 _THROUGHPUT_BUCKET_COUNT = 5
+INSPECTION_ZOOM_NOTE_SHRINK = 2.0  # an inspection read at under half the linear resolution of its source names bbox, once per session
 
 _TOOL_TYPE_MAP = {
     "str": "string",
@@ -544,6 +545,7 @@ class AssistantSessionState:
     chat_revision: int = 0
     chat_event_sequence: int = 0
     chat_session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    inspection_zoom_noted: bool = False  # the bbox note on a much-reduced inspection was given
     storage_session_id: str = ""
     storage_session_dir: str = ""
     storage_title: str = ""
@@ -6358,13 +6360,13 @@ class DeepyZeroTools:
             try:
                 input_time_seconds = None if input_time_seconds is None or str(input_time_seconds).strip() == "" else float(input_time_seconds)
             except Exception:
-                return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": raw_inputs, "question": question, "answer": "", "error": f"media_inputs[{index}].time_snds must be a number."}
+                return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": raw_inputs, "question": question, "answer": "", "error": f"media_inputs[{index}].time_s must be a number."}
             if input_frame_no is not None and input_time_seconds is not None:
-                return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": raw_inputs, "question": question, "answer": "", "error": f"media_inputs[{index}] cannot combine frame_no and time_seconds."}
+                return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": raw_inputs, "question": question, "answer": "", "error": f"media_inputs[{index}] cannot combine frame_no and time_s."}
             if input_frame_no is not None and input_frame_no < 0:
                 return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": raw_inputs, "question": question, "answer": "", "error": f"media_inputs[{index}].frame_no must be non-negative."}
             if input_time_seconds is not None and (not math.isfinite(input_time_seconds) or input_time_seconds < 0):
-                return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": raw_inputs, "question": question, "answer": "", "error": f"media_inputs[{index}].time_snds must be a finite non-negative number."}
+                return {"status": "error", "media_id": single_media_id, "media_ids": [], "media_inputs": raw_inputs, "question": question, "answer": "", "error": f"media_inputs[{index}].time_s must be a finite non-negative number."}
             try:
                 input_bbox = deepy_vision.normalize_inspection_bbox(raw_input.get("bbox"))
             except ValueError as exc:
@@ -6398,7 +6400,7 @@ class DeepyZeroTools:
             if requested_input.get("view"):
                 return {"status": "error", "media_id": media_record.get("media_id", ""), "media_ids": requested_media_ids, "media_inputs": progress_inputs, "media_type": media_record.get("media_type", ""), "question": question, "answer": "", "error": f"media_inputs[{index}].view applies to 3D assets only."}
             if media_inputs is not None and media_record.get("media_type") == "image" and (requested_input["frame_no"] is not None or requested_input["time_seconds"] is not None):
-                return {"status": "error", "media_id": media_record.get("media_id", ""), "media_ids": requested_media_ids, "media_inputs": progress_inputs, "media_type": "image", "question": question, "answer": "", "error": f"media_inputs[{index}] is an image and cannot specify frame_no or time_seconds."}
+                return {"status": "error", "media_id": media_record.get("media_id", ""), "media_ids": requested_media_ids, "media_inputs": progress_inputs, "media_type": "image", "question": question, "answer": "", "error": f"media_inputs[{index}] is an image and cannot specify frame_no or time_s."}
             inspection_record = dict(media_record)
             inspection_record["frame_no"] = (requested_input["frame_no"] if requested_input["frame_no"] is not None or requested_input["time_seconds"] is not None else 0) if media_record.get("media_type") == "video" else None
             inspection_record["time_seconds"] = requested_input["time_seconds"] if media_record.get("media_type") == "video" else None
@@ -6415,6 +6417,10 @@ class DeepyZeroTools:
                 "error": "Deepy vision inspection is not available.",
             }
         result = self._vision_query_callback(media_records[0] if len(media_records) == 1 else media_records, question, frame_no if media_inputs is None else None)
+        shrink = result.pop("_inspection_shrink", 1.0) if isinstance(result, dict) else 1.0
+        if shrink >= INSPECTION_ZOOM_NOTE_SHRINK and not self.session.inspection_zoom_noted and result.get("status") == "done":  # once per session: later answers on large images stay lean
+            self.session.inspection_zoom_noted = True
+            result["note"] = f"The inspector read this at about 1/{shrink:.0f} of its resolution. For small text or details, inspect a region at full detail with bbox=[x_min,y_min,x_max,y_max] (0-1000 of the full image) instead of making crop files."
         if isinstance(result, dict) and result.get("status") == "done":
             image_details = []
             worlds = [record for record in media_records if record.get("source_media_type") == "world"]
@@ -6565,6 +6571,7 @@ class DeepyZeroTools:
         if isinstance(result, dict):
             result.pop("media", None)
             result.pop("media_ids", None)
+            result.pop("_inspection_shrink", None)  # sampled frames are small by design
             result.update({
                 "media_id": media_record.get("media_id", ""), "start_frame_no": start_frame, "end_frame_no": end_frame,
                 "start_s": start_time_seconds, "end_s": sampled_end_seconds,
@@ -8016,6 +8023,7 @@ class AssistantEngine:
                     )
                 prompt_embeds = prompt_embeds.detach().to("cpu")
                 prompt_position_ids = prompt_position_ids.detach().to("cpu")
+                shrink = deepy_vision.inspection_shrink(images, deepy_vision.local_inspection_pixels(caption_processor, None if max_image_edge is None else max_image_edge * max_image_edge))
             finally:
                 if resident:
                     unload_vision()
@@ -8072,6 +8080,7 @@ class AssistantEngine:
             "question": str(question or "").strip(),
             "answer": answer,
             "error": "",
+            "_inspection_shrink": shrink,
         }
         if len(inspected_media) == 1:
             result.update(inspected_media[0])

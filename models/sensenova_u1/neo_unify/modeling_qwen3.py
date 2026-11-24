@@ -175,6 +175,78 @@ def _cached_prefix(past_key_values, layer_idx):
     return keys.transpose(1, 2), values.transpose(1, 2)
 
 
+class _StaticCacheLayer:
+    def __init__(self, cache, index):
+        self.cache, self.index = cache, index
+
+    @property
+    def keys(self):  # (batch, kv heads, tokens, head_dim) views of the tokens written, as a transformers cache layer gives
+        return self.cache.k[self.index][:, :self.cache.lengths[self.index]].transpose(1, 2)
+
+    @property
+    def values(self):
+        return self.cache.v[self.index][:, :self.cache.lengths[self.index]].transpose(1, 2)
+
+
+class StaticKVCache:
+    """A KV cache of fixed capacity for interleaved generation (self-correction). Prompts and image appends write through update(), as into
+    a transformers DynamicCache; a written token goes through decode steps (Qwen3Model.decode_step) that write at the device slot `position`
+    and attend to the slots up to it, with fixed shapes: CUDA graphs replay them (the cache is their registered state). Token-major storage
+    (batch, slots, kv heads, head_dim): a layer's prefix is then a contiguous slice."""
+
+    def __init__(self, config, capacity, rotary_emb_hw, device, dtype=torch.bfloat16):
+        shape = (1, capacity, config.num_key_value_heads, getattr(config, "head_dim", config.hidden_size // config.num_attention_heads))
+        self.k = [torch.zeros(shape, dtype=dtype, device=device) for _ in range(config.num_hidden_layers)]
+        self.v = [torch.zeros(shape, dtype=dtype, device=device) for _ in range(config.num_hidden_layers)]
+        self.lengths = [0] * config.num_hidden_layers
+        self.layers = [_StaticCacheLayer(self, index) for index in range(config.num_hidden_layers)]
+        self.capacity = capacity
+        self.position = torch.zeros(1, dtype=torch.long, device=device)  # the slot of the token a decode step writes
+        self.slots = torch.arange(capacity, device=device)
+        # a written token's height and width positions are 0: their rotary tables, computed once (the module reads its frequencies from RAM)
+        self.rope_hw = rotary_emb_hw(self.k[0], torch.zeros(1, 1, dtype=torch.long, device=device))
+
+    def get_seq_length(self, layer_idx=0):
+        return self.lengths[layer_idx]
+
+    def reserve(self, count):
+        """Room for count more tokens: a larger cache, its tokens copied layer by layer (one layer's copy at a time). New tensors: their CUDA
+        graphs go (register the cache again)."""
+        capacity = self.lengths[0] + count
+        if capacity <= self.capacity:
+            return False
+        for index, length in enumerate(self.lengths):
+            for tensors in (self.k, self.v):
+                grown = tensors[index].new_zeros((1, capacity, *tensors[index].shape[2:]))
+                grown[:, :length].copy_(tensors[index][:, :length])
+                tensors[index] = grown
+        self.capacity = capacity
+        self.slots = torch.arange(capacity, device=self.slots.device)
+        return True
+
+    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
+        start, count = self.lengths[layer_idx], key_states.shape[2]
+        if start + count > self.capacity:
+            raise RuntimeError(f"SenseNova KV cache capacity {self.capacity} exceeded")
+        self.k[layer_idx][:, start:start + count].copy_(key_states.transpose(1, 2))
+        self.v[layer_idx][:, start:start + count].copy_(value_states.transpose(1, 2))
+        self.lengths[layer_idx] = start + count
+        return self.layers[layer_idx].keys, self.layers[layer_idx].values
+
+    def decode_bias(self, dtype):
+        """Additive mask of a decode step: the slots up to `position`, (batch, tokens, 1, slots) as _pay_attention_gqa takes it."""
+        return torch.zeros(1, 1, 1, self.capacity, dtype=dtype, device=self.slots.device).masked_fill_(self.slots > self.position, float("-inf"))
+
+    def begin_decode(self):
+        """Before a decode step: its token goes to the slot after the tokens written (prompts and images included)."""
+        if self.lengths[0] >= self.capacity:
+            raise RuntimeError(f"SenseNova KV cache capacity {self.capacity} exceeded")
+        self.position.fill_(self.lengths[0])
+
+    def end_decode(self):
+        self.lengths = [length + 1 for length in self.lengths]
+
+
 def _norm_rope_rows(x, norm_t, norm_hw, cos, sin, partner):
     """forward_gen's norms of the t and hw halves of the head dimension, then RoPE of its t, h and w parts, of rows x (batch, tokens,
     heads, head_dim), in one pass each: the same arithmetic as the Qwen3RMSNorm calls and the three rotate-half passes."""
@@ -465,6 +537,40 @@ class Qwen3Attention(nn.Module):
         del attn_output
         attn_output = _linear_disposable(self.o_proj, attn_output_list)
         return attn_output, attn_weights
+
+    def forward_decode(self, hidden_states_list, cache, rope, bias):
+        """forward_und for one written token (batch 1), with fixed shapes for CUDA graphs: its keys/values go to the slot cache.position and
+        it attends to the slots up to it (bias). rope: the (cos, sin) tables of its time, height and width positions."""
+        hidden_states = _take_tensor(hidden_states_list)
+        hidden_shape = (1, 1, -1, self.head_dim)
+        (cos_t, sin_t), (cos_h, sin_h), (cos_w, sin_w) = rope
+        query_states = self.q_proj(hidden_states).view(hidden_shape)
+        key_states = self.k_proj(hidden_states).view(hidden_shape)
+        hidden_states_list = [hidden_states]
+        del hidden_states
+        value_states = _linear_disposable(self.v_proj, hidden_states_list).view(hidden_shape)
+        # the norms and rotations of forward_und, in place on views of query_states / key_states
+        for states, norm_t, norm_hw in ((query_states, self.q_norm, self.q_norm_hw), (key_states, self.k_norm, self.k_norm_hw)):
+            states_t, states_hw = states.chunk(2, dim=-1)
+            states_t.copy_(norm_t(states_t))
+            states_hw.copy_(norm_hw(states_hw))
+        query_t, query_hw = query_states.chunk(2, dim=-1)
+        key_t, key_hw = key_states.chunk(2, dim=-1)
+        query_t, query_hw, key_t, key_hw = query_t.transpose(1, 2), query_hw.transpose(1, 2), key_t.transpose(1, 2), key_hw.transpose(1, 2)
+        query_h, query_w = query_hw.chunk(2, dim=-1)
+        key_h, key_w = key_hw.chunk(2, dim=-1)
+        rope_scratch = torch.empty_like(query_t[..., :query_t.shape[-1] // 2])
+        for query, key, cos, sin in ((query_t, key_t, cos_t, sin_t), (query_h, key_h, cos_h, sin_h), (query_w, key_w, cos_w, sin_w)):
+            apply_rotary_pos_emb([query, key], cos, sin, rope_scratch)
+        del query_t, query_hw, query_h, query_w, key_t, key_hw, key_h, key_w, rope_scratch
+        k_cache, v_cache = cache.k[self.layer_idx], cache.v[self.layer_idx]
+        k_cache.index_copy_(1, cache.position, key_states)
+        v_cache.index_copy_(1, cache.position, value_states)
+        del key_states, value_states
+        qkv_list = [query_states, k_cache, v_cache]
+        del query_states
+        attn_output = _pay_attention_gqa(qkv_list, softmax_scale=self.scaling, attention_mask=bias).reshape(1, 1, -1)
+        return _linear_disposable(self.o_proj, [attn_output])
 
     # def forward_gen(
     #     self,
@@ -933,6 +1039,15 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         mlp = self.mlp_mot_gen
         return ops.mlp(hidden_states_list, mlp.gate_proj, mlp.down_proj, "swiglu", up=mlp.up_proj, residual=hidden_states)
 
+    def forward_decode(self, hidden_states_list, cache, rope, bias):
+        """forward_und for one written token through a StaticKVCache (Qwen3Model.decode_step)."""
+        residual = _take_tensor(hidden_states_list)
+        hidden_states_list = [self.input_layernorm(residual)]
+        hidden_states = residual.add_(self.self_attn.forward_decode(hidden_states_list, cache, rope, bias))
+        residual = hidden_states
+        hidden_states_list = [self.post_attention_layernorm(hidden_states)]
+        return residual.add_(self.mlp(hidden_states_list))
+
     def forward_gen_branches(self, hidden_states, branches):
         outputs = []
         for branch in branches:
@@ -966,10 +1081,15 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         branches=None,
+        decode_cache=None,
+        decode_rope=None,
+        decode_bias=None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
         if branches is not None:
             return self.forward_gen_branches(hidden_states, branches)
+        if decode_cache is not None:
+            return self.forward_decode(hidden_states, decode_cache, decode_rope, decode_bias)
         if exist_non_image_gen_tokens and not exist_image_gen_tokens:
             return self.forward_und(hidden_states, image_gen_indicators, exist_non_image_gen_tokens, exist_image_gen_tokens, indexes, attention_mask, position_ids, past_key_values, use_cache, cache_position, **kwargs)
         if not exist_non_image_gen_tokens and exist_image_gen_tokens:
@@ -1181,6 +1301,16 @@ class Qwen3Model(Qwen3PreTrainedModel):
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
         )
+
+    def decode_step(self, hidden_states, cos_t, sin_t, cache):
+        """One written token (embedded, (1, 1, hidden)) through the layers: its keys/values go to the slot cache.position, its final hidden
+        state is returned. Fixed shapes and the cache as registered state: one CUDA graph when the layers are in VRAM, else a graph per
+        layer (shared.llm_engines.cudagraph_kit). cos_t / sin_t: the rotary tables of its time position."""
+        bias = cache.decode_bias(hidden_states.dtype)
+        rope = ((cos_t, sin_t), cache.rope_hw, cache.rope_hw)
+        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            hidden_states = decoder_layer([hidden_states], image_gen_indicators=None, exist_non_image_gen_tokens=True, exist_image_gen_tokens=False, decode_cache=cache, decode_rope=rope, decode_bias=bias)
+        return self.norm.forward_list([hidden_states])
 
     def forward_gen_branches(self, input_embeds_list, branches):
         input_embeds = _take_tensor(input_embeds_list)

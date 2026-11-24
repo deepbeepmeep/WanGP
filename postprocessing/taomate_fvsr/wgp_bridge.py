@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from mmgp import offload
-from postprocessing.face_refiner.bridge import ASSET_DOWNLOAD_DEF, FaceRefineJob, FaceRefinerBridge, FaceSegment, PrivateRuntime, UNDETECTED_FRAMES_CHOICES, face_count_parameter, face_reference_images_parameter, face_strength_parameter, model_step_callback
+from postprocessing.face_refiner.bridge import ASSET_DOWNLOAD_DEFS, FaceRefineJob, FaceRefinerBridge, FaceSegment, PrivateRuntime, UNDETECTED_FRAMES_CHOICES, face_count_parameter, face_reference_images_parameter, face_strength_parameter, model_step_callback
 from postprocessing.spatial_upsamplers import PARAMETER_UI_LATE_POSTPROCESSING, PARAMETER_UI_MEDIA_FLOW, PARAMETER_UI_POSTPROCESSING, POSTPROCESSING_CATEGORY_REFINER, UPSAMPLER_PROFILE_VIDEO, UPSAMPLER_TYPE_POSTPROCESSING
 from shared.hubert import HUBERT_FOLDER
 from shared.utils import files_locator as fl
@@ -34,7 +34,7 @@ def weights_format(quantization: str) -> str:
 
 
 def model_download_defs(transformer_format: str, audio_encoder_format: str) -> list[dict[str, Any]]:
-    return [{"repoId": WEIGHTS_REPO, "sourceFolderList": ["", HUBERT_FOLDER], "fileList": [[TRANSFORMER_FILE.format(transformer_format), VAE_FILE], [AUDIO_ENCODER_FILE.format(audio_encoder_format), *AUDIO_ENCODER_ASSETS]]}, ASSET_DOWNLOAD_DEF]
+    return [{"repoId": WEIGHTS_REPO, "sourceFolderList": ["", HUBERT_FOLDER], "fileList": [[TRANSFORMER_FILE.format(transformer_format), VAE_FILE], [AUDIO_ENCODER_FILE.format(audio_encoder_format), *AUDIO_ENCODER_ASSETS]]}, *ASSET_DOWNLOAD_DEFS]
 
 
 class TaoMateRuntime(PrivateRuntime):
@@ -118,7 +118,7 @@ class TaoMateEngine:
         else:
             if matched_reference is not None:
                 print(f"[FaceRefine] Face track {track_index + 1}: no face detected in the supplied reference image; using the track's best frame")
-            frame, crop = best_reference_crop(job.frames, transform, job.insightface_model_dir)
+            frame, crop = best_reference_crop(job.frames, transform)
             native = transform["boxes"][frame][3]
             print(f"[FaceRefine] Face track {track_index + 1}: using stabilized single-face crop from pose-aware source frame {frame + 1} as reference, {native:.0f}px")
         method = job.config["reference_restorer"]

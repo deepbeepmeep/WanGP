@@ -16,9 +16,7 @@ import numpy as np
 import gradio as gr
 from datetime import datetime
 from .tools.painter import mask_painter, point_painter
-from .tools.interact_tools import SamControler
 from .tools.misc import get_device
-from .tools.base_segmenter import set_image_encoder_patch
 from .utils.model_assets import MATANYONE_SAM3, ensure_selected_matanyone_assets, get_matanyone_title_html, get_selected_matanyone_version, load_selected_matanyone_model
 from .matanyone.inference.inference_core import InferenceCore
 from .matanyone_wrapper import matanyone
@@ -33,6 +31,11 @@ from functools import wraps
 import inspect
 from shared.gradio.progress import WangpProgress
 from shared.utils.download_progress import download_operation
+
+
+def set_image_encoder_patch():  # segment_anything (with matplotlib) loads when a mask is first made, not with WanGP's UI
+    from .tools.base_segmenter import set_image_encoder_patch as patch
+    patch()
 
 logger = get_logger(__name__)
 
@@ -133,6 +136,7 @@ class MaskGenerator():
     def __init__(self, sam_checkpoint, device):
         global args_device
         args_device  = device
+        from .tools.interact_tools import SamControler  # here: segment_anything and matplotlib are heavy to import
         self.samcontroler = SamControler(sam_checkpoint, arg_sam_model_type, arg_device)
        
     def first_frame_click(self, image: np.ndarray, points:np.ndarray, labels: np.ndarray, multimask=True):

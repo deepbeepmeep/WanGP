@@ -27,6 +27,7 @@ from . import inkling2
 from .inkling2 import _Tensors, _linear
 from .inkling2_core import DRAFT_FEATURES, rms, softcap
 
+TIED = ("embed", "embed_norm", "unembed")  # the target's modules whose weights the drafter's stages read (Inkling2Draft.tied)
 REWIND_ROWS = 4096  # positions a window ring keeps beyond its window: a rewind up to this far leaves the drafts their whole context
 CONFIDENT = "confident_drafts" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(",")  # disabled: the automatic count from the measured history only (MeasuredDrafts), for comparisons
 IN_PLACE = "draft_attention" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(",")  # the block's keys and values written at its positions in the caches, attended there up to the block (the target's attention kernels when it has them); disabled: the previous path (copies of the whole caches, scores over all their rows), for comparisons
@@ -80,6 +81,9 @@ class Inkling2Draft(nn.Module):
         head.rnn_proj = nn.Linear(2 * self.rank + 2 * hidden, 3 * self.rank, dtype=torch.bfloat16)
         head.hidden_out = nn.Linear(self.rank, hidden, dtype=torch.bfloat16)
         self.register_buffer("head_latent", torch.empty(self.draft_vocab_size, self.rank + 1, dtype=torch.bfloat16))  # U H | U b (draft_head_tensors)
+        # the target's tensors its stages read (the anchor's embedding, the head), tied to them (draft_head_tensors): the same tensors, which MMGP
+        # counts once and places as the target's, are also the drafter's weights, which its graphs may read and whose changes they follow
+        self.tied = _Tensors(**{name: getattr(target, name).weight.shape for name in TIED})
         self._keys = self._values = self._rnn = None
         self._length = 0
 
@@ -274,7 +278,7 @@ class Inkling2Draft(nn.Module):
         last = self._rnn.index_select(0, (self._cursor - 1).clamp_min(0) % self._ring)
         last = last * (self._cursor > (self._high - self._ring).clamp_min(0)).to(last.dtype)  # no committed position, or one the ring lost
         base.copy_(F.linear(states.float(), head.rnn_proj.weight[:, 2 * self.rank:2 * self.rank + self.hidden].float(), head.rnn_proj.bias.float()) + last)
-        unary.copy_(F.linear(states, self.target.unembed.weight[:self.draft_vocab_size]))
+        unary.copy_(F.linear(states, self.tied.unembed[:self.draft_vocab_size]))
 
     def propose(self, anchor, start_position=None, embedding=None, output=None):
         """(base, unary) of the block after the token anchor: what proposal_step turns into the logits of each draft."""
@@ -309,5 +313,6 @@ def draft_head_tensors(vocab, rows=16384):
         unembed, head = state_dict["unembed.weight"], "mtp.markov_head.hidden_out."
         extended = torch.cat((state_dict[head + "weight"].float(), state_dict[head + "bias"].float()[:, None]), 1)
         state_dict["mtp.head_latent"] = torch.cat([(unembed[start:min(vocab, start + rows)].float() @ extended).to(unembed.dtype) for start in range(0, vocab, rows)])
+        state_dict.update({f"mtp.tied.{name}": state_dict[f"{name}.weight"] for name in TIED})  # the same tensors: tied weights
         return state_dict, quant_map, tied_map
     return add
