@@ -6,19 +6,16 @@
     return value ? JSON.parse(value) : null;
   }
   let sequence = 0, pendingView = null, acceptedView = null, viewing = null, repairedView = null;
-  // File names, as thumbnail URLs (served path, cached copy, preview query) and view paths share them.
-  function fileName(path) {
-    try {path = decodeURIComponent(path);} catch {}
-    return path.split('?')[0].split(/[\\/]/).pop().replace(/^file=/, '');
-  }
   // True when the gallery shows other files than the view its clicks resolve through
-  // (a gallery value written by another response than the view refresh).
+  // (a gallery value written by another response than the view refresh). Thumbnails are compared by
+  // the listed file's name (data-wangp-name), not by their URL: Gradio's cache copy strips characters
+  // such as brackets from file names and fast video previews are served under another name.
   function stale(state = view()) {
     if (!state || !document.querySelector('#gallery')) return false;
     const thumb = document.querySelector('#gallery .thumbnail-item');
-    const sources = thumb ? [...thumb.parentElement.querySelectorAll('.thumbnail-item')].map(node => node.querySelector('img, video')?.getAttribute('src')) : [];
-    if (sources.some(source => !source)) return false;
-    return sources.length !== state.video.length || sources.some((source, index) => fileName(source) !== fileName(state.video[index]));
+    const names = thumb ? [...thumb.parentElement.querySelectorAll('.thumbnail-item')].map(node => node.dataset.wangpName) : [];
+    if (names.some(name => !name)) return false;
+    return names.length !== state.video.length || names.some((name, index) => name !== state.video[index].split(/[\\/]/).pop());
   }
   // `index`: position in the whole gallery `source`.
   function request(state, source, index, path) {

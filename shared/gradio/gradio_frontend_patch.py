@@ -457,6 +457,8 @@ _PATCHES = {
         ('function dt(n){', '''function wangpGalleryVideoThumbnail(button, item) {
             B(button, 'draggable', item.video ? 'true' : null);
             B(button, 'data-wangp-video-url', item.video?.url);
+            // The listed file's own name: Gradio's cache copy and the fast video preview serve it under another one.
+            B(button, 'data-wangp-name', (item.video || item.image)?.orig_name);
         }
         function wangpGalleryImage(src, edge) {
             if (!src || !edge) return src;
