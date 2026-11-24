@@ -92,9 +92,11 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 - **Maintenance Tools**: In **Config > Performance** purge your Triton cache (sometime solves performance issues), **Config > Outputs > Gradio Media Cache**, purge temp gradio files, thanks to *@JedsDeadBaby* for the original PlugIn
 
+- **Sensenova u1.6**: the **Best Infographics Generator** has been upgraded. It contains an optional **Self Correcting** tool that will fix automatically bad spelling or layout errors. Note that to get the best speed the correcting tool needs Memory Profiles 0/1/3
+
 - **Inkling 2 Mini SpeedUp**: up to 50% faster
 
-- **Qwen3.8 27B - Bonsai 2.5**: the smallest Qwen 3.8 used by Deepy Prime has been upgraded and now is much smarter while still being able to run with 8GB of VRAM
+- **Qwen3.8 27B - Bonsai 2.5**: the smallest Qwen 3.8 used by Deepy Prime has been upgraded and now is much smarter while still being able to run with only 8GB of VRAM
 
 ## 22nd of November 2026: WanGP v20.12 - To the Extreme… and a Little Further
 
