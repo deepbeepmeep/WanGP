@@ -150,6 +150,12 @@ Result: the reference voice workflow uses your ID-LoRA file and weight.
 ```
 """
 
+LTX2_SOL_INFOS = """
+## Sol-Attn Sparse Attention
+
+In **Advanced Mode > Misc. > Override Attention Mode**, select **sol** to route the large self-attention blocks of the LTX2 video stream (sequences of 8192 tokens or more with 128-dim heads) through the bundled Triton Sol-Attn kernels. The **Start Tau** slider then appears below the attention selector and shows that End Tau is fixed at `0.8`: the value is used on the first denoising step of each phase and moves to `0.8` on the final step, in five levels, because CUDA graphs keep one graph per value. The default is `1.0`, the starting value the Sol-Attn paper gives: increase it to route more attention blocks through the approximate path for greater speed, or lower it for denser attention and higher fidelity. The first third of the denoising steps of each phase runs with full attention, so the face and the shape are built densely first. The tokens that carry conditioning keep full attention as well: a reference video, a keyframe, a start image and a Multiple Subject Reference are attended to exactly, which keeps the identity of the person, and only the generated frames take the approximate path, for about twice the speed on RTX 30/40/50-series cards. A window with no conditioning at all uses the fastest path. When the conditioning tokens of a window are not one leading run, or fill more than a quarter of it, that window keeps full attention: the sparse path has nothing left to win there. Cross-attention, audio self-attention, masked self-attention, and short sequences always keep the regular attention backend. Sol-Attn applies to the LTX2 video stream only, and requires BF16, Triton 3.6 or newer, and a CUDA NVIDIA GPU using SM86, SM89, SM90, SM100, SM120, or SM121 (such as RTX 30/40/50-series, H100/H200, B100/B200, or DGX Spark); the dropdown reports whether it is available on the current system. Do not combine it with a step-skipping mode without checking the result on the same seed.
+"""
+
 LTX2_25_INFOS = LTX2_INFOS + """
 Reference Voice (ID-LoRA) is unavailable for LTX-2.5.
 
