@@ -1,7 +1,7 @@
 {
     "model": {
         "name": "Vace Cocktail 14B",
-        "architecture": "vace_14B",
+        "compile": false,        "architecture": "vace_14B",
         "modules": [
             "vace_14B"
         ],

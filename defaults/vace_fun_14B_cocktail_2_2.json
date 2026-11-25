@@ -1,7 +1,7 @@
 {
     "model": {
         "name": "Wan2.2 Vace Fun Cocktail 14B",
-        "architecture": "vace_14B_2_2",
+        "compile": false,        "architecture": "vace_14B_2_2",
         "description": "This model has been created on the fly using the Wan text 2.2 video model and the Loras of FusioniX. The weight of the Detail Enhancer Lora has been reduced to improve identity preservation. This is the Fun Vace 2.2, that is not the official Vace 2.2",
         "URLs": "vace_fun_14B_2_2",
         "URLs2": "vace_fun_14B_2_2",
