@@ -125,7 +125,7 @@ def normalize_shot(shot: dict[str, Any]) -> dict[str, Any]:
             take.setdefault(key, copy.deepcopy(value))
         # the showrunner's own verdict, kept beside the user's (takes judged before it was kept: the verdict when it is the showrunner's)
         take.setdefault("showrunner_verdict", copy.deepcopy(take["verdict"]) if (take["verdict"] or {}).get("by", "user") != "user" else None)
-    return shot_times(shot)
+    return shot_times(shot, saved=True)
 
 
 def _seconds(value: Any, field: str) -> Any:
@@ -141,18 +141,46 @@ def _seconds(value: Any, field: str) -> Any:
     return seconds
 
 
-def shot_times(shot: dict[str, Any]) -> dict[str, Any]:
-    """A shot's times as numbers: a director may write them as text ("12.5", or a range "42.0-48.1" for a [start, end] pair), which the song
-    alignment after every take cannot subtract."""
+def _time_range(value: Any, key: str, shot_id: str) -> Any:
+    field = f"Shot {shot_id}: {key}"
+    if key == "audio_slice" and value in ([], {}):
+        return None
+    if isinstance(value, dict):
+        for start, end in (("start_s", "end_s"), ("start", "end"), ("0", "1")):
+            if start in value and (end in value or key != "audio_slice" and len(value) == 1):
+                value = [value[start], value.get(end)]
+                break
+        else:
+            raise OperationError(f"{field} is [start_s, end_s], not {value!r}.")
+    elif isinstance(value, str):
+        pair = re.fullmatch(r"\s*\[?\s*([\d.]+)\s*s?\s*(?:-|–|to|,)\s*([\d.]+|null|None)?\s*s?\s*\]?\s*", value)
+        if pair is None:
+            raise OperationError(f"{field} is [start_s, end_s], not {value!r}.")
+        value = [pair[1], None if pair[2] in (None, "null", "None") else pair[2]]
+    if isinstance(value, list):
+        value = [_seconds(endpoint, field) for endpoint in value]
+    if key == "audio_slice" and value is not None:
+        if not isinstance(value, list) or len(value) != 2 or not all(type(t) in (int, float) and math.isfinite(t) for t in value):
+            raise OperationError(f"{field} needs a start and an end in seconds, got {value!r}.")
+    return value
+
+
+def song_range_issue(shot: dict[str, Any]) -> str | None:
+    if "invalid_audio_slice" in shot:
+        return f"{shot['id']}: the saved audio_slice {shot['invalid_audio_slice']!r} is unreadable. Set its start and end in seconds or clear it."
+    return None
+
+
+def shot_times(shot: dict[str, Any], *, saved: bool = False) -> dict[str, Any]:
+    """A damaged song range is recoverable on load. New edits must supply a usable range."""
     shot["duration_s"] = _seconds(shot["duration_s"], "duration_s")
     for key in ("audio_slice", "trim", "line_cut", "audio_part"):
-        if isinstance(shot[key], str):
-            pair = re.fullmatch(r"\s*\[?\s*([\d.]+)\s*s?\s*(?:-|–|to|,)\s*([\d.]+|null|None)?\s*s?\s*\]?\s*", shot[key])
-            if pair is None:
-                raise OperationError(f"{key} is [start_s, end_s], not {shot[key]!r}.")
-            shot[key] = [pair[1], None if pair[2] in (None, "null", "None") else pair[2]]
-        if isinstance(shot[key], list):
-            shot[key] = [_seconds(value, key) for value in shot[key]]
+        try:
+            shot[key] = _time_range(shot[key], key, shot["id"])
+        except OperationError:
+            if not saved or key != "audio_slice":
+                raise
+            shot["invalid_audio_slice"], shot[key] = shot[key], None
     if "duration_s" in shot["transition"]:
         shot["transition"]["duration_s"] = _seconds(shot["transition"]["duration_s"], "transition duration_s")
     return shot
@@ -583,9 +611,10 @@ def song_words(doc: dict[str, Any]) -> list[str]:
 
 def song_drift(doc: dict[str, Any]) -> list[str]:
     """On a cut that plays the song: shots away from the part of the song their lips were made from, and takes made from a recording the cut does not play."""
+    warnings = [issue for shot in doc["shots"] if (issue := song_range_issue(shot))]
     if not on_the_song(doc):
-        return []
-    start, cut, warnings = float(doc["edit"].get("song_start_s") or 0.0), {item["shot"]: item for item in timeline(doc)}, []
+        return warnings
+    start, cut = float(doc["edit"].get("song_start_s") or 0.0), {item["shot"]: item for item in timeline(doc)}
     away, spoken, short, longer = [], [], [], []
     for shot in doc["shots"]:
         item, take = cut.get(shot["id"]), chosen_take(shot)
@@ -706,6 +735,9 @@ def keep_on_the_song(doc: dict[str, Any], asked: set[str] = frozenset()) -> list
         return []
     start, notes, free = float(doc["edit"].get("song_start_s") or 0.0), [], []  # free: the shots without lips since the last lip-synced one
     for shot in [item for item in doc["shots"] if item.get("included", True)]:
+        if "invalid_audio_slice" in shot:  # do not move this shot or borrow time across its unknown anchor
+            free = []
+            continue
         if not has_lips(doc, shot) or shot.get("locked"):
             free = [] if has_lips(doc, shot) else [*free, *([] if shot["id"] in asked or shot.get("locked") else [shot])]
             continue
@@ -955,6 +987,8 @@ def _set_shot_fields(shot: dict[str, Any], fields: dict[str, Any], by: str, revi
             shot[key] = copy.deepcopy(value)
         changed.append(key)
     shot_times(shot)
+    if "audio_slice" in fields:
+        shot.pop("invalid_audio_slice", None)
     if {"chosen_take", "cut_extra_words"} & set(fields):
         follow_line_cut(shot)
     if by == "user" and set(fields) - {"status"}:  # the user's last change of the shot: it protects it from the director's stale writes and replans
@@ -1086,6 +1120,12 @@ def _op_brief(doc, op, by, revision, base_revision):
     singers = fields.get("song_voices", [])
     if not isinstance(singers, list) or len(singers) > 2 or any(not any(member["id"] == singer for member in doc["cast"]) for singer in singers):
         raise OperationError("song_voices: one or two cast ids, first heard first (SeedVC tells two voices apart, not more).")
+    old_song = doc["brief"].get("song")
+    if old_song and fields.get("song") and fields["song"] != old_song:
+        for shot in doc["shots"]:
+            settings = shot["generation"]["settings"]
+            if settings.get("audio_guide") == old_song and (shot["audio_slice"] or doc["edit"]["audio_mode"] in ("song", "mix")):
+                settings["audio_guide"] = fields["song"]
     doc["brief"].update(copy.deepcopy(fields))
     normalize(doc)
 
@@ -1242,6 +1282,8 @@ def _op_split_shot(doc, op, by, revision, base_revision):
     shot = find(doc["shots"], op.get("shot"), "shot")
     _check_shot_write(shot, by, set(), op.get("revision", base_revision))
     at, length = float(_seconds(op.get("at_s"), "at_s") or 0.0), float(shot["duration_s"])
+    if issue := song_range_issue(shot):
+        raise OperationError(issue)
     if not 0.5 <= at <= length - 0.5:
         raise OperationError(f"Split {shot['id']} between 0.5 and {length - 0.5:g} s of its {length:g} s.")
     settings = shot["generation"].get("settings") or {}

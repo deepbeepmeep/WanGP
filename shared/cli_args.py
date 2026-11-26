@@ -39,7 +39,7 @@ def parse_wgp_args(config_filename: str, argv: Sequence[str] | None = None):
     add("--settings", type=str, default="settings", help="Path to settings folder")
     add("--config", type=str, default="", help=f"Path to config folder for {config_filename} and queue.zip")
     add("--profile", type=str, default=-1, help="Profile No")
-    add("--verbose", type=str, default=1, help="Verbose level")
+    add("--verbose", type=str, default=1, help="Verbosity level (default: 1). Level 2 or higher shows WGPKernels autotuning details.")
     add("--debug-deepy", type=str, default=None, help="Enable Deepy verbose debug logging and write it to the given folder")
     add("--deepy-sessions-dir", type=str, default="", metavar="FOLDER", help="Store persistent Deepy sessions in FOLDER (default: ./deepy_sessions)")
     add("--workspaces-dir", type=str, default="", metavar="FOLDER", help="Workspace manifests and dedicated media folders (overrides Configuration / Outputs; default: ./workspaces)")
@@ -110,4 +110,10 @@ def parse_wgp_args(config_filename: str, argv: Sequence[str] | None = None):
         configure_llm_io(args.llm_io)
     if args.ask_deepy and not _arg_provided(argv, "--verbose"):
         args.verbose = "0"
+    try:
+        import wgpkernels
+    except ImportError:
+        pass  # Optional on installations using other kernel backends.
+    else:
+        wgpkernels.verbose_level = int(args.verbose)
     return args

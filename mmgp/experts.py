@@ -101,6 +101,10 @@ class ExpertBank(nn.Module):
         """Expert id to checkpoint-name -> GPU tensor; callers must not mutate it."""
         return self._resident
 
+    def graph_pointer_tables(self):
+        """Device tensors holding this bank's expert addresses, borrowed for the lifetime of the current placement."""
+        return ()
+
     def release_execution_cache(self):
         """Optional backend scratch; called when the owning model is unloaded."""
 

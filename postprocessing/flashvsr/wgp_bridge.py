@@ -290,7 +290,7 @@ class FlashVSRBridge:
     def create_config_ui(self, gr, config: dict[str, Any], *, lock_config: bool = False):
         with gr.Group():
             with gr.Row():
-                mode = gr.Dropdown(choices=self.MODE_CHOICES, value=config["mode"], label="FlashVSR Spatial Upsampling (Needs Triton; SpargeAttn optional)", interactive=not lock_config)
+                mode = gr.Dropdown(choices=self.MODE_CHOICES, value=config["mode"], label="FlashVSR Spatial Upsampling", interactive=not lock_config)
             with gr.Row():
                 model = gr.Dropdown(choices=self.MODEL_CHOICES, value=config["model"], label="Model", info="Chooses the version normally shown in upsampling menus. Extract Settings can restore the other version without changing this preference. FlashVSR+ Turbo always runs with memory profile 0 and processes 16 frames per step.", interactive=not lock_config)
                 quantization = gr.Dropdown(choices=self.QUANTIZATION_CHOICES, value=config["quantization"], label="Transformer Quantization", interactive=not lock_config)

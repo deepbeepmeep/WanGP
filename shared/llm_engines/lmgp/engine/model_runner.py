@@ -440,6 +440,12 @@ class ModelRunner:
         """MMGP mode: a decoding pass of the target model into outputs, one MMGP graph while its weights are all in VRAM; otherwise its
         tower runs block by block, each run of blocks kept in VRAM replayed as one graph, the others streamed."""
         from mmgp import cuda_graphs, runtime
+        segmented = getattr(self.model, "lm_engine_segmented_graph_forward", None)
+        if segmented is not None:
+            # A stage with host-side routing owns its graph scopes. Its device-only
+            # blocks still use the registered KV/recurrent state and MMGP block hooks.
+            segmented(input_ids, positions, outputs, draft_features)
+            return
         with cuda_graphs.scope(gated=False):
             cuda_graphs.run(self.model, input_ids, positions, outputs, draft_features, method="lm_engine_graph_forward", enabled=runtime.weights_resident(self.model))
         if draft_features is not None:
@@ -670,7 +676,12 @@ class ModelRunner:
         if self.model.__class__.__name__ in ("Qwen3_5ForCausalLM", "Qwen4ExpForCausalLM") and self.use_triton_sampling:
             from ..models.qwen3_5 import configure_qwen35_fla_prefill_autotune
             configure_qwen35_fla_prefill_autotune(runtime_device)
+        shared_state = {}  # immutable tables shared by modules in this preparation, never borrowed from a suspended pool
         for module in self.model.modules():
+            prepare_shared = getattr(module, "prepare_shared_sequence_state", None)
+            if callable(prepare_shared):
+                prepare_shared(runtime_device, shared_state)
+                continue
             prepare = getattr(module, "prepare_sequence_state", None)
             if callable(prepare):
                 prepare(self.config.max_num_seqs, runtime_device, self.dtype)
@@ -844,6 +855,10 @@ class ModelRunner:
         if self.mmgp_graphs:  # its base back in VRAM first: unloaded (suspended), its tensors are their RAM copies until it loads again
             from mmgp import runtime
             runtime.ensure_loaded(self.model)
+            # Loading the base can purge this suspended runner under RAM pressure. Its graphs
+            # are already gone; the owner will recreate the engine and restore the saved context.
+            if not self._runtime_ready:
+                return True
         current_signature = self._get_model_storage_signature()
         if current_signature == self._model_storage_signature:
             return False
@@ -1243,13 +1258,8 @@ class ModelRunner:
             raise RuntimeError(f"INT8 KV cache requires a head dimension divisible by 32; got {head_dim}.")
         kv_cache_modules = self._get_kv_cache_modules()
         kv_cache_layer_count = len(kv_cache_modules)
-        cache_element_size = torch.empty((), dtype=torch.int8 if config.kv_cache_int8 else self.dtype).element_size()
         scale_elements = head_dim // 32 if config.kv_cache_int8 else 0
-        scale_element_size = torch.float16.itemsize if config.kv_cache_int8 else 0
-        if config.kv_cache_int8:
-            block_bytes = self.block_size * self.kv_layout.body_bytes_per_token(kv_cache_layer_count, num_kv_heads, head_dim)
-        else:
-            block_bytes = 2 * kv_cache_layer_count * self.block_size * num_kv_heads * head_dim * cache_element_size
+        block_bytes = kvf.paged_kv_bytes(kv_cache_layer_count, num_kv_heads, head_dim, self.block_size, self.kv_layout if config.kv_cache_int8 else None, dtype_bytes=self.dtype.itemsize, overlays=False)
 
         # Default consumers reserve the full limit; token generators can opt into growth.
         cache_length = config.max_model_len

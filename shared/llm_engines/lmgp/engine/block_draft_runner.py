@@ -7,6 +7,9 @@ from .model_runner import ModelRunner
 from ..utils.context import reset_context, set_context
 
 
+DRAFT_SAMPLE_ROWS = 64  # a sampled draft's law over the head's best rows: the filtered target law rarely holds more at 0.6 / 0.9
+
+
 class BlockDraftRunner(ModelRunner):
     def _can_batch_dflash_acceptance(self, seq):
         from .speculative_sampling import can_batch_acceptance
@@ -115,6 +118,8 @@ class BlockDraftRunner(ModelRunner):
         active = torch.ones((), dtype=torch.bool, device=hidden.device)
         top_k = None if seq.top_k is None else min(seq.top_k, unary.shape[-1])
         state = None  # of a recurrent head (Inkling 2), carried along the chain
+        if getattr(self.model.mtp, "candidates", False):
+            return self._dspark_candidate_chain(seq, hidden, anchor, bias, noise, confident)
         for index in range(noise.shape[0]):
             scores, confidence, state = self.model.mtp.proposal_step(index, hidden[index], unary[index], previous, state)
             scores = scores + bias
@@ -135,6 +140,44 @@ class BlockDraftRunner(ModelRunner):
             if confident:  # the drafted token's probability under the head at the run's temperature (ConfidentDrafts' bins)
                 scaled = scores.float() / (seq.temperature if seq.top_k != 1 and seq.temperature else 1.0)
                 confidences.append(torch.exp(scaled.gather(0, previous.reshape(1))[0] - torch.logsumexp(scaled, 0)))
+            tokens.append(previous)
+        return torch.stack(tokens), probabilities, torch.stack(valid_prefix).sum(), torch.stack(confidences) if confident else None
+
+    def _dspark_candidate_chain(self, seq, hidden, anchor, bias, noise, confident):
+        """_dspark_gpu_chain for a head that scores candidate rows (Inkling2Draft.candidate_step; its drafts carry no confidence of their own,
+        so no threshold): the filtering, the draw and the confidence over those rows only, the other tokens being at the floor logit (no
+        probability): the same q, scattered over the vocabulary for acceptance, without a pass over the whole vocabulary at each draft."""
+        tokens, probabilities, valid_prefix, confidences = [], [], [], []
+        previous, state, vocabulary = anchor, None, noise.shape[-1]
+        active = torch.ones((), dtype=torch.bool, device=hidden.device)
+        for index in range(noise.shape[0]):
+            scores, rows, state = self.model.mtp.candidate_step(index, hidden[index], previous, state)
+            ids = rows.clamp(max=vocabulary - 1)  # padding rows (at the floor) read a real token's bias and get no probability
+            scores = scores + bias.index_select(0, ids)
+            active = active & torch.isfinite(scores).any()
+            valid_prefix.append(active)
+            if seq.top_k != 1:
+                # q over the head's best rows (sorted by topk: top-p and min-p by a running sum, no sort of the candidates). Any q keeps the
+                # verification exact (rejection sampling); a q close to the target's filtered law keeps the acceptance.
+                values, order = (scores / (seq.temperature or 1.0)).topk(min(DRAFT_SAMPLE_ROWS, scores.numel(), seq.top_k or DRAFT_SAMPLE_ROWS))
+                probs = torch.softmax(values, 0)
+                keep = torch.ones_like(probs, dtype=torch.bool)
+                if seq.top_p is not None and 0 < seq.top_p < 1:
+                    keep = keep & (probs.cumsum(0) - probs < seq.top_p)
+                if seq.min_p:
+                    keep = keep & (probs >= seq.min_p * probs[0])
+                probs = torch.where(keep, probs, 0.0)
+                probs = probs / probs.sum()
+                chosen = ids.gather(0, order)
+                pick = order.gather(0, (probs / noise[index].index_select(0, chosen)).argmax().reshape(1))  # exponential race
+                probabilities.append(torch.zeros(vocabulary, dtype=probs.dtype, device=probs.device).scatter_add_(0, chosen, probs))
+            else:
+                pick = rows.masked_fill(scores != scores.max(), vocabulary).argmin().reshape(1)  # lowest token ID among ties, as the reference argmax
+            # indexes kept on the device: a tensor index would read it back, which a graph capture refuses
+            previous = rows.gather(0, pick)[0]
+            if confident:  # the drafted token's probability under the head at the run's temperature (ConfidentDrafts' bins)
+                scaled = scores.float() / (seq.temperature if seq.top_k != 1 and seq.temperature else 1.0)
+                confidences.append(torch.exp(scaled.gather(0, pick)[0] - torch.logsumexp(scaled, 0)))
             tokens.append(previous)
         return torch.stack(tokens), probabilities, torch.stack(valid_prefix).sum(), torch.stack(confidences) if confident else None
 

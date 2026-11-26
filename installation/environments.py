@@ -53,7 +53,7 @@ INSPECT_SCRIPT = """
 import ast, importlib.metadata, json, sys
 from pathlib import Path
 packages = {}
-for name in ('torch', 'torchvision', 'torchaudio', 'triton', 'triton-windows', 'sageattention', 'sagegp', 'spas-sage-attn', 'flash-attn', 'wgpkernels'):
+for name in ('torch', 'torchvision', 'torchaudio', 'triton', 'triton-windows', 'sageattention', 'sagegp', 'sparsegp', 'spas-sage-attn', 'flash-attn', 'wgpkernels'):
     try:
         packages[name] = importlib.metadata.version(name)
     except importlib.metadata.PackageNotFoundError:

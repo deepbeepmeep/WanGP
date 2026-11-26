@@ -6,7 +6,7 @@ _restart_launch = supervise() if __name__ == "__main__" else False
 for _stream in (sys.stdout, sys.stderr): _stream.reconfigure(encoding="utf-8", errors="replace")
 from tqdm import tqdm
 
-WanGP_version = "20.20"
+WanGP_version = "20.21"
 _welcome_message = f" WanGP v{WanGP_version} - Copyright (c) 2024-2026 DeepBeepMeep "
 tqdm.write(f"\033[1m\033[93m{_welcome_message:*^100}\033[0m")
 
@@ -106,7 +106,7 @@ from shared.utils.background_save import BackgroundSaver
 from shared.utils.video_codecs import nvenc_in_use, set_hardware_video_encoding
 from shared.utils.frame_scheduler import resolve_window_geometry, SLASH_BLOCK_RE, build_default_window_plan, build_extension_window, build_frame_scheduler, fit_video_length, floor_frame_count, has_slash_commands, normalize_frame_count, set_video_length_rounding, prepare_loras_mult_windows
 from shared.match_archi import match_nvidia_architecture
-from shared.attention import ATTENTION_MODE_AVAILABILITY, sagegp_ready, sage_gp_redirect, get_attention_modes, get_supported_attention_modes, get_default_attention_mode, get_override_attention_modes, get_supported_override_attention_modes
+from shared.attention import ATTENTION_MODE_AVAILABILITY, sparsegp_backend, sagegp_ready, sage_gp_redirect, get_attention_modes, get_supported_attention_modes, get_default_attention_mode, get_override_attention_modes, get_supported_override_attention_modes
 from shared.utils.utils import truncate_for_filesystem, sanitize_file_name, process_images_multithread, get_default_workers, resize_lanczos_frames, expand_or_shrink_mask, prepare_binary_mask_frame
 from shared.utils.process_locks import (
     acquire_GPU_ressources,
@@ -3802,7 +3802,7 @@ attention_kit.configure(server_config.get(attention_kit.CHUNKER_CONFIG_KEY, atte
 # the global states that change what the blocks of a CUDA graph compute are part of the keys of their graphs
 cuda_graphs.register_key(lambda: (offload.shared_state.get("_attention"), attention_kit.chunker, kernel_policy.precision, int8_backend.revision, fp8_backend.revision))
 # CUDA Graph mode: the attention modes and the classes of quantized weights / layers whose kernels were validated in captured graphs
-CUDA_GRAPH_ATTENTION_MODES = {"sdpa", "flash", "sage", "sage2", "radial", "sol"}
+CUDA_GRAPH_ATTENTION_MODES = {"sdpa", "flash", "sage", "sage2", "radial", "sol", "sol3"}
 CUDA_GRAPH_WEIGHT_TYPES = {"WeightQBytesTensor", "ScaledFP8WeightTensor", "Int8ConvRotWeightTensor", "GGUFWeightTensor", "GGUFSourceTensor", "BNBNF4WeightTensor", "AsymW4A8Int8WeightTensor",
                            "NunchakuSVDQWeightTensor", "NunchakuAWQWeightTensor", "NVFP4WeightTensor", "BlockScaledWeight",
                            "QEmbedding"}  # Quanto embedding: a lookup in its WeightQBytesTensor (graph replay equal to eager, 2026-10-20)
@@ -3810,16 +3810,17 @@ cuda_graphs.register_gate(lambda: None if offload.shared_state.get("_attention")
                           f"the attention mode '{offload.shared_state.get('_attention')}' is not supported by them (supported: {', '.join(sorted(CUDA_GRAPH_ATTENTION_MODES))})")
 
 
-def check_cuda_graph_weights(offloadobj):
+def check_cuda_graph_weights(offloadobj, model_def):
     """The graphed models whose quantized weights or layers have not been validated with CUDA graphs run their blocks eagerly."""
     for model_id, graphs in offloadobj.cuda_graphs.items():
         model = offloadobj.models[model_id]
         kinds = {type(t).__name__ for t in list(model.parameters()) + list(model.buffers()) if type(t) not in (torch.Tensor, torch.nn.Parameter)}
         kinds |= {type(module).__name__ for module in model.modules() if type(module).__module__.startswith(("shared.qtypes", "optimum.quanto"))}
-        unknown = sorted(kinds - CUDA_GRAPH_WEIGHT_TYPES)
+        validated = model_def.get("cuda_graph_weight_types", {}).get(model_id, ())
+        unknown = sorted(kinds.difference(CUDA_GRAPH_WEIGHT_TYPES, validated))
         if unknown:
             graphs.disabled = f"its weights of type {', '.join(unknown)} have not been validated with them"
-            print(f"[CUDA Graphs] Off for '{model_id}': {graphs.disabled}.")
+            tqdm.write(f"[CUDA Graphs] Off for '{model_id}': {graphs.disabled}.")
 vae_config = server_config.get("vae_config", 0)
 if len(args.vae_config) > 0:
     vae_config = int(args.vae_config)
@@ -4676,6 +4677,9 @@ def load_models(model_type, override_profile = -1, output_type="video", config_i
             loras_transformer += ["transformer"]
         if "transformer2" in pipe:
             loras_transformer += ["transformer2"]
+        for name in ("transformer", "transformer2"):
+            if pipe.get(name) is not None:
+                kernel_policy.install_first_block_policy(pipe[name])
         compile_modules = model_def.get("compile", compilation) if compilation == "transformer" else False
         custom_compile = compilation == "transformer" and hasattr(wan_model, "custom_compile")
         int8_backend.prepare_compile_cache(compile_modules or custom_compile)
@@ -4693,7 +4697,7 @@ def load_models(model_type, override_profile = -1, output_type="video", config_i
         if server_config.get("smart_memory_pinning", True): kwargs["smartPinning"] = 0 # the models processed block by block that the profile does not pin cross a staging ring
         offloadobj = offload.profile(pipe, profile_no= mmgp_profile, compile = compile_modules, quantizeTransformer = False, loras = loras_transformer, vram_safety_coefficient = vram_safety_coefficient , convertWeightsFloatTo = transformer_dtype, loading_callback=loading_callback, **kwargs)
         if kwargs.get("cudaGraphs"):
-            check_cuda_graph_weights(offloadobj)
+            check_cuda_graph_weights(offloadobj, model_def)
     offloadobj.tiny_vae = preview_decoder
     if len(args.gpu) > 0:
         torch.set_default_device(args.gpu)
@@ -7772,6 +7776,7 @@ def generate_media(
     spatial_postprocessing_parameters=None,
     temporal_postprocessing_parameters=None,
     postprocessing_reference_images=None,
+    sol3_tau=None,
 ):
     filename_formatter = None
     if output_filename:
@@ -7967,6 +7972,8 @@ def generate_media(
 
     offload.shared_state["_attention_fallback"] = get_auto_attention() if attention_mode == "auto" else attention_mode
     attn, kernel_policy.sage2_quality_override = sage_gp_redirect(attn)  # SageGP: sage3 and sageadaptative run its Fast and Adaptive modes
+    kernel_policy.set_denoising_step(None)
+    offload.shared_state["_sol3_tau"] = float(sol3_tau) if attn == "sol3" and sol3_tau is not None else None
     offload.shared_state["_attention"] =  attn
     offload.shared_state["_sage_v_scaling"] = model_def.get("sage_v_scaling", False)
     device_mem_capacity = torch.cuda.get_device_properties(0).total_memory / 1048576
@@ -11880,6 +11887,7 @@ def save_inputs(
             min_frames_if_references,
             overrides,
             attention_sparsity,
+            sol3_tau,
             temperature,
             custom_setting_1,
             custom_setting_2,
@@ -12713,7 +12721,7 @@ memory_profile_choices= [   ("Profile 0, AutoRAM_AutoVRAM: Profile 4 that reserv
 def check_attn(mode):
     if mode not in attention_modes_installed: return " (NOT INSTALLED)"
     if mode not in attention_modes_supported: return " (NOT SUPPORTED)"
-    return ""
+    return " (AVAILABLE)"
 
 attention_modes_choices= [
     ("Auto: Best available (sage2 > sage > sdpa)", "auto"),
@@ -12725,10 +12733,12 @@ attention_modes_choices= [
     (f'sage2 gp{check_attn("sage2")}: ~50% faster, (recommended, extra optims when used)', "sage2"),
     (f'sage 2/3 adaptative gp{check_attn("sageadaptative")}: ~50%-70% , (less precise, adapt to model), RTX50xx only', "sageadaptative"),
 ] if sagegp_ready else [
+    (f'SageGP Adaptive{check_attn("sageadaptative")}: Requires SageGP on RTX 50 series', "sageadaptative"),
     (f'sage2/sage2++{check_attn("sage2")}: ~40% faster, (recommended, extra optims when used) requires manual install', "sage2"),
-]) + ([(f'radial{check_attn("radial")}: Experimental, may be faster, requires manual install', "radial")] if args.betatest else []) + [
+]) + ([(f'radial{check_attn("radial")}: Experimental block-sparse video attention', "radial")] if args.betatest else []) + [
     (f'sage3 gp{check_attn("sage3")}: >70% faster, may have quality trade-offs but more precise than original sage3', "sage3") if sagegp_ready else
     (f'sage3{check_attn("sage3")}: >70% faster, may have quality trade-offs, requires manual install, RTX50xx only', "sage3"),
+    (f'Sol3{check_attn("sol3")}: Mixed-block INT8 attention' + (f" ({sparsegp_backend.upper()})" if sparsegp_backend else ""), "sol3"),
 ]
 
 def refresh_attention_header(state, overrides, guidance_phases=1, video_prompt_type=""):
@@ -12745,6 +12755,7 @@ def get_attention_override_choices(model_def, selected_attention):
         supported = definition.get("supported", status.get("supported", installed))
         status_label = "AVAILABLE" if supported else ("NOT SUPPORTED" if installed else "NOT INSTALLED")
         choices.append((f"{mode} ({status_label}): {definition['label']}", mode))
+    choices.sort(key=lambda choice: choice[1] == "sol3")
     return selected_attention if any(value == selected_attention for _, value in choices) else choices[0][1], choices
 
 def get_overrides_error(model_def, overrides):
@@ -12768,8 +12779,10 @@ def get_quantization_overridable(model_type, model_def):
     return len(transformer_files) > 1 or model_def.get("auto_quantize", False), len(text_encoder_files) > 1
 
 def refresh_attention_sparsity(state, override_attention):
-    modes = get_model_def(get_state_model_type(state)).get("custom_attention_modes", {})
-    return gr.update(visible=modes.get(override_attention, {}).get("supports_sparsity", False))
+    model_type = get_state_model_type(state)
+    modes = get_model_def(model_type).get("custom_attention_modes", {})
+    effective = override_attention or get_overridden_attention(model_type) or attention_mode
+    return gr.update(visible=modes.get(effective, {}).get("supports_sparsity", False)), gr.update(visible=effective == "sol3")
 
 def detect_auto_save_form(state, evt:gr.SelectData):
     last_tab_id = state.get("last_tab_id", 0)
@@ -14213,7 +14226,9 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                         interactive=len(override_attention_choices) > 1,
                         label=f"Override Attention Mode"
                     )
-                    attention_sparsity = setting_slider("attention_sparsity", visible=model_def.get("custom_attention_modes", {}).get(selected_attention, {}).get("supports_sparsity", False))
+                    effective_attention = selected_attention or get_overridden_attention(model_type) or attention_mode
+                    attention_sparsity = setting_slider("attention_sparsity", visible=model_def.get("custom_attention_modes", {}).get(effective_attention, {}).get("supports_sparsity", False))
+                    sol3_tau = setting_slider("sol3_tau", visible=effective_attention == "sol3")
 
                     transformer_quantization_overridable, text_encoder_quantization_overridable = get_quantization_overridable(model_type, model_def)
                     with gr.Column(visible=transformer_quantization_overridable or text_encoder_quantization_overridable) as quantization_overrides_col:
@@ -14299,7 +14314,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                     header_refresh = dict(fn=refresh_attention_header, inputs=[state, overrides, guidance_phases, video_prompt_type], outputs=[header], show_progress="hidden")
                     overrides_event.then(**header_refresh)
                     gr.on(triggers=[guidance_phases.change, video_prompt_type.change], **header_refresh)
-                attention_mode_override.input(fn=refresh_attention_sparsity, inputs=[state, attention_mode_override], outputs=[attention_sparsity], show_progress="hidden")
+                attention_mode_override.input(fn=refresh_attention_sparsity, inputs=[state, attention_mode_override], outputs=[attention_sparsity, sol3_tau], show_progress="hidden")
                 gen_status = WangpProgress.component(visible=True, value=render_idle_generation_status(state_dict))
                 main_bridge_elem_ids = tab_id == 'generate'
                 status_trigger = gr.Text(interactive= False, visible=False)  # unbound: plugins whose queue chains still output to it

@@ -352,7 +352,7 @@ JSON entries take precedence over `--loras`. Unlisted keys use the root from `--
 --config PATH                # Config folder for wgp_config.json and queue.zip
 --workspaces-dir FOLDER       # Workspace manifests/media; overrides Config / Outputs (default: ./workspaces)
 --offline                    # Never download: use only the files already on this computer
---verbose LEVEL              # Information level 0-2 (default: 1)
+--verbose LEVEL              # Default 1. Level 2 also shows WGPKernels autotuning searches and results.
 ```
 
 With `--offline`, WanGP and the libraries it uses never download anything: models, text encoders, LoRAs from links and processing tools must already be in your checkpoints folders. A missing file stops the job with an error naming it, instead of starting a download. Useful on a computer without internet access, on a metered connection, or to make sure a test or a batch runs only with the files you already have.

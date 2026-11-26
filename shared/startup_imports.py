@@ -201,13 +201,20 @@ def _lazy_compiler_disable(compiler):
     # loaded runs as it is until it has loaded (nothing can be compiling before), then through torch.compiler.disable as before: their
     # torch.compiler.disable versions are made as torch._dynamo loads, outside any compiled code.
     import functools
+    import inspect
     import weakref
     original = compiler.disable
+    supports_reason = "reason" in inspect.signature(original).parameters
     pending = weakref.WeakSet()
+
+    def call_original(fn, recursive, reason):
+        if supports_reason:
+            return original(fn, recursive, reason=reason)
+        return original(fn, recursive)
 
     def disable(fn=None, recursive=True, *, reason=None):
         if _dynamo_loaded():
-            return original(fn, recursive, reason=reason)
+            return call_original(fn, recursive, reason)
         if fn is None:
             return lambda fn: disable(fn, recursive, reason=reason)
 
@@ -216,7 +223,7 @@ def _lazy_compiler_disable(compiler):
             disabled = wrapper._wangp_disabled
             return fn(*args, **kwargs) if disabled is None else disabled(*args, **kwargs)
         wrapper._wangp_disabled = None
-        wrapper._wangp_disable = lambda: original(fn, recursive, reason=reason)
+        wrapper._wangp_disable = lambda: call_original(fn, recursive, reason)
         pending.add(wrapper)
         return wrapper
 

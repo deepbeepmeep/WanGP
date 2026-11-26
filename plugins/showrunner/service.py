@@ -658,6 +658,8 @@ class Showrunner:
         production = self.store.get(production_id)
         doc = production.snapshot()
         shot = model.find(doc["shots"], shot_id, "shot")
+        if issue := model.song_range_issue(shot):
+            raise ValueError(issue)
         if shot.get("source_range") and shot["takes"]:  # a remake's shot renders from its own settings, with the neighbours it renders together with
             self.render_directly(production_id, [shot_id])
             return {"shot": shot_id, "status": "rendering"}
@@ -666,9 +668,9 @@ class Showrunner:
             raise ValueError("This shot has no take with saved settings yet: use Render now.")
         tier = take.get("tier")
         ends = {"image_start", "image_end"}
-        if shot.get("continues") or shot.get("start_from") or shot.get("end_on") or ends & set(take["settings"]) or ends & set(shot["generation"].get("settings") or {}) or templates.own_audio(shot):
-            # its start, end and the user's audio as they are now: another shot's new take, a new picture, new audio or its part of a split shot's
-            self.render_directly(production_id, [shot_id], final=tier == "final", new_seed=True)
+        if shot.get("continues") or shot.get("start_from") or shot.get("end_on") or ends & set(take["settings"]) or ends & set(shot["generation"].get("settings") or {}) or shot.get("audio_slice") or templates.own_audio(shot):
+            # Rebuild the shot with the current pictures and audio, including its excerpt of the current song.
+            self.render_directly(production_id, [shot_id], final=tier == "final", new_seed=True if new_seed else take["settings"].get("seed", False))
             return {"shot": shot_id, "status": "rendering"}
         settings = production.resolve_settings(take["settings"])
         settings.update({key: value for key, value in shot["generation"].get("settings", {}).items() if key in ("prompt", "alt_prompt", "negative_prompt")})
@@ -733,7 +735,7 @@ class Showrunner:
         entry = templates.resolve(catalog, templates.effective(doc, catalog).get("people_edits"))
         return [[shot["id"] for shot in group] for group in ShowrunnerToolbox._render_groups(doc, entry, shots)] if doc.get("remake") and entry is not None else []
 
-    def render_directly(self, production_id: str, shot_ids: list[str], final: bool = False, new_seed: bool | None = None) -> dict[str, Any]:
+    def render_directly(self, production_id: str, shot_ids: list[str], final: bool = False, new_seed: bool | int | None = None) -> dict[str, Any]:
         """Render shots now, one after the other, without the showrunner: the render action's own work (the cast's pictures, spoken lines, lengths) with no language model and no verdict.
         A shot nobody chose a model for gets the brief's for what it shows, a shot without a prompt one made from what it says, kept on the shot, where it can be edited.
         new_seed: None draws a new seed for a draft and keeps the take's for a final (its draft at the target size); True, a new one either way (Render again)."""

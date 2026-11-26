@@ -31,7 +31,8 @@ import torch
 from tqdm import tqdm
 from mmgp import allocator, cuda_graphs, offload, runtime
 
-from shared.attention import pay_attention, sage_staged, sage_attention_mask, launch_waves, fp4_geometry, dense_staged, kv_first_staged, owned_query_staged
+from shared import sparge_core
+from shared.attention import get_default_attention_mode, pay_attention, sage_staged, sage_attention_mask, launch_waves, fp4_geometry, dense_staged, kv_first_staged, owned_query_staged
 from shared.kernels import dispatch, ops
 from shared.llm_engines.lmgp.layers import kv_formats
 
@@ -811,6 +812,23 @@ def _attend_with_prefix(core, settings, out, quantized, prefix, heads):
     return _merge_lse_(out, lse, prefix_out, prefix_lse)
 
 
+def compact_prompt_padding(tokens, mask):
+    """Pack real conditioning rows in their original order, once before denoising.
+    The caller has already applied positional encoding, or supplies positions for the packed rows.
+    Return a key mask only when a rectangular batch still needs padding."""
+    if mask is None:
+        return tokens, None
+    lengths = mask.sum(1).tolist()
+    width = max(lengths)
+    if width == 0:
+        return tokens, mask
+    if min(lengths) == mask.size(1):
+        return tokens, None
+    indices = mask.to(torch.int32).argsort(dim=1, descending=True, stable=True)[:, :width]
+    batch = torch.arange(tokens.size(0), device=tokens.device)[:, None]
+    return tokens[batch, indices], None if min(lengths) == width else mask[batch, indices]
+
+
 def _head_slice(mask, dim, heads):
     """mask restricted to the range heads along its head dimension dim, when it has one row per head."""
     return mask if mask is None or mask.dim() < 4 or mask.shape[dim] == 1 else mask.narrow(dim, heads.start, heads.stop - heads.start)
@@ -1022,6 +1040,8 @@ class _ProbeProjection:
 def _head_bytes(cross, batch, lengths, tokens, heads, kv_heads, head_dim, dtype, staged):
     """What one more key / value head in a group holds: its q (16 bits, then INT8 too), k and v (INT8) with a staged core, all three
     in 16 bits without; a cross attention's q over the query tokens, k and v over the keys' (a long video as keys of short audio queries)."""
+    if not cross and staged is not None and hasattr(staged[0], "head_bytes"):
+        return staged[0].head_bytes(staged[1], batch, tokens, head_dim, dtype, heads // kv_heads)
     if cross:
         return batch * head_dim * ((heads // kv_heads) * lengths[0] * (dtype.itemsize + 1 if staged is not None else dtype.itemsize)
                                    + lengths[1] * (2 if staged is not None else 2 * dtype.itemsize))
@@ -1099,7 +1119,7 @@ def _by_items(streams, args, kwargs, by_items):
             options["segments"] = [(max(start, first) - first, min(stop, last) - first, row) for start, stop, row in segments if stop > first and start < last]
         for name in ("attention_mask", "head_gate"):
             value = kwargs.get(name)
-            if torch.is_tensor(value) and value.shape[0] > 1:
+            if torch.is_tensor(value) and (name == "head_gate" or value.ndim >= 3) and value.shape[0] > 1:
                 options[name] = value[item:item + 1]
         prefix = kwargs.get("kv_prefix")
         if prefix is not None and not isinstance(prefix, KVPrefix) and prefix[0].shape[0] > 1:
@@ -1139,7 +1159,7 @@ def joint_qkv_attention(streams, *args, by_items=None, **kwargs):
 def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, norm_spans_heads=False, split_heads=True, kv_prefix=None,
                         attention_mask=None, force_attention=None, attention_fn=None, norm_stats=None, _cross=False, norm_v=None, softmax_scale=None,
                         head_split_level=None, fused_quant=None, kv_window=None, out_proj=None, residual=None, gate=None, segments=None, norm_rows=False, head_gate=None,
-                        add_after=False, _room=None, sample_query=None, out_stream=None):
+                        add_after=False, _room=None, sample_query=None, out_stream=None, sol3_prefix_tokens=0, sol3_suffix_tokens=0, sol_tau=None):
     """Attention of the q/k/v projections of several streams joined along the tokens in their order: streams is a list of
     (x_list, (q_proj, k_proj, v_proj)), each x handed off in its list, of shape (batch, tokens, features) or (tokens, features), or
     an mmgp offload.RowSource of shape (batch, tokens, features): an input only its projections read, prepared by ranges of tokens
@@ -1155,7 +1175,7 @@ def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, nor
     kv_prefix: (key, value) of shape (batch, prefix tokens, kv_heads, head_dim), already normalized and rotated, put before the
     projected keys and values; or a cached prefix (cache_prefix, q8_prefix: KVPrefix), q8 / q4_0 dequantized into the joined keys and values,
     native attended in a pass of its own (a native prefix needs the staged core it was made for: no mask, no attention_fn), a prefix
-    of one batch item serving all. attention_mask: pay_attention's mask, or on a staged core a callable mask(query, key, group) building
+    of one batch item serving all. attention_mask: pay_attention's mask, or a callable mask(query, key, group) building
     the group's mask from its normalized and rotated query and key (the key with its prefix): called with the key alone first (it
     keeps what it needs, the key is then quantized and released), then with the query alone, returning the mask.
     kv_heads < heads: grouped query attention.
@@ -1196,8 +1216,10 @@ def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, nor
     their order (MMDiT blocks: the image stream projected into its residual here, the text returned for its own projection).
     With EXTREME_LOW_VRAM one stream (of norms per head when there are several) may be a RowSource made again by every head group."""
     global _unsplit_notice
-    if softmax_scale is not None and (force_attention != "sdpa" or attention_fn is not None):
-        raise ValueError("An explicit softmax_scale requires force_attention='sdpa' and no attention_fn")
+    mode = force_attention or offload.shared_state.get("_attention")
+    token_mask = attention_mask is not None and mode not in sparge_core.MODES.values()
+    if softmax_scale is not None and (attention_fn is not None or not token_mask and force_attention != "sdpa"):
+        raise ValueError("An explicit softmax_scale requires a token mask or force_attention='sdpa', and no attention_fn")
     inputs, projections = [], []
     for x_list, stream_projections in streams:
         x = x_list[0]
@@ -1210,7 +1232,17 @@ def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, nor
     batch, lengths, dtype, device = inputs[0].shape[0], [x.shape[1] for x in inputs], inputs[0].dtype, inputs[0].device
     tokens = lengths[0] if _cross else sum(lengths)
     kv_heads = kv_heads or heads
-    staged = None if attention_fn is not None else sage_staged(inputs[0].device, head_dim, force_attention, attention_mask is not None)
+    if attention_mask is None and (force_attention or offload.shared_state.get("_attention")) in ("sol3", "sol") and (
+            _cross or kv_prefix is not None or kv_window is not None or (mode == "sol" and kv_heads != heads) or
+            (len(inputs) > 1 and not (sol3_prefix_tokens or sol3_suffix_tokens))):
+        force_attention = get_default_attention_mode()
+    if token_mask and torch.is_tensor(attention_mask) and attention_mask.dtype != torch.bool and not attention_mask.is_floating_point():
+        raise TypeError("Token attention masks must be boolean or floating point.")
+    # Projections can introduce gradients even when the model input requires none.
+    # The direct dispatcher checks the projected tensors before selecting an inference kernel.
+    staged = None if attention_fn is not None or token_mask and (torch.is_grad_enabled() or softmax_scale is not None) else sage_staged(
+        device, head_dim, force_attention, attention_mask is not None, dtype=dtype, tokens=tokens, batch=batch,
+        sol3_prefix_tokens=sol3_prefix_tokens, sol3_suffix_tokens=sol3_suffix_tokens, sol_tau=sol_tau)
     split_tokens = batch * (max(lengths) if _cross else tokens)
     if out_stream is not None and (out_proj is None or residual is None or _cross):
         raise ValueError("out_stream needs out_proj and residual, and joined streams")
@@ -1235,8 +1267,6 @@ def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, nor
         direct_bytes += batch * tokens * heads * head_dim * dtype.itemsize
         if chunker != "auto" or not chunking_needed(device, direct_bytes, ("nvfp4", heads, batch, tuple(lengths), dtype, _cross)):
             staged = None
-    if callable(attention_mask) and staged is None:
-        raise ValueError("A per-group attention mask (a callable) needs a staged attention core")
     cached = isinstance(kv_prefix, KVPrefix)
     native = cached and kv_prefix.k_mean is not None
     if kv_window is not None and cached:
@@ -1556,8 +1586,9 @@ def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, nor
         core, settings = staged
         if native:  # the layout the prefix was kept in (cache_prefix)
             settings = core.prefix_settings(settings, kv_prefix.k.device, offload.shared_state.get("_sage_v_scaling", False))
-        if attention_mask is not None and not callable(attention_mask):  # in SageAttention's layout (batch, heads, q, k)
-            attention_mask = sage_attention_mask(attention_mask, dtype)
+        if attention_mask is not None and not callable(attention_mask):
+            # Sparge supplies a head-major block map. Dense cores take a token mask in SageAttention's layout.
+            attention_mask = getattr(core, "prepare_mask", sage_attention_mask)(attention_mask, dtype)
     if query_chunks:
         core, settings = staged
         all_heads = HeadGroup(range(heads), range(kv_heads), None)
@@ -1652,10 +1683,17 @@ def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, nor
             if kv_window is not None:
                 window(1, qkv_list[1], group.kv)
                 window(2, qkv_list[2], group.kv)
-            if ratio != 1:  # pay_attention's backends do not all take fewer key/value heads
+            if callable(attention_mask):
+                attention_mask(None, qkv_list[1], group)
+                mask = attention_mask(qkv_list[0], None, group)
+                if mask is not None and token_mask:
+                    mask = mask.transpose(1, 2) if mask.ndim == 4 else mask  # callable token masks return kernel layout
+            else:
+                mask = _head_slice(attention_mask, 2, group.q)
+            if ratio != 1:  # preserve each unstaged backend's projection layout and arithmetic
                 qkv_list[1:] = [tensor.repeat_interleave(ratio, dim=2) for tensor in qkv_list[1:]]
             if attention_fn is None:
-                attention = pay_attention(qkv_list, attention_mask=_head_slice(attention_mask, 2, group.q), force_attention=force_attention, recycle_q=True, softmax_scale=softmax_scale)
+                attention = pay_attention(qkv_list, attention_mask=mask, force_attention=force_attention, recycle_q=True, softmax_scale=softmax_scale, sol3_prefix_tokens=sol3_prefix_tokens, sol3_suffix_tokens=sol3_suffix_tokens, sol_tau=sol_tau)
             else:
                 attention = attention_fn(qkv_list, group) if extra_list is None else attention_fn(qkv_list, group, extra_list)
             gate_(attention, group.q)
@@ -1705,7 +1743,10 @@ def _joint_qkv_attention(streams, heads, head_dim, norm_rope, kv_heads=None, nor
                     window(1, key, group.kv)
                 if callable(attention_mask):
                     attention_mask(None, key, group)
-                quantized[1] = core.staged_quantize_k([key], k_settings)
+                if hasattr(core, "staged_quantize_k_with_v"):
+                    quantized[1] = core.staged_quantize_k_with_v([key], quantized[2], k_settings)
+                else:
+                    quantized[1] = core.staged_quantize_k([key], k_settings)
             else:
                 quantized[1] = fused[1]
             del key, fused

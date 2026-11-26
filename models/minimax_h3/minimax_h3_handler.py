@@ -420,7 +420,7 @@ The extra phase uses the text prompt and the locked final video only. Reference 
 """
 
 H3_COMMON_RUNTIME_INFOS = """
-- **Sol-Attn:** in **Advanced Mode > Configs > Override Attention Mode**, select **sol**. The **Start Tau** slider then appears below the attention selector and shows that End Tau is fixed at `0.8`. H3 defaults to `1.3`; this value is used on the first denoising step and decreases linearly to `0.8` on the final step. Use `1.0` for the Sol-Attn paper starting value, increase it to route more attention blocks through the approximate path for greater speed, or lower it for denser attention and higher fidelity. It uses sparse attention only on large visual sequences and requires BF16, Triton 3.6 or newer, and a CUDA NVIDIA GPU using SM86, SM89, SM90, SM100, SM120, or SM121 (such as RTX 30/40/50-series, H100/H200, B100/B200, or DGX Spark); the dropdown reports whether it is available on the current system.
+- **Sol-Attn:** in **Advanced Mode > Configs > Override Attention Mode**, select **sol**. The **Start Tau** slider then appears below the attention selector and shows that End Tau is fixed at `0.8`. H3 defaults to `1.3`; this value is used on the first denoising step and decreases linearly to `0.8` on the final step. Use `1.0` for the Sol-Attn paper starting value, increase it to route more attention blocks through the approximate path for greater speed, or lower it for denser attention and higher fidelity. It uses sparse attention on large BF16 visual sequences. SparseGP supplies precompiled NVIDIA and AMD kernels. Without a compatible wheel, WanGP uses a supported local Triton kernel. The dropdown shows availability on the current GPU.
 """
 
 H3_TEXT_ENCODER_INFOS = """Choose how much system RAM to use for interpreting prompts.
@@ -633,7 +633,7 @@ def _get_audio_generator_model_def(model_def):
         "skip_steps_multiplier_label": "First Block Cache Threshold",
         "first_block_cache_thresholds": FIRST_BLOCK_CACHE_THRESHOLDS,
         "custom_attention_modes": {
-            "sol": {"label": "Sol sparse attention, requires Triton and RTX 30xx or newer", "supports_sparsity": True},
+            "sol": {"label": "Original Sol sparse attention (SparseGP CUDA/ROCm or WanGP Triton)", "supports_sparsity": True},
         },
         "default_attention_modes_supported": True,
         "attention_sparsity": {
@@ -952,7 +952,7 @@ class family_handler:
             } if fasth3 else {
                 "veda": {"label": "Veda Learned Sparse Attention (Triton, NVIDIA SM80+)", "supports_sparsity": False},
             } if veda else {
-                "sol": {"label": "Sol sparse attention, requires Triton and RTX 30xx or newer", "supports_sparsity": True},
+                "sol": {"label": "Original Sol sparse attention (SparseGP CUDA/ROCm or WanGP Triton)", "supports_sparsity": True},
             },
             "default_attention_modes_supported": not (vdn or veda or fasth3),
             "attention": {">=0": "vdn"} if vdn else {">=80": "vsa"} if fasth3 else {">=80": "veda"} if veda else None,

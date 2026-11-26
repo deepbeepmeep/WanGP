@@ -15,12 +15,14 @@ from torch.nn import functional as F
 from mmgp import cuda_graphs, expert_stream, offload, runtime
 from mmgp.expert_compute import RoutedExperts
 
+from ..layers import expert_placement
 from ..layers.attention_indexed import IndexedAttention, fused_kernels, rms_norm, rotate_
 from ..layers.layernorm import RMSNorm
 from ..layers.linear import ColumnParallelLinear, RowParallelLinear
 from ..layers.moe import routed_experts, softmax_topk
 from ..layers.ngram_table import QUEUED_ROWS
 from ..utils.context import get_context
+from .base import LMEngineModel, OutputStage, last_rows
 from .qwen3_5 import Qwen3_5Block, Qwen3_5RMSNormGated, Qwen3_5StaticCache, Qwen3_5TextRotaryEmbedding, _fla_fused_norm_gate
 from shared.kernels.dispatch import triton_dtype_supported
 
@@ -385,7 +387,7 @@ class Qwen4ExpBlock(Qwen3_5Block):
         return self.hc_ffn.combine(state, self.moe(mixed), weights)
 
 
-class Qwen4ExpOutput(nn.Module):
+class Qwen4ExpOutput(OutputStage, nn.Module):
     """The last mix of the streams, which stands for the output norm, then the head."""
     def __init__(self, config):
         super().__init__()
@@ -399,12 +401,8 @@ class Qwen4ExpOutput(nn.Module):
     def forward(self, state):
         return self.head(self.mixer(state))
 
-    def lm_engine_graph_forward(self, state, logits):
-        """The logits of a verification window into their buffer (cuda_graphs.run stage): no Python between the pass and the sampling."""
-        logits.copy_(self(state))
 
-
-class Qwen4ExpForCausalLM(nn.Module):
+class Qwen4ExpForCausalLM(LMEngineModel):
     """The LM engine's Qwen3.8 Flash-Next. forward returns the residual streams [1, tokens, streams * hidden], which the drafter also reads; output (or
     compute_logits) mixes them and applies the head."""
     _lm_engine_tower_prefix = "blk."
@@ -453,24 +451,7 @@ class Qwen4ExpForCausalLM(nn.Module):
 
     def lm_engine_prefill_chunk(self, tokens):
         """The tokens of a prompt read together: a whole prompt if it fits in the free VRAM, or else the longest chunk that does. Longer chunks read each expert out of VRAM once for more tokens."""
-        if not expert_stream.ENABLED:
-            return self._prefill_chunk_tokens
-        room = runtime.free_vram() + runtime.lendable_experts(self) // 2 - PROMPT_VRAM_MARGIN - expert_stream.REGION_BYTES * expert_stream.MIN_RING_REGIONS
-        if tokens * PROMPT_BYTES_PER_TOKEN <= room:
-            return max(tokens, PROMPT_CHUNKS[-1])
-        return next((chunk for chunk in PROMPT_CHUNKS if chunk * PROMPT_BYTES_PER_TOKEN <= room), PROMPT_CHUNKS[-1])
-
-    def _sequence_positions(self, tokens, device):
-        """The positions in the cache of the tokens of this pass."""
-        context = get_context()
-        if context.speculative_verify:
-            first = context.cu_seqlens_k[1] - tokens
-        elif context.is_prefill:
-            first = context.cu_seqlens_k[1] - context.cu_seqlens_q[1]
-        else:
-            first = context.context_lens[0] - 1
-        # a graph capture's pass on dummy pages has no context: position 0 keeps its attention, and what it writes, finite
-        return first.long().clamp_min(0) + torch.arange(tokens, dtype=torch.long, device=device)
+        return expert_placement.prompt_chunk(self, tokens, PROMPT_CHUNKS, PROMPT_BYTES_PER_TOKEN, PROMPT_VRAM_MARGIN) if expert_stream.ENABLED else self._prefill_chunk_tokens
 
     def forward(self, input_ids=None, positions=None, inputs_embeds=None, **_kwargs):
         if input_ids is not None and input_ids.ndim == 1:
@@ -525,13 +506,7 @@ class Qwen4ExpForCausalLM(nn.Module):
         outputs.copy_(self(input_ids, positions).view(outputs.shape))
 
     def compute_logits(self, hidden_states):
-        context = get_context()
-        if hidden_states.ndim == 3:
-            if context.is_prefill and context.cu_seqlens_q is not None:
-                hidden_states = hidden_states[:, int(context.cu_seqlens_q[-1].item()) - 1, :]
-            elif hidden_states.shape[-2] == 1:
-                hidden_states = hidden_states[:, 0, :]
-        return self.output(hidden_states)
+        return self.output(last_rows(hidden_states))
 
 
 class Qwen4ExpDraftBlock(nn.Module):

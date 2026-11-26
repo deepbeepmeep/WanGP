@@ -108,7 +108,12 @@ def cuda_inference(x, *, dtypes=(torch.bfloat16,), approximate=False, capability
     return device_supported(x.device, x.dtype, capability_floor=capability_floor, hip=hip)
 
 
-# A preferred family can change while the resolved INT8 backend stays the same.
-# Include the preference itself, including for standalone managed components.
-cuda_graphs.register_key(lambda: (kernel_policy.precision, kernel_policy.families, kernel_policy.sage2_execution_quality()))
+def _graph_key():
+    # A preferred family can change while the resolved INT8 backend stays the same.
+    # The first-block hook can run inside a captured region, after MMGP has looked up its key.
+    return (kernel_policy.precision, kernel_policy.families, kernel_policy.sage2_execution_quality(),
+            kernel_policy.sage2_quality_override, kernel_policy.first_step_precision_enabled(), kernel_policy.sol3_dense())
+
+
+cuda_graphs.register_key(_graph_key)
 cuda_graphs.register_eager(kernel_policy.first_step_precise)  # one use: no graph for that step

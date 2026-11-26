@@ -96,6 +96,7 @@
 	"RIFLEx_setting": 0,
 	"overrides": "",
 	"attention_sparsity": 1.0,
+	"sol3_tau": 0.8,
 	"output_filename": "",
 	"config": "",
 	"activated_loras": [],

@@ -84,6 +84,7 @@ from ..layers.layernorm import RMSNorm
 from shared.kernels import bf16_bits
 from ..layers.linear import ColumnParallelLinear, RowParallelLinear
 from ..utils.context import get_context
+from .base import LMEngineModel
 from mmgp import cuda_graphs, runtime as mmgp_runtime
 from gguf import GGMLQuantizationType
 from shared.qtypes.gguf import GGUFWeightTensor
@@ -129,24 +130,18 @@ def _build_cu_seqlens(lengths: list[int], device: torch.device) -> torch.Tensor:
     return cached
 
 
-def _build_mrope_freq_cache(
-    device: torch.device,
-    max_position: int,
-    rotary_dim: int,
-    rope_theta: float,
-) -> torch.Tensor:
-    cache_key = (str(device), int(max_position), int(rotary_dim), float(rope_theta))
-    cached = _MROPE_FREQ_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
+def _build_mrope_freq_cache(device: torch.device, max_position: int, rotary_dim: int, rope_theta: float, *, cache=None) -> torch.Tensor:
+    if cache is None:
+        cache = _MROPE_FREQ_CACHE  # eager calls outside runtime preparation
+    key = (str(device), max_position, rotary_dim, rope_theta)
+    if key in cache:
+        return cache[key]
     inv_freq = 1.0 / (
         rope_theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device) / rotary_dim)
     )
     positions = torch.arange(max_position, dtype=torch.float32, device=device)
-    cached = torch.einsum("i,j->ij", positions, inv_freq)
-    _MROPE_FREQ_CACHE[cache_key] = cached
-    return cached
+    table = cache[key] = torch.einsum("i,j->ij", positions, inv_freq)
+    return table
 
 
 def _interleave_axis_halves(tensor: torch.Tensor, dim: int) -> torch.Tensor:
@@ -645,18 +640,20 @@ class Qwen3_5TextRotaryEmbedding(nn.Module):
         self._freq_cache = None
 
     def prepare_sequence_state(self, max_batch_size: int, device: torch.device, dtype: torch.dtype):
-        # the table the decoding graphs read, made before their capture and held as engine state while the runtime lives
-        self._freq_cache = _build_mrope_freq_cache(device, max_position=self.max_position_embeddings, rotary_dim=self.rotary_dim, rope_theta=self.rope_theta)
+        self.prepare_shared_sequence_state(device, {})
+
+    def prepare_shared_sequence_state(self, device, tables):
+        # The target and drafter share this table within one runner's suspendable pool.
+        self._freq_cache = _build_mrope_freq_cache(device, self.max_position_embeddings, self.rotary_dim, self.rope_theta, cache=tables)
 
     def release_sequence_state(self):
         self._freq_cache = None
 
     def freq_table(self, device, max_position):
-        """The engine's registered table when it covers max_position: the shared cache may have been cleared since (an engine closed while
-        another was prepared) and a new table there is no state of the graphs, which would read it at an address they do not know."""
+        """Use the registered table at its captured address, or the eager cache for positions outside it."""
         table = self._freq_cache
         if table is None or table.device != device or table.shape[0] < max_position:
-            table = _build_mrope_freq_cache(device, max_position=max_position, rotary_dim=self.rotary_dim, rope_theta=self.rope_theta)
+            table = _build_mrope_freq_cache(device, max_position, self.rotary_dim, self.rope_theta)
         return table
 
     def apply_interleaved_mrope(self, freqs: torch.Tensor) -> torch.Tensor:
@@ -1664,7 +1661,7 @@ class Qwen3_5Block(nn.Module):
         return hidden_states, residual
 
 
-class Qwen3_5ForCausalLM(nn.Module):
+class Qwen3_5ForCausalLM(LMEngineModel):
     _lm_engine_tower_prefix = "blk."  # the blocks MMGP streams: the engine's own graphs read the rest of the model
 
     def __init__(self, config) -> None:

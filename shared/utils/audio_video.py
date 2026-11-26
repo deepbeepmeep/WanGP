@@ -22,7 +22,7 @@ import zlib
 import re
 from .hdr import hdr10_x265_params, hdr10_zscale_filter, iter_hdr_gbrpf32_frames, iter_video_chunks
 
-from .video_decode import picture_duration, probe_video_stream_metadata, resolve_media_binary
+from .video_decode import picture_duration, probe_video_stream_metadata, resolve_hdr_ffmpeg, resolve_media_binary
 from .video_codecs import SUPPORTED_VIDEO_CONTAINERS, get_imageio_codec_params, get_video_encode_args, validate_video_output_settings
 from .virtual_media import get_virtual_media_entry, parse_virtual_media_path, strip_virtual_media_suffix
 
@@ -923,9 +923,7 @@ def save_hdr_video(
     output_file = osp.join('/tmp', rand_name(suffix=suffix)) if save_file is None else save_file
     if not output_file.endswith(suffix):
         output_file = osp.splitext(output_file)[0] + suffix
-    ffmpeg_path = resolve_media_binary("ffmpeg")
-    if ffmpeg_path is None:
-        raise RuntimeError("ffmpeg binary not found")
+    ffmpeg_path = resolve_hdr_ffmpeg()
 
     width = height = None
     for chunk in iter_video_chunks(tensor):

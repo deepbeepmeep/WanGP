@@ -590,6 +590,18 @@ class RoutedExperts(ExpertBank):
                 status, job.status = job.status, 0
                 raise RuntimeError(f"CPU expert kernel failed ({status})")
 
+    def graph_pointer_tables(self):
+        # Warmup prepares these tables. Elastic moves update their contents in place;
+        # replacing a placement or releasing its execution state clears its graphs.
+        if self.gpu_branch:
+            residency = self._residency()
+            if residency.table is not None:
+                yield residency.table_views[self]
+        elif self._pointer_table is not None:
+            yield self._pointer_table
+        if self.gpu_share is not None:
+            yield self.gpu_share
+
     def _pointers(self, device):
         if self.gpu_branch:
             return self._residency().pointers(self, device)

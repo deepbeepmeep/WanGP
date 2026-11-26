@@ -412,7 +412,7 @@ class QwenDoubleStreamAttnProcessor2_0:
         options = {} if residual is None else dict(out_proj=attn.to_out[0], residual=residual[0], gate=residual[1], segments=residual[2], out_stream=1,
                                                          by_items=True)  # a batch: the items one after another (batch-wide tables: one row)
         joint_hidden_states = attention_kit.joint_qkv_attention(streams, attn.heads, attn.to_q.out_features // attn.heads,
-                                                                lambda query, key, group: _norm_rope_(query, key, segments),
+                                                                lambda query, key, group: _norm_rope_(query, key, segments), sol3_prefix_tokens=seq_txt,
                                                                 fused_quant=lambda query, key, group, core, settings: ops.split_half_norm_rope_quant_(query, key, table, q_segments, k_segments, core, settings, interleaved=True),
                                                                 **options).flatten(2, 3)
         if residual is not None:  # the image's output already in its residual

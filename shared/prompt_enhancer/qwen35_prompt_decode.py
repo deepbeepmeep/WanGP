@@ -6,8 +6,19 @@ from tqdm import tqdm
 
 from shared.llm_engines.lmgp.engine.block_manager import BlockManager
 from shared.llm_engines.lmgp.layers.kv_formats import overlay_slots
+from shared.prompt_enhancer import chat_formats
+from shared.prompt_enhancer.qwen35_assistant_runtime import prefill_suffix_chunk
 from shared.prompt_enhancer.streaming import ThrottledStreamEmitter
 from shared.utils.cancellation import check_cancelled
+
+
+THOUGHT_BUDGET_UPDATE = """
+<wangp_runtime_update>
+Your planning is complete. Use the decisions you have already made. Output only the finished prompt now. Follow the requested format and its examples exactly.
+</wangp_runtime_update>
+</think>
+
+"""
 
 
 def generate_prompt(llm, prompt, sampling_params, *, stop_token_ids, close_think_token_id, max_thinking_tokens, stop_requested=None, stream_callback=None, decode=None):
@@ -55,9 +66,8 @@ def generate_prompt(llm, prompt, sampling_params, *, stop_token_ids, close_think
                     break
                 remaining = sampling_params.max_tokens - seq.num_completion_tokens
                 if in_thinking:
-                    # The logits processor forces </think> at the thinking limit.
-                    # Reserve that one token, then fail explicitly if it was ignored.
-                    remaining = min(remaining, max_thinking_tokens + 1 - seq.num_completion_tokens)
+                    # Stop even a speculative block before the processor can force a bare close.
+                    remaining = min(remaining, max_thinking_tokens - seq.num_completion_tokens)
                 if remaining <= 0:
                     stop_reason = "thought_budget_exhausted" if in_thinking else "max_tokens"
                     break
@@ -84,6 +94,23 @@ def generate_prompt(llm, prompt, sampling_params, *, stop_token_ids, close_think
                 emit()
                 if stop_token_id is not None:
                     break
+                if in_thinking and seq.num_completion_tokens == max_thinking_tokens and not seq.is_finished:
+                    suffix = chat_formats.of(llm.tokenizer).encode_action_text(llm.tokenizer, THOUGHT_BUDGET_UPDATE)
+                    if seq.num_completion_tokens + len(suffix) >= sampling_params.max_tokens:
+                        stop_reason = "thought_budget_exhausted"
+                        break
+                    if len(seq) + len(suffix) >= llm.config.max_model_len:
+                        stop_reason = "context_limit"
+                        break
+                    speculative = bool(getattr(llm.model_runner.model, "_prompt_enhancer_speculative_decoding", False))
+                    prefill_suffix_chunk(llm, seq, suffix, len(seq) - 1, speculative=speculative)
+                    llm.scheduler.block_manager.normalize_tail_after_prefill(seq)
+                    if seq.logits_processor_update_state is not None:
+                        seq.logits_processor_update_state(close_think_token_id)
+                    output_ids.extend(suffix)
+                    in_thinking = False
+                    seq.speculative_stop_token_ids = stop_ids
+                    pbar.update(len(suffix))
             emit(force=True)
         return {"text": decode(output_ids) if decode else llm.tokenizer.decode(output_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False),
                 "output_token_ids": list(seq.completion_token_ids), "stop_reason": stop_reason, "stop_token_id": stop_token_id}

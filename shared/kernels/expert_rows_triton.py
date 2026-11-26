@@ -4,8 +4,7 @@ input projection weights, down weights, input projection scales, down scales, th
 zero for an expert without a GPU copy, which contributes nothing):
 - NVFP4 rows: two E2M1 codes per byte (the even column in the low nibble), an E4M3 scale per 16 values of a row, a factor per expert;
 - MXFP8 rows: E4M3 values, a scale 2^(byte - 127) per 32 values of a row.
-The rows of the input projection alternate gate and up. Activation: SwiGLU, with soft caps (cap * tanh(v / cap) on the gate and on the
-up outputs) when caps are given.
+Gated inputs alternate gate and up rows for SwiGLU, with optional soft caps. Ungated inputs store one row per squared-ReLU neuron.
 
 Decoding passes (forward): one program per (token, slot) pair and row, 32 lanes keeping their float32 partial sums of the exact decoded
 weights over the row (the addresses of the table are 4-byte aligned, as MMGP's slots and regions are). Passes of many tokens (GroupedPass, from compute capability 8.0): the pairs routed to an expert form groups, and a value times its block scale
@@ -106,13 +105,20 @@ def _activate(gate, up, CAP_GATE, CAP_UP, SOFTCAP: tl.constexpr):
 
 
 @triton.jit
+def _e2m1_shifted(code):
+    """E2M1 codes (int32, sign in bit 3; higher bits ignored) as float32 times 2^-14: their bits placed where FP16 keeps a sign, an exponent and a mantissa (exact)."""
+    return (((code & 7) << 9) | ((code & 8) << 12)).to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
+
+
+@triton.jit
 def _lane_weights(weight, scale, step, lanes, KIND: tl.constexpr):
-    """The 4 columns of each lane at a step of a row (weight, scale: its packed values and its block scales), then the lane's block scale. NVFP4: the scale over 256; MXFP8: the values over
-    256 and the scale times 256."""
+    """The 4 columns of each lane at a step of a row (weight, scale: its packed values and its block scales), then the lane's block scale. NVFP4: the values times 2^-14 and the scale
+    over 256 times 2^14 (_e2m1_shifted: about half the instructions of _decode_e2m1, the same products and sums, powers of two); MXFP8: the values over 256 and the scale times 256.
+    The decoding kernels are bound by these instructions, not by VRAM (RTX 5090: 87 % of SM throughput, 52 % of DRAM)."""
     if KIND == 0:
         word = tl.load((weight + step * 64 + lanes * 2).to(tl.pointer_type(tl.uint16))).to(tl.int32)
-        block = _e4m3(tl.load(scale + step * 8 + (lanes >> 2)).to(tl.int32))
-        return _decode_e2m1(word & 15), _decode_e2m1((word >> 4) & 15), _decode_e2m1((word >> 8) & 15), _decode_e2m1(word >> 12), block
+        block = _e4m3(tl.load(scale + step * 8 + (lanes >> 2)).to(tl.int32)) * 16384.0
+        return _e2m1_shifted(word), _e2m1_shifted(word >> 4), _e2m1_shifted(word >> 8), _e2m1_shifted(word >> 12), block
     else:
         word = tl.load((weight + step * 128 + lanes * 4).to(tl.pointer_type(tl.int32)))
         block = ((tl.load(scale + step * 4 + (lanes >> 3)).to(tl.int32) + 8) << 23).to(tl.float32, bitcast=True)
@@ -181,6 +187,42 @@ def _down_lanes(weights, scales, activations, lanes, I: tl.constexpr, KIND: tl.c
         for step in range(I // 128):
             value = _down_step(value, weights, scales, activations, step, lanes, KIND)
     return value
+
+
+@triton.jit(do_not_specialize=("STRIDE",))
+def _relu2_projection(X, IDs, Probs, PTR, Out, STRIDE, IN: tl.constexpr, OUT: tl.constexpr, K: tl.constexpr,
+                      KIND: tl.constexpr, ROWS: tl.constexpr, UP: tl.constexpr):
+    # A warp per output row. Both projections run every slot in parallel and read packed weights directly.
+    pair = tl.program_id(1)
+    rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    lanes = tl.arange(0, 32)
+    expert = tl.load(IDs + pair).to(tl.int64)
+    table = PTR + tl.maximum(expert, 0) * STRIDE
+    projection: tl.constexpr = 0 if UP else 1
+    address = tl.where(expert >= 0, tl.load(table + projection), 0)
+    result = tl.full((ROWS,), 0, tl.float32)
+    if address != 0:
+        width: tl.constexpr = IN // 2 if KIND == 0 else IN
+        scales: tl.constexpr = IN // 16 if KIND == 0 else IN // 32
+        weight = address.to(tl.pointer_type(tl.uint8)) + rows[:, None] * width
+        scale = tl.load(table + projection + 2).to(tl.pointer_type(tl.uint8)) + rows[:, None] * scales
+        source = X + (pair // K if UP else pair) * IN
+        acc = tl.full((ROWS, 32), 0, tl.float32)
+        for step in tl.static_range(IN // 128):
+            acc = _down_step(acc, weight, scale, source + lanes * 4, step, lanes[None, :], KIND)
+        if IN % 128:
+            # The last 64 columns are a whole set of scale blocks. Inactive lanes alias valid addresses.
+            tail = lanes % 16
+            acc = tl.where(lanes[None, :] < 16, _down_step(acc, weight, scale, source + tail * 4, IN // 128, tail[None, :], KIND), acc)
+        result = tl.reduce(acc, 1, _radd)
+        if KIND == 0:
+            result *= tl.load(tl.load(table + projection + 4).to(tl.pointer_type(tl.float32))) * 256.
+        if UP:
+            positive = tl.maximum(result, 0.)
+            result = positive * positive
+        else:
+            result *= tl.load(Probs + pair).to(tl.float32)
+    tl.store(Out + pair * OUT + rows, result)
 
 
 @triton.jit(do_not_specialize=("STRIDE", "CAP_GATE", "CAP_UP"), do_not_specialize_on_alignment=("X", "IDs", "PTR", "Mid"))
@@ -351,7 +393,7 @@ def _sum_slots(Parts, Out, H: tl.constexpr, K: tl.constexpr, BLOCK: tl.constexpr
 
 @triton.jit(do_not_specialize=("FIRST", "STRIDE", "CAP_GATE", "CAP_UP"), do_not_specialize_on_alignment=("X", "Pairs", "Experts", "PTR", "Mid"))
 def _gate_up_group(X, Pairs, Experts, PTR, Mid, FIRST, STRIDE, CAP_GATE, CAP_UP, H: tl.constexpr, I: tl.constexpr, K: tl.constexpr, KIND: tl.constexpr, ROWS: tl.constexpr, GROUP: tl.constexpr,
-                   SOFTCAP: tl.constexpr):
+                   SOFTCAP: tl.constexpr, GATED: tl.constexpr = True):
     # ROWS rows of the gate and up projections of one expert for up to GROUP pairs routed to it, into Mid by place in the groups (float32 or BF16).
     group = FIRST + tl.program_id(0)
     rows = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
@@ -369,18 +411,26 @@ def _gate_up_group(X, Pairs, Experts, PTR, Mid, FIRST, STRIDE, CAP_GATE, CAP_UP,
         up_lost = tl.zeros((ROWS, GROUP), tl.float32)
         for unit in range(H // _UNIT):
             x = tl.trans(tl.load(activations + unit * _UNIT))
+            up_rows = 2 * rows + 1 if GATED else rows
             if Mid.dtype.element_ty == tl.bfloat16:
-                gate = tl.dot(_unit_bf16(weight, scale, 2 * rows, unit, H, ROWS, KIND), x, gate)
-                up = tl.dot(_unit_bf16(weight, scale, 2 * rows + 1, unit, H, ROWS, KIND), x, up)
+                if GATED:
+                    gate = tl.dot(_unit_bf16(weight, scale, 2 * rows, unit, H, ROWS, KIND), x, gate)
+                up = tl.dot(_unit_bf16(weight, scale, up_rows, unit, H, ROWS, KIND), x, up)
             else:  # the sums of the tensor cores are truncated: each unit summed from zero, the units with what their sums round kept
-                gate, gate_lost = _add(gate, gate_lost, tl.dot(_unit_bf16(weight, scale, 2 * rows, unit, H, ROWS, KIND), x))
-                up, up_lost = _add(up, up_lost, tl.dot(_unit_bf16(weight, scale, 2 * rows + 1, unit, H, ROWS, KIND), x))
+                if GATED:
+                    gate, gate_lost = _add(gate, gate_lost, tl.dot(_unit_bf16(weight, scale, 2 * rows, unit, H, ROWS, KIND), x))
+                up, up_lost = _add(up, up_lost, tl.dot(_unit_bf16(weight, scale, up_rows, unit, H, ROWS, KIND), x))
         gate, up = gate + gate_lost, up + up_lost
         if KIND == 0:
             factor = tl.load(tl.load(row + 4).to(tl.pointer_type(tl.float32)))
             gate, up = gate * factor, up * factor
         place = group.to(tl.int64) * GROUP + within
-        tl.store(Mid + place[None, :] * I + rows[:, None], _activate(gate, up, CAP_GATE, CAP_UP, SOFTCAP).to(Mid.dtype.element_ty))
+        if GATED:
+            activation = _activate(gate, up, CAP_GATE, CAP_UP, SOFTCAP)
+        else:
+            positive = tl.maximum(up, 0.)
+            activation = positive * positive
+        tl.store(Mid + place[None, :] * I + rows[:, None], activation.to(Mid.dtype.element_ty))
 
 
 @triton.jit(do_not_specialize=("FIRST", "STRIDE"), do_not_specialize_on_alignment=("Mid", "Pairs", "Experts", "PTR", "Probs", "Parts"))
@@ -437,10 +487,11 @@ def pass_supported(device):
     return portable_supported(device) and not reads_bits(device)
 
 
-def _check(kind, pointers, hidden, intermediate, *tensors):
+def _check(kind, pointers, hidden, intermediate, *tensors, gated=True):
     # the kernels read raw addresses: nothing but CUDA memory of the expected layout may reach them
-    if hidden % 128 or intermediate % 128:
-        raise ValueError(f"The row-scaled expert kernels take widths that are multiples of 128, not {hidden} and {intermediate}")
+    alignment = 128 if gated else 64
+    if hidden % alignment or intermediate % alignment:
+        raise ValueError(f"The row-scaled expert kernels require widths divisible by {alignment}, got {hidden} and {intermediate}")
     if not (pointers.is_cuda and pointers.dtype == torch.int64 and pointers.dim() == 2 and pointers.shape[1] >= TENSORS[kind] and pointers.is_contiguous()):
         raise ValueError(f"The expert pointer table must be a contiguous CUDA int64 [experts, {TENSORS[kind]} or more] tensor")
     if not all(tensor.is_cuda and tensor.is_contiguous() for tensor in tensors):
@@ -465,7 +516,7 @@ def _groups(ids, group, order):
 class GroupedPass:
     """A pass of many tokens: run() computes experts of the order of processing (some may arrive later, streamed), finish() gives the float32 [tokens, hidden] sum. ids: the routing on the host;
     order: the routed experts to compute, an int array (by default all of them); zero: the pairs of the other experts count for nothing (else every routed expert must run)."""
-    def __init__(self, kind, x, ids, probabilities, intermediate, caps=None, order=None, zero=False):
+    def __init__(self, kind, x, ids, probabilities, intermediate, caps=None, order=None, zero=False, gated=True):
         if x.dtype != torch.bfloat16:
             raise ValueError(f"The grouped expert kernels take BF16 activations, not {x.dtype}")
         self.kind, self.x, self.probabilities, self.intermediate, self.caps = kind, x.contiguous(), probabilities.reshape(-1).float().contiguous(), intermediate, caps
@@ -473,6 +524,9 @@ class GroupedPass:
         self.topk = ids.shape[-1]
         approximate = kernel_policy.allow_approximate()
         self.rows, self.group, self.warps = group_tiles(x.device, approximate)
+        self.gated = gated
+        if (intermediate % self.rows or self.hidden % self.rows) and not gated:
+            self.rows = min(self.rows, 64)
         if order is None:
             order = np.unique(ids.numpy())
             order = order[order >= 0]
@@ -489,11 +543,11 @@ class GroupedPass:
         count = int(self.first[len(self.first) - 1 if stop is None else stop]) - first
         if not count:
             return
-        _check(self.kind, pointers, self.hidden, self.intermediate, self.x)
+        _check(self.kind, pointers, self.hidden, self.intermediate, self.x, gated=self.gated)
         hidden, intermediate, stride = self.hidden, self.intermediate, pointers.shape[1]
         cap_gate, cap_up = self.caps or (0.0, 0.0)
         _gate_up_group[(count, intermediate // self.rows)](self.x, self.pairs, self.experts, pointers, self.mid, first, stride, cap_gate, cap_up, hidden, intermediate, self.topk, self.kind, self.rows, self.group,
-                                                           self.caps is not None, num_warps=self.warps, num_stages=1)
+                                                           self.caps is not None, self.gated, num_warps=self.warps, num_stages=1)
         _down_group[(count, hidden // self.rows)](self.mid, self.pairs, self.experts, pointers, self.probabilities, self.parts, first, stride, hidden, intermediate, self.kind, self.rows, self.group,
                                                   num_warps=self.warps, num_stages=1)
 
@@ -504,7 +558,7 @@ class GroupedPass:
         return output
 
 
-def forward(kind, x, ids, probabilities, pointers, intermediate, caps=None, out=None, mid=None):
+def forward(kind, x, ids, probabilities, pointers, intermediate, caps=None, out=None, mid=None, gated=True):
     """float32 [tokens, hidden] sum of the selected experts having GPU copies (zero for the others, and for ids of -1); out and the float32 [tokens * topk, intermediate] scratch mid may be
     preallocated. kind: NVFP4 or MXFP8; pointers: int64 [experts, 4 or more] (6 for NVFP4); caps: (gate cap, up cap) of the soft caps, None for plain SwiGLU. Eager calls of many pairs run by
     groups (they read the routing and the table on the host)."""
@@ -513,19 +567,30 @@ def forward(kind, x, ids, probabilities, pointers, intermediate, caps=None, out=
     if out is None and tokens * topk >= GROUPED_PAIRS and x.dtype == torch.bfloat16 and pass_supported(x.device) and not torch.cuda.is_current_stream_capturing():
         host_ids = ids.to("cpu")
         routed = np.bincount(host_ids.numpy().ravel().clip(0), minlength=pointers.shape[0]) > 0
-        job = GroupedPass(kind, x, host_ids, probabilities, intermediate, caps, np.nonzero(routed & (pointers[:, 0].to("cpu").numpy() != 0))[0], zero=True)
+        job = GroupedPass(kind, x, host_ids, probabilities, intermediate, caps, np.nonzero(routed & (pointers[:, 0].to("cpu").numpy() != 0))[0], zero=True, gated=gated)
         job.run(pointers)
         return job.finish()
     if _needs_fp32_inputs(x.device):  # these kernels compute in float32: converted exactly before launch on GPUs without BF16 conversions
         x, probabilities = x.float(), probabilities.float()
     mid = torch.empty(tokens * topk, intermediate, dtype=torch.float32, device=x.device) if mid is None else mid
     out = torch.empty(tokens, hidden, dtype=torch.float32, device=x.device) if out is None else out
-    _check(kind, pointers, hidden, intermediate, x, ids, probabilities, mid, out)
+    _check(kind, pointers, hidden, intermediate, x, ids, probabilities, mid, out, gated=gated)
     if mid.dtype != torch.float32 or out.dtype != torch.float32 or mid.numel() < tokens * topk * intermediate or out.numel() != tokens * hidden or ids.numel() != tokens * topk:
         raise ValueError("The scratch and the output of the row-scaled expert kernels are float32 tensors of the call's sizes")
     cap_gate, cap_up = caps or (0.0, 0.0)
     if (x.data_ptr() | mid.data_ptr()) & 7 or x.dtype not in (torch.bfloat16, torch.float32):
         raise ValueError("The decoding kernels read BF16 or float32 activations and a scratch aligned on 8 bytes")
+    if not gated:
+        if kind == NVFP4:
+            from shared.kernels import expert_rows_native
+            if expert_rows_native.relu2_decode(x, ids, probabilities, pointers, intermediate, out, mid):
+                return out
+        parts = torch.empty(tokens * topk, hidden, dtype=torch.float32, device=x.device)
+        rows = 4
+        _relu2_projection[(intermediate // rows, tokens * topk)](x, ids, probabilities, pointers, mid, pointers.shape[1], hidden, intermediate, topk, kind, rows, True, num_warps=4, enable_fp_fusion=False)
+        _relu2_projection[(hidden // rows, tokens * topk)](mid, ids, probabilities, pointers, parts, pointers.shape[1], intermediate, hidden, topk, kind, rows, False, num_warps=4, enable_fp_fusion=False)
+        _sum_slots[(tokens, hidden // 64)](parts, out, hidden, topk, 64, num_warps=1)
+        return out
     if not WINDOW_ROWS and SHARED and 1 < tokens <= SHARED_ROWS:  # a verification window through the leader kernels: each routed expert read once for the tokens that share it
         members = torch.empty(tokens * topk, SHARED_ROWS, dtype=torch.int32, device=x.device)
         parts = torch.empty(tokens * topk, hidden, dtype=torch.float32, device=x.device)

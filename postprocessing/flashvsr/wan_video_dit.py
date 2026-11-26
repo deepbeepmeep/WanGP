@@ -11,21 +11,15 @@ from typing import Tuple, Optional, List
 from einops import rearrange
 from .utils import hash_state_dict_keys
 
-try:
-    from block_sparse_attn import block_sparse_attn_func
-    BLOCK_ATTN_AVAILABLE = True
-except:
-    BLOCK_ATTN_AVAILABLE = False
-
-from .attention_backend import sparse_attention, staged_sparge_available
+from .attention_backend import attention_mode, staged_sparge_available
 from shared import attention_kit
 from shared.kernels import ops as kernels
-from shared.attention import get_supported_attention_modes, pay_attention
+from shared.attention import get_default_attention_mode, pay_attention
+from tqdm import tqdm
 from mmgp import auto_preload, offload
 from PIL import Image
 import numpy as np
 
-USE_BLOCK_ATTN = False
 STAGED_SPARGE = os.environ.get("WGP_FLASHVSR_STAGED", "1") != "0"  # debug comparison switch: 0 runs the SpargeAttn backend on whole q/k/v
 _FLASHVSR_ATTENTION_MODE = None
 
@@ -36,9 +30,8 @@ def get_flashvsr_attention_mode():
     if selected not in (None, "auto"):
         return selected
     if _FLASHVSR_ATTENTION_MODE is None:
-        modes = get_supported_attention_modes()
-        _FLASHVSR_ATTENTION_MODE = "sage2" if "sage2" in modes else "sage" if "sage" in modes else "sdpa"
-        print(f"[FlashVSR] WanGP dense attention backend: {_FLASHVSR_ATTENTION_MODE}")
+        _FLASHVSR_ATTENTION_MODE = get_default_attention_mode()
+        tqdm.write(f"[FlashVSR] WanGP dense attention backend: {_FLASHVSR_ATTENTION_MODE}")
     return _FLASHVSR_ATTENTION_MODE
 
 # ----------------------------
@@ -141,44 +134,6 @@ def _topk_threshold_mask(flat: torch.Tensor, apply_topk: int) -> torch.Tensor:
 
 
 @torch.no_grad()
-def generate_draft_block_mask(batch_size, nheads, seqlen,
-                              qk_list, topk=10, local_attn_mask=None):
-    assert batch_size == 1, "Only batch_size=1 supported for now"
-    assert local_attn_mask is not None, "local_attn_mask must be provided"
-    q_w, k_w = qk_list
-    qk_list.clear()
-    avgpool_q = torch.mean(q_w, dim=1) 
-    avgpool_k = torch.mean(k_w, dim=1)
-    del q_w, k_w
-    avgpool_q = rearrange(avgpool_q, 's (h d) -> s h d', h=nheads)
-    avgpool_k = rearrange(avgpool_k, 's (h d) -> s h d', h=nheads)
-    q_heads = avgpool_q.permute(1, 0, 2)
-    k_heads = avgpool_k.permute(1, 0, 2)
-    D = avgpool_q.shape[-1]
-    scores = torch.einsum("hld,hmd->hlm", q_heads, k_heads)
-    scores.mul_(1 / math.sqrt(D))
-
-    repeat_head = scores.shape[0]
-    local_h, local_w = local_attn_mask.shape
-    repeat_len = scores.shape[1] // local_h
-    repeat_num = scores.shape[2] // local_w
-    scores = scores.reshape(repeat_head, repeat_len, local_h, repeat_num, local_w)
-    scores.masked_fill_(~local_attn_mask.view(1, 1, local_h, 1, local_w), -float('inf'))
-    scores = scores.reshape(repeat_head, repeat_len * local_h, repeat_num * local_w)
-
-    attn_map = torch.softmax(scores, dim=-1)
-    del scores
-    attn_map = rearrange(attn_map, 'h (it s1) s2 -> (h it) s1 s2', it=seqlen)
-    loop_num, s1, s2 = attn_map.shape
-    flat = attn_map.reshape(loop_num, -1)
-    apply_topk = min(flat.shape[1]-1, topk)
-    mask_new = _topk_threshold_mask(flat, apply_topk)
-    del flat, attn_map
-    mask_new = mask_new.reshape(nheads, seqlen * s1, s2)
-    return mask_new.unsqueeze(0)
-
-
-@torch.no_grad()
 def _draft_block_mask(q_heads, k_heads_doubled, seqlen, topk, local_attn_mask, groups=None):
     """Block map (1, heads, query windows, key half-windows) int8 of the window-pooled q_heads (heads, windows, d) against the
     half-window-pooled k_heads_doubled (heads, 2 x key windows, d): local windows only, the top-k entries of every temporal slab
@@ -260,62 +215,14 @@ def generate_draft_block_mask_sage(batch_size, nheads, seqlen,
 # Attention kernels
 # ----------------------------
 def flash_attention(qkv_list: list[torch.Tensor], num_heads: int, compatibility_mode=False, attention_mask_list=None, return_KV=False):
-    q, k, v = qkv_list
+    projections = [tensor.unflatten(-1, (num_heads, -1)) for tensor in qkv_list]
     qkv_list.clear()
-    if isinstance(attention_mask_list, list):
-        attention_mask = attention_mask_list[0]
-        attention_mask_list.clear()
-    else:
-        attention_mask = None
-    if attention_mask is not None:
-        seqlen = q.shape[1]
-        seqlen_kv = k.shape[1]
-        if USE_BLOCK_ATTN and BLOCK_ATTN_AVAILABLE:
-            q = rearrange(q, "b s (n d) -> (b s) n d", n=num_heads)
-            k = rearrange(k, "b s (n d) -> (b s) n d", n=num_heads)
-            v = rearrange(v, "b s (n d) -> (b s) n d", n=num_heads)
-        else:
-            q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
-            k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
-            v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
-        max_seqlen_q_ = seqlen
-        max_seqlen_k_ = seqlen_kv
-        p_dropout = 0.0
-        if USE_BLOCK_ATTN and BLOCK_ATTN_AVAILABLE:
-            cu_seqlens_q = torch.tensor([0, seqlen], device=q.device, dtype=torch.int32)
-            cu_seqlens_k = torch.tensor([0, seqlen_kv], device=q.device, dtype=torch.int32)
-            head_mask_type = torch.tensor([1]*num_heads, device=q.device, dtype=torch.int32)
-            streaming_info = None
-            x = block_sparse_attn_func(
-                q, k, v,
-                cu_seqlens_q, cu_seqlens_k,
-                head_mask_type,
-                streaming_info,
-                attention_mask,
-                max_seqlen_q_, max_seqlen_k_,
-                p_dropout,
-                deterministic=False,
-                softmax_scale=None,
-                is_causal=False,
-                exact_streaming=False,
-                return_attn_probs=False,
-            ).unsqueeze(0)
-            x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
-        else:
-            qkv_list = [q, k, v]
-            mask_list = [attention_mask]
-            del q, k, v, attention_mask
-            x = sparse_attention(qkv_list, mask_list, recycle_q=True)
-            x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
-    else:
-        q = rearrange(q, "b s (n d) -> b s n d", n=num_heads)
-        k = rearrange(k, "b s (n d) -> b s n d", n=num_heads)
-        v = rearrange(v, "b s (n d) -> b s n d", n=num_heads)
-        qkv_list = [q, k, v]
-        del q, k, v
-        x = pay_attention(qkv_list, force_attention="sdpa" if compatibility_mode else get_flashvsr_attention_mode(), recycle_q=True)
-        x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
-    return x
+    mask = attention_mask_list
+    if isinstance(mask, list):
+        mask = mask.pop() if mask else None
+    mode = attention_mode() if mask is not None else "sdpa" if compatibility_mode else get_flashvsr_attention_mode()
+    output = pay_attention(projections, force_attention=mode, attention_mask=mask, recycle_q=True)
+    return output.flatten(2)
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
@@ -447,7 +354,7 @@ class SelfAttention(nn.Module):
         x = None
         if block_mask is None:
             self._local_mask(h, w, local_range, x_w.device)
-        if STAGED_SPARGE and staged_sparge_available():
+        if STAGED_SPARGE and staged_sparge_available(x_w.device, D // self.num_heads):
             x_list = [x_w]
             x_w = None
             return self._forward_staged(x_list, freqs, f, h, w, win, B, topk, is_stream, stream_cache, block_id, prefix, kv_len, cache_next, topk_groups, block_mask)
@@ -493,10 +400,6 @@ class SelfAttention(nn.Module):
         if block_mask is not None:  # structural map: no pooled scores, no top-k
             q_w = k_w = None
             attention_mask = block_mask
-        elif USE_BLOCK_ATTN and BLOCK_ATTN_AVAILABLE:
-            qk_list = [q_w, k_w]
-            q_w = k_w = None
-            attention_mask = generate_draft_block_mask(B, self.num_heads, seqlen, qk_list, topk=topk, local_attn_mask=self.local_attn_mask)
         else:
             qk_list = [q_w, k_w]
             q_w = k_w = None
@@ -569,7 +472,7 @@ class SelfAttention(nn.Module):
         x_list = [x_w.view(B, new_tokens, D)]
         x_w = None
         x = attention_kit.qkv_attention(x_list, self.q, self.k, self.v, heads, head_dim, norm_rope, norm_spans_heads=True,
-                                        kv_prefix=prefix, attention_mask=block_mask, force_attention="sparge", kv_window=window)
+                                        kv_prefix=prefix, attention_mask=block_mask, force_attention=attention_mode(), kv_window=window)
         prefix = None
         if window is not None:  # the block's state for the next chunk written over the prefix it attended
             stream_cache.commit(block_id, window[0].shape[1])

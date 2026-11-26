@@ -72,33 +72,35 @@ Comfy Kitchen is installed with `requirements.txt`; its prebuilt CUDA kernels re
 
 The Windows and Linux install scripts include WGPKernels for RTX 20XX, 30XX, 40XX and 50XX, choosing the wheel for the selected CUDA stack. AMD RDNA4 targets (`gfx1200`, `gfx1201`) receive the experimental ROCm 10 wheel. For an existing installation, choose **Upgrade** in the update script; **Update** only refreshes code and requirements.
 
+WGPKernels 1.5.1 tunes silently at WanGP's default verbosity. Start WanGP with `--verbose 2` to see each tuning search and its selected configuration. Cache-write warnings appear at every level.
+
 WGPKernels are WanGP's own INT8 kernels, with higher precision than the other fast INT8 backends. Install the wheel matching the CUDA version of your PyTorch (NVIDIA RTX 20XX or newer; WanGP checks the kernels on your GPU before using them):
 
 For **PyTorch 2.10 / CUDA 13** (NVIDIA R580+ driver):
 
 ```bash
 # Windows
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Bcu130-py3-none-win_amd64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.1/wgpkernels-1.5.1%2Bcu130-py3-none-win_amd64.whl
 # Linux (glibc 2.34+)
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Bcu130-py3-none-linux_x86_64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.1/wgpkernels-1.5.1%2Bcu130-py3-none-linux_x86_64.whl
 ```
 
 For **PyTorch 2.7.1 / CUDA 12.8** (NVIDIA R570+ driver):
 
 ```bash
 # Windows
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Bcu128-py3-none-win_amd64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.1/wgpkernels-1.5.1%2Bcu128-py3-none-win_amd64.whl
 # Linux (glibc 2.34+)
-pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Bcu128-py3-none-linux_x86_64.whl
+pip install https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.1/wgpkernels-1.5.1%2Bcu128-py3-none-linux_x86_64.whl
 ```
 
 For **AMD RDNA4 (`gfx1200`, `gfx1201`) with PyTorch 2.13.0 / ROCm 10.0** (experimental):
 
 ```bash
 # Windows
-python -m pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Brocm100-py3-none-win_amd64.whl
+python -m pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.1/wgpkernels-1.5.1%2Brocm100-py3-none-win_amd64.whl
 # Linux
-python -m pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Brocm100-py3-none-linux_x86_64.whl
+python -m pip install --no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.1/wgpkernels-1.5.1%2Brocm100-py3-none-linux_x86_64.whl
 ```
 
 The AMD wheel provides INT8 linear kernels. Native AdaLN, PixelNorm + SiLU and Conv3D remain CUDA-only; AMD retains the independent supported backends for those operations. AMD packages pass installation and library-loading checks, but kernel execution on AMD hardware remains unvalidated.
@@ -122,7 +124,7 @@ With [SageGP](#sage-attention) installed on an RTX 50-series GPU, **Attention Ty
 - **sage 2/3 adaptative gp** chooses, for each head, how much of the score and value calculation can use cheaper formats, by comparing candidate outputs on samples of the current activations. Its speed therefore depends on the model and the content: large on blocks whose attention is easy to compress, small on the others. It is less precise than sage2 gp.
 - **sage3 gp** computes every score in FP4 on the RTX 50 series' FP4 tensor cores and keeps the values in FP8. It runs at about the speed of SageAttention 3 on every block, with roughly half of its error. It changes fine detail more than the adaptative mode; with few-step (distilled) models the video can follow a somewhat different path at the same seed.
 
-**Run the First Denoising Step in Precise** (on by default, shown only with SageGP on an RTX 50-series GPU) applies to sage 2/3 adaptative gp and sage3 gp: the first step, which sets the composition, runs with sage2 gp's precision, for a small part of the speed gain.
+**Use Precise Attention for the First Denoising Step and First Block** is enabled by default. Sol3, SageGP Adaptive and SageGP Fast use the available default dense attention throughout the first denoising step and in the first transformer block of each subsequent step.
 
 The adaptative and sage3 gp modes need Triton 3.6 or newer. They handle unmasked, noncausal BF16 attention with batch size 1, 128 channels per head (256 for wide heads, such as Ideogram 4), equal query and KV head counts, and matching sequence lengths within the kernels' indexing limits. Up to 8,192 tokens, both run sage2 gp. Other shapes and masks use the existing backend.
 
@@ -235,25 +237,19 @@ pip install --no-build-isolation -e .
 ```
 
 ## Sparge Attention
-Sparge Attention (`spas_sage_attn`) provides the optimized sparse attention kernels used by FlashVSR. Install it after Pytorch and Triton.
 
-#### Windows Install Sparge Attention for Pytorch 2.10 / Python 3.11 / Cuda 13
-```
-pip install https://github.com/woct0rdho/SpargeAttn/releases/download/v0.1.0-windows.post4/spas_sage_attn-0.1.0%2Bcu130torch2.9.0andhigher.post4-cp39-abi3-win_amd64.whl
-```
+[SparseGP](https://github.com/deepbeepmeep/SparseGP) supplies **Sol3** for the Attention Type dropdown and block-sparse Sparge attention for FlashVSR. The installer offers SparseGP on RTX 20, 30, 40 and 50 series and AMD. The same wheel contains precompiled CUDA and Radeon RDNA 3/4 device images for Windows and Linux x86-64. WanGP stages Sol and Sparge projections in its shared attention kit. SparseGP ships upstream Sparge CUDA tensor-core kernels for standard block maps on Ampere and newer, dedicated compiled block-list kernels for other targets and geometries, and compiled Sol3 mixed-block attention. The packed Ada/Blackwell Sol kernels and their router load cubins directly. Version 1.2.0 adds grouped-query Sol3. On Krea 2 it packs 12 K/V heads and routes all 48 query heads independently. Sol3 can also run with WanGP's bundled mixed-block Triton kernels when the wheel is absent. In Auto mode, FlashVSR and Radial use the shared Sparge core. It selects SparseGP machine code first, then the original SpargeAttention CUDA extension if available. When neither native backend can serve the GPU, it uses compatible SparseGP or bundled WanGP Triton kernels. FlashVSR's explicit Triton setting selects the bundled kernels for that processor.
 
-#### Windows Install Sparge Attention for Pytorch 2.7.1 / Python 3.10 / Cuda 12.8
-```
-pip install https://github.com/woct0rdho/SpargeAttn/releases/download/v0.1.0-windows.post3/spas_sage_attn-0.1.0%2Bcu128torch2.7.1.post3-cp39-abi3-win_amd64.whl
+For a manual install, activate the WanGP environment with the appropriate PyTorch build. If migrating from the previous SpargeAttention distribution, uninstall it first because both provide the `spas_sage_attn` import.
+
+```shell
+python -m pip uninstall -y spas-sage-attn
+python -m pip install https://github.com/deepbeepmeep/SparseGP/releases/download/v1.2.0/sparsegp-1.2.0-py3-none-any.whl
 ```
 
-#### Linux Install Sparge Attention
-Activate your WanGP Python environment before running these commands; SpargeAttn's build also invokes `python` from `PATH` to generate its kernels.
-```
-python -m pip install ninja wheel packaging
-python -m pip install --no-build-isolation git+https://github.com/woct0rdho/SpargeAttn.git
-```
+Select **Sol3** in **Configuration → Performance → Attention Type** or under generation overrides. Eligible bidirectional self-attention uses INT8 mixed-block routing. When Sol3 is selected, **Settings → Configs → Sol3 Tau** sets its routing threshold (default 0.8). Conditioning, VAE decoding, cross-attention, masked calls and short sequences use a compatible dense backend. The same seed can give visibly different results from Sage2. In the SparseGP clip comparison, MiniMax H3 changed more than Wan 2.2. The first-step precision checkbox also protects the first transformer block in later steps. See the [SparseGP README](https://github.com/deepbeepmeep/SparseGP#attention-modes) for kernel coverage.
 
+For a token mask, both the attention kit and direct attention calls prefer the masked SageGP/SageAttention 2 core, followed by mask-capable SageAttention 1 on Turing, then PyTorch SDPA. SageGP ships the SageAttention 2 interface used by that core. Selecting SDPA explicitly keeps SDPA. Ming Design, Krea 2 and HunyuanVideo can omit padding rows when their conditioning allows it.
 
 ## Flash Attention
 Flash attention is not as fast as Sage for Generating Videos or Images but it preserves quality. However when used with a Language Model (prompt enhancer, Text to Speech, Deepy) it can offer a significant speedup.

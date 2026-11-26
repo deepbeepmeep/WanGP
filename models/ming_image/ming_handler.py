@@ -1,5 +1,5 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
-"""WanGP integration for inclusionAI Ming-Image-0.1-Design.
+"""WanGP integration for the inclusionAI Ming Image family.
 
 The checkpoint URLs describe the prepared DeepBeepMeep layout.  The
 upstream code and checkpoint provenance are recorded in README.md.
@@ -57,6 +57,11 @@ STRUCTURED_PROMPT_EXAMPLE = """{
 }"""
 
 
+def conditioner_file(model_def):
+    stem = "conditioning_0_2" if model_def.get("ming_release") == "0.2" else "conditioning"
+    return f"{stem}_{model_def.get('ming_encoder_variant', 'bf16')}.safetensors"
+
+
 class family_handler:
     @staticmethod
     def resolve_runtime_model_def(model_def, runtime_context):
@@ -93,7 +98,7 @@ class family_handler:
 
     @staticmethod
     def query_family_infos():
-        return {"ming_image": (1160, "Ming Image 0.1")}
+        return {"ming_image": (1160, "Ming Image")}
 
     @staticmethod
     def query_family_maps():
@@ -219,9 +224,10 @@ class family_handler:
             "image_ref_choices": {
                 "choices": [
                     ("None", ""),
-                    ("Edit the Reference Image", "I"),
+                    ("First Reference Defines Output Dimensions (Main Image Ref)", "KI"),
+                    ("Edit the Reference Image at the Selected Size", "I"),
                 ],
-                "letters_filter": "I",
+                "letters_filter": "KI",
             },
             "one_image_ref_only": True,
             "no_background_removal": True,
@@ -241,7 +247,8 @@ class family_handler:
             "infos": (
                 "**Ming Image Design** creates posters, infographics, interface mockups, and other visual designs "
                 "from text. You can also select one Reference Image and describe a change while saying what to "
-                "keep. For a simple image, write a normal prompt. For a precise layout with titles and labels, "
+                "keep. Main Image Ref takes the canvas dimensions from the reference. Edit at the Selected Size uses "
+                "the chosen canvas. For a simple image, write a normal prompt. For a precise layout with titles and labels, "
                 "use the Ming JSON prompt enhancer or arrange the design in Prompt Helper. Put any words that "
                 "must appear exactly in quotes.\n\n"
                 "Start with 12 steps and guidance 1. The default 2048x2048 size gives more detail; choose "
@@ -266,7 +273,8 @@ class family_handler:
             ),
             "deepy_infos": (
                 "Ming Image Design creates posters, infographics, and other visual designs from text or edits "
-                "one reference image. Use a plain prompt for simple work or structured JSON for precise "
+                "one reference image. Use Main Image Ref to take its dimensions or Edit at the Selected Size to use "
+                "the chosen canvas. Use a plain prompt for simple work or structured JSON for precise "
                 "layouts. Quote exact visible words. For an edit, name the change and what "
                 "to preserve. Start with 12 steps and guidance 1; 2048x2048 gives more detail, while "
                 "1024x1024 is faster and suits edits. For transparency, enable RGBA Output and request a "
@@ -290,12 +298,12 @@ class family_handler:
     def query_model_files(computeList, base_model_type, model_def=None):
         variant = (model_def or {}).get("ming_encoder_variant", "bf16")
         vision_file = f"vision_encoder_{variant}.safetensors"
-        conditioner_file = f"conditioning_{variant}.safetensors"
+        conditioning = conditioner_file(model_def or {})
         if base_model_type == LAYER_ARCHITECTURE:
             return [
                 {"repoId": LAYER_REPO, "sourceFolderList": [LAYER_PROJECT], "fileList": [[
                     "transformer_config.json", "connector_config.json", "mlp_config.json",
-                    "scheduler_config.json", conditioner_file,
+                    "scheduler_config.json", conditioning,
                 ]]},
                 {"repoId": REPO, "sourceFolderList": [SHARED_PROJECT], "fileList": [[vision_file]]},
                 {"repoId": REPO, "sourceFolderList": [ENCODER], "fileList": [list(TOKENIZER_FILES)]},
@@ -306,7 +314,7 @@ class family_handler:
         return [
             {"repoId": REPO, "sourceFolderList": [PROJECT], "fileList": [[
                 "transformer_config.json", "connector_config.json", "mlp_config.json",
-                "vae_config.json", "vae.safetensors", "scheduler_config.json", conditioner_file,
+                "vae_config.json", "vae.safetensors", "scheduler_config.json", conditioning,
             ]]},
             {"repoId": REPO, "sourceFolderList": [SHARED_PROJECT], "fileList": [[vision_file]]},
             {"repoId": REPO, "sourceFolderList": [ENCODER], "fileList": [list(TOKENIZER_FILES)]},
@@ -335,6 +343,7 @@ class family_handler:
             transformer_filename=model_filename[0],
             text_encoder_filename=text_encoder_filename,
             model_type=model_type,
+            base_model_type=base_model_type,
             save_quantized=save_quantized,
             quantize_transformer=quantizeTransformer,
             model_def=model_def,

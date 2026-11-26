@@ -4,9 +4,9 @@ tensor cores, with the activation quantization the Inkling 2 checkpoint specifie
 NVFP4 "fouroversix_mae" per token / per (token, expert) row, MXFP8 per 32 values; gate / up, the activation and each expert's output
 rounded to BF16, the top-k outputs summed in float32): LightX2V's moe_ops operators (torch.ops.lightx2v_moe, lightx2v_kernel.moe_ops).
 Binning, quantizers, both grouped GEMMs and the slot sum stay on the device; a token's result does not depend on the other rows of the
-pass. Opt-in (WGP_INKLING2_ENABLE=fp4_prefill): the arithmetic differs from the float-activation path of the other kernels."""
+pass. Opt-in (WGP_INKLING2_ENABLE=fp4_prefill): the arithmetic differs from the float-activation path of the other kernels.
+Nemotron Image single-token passes use native FP4 unpacking with floating-point activations and squared ReLU."""
 import importlib
-import importlib.util
 import os
 from functools import cache
 
@@ -23,8 +23,11 @@ HIDDEN, INTERMEDIATE = 2304, 1152  # the widths the operators are built for (Ink
 @cache
 def _library():
     """The operators: lightx2v_kernel.moe_ops when the installed package has it (or already loaded), else None."""
-    if not hasattr(torch.ops.lightx2v_moe, "inkling2_prefill") and importlib.util.find_spec("lightx2v_kernel") is not None and importlib.util.find_spec("lightx2v_kernel.moe_ops") is not None:
-        importlib.import_module("lightx2v_kernel.moe_ops")
+    if not hasattr(torch.ops.lightx2v_moe, "inkling2_prefill"):
+        try:
+            importlib.import_module("lightx2v_kernel.moe_ops")
+        except (ImportError, OSError):
+            return None
     return torch.ops.lightx2v_moe if hasattr(torch.ops.lightx2v_moe, "inkling2_prefill") else None
 
 
@@ -42,6 +45,25 @@ def eligible(bank, x):
     MIN_ROWS outside graph capture, Inkling 2's widths and soft caps."""
     return (ENABLED and kernel_policy.allow_approximate() and x.is_cuda and x.dtype == torch.bfloat16 and x.shape[0] > MIN_ROWS and bank.hidden == HIDDEN and bank.intermediate == INTERMEDIATE and bank.caps is not None
             and bank.format.name in ("nvfp4_rows", "mxfp8_rows") and not torch.cuda.is_current_stream_capturing() and supported(x.device))
+
+
+@cache
+def _relu2_decode_operator(device):
+    if torch.version.hip is None and torch.cuda.get_device_capability(device) in ((12, 0), (12, 1)) and supported(device):
+        return getattr(_library(), "nvfp4_relu2_decode", None)
+    return None
+
+
+def relu2_decode(x, ids, probabilities, pointers, intermediate, out, mid):
+    """One resident-expert decoding pass with native FP4 unpacking. Older LightX2V installations use the portable kernel."""
+    if (x.shape != (1, 2688) or intermediate != 1856 or ids.shape != (1, 6) or x.dtype != torch.bfloat16
+            or probabilities.dtype != torch.float32 or ids.dtype not in (torch.int32, torch.int64) or mid.data_ptr() % 16):
+        return False
+    op = _relu2_decode_operator(x.device)
+    if op is None:
+        return False
+    op(out, mid, x, ids, probabilities, pointers)
+    return True
 
 
 def forward(kind, x, ids, weights, pointers, caps):

@@ -105,7 +105,8 @@ advice's automatic picks.
   of that audio); a continued part hears the end of the part before it first.
   A music video carries no lyrics subtitles unless the user asks for them (`edit(song_subtitles=true)`).
 - A lip-synced shot also takes its exact slice of the song as driving audio, with the template of `cast_shots_lip_synced`: set its
-  `audio_slice`. On a cut that plays the song, a shot's `dialogue` holds the lyric sung under it, for the subtitles: `render` never speaks it. Give a shot that shows the singer singing its slice. `render` takes the brief's song, cuts the slice and makes the
+  `audio_slice`. If a shot names the full production song as its guide and leaves out the slice, Shoot takes the excerpt at the shot's position in the song edit and keeps its planned duration.
+  On a cut that plays the song, a shot's `dialogue` holds the lyric sung under it, for the subtitles: `render` never speaks it. Give a shot that shows the singer singing its slice. `render` takes the brief's song, cuts the slice and makes the
   shot's model keep it as its soundtrack, whatever audio choice its template or settings hold; do not cut it yourself.
 - A change of what someone wears or looks like (a user's note "no raincoat in the last two shots") is a look, in a production of any
   length (see Long productions): rewriting the prompts is not enough, the reference picture brings the old outfit back.

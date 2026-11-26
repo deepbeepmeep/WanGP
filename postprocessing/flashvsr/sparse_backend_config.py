@@ -7,7 +7,7 @@ SPARSE_BACKEND_SPARGE = "sparge"
 SPARSE_BACKEND_LABELS = {
     SPARSE_BACKEND_AUTO: "Auto",
     SPARSE_BACKEND_TRITON_SPARSE: "Triton Sparse Attention",
-    SPARSE_BACKEND_SPARGE: "SpargeAttn (recommended, best quality especially when there is motion)",
+    SPARSE_BACKEND_SPARGE: "Installed Sparge kernels (SparseGP or SpargeAttention)",
 }
 SPARSE_BACKEND_CHOICES = [
     (SPARSE_BACKEND_LABELS[key], key)

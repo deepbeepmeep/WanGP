@@ -498,6 +498,34 @@ def has_complete_tool_call(raw_text: str, allow_untagged: bool = True) -> bool:
     return _extract_inline_tool_call(answer_text)[0] is not None
 
 
+def prefill_suffix_chunk(llm, seq: Sequence, chunk: list[int], processed: int, *, speculative: bool) -> None:
+    """Append known tokens to a live sequence and bring its decoding caches to the new end."""
+    old_num_tokens = seq.num_tokens
+    blocks = llm.scheduler.block_manager
+    seq.token_ids.extend(chunk)
+    seq.last_token = seq.token_ids[-1]
+    seq.num_tokens = len(seq.token_ids)
+    if not blocks.can_prompt_append(seq, old_num_tokens):
+        del seq.token_ids[old_num_tokens:]
+        seq.num_tokens = old_num_tokens
+        seq.last_token = seq.token_ids[-1] if seq.token_ids else 0
+        seq.num_cached_tokens = min(seq.num_cached_tokens, old_num_tokens)
+        raise RuntimeError("Assistant chunk prefill exceeded the available KV cache blocks.")
+    blocks.begin_prompt_append(seq, old_num_tokens)
+    if speculative:
+        seq.num_cached_tokens = old_num_tokens
+        llm.model_runner.call("prefill_mtp_suffix", [seq], old_num_tokens)
+    elif seq.num_tokens - 1 > processed:
+        full_token_ids = seq.token_ids
+        seq.num_cached_tokens, seq.num_tokens, seq.token_ids = processed, len(full_token_ids) - 1, full_token_ids[:-1]
+        try:
+            llm.model_runner.call("prefill_only", [seq])
+        finally:
+            seq.num_tokens, seq.token_ids = len(full_token_ids), full_token_ids
+    blocks.finalize_prompt_append(seq, old_num_tokens)
+    seq.num_cached_tokens = seq.num_tokens if speculative else seq.num_tokens - 1
+
+
 class Qwen35AssistantRuntime:
     def __init__(self, model, debug_enabled: bool = False):
         self.model = model
@@ -1129,11 +1157,11 @@ class Qwen35AssistantRuntime:
 
     def _chunk_prefill_suffix(self, seq: Sequence, token_ids: list[int], chunk_tokens: int | None = None, processed_tokens: int | None = None) -> Sequence:
         suffix = [int(token_id) for token_id in list(token_ids or [])]
-        chunk_tokens = chunk_tokens or self._prefill_chunk_tokens(len(suffix))
         if suffix and seq.token_ids and suffix[0] == int(seq.token_ids[-1]) == self._single_token_id(self.chat_format.turn_end):
             suffix = suffix[1:]  # a response that sampled its own end of turn (after parallel tool calls) keeps it once, as the chat format writes it
         if len(suffix) == 0:
             return seq
+        chunk_tokens = chunk_tokens or self._prefill_chunk_tokens(len(suffix))
         target_tokens = len(seq.token_ids) + len(suffix)
         if self.context_progress is not None and processed_tokens is None:
             self.context_progress(len(seq.token_ids), target_tokens)
@@ -1156,30 +1184,8 @@ class Qwen35AssistantRuntime:
                 chunk_started_at = time.perf_counter()
                 chunk = suffix[chunk_start : chunk_start + chunk_tokens]
                 self._read_ahead(suffix, chunk_start + chunk_tokens, chunk_start + 2 * chunk_tokens)
-                old_num_tokens = int(seq.num_tokens)
-                seq.token_ids.extend(chunk)
-                seq.last_token = int(seq.token_ids[-1])
-                seq.num_tokens = len(seq.token_ids)
-                if not llm.scheduler.block_manager.can_prompt_append(seq, old_num_tokens):
-                    del seq.token_ids[old_num_tokens:]
-                    seq.num_tokens = old_num_tokens
-                    seq.last_token = int(seq.token_ids[-1]) if seq.token_ids else 0
-                    seq.num_cached_tokens = min(int(getattr(seq, "num_cached_tokens", old_num_tokens) or 0), old_num_tokens)
-                    raise RuntimeError("Assistant chunk prefill exceeded the available KV cache blocks.")
-                llm.scheduler.block_manager.begin_prompt_append(seq, old_num_tokens)
-                if speculative:
-                    seq.num_cached_tokens = old_num_tokens
-                    llm.model_runner.call("prefill_mtp_suffix", [seq], old_num_tokens)
-                elif seq.num_tokens - 1 > processed:
-                    full_token_ids = seq.token_ids
-                    seq.num_cached_tokens, seq.num_tokens, seq.token_ids = processed, len(full_token_ids) - 1, full_token_ids[:-1]
-                    try:
-                        llm.model_runner.call("prefill_only", [seq])
-                    finally:
-                        seq.num_tokens, seq.token_ids = len(full_token_ids), full_token_ids
-                llm.scheduler.block_manager.finalize_prompt_append(seq, old_num_tokens)
+                prefill_suffix_chunk(llm, seq, chunk, processed, speculative=speculative)
                 processed = seq.num_tokens - 1
-                seq.num_cached_tokens = seq.num_tokens if speculative else processed
                 self._log(
                     f"Chunk-prefilled assistant suffix chunk {chunk_index}/{total_chunks} "
                     f"with {len(chunk)} tokens in {time.perf_counter() - chunk_started_at:.3f}s (context={int(seq.num_tokens)})."

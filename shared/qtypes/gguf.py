@@ -1820,14 +1820,44 @@ _DRAFT_HEAD_FLOOR = -30000.0  # the logit of the other rows: no probability, and
 _DRAFT_HEAD_DISABLED = "draft_candidates" in os.environ.get("WGP_FN_DISABLE", "").split(",")  # the whole head at each draft, to compare
 
 
+def _candidate_module(row_count: int, columns: int):
+    """The kernel package when it selects candidate rows on this GPU for a head of this shape, else None."""
+    module = _gguf_cuda_module() if _gguf_cuda_kernels_enabled() and torch.cuda.is_available() else None
+    if _DRAFT_HEAD_DISABLED or module is None or not hasattr(module, "head_group_bits") or not module.has_head_candidates(torch.cuda.current_device()):
+        return None
+    return module if row_count % _DRAFT_HEAD_GROUPS == 0 and _DRAFT_HEAD_KEEP <= row_count // _DRAFT_HEAD_GROUPS <= 1024 and columns % 128 == 0 and columns <= 8192 else None
+
+
 def draft_candidates_supported(source: torch.nn.Module, row_count: int) -> bool:
     """GGUFCandidateRowsLinear serves this head: the GGUF kernel package has its selection kernel for this GPU and the head's shape fits it."""
-    module = _gguf_cuda_module() if _gguf_cuda_kernels_enabled() and torch.cuda.is_available() else None
     weight = getattr(source, "weight", None)
-    if _DRAFT_HEAD_DISABLED or module is None or not hasattr(module, "head_group_bits") or not module.has_head_candidates(torch.cuda.current_device()) or not isinstance(weight, GGUFWeightTensor):
-        return False
-    columns = int(weight._tensor_shape[1])
-    return row_count % _DRAFT_HEAD_GROUPS == 0 and _DRAFT_HEAD_KEEP <= row_count // _DRAFT_HEAD_GROUPS <= 1024 and columns % 128 == 0 and columns <= 8192
+    return isinstance(weight, GGUFWeightTensor) and _candidate_module(row_count, int(weight._tensor_shape[1])) is not None
+
+
+def _candidate_tensors(module, row_count: int, dense_rows):
+    """(group bits, scales as int32 bits, row ids) of the one-bit copy of a head's first row_count rows; dense_rows(start, stop): those rows
+    in float32 on the GPU, built by chunks (about 100 MB at a time) and kept on the CPU, dealt into groups by a fixed shuffle."""
+    bits, scales = [], []
+    for start in range(0, row_count, 1024):
+        chunk_bits, chunk_scale = module.head_sign_bits(dense_rows(start, min(start + 1024, row_count)))
+        bits.append(chunk_bits.cpu())
+        scales.append(chunk_scale.cpu())
+    shuffle = torch.randperm(row_count, generator=torch.Generator(device="cpu").manual_seed(0), device="cpu")
+    return module.head_group_bits(torch.cat(bits)[shuffle], _DRAFT_HEAD_GROUPS), torch.cat(scales)[shuffle].contiguous().view(torch.int32), shuffle.to(torch.int32)
+
+
+def dense_head_candidates(weight: torch.Tensor, row_count: int):
+    """The one-bit copy (group bits, scales as int32 bits, row ids) of the first row_count rows of a dense (BF16 / FP16 / FP32) head, for
+    select_candidate_rows, or None when the kernel package does not select candidates on this GPU or for this shape."""
+    module = _candidate_module(row_count, int(weight.shape[1]))
+    if module is None or weight.shape[0] < row_count:
+        return None
+    return _candidate_tensors(module, row_count, lambda start, stop: weight[start:stop].to("cuda", torch.float32))
+
+
+def select_candidate_rows(input: torch.Tensor, bits: torch.Tensor, scale: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+    """The ids (int64) of the head rows a one-bit copy ranks best for one input row: the _DRAFT_HEAD_KEEP best of each of _DRAFT_HEAD_GROUPS groups."""
+    return _gguf_cuda_module().head_candidates(input, bits, scale.view(torch.float32), ids, _DRAFT_HEAD_GROUPS, _DRAFT_HEAD_KEEP)[0].long()
 
 
 class GGUFCandidateRowsLinear(GGUFFirstRowsLinear):
@@ -1845,18 +1875,12 @@ class GGUFCandidateRowsLinear(GGUFFirstRowsLinear):
         values, size = _quantization_sizes(weight._tensor_type)
         full_rows, columns = map(int, weight._tensor_shape)
         raw = weight._data.reshape(full_rows, -1)
-        dequantize, module = _DEQUANTIZE_FUNCTIONS[_quantization_type(weight._tensor_type)], _gguf_cuda_module()
-        device = torch.device("cuda")  # built on the GPU by chunks of rows (about 100 MB at a time), kept as buffers that MMGP places with the model
-        bits, scales = [], []
-        for start in range(0, self.row_count, 1024):
-            dense = dequantize(raw[start:min(start + 1024, self.row_count)].to(device).reshape(-1, size), values, size, torch.float32).reshape(-1, columns)
-            chunk_bits, chunk_scale = module.head_sign_bits(dense)
-            bits.append(chunk_bits.cpu())
-            scales.append(chunk_scale.cpu())
-        shuffle = torch.randperm(self.row_count, generator=torch.Generator(device="cpu").manual_seed(0), device="cpu")
-        self.register_buffer("candidate_bits", module.head_group_bits(torch.cat(bits)[shuffle], _DRAFT_HEAD_GROUPS), persistent=False)  # by group and by part of a row: read as contiguous runs
-        self.register_buffer("candidate_scale", torch.cat(scales)[shuffle].contiguous().view(torch.int32), persistent=False)  # float32 kept as its bits: no dtype conversion touches it
-        self.register_buffer("candidate_ids", shuffle.to(torch.int32), persistent=False)
+        dequantize = _DEQUANTIZE_FUNCTIONS[_quantization_type(weight._tensor_type)]
+        dense_rows = lambda start, stop: dequantize(raw[start:stop].to("cuda").reshape(-1, size), values, size, torch.float32).reshape(-1, columns)
+        bits, scale, ids = _candidate_tensors(_gguf_cuda_module(), self.row_count, dense_rows)  # kept as buffers that MMGP places with the model
+        self.register_buffer("candidate_bits", bits, persistent=False)  # by group and by part of a row: read as contiguous runs
+        self.register_buffer("candidate_scale", scale, persistent=False)  # float32 kept as its bits: no dtype conversion touches it
+        self.register_buffer("candidate_ids", ids, persistent=False)
         # the candidates' quantized rows, gathered at each draft: one buffer for every graph that drafts, instead of a temporary in each graph's own memory
         self.register_buffer("candidate_rows", torch.empty((_DRAFT_HEAD_GROUPS * _DRAFT_HEAD_KEEP, raw.shape[1]), dtype=torch.uint8), persistent=False)
 
@@ -1865,10 +1889,9 @@ class GGUFCandidateRowsLinear(GGUFFirstRowsLinear):
         source_raw = source_weight._data
         if not (input.is_cuda and bits.device == input.device and gathered.device == input.device and source_raw.device == input.device and input.numel() == input.shape[-1] and input.dtype in (torch.float16, torch.bfloat16, torch.float32)):
             return super().forward(input)  # several rows at once, or weights not placed with the input: the whole head
-        module = _gguf_cuda_module()
         full_rows, in_features = map(int, source_weight._tensor_shape)
         count = _DRAFT_HEAD_GROUPS * _DRAFT_HEAD_KEEP
-        index = module.head_candidates(input, bits, self.candidate_scale.view(torch.float32), self.candidate_ids, _DRAFT_HEAD_GROUPS, _DRAFT_HEAD_KEEP)[0].long()
+        index = select_candidate_rows(input, bits, self.candidate_scale, self.candidate_ids)
         rows = GGUFWeightTensor.create(torch.index_select(source_raw.reshape(full_rows, -1), 0, index, out=gathered), (count, in_features), (in_features, 1), source_weight.dtype, tensor_type=source_weight._tensor_type, tensor_shape=(count, in_features))
         exact = rows.linear(input)
         _gguf_log_once("draft_candidates", f"[GGUF][llama.cpp CUDA] draft head: {count} candidate rows of {self.row_count} scored at each draft (one-bit copy of the head, {bits.numel() * 4 >> 20} MB).")

@@ -8,7 +8,8 @@ import struct
 from collections import OrderedDict
 
 import torch
-from safetensors import safe_open
+from mmgp.safetensors2 import safe_open
+from tqdm import tqdm
 
 from shared.qtypes.int8_convrot import _regular_hadamard, convrot_group_size as _group_size
 
@@ -37,10 +38,7 @@ def _normalized_module_name(name):
 
 
 def _tensor_bytes(tensor):
-    tensor = tensor.detach().contiguous().cpu()
-    if tensor.dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2):
-        tensor = tensor.view(torch.uint8)
-    return tensor.numpy().tobytes()
+    return memoryview(tensor.detach().contiguous().cpu().reshape(-1).view(torch.uint8).numpy())
 
 
 def quantize_weight(weight, group_size, device):
@@ -69,10 +67,26 @@ def save_convrot_model(model, source_file, output_file, layout=None, verboseLeve
     temp_file = output_file + ".tmp"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    with safe_open(source_file, framework="pt", device="cpu") as reader:
+    with safe_open(source_file, writable_tensors=False) as reader:
         source_keys = list(reader.keys())
         source_metadata = dict(reader.metadata() or {})
         quantized = {}
+        # Expert banks store independent matrices along axis zero. MMGP consumes both
+        # projections in the same rotation basis, with a float32 scale per expert row.
+        expert_weights = {}
+        for name, module in model.named_modules():
+            projections = getattr(module, "convrot_expert_projections", None)
+            if not projections or not _module_matches(name + ".", tower_prefixes):
+                continue
+            entries = {key: reader.get_slice(f"{name}.{key}") for key in projections}
+            shapes = {key: tuple(entry.get_shape()) for key, entry in entries.items()}
+            if any(len(shapes[key]) != 3 or entry.get_dtype() not in ("BF16", "F16") for key, entry in entries.items()):
+                raise ValueError(f"Expected floating-point expert matrices for {name}")
+            group = _group_size(math.gcd(*(shape[-1] for shape in shapes.values())))
+            if not group:
+                raise ValueError(f"No common ConvRot group for expert bank {name}")
+            for key, target in projections.items():
+                expert_weights[f"{name}.{key}"] = (f"{name}.{target}", shapes[key], group)
         for key in source_keys:
             tensor_slice = reader.get_slice(key)
             shape, dtype = tuple(tensor_slice.get_shape()), tensor_slice.get_dtype()
@@ -94,7 +108,14 @@ def save_convrot_model(model, source_file, output_file, layout=None, verboseLeve
             offset += size
 
         for key in source_keys:
-            if key in quantized:
+            if key in expert_weights:
+                base, shape, group = expert_weights[key]
+                add_entry(base + "_weight", torch.int8, shape, source_key=key)
+                add_entry(base + "_scales", torch.float32, (*shape[:-1], 1), payload="expert_scales")
+                rotation = base.rsplit(".", 1)[0] + ".convrot_group_size"
+                if rotation not in header:
+                    add_entry(rotation, torch.int64, (), payload=struct.pack("<q", group))
+            elif key in quantized:
                 shape, group_size = tuple(reader.get_slice(key).get_shape()), quantized[key]
                 base = key[:-len(".weight")]
                 config = json.dumps({"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": group_size}).encode("utf-8")
@@ -112,8 +133,9 @@ def save_convrot_model(model, source_file, output_file, layout=None, verboseLeve
         source_metadata.update(quantization_format="int8_convrot", convrot_format="comfy_quant_v1")
         header["__metadata__"] = source_metadata
         header_bytes = json.dumps(header).encode("utf-8")
+        count = len(quantized) + sum(shape[0] for _, shape, _ in expert_weights.values())
         if verboseLevel >= 1:
-            print(f"ConvRot quantization of {len(quantized)} weights started on {device}")
+            tqdm.write(f"ConvRot quantization of {count} weights started on {device}")
 
         try:
             with open(temp_file, "wb") as writer:
@@ -122,11 +144,33 @@ def save_convrot_model(model, source_file, output_file, layout=None, verboseLeve
                 scales = {}
                 for index, (key, source_key, payload) in enumerate(output_entries, 1):
                     transform = layout.get(_normalized_module_name(source_key)) if source_key is not None else None
-                    if source_key in quantized:
-                        qweight, scale = quantize_weight(reader.get_tensor(source_key), payload, device)
-                        if transform is not None:
+                    if source_key in expert_weights:
+                        base, shape, group = expert_weights[source_key]
+                        bank = reader.get_slice(source_key)
+                        row_scales = []
+                        for expert in range(shape[0]):
+                            qweight, scale = quantize_weight(bank[expert], group, device)
+                            writer.write(_tensor_bytes(qweight))
+                            row_scales.append(scale)
+                        scales[base] = torch.stack(row_scales)
+                    elif payload == "expert_scales":
+                        writer.write(_tensor_bytes(scales.pop(key.removesuffix("_scales"))))
+                    elif source_key in quantized:
+                        matrix = reader.get_tensor(source_key)
+                        if transform is None:
+                            # Large vocabulary heads can exceed GPU memory during a whole-matrix
+                            # FP32 rotation. Rows have independent scales and can be written directly.
+                            rows = max(1, (64 << 20) // (4 * matrix.shape[1]))
+                            row_scales = []
+                            for part in matrix.split(rows):
+                                qweight, scale = quantize_weight(part, payload, device)
+                                writer.write(_tensor_bytes(qweight))
+                                row_scales.append(scale)
+                            scale = torch.cat(row_scales)
+                        else:
+                            qweight, scale = quantize_weight(matrix, payload, device)
                             qweight, scale = transform(qweight), transform(scale)
-                        writer.write(_tensor_bytes(qweight))
+                            writer.write(_tensor_bytes(qweight))
                         scales[source_key[:-len(".weight")]] = scale
                     elif payload == "scale":
                         writer.write(_tensor_bytes(scales.pop(key[:-len(".weight_scale")])))
@@ -138,7 +182,7 @@ def save_convrot_model(model, source_file, output_file, layout=None, verboseLeve
                             tensor = transform(tensor)
                         writer.write(_tensor_bytes(tensor))
                     if verboseLevel >= 1 and index % 100 == 0:
-                        print(f"ConvRot checkpoint: wrote {index}/{len(output_entries)} tensors")
+                        tqdm.write(f"ConvRot checkpoint: wrote {index}/{len(output_entries)} tensors")
             os.replace(temp_file, output_file)
         except BaseException:
             if os.path.isfile(temp_file):
@@ -146,5 +190,5 @@ def save_convrot_model(model, source_file, output_file, layout=None, verboseLeve
             raise
 
     if verboseLevel >= 1:
-        print(f"ConvRot checkpoint saved to '{output_file}'")
-    return len(quantized)
+        tqdm.write(f"ConvRot checkpoint saved to '{output_file}'")
+    return count

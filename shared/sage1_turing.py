@@ -48,18 +48,21 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, qo_len, lo, hi,
         qk = tl.dot(q, k).to(tl.float32) * q_scale * k_scale
         if MASK_MODE == 1:
             # boolean mask (batch, heads, q, k) as uint8, broadcast through zero strides: a masked key gets no weight (-inf before the
-            # softmax, as SDPA); keys beyond kv_len keep the kernel's behavior (unmasked)
-            keep = tl.load(M_ptrs, mask=(offs_m[:, None] < qo_len) & k_mask, other=1)
+            # softmax, as SDPA), including the tail of the last tile
+            keep = tl.load(M_ptrs, mask=(offs_m[:, None] < qo_len) & k_mask, other=0)
             qk = tl.where(keep != 0, qk, float("-inf"))
         elif MASK_MODE == 2:
             # additive FP32 mask in the natural-log domain of SDPA: the scores are in base 2 here (log2 e folded into q_scale)
-            qk = qk + tl.load(M_ptrs, mask=(offs_m[:, None] < qo_len) & k_mask, other=0.0) * 1.4426950408889634
+            qk = qk + tl.load(M_ptrs, mask=(offs_m[:, None] < qo_len) & k_mask, other=-float("inf")) * 1.4426950408889634
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
-        qk = qk - m_ij[:, None]
+        # A query can first see a key in a later tile. Keep its running max at
+        # -inf while using a finite origin for exp2 in the empty tile.
+        origin = tl.where(m_ij == -float("inf"), 0., m_ij) if MASK_MODE else m_ij
+        qk = qk - origin[:, None]
         p = tl.math.exp2(qk)
         l_ij = tl.sum(p, 1)
 
-        alpha = tl.math.exp2(m_i - m_ij)
+        alpha = tl.math.exp2(m_i - origin)
         l_i = l_i * alpha + l_ij
 
         acc = acc * alpha[:, None]
@@ -148,9 +151,10 @@ def _attn_fwd(Q, K, V,
                                     BLOCK_M, HEAD_DIM, BLOCK_N,
                                     4 - STAGE, offs_m, offs_n, V_BITS, MASK_MODE
                                     )
-    acc = acc / l_i[:, None]
+    acc = acc / tl.where(l_i > 0., l_i, 1.)[:, None] if MASK_MODE else acc / l_i[:, None]
     # BF16 output written as bits (int16 pointer): one rounding of the FP32 accumulator (round to nearest even)
-    tl.store(O_block_ptr, fp32_to_bf16_bits(acc), mask=(offs_m[:, None] < qo_len))
+    value = fp32_to_bf16_bits(acc) if Out.dtype.element_ty == tl.int16 else acc
+    tl.store(O_block_ptr, value, mask=(offs_m[:, None] < qo_len))
     if RETURN_LSE:  # base-2 log-sum-exp of the scores (log2 e is folded into q_scale), Lse (batch, heads, tokens) FP32
         tl.store(Lse + (off_z * H + off_h) * qo_len + offs_m, m_i + tl.math.log2(l_i), mask=offs_m < qo_len)
 
@@ -206,7 +210,7 @@ def _attn_range(Q, K, V,
     acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, qo_len, lo, hi, K_ptrs, K_scale + k_scale_offset, V_ptrs, M_ptrs,
                                     stride_kn, stride_vn, stride_mk, start_m, H // num_kv_groups, BLOCK_M, HEAD_DIM, BLOCK_N, 4 - STAGE,
                                     offs_m, offs_n, V_BITS, MASK_MODE)
-    acc = acc / l_i[:, None]
+    acc = acc / tl.where(l_i > 0., l_i, 1.)[:, None] if MASK_MODE else acc / l_i[:, None]
     local = (offs_m - FIRST * BLOCK_M).to(tl.int64)
     inside = offs_m < qo_len
     part = tl.program_id(2).to(tl.int64)

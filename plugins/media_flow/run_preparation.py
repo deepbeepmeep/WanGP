@@ -9,7 +9,7 @@ import gradio as gr
 from postprocessing import chunking
 from shared.utils.audio_video import extract_audio_tracks
 from shared.utils.utils import get_video_info_details
-from shared.utils.video_decode import resolve_media_binary
+from shared.utils.video_decode import resolve_hdr_ffmpeg, resolve_media_binary
 from shared.utils.virtual_media import build_virtual_media_path
 
 from . import common
@@ -168,7 +168,7 @@ def prepare_run(
     dropped_tail_frames = selected_unique_frames - requested_unique_frames
     if dropped_tail_frames > 0:
         common.plugin_info(f"Dropping the last {dropped_tail_frames} source frame(s) so the selected range fits the current model chunk shape.")
-    ffmpeg_path = resolve_media_binary("ffmpeg")
+    ffmpeg_path = resolve_hdr_ffmpeg() if process_is_hdr else resolve_media_binary("ffmpeg")
     if ffmpeg_path is None:
         raise gr.Error("ffmpeg binary not found.")
     ffprobe_path = resolve_media_binary("ffprobe")

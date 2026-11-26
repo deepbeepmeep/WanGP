@@ -14,6 +14,7 @@ from transformers import AutoTokenizer, Qwen2VLImageProcessorFast, Qwen2VLProces
 from transformers.processing_utils import ProcessorMixin
 
 from mmgp import offload, runtime
+from shared.attention_kit import compact_prompt_padding
 from shared.utils import files_locator as fl
 from shared.utils.gguf_mapping import has_standard_gguf_tensor_names, remap_state_dict_triplet
 from shared.utils.text_encoder_cache import TextEncoderCache
@@ -59,10 +60,9 @@ def _prepare(img, txtlen, patch, txtmask):
     imgids[..., 1] = torch.arange(h_, device=img.device)[:, None]
     imgids[..., 2] = torch.arange(w_, device=img.device)[None, :]
     imgpos = repeat(imgids, "h w three -> b (h w) three", b=b, three=3)
-    imgmask = torch.ones(b, h_ * w_, device=img.device, dtype=torch.bool)
     img = rearrange(img, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch, pw=patch)
     txtpos = torch.zeros(b, txtlen, 3, device=img.device)
-    mask = torch.cat((txtmask, imgmask), dim=1)
+    mask = None if txtmask is None else torch.cat((txtmask, txtmask.new_ones(b, h_ * w_)), dim=1)
     pos = torch.cat((txtpos, imgpos), dim=1)
     return img, pos, mask
 
@@ -338,7 +338,6 @@ class Krea2Pipeline:
             true_cfg_scale = guidance + 1.0 if cfg else 1.0
             NAG = None
             nagtxt = nagtxtmask = None
-            context_len = txt.shape[1]
             if float(NAG_scale) > 1.0 and not cfg:
                 nagtxt, nagtxtmask = self._encode_prompts(negative_prompts, device, dtype, images=grounding_images)
                 if nagtxt is None:
@@ -347,11 +346,15 @@ class Krea2Pipeline:
                 txtmask = torch.cat((txtmask, txtmask.new_zeros(txtmask.shape[0], context_len - txtmask.shape[1])), dim=1)
                 nagtxtmask = torch.cat((nagtxtmask, nagtxtmask.new_zeros(nagtxtmask.shape[0], context_len - nagtxtmask.shape[1])), dim=1)
                 NAG = {"scale": float(NAG_scale), "tau": float(NAG_tau), "alpha": float(NAG_alpha), "cap_embed_len": context_len, "prefix_len": 0}
+            else:
+                txt, txtmask = compact_prompt_padding(txt, txtmask)
+                context_len = txt.shape[1]
             x, pos, mask = _prepare(noise, context_len, patch, txtmask)
             if cfg:
                 untxt, untxtmask = self._encode_prompts(negative_prompts, device, dtype, images=grounding_images)
                 if untxt is None:
                     return None
+                untxt, untxtmask = compact_prompt_padding(untxt, untxtmask)
                 _, unpos, unmask = _prepare(noise, untxt.shape[1], patch, untxtmask)
         x1 = (256 // align) ** 2
         x2 = (1280 // align) ** 2
@@ -373,12 +376,15 @@ class Krea2Pipeline:
                 ref_pos[..., 1] = (torch.arange(grid_h, device=device) + offset_h).view(-1, 1).expand(grid_h, grid_w).reshape(-1)
                 ref_pos[..., 2] = (torch.arange(grid_w, device=device) + offset_w).view(1, -1).expand(grid_h, grid_w).reshape(-1)
                 reference_positions.append(ref_pos)
-                reference_masks.append(torch.ones(batch_size, grid_h * grid_w, device=device, dtype=torch.bool))
+                if mask is not None or (cfg and unmask is not None):
+                    reference_masks.append(torch.ones(batch_size, grid_h * grid_w, device=device, dtype=torch.bool))
             pos = torch.cat([pos[:, :context_len]] + reference_positions + [pos[:, context_len:]], dim=1)
-            mask = torch.cat([mask[:, :context_len]] + reference_masks + [mask[:, context_len:]], dim=1)
+            if mask is not None:
+                mask = torch.cat([mask[:, :context_len]] + reference_masks + [mask[:, context_len:]], dim=1)
             if cfg:
                 unpos = torch.cat([unpos[:, :untxt.shape[1]]] + reference_positions + [unpos[:, untxt.shape[1]:]], dim=1)
-                unmask = torch.cat([unmask[:, :untxt.shape[1]]] + reference_masks + [unmask[:, untxt.shape[1]:]], dim=1)
+                if unmask is not None:
+                    unmask = torch.cat([unmask[:, :untxt.shape[1]]] + reference_masks + [unmask[:, untxt.shape[1]:]], dim=1)
         if NAG is not None:
             NAG["query_start"] = context_len + sum(tokens.shape[1] for tokens in reference_tokens)
             NAG["query_end"] = NAG["query_start"] + img.shape[1]

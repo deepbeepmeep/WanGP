@@ -270,6 +270,7 @@ class MMDoubleStreamBlock(nn.Module):
             attention_mask=attn_mask,                
             q_lens=seqlens_q,
             k_lens=seqlens_kv,
+            sol3_suffix_tokens=txt.shape[1],
         )
         b, s, a, d = attn.shape
         attn = attn.reshape(b, s, -1)        
@@ -471,6 +472,7 @@ class MMSingleStreamBlock(nn.Module):
             attention_mask=attn_mask,                
             q_lens = seqlens_q,
             k_lens = seqlens_kv,
+            sol3_suffix_tokens=txt.shape[1],
         )
         b, s, a, d = attn.shape
         attn = attn.reshape(b, s, -1)        
@@ -1085,14 +1087,6 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         else:
             ref_length = ref_latents.shape[-2]
             img = torch.cat([ref_latents, img], dim=-2) # t c
-        txt_seq_len = txt.shape[1]
-        img_seq_len = img.shape[1]
-
-        text_len = text_mask.sum(1)
-        total_len = text_len + img_seq_len
-        seqlens_q = seqlens_kv = total_len 
-        attn_mask = None
-
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
         should_calc = True
         skip_steps_cache  = self.cache
@@ -1140,6 +1134,12 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                 skip_steps_cache.previous_residual[x_id] = None
                 ori_img = img[0:1].clone()
             # --------------------- Pass through DiT blocks ------------------------
+            # The block calls already process one example at a time. Their length
+            # contract admits only this prefix after the image. Discard padding once.
+            lengths = text_mask.sum(1).tolist()
+            captions = [txt[i:i + 1, :max(n, 1)] for i, n in enumerate(lengths)]
+            # An empty caption keeps a masked dummy for projections that require a row.
+            limits = [None if n else text_mask.new_full((1,), img.shape[1], dtype=torch.int32) for n in lengths]
             for layer_num, block in enumerate(self.double_blocks):
                 for i in range(len(img)):
                     if callback != None:
@@ -1148,18 +1148,18 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                         return None
                     double_block_args = [
                         img[i:i+1],
-                        txt[i:i+1],
+                        captions[i],
                         vec[i:i+1],
-                        attn_mask,                
-                        seqlens_q[i:i+1],
-                        seqlens_kv[i:i+1],
+                        None,
+                        limits[i],
+                        limits[i],
                         freqs_cis,
                         self.i2v_condition_type,
                         token_replace_vec,
                         frist_frame_token_num,                    
                     ]
 
-                    img[i], txt[i] = block(*double_block_args)
+                    img[i:i+1], captions[i][:] = block(*double_block_args)
                     double_block_args = None
                     # insert audio feature to img 
                     if audio_prompts != None: 
@@ -1184,19 +1184,19 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                     single_block_args = [
                         # x,
                         img[i:i+1],
-                        txt[i:i+1],
+                        captions[i],
                         vec[i:i+1],
-                        txt_seq_len,
-                        attn_mask,                
-                        seqlens_q[i:i+1],
-                        seqlens_kv[i:i+1],
+                        captions[i].shape[1],
+                        None,
+                        limits[i],
+                        limits[i],
                         (freqs_cos, freqs_sin),
                         self.i2v_condition_type,
                         token_replace_vec,
                         frist_frame_token_num,                    
                     ]
 
-                    img[i], txt[i] = block(*single_block_args)
+                    img[i:i+1], captions[i][:] = block(*single_block_args)
                     single_block_args = None
 
             # img = x[:, :img_seq_len, ...]

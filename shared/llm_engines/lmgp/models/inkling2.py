@@ -23,11 +23,12 @@ from torch.nn import functional as F
 from mmgp import cuda_graphs, runtime
 from mmgp.expert_compute import RoutedExperts
 
-from ..layers import kv_formats as kvf
+from ..layers import expert_placement, kv_formats as kvf
 from ..layers.attention import Attention, store_kvcache
 from ..layers.attention_indexed import IndexedAttention
 from ..layers.moe import routed_experts, sigmoid_bias_topk
 from ..utils.context import get_context
+from .base import LMEngineModel, OutputStage, last_rows
 from .inkling2_core import DRAFT_FEATURES, E2M1, Inkling2Config, l2_clip, rms, softcap
 
 CONV_RING = 32  # the convolution inputs kept by position: the longest verification pass and the taps before it
@@ -603,7 +604,7 @@ class Inkling2Block(nn.Module):
         return [(residual + mlp.float()).to(dtype), normed]
 
 
-class Inkling2Head(nn.Module):
+class Inkling2Head(OutputStage, nn.Module):
     """The head: the token rows of the unembedding, soft-capped float32 logits."""
     def __init__(self, c):
         super().__init__()
@@ -616,12 +617,8 @@ class Inkling2Head(nn.Module):
             return _LINEAR.linear(rows, self.weight[:self.vocab], softcap=self.cap).view(*hidden.shape[:-1], self.vocab)
         return softcap(F.linear(hidden, self.weight[:self.vocab]).float(), self.cap)
 
-    def lm_engine_graph_forward(self, hidden, logits):
-        """The logits of a verification window into their buffer (cuda_graphs.run stage)."""
-        logits.copy_(self(hidden))
 
-
-class Inkling2ForCausalLM(nn.Module):
+class Inkling2ForCausalLM(LMEngineModel):
     """The LM engine's Inkling 2. forward returns the final normalized hidden states [1, tokens, hidden]; compute_logits (or output)
     applies the head. draft_features [1, tokens, 4 * hidden], when given, receives what the DSpark drafter reads: the states entering
     the applications DRAFT_FEATURES, then the returned states."""
@@ -688,18 +685,6 @@ class Inkling2ForCausalLM(nn.Module):
     def embed_ids(self, input_ids):
         """The hidden states the blocks read for these tokens (the embedding rows through their norm): what inputs_embeds stands for."""
         return norm(self.embed(input_ids), self.c.eps, self.embed_norm.weight, self.embed_norm.weight.dtype)
-
-    def _sequence_positions(self, tokens, device):
-        """The positions in the sequence of the tokens of this pass."""
-        context = get_context()
-        if context.speculative_verify:
-            first = context.cu_seqlens_k[1] - tokens
-        elif context.is_prefill:
-            first = context.cu_seqlens_k[1] - context.cu_seqlens_q[1]
-        else:
-            first = context.context_lens[0] - 1
-        # a graph capture's pass on dummy pages has no context: position 0 keeps what it reads and writes finite
-        return first.long().clamp_min(0) + torch.arange(tokens, dtype=torch.long, device=device)
 
     def forward(self, input_ids=None, positions=None, inputs_embeds=None, draft_features=None, **_kwargs):
         c = self.c
@@ -775,13 +760,7 @@ class Inkling2ForCausalLM(nn.Module):
             _PROMPT_REAL = None
 
     def compute_logits(self, hidden_states):
-        context = get_context()
-        if hidden_states.ndim == 3:
-            if context.is_prefill and context.cu_seqlens_q is not None:
-                hidden_states = hidden_states[:, int(context.cu_seqlens_q[-1].item()) - 1, :]
-            elif hidden_states.shape[-2] == 1:
-                hidden_states = hidden_states[:, 0, :]
-        return self.unembed(hidden_states)
+        return self.unembed(last_rows(hidden_states))
 
 
 def llm_state_dict(state_dict, quant_map=None, tied_map=None, prefix="model.llm."):
@@ -803,20 +782,12 @@ def kv_cache_bytes(c, kv_cache_layout, tokens, page=256):
     slots = c.schedule()
     full = sum(layer not in c.local_layers for layer, *_ in slots)
     rings = (len(slots) - full) * (c.window + WINDOW_SLACK) * 2 * c.kv_heads * c.head_dim * 2
-    if not kv_cache_layout:
-        return rings + full * 2 * c.kv_heads * c.head_dim * 2 * tokens
-    layout = kvf.parse_layout(kv_cache_layout)
-    return rings + layout.body_bytes_per_token(full, c.kv_heads, c.head_dim) * tokens + layout.overlay_bytes(full, c.kv_heads, c.head_dim, page, 1)
+    return rings + kvf.paged_kv_bytes(full, c.kv_heads, c.head_dim, tokens, kv_cache_layout, page)
 
 
 def set_expert_priorities(model):
     """The first placement of the experts (expert_priority of each bank, before MMGP takes the model): measured evaluations per token and per byte, comparable across
     the layers. The counts of inkling2_expert_usage.json are per layer over the three passes of the loop: an expert of blocks 6-17 is read up to three times per
     token, and a share of its own layer's routing would hide it. Decoding then follows the routing of the text (the banks count each call)."""
-    import json
-    with open(os.path.join(os.path.dirname(__file__), "inkling2_expert_usage.json"), encoding="utf-8") as reader:
-        usage = torch.tensor(json.load(reader)["counts"], dtype=torch.float64)
-    tokens = usage.sum() / (len(model.schedule) * model.c.top_k)
-    for block, counts in zip(model.layers, usage):
-        bank = block.mlp.experts
-        bank.expert_priority = ((counts + 1) / tokens * (2 << 20) / bank.expert_nbytes).tolist()
+    usage = expert_placement.load_usage(os.path.join(os.path.dirname(__file__), "inkling2_expert_usage.json"))
+    expert_placement.set_expert_priorities([block.mlp.experts for block in model.layers], usage, usage.sum() / (len(model.schedule) * model.c.top_k))

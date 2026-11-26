@@ -19,6 +19,7 @@ import inspect
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
+from mmgp import cuda_graphs
 from shared.utils.phase_progress import check_abort
 from transformers import AutoTokenizer, PreTrainedModel
 
@@ -640,15 +641,16 @@ class ImageGenerationPipeline(DiffusionPipeline):
                         )
                         ref_hidden_states_input = list(ref_hidden_states_input.unbind(dim=0))        # B * [C, N, H, W]
 
-                model_out_list = self.transformer(
-                    latent_model_input_list,
-                    timestep_model_input,
-                    prompt_embeds_model_input,
-                    ref_hidden_states=ref_hidden_states_input,
-                    return_dict=False,
-                    encoder_hidden_states_2=prompt_embeds_model_input_2,
-                    joint_cfg=apply_cfg,
-                )[0]
+                with cuda_graphs.scope():
+                    model_out_list = self.transformer(
+                        latent_model_input_list,
+                        timestep_model_input,
+                        prompt_embeds_model_input,
+                        ref_hidden_states=ref_hidden_states_input,
+                        return_dict=False,
+                        encoder_hidden_states_2=prompt_embeds_model_input_2,
+                        joint_cfg=apply_cfg,
+                    )[0]
                 model_out_list = [
                     output[:, :num_frames_per_prompt, :, :].float()
                     for output in model_out_list

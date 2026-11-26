@@ -124,6 +124,16 @@ def parse_layout(value: str) -> KVCacheLayout:
     return KVCacheLayout(body, exact, k, v, sink_pages, recent)
 
 
+def paged_kv_bytes(layers: int, kv_heads: int, head_dim: int, tokens: int, layout: str | KVCacheLayout | None = None, page_size: int = 256,
+                   dtype_bytes: int = 2, overlays: bool = True) -> int:
+    """VRAM of the keys and values of tokens in the paged attention layers: 16-bit (dtype_bytes) without a layout, else the body of the
+    layout (a config value or a KVCacheLayout) and, unless overlays is False, its exact overlays of one sequence."""
+    if not layout:
+        return layers * 2 * kv_heads * head_dim * dtype_bytes * tokens
+    layout = parse_layout(layout) if isinstance(layout, str) else layout
+    return layout.body_bytes_per_token(layers, kv_heads, head_dim) * tokens + (layout.overlay_bytes(layers, kv_heads, head_dim, page_size, 1) if overlays else 0)
+
+
 def layout_of(config) -> KVCacheLayout | None:
     """The layout of an engine Config's cache: None for a BF16 cache."""
     return parse_layout(config.kv_cache_layout or "int8") if config.kv_cache_int8 else None

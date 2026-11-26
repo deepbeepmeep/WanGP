@@ -13,6 +13,7 @@ from ..layers.layernorm import RMSNorm
 from ..layers.linear import ColumnParallelLinear, RowParallelLinear
 from ..layers.rotary_embedding import RotaryEmbedding
 from ..layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from .base import LMEngineModel
 
 
 def _get_tp_size():
@@ -184,7 +185,7 @@ class Qwen3Model(nn.Module):
         return hidden_states
 
 
-class Qwen3ForCausalLM(nn.Module):
+class Qwen3ForCausalLM(LMEngineModel):
     _lm_engine_tower_prefix = "model.layers."  # the blocks MMGP streams: the engine's own graphs read the rest of the model
 
     def __init__(

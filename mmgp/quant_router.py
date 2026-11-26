@@ -83,6 +83,15 @@ def _get_qmodule_for_qtype(qtype_obj):
     return _QTYPE_QMODULE_CACHE.get(qtype_obj)
 
 
+def checkpoint_linear_classes():
+    """Registered linear classes that load their checkpoint directly on the final module."""
+    global _QTYPE_QMODULE_CACHE
+    if _QTYPE_QMODULE_CACHE is None:
+        _QTYPE_QMODULE_CACHE = _build_qmodule_cache()
+    return {qt.name: cls for qt, cls in _QTYPE_QMODULE_CACHE.items()
+            if getattr(cls, "direct_load_qtype", None) is qt}
+
+
 def _load_with_qmodule(
     module,
     qmodule_cls,

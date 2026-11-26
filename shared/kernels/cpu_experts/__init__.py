@@ -130,13 +130,14 @@ class NativeExpertFormat(ExpertFormat):
 
 class RowScaledExpertFormat(NativeExpertFormat):
     """Expert formats whose rows carry their own block scales (NVFP4 rows, MXFP8 rows), computed by this library on the CPU and by
-    shared.kernels.expert_rows_triton on the GPU (gated activations only). The rows of w13 alternate gate and up (row 2i: gate i, row
-    2i + 1: up i). Subclasses declare the tensors, the native format id, the kernels' kind and dequantize_matrix(weight, scale, factor)."""
+    shared.kernels.expert_rows_triton on the GPU. Gated projections interleave gate and up rows. Squared ReLU uses one up row per neuron."""
     kind = None  # shared.kernels.expert_rows_triton: NVFP4 or MXFP8
 
     def blocks(self, hidden, intermediate, tensors):
-        if hidden % 128 or intermediate % 128:
-            raise ValueError(f"The {self.name} experts take widths that are multiples of 128, not {hidden} and {intermediate}")
+        gated = tensors["w13_weight"].shape[1] != intermediate
+        alignment = 128 if gated else 64
+        if hidden % alignment or intermediate % alignment:
+            raise ValueError(f"The {self.name} experts require widths divisible by {alignment}, got {hidden} and {intermediate}")
         return super().blocks(hidden, intermediate, tensors)
 
     def count_pairs(self, ids, counts):
@@ -145,9 +146,9 @@ class RowScaledExpertFormat(NativeExpertFormat):
 
     def gpu_forward(self, bank, x, ids, probabilities, pointers, out=None, mid=None):
         from shared.kernels import expert_rows_triton
-        if bank.rotation or not bank.gated:
-            raise NotImplementedError(f"The GPU kernels of the {self.name} experts take a gated activation and no ConvRot rotation")
-        return expert_rows_triton.forward(self.kind, x, ids, probabilities, pointers, bank.intermediate, bank.caps, out=out, mid=mid)
+        if bank.rotation:
+            raise NotImplementedError(f"The GPU kernels of the {self.name} experts require unrotated weights")
+        return expert_rows_triton.forward(self.kind, x, ids, probabilities, pointers, bank.intermediate, bank.caps, out=out, mid=mid, gated=bank.gated)
 
     def gpu_pass_supported(self, device):
         from shared.kernels import expert_rows_triton
@@ -163,7 +164,7 @@ class RowScaledExpertFormat(NativeExpertFormat):
 
     def gpu_pass(self, bank, x, host_ids, probabilities, order, zero=False):
         from shared.kernels import expert_rows_triton
-        return expert_rows_triton.GroupedPass(self.kind, x, host_ids, probabilities, bank.intermediate, bank.caps, order, zero=zero)
+        return expert_rows_triton.GroupedPass(self.kind, x, host_ids, probabilities, bank.intermediate, bank.caps, order, zero=zero, gated=bank.gated)
 
     def dequantize(self, bank, tensors):
         w13, w2, s13, s2, f13, f2 = ([tensors[name] for name in bank.expert_tensor_names] + [None, None])[:6]

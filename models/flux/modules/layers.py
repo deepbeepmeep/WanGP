@@ -349,7 +349,7 @@ class DoubleStreamBlock(nn.Module):
                                segments=[(b * tokens, (b + 1) * tokens, b if gates.shape[0] > 1 else 0) for b in range(batch)],
                                by_items=lambda item: dict(norm_rope=lambda query, key, group: normalize(query, key, item_pe(item), segments),
                                                           fused_quant=lambda query, key, group, core, settings: _fused_norm_rope_quant_(query, key, item_pe(item), segments, core, settings)))
-            attn = attention_kit.joint_qkv_attention(streams, self.num_heads, head_dim, lambda query, key, group: normalize(query, key, pe, segments), kv_prefix=kv_prefix,
+            attn = attention_kit.joint_qkv_attention(streams, self.num_heads, head_dim, lambda query, key, group: normalize(query, key, pe, segments), kv_prefix=kv_prefix, sol3_prefix_tokens=txt_len,
                                                      fused_quant=lambda query, key, group, core, settings: _fused_norm_rope_quant_(query, key, pe, segments, core, settings), **options).flatten(2)
         else:
             img_list, img_modulated = [img_modulated], None
@@ -482,7 +482,7 @@ class SingleStreamBlock(nn.Module):
             segments = ((0, x_mod.shape[1], self.norm),)
             normalize = _kv_norm_rope_ if cache_layer is not None else _norm_rope_
             attn = attention_kit.qkv_attention([x_mod], self.linear1_attn_q, self.linear1_attn_k, self.linear1_attn_v, self.num_heads,
-                                               self.hidden_size // self.num_heads, lambda query, key, group: normalize(query, key, pe, segments), kv_prefix=kv_prefix,
+                                               self.hidden_size // self.num_heads, lambda query, key, group: normalize(query, key, pe, segments), kv_prefix=kv_prefix, sol3_prefix_tokens=txt_len or 0,
                                                fused_quant=lambda query, key, group, core, settings: _fused_norm_rope_quant_(query, key, pe, segments, core, settings)).flatten(2)
         else:
             shape = (*x_mod.shape[:2], self.num_heads, int(x_mod.shape[-1] / self.num_heads) )

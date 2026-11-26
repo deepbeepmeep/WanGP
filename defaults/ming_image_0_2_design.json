@@ -1,0 +1,27 @@
+{
+    "model": {
+        "name": "Ming Image 0.2 Design 6B",
+        "architecture": "ming_image_0_1_design",
+        "priority": 1,
+        "parent_model_type": "ming_image_0_2_design",
+        "resolution_budget": "2432x1824",
+        "cuda_graphs": ["transformer"],
+        "cuda_graph_weight_types": {"transformer": ["QLinearInt8ConvRot"]},
+        "ming_release": "0.2",
+        "description": "Generate text-rich posters, interface mockups, and product imagery from a prompt, or edit one reference image. Supports structured layouts and optional RGBA output.",
+        "URLs": [
+            "https://huggingface.co/DeepBeepMeep/MingImage/resolve/main/Ming-Image-0.2-Design_bf16.safetensors",
+            "https://huggingface.co/DeepBeepMeep/MingImage/resolve/main/Ming-Image-0.2-Design_int8_convrot.safetensors"
+        ]
+    },
+    "image_mode": 1,
+    "resolution": "2048x2048",
+    "prompt": "A botanical exhibition poster on warm ivory paper. A large dark-green fern frond curves across the lower two thirds. Print the exact title \"FERN STUDY\" at the top in bold forest-green lettering. Place the small date \"JUNE 12\" below the title. Keep the rest of the poster free of text.",
+    "num_inference_steps": 12,
+    "guidance_scale": 1.0,
+    "batch_size": 1,
+    "custom_settings": {
+        "rgba": "Disabled"
+    },
+    "prompt_enhancer": ""
+}

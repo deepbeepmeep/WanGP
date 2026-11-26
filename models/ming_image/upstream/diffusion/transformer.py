@@ -22,11 +22,11 @@ from torch.nn.utils.rnn import pad_sequence
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.loaders import FromOriginalModelMixin, PeftAdapterMixin
-from diffusers.models.attention_processor import Attention
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import RMSNorm
 from diffusers.utils.torch_utils import maybe_allow_in_graph
-from shared.attention import pay_attention
+from shared import attention_kit
+from shared.kernels import ops
 from shared.utils.phase_progress import check_abort
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 
@@ -36,23 +36,6 @@ from .padding import mask_out_alignment_padding
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
-
-
-def _apply_rotary_in_place(x: torch.Tensor, freqs_cis: torch.Tensor) -> None:
-    """Rotate disposable q/k storage with one full-size FP32 output buffer."""
-    with torch.amp.autocast("cuda", enabled=False):
-        pairs = x.unflatten(-1, (-1, 2))
-        cos = freqs_cis.real.unsqueeze(2)
-        sin = freqs_cis.imag.unsqueeze(2)
-        real = pairs[..., 0].float()
-        imag = pairs[..., 1].float()
-        rotated = torch.empty(x.shape, dtype=torch.float32, device=x.device)
-        output = rotated.unflatten(-1, (-1, 2))
-        torch.mul(real, cos, out=output[..., 0])
-        output[..., 0].addcmul_(imag, sin, value=-1)
-        torch.mul(real, sin, out=output[..., 1])
-        output[..., 1].addcmul_(imag, cos)
-        x.copy_(rotated)
 
 
 class TimestepEmbedder(nn.Module):
@@ -90,71 +73,29 @@ class TimestepEmbedder(nn.Module):
         return t_emb
 
 
-class SingleStreamAttentionProcessor:
-    """
-    Processor for single-stream (joint text-image) attention; adapts the
-    existing Attention class to the single-stream behavior.
-    """
+class MingSelfAttention(nn.Module):
+    def __init__(self, dim, heads, qk_norm):
+        super().__init__()
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.to_q = nn.Linear(dim, dim, bias=False)
+        self.to_k = nn.Linear(dim, dim, bias=False)
+        self.to_v = nn.Linear(dim, dim, bias=False)
+        self.to_out = nn.ModuleList([nn.Linear(dim, dim, bias=False)])
+        self.norm_q = RMSNorm(self.head_dim, eps=1e-5) if qk_norm else None
+        self.norm_k = RMSNorm(self.head_dim, eps=1e-5) if qk_norm else None
 
-    _attention_backend = None
-    _parallel_config = None
-
-    def __init__(self):
-        if not hasattr(F, "scaled_dot_product_attention"):
-            raise ImportError(
-                "SingleStreamAttentionProcessor requires PyTorch 2.0. To use it, please upgrade PyTorch to version 2.0 or higher."
-            )
-
-    def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        freqs_cis: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        query = attn.to_q(hidden_states)
-        key = attn.to_k(hidden_states)
-        value = attn.to_v(hidden_states)
-
-        query = query.unflatten(-1, (attn.heads, -1))
-        key = key.unflatten(-1, (attn.heads, -1))
-        value = value.unflatten(-1, (attn.heads, -1))
-
-        # Apply Norms
-        if attn.norm_q is not None:
-            query = attn.norm_q(query)
-        if attn.norm_k is not None:
-            key = attn.norm_k(key)
-
-        # Apply RoPE
-        if freqs_cis is not None:
-            _apply_rotary_in_place(query, freqs_cis)
-            _apply_rotary_in_place(key, freqs_cis)
-
-        # Cast to correct dtype
-        dtype = query.dtype
-        query, key = query.to(dtype), key.to(dtype)
-
-        # From [batch, seq_len] to [batch, 1, 1, seq_len] -> broadcast to [batch, heads, seq_len, seq_len]
+    def forward(self, x_list, attention_mask, freqs_cis, caption_tokens=0):
+        rope = torch.view_as_real(freqs_cis).unsqueeze(2) if freqs_cis is not None else None
         if attention_mask is not None and attention_mask.ndim == 2:
             attention_mask = attention_mask[:, None, None, :]
-
-        # Compute joint attention
-        qkv = [query, key, value]
-        query = key = value = None
-        hidden_states = pay_attention(qkv, attention_mask=attention_mask,
-                                      causal=False, recycle_q=True)
-
-        # Reshape back
-        hidden_states = hidden_states.flatten(2, 3)
-        hidden_states = hidden_states.to(dtype)
-
-        output = attn.to_out[0](hidden_states)
-        if len(attn.to_out) > 1:  # dropout
-            output = attn.to_out[1](output)
-
-        return output
+        return attention_kit.qkv_attention(
+            x_list, self.to_q, self.to_k, self.to_v, self.heads, self.head_dim,
+            lambda q, k, group: ops.interleaved_norm_rope_(q, k, rope, self.norm_q, self.norm_k),
+            fused_quant=lambda q, k, group, core, settings: ops.split_half_norm_rope_quant_(
+                q, k, rope, self.norm_q, self.norm_k, core, settings, interleaved=True),
+            attention_mask=attention_mask, sol3_suffix_tokens=caption_tokens, out_proj=self.to_out[0],
+        )
 
 
 class FeedForward(nn.Module):
@@ -171,15 +112,13 @@ class FeedForward(nn.Module):
         # avoid the overhead; large image-token sequences use bounded chunks.
         chunk = max(1, (64 * 1024 * 1024) // (batch * hidden_dim * x.element_size()))
         if tokens <= 2048 or tokens <= chunk:
-            gate = F.silu(self.w1(x), inplace=True)
-            gate.mul_(self.w3(x))
-            return self.w2(gate)
+            return self.w2(ops.swiglu([self.w1(x), self.w3(x)], packed=False))
         result = torch.empty_like(x)
         for start in range(0, tokens, chunk):
             check_abort()
             end = min(start + chunk, tokens)
-            gate = F.silu(self.w1(x[:, start:end]), inplace=True)
-            gate.mul_(self.w3(x[:, start:end]))
+            rows = x[:, start:end]
+            gate = ops.swiglu([self.w1(rows), self.w3(rows)], packed=False)
             result[:, start:end].copy_(self.w2(gate))
             del gate
         return result
@@ -201,19 +140,7 @@ class TransformerBlock(nn.Module):
         self.dim = dim
         self.head_dim = dim // n_heads
 
-        # Refactored to use diffusers Attention with custom processor
-        # Upstream parameter order: dim, n_heads, n_kv_heads, qk_norm
-        self.attention = Attention(
-            query_dim=dim,
-            cross_attention_dim=None,
-            dim_head=dim // n_heads,
-            heads=n_heads,
-            qk_norm="rms_norm" if qk_norm else None,
-            eps=1e-5,
-            bias=False,
-            out_bias=False,
-            processor=SingleStreamAttentionProcessor(),
-        )
+        self.attention = MingSelfAttention(dim, n_heads, qk_norm)
 
         self.feed_forward = FeedForward(dim=dim, hidden_dim=int(dim / 3 * 8))
         self.layer_id = layer_id
@@ -234,6 +161,7 @@ class TransformerBlock(nn.Module):
         attn_mask: torch.Tensor,
         freqs_cis: torch.Tensor,
         adaln_input: Optional[torch.Tensor] = None,
+        caption_tokens=0,
     ):
         if self.modulation:
             assert adaln_input is not None
@@ -243,7 +171,7 @@ class TransformerBlock(nn.Module):
 
             # Attention block
             attn_out = self.attention(
-                self.attention_norm1(x) * scale_msa, attention_mask=attn_mask, freqs_cis=freqs_cis
+                [self.attention_norm1(x) * scale_msa], attention_mask=attn_mask, freqs_cis=freqs_cis, caption_tokens=caption_tokens
             )
             x = x + gate_msa * self.attention_norm2(attn_out)
 
@@ -251,7 +179,7 @@ class TransformerBlock(nn.Module):
             x = x + gate_mlp * self.ffn_norm2(self.feed_forward(self.ffn_norm1(x) * scale_mlp))
         else:
             # Attention block
-            attn_out = self.attention(self.attention_norm1(x), attention_mask=attn_mask, freqs_cis=freqs_cis)
+            attn_out = self.attention([self.attention_norm1(x)], attention_mask=attn_mask, freqs_cis=freqs_cis, caption_tokens=caption_tokens)
             x = x + self.attention_norm2(attn_out)
 
             # FFN block
@@ -478,6 +406,7 @@ class DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigin
         f_patch_size: int,
         all_image_ref: List[torch.Tensor] = None,
         all_cap_feats_2: List[torch.Tensor] = None,
+        compact=False,
     ):
         pH = pW = patch_size
         pF = f_patch_size
@@ -516,7 +445,9 @@ class DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigin
             if cap_feat_2 is not None:
                 cap_ori_len += len(cap_feat_2)
             
-            cap_padding_len = (-cap_ori_len) % SEQ_MULTI_OF
+            # The image RoPE coordinates use the aligned caption length even when its masked rows are omitted.
+            image_position_start = cap_ori_len + (-cap_ori_len) % SEQ_MULTI_OF + 1
+            cap_padding_len = 0 if compact else (-cap_ori_len) % SEQ_MULTI_OF
             # padded position ids
             cap_padded_pos_ids = self.create_coordinate_grid(
                 size=(cap_ori_len + cap_padding_len, 1, 1),
@@ -524,26 +455,20 @@ class DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigin
                 device=device,
             ).flatten(0, 2)
             all_cap_pos_ids.append(cap_padded_pos_ids)
-            # pad mask
-            cap_pad_mask = torch.cat(
-                [
-                    torch.zeros((cap_ori_len,), dtype=torch.bool, device=device),
-                    torch.ones((cap_padding_len,), dtype=torch.bool, device=device),
-                ],
-                dim=0,
-            )
-            all_cap_pad_mask.append(
-                cap_pad_mask if cap_padding_len > 0 else torch.zeros((cap_ori_len,), dtype=torch.bool, device=device)
-            )
+            if not compact:
+                cap_pad_mask = torch.arange(cap_ori_len + cap_padding_len, device=device) >= cap_ori_len
+                all_cap_pad_mask.append(cap_pad_mask)
 
             if cap_feat_2 is not None:
                 if cap_feat is not None:
                     all_cap_feats_out.append(cap_feat)
-                cap_padded_feat = torch.cat([cap_feat_2, (cap_feat_2[-1:] * 0).repeat(cap_padding_len, 1)], dim=0)
-                all_cap_feats_2_out.append(cap_padded_feat)
+                if cap_padding_len:
+                    cap_feat_2 = torch.cat([cap_feat_2, (cap_feat_2[-1:] * 0).repeat(cap_padding_len, 1)])
+                all_cap_feats_2_out.append(cap_feat_2)
             else:
-                cap_padded_feat = torch.cat([cap_feat, cap_feat[-1:].repeat(cap_padding_len, 1)], dim=0)
-                all_cap_feats_out.append(cap_padded_feat)
+                if cap_padding_len:
+                    cap_feat = torch.cat([cap_feat, cap_feat[-1:].repeat(cap_padding_len, 1)])
+                all_cap_feats_out.append(cap_feat)
 
             ### Process Image
             if image_ref is not None:
@@ -558,42 +483,21 @@ class DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigin
             image = image.permute(1, 3, 5, 2, 4, 6, 0).reshape(F_tokens * H_tokens * W_tokens, pF * pH * pW * C)
 
             image_ori_len = len(image)
-            image_padding_len = (-image_ori_len) % SEQ_MULTI_OF
+            image_padding_len = 0 if compact else (-image_ori_len) % SEQ_MULTI_OF
 
             image_ori_pos_ids = self.create_coordinate_grid(
                 size=(F_tokens, H_tokens, W_tokens),
-                start=(cap_ori_len + cap_padding_len + 1, 0, 0),
+                start=(image_position_start, 0, 0),
                 device=device,
             ).flatten(0, 2)
-            image_padded_pos_ids = torch.cat(
-                [
-                    image_ori_pos_ids,
-                    self.create_coordinate_grid(size=(1, 1, 1), start=(0, 0, 0), device=device)
-                    .flatten(0, 2)
-                    .repeat(image_padding_len, 1),
-                ],
-                dim=0,
-            )
-            all_image_pos_ids.append(image_padded_pos_ids if image_padding_len > 0 else image_ori_pos_ids)
-            # pad mask
-            image_pad_mask = torch.cat(
-                [
-                    torch.zeros((image_ori_len,), dtype=torch.bool, device=device),
-                    torch.ones((image_padding_len,), dtype=torch.bool, device=device),
-                ],
-                dim=0,
-            )
-            all_image_pad_mask.append(
-                image_pad_mask
-                if image_padding_len > 0
-                else torch.zeros((image_ori_len,), dtype=torch.bool, device=device)
-            )
-            # padded feature
-            image_padded_feat = torch.cat(
-                [image, image[-1:].repeat(image_padding_len, 1)],
-                dim=0,
-            )
-            all_image_out.append(image_padded_feat if image_padding_len > 0 else image)
+            if image_padding_len:
+                image_ori_pos_ids = torch.cat([image_ori_pos_ids, image_ori_pos_ids.new_zeros((image_padding_len, 3))])
+                image = torch.cat([image, image[-1:].repeat(image_padding_len, 1)])
+            all_image_pos_ids.append(image_ori_pos_ids)
+            all_image_out.append(image)
+            if not compact:
+                image_pad_mask = torch.arange(image_ori_len + image_padding_len, device=device) >= image_ori_len
+                all_image_pad_mask.append(image_pad_mask)
 
         return (
             all_image_out,
@@ -624,17 +528,25 @@ class DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigin
         bsz = len(x)
         device = x[0].device
 
-        def run_layer(layer, hidden, *args):
-            if not joint_cfg or bsz == 1:
-                return layer(hidden, *args)
-            # Keep each layer resident while running CFG branches in sequence.
-            # Attention and modulation are independent across batch items.
-            results = torch.empty_like(hidden)
+        # Alignment rows in Design are hidden from every key lookup and discarded by unpatchify.
+        # Learned alignment rows in Layer checkpoints carry information and must remain in the sequence.
+        compact = self.alignment_padding_mode == ZERO_MASKED_PADDING and not torch.is_grad_enabled()
+
+        def run_layer(layer, hidden, mask, rope, modulation=None, *, lengths, captions=None):
+            suffix = captions[0] if compact and captions else 0
+            ragged = compact and (min(lengths) != max(lengths) or captions is not None and min(captions) != max(captions))
+            if bsz == 1 or not joint_cfg and not ragged:
+                return layer(hidden, mask, rope, modulation, caption_tokens=suffix)
+            # Keep the layer resident across CFG branches. In compact batches only real tokens enter attention.
+            results = torch.zeros_like(hidden) if ragged else torch.empty_like(hidden)
             for item in range(bsz):
                 check_abort()
-                results[item:item + 1].copy_(layer(hidden[item:item + 1], *(
-                    value[item:item + 1] for value in args
-                )))
+                batch = slice(item, item + 1)
+                rows = slice(0, lengths[item]) if compact else slice(None)
+                item_mask = None if mask is None else mask[batch]
+                results[batch, rows].copy_(layer(hidden[batch, rows], item_mask, rope[batch, rows],
+                                                 None if modulation is None else modulation[batch],
+                                                 caption_tokens=captions[item] if compact and captions else 0))
             return results
 
         t = t * self.t_scale
@@ -649,11 +561,11 @@ class DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigin
             x_inner_pad_mask,
             cap_inner_pad_mask,
             cap_feats_2,
-        ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size, ref_x, cap_feats_2)
+        ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size, ref_x, cap_feats_2, compact=compact)
 
         # x embed & refine
         x_item_seqlens = [len(_) for _ in x]
-        assert all(_ % SEQ_MULTI_OF == 0 for _ in x_item_seqlens)
+        assert compact or all(_ % SEQ_MULTI_OF == 0 for _ in x_item_seqlens)
         x_max_item_seqlen = max(x_item_seqlens)
 
         x = torch.cat(x, dim=0)
@@ -663,7 +575,7 @@ class DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigin
         adaln_input = t.type_as(x)
         if self.alignment_padding_mode == LEARNED_PADDING:
             x[torch.cat(x_inner_pad_mask)] = self.x_pad_token
-        else:
+        elif not compact:
             x[torch.cat(x_inner_pad_mask)] = 0.0
         x = list(x.split(x_item_seqlens, dim=0))
         x_freqs_cis = list(self.rope_embedder(torch.cat(x_pos_ids, dim=0)).split([len(_) for _ in x_pos_ids], dim=0))
@@ -673,11 +585,13 @@ class DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigin
         # Clarify the length matches to satisfy Dynamo due to "Symbolic Shape Inference" to avoid compilation errors
         x_freqs_cis = x_freqs_cis[:, : x.shape[1]]
 
-        x_attn_mask = torch.zeros((bsz, x_max_item_seqlen), dtype=torch.bool, device=device)
-        for i, seq_len in enumerate(x_item_seqlens):
-            x_attn_mask[i, :seq_len] = 1
-        if self.alignment_padding_mode == ZERO_MASKED_PADDING:
-            mask_out_alignment_padding(x_attn_mask, x_inner_pad_mask, [0] * bsz)
+        x_attn_mask = None
+        if not compact:
+            x_attn_mask = torch.zeros((bsz, x_max_item_seqlen), dtype=torch.bool, device=device)
+            for i, seq_len in enumerate(x_item_seqlens):
+                x_attn_mask[i, :seq_len] = 1
+            if self.alignment_padding_mode == ZERO_MASKED_PADDING:
+                mask_out_alignment_padding(x_attn_mask, x_inner_pad_mask, [0] * bsz)
 
         if torch.is_grad_enabled() and self.gradient_checkpointing:
             for layer in self.noise_refiner:
@@ -685,7 +599,7 @@ class DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigin
         else:
             for layer in self.noise_refiner:
                 check_abort()
-                x = run_layer(layer, x, x_attn_mask, x_freqs_cis, adaln_input)
+                x = run_layer(layer, x, x_attn_mask, x_freqs_cis, adaln_input, lengths=x_item_seqlens)
 
 
         if len(cap_feats) > 0:
@@ -710,7 +624,7 @@ class DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigin
         cap_max_item_seqlen = max(cap_item_seqlens)
         if self.alignment_padding_mode == LEARNED_PADDING:
             cap_feats[torch.cat(cap_inner_pad_mask)] = self.cap_pad_token
-        else:
+        elif not compact:
             cap_feats[torch.cat(cap_inner_pad_mask)] = 0.0
 
         cap_feats = list(cap_feats.split(cap_item_seqlens, dim=0))
@@ -723,11 +637,13 @@ class DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigin
         # Clarify the length matches to satisfy Dynamo due to "Symbolic Shape Inference" to avoid compilation errors
         cap_freqs_cis = cap_freqs_cis[:, : cap_feats.shape[1]]
 
-        cap_attn_mask = torch.zeros((bsz, cap_max_item_seqlen), dtype=torch.bool, device=device)
-        for i, seq_len in enumerate(cap_item_seqlens):
-            cap_attn_mask[i, :seq_len] = 1
-        if self.alignment_padding_mode == ZERO_MASKED_PADDING:
-            mask_out_alignment_padding(cap_attn_mask, cap_inner_pad_mask, [0] * bsz)
+        cap_attn_mask = None
+        if not compact:
+            cap_attn_mask = torch.zeros((bsz, cap_max_item_seqlen), dtype=torch.bool, device=device)
+            for i, seq_len in enumerate(cap_item_seqlens):
+                cap_attn_mask[i, :seq_len] = 1
+            if self.alignment_padding_mode == ZERO_MASKED_PADDING:
+                mask_out_alignment_padding(cap_attn_mask, cap_inner_pad_mask, [0] * bsz)
 
         if torch.is_grad_enabled() and self.gradient_checkpointing:
             for layer in self.context_refiner:
@@ -735,7 +651,7 @@ class DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigin
         else:
             for layer in self.context_refiner:
                 check_abort()
-                cap_feats = run_layer(layer, cap_feats, cap_attn_mask, cap_freqs_cis)
+                cap_feats = run_layer(layer, cap_feats, cap_attn_mask, cap_freqs_cis, lengths=cap_item_seqlens, captions=cap_item_seqlens)
 
         # unified
         unified = []
@@ -751,15 +667,17 @@ class DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigin
 
         unified = pad_sequence(unified, batch_first=True, padding_value=0.0)
         unified_freqs_cis = pad_sequence(unified_freqs_cis, batch_first=True, padding_value=0.0)
-        unified_attn_mask = torch.zeros((bsz, unified_max_item_seqlen), dtype=torch.bool, device=device)
-        for i, seq_len in enumerate(unified_item_seqlens):
-            unified_attn_mask[i, :seq_len] = 1
-        if self.alignment_padding_mode == ZERO_MASKED_PADDING:
-            # Unified layout is [image, caption] for every batch item.
-            mask_out_alignment_padding(unified_attn_mask, x_inner_pad_mask, [0] * bsz)
-            mask_out_alignment_padding(
-                unified_attn_mask, cap_inner_pad_mask, x_item_seqlens
-            )
+        unified_attn_mask = None
+        if not compact:
+            unified_attn_mask = torch.zeros((bsz, unified_max_item_seqlen), dtype=torch.bool, device=device)
+            for i, seq_len in enumerate(unified_item_seqlens):
+                unified_attn_mask[i, :seq_len] = 1
+            if self.alignment_padding_mode == ZERO_MASKED_PADDING:
+                # Unified layout is [image, caption] for every batch item.
+                mask_out_alignment_padding(unified_attn_mask, x_inner_pad_mask, [0] * bsz)
+                mask_out_alignment_padding(
+                    unified_attn_mask, cap_inner_pad_mask, x_item_seqlens
+                )
 
         if torch.is_grad_enabled() and self.gradient_checkpointing:
             for layer in self.layers:
@@ -770,7 +688,7 @@ class DiffusionTransformer(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigin
             for layer in self.layers:
                 check_abort()
                 unified = run_layer(layer, unified, unified_attn_mask,
-                                    unified_freqs_cis, adaln_input)
+                                    unified_freqs_cis, adaln_input, lengths=unified_item_seqlens, captions=cap_item_seqlens)
 
         unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](unified, adaln_input)
         unified = list(unified.unbind(dim=0))

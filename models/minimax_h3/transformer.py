@@ -34,7 +34,7 @@ from .interrupt import GenerationInterrupted
 from shared.kernels import ops as kernels
 from shared.utils.lora_mapping import convert_lora_keys
 from .pdd import MiniMaxH3ParallelHead
-from .sol_attention import MiniMaxH3SolAttention
+from shared.sol_core import Layout as SolLayout
 from mmgp import cuda_graphs, offload
 from .components.packing import (
     MINIMAX_H3_AUDIO_TAG,
@@ -218,15 +218,14 @@ class Attention(nn.Module):
         # several images of one layout have their rows one after the other; the rope table covers one of them
         batch = 1 if rope is None else seq_len // rope.shape[1]
         tokens = seq_len // batch
-        use_sol = batch == 1 and not hasattr(self, "vdn") and self.sol_attention is not None and self.sol_attention.use_for_layer(seq_len)
         use_veda = hasattr(self, "veda") and self.veda.policy.enabled and self.veda.layer not in self.veda.policy.full_layers
         use_vsa = hasattr(self, "vsa") and self.vsa.policy.enabled
-        allow_fusion = not use_sol and not hasattr(self, "vdn")
+        allow_fusion = not hasattr(self, "vdn")
         split_qkv = hasattr(self, "q_proj")
-        if isinstance(x, offload.RowSource) and not (split_qkv and not use_sol and not hasattr(self, "vdn") and batch == 1):
+        if isinstance(x, offload.RowSource) and not (split_qkv and not hasattr(self, "vdn") and batch == 1):
             x = x.materialize().view(seq_len, -1)  # read whole by the paths other than the kit's
         vdn_input = x if hasattr(self, "vdn") else None
-        if split_qkv and not use_sol and not hasattr(self, "vdn"):
+        if split_qkv and not hasattr(self, "vdn"):
             x_list, x = [x.view(batch, tokens, x.shape[-1]) if batch > 1 else x], None
             # VSA: q, k, v and the gate are projected by head groups from one prepared input, so the tiled copies stay bounded
             # the kit applies out_proj: with the heads split, it reads each group's output as its weight format allows (INT8: one byte)
@@ -236,6 +235,8 @@ class Attention(nn.Module):
                                                                  kernels.split_half_norm_rope_quant_(query, key, rope, self.q_norm, self.k_norm, core, settings)) if allow_fusion else None,
                                                     sample_query=(lambda q, ids, core: kernels.norm_rope_query_sample(q, ids, rope, self.q_norm, core)) if allow_fusion else None,
                                                     attention_fn=self.vsa if use_vsa else self.veda if use_veda else None,
+                                                    sol_tau=self.sol_attention.tau if self.sol_attention is not None else None,
+                                                    sol3_prefix_tokens=self.sol_attention.sink_tokens if self.sol_attention is not None else 0,
                                                     extra_proj=self.gate_proj if use_vsa else None, head_split_level=VSA_HEAD_SPLIT_LEVEL if use_vsa else None,
                                                     out_proj=self.out_proj, residual=residual, gate=gate, segments=segments)
             return output if residual is not None else output.view(seq_len, -1)
@@ -244,42 +245,22 @@ class Attention(nn.Module):
             x_list, x, vdn_input = [x], None, None
             return self.vdn(x_list, (self.q_proj, self.k_proj, self.v_proj), lambda query, key: self._norm_rope_(query, key, rope, packed_rope, False),
                             self.out_proj, input_again)
-        if split_qkv and use_sol and self.sol_attention.staged(x, (self.q_proj, self.k_proj, self.v_proj)):
-            x_list, x = [x], None
-            attention = self.sol_attention.attention(x_list, (self.q_proj, self.k_proj, self.v_proj), (self.q_norm, self.k_norm), rope,
-                                                     self.q_norm.eps, self.heads, self.head_dim)
-            attention_list, attention = [attention], None
-            return self._out_projection(attention_list, seq_len, residual, gate, segments)
-        if split_qkv:
-            projections = (self.q_proj, self.k_proj, self.v_proj)
-            x_list, x = [x], None
-            query, key, value = kernels.project_many(projections, x_list)
-            x = None  # only the projections read it: released before the norms, at the peak of the block
+        qkv = self.qkv_proj(x)
+        x = None
+        if self.qkv_interleaved:
+            query, key, value = qkv.view(batch, tokens, self.heads, 3, self.head_dim).unbind(3)
+        else:
+            query, key, value = qkv.split(self.heads * self.head_dim, dim=-1)
             query = query.view(batch, tokens, self.heads, self.head_dim)
             key = key.view(batch, tokens, self.heads, self.head_dim)
             value = value.view(batch, tokens, self.heads, self.head_dim)
-        else:
-            qkv = self.qkv_proj(x)
-            x = None
-            if self.qkv_interleaved:
-                query, key, value = qkv.view(batch, tokens, self.heads, 3, self.head_dim).unbind(3)
-            else:
-                query, key, value = qkv.split(self.heads * self.head_dim, dim=-1)
-                query = query.view(batch, tokens, self.heads, self.head_dim)
-                key = key.view(batch, tokens, self.heads, self.head_dim)
-                value = value.view(batch, tokens, self.heads, self.head_dim)
-            if not use_sol:
-                value = value.clone()
-            del qkv
+        value = value.clone()
+        del qkv
         if hasattr(self, "vdn"):  # fused q/k/v projection: k gets storage of its own, normalized in place
             x_handoff, qkv = [vdn_input], [query, key.contiguous(), value]
             vdn_input = query = key = value = None
             return self.vdn(x_handoff, qkv, lambda query, key: self._norm_rope_(query, key, rope, packed_rope, False), self.out_proj)
-        if use_sol:
-            kernels.sol_rms_rope_(query, self.q_norm.weight, rope, self.q_norm.eps)
-            kernels.sol_rms_rope_(key, self.k_norm.weight, rope, self.k_norm.eps)
-        else:
-            self._norm_rope_(query, key, rope, packed_rope, allow_fusion)
+        self._norm_rope_(query, key, rope, packed_rope, allow_fusion)
         qkv_list = [query, key, value]
         del query, key, value
         if use_vsa:
@@ -288,7 +269,9 @@ class Attention(nn.Module):
         elif use_veda:
             attention = self.veda(qkv_list, attention_kit.HeadGroup(range(self.heads), range(self.heads), None))
         else:
-            attention = pay_attention(qkv_list, recycle_q=True) if self.sol_attention is None else self.sol_attention(qkv_list, use_sol)
+            attention = pay_attention(qkv_list, recycle_q=True,
+                                      sol3_prefix_tokens=self.sol_attention.sink_tokens if self.sol_attention is not None else 0,
+                                      sol_tau=self.sol_attention.tau if self.sol_attention is not None else None)
         attention_list, attention = [attention], None
         return self._out_projection(attention_list, seq_len, residual, gate, segments)
 
@@ -734,7 +717,7 @@ class MiniMaxH3Model(nn.Module):
         self.token_refiner = TokenRefiner(token_refiner_num_layers, hidden_size, num_attention_heads,
                                           attention_head_dim, ffn_hidden_size, norm_eps, qk_norm_eps,
                                           final_norm_eps, dtype=dtype, device=device)
-        self.sol_attention = MiniMaxH3SolAttention()
+        self.sol_attention = SolLayout()
         curve = {"apply_silu": not self.use_adaln_curves,
                  "adaln_dtype": adaln_dtype if self.use_adaln_curves else dtype}
         self.blocks = nn.ModuleList([DroppedBlock() if index in dropped_blocks else
@@ -1058,12 +1041,15 @@ class MiniMaxH3Model(nn.Module):
         del adaln_indices, changes
         target_audio_rows = audio_t * 2
         audio_start = video_start - target_audio_rows
-        self.sol_attention.begin_forward(layout, device, dtype, payload["attention_sparsity"], target_video_order is not None)
+        mode = offload.shared_state.get("_attention")
+        if mode == "sol" and target_video_order is not None:
+            raise ValueError("MiniMax H3 grouped masked denoising is not compatible with Sol Attention")
+        self.sol_attention.update(layout.video_indices[layout.num_condition_video_rows], payload["attention_sparsity"], mode)
         if hasattr(self, "veda_attention"):
             self.veda_attention.begin_forward(layout, (latent_t, latent_h // self.patch_size[1], latent_w // self.patch_size[2]), payload, device, dtype)
         if hasattr(self, "vsa_attention"):
             self.vsa_attention.begin_forward(layout, (latent_t, latent_h // self.patch_size[1], latent_w // self.patch_size[2]), payload, device, dtype)
-        if not hasattr(self.blocks[0].attn, "vdn"):  # Sol layers ignore the Kitchen table; shorter sequences use it
+        if not hasattr(self.blocks[0].attn, "vdn"):
             rope = kernels.prepare_split_half_rope(rope)
         if vdn := getattr(self.blocks[0].attn, "vdn", None):
             for block in self.blocks:
@@ -1109,7 +1095,7 @@ class MiniMaxH3Model(nn.Module):
         attn = self.blocks[self.kept_blocks[0]].attn
         extreme = (attention_kit.plan_extreme(attn, device, hidden.dtype, hidden.shape[0], hidden.shape[-1], attn.heads, attn.heads, attn.head_dim,
                                               (attn.q_proj, attn.k_proj, attn.v_proj), attn.out_proj)
-                   if batch == 1 and hasattr(attn, "q_proj") and not hasattr(attn, "vdn") and not self.sol_attention.use_for_layer(hidden.shape[0])
+                   if batch == 1 and hasattr(attn, "q_proj") and not hasattr(attn, "vdn")
                    else contextlib.nullcontext())
         with extreme, cuda_graphs.scope():
             if first_block_cache is None:

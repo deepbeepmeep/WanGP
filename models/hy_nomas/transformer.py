@@ -123,7 +123,7 @@ class NomasDoubleBlock(nn.Module):
         def keep_value(value, group):
             writer.store(index, value, group.kv, values=True)
 
-        attention = joint_qkv_attention(streams, HEADS, HEAD_DIM, norm_rope, kv_prefix=None if history_kv is None else q8_prefix(*history_kv), norm_v=keep_value if write else None,
+        attention = joint_qkv_attention(streams, HEADS, HEAD_DIM, norm_rope, kv_prefix=None if history_kv is None else q8_prefix(*history_kv), norm_v=keep_value if write else None, sol3_suffix_tokens=txt.shape[0],
                                         attention_fn=_masked_attention(plan.classes) if plan.classes else None)
         if last and write:
             return

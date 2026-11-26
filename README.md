@@ -84,7 +84,7 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 ## 🔥 Latest Updates : 
 
 
-## 24th of November 2026: WanGP v20.20 - No Time to Wait for a Gen
+## 24th of November 2026: WanGP v20.21 - No Time to Wait for a Gen
 
 - **Faster WanGP Startup**: WanGP should be twice as fast to launch
 
@@ -98,6 +98,12 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 - **Qwen3.8 27B - Bonsai 2.5**: the smallest Qwen 3.8 used by Deepy Prime has been upgraded and now is much smarter while still being able to run with only 8GB of VRAM
 
+- **SparseGP**: the new kernel repository replaces SpargeAttn and will bring together all optimized cuda and hip kernels used by WanGP, including **SpargeAttn** and **Sol3**.
+
+- **Sol3**: improved quality and support for every model, with a **10-20% speedup** and potentially even larger gains at very high resolutions or with longer videos. Install **SparseGP** to use the optimized CUDA kernels.
+
+- **Ming Image 0.2**: claims to be the new best image generator, with support for both plain-language prompts and structured **JSON prompts**. Use the **Prompt Helper** or **Prompt Enhancer** to build your JSON prompts.
+ 
 ## 22nd of November 2026: WanGP v20.12 - To the Extreme… and a Little Further
 
 - **pi-H3 with optional DWD**: new H3 FL2VA variant **2 or 4 steps**, that claims to be the fastest. **pi-H3 DWD** draws the frames in its last step, so it is **Decoding Without a Decoder**. Choose 2 steps for quick experiments and 4 for more detail. The new **pi-H3 FL2VA 2 Steps / 4 Steps** accelerator profiles bring the same step counts to standard and Pruned FL2VA models while keeping the regular video decoder.
@@ -121,7 +127,7 @@ WanGP is a one-stop super app for open source generative models: create videos, 
 
 - **Even Less VRAM, Again!** Thought VRAM usage couldn't get any lower? The new **Smart Inputs Chunker**, which replaces the Attention Head Splitter, lets you generate **15 seconds of H3 video at 1080p with only 8 GB of VRAM!** Best of all, generation takes in the worst case **1-2% longer**. Find it in *Configuration > Performance > Smart Inputs Chunker* and choose **Auto** to use chunking only when VRAM would otherwise run short.
 
-- **VAE RAM/VRAM Reduction**: GPUs with limited VRAM just got a free quality upgrade. VAE decoders can now use much larger tiles within the same memory budget, improving output quality. WanGP automatically picks the largest tiles that fit, or skips tiling when the whole frame fits. Choose **Auto** in *Configuration > VRAM Management > VAE Tiling*, or set a fixed share of VRAM. As a bonus, some VAE decoders, including LTX-2.x, get an **extra 10-20% speedup**. You will need to install new *WGPKernels 1.5.0*.
+- **VAE RAM/VRAM Reduction**: GPUs with limited VRAM just got a free quality upgrade. VAE decoders can now use much larger tiles within the same memory budget, improving output quality. WanGP automatically picks the largest tiles that fit, or skips tiling when the whole frame fits. Choose **Auto** in *Configuration > VRAM Management > VAE Tiling*, or set a fixed share of VRAM. As a bonus, some VAE decoders, including LTX-2.x, get an **extra 10-20% speedup**. Install *WGPKernels 1.5.1* using the [installation guide](docs/INSTALLATION.md#wgpkernels-installation).
 
 - **Infinite Sliding Windows**: Low on RAM? Say goodbye to the **3,000-frame limit**! Keep extending your video - forever and ever - while **RAM usage stays steady** as the video grows. Each new window is appended without re-encoding the earlier ones. 
 

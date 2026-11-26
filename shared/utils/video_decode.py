@@ -86,20 +86,71 @@ def _resample_frame_indices(video_fps, video_frames_count, max_target_frames_cou
     return frame_ids[:max_target_frames_count]
 
 
-def _resolve_media_binary(binary_name: str):
+def _media_binary_candidates(binary_name: str):
     env_map = {"ffmpeg": "FFMPEG_BINARY", "ffprobe": "FFPROBE_BINARY", "ffplay": "FFPLAY_BINARY"}
     binary_path = os.environ.get(env_map.get(binary_name, ""), "")
-    if len(binary_path) > 0 and os.path.isfile(binary_path):
-        return binary_path
+    if os.path.isfile(binary_path):
+        yield os.path.abspath(binary_path)
     repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    candidate = os.path.join(repo_root, "ffmpeg_bins", binary_name + (".exe" if os.name == "nt" else ""))
+    executable = binary_name + (".exe" if os.name == "nt" else "")
+    candidate = os.path.join(repo_root, "ffmpeg_bins", executable)
     if os.path.isfile(candidate):
-        return candidate
-    return shutil.which(binary_name + (".exe" if os.name == "nt" else "")) or shutil.which(binary_name)
+        yield candidate
+    if candidate := shutil.which(executable) or shutil.which(binary_name):
+        yield os.path.abspath(candidate)
+    # A second installation further down PATH may supply an optional filter.
+    for directory in os.get_exec_path():
+        candidate = os.path.join(os.path.abspath(directory), executable)
+        if shutil.which(candidate):
+            yield candidate
+
+
+def _resolve_media_binary(binary_name: str):
+    return next(_media_binary_candidates(binary_name), None)
 
 
 def resolve_media_binary(binary_name: str):
     return _resolve_media_binary(binary_name)
+
+
+def _hdr_ffmpeg_candidates():
+    yield from _media_binary_candidates("ffmpeg")
+    import imageio_ffmpeg
+    try:
+        candidate = imageio_ffmpeg.get_ffmpeg_exe()
+    except RuntimeError:
+        return
+    if resolved := shutil.which(candidate):
+        yield os.path.abspath(resolved)
+
+
+@lru_cache(maxsize=16)
+def _has_zscale(path, mtime_ns):
+    # FFmpeg can exit successfully for an unknown filter. Check its help header.
+    try:
+        probe = subprocess.run([path, "-hide_banner", "-h", "filter=zscale"], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return probe.returncode == 0 and b"Filter zscale" in probe.stdout.splitlines()
+
+
+def resolve_hdr_ffmpeg():
+    checked = {}
+    for path in _hdr_ffmpeg_candidates():
+        key = os.path.normcase(os.path.normpath(path))
+        if key in checked:
+            continue
+        checked[key] = path
+        try:
+            modified = os.stat(path).st_mtime_ns
+        except OSError:
+            continue
+        if _has_zscale(path, modified):
+            return path
+    locations = ", ".join(checked.values()) or "no executable found"
+    raise RuntimeError(f"HDR processing requires FFmpeg with the zscale filter (libzimg). "
+                       f"Install a zscale-enabled build in ffmpeg_bins. Checked: {locations}.")
 
 
 def picture_duration(video_path):
@@ -287,6 +338,7 @@ def probe_video_stream_metadata(video_path, *, file_version=None):
     return _augment_virtual_metadata(video_path, {
         "codec_name": codec_name,
         "codec_profile": codec_profile,
+        "pix_fmt": stream.get("pix_fmt") or "",
         "width": width,
         "height": height,
         "display_width": display_width,
@@ -365,6 +417,23 @@ def _build_hdr_linear_filter(metadata):
     return ["zscale=" + ":".join(zscale_parts), "format=gbrpf32le"]
 
 
+def _missing_bt2100_tags(metadata):
+    # PQ/HLG YUV video can omit one or both BT.2100 tags. Set them on the
+    # frames so they survive the intermediate linear RGB stage during tonemapping.
+    if metadata["color_transfer"] not in ("smpte2084", "arib-std-b67") or not metadata.get("pix_fmt", "").startswith("yuv"):
+        return []
+    missing = ("", "unknown", "unspecified")
+    primaries, matrix = metadata["color_primaries"], metadata["color_space"]
+    if primaries not in (*missing, "bt2020") or matrix not in (*missing, "bt2020nc", "bt2020c"):
+        return []
+    tags = []
+    if primaries in missing:
+        tags.append("color_primaries=bt2020")
+    if matrix in missing:
+        tags.append("colorspace=bt2020nc")
+    return ["setparams=" + ":".join(tags)] if tags else []
+
+
 def _build_corrected_video_filter(metadata, target_fps=None, start_frame=0, end_frame=None, hdr_linear=False):
     filters = []
     if target_fps is not None and float(target_fps) > 0:
@@ -375,6 +444,8 @@ def _build_corrected_video_filter(metadata, target_fps=None, start_frame=0, end_
             trim_parts.append(f"end_frame={int(end_frame)}")
         filters.append("trim=" + ":".join(trim_parts))
         filters.append("setpts=PTS-STARTPTS")
+    if hdr_linear or metadata["needs_tonemap"]:
+        filters.extend(_missing_bt2100_tags(metadata))
     if metadata["needs_sar_fix"]:
         filters += [f"scale={int(metadata['display_width'])}:{int(metadata['display_height'])}:flags=lanczos", "setsar=1"]
     if hdr_linear:
@@ -426,7 +497,7 @@ def _decode_contiguous_video_frames_ffmpeg(video_path, start_frame, max_frames, 
         raise RuntimeError(f"Unable to probe video metadata for {video_path}")
     virtual_spec = parse_virtual_media_path(video_path)
     decode_path = os.fspath(metadata.get("source_path") or strip_virtual_media_suffix(video_path))
-    ffmpeg_path = _resolve_media_binary("ffmpeg")
+    ffmpeg_path = resolve_hdr_ffmpeg() if hdr_linear or metadata["needs_tonemap"] else _resolve_media_binary("ffmpeg")
     if ffmpeg_path is None:
         raise RuntimeError("ffmpeg binary not found")
     start_frame = int(start_frame)
@@ -503,7 +574,7 @@ def _decode_contiguous_video_frames_ffmpeg(video_path, start_frame, max_frames, 
         if process.stderr is not None:
             process.stderr.close()
     if return_code != 0 and frame_count == 0:
-        raise RuntimeError(f"ffmpeg decode failed for {video_path}: {stderr}")
+        raise RuntimeError(f"ffmpeg decode failed for {video_path} using {ffmpeg_path}: {stderr}")
     frames = frames[:frame_count]
     if local_search_enabled and frame_count > 0:
         first_pts_time = _parse_first_showinfo_pts_time(stderr)
@@ -537,7 +608,7 @@ def decode_video_frame_indices_ffmpeg(video_path, frame_indices, bridge="torch",
         decoded = decode_video_frames_ffmpeg(video_path, start_frame, span, target_fps=None, bridge="torch", hdr_linear=hdr_linear)
         frames = decoded[[frame_index - start_frame for frame_index in frame_indices]]
         return frames if bridge == "torch" else frames.numpy()
-    ffmpeg_path = _resolve_media_binary("ffmpeg")
+    ffmpeg_path = resolve_hdr_ffmpeg() if hdr_linear or metadata["needs_tonemap"] else _resolve_media_binary("ffmpeg")
     if ffmpeg_path is None:
         raise RuntimeError("ffmpeg binary not found")
     decode_path = os.fspath(metadata.get("source_path") or strip_virtual_media_suffix(video_path))
@@ -586,7 +657,7 @@ def decode_video_frame_indices_ffmpeg(video_path, frame_indices, bridge="torch",
         if process.stderr is not None:
             process.stderr.close()
     if return_code != 0 or frame_count != len(unique_indices):
-        raise RuntimeError(f"ffmpeg indexed decode failed for {video_path}: {stderr}")
+        raise RuntimeError(f"ffmpeg indexed decode failed for {video_path} using {ffmpeg_path}: {stderr}")
     if hdr_linear:
         frames_np = np.ascontiguousarray(frames_np[:, [2, 0, 1]].transpose(0, 2, 3, 1))
     frames = torch.from_numpy(frames_np)

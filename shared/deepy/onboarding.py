@@ -73,7 +73,7 @@ def deepy_prime_hardware_profile(vram_gb: float | None = None) -> tuple[str, str
         return "Q4", "gguf", reported_vram_gb
     if reported_vram_gb >= DEEPY_PRIME_Q3_MIN_VRAM_GB:
         return "Q3", "gguf_q3", reported_vram_gb
-    return ("Bonsai 2.0 Q1", "gguf_ptq1", reported_vram_gb) if reported_vram_gb > 0 and bonsai_kernels_installed() else None
+    return ("Bonsai 2.5 Q1", "gguf_ptq1_25", reported_vram_gb) if reported_vram_gb > 0 and bonsai_kernels_installed() else None
 
 
 def qwen38_recommended_quantization(vram_gb: float | None = None) -> str | None:
@@ -122,8 +122,8 @@ def performance_warnings(server_config: dict[str, Any], vram_gb: float | None = 
     chosen = server_config.get("prompt_enhancer_quantization")
     if reported_vram_gb <= 0 or normalize_llm_config(server_config)["deepy"] != ENGINE_QWEN38_27B or chosen not in QWEN38_QUANTIZATIONS:
         return []
-    warnings, recommended, order = [], qwen38_recommended_quantization(reported_vram_gb), [quantization for quantization in QWEN38_QUANTIZATIONS if quantization != "gguf_ptq1_25"]
-    if order.index(chosen.replace("gguf_ptq1_25", "gguf_ptq1")) > order.index(recommended):
+    warnings, recommended, order = [], qwen38_recommended_quantization(reported_vram_gb), [quantization for quantization in QWEN38_QUANTIZATIONS if quantization != "gguf_ptq1"]
+    if order.index("gguf_ptq1_25" if chosen == "gguf_ptq1" else chosen) > order.index(recommended):  # Bonsai 2.0 is as compressed as 2.5
         warnings.append(("⚠️", f"Qwen3.8 {QWEN38_QUANTIZATIONS[chosen]} may perform poorly on your GPU", f"with {reported_vram_gb} GB of VRAM, part of the model may not fit and Deepy and the Prompt Enhancer can become very slow. For this GPU, select {QWEN38_QUANTIZATIONS[recommended]} under Qwen LLM Quantization"))
     mode = speculative_decoding_runtime(server_config.get(PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY, PROMPT_ENHANCER_SPECULATIVE_DECODING_DEFAULT))[0]
     if mode == PROMPT_ENHANCER_SPECULATIVE_DECODING_AUTO:

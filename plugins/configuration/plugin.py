@@ -1,7 +1,7 @@
 from postprocessing import memory as processor_memory
 from shared.kernels import fp8_backend, int8_backend, kernel_policy, triton_cache
 from shared import attention_kit, model_dropdowns
-from shared.attention import sagegp_ready
+from shared.attention import sagegp_ready, sparsegp_backend
 from shared.cuda_memory import COMPUTE_CACHE_KEY, COMPUTE_CACHE_PATH_DEFAULT, COMPUTE_CACHE_PATH_KEY, RAM_ALLOCATOR_DEFAULT, RAM_ALLOCATOR_KEY, compute_cache_folder, compute_cache_useful
 import gradio as gr
 from shared.utils.plugins import WAN2GPPlugin
@@ -169,7 +169,7 @@ INKLING2_MINI_PROMPT_ENHANCER_ID = 8
 QWEN_PROMPT_ENHANCER_IDS = (3, 4, 5, 6, 7, 8)  # the local models of the LM engine
 QWEN35_QUANTIZATION_CHOICES = [("Quanto Int8 (recommended, better quality)", "quanto_int8"), ("GGUF Q4 (less VRAM/RAM & faster if kernels are installed, but worse quality)", "gguf")]
 QWEN38_9B_QUANTIZATION_CHOICES = [("GGUF Uncensored Q4_K_M (default, fits 8 GB of VRAM)", "gguf"), ("GGUF Uncensored Q8_0 (closest to full precision, needs about 12 GB of VRAM)", "gguf_q8")]
-QWEN38_QUANTIZATION_CHOICES = [("GGUF Uncensored Q4 (highest quality and VRAM/RAM use, for 24 GB of VRAM or more)", "gguf"), ("GGUF Uncensored IQ3_S (Q3, middle quality and VRAM/RAM use, for 16 GB of VRAM or more)", "gguf_q3"), ("GGUF Uncensored Q2 (lower quality and VRAM/RAM use)", "gguf_q2"), ("Bonsai 2.0 Abliterated PTQ1_0 (Q1, ternary, lowest VRAM/RAM use, for less than 16 GB of VRAM, requires kernels 1.0.22+)", "gguf_ptq1"), ("Bonsai 2.5 Uncensored PTQ1_0 (Q1, ternary, as light as 2.0 and better at multi-step tasks and tool calls, requires kernels 1.0.22+)", "gguf_ptq1_25")]
+QWEN38_QUANTIZATION_CHOICES = [("GGUF Uncensored Q4 (highest quality and VRAM/RAM use, for 24 GB of VRAM or more)", "gguf"), ("GGUF Uncensored IQ3_S (Q3, middle quality and VRAM/RAM use, for 16 GB of VRAM or more)", "gguf_q3"), ("GGUF Uncensored Q2 (lower quality and VRAM/RAM use)", "gguf_q2"), ("Bonsai 2.5 Uncensored PTQ1_0 (Q1, ternary, lowest VRAM/RAM use, recommended for less than 16 GB of VRAM, requires kernels 1.0.22+)", "gguf_ptq1_25"), ("Bonsai 2.0 Abliterated PTQ1_0 (Q1, ternary, the earlier release, as light as 2.5, requires kernels 1.0.22+)", "gguf_ptq1")]
 QWEN38_QUANTIZATIONS = tuple(value for _, value in QWEN38_QUANTIZATION_CHOICES)
 
 
@@ -448,9 +448,9 @@ class ConfigTabPlugin(WAN2GPPlugin):
                     )
                     self.sage2_first_step_precise_choice = gr.Checkbox(
                         value=self.server_config.get("sage2_first_step_precise", kernel_policy.SAGE2_FIRST_STEP_PRECISE_DEFAULT),
-                        label="Run the First Denoising Step in Precise (Sage 2/3 Adaptative GP and Sage3 GP)", interactive=not self.args.lock_config,
-                        info="The first step sets the composition: computed precisely, the video stays closer to an exact computation for a small part of the speed gain.",
-                        visible=sagegp_ready,
+                        label="Use Precise Attention for the First Denoising Step and First Block", interactive=not self.args.lock_config,
+                        info="Sol3, SageGP Adaptive and SageGP Fast use the default dense attention for the full first step and for the first transformer block in each later step.",
+                        visible=sagegp_ready or sparsegp_backend is not None,
                     )
                     self.quantization_choice = gr.Dropdown(choices=self.transformer_quantization_choices, value=self.transformer_quantization, label="Transformer Model Quantization (if available otherwise get the closest available)")
                     self.transformer_dtype_policy_choice = gr.Dropdown(choices=[("Auto (Best for Hardware)", ""), ("FP16", "fp16"), ("BF16", "bf16")], value=self.transformer_dtype_policy, label="Transformer Data Type (if available)")

@@ -120,8 +120,9 @@ def _quantize(x, block, sm_scale, mean=None):
 def staged_quantize_v(v_list, settings):
     """fp16 v with its scales (fp16_v, None without settings["scale_v"]); v is released. On compute capability 7.5, an unscaled BF16 v
     of a short sequence stays as it is: the Turing kernel reads its bits (staged_attention)."""
-    v = v_list[0]
-    v_list.clear()
+    v = v_list.pop()
+    if "padded_dim" in settings:
+        v = torch.nn.functional.pad(v, (0, settings["padded_dim"] - v.size(-1)))
     if (_attn_fwd_bits is not None and v.dtype == torch.bfloat16 and not settings["scale_v"] and v.shape[1] <= _V_BITS_MAX_TOKENS
             and _fp16_required(v.device)):
         return v, None, None
@@ -146,8 +147,9 @@ def _quantize_k(k, in_place, mean=None):
 def staged_quantize_k(k_list, settings):
     """INT8 k minus its mean over the tokens of all batch items, with its scales; k is released (the mean is subtracted in place).
     settings["k_mean"] (heads, head_dim) FP32, when present, is the mean subtracted instead (a cached prefix's: shared.attention_kit)."""
-    k = k_list[0]
-    k_list.clear()
+    k = k_list.pop()
+    if "padded_dim" in settings:
+        k = torch.nn.functional.pad(k, (0, settings["padded_dim"] - k.size(-1)))
     return _quantize_k(k, True, settings.get("k_mean"))
 
 
@@ -156,6 +158,8 @@ def staged_quantize_q(q, settings, sm_scale=None):
     """INT8 q with its scales (the softmax scale, in base 2, goes into them: sm_scale, or that of q's head_dim); q is not released
     (staged_attention can write the output into it)."""
     factor = (_sm_scale(q.shape[-1]) if sm_scale is None else sm_scale) * 1.44269504
+    if "padded_dim" in settings:
+        q = torch.nn.functional.pad(q, (0, settings["padded_dim"] - q.size(-1)))
     batch, tokens, heads, dim = q.shape
     if (settings.get("recycle_query") and _fp16_required(q.device) and (q.dtype == torch.float16 or _bits_input(q))
             and (batch == 1 or q.stride(0) == tokens * q.stride(1)) and sage_block_query.recyclable_query(q)):
@@ -173,6 +177,11 @@ def staged_attention(out, quantized_list, settings, attn_mask=None, return_lse=F
     batch items one after another in memory: q itself, or a slice of heads of a larger output. Fewer heads in k/v: grouped query
     attention. return_lse (Turing kernel only): (out, lse), lse (batch, heads, tokens) FP32 the base-2 log-sum-exp of each query's
     scores without the keys' smoothing mean."""
+    if quantized_list[0][0].size(-1) != out.size(-1):
+        padded = out.new_empty((*out.shape[:-1], quantized_list[0][0].size(-1)))
+        result = staged_attention(padded, quantized_list, settings, attn_mask, return_lse)
+        out.copy_(padded[..., :out.size(-1)])
+        return (out, result[1]) if return_lse else out
     (q_int8, q_scale, q_offsets, q_scale_offsets), (k_int8, k_scale, k_offsets, k_scale_offsets), (v, v_scale, _) = quantized_list
     quantized_list.clear()
     batch, tokens, heads, head_dim = out.shape
@@ -192,15 +201,16 @@ def staged_attention(out, quantized_list, settings, attn_mask=None, return_lse=F
     strides = (q_int8.stride(1), q_int8.stride(0), k_int8.stride(1), k_int8.stride(0), v.stride(1), v.stride(0), rows.stride(1), rows.stride(0))
     launch = dict(BLOCK_M=128, BLOCK_N=64, HEAD_DIM=head_dim, STAGE=1, num_warps=4 if head_dim == 64 else 8, num_stages=_STAGES[head_dim])
     mask, mask_mode = None, 0
-    if bits and attn_mask is not None:  # SageAttention's (batch, heads, q, k) layout, broadcastable; boolean as a uint8 view, additive as FP32
+    masked = attn_mask is not None and masks_supported(out.device)
+    if masked:  # SageAttention's (batch, heads, q, k) layout, broadcastable; boolean as a uint8 view, additive as FP32
         mask = attn_mask.view(torch.uint8) if attn_mask.dtype == torch.bool else attn_mask.to(torch.float32)
         mask = mask.expand(batch, heads, tokens, k_int8.shape[0] // batch)
         mask_mode = 1 if attn_mask.dtype == torch.bool else 2
     mask_strides = mask.stride() if mask is not None else (0, 0, 0, 0)
     main, splits = (_range_plan(out.device, head_dim, launch["num_warps"], launch["num_stages"], grid[0], heads * batch, k_int8.shape[0] // batch)
-                    if LAST_WAVE_SPLIT and _attn_range is not None and not return_lse else (grid[0], 1))
+                    if LAST_WAVE_SPLIT and _attn_range is not None and attn_mask is None and not return_lse else (grid[0], 1))
     grid = (main, heads, batch)
-    if bits:
+    if bits or masked:
         # without a mask the kernel still takes a pointer (never read): q_int8 with zero strides, as Lse without return_lse
         lse = torch.empty((batch, heads, tokens), dtype=torch.float32, device=out.device) if return_lse else q_int8
         if main:

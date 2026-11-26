@@ -6,12 +6,13 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
-from mmgp import cuda_graphs
+from mmgp import cuda_graphs, runtime
 from mmgp.expert_compute import RoutedExperts
 
 from ..layers.attention import Attention
 from ..layers.moe import SigmoidBiasRouter, routed_experts
 from ..utils.context import get_context
+from .base import LMEngineModel
 
 
 class NemotronHRMSNorm(nn.Module):
@@ -310,7 +311,9 @@ class NemotronHBlock(nn.Module):
 def _run_block(index, block, carry):
     hidden_states = carry[0]
     carry.clear()
-    return [block(hidden_states)]
+    result = block(hidden_states)
+    runtime.checkpoint()
+    return [result]
 
 
 class NemotronHModel(nn.Module):
@@ -321,7 +324,7 @@ class NemotronHModel(nn.Module):
         self.norm = NemotronHRMSNorm(config.hidden_size, config.layer_norm_epsilon)
 
 
-class NemotronHForCausalLM(nn.Module):
+class NemotronHForCausalLM(LMEngineModel):
     """The LM engine's Nemotron-H: forward(input_ids, positions, inputs_embeds) over the flattened tokens of the pass (the engine's
     context holds the paged KV slots of the attention layers); compute_logits applies the head to the last token of each sequence."""
     _lm_engine_tower_prefix = "model.layers."

@@ -544,7 +544,7 @@ def staged_attention(out, quantized_list, settings, attn_mask=None):
     (q_int8, q_scale), (k_int8, k_scale), (v, v_scale) = quantized_list
     quantized_list.clear()
     lut, valid_block_num = block_map_lut_triton(attn_mask if attn_mask.dtype == torch.int8 else attn_mask.to(torch.int8))
-    options = (0, False, 1, out.shape[-1] ** -0.5, 0)  # NHD layout, not causal, per-block scales, softmax scale, no lse
+    options = (0, settings.get("causal", False), 1, out.shape[-1] ** -0.5, 0)  # NHD layout, per-block scales, no LSE
     pv_threshold = _pv_threshold(q_int8.shape[2], out.device)
     if not settings["fp8"]:
         _qattn_sm80.qk_int8_sv_f16_accum_f16_block_sparse_attn_inst_buf_with_pv_threshold(q_int8, k_int8, v, out, lut, valid_block_num, pv_threshold, q_scale, k_scale, *options)

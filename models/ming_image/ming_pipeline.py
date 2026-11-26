@@ -6,6 +6,7 @@ Weights remain on CPU after loading; MMGP owns residency and layer offload.
 import hashlib
 import inspect
 import json
+import math
 import re
 from io import BytesIO
 from pathlib import Path
@@ -17,6 +18,7 @@ from accelerate import init_empty_weights
 from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.models.normalization import RMSNorm
 from PIL import Image
+from mmgp import runtime
 from torch import nn
 from torch.nn import functional as F
 from transformers import Qwen2Config, Qwen2ForCausalLM
@@ -27,7 +29,7 @@ from shared.utils.phase_progress import (
 )
 from shared.utils.text_encoder_cache import TextEncoderCache
 from shared.utils.utils import convert_tensor_to_image
-from .ming_handler import ENCODER, LAYER_ARCHITECTURE, LAYER_PROJECT, PROJECT, SHARED_PROJECT, TOKENIZER_FILES
+from .ming_handler import ENCODER, LAYER_ARCHITECTURE, LAYER_PROJECT, PROJECT, SHARED_PROJECT, TOKENIZER_FILES, conditioner_file
 from .prompt_format import strip_comment_lines
 from .vae import MingImageVAE
 from .upstream.bailingmm_utils import process_ratio
@@ -165,13 +167,13 @@ def _preserve_dtype(module):
     return module
 
 
-def load_components(transformer_filename, text_encoder_filename, model_type,
+def load_components(transformer_filename, text_encoder_filename, model_type, base_model_type,
                     save_quantized, quantize_transformer, model_def):
     from mmgp import offload
 
     if text_encoder_filename is None:
         raise ValueError("Ming Image requires its BailingMM2 text encoder checkpoint")
-    layer = model_type == LAYER_ARCHITECTURE
+    layer = base_model_type == LAYER_ARCHITECTURE
     project = LAYER_PROJECT if layer else PROJECT
     encoder_folder = ENCODER
     transformer_config = _config("transformer_config.json", project)
@@ -203,12 +205,15 @@ def load_components(transformer_filename, text_encoder_filename, model_type,
 
     set_phase_status("Loading - Bailing Text Encoder")
     encoder, vision_encoder = _make_text_encoder(str(tokenizer_dir / "config.json"), connector_config, mlp_config)
+    if model_def.get("ming_release") == "0.2":
+        # This connector is always called with inputs_embeds from proj_in.
+        encoder.connector.model.embed_tokens = None
     encoder.inference_profile = profile
     variant = model_def.get("ming_encoder_variant", "bf16")
     expected_suffix = f"_{variant}.safetensors"
     if not Path(text_encoder_filename).name.endswith(expected_suffix):
         raise ValueError("Ming encoder core and companion checkpoint precisions do not match")
-    conditioner_filename = fl.locate_file(f"{project}/conditioning{expected_suffix}")
+    conditioner_filename = fl.locate_file(f"{project}/{conditioner_file(model_def)}")
     vision_filename = fl.locate_file(f"{SHARED_PROJECT}/vision_encoder{expected_suffix}")
     offload.load_model_data(encoder, [text_encoder_filename, conditioner_filename],
                             writable_tensors=False, default_dtype=torch.bfloat16)
@@ -231,20 +236,22 @@ def load_components(transformer_filename, text_encoder_filename, model_type,
 
     scheduler_config["use_dynamic_shifting"] = True
     scheduler = FlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
-    pipeline = MingImagePipeline(encoder, vision_encoder, transformer, vae, processor, scheduler, profile)
+    pipeline = MingImagePipeline(encoder, vision_encoder, transformer, vae, processor, scheduler, profile,
+                                 design_release=model_def.get("ming_release", "0.1"))
     return pipeline, {"transformer": transformer, "text_encoder": encoder,
                       "vision_encoder": vision_encoder, "vae": vae,
                       "tokenizer": processor.tokenizer}
 
 
 class MingImagePipeline:
-    def __init__(self, encoder, vision_encoder, transformer, vae, processor, scheduler, profile):
+    def __init__(self, encoder, vision_encoder, transformer, vae, processor, scheduler, profile, design_release="0.1"):
         self.text_encoder = encoder
         self.vision_encoder = vision_encoder
         self.transformer = transformer
         self.vae = vae
         self.processor = processor
         self.profile = profile
+        self.design_release = design_release
         self.text_encoder_cache = TextEncoderCache()
         self.diffusion = ImageGenerationPipeline(
             scheduler=scheduler, vae=vae, transformer=transformer,
@@ -275,7 +282,7 @@ class MingImagePipeline:
         input_prompt = strip_comment_lines(input_prompt)
         if not input_prompt:
             raise ValueError("Ming Image prompt contains no content after removing comment lines")
-        device = torch.device("cuda:0")
+        device = runtime.execution_device(self.transformer)
         reference = None
         images = list(input_ref_images or [])
         if input_frames is not None:
@@ -293,7 +300,13 @@ class MingImagePipeline:
             task = "image-edit" if reference is not None else "text-to-image"
             num_layers = 1
             self.profile.validate_task(task, has_reference_image=reference is not None)
-            bucket = 1024 if task == "image-edit" or max(width, height) < 1536 else 2048
+            if task == "image-edit":
+                bucket = 1024
+            elif self.design_release == "0.2":
+                # Upstream chooses the closest tier by area, breaking ties toward 1024.
+                bucket = 1024 if round(math.sqrt(width * height)) <= 1536 else 2048
+            else:
+                bucket = 1024 if max(width, height) < 1536 else 2048
         self.vae.use_slicing = True
         self.vae.configure_tiling(VAE_tile_size)
 

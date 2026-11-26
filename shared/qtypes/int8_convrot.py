@@ -206,6 +206,10 @@ def _convrot_group_size(config):
     return int(config.get("convrot_groupsize", 256) or 256)
 
 
+def _valid_rotation_size(size):
+    return size >= 4 and (size & (size - 1)) == 0 and math.log(size, 4).is_integer()
+
+
 def _regular_hadamard(size, device, dtype):
     size = int(size)
     device = torch.device(device)
@@ -213,7 +217,7 @@ def _regular_hadamard(size, device, dtype):
     cached = _HADAMARD_CACHE.get(key)
     if cached is not None:
         return cached
-    if size < 4 or (size & (size - 1)) != 0 or math.log(size, 4) % 1 != 0:
+    if not _valid_rotation_size(size):
         raise ValueError(f"Regular Hadamard size must be a power of 4, got {size}")
     h4 = torch.tensor(
         [[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]],
@@ -416,6 +420,8 @@ def detect_quantization_label_from_filename(filename, verboseLevel=0):
 
 
 class QLinearInt8ConvRot(QModuleMixin, torch.nn.Linear):
+    direct_load_qtype = _QINT8_CONVROT_QTYPE
+
     @classmethod
     def qcreate(cls, module, weights, activations=None, optimizer=None, device=None):
         if torch.is_tensor(module.weight) and module.weight.dtype.is_floating_point:
@@ -507,11 +513,20 @@ class QLinearInt8ConvRot(QModuleMixin, torch.nn.Linear):
             return super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
 
         group_key = prefix + "convrot_group_size"
+        packed_data = state_dict.get(prefix + "weight._data")
+        packed_scale = state_dict.get(prefix + "weight._scale")
         group_size = state_dict.pop(group_key, None)
         if group_size is None:
             missing_keys.append(group_key)
+            if packed_data is not None:
+                error_msgs.append(f"Missing {group_key} for packed INT8 weight")
+                return
         else:
-            self._convrot_group_size = int(group_size.item() if torch.is_tensor(group_size) else group_size)
+            group_size = int(group_size.item() if torch.is_tensor(group_size) else group_size)
+            if group_size and (not _valid_rotation_size(group_size) or self.in_features % group_size):
+                error_msgs.append(f"Invalid {group_key}={group_size} for input width {self.in_features}")
+                return
+            self._convrot_group_size = group_size
         result = super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
         compute_dtype = self._convrot_default_dtype
         if compute_dtype is None and torch.is_tensor(getattr(self, "bias", None)) and self.bias.dtype.is_floating_point:
@@ -519,6 +534,18 @@ class QLinearInt8ConvRot(QModuleMixin, torch.nn.Linear):
         wrapped = _wrap_int8_convrot_weight(self.weight, compute_dtype)
         if wrapped is not self.weight:
             self.weight = torch.nn.Parameter(wrapped, requires_grad=self.weight.requires_grad)
+        if packed_data is not None and packed_scale is not None:
+            weight = self.weight
+            if (not isinstance(weight, Int8ConvRotWeightTensor) or weight.dtype != _normalize_compute_dtype(compute_dtype)
+                    or weight._data.dtype != torch.int8 or weight._data.shape != (self.out_features, self.in_features)
+                    or weight._scale.dtype != packed_scale.dtype or weight._scale.numel() != self.out_features):
+                error_msgs.append(f"Invalid INT8 ConvRot weight, scales or compute dtype for {prefix}weight")
+            elif local_metadata.get("assign_to_params_buffers") and not (
+                    weight._data.is_set_to(packed_data) and weight._scale.is_set_to(packed_scale)):
+                error_msgs.append(f"INT8 ConvRot weight or scales lost checkpoint storage for {prefix}weight")
+            if (self._convrot_group_size != group_size or not self._mm_requires_native_linear_forward
+                    or getattr(self.forward, "__func__", None) is not QLinearInt8ConvRot.forward):
+                error_msgs.append(f"Invalid INT8 ConvRot rotation or forward method for {prefix}weight")
         return result
 
 from shared.kernels.cpu_experts import INT8_ROWS, NativeExpertFormat

@@ -306,6 +306,8 @@ def get_env_details(name, env_data):
         return {'error': inspection["error"], 'type': env_type, 'path': dir_name}
     packages = inspection["packages"]
     data = {key: packages.get(distribution) or "Missing" for key, distribution in (("torch", "torch"), ("sageattention", "sageattention"), ("spas_sage_attn", "spas-sage-attn"), ("flash_attn", "flash-attn"))}
+    if packages.get("sparsegp"):
+        data["spas_sage_attn"] = "SparseGP " + packages["sparsegp"]
     if packages.get("sagegp"):
         data["sageattention"] = "SageGP " + packages["sagegp"]
     data["triton"] = packages["triton"] or packages["triton-windows"] or "Missing"
@@ -403,7 +405,11 @@ def install_logic(env_name, env_type, env_path, py_k, torch_k, triton_k, sage_k,
 
     if sparge_k:
         cmd = resolve_cmd(config['components']['sparge'][sparge_k]['cmd'])
-        if cmd: run_pip_component(pip, cmd, env_path=env_path if env_type != "none" else None)
+        if cmd:
+            if sparge_k == "sparsegp":
+                uninstall = pip.replace(" install", " uninstall", 1).replace("--index-strategy unsafe-best-match ", "")
+                run_cmd(f"{uninstall} spas-sage-attn" if uninstall.startswith("uv ") else f"{uninstall} -y spas-sage-attn")
+            run_pip_component(pip, cmd, env_path=env_path if env_type != "none" else None)
 
     if flash_k:
         cmd = resolve_cmd(config['components']['flash'][flash_k]['cmd'])
@@ -472,7 +478,7 @@ def do_install_interactive(env_type, config, detected_key):
         torch_k = menu("Torch Version", config['components']['torch'], base['torch'])
         triton_k = menu("Triton", config['components']['triton'], recommended_triton(base, torch_k))
         sage_k = menu("Sage Attention", config['components']['sage'], base['sage'])
-        sparge_k = menu("Sparge Attention", config['components']['sparge'], base.get('sparge'))
+        sparge_k = menu("SparseGP Attention", config['components']['sparge'], base.get('sparge'))
         flash_k = menu("Flash Attention", config['components']['flash'], base['flash'])
         kernels = base['kernels']
 
@@ -868,7 +874,7 @@ def do_upgrade(config, profile_key=None):
     torch_k = menu("Torch Version", config['components']['torch'], rec['torch'])
     triton_k = menu("Triton", config['components']['triton'], recommended_triton(rec, torch_k))
     sage_k = menu("Sage Attention", config['components']['sage'], rec['sage'])
-    sparge_k = menu("Sparge Attention", config['components']['sparge'], rec.get('sparge'))
+    sparge_k = menu("SparseGP Attention", config['components']['sparge'], rec.get('sparge'))
     flash_k = menu("Flash Attention", config['components']['flash'], rec['flash'])
 
     install_logic(env_name, env_data['type'], env_data['path'], py_k, torch_k, triton_k, sage_k, sparge_k, flash_k, rec['kernels'], config)

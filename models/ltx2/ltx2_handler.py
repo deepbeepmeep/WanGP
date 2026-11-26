@@ -792,7 +792,7 @@ class family_handler:
             "overlap_step": 8,
             "overlap_default": 9,
             "window_min": 5,
-            "window_max": 501,
+            "window_max": 961,  # 40 s at 24 fps
             "window_step": 4,
             "window_default": 241,
         }

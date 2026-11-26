@@ -39,6 +39,7 @@ from mmgp import __version__, profile_type
 from .quant_router import (
     apply_pre_quantization,
     cache_quantization_for_file,
+    checkpoint_linear_classes,
     detect_and_convert,
     detect_safetensors_format,
     sd_split_linear,
@@ -2341,9 +2342,10 @@ def _quantize_submodule(
     weights = None,
     activations = None,
     optimizer = None,
+    linear_cls = None,
 ):
-    
-    qmodule = quantize_module(module, weights=weights, activations=activations, optimizer=optimizer)
+    create = linear_cls.from_module if linear_cls is not None and isinstance(module, torch.nn.Linear) else quantize_module
+    qmodule = create(module, weights=weights, activations=activations, optimizer=optimizer)
     if qmodule is not None:
         _set_module_by_name(model, name, qmodule)
         qmodule.name = name
@@ -2373,6 +2375,7 @@ def _requantize(model: torch.nn.Module, state_dict: dict, quantization_map: dict
             p.data = p.data.to(p_in_file.data.dtype)
 
     # rebuild quanto objects
+    direct_linears = checkpoint_linear_classes()
     for name, m in model.named_modules():
         qconfig = quantization_map.get(name, None)
         if qconfig is not None:
@@ -2382,7 +2385,8 @@ def _requantize(model: torch.nn.Module, state_dict: dict, quantization_map: dict
             activations = qconfig["activations"]
             if activations == "none":
                 activations = None
-            _quantize_submodule(model, name, m, weights=weights, activations=activations)
+            _quantize_submodule(model, name, m, weights=weights, activations=activations,
+                                linear_cls=direct_linears.get(getattr(weights, "name", weights)))
             if default_dtype is not None:
                 new_module = model.get_submodule(name)
                 setter = getattr(new_module, "set_default_dtype", None)
@@ -5776,7 +5780,11 @@ class offload:
 
     def _graph_weight_tensors(self, model, module):
         """The CUDA tensors a block reads besides its arguments and LoRA copies: its parameters and buffers (their quantized parts and the
-        tensors cached on them, e.g. converted scales)."""
+        tensors cached on them, e.g. converted scales), and the placement's expert pointer tables."""
+        from .experts import ExpertBank
+        for submodule in module.modules():
+            if isinstance(submodule, ExpertBank):
+                yield from submodule.graph_pointer_tables()
         for tensor in builtins.list(module.parameters()) + builtins.list(module.buffers()):
             subtensors = _get_quantized_subtensors(tensor)
             yield from (t for _, t in subtensors) if subtensors else (tensor,)

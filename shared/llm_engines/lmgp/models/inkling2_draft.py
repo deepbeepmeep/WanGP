@@ -14,6 +14,9 @@ other (proposal_step, run by the runner's chain).
   place, only the positions it reads (block_attend of the target's attention kernels, or the live rows in PyTorch).
 - The head's logits U (h + H latent + b) are computed as U h, once for the 7 rows, plus (U H) latent + U b per token: U H and U b
   are made when the checkpoint loads (draft_head_tensors), so that a token costs a product over 257 columns instead of the vocabulary's 2304.
+  With the GGUF kernel package's candidate selection (use_candidates, as Qwen3.8's drafter heads), a token instead gets the head's input
+  h + H latent + b, a one-bit copy of the head ranks its rows and the 1,024 best of the groups are scored exactly from the head itself;
+  the other tokens get a floor logit (CANDIDATE_ROWS rows: the vocabulary and the padding rows up to a multiple of the groups).
   Drafts only: verification by the target is exact whatever the drafter computes.
 - Its passes are stages of the target's MMGP graphs (the cache and the buffers below are the engine's registered state)."""
 import os
@@ -30,7 +33,18 @@ from .inkling2_core import DRAFT_FEATURES, rms, softcap
 TIED = ("embed", "embed_norm", "unembed")  # the target's modules whose weights the drafter's stages read (Inkling2Draft.tied)
 REWIND_ROWS = 4096  # positions a window ring keeps beyond its window: a rewind up to this far leaves the drafts their whole context
 CONFIDENT = "confident_drafts" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(",")  # disabled: the automatic count from the measured history only (MeasuredDrafts), for comparisons
+CANDIDATES = "draft_candidates" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(",")  # the head's best rows by a one-bit copy, then scored exactly (use_candidates); disabled: the whole vocabulary at each draft, for comparisons
+CANDIDATE_ROWS = 200192  # the head rows the one-bit copy ranks: the 200,058 tokens and the table's padding rows up to a multiple of its 256 groups
 IN_PLACE = "draft_attention" not in os.environ.get("WGP_INKLING2_DISABLE", "").split(",")  # the block's keys and values written at its positions in the caches, attended there up to the block (the target's attention kernels when it has them); disabled: the previous path (copies of the whole caches, scores over all their rows), for comparisons
+
+
+def _linears(x, *modules):
+    """x through each module's weight, the short passes of a block (at most 16 rows) by the target's row kernels in one launch, the others
+    by the library (the same products as the modules', other rounding of a few sums: drafts only)."""
+    rows = inkling2._LINEAR
+    if rows is not None and x.is_cuda and x.shape[0] <= rows.ROWS and len(modules) <= rows.SEGMENTS and rows.supported(x.device):
+        return rows.linears([(x, module.weight) for module in modules])
+    return [module(x) for module in modules]
 
 
 def _rotate(x, cos, sin):
@@ -86,6 +100,23 @@ class Inkling2Draft(nn.Module):
         self.tied = _Tensors(**{name: getattr(target, name).weight.shape for name in TIED})
         self._keys = self._values = self._rnn = None
         self._length = 0
+        self.candidates = False  # use_candidates
+
+    def use_candidates(self, bits, scale, ids):
+        """The head through its one-bit copy (shared.qtypes.gguf.dense_head_candidates of the target's head): buffers placed with the
+        drafter, and the head's low-rank table (U H | U b, 98 MiB) left out."""
+        from shared.qtypes.gguf import _DRAFT_HEAD_GROUPS, _DRAFT_HEAD_KEEP
+        self.register_buffer("candidate_bits", bits, persistent=False)
+        self.register_buffer("candidate_scale", scale, persistent=False)
+        self.register_buffer("candidate_ids", ids, persistent=False)
+        self.register_buffer("candidate_rows", torch.empty(_DRAFT_HEAD_GROUPS * _DRAFT_HEAD_KEEP, self.hidden, dtype=torch.bfloat16), persistent=False)  # the rows scored at a draft
+        self.register_buffer("slot_states", torch.zeros(self.block_size - 1, self.hidden, dtype=torch.bfloat16), persistent=False)  # the block's 7 slots before the head
+        # the recurrence's two products in one, float32 once: [previous token's Markov row | state] -> its 3 x rank inputs
+        weight = self.markov_head.rnn_proj.weight
+        self.register_buffer("base_weight", weight[:, 2 * self.rank:2 * self.rank + self.hidden].float().contiguous(), persistent=False)
+        self.register_buffer("recurrence_weight", torch.cat((weight[:, self.rank:2 * self.rank], weight[:, :self.rank]), 1).float().contiguous(), persistent=False)
+        self.head_latent = torch.empty(0, self.rank + 1, dtype=torch.bfloat16)
+        self.candidates = True
 
     # the context cache -------------------------------------------------------------------------------------------------------------
     def prepare_cache(self, max_length, device, dtype):
@@ -163,7 +194,7 @@ class Inkling2Draft(nn.Module):
 
     def _normed(self, x, heads, norm, cos, sin):
         dtype = x.dtype
-        return _rotate(rms(x.view(-1, heads, self.dim), self.eps, norm.weight).to(dtype), cos, sin).to(dtype)
+        return _rotate(inkling2.norm(x.view(-1, heads, self.dim), self.eps, norm.weight, dtype), cos, sin).to(dtype)  # the fused row kernel where it runs
 
     def _append(self, features, first):
         """Keys, values and head input of the positions first.. from their target features [rows, 4, hidden], written by position."""
@@ -175,8 +206,9 @@ class Inkling2Draft(nn.Module):
             attention = layer.self_attn
             context = rms(mixed[:, index], self.eps, layer.dflare_norm.weight).to(dtype)
             rows = positions % self._keys[index].shape[0]
-            self._keys[index].index_copy_(0, rows, self._normed(attention.k_proj_ctx(context), self.kv_heads, attention.k_norm_ctx, cos, sin))
-            self._values[index].index_copy_(0, rows, attention.v_proj_ctx(context).view(count, self.kv_heads, self.dim))
+            keys, values = _linears(context, attention.k_proj_ctx, attention.v_proj_ctx)
+            self._keys[index].index_copy_(0, rows, self._normed(keys, self.kv_heads, attention.k_norm_ctx, cos, sin))
+            self._values[index].index_copy_(0, rows, values.view(count, self.kv_heads, self.dim))
         head = self.markov_head
         self._rnn.index_copy_(0, positions % self._ring, F.linear(rms(mixed[:, -1], self.eps, head.dflare_norm.weight), head.rnn_proj.weight[:, -self.hidden:].float()))
         self._high.copy_(torch.maximum(self._high, positions[-1:] + 1))
@@ -260,16 +292,17 @@ class Inkling2Draft(nn.Module):
             kept = torch.minimum((self._high - self._ring).clamp_min(0), cursor)
         for index, layer in enumerate(self.layers):
             attention = layer.self_attn
-            x = rms(h, self.eps, layer.input_layernorm.weight).to(dtype)
-            q = self._normed(attention.q_proj(x), self.heads, attention.q_norm, cos, sin)
-            k = self._normed(attention.k_proj(x), self.kv_heads, attention.k_norm, cos, sin)
-            v = attention.v_proj(x).view(rows, self.kv_heads, self.dim)
+            x = inkling2.norm(h, self.eps, layer.input_layernorm.weight, dtype)
+            q, k, v = _linears(x, attention.q_proj, attention.k_proj, attention.v_proj)
+            q, k, v = self._normed(q, self.heads, attention.q_norm, cos, sin), self._normed(k, self.kv_heads, attention.k_norm, cos, sin), v.view(rows, self.kv_heads, self.dim)
             output = self._attend(index, q, k, v, places, kept) if IN_PLACE else self._attend_copies(index, q, k, v, cursor)
-            h = h + attention.o_proj(output)
+            h = h + _linears(output.reshape(rows, -1), attention.o_proj)[0]
             q = k = v = output = None
-            x = rms(h, self.eps, layer.post_attention_layernorm.weight).to(dtype)
-            h = h + layer.mlp.down_proj((F.silu(layer.mlp.gate_proj(x).float()) * layer.mlp.up_proj(x).float()).to(dtype))
-        return rms(h, self.eps, self.norm.weight).to(dtype)
+            x = inkling2.norm(h, self.eps, layer.post_attention_layernorm.weight, dtype)
+            gate, up = _linears(x, layer.mlp.gate_proj, layer.mlp.up_proj)
+            h = h + _linears((F.silu(gate.float()) * up.float()).to(dtype), layer.mlp.down_proj)[0]
+            gate = up = None
+        return inkling2.norm(h, self.eps, self.norm.weight, dtype)
 
     def draft_stage(self, anchor, base, unary):
         """The block after the token anchor (cuda_graphs.run stage). Into base [7, 3 * rank]: what the head's recurrence reads of each
@@ -277,8 +310,14 @@ class Inkling2Draft(nn.Module):
         head, states = self.markov_head, self._block(anchor)[1:]
         last = self._rnn.index_select(0, (self._cursor - 1).clamp_min(0) % self._ring)
         last = last * (self._cursor > (self._high - self._ring).clamp_min(0)).to(last.dtype)  # no committed position, or one the ring lost
-        base.copy_(F.linear(states.float(), head.rnn_proj.weight[:, 2 * self.rank:2 * self.rank + self.hidden].float(), head.rnn_proj.bias.float()) + last)
-        unary.copy_(F.linear(states, self.tied.unembed[:self.draft_vocab_size]))
+        if self.candidates:  # the slots' share of the recurrence, its weight converted once (use_candidates)
+            base.copy_(F.linear(states.float(), self.base_weight, head.rnn_proj.bias.float()) + last)
+        else:
+            base.copy_(F.linear(states.float(), head.rnn_proj.weight[:, 2 * self.rank:2 * self.rank + self.hidden].float(), head.rnn_proj.bias.float()) + last)
+        if self.candidates:  # each draft scores its own candidates (proposal_step): unary stays unused
+            self.slot_states.copy_(states)
+        else:
+            unary.copy_(F.linear(states, self.tied.unembed[:self.draft_vocab_size]))
 
     def propose(self, anchor, start_position=None, embedding=None, output=None):
         """(base, unary) of the block after the token anchor: what proposal_step turns into the logits of each draft."""
@@ -287,8 +326,8 @@ class Inkling2Draft(nn.Module):
             cuda_graphs.run(self, self._anchor, self._base, self._unary, owner=self.target, method="draft_stage", enabled=self._graphed())
         return self._base, self._unary
 
-    def proposal_step(self, index, base, unary, previous, state=None):
-        """Draft index of the chain: (float32 logits, no confidence, the recurrence's state for the next draft). previous: the token before it."""
+    def _recurrence(self, base, previous, state):
+        """The head's recurrence for a draft: (its latent, the state for the next draft)."""
         head, rank = self.markov_head, self.rank
         previous = torch.as_tensor(previous, dtype=torch.long, device=base.device)
         weight = head.rnn_proj.weight[:, :2 * rank].float()
@@ -296,7 +335,31 @@ class Inkling2Draft(nn.Module):
         if state is not None:
             raw = raw + F.linear(state, weight[:, :rank])
         gate, candidate, latent = torch.sigmoid(raw[:rank]), torch.tanh(raw[rank:2 * rank]), torch.tanh(raw[2 * rank:])
+        return latent, (1 - gate) * candidate if state is None else gate * state + (1 - gate) * candidate
+
+    def candidate_step(self, index, base, previous, state=None):
+        """Draft index of the chain through the head's candidates (use_candidates): (float32 soft-capped logits of the rows, the rows' token
+        ids (int64; padding rows beyond the vocabulary at the floor logit), the recurrence's state). The other tokens are at the floor."""
+        from shared.qtypes.gguf import _DRAFT_HEAD_FLOOR, select_candidate_rows
+        head, rank = self.markov_head, self.rank
+        previous = torch.as_tensor(previous, dtype=torch.long, device=base.device)
+        inputs = torch.cat((head.markov_w1(previous).float().reshape(-1), state if state is not None else base.new_zeros(rank)))
+        raw = base + F.linear(inputs, self.recurrence_weight)  # a zero state adds exact zeros: the first draft's terms as _recurrence's
+        gate, candidate, latent = torch.sigmoid(raw[:rank]), torch.tanh(raw[rank:2 * rank]), torch.tanh(raw[2 * rank:])
         state = (1 - gate) * candidate if state is None else gate * state + (1 - gate) * candidate
+        x = (self.slot_states[index].float() + head.hidden_out(latent.to(head.hidden_out.weight.dtype)).float()).to(torch.bfloat16)  # the head's input h + H latent + b
+        rows = select_candidate_rows(x, self.candidate_bits, self.candidate_scale, self.candidate_ids)
+        exact = softcap(F.linear(x, torch.index_select(self.tied.unembed, 0, rows, out=self.candidate_rows)).float(), self.cap)
+        return exact.masked_fill(rows >= self.draft_vocab_size, _DRAFT_HEAD_FLOOR), rows, state
+
+    def proposal_step(self, index, base, unary, previous, state=None):
+        """Draft index of the chain: (float32 logits, no confidence, the recurrence's state for the next draft). previous: the token before it."""
+        if self.candidates:
+            from shared.qtypes.gguf import _DRAFT_HEAD_FLOOR
+            scores, rows, state = self.candidate_step(index, base, previous, state)
+            logits = torch.full((CANDIDATE_ROWS,), _DRAFT_HEAD_FLOOR, dtype=torch.float32, device=scores.device).scatter_(0, rows, scores)
+            return logits[:self.draft_vocab_size], None, state
+        latent, state = self._recurrence(base, previous, state)
         own = F.linear(torch.cat((latent, latent.new_ones(1))).to(self.head_latent.dtype), self.head_latent)
         return softcap(unary + own.float(), self.cap), None, state
 

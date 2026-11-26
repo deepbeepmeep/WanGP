@@ -261,10 +261,18 @@ def fit_picture(path: str | Path, size: str, out_folder: str | Path) -> Path:
 
 def audio_slice(path: str | Path, start_s: float, end_s: float, out_folder: str | Path) -> Path:
     """The [start_s, end_s] excerpt of an audio file as a WAV in out_folder, cut once and reused (a shot's driving audio)."""
-    out = Path(out_folder) / f"{Path(path).stem}-{start_s:.3f}-{end_s:.3f}.wav"
+    out = Path(out_folder) / cache_key(path) / f"{Path(path).stem}-{start_s:.3f}-{end_s:.3f}.wav"
     if not out.is_file():
         out.parent.mkdir(parents=True, exist_ok=True)
-        _run([ffmpeg(), "-y", "-v", "error", "-ss", f"{start_s:.3f}", "-t", f"{end_s - start_s:.3f}", "-i", str(path), "-vn", "-c:a", "pcm_s16le", str(out)])
+        making = out.with_name(f"{uuid.uuid4().hex}.wav")
+        try:
+            _run([ffmpeg(), "-y", "-v", "error", "-ss", f"{start_s:.3f}", "-t", f"{end_s - start_s:.3f}", "-i", str(path), "-vn", "-c:a", "pcm_s16le", str(making)])
+            try:
+                making.rename(out)
+            except FileExistsError:  # another validation or render already published the same slice
+                pass
+        finally:
+            making.unlink(missing_ok=True)
     return out
 
 

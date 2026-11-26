@@ -60,9 +60,10 @@
                 }
             },
             "v38": {
-                "label": "Triton 3.7.x (Torch 2.13, AMD ROCm)",
+                "label": "Triton 3.7 Windows / TheRock 3.8 Linux (Torch 2.13, AMD ROCm)",
                 "cmd": {
-                    "win": "-U \"triton-windows>=3.7.0.post26,<=3.7.1.post27\""
+                    "win": "-U \"triton-windows>=3.7.0.post26,<=3.7.1.post27\"",
+                    "linux": "triton==3.8.0+git4cff872c.rocm10.0.0 --index-url https://stable.repo.amd.com/rocm/whl-next/"
                 }
             }
         },
@@ -84,19 +85,9 @@
             }
         },
         "sparge": {
-            "v010_cu128": {
-                "label": "Sparge Attention 0.1.0 (CUDA 12.8 / Torch 2.7.1)",
-                "cmd": {
-                    "win": "https://github.com/woct0rdho/SpargeAttn/releases/download/v0.1.0-windows.post3/spas_sage_attn-0.1.0%2Bcu128torch2.7.1.post3-cp39-abi3-win_amd64.whl",
-                    "linux": "{pip} ninja wheel packaging && {pip} --no-build-isolation git+https://github.com/woct0rdho/SpargeAttn.git"
-                }
-            },
-            "v010_cu13": {
-                "label": "Sparge Attention 0.1.0 (CUDA 13 / Torch 2.9+ ABI)",
-                "cmd": {
-                    "win": "https://github.com/woct0rdho/SpargeAttn/releases/download/v0.1.0-windows.post4/spas_sage_attn-0.1.0%2Bcu130torch2.9.0andhigher.post4-cp39-abi3-win_amd64.whl",
-                    "linux": "https://github.com/deepbeepmeep/kernels/releases/download/SpargeAttn/spas_sage_attn-0.1.0%2Bcu130torch2.10-cp311-cp311-linux_x86_64.whl"
-                }
+            "sparsegp": {
+                "label": "SparseGP 1.1.0 (Sol3 and Sparge, CUDA / ROCm, Windows and Linux)",
+                "cmd": "https://github.com/deepbeepmeep/SparseGP/releases/download/v1.2.0/sparsegp-1.2.0-py3-none-any.whl"
             }
         },
         "flash": {
@@ -117,24 +108,24 @@
         },
         "kernels": {
             "wgpkernels": {
-                "label": "WGPKernels 1.5.0 (CUDA 13, RTX 20XX+)",
+                "label": "WGPKernels 1.5.1 (CUDA 13, RTX 20XX+)",
                 "cmd": {
-                    "win": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Bcu130-py3-none-win_amd64.whl",
-                    "linux": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Bcu130-py3-none-linux_x86_64.whl"
+                    "win": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.1/wgpkernels-1.5.1%2Bcu130-py3-none-win_amd64.whl",
+                    "linux": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.1/wgpkernels-1.5.1%2Bcu130-py3-none-linux_x86_64.whl"
                 }
             },
             "wgpkernels_cu128": {
-                "label": "WGPKernels 1.5.0 (CUDA 12.8, RTX 20XX+)",
+                "label": "WGPKernels 1.5.1 (CUDA 12.8, RTX 20XX+)",
                 "cmd": {
-                    "win": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Bcu128-py3-none-win_amd64.whl",
-                    "linux": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Bcu128-py3-none-linux_x86_64.whl"
+                    "win": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.1/wgpkernels-1.5.1%2Bcu128-py3-none-win_amd64.whl",
+                    "linux": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.1/wgpkernels-1.5.1%2Bcu128-py3-none-linux_x86_64.whl"
                 }
             },
             "wgpkernels_rocm10": {
-                "label": "WGPKernels 1.5.0 (ROCm 10, RDNA4, experimental)",
+                "label": "WGPKernels 1.5.1 (ROCm 10, RDNA4, experimental)",
                 "cmd": {
-                    "win": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Brocm100-py3-none-win_amd64.whl",
-                    "linux": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.0/wgpkernels-1.5.0%2Brocm100-py3-none-linux_x86_64.whl"
+                    "win": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.1/wgpkernels-1.5.1%2Brocm100-py3-none-win_amd64.whl",
+                    "linux": "--no-deps https://github.com/deepbeepmeep/WGPKernels/releases/download/v1.5.1/wgpkernels-1.5.1%2Brocm100-py3-none-linux_x86_64.whl"
                 }
             },
             "nunchaku": { 
@@ -183,11 +174,11 @@
     },
     "gpu_profiles": {
         "GTX_10":      { "platforms": ["win", "linux"], "python": "3.10", "torch": "cu126", "triton": null,     "sage": null,       "sparge": null, "flash": null, "kernels": [] },
-        "RTX_20":      { "platforms": ["win", "linux"], "python": "3.11", "torch": "cu130", "triton": "v33", "sage": "v1", "sparge": null, "flash": null, "kernels": ["wgpkernels", "nunchaku_cu13", "gguf"] },
-        "RTX_30":      { "platforms": ["win", "linux"], "python": "3.11", "torch": "cu130", "triton": "v37", "sage": "v220_cu13", "sparge": "v010_cu13", "flash": "v210", "kernels": ["wgpkernels", "nunchaku_cu13", "gguf"] },
-        "RTX_40":      { "platforms": ["win", "linux"], "python": "3.11", "torch": "cu130", "triton": "v37", "sage": "v220_cu13", "sparge": "v010_cu13", "flash": "v210", "kernels": ["wgpkernels", "nunchaku_cu13", "gguf"] },
-        "RTX_50":      { "platforms": ["win", "linux"], "python": "3.11", "torch": "cu130", "triton": "v37", "sage": "v220_cu13", "sparge": "v010_cu13", "flash": "v210", "kernels": ["wgpkernels", "nunchaku_cu13","light2xv", "gguf"] },
-        "AMD":         { "platforms": ["win", "linux"], "python": "3.12", "torch": "rocm10", "triton": "v38", "sage": "v1", "sparge": null, "flash": "v284_rocm", "kernels": ["wgpkernels", "gguf"], "attention": "sdpa" },
+        "RTX_20":      { "platforms": ["win", "linux"], "python": "3.11", "torch": "cu130", "triton": "v33", "sage": "v1", "sparge": "sparsegp", "flash": null, "kernels": ["wgpkernels", "nunchaku_cu13", "gguf"] },
+        "RTX_30":      { "platforms": ["win", "linux"], "python": "3.11", "torch": "cu130", "triton": "v37", "sage": "v220_cu13", "sparge": "sparsegp", "flash": "v210", "kernels": ["wgpkernels", "nunchaku_cu13", "gguf"] },
+        "RTX_40":      { "platforms": ["win", "linux"], "python": "3.11", "torch": "cu130", "triton": "v37", "sage": "v220_cu13", "sparge": "sparsegp", "flash": "v210", "kernels": ["wgpkernels", "nunchaku_cu13", "gguf"] },
+        "RTX_50":      { "platforms": ["win", "linux"], "python": "3.11", "torch": "cu130", "triton": "v37", "sage": "v220_cu13", "sparge": "sparsegp", "flash": "v210", "kernels": ["wgpkernels", "nunchaku_cu13","light2xv", "gguf"] },
+        "AMD":         { "platforms": ["win", "linux"], "python": "3.12", "torch": "rocm10", "triton": "v38", "sage": "v1", "sparge": "sparsegp", "flash": "v284_rocm", "kernels": ["wgpkernels", "gguf"], "attention": "sdpa" },
         "MPS":         { "platforms": ["macos"], "python": "3.11", "torch": "mps", "triton": null, "sage": null, "sparge": null, "flash": null, "kernels": [], "attention": "sdpa" }
     }
 }

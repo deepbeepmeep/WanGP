@@ -11,6 +11,7 @@ from contextlib import contextmanager, nullcontext
 
 import torch
 
+from accelerate import init_empty_weights
 from mmgp import offload
 from PIL import Image
 from tqdm.auto import tqdm
@@ -21,7 +22,6 @@ from transformers.models.qwen2_vl.video_processing_qwen2_vl import Qwen2VLVideoP
 from shared.llm_io import known_token_ids, llm_io_enabled, log_llm_io, media_descriptor
 from shared.llm_engines.lmgp.models.qwen3_5 import Qwen3_5DynamicCache
 from shared.llm_engines.lmgp.utils.context import reset_context
-from shared.qtypes.gguf import materialize_module_source_tensors
 from shared.utils import files_locator as fl
 from shared.utils.cancellation import cancellation_context, check_cancelled
 
@@ -263,6 +263,10 @@ def _build_qwen35_vl_gguf_preprocess_sd(patch_shape):
         new_sd = OrderedDict()
         patch_slices = []
         for name, tensor in sd.items():
+            # Floating GGUF tensors already have their storage dtype and shape.
+            # Keep their mmap storage through the QKV views and MMGP assignment.
+            if tensor.is_floating_point():
+                tensor = tensor.as_subclass(torch.Tensor)
             if name in ("v.pos_embed.weight", "v.position_embd.weight"):
                 target_name = "pos_embed.weight"
                 target_tensor = tensor
@@ -1243,7 +1247,8 @@ def load_qwen35_vl_prompt_enhancer(
         config.vision_config._attn_implementation = attn_implementation
     with torch.device("meta"):
         model = model_class(config)
-    model.model.visual = model.model.visual.__class__._from_config(config.vision_config)
+    with init_empty_weights(include_buffers=False):
+        model.model.visual = model.model.visual.__class__._from_config(config.vision_config)
     model.model.language_model = _SharedQwen35TextAdapter(text_model, input_embedding_model)
     model.lm_head = _SharedQwen35LmHeadAdapter(text_model.lm_head)
     if str(model_path).lower().endswith(".gguf"):
@@ -1253,10 +1258,9 @@ def load_qwen35_vl_prompt_enhancer(
             model_path,
             preprocess_sd=preprocess_sd,
             writable_tensors=False,
-            default_dtype=torch.bfloat16,
+            default_dtype=torch.float16,
         )
-        materialize_module_source_tensors(model.model.visual)
-        model.model.visual.to(dtype=torch.float16)
+        model.model.visual.rotary_pos_emb.to(dtype=torch.float16)
     else:
         offload.load_model_data(
             model.model.visual,

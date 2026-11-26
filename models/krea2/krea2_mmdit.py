@@ -139,8 +139,8 @@ def attention(
     return out
 
 
-def key_padding_mask(mask: Tensor) -> Tensor:
-    return mask.unsqueeze(1).unsqueeze(2)
+def key_padding_mask(mask: Tensor | None) -> Tensor | None:
+    return None if mask is None else mask[:, None, None, :]
 
 
 def temb(t: Tensor, dim: int, period: float = 1e4, tfactor: float = 1e3, device: torch.device = None, dtype: torch.dtype = None) -> Tensor:
@@ -304,7 +304,8 @@ class Attention(nn.Module):
             out = attention_kit.qkv_attention(x_list, self.wq, self.wk, self.wv, self.heads, self.headdim,
                                               lambda query, key, group: _norm_rope_(query, key, self.qknorm, freqs),
                                               fused_quant=lambda query, key, group, core, settings: _norm_rope_quant(query, key, self.qknorm, freqs, core, settings),
-                                              kv_heads=self.kvheads, attention_mask=None if mask is None else mask.transpose(1, 2)).flatten(2)
+                                              kv_heads=self.kvheads, attention_mask=None if mask is None else mask.transpose(1, 2),
+                                              sol3_prefix_tokens=txt_len or 0).flatten(2)
             ops.sigmoid_gate_(out, [gate])
             del gate
             return self.wo(out)
@@ -511,7 +512,7 @@ class SingleStreamDiT(nn.Module):
         self.last = LastLayer(config.features, config.patch, config.channels)
         self.tproj = nn.Sequential(nn.GELU(approximate="tanh"), nn.Linear(config.features, config.features * 6))
 
-    def prepare_context(self, context: Tensor | list[Tensor], mask: Tensor, output_len: int | None = None) -> Tensor | None:
+    def prepare_context(self, context: Tensor | list[Tensor], mask: Tensor | None, output_len: int | None = None) -> Tensor | None:
         self.txtfusion._interrupt = getattr(self, "_interrupt", False)
         if isinstance(context, list):
             context_ = context[0]
@@ -519,13 +520,14 @@ class SingleStreamDiT(nn.Module):
             context = context_
         else:
             context = context.clone()
-        valid_mask = mask[:, : context.shape[1]]
+        valid_mask = None if mask is None else mask[:, : context.shape[1]]
         txtmask = key_padding_mask(valid_mask)
         context = self.txtfusion(context, mask=txtmask)
         if context is None:
             return None
         context = self.txtmlp(context)
-        context.masked_fill_(~valid_mask.unsqueeze(-1), 0)
+        if valid_mask is not None:
+            context.masked_fill_(~valid_mask.unsqueeze(-1), 0)
         if output_len is not None and context.shape[1] < output_len:
             context = F.pad(context, (0, 0, 0, output_len - context.shape[1]))
         return context
@@ -534,18 +536,12 @@ class SingleStreamDiT(nn.Module):
         t = self.tmlp(temb(t, self.config.tdim, device=t.device, dtype=t.dtype))
         return t, self.tproj(t)
 
-    def _build_stream(self, img: Tensor, context: Tensor, pos: Tensor, mask: Tensor, freqs: Tensor | None = None):
+    def _build_stream(self, img: Tensor, context: Tensor, pos: Tensor, mask: Tensor | None, freqs: Tensor | None = None):
         txtlen, imglen = context.shape[1], img.shape[1]
         combined = img.new_empty(img.shape[0], txtlen + imglen, img.shape[-1])
         combined[:, :txtlen].copy_(context)
         combined[:, txtlen:].copy_(img)
         del context
-        fulllen = combined.shape[1]
-        padlen = (-fulllen) % 256
-        if padlen > 0:
-            combined = F.pad(combined, (0, 0, 0, padlen))
-            mask = F.pad(mask, (0, padlen), value=False)
-            pos = F.pad(pos, (0, 0, 0, padlen))
         mask = key_padding_mask(mask)
         if freqs is None:
             freqs = self.posemb(pos)
@@ -577,7 +573,7 @@ class SingleStreamDiT(nn.Module):
         target_len = imglen if target_len is None else target_len
         return self.last([combined[:, txtlen + imglen - target_len : txtlen + imglen]], t)
 
-    def forward_cfg(self, img: Tensor, context: Tensor, uncond_context: Tensor, t: Tensor, tvec: Tensor, pos: Tensor, uncond_pos: Tensor, mask: Tensor, uncond_mask: Tensor, target_len: int | None = None) -> tuple[Tensor | None, Tensor | None]:
+    def forward_cfg(self, img: Tensor, context: Tensor, uncond_context: Tensor, t: Tensor, tvec: Tensor, pos: Tensor, uncond_pos: Tensor, mask: Tensor | None, uncond_mask: Tensor | None, target_len: int | None = None) -> tuple[Tensor | None, Tensor | None]:
         img = self.first(img)
         share_freqs = pos.shape == uncond_pos.shape
         combined, txtlen, imglen, freqs, mask = self._build_stream(img, context, pos, mask)
@@ -585,10 +581,10 @@ class SingleStreamDiT(nn.Module):
         del img, context, uncond_context, pos, uncond_pos
         with cuda_graphs.scope():
             for block in self.blocks:
-                combined = block(combined, tvec, freqs, mask)
+                combined = block(combined, tvec, freqs, mask, txt_len=txtlen)
                 if getattr(self, "_interrupt", False):
                     return None, None
-                uncond_combined = block(uncond_combined, tvec, uncond_freqs, uncond_mask)
+                uncond_combined = block(uncond_combined, tvec, uncond_freqs, uncond_mask, txt_len=uncond_txtlen)
                 if getattr(self, "_interrupt", False):
                     return None, None
         target_len = imglen if target_len is None else target_len

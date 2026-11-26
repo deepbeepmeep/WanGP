@@ -116,6 +116,8 @@ def kernel_variant(key, torch_key, python_key, amd_targets=()):
 
 def component_commands(data, group, key, platform=None, python_key=None, amd_targets=()):
     """Translate the catalog's supported pip recipes into argv and environment."""
+    if group == "sparge" and key in ("v010_cu128", "v010_cu13") and key not in data["components"][group] and "sparsegp" in data["components"][group]:
+        key = "sparsegp"
     try:
         entry = data["components"][group][key]
     except KeyError:

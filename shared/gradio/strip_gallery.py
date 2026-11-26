@@ -1657,14 +1657,14 @@ window.WangpWorld = window.WangpWorld || (function () {
   function showClip(url) {
     // the clips are shown one after the other, each in full: a clip that arrives while the previous one still waits for its turn (a model
     // faster than playback) queues behind it instead of replacing it
-    const viewer = session.viewer;
-    session.clips = (session.clips || Promise.resolve()).then(() => presentClip(viewer, url));
+    const current = session;
+    current.clips = (current.clips || Promise.resolve()).then(() => presentClip(current, url));
   }
   function lastFrameShown(video) {
     // resolves when the video's last frame has been on screen for one frame: its 'ended' event comes later (a visible hitch between
-    // clips); a video already ended or paused (the world's own video at its end) resolves at once
+    // clips). The gallery video is already at the world's end; a move may still be starting or paused by the viewer.
     return new Promise((resolve) => {
-      if (video.ended || video.paused && !(session && session.resumed)) { resolve(); return; }
+      if (video === session.worldVideo || video.ended) { resolve(); return; }
       video.addEventListener('ended', resolve, {once: true});
       if (!video.requestVideoFrameCallback) return;
       let previous = null;
@@ -1677,29 +1677,28 @@ window.WangpWorld = window.WangpWorld || (function () {
       video.requestVideoFrameCallback(check);
     });
   }
-  function presentClip(viewer, url) {
-    // the clip loads in a second video under the shown one and takes its place once loaded and once the shown clip's last frame has
-    // been shown: no blank or stale frame, no pause between clips; nothing changes while the viewer paused (double Esc).
-    // The hidden video never plays before its turn: the world's own video, which serves as the second one from the second move on,
-    // autoplays, and would otherwise run the clip while hidden and show it from its middle or its end
-    if (!session || session.viewer !== viewer) return;
-    const shown = viewer.querySelector('.world-video:not(.world-buffer)');
-    let next = viewer.querySelector('.world-video.world-buffer');
-    if (!next) {
-      next = document.createElement('video');
-      next.className = 'world-video world-buffer'; next.muted = true; next.playsInline = true;
-      shown.before(next);
-    }
-    next.autoplay = false; next.loop = false;
-    const loaded = new Promise((resolve) => { next.addEventListener('loadeddata', resolve, {once: true}); next.addEventListener('error', resolve, {once: true}); });
+  async function presentClip(current, url) {
+    if (session !== current) return;
+    const shown = current.viewer.querySelector('.world-video:not(.world-buffer)');
+    // A reused video can paint its poster or its previous source at a join. Give each move its own
+    // poster-free video and prepare its first frame underneath the outgoing clip.
+    const next = document.createElement('video');
+    next.className = 'world-video world-buffer'; next.muted = true; next.playsInline = true; next.preload = 'auto';
+    shown.before(next);
+    const ready = new Promise((resolve) => {
+      next.addEventListener('error', resolve, {once: true});
+      if (next.requestVideoFrameCallback) next.requestVideoFrameCallback(resolve);
+      else next.addEventListener('loadeddata', resolve, {once: true});
+    });
     const ended = lastFrameShown(shown);
     next.src = url;
-    return Promise.all([loaded, ended]).then(() => session && session.viewer === viewer && session.resumed).then(() => {
-      if (!session || session.viewer !== viewer || next.getAttribute('src') !== url || next.error) return;
-      shown.pause(); shown.classList.add('world-buffer'); next.classList.remove('world-buffer');
-      next.before(shown);  // the next clip loads underneath (painted before it in the page): never a stale frame of a hidden video at a switch
-      next.play().catch(() => {});
-    });
+    await Promise.all([ready, ended]);
+    await current.resumed;
+    if (session !== current) return;
+    if (next.error) { next.remove(); return; }
+    shown.pause(); shown.remove();
+    next.classList.remove('world-buffer');
+    next.play().catch(() => {});
   }
   function showKeys() {
     if (!session) return;
@@ -1740,7 +1739,7 @@ window.WangpWorld = window.WangpWorld || (function () {
     const resolve = session.resume;
     session.resumed = session.resume = null;
     const shown = session.viewer.querySelector('.world-video:not(.world-buffer)');
-    if (shown && !shown.ended && shown.currentTime < shown.duration - 0.01) shown.play().catch(() => {});
+    if (shown !== session.worldVideo && !shown.ended) shown.play().catch(() => {});
     status('');
     resolve();
   }
@@ -1807,16 +1806,14 @@ window.WangpWorld = window.WangpWorld || (function () {
   function start(viewer) {
     if (session) leave();
     const choice = (name) => viewer.querySelector('.world-' + name + ' select').value;
-    session = {viewer: viewer, path: viewer.dataset.world, layout: JSON.parse(viewer.dataset.controls), held: new Set(), pressed: new Set(), queue: [], inflight: 0, seq: 0, nextClip: 1, clipUrls: {}, heldSince: 0, holdTimer: null, busy: true, ready: false, text: '',
+    const video = viewer.querySelector('.world-video');  // restored to the gallery on leaving
+    session = {viewer: viewer, worldVideo: video, path: viewer.dataset.world, layout: JSON.parse(viewer.dataset.controls), held: new Set(), pressed: new Set(), queue: [], inflight: 0, seq: 0, nextClip: 1, clipUrls: {}, heldSince: 0, holdTimer: null, busy: true, ready: false, text: '',
                seconds: parseFloat(choice('seconds')), steps: parseInt(choice('steps')), memory: parseInt(choice('memory')), moves: 0};
     viewer.classList.add('exploring');
-    const video = viewer.querySelector('.world-video');  // the exploration continues from the world's last frame
     video.loop = false; video.pause();
-    // once the world's video is known: this element shows the clips later, which must not be moved to their end
-    const world = video.getAttribute('src');
-    const toEnd = () => { if (session && session.viewer === viewer && video.getAttribute('src') === world) video.currentTime = Math.max(0, video.duration - 0.05); };
+    const toEnd = () => { video.currentTime = Math.max(0, video.duration - 0.05); };
     if (isFinite(video.duration)) toEnd();
-    else video.addEventListener('loadedmetadata', toEnd, {once: true});
+    else if (viewer.dataset.video) video.addEventListener('loadedmetadata', toEnd, {once: true});
     document.addEventListener('keydown', onKey, true);
     document.addEventListener('keyup', onKey, true);
     document.addEventListener('fullscreenchange', onFullscreen);
@@ -1826,7 +1823,7 @@ window.WangpWorld = window.WangpWorld || (function () {
     status('Preparing the world… (the model loads the first time)');
     send({action: 'start', path: session.path, seconds: session.seconds, steps: session.steps, memory: session.memory});
   }
-  function leave(suspend = false) {
+  function leave() {
     if (!session) return;
     if (session.replay) stopReplay();
     const current = session;
@@ -1839,16 +1836,12 @@ window.WangpWorld = window.WangpWorld || (function () {
     document.removeEventListener('keyup', onKey, true);
     document.removeEventListener('fullscreenchange', onFullscreen);
     current.viewer.classList.remove('exploring', 'world-ui-hidden', 'world-ready', 'world-stats-shown');
-    const [video, ...buffers] = current.viewer.querySelectorAll('.world-video');
-    buffers.forEach((buffer) => buffer.remove());
-    video.classList.remove('world-buffer');
-    // back to where the exploration started: the world's video paused at its last frame, or its poster (a world saved without video)
+    const video = current.worldVideo;
+    current.viewer.querySelectorAll('.world-video').forEach((clip) => { if (clip !== video) clip.remove(); });
+    if (video.parentNode !== current.viewer) current.viewer.prepend(video);
+    // The gallery keeps its own video at the end of the world, including its poster for a world saved without video.
     video.loop = true; video.autoplay = false;
     video.pause();
-    if (!suspend && current.viewer.dataset.video) {
-      video.src = current.viewer.dataset.video;
-      video.addEventListener('loadedmetadata', () => { video.currentTime = Math.max(0, video.duration - 0.05); }, {once: true});
-    } else if (!suspend) { video.removeAttribute('src'); video.load(); }
     if (document.fullscreenElement === current.viewer) document.exitFullscreen().catch(() => {});
     send({action: 'leave', path: current.path});
   }
@@ -1982,7 +1975,7 @@ window.WangpWorld = window.WangpWorld || (function () {
     connectedCallback() {queueMicrotask(() => {if (this.isConnected) this.refresh();});}
     disconnectedCallback() { this.suspend(); }
     suspend() {
-      if (session?.viewer === this) leave(true);
+      if (session?.viewer === this) leave();
       this.querySelectorAll('video').forEach(video => {video.pause(); video.removeAttribute('src'); video.load();});
       this.suspended = true;
     }

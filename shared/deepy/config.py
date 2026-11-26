@@ -661,13 +661,8 @@ def estimate_deepy_kv_cache_mb(enhancer_enabled: Any, context_tokens: Any, kv_ca
     block_size = max(1, int(spec.get("kvcache_block_size", 256) or 256))
     num_blocks = (tokens + block_size - 1) // block_size
     layers, heads, head_dim = int(spec["num_kv_cache_layers"]), int(spec["num_key_value_heads"]), int(spec["head_dim"])
-    mode = resolve_deepy_kv_cache_quantization(kv_cache_quantization)[0]
-    if mode:
-        from shared.llm_engines.lmgp.layers.kv_formats import parse_layout
-        layout = parse_layout(mode)
-        total_bytes = num_blocks * block_size * layout.body_bytes_per_token(layers, heads, head_dim) + layout.overlay_bytes(layers, heads, head_dim, block_size, 1)
-    else:
-        total_bytes = 2 * layers * num_blocks * block_size * heads * head_dim * int(spec["dtype_bytes"])
+    from shared.llm_engines.lmgp.layers.kv_formats import paged_kv_bytes
+    total_bytes = paged_kv_bytes(layers, heads, head_dim, num_blocks * block_size, resolve_deepy_kv_cache_quantization(kv_cache_quantization)[0], block_size, int(spec["dtype_bytes"]))
     return _DEEPY_QWEN_VARIANT_LABELS.get(enhancer_no, "Qwen3.5"), int(round((total_bytes + spec.get("fixed_bytes", 0)) / (1024 * 1024)))
 
 

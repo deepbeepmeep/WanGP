@@ -16,6 +16,7 @@ limitations under the License.
 """
 
 import sys
+from functools import lru_cache
 import torch
 from tqdm import tqdm
 
@@ -224,9 +225,8 @@ def _attn_false_low_shared_masked(q, k, v, q_scale, k_scale, tensor_layout="HND"
     return o, lse
 
 
-def sageattn_attention_mask_support_reason(qkv_list=None, attn_mask: torch.Tensor | None = None, device: torch.device | str | None = None, tensor_layout: str = "NHD") -> str | None:
-    if qkv_list is not None:
-        device = qkv_list[0].device
+@lru_cache(None)
+def _device_mask_support_reason(device):
     if not torch.cuda.is_available():
         return "CUDA is unavailable"
     device = torch.device("cuda" if device is None else device)
@@ -240,6 +240,15 @@ def sageattn_attention_mask_support_reason(qkv_list=None, attn_mask: torch.Tenso
             return "installed SageAttention does not expose attn_mask"
     except (TypeError, ValueError):
         return "unable to inspect installed SageAttention mask support"
+    return None
+
+
+def sageattn_attention_mask_support_reason(qkv_list=None, attn_mask: torch.Tensor | None = None, device: torch.device | str | None = None, tensor_layout: str = "NHD") -> str | None:
+    if qkv_list is not None:
+        device = qkv_list[0].device
+    reason = _device_mask_support_reason(device)
+    if reason is not None:
+        return reason
     if qkv_list is None:
         return None
 
@@ -416,9 +425,10 @@ def staged_settings(device, masked=False, scale_v=False, head_dim=128):
     blocks where shared memory is short), None where sageattn uses other kernels. A block recorded for a CUDA graph gets the Triton path
     when the CUDA kernels cannot be captured (cuda_kernels_capturable), as head_dim 256 always does. scale_v: v scaled by powers of two
     on the Triton path."""
-    if 64 < head_dim < 128:
-        settings = staged_settings(device, masked, scale_v)
-        return None if settings is None else {**settings, "padded_dim": 128}
+    if (masked and 0 < head_dim < 64) or 64 < head_dim < 128:
+        padded = 64 if head_dim < 64 else 128
+        settings = staged_settings(device, masked, scale_v, padded)
+        return None if settings is None else {**settings, "padded_dim": padded}
     if head_dim not in (64, 128, 256):
         return None
     if head_dim == 256:
@@ -656,7 +666,17 @@ def staged_attention(out, quantized_list, settings, attn_mask=None, return_lse=F
     if settings["qk_quant_gran"] == "per_block":  # attn_qk_int8_per_block.forward's launch, with out as its output
         b, qo_len, heads, head_dim = q_int8.shape
         kv_len = k_int8.shape[1]
+        empty_rows = None
         if attn_mask is not None:
+            if attn_mask.dtype == torch.bool:
+                empty_rows = ~attn_mask.any(-1, keepdim=True)
+            else:
+                # The Triton scores use exp2. Center in FP32 before converting a natural-log
+                # bias, including finite all-equal biases, and keep excluded first tiles finite.
+                highest = attn_mask.amax(-1, keepdim=True)
+                empty_rows = highest.isneginf()
+                bias = attn_mask.float() - highest.masked_fill(empty_rows, 0)
+                attn_mask = bias.mul_(1.4426950408889634).clamp_min_(-1.e6)
             attn_mask = attn_mask.expand(b, heads, qo_len, kv_len)
         mask = ((attn_mask,), attn_mask.stride()) if attn_mask is not None else ((None,), (0, 0, 0, 0)) if _TRITON_MASK_ARGUMENT else ((), ())
         num_warps, num_stages = settings["launch"] or ((4, 3) if head_dim == 64 else (8, 4))
@@ -685,6 +705,10 @@ def staged_attention(out, quantized_list, settings, attn_mask=None, return_lse=F
         if settings.get("recycle_query") and q_int8.data_ptr() == out.data_ptr():
             torch.autograd.graph.increment_version(out)
         out = out if v_scale is None else scale_output(out, v_scale, 2)
+        if empty_rows is not None:
+            out.masked_fill_(empty_rows.transpose(1, 2), 0)
+            if return_lse:
+                lse.masked_fill_(empty_rows.squeeze(-1), -torch.inf)
         return (out, lse) if return_lse else out
     gran, sm_scale = 3 if settings["qk_quant_gran"] == "per_thread" else 2, settings.get("softmax_dim", head_dim) ** -0.5
     inputs = (q_int8, k_int8, v, out, q_scale, k_scale, v_scale) + ((v_mean,) if settings["pv_accum_dtype"] == "fp32" and settings["smooth_v"] else ())

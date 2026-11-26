@@ -313,7 +313,7 @@ class ShowrunnerToolbox:
         frame = round(model._trim_of(shot)[0] * fps) if at == "start" else round(model._plays_until(shot) * fps) - 1
         return media.video_frame(path, min(max(0, frame), frames - 1), target.folder / "media" / "frames")
 
-    def _continuation(self, ctx, target, shot: dict[str, Any], entry: dict[str, Any], settings: dict[str, Any]) -> int:
+    def _continuation(self, ctx, target, shot: dict[str, Any], entry: dict[str, Any], settings: dict[str, Any], song_slice: list[float] | None) -> int:
         """A continued shot's start: the last frames the edit plays of the shot before it (its overlap, with their sound), as the video WanGP continues,
         asked for the shot's own frames after them. Returns how many frames of the output are that start, which the take leaves out."""
         doc = target.snapshot()
@@ -333,9 +333,9 @@ class ShowrunnerToolbox:
                              f"Make {before['id']} longer, or let {shot['id']} start on its own.")
         clip = media.video_window(target.resolve(take["path"]), end - shared, shared, fps, target.folder / "media" / "continued")
         if guide := settings.get("audio_guide"):  # WanGP reads the driving audio from the first shared frame: the shared frames' sound comes first, or the lips run early
-            folder, lead, part, song = target.folder / "media" / "slices", shared / fps, shot.get("audio_slice"), target.resolve(doc["brief"].get("song"))
-            if part and song is not None and ctx.resolve(guide) == media.audio_slice(song, float(part[0]), float(part[1]), folder) and float(part[0]) >= lead:
-                guide = media.audio_slice(song, float(part[0]) - lead, float(part[1]), folder)  # the song under the shared frames: on the song, the shot before it ends where this slice starts
+            folder, lead = target.folder / "media" / "slices", shared / fps
+            if song_slice and song_slice[0] >= lead:
+                guide = media.audio_slice(target.resolve(doc["brief"]["song"]), song_slice[0] - lead, song_slice[1], folder)
             else:
                 guide = media.prefixed_audio(clip, ctx.resolve(guide), shared, fps, folder)  # a line, the user's recording: after the sound the shot before it ends on
             settings["audio_guide"] = ctx.virtualize(str(guide))
@@ -368,13 +368,40 @@ class ShowrunnerToolbox:
         settings, doc = self._generation(ctx, target, shot, final), target.snapshot()
         return self.showrunner.with_cast_loras(doc, shot, templates.resolve(self._catalog(doc), settings["template"]), settings)
 
+    @staticmethod
+    def _slice_song(ctx, target, doc: dict[str, Any], shot: dict[str, Any], settings: dict[str, Any]) -> list[float] | None:
+        """A guide pointing at the production song plays the shot's excerpt. A separate recording already has its own time base."""
+        song, guide = target.resolve(doc["brief"].get("song")), settings.get("audio_guide")
+        if song is None or not guide or ctx.resolve(guide).resolve() != song.resolve():
+            return None
+        part = shot.get("audio_slice")
+        if part is None:
+            if doc["edit"]["audio_mode"] not in ("song", "mix"):
+                return None
+            place = next((item for item in model.timeline(doc) if item["shot"] == shot["id"]), None)
+            if place is None:
+                raise ValueError(f"{shot['id']} is outside the edit: set its audio_slice to choose the part of the song to shoot.")
+            start = round(float(doc["edit"].get("song_start_s") or 0.0) + place["start_s"] - model._trim_of(shot)[0], 3)
+            if start < 0:
+                raise ValueError(f"{shot['id']}'s trim would start its take before the song: set its audio_slice or change its trim.")
+            part = [start, round(start + model.take_length(doc, shot), 3)]
+        start, end = part
+        settings["audio_guide"] = ctx.virtualize(str(media.audio_slice(song, start, end, target.folder / "media" / "slices")))
+        return part
+
     def _validate(self, ctx, target, shot_ids: list[str]) -> tuple[list[str], dict[str, dict[str, float | None]]]:
         """The listed shots' settings checked as render will send them (drawn and locked shots skipped): their problems, one line per shot ("s4: ..."),
         and what they will render at as the validator measures it, {size: {shot: seconds}}."""
         problems, batch = [], []
-        for shot in [item for item in target.snapshot()["shots"] if item["id"] in shot_ids and not item["locked"] and item["generation"].get("template") != templates.DRAWN]:
+        doc = target.snapshot()
+        for shot in [item for item in doc["shots"] if item["id"] in shot_ids and not item["locked"] and item["generation"].get("template") != templates.DRAWN]:
+            if issue := model.song_range_issue(shot):
+                problems.append(issue)
+                continue
             try:
-                batch.append((shot["id"], self._generation_with_loras(ctx, target, shot)[0]))
+                settings, _ = self._generation_with_loras(ctx, target, shot)
+                self._slice_song(ctx, target, doc, shot, settings)
+                batch.append((shot["id"], settings))
             except Exception as error:
                 problems.append(f"{shot['id']}: {error}")
         found, renders = self._check_settings(ctx, batch) if batch else ([], {})
@@ -722,6 +749,8 @@ class ShowrunnerToolbox:
         shot = model.find(target.snapshot()["shots"], shot_id, "shot")
         if shot["locked"] and by == "deepy":
             return {"shot": shot_id, "error": "locked by the user"}
+        if issue := model.song_range_issue(shot):
+            return {"shot": shot_id, "error": issue}
         if shot["generation"].get("template") == templates.DRAWN:
             return {"shot": shot_id, "error": "a drawn shot: draw it with draw_svg and record it with record_take (or record_take card=...)"}
         doc = target.snapshot()
@@ -754,11 +783,8 @@ class ShowrunnerToolbox:
         follows = model.chosen_take(shot) if final and not new_seed else None
         if follows is not None and follows.get("kind", "video") == "video" and (seed := media.generation_seed(target.resolve(follows["path"]))) is not None:
             settings["seed"] = seed  # the take you approved at its draft size
-        song = target.resolve(target.snapshot()["brief"].get("song"))
-        if shot.get("audio_slice") and song is not None and settings.get("audio_guide") == ctx.virtualize(str(song)):
-            start_s, end_s = shot["audio_slice"]  # the song drives the shot: its own slice, not the song from the start
-            settings["audio_guide"] = ctx.virtualize(str(media.audio_slice(song, float(start_s), float(end_s), target.folder / "media" / "slices")))
-        elif settings.get("audio_guide") and shot.get("duration_s"):  # a line shorter than its shot: silence after it, or the model invents more speech
+        song_slice = self._slice_song(ctx, target, doc, shot, settings)
+        if not song_slice and not shot.get("audio_slice") and settings.get("audio_guide") and shot.get("duration_s"):  # an independent recording sets its shot's length
             guide = ctx.resolve(settings["audio_guide"])
             if (part := shot.get("audio_part")) and (shot["generation"].get("settings") or {}).get("audio_guide"):  # a part of a split shot: its seconds of the shot's audio
                 end_s = float(part[1]) if part[1] is not None else media.probe(guide)["duration_s"]
@@ -783,14 +809,17 @@ class ShowrunnerToolbox:
         shared = 0
         if shot.get("continues"):
             try:
-                shared = self._continuation(ctx, target, shot, entry, settings)
+                shared = self._continuation(ctx, target, shot, entry, settings, song_slice)
             except ValueError as error:
                 return {"shot": shot_id, "error": str(error)}
         links = model.frame_links(target.snapshot(), shot)  # what it is made from, to tell when one of them changes
-        if new_seed:
+        if new_seed is not False:
             settings["seed"] = -1 if new_seed is True else int(new_seed)
         ctx.progress(done=index, total=total, text=f"Rendering {shot_id} ({index + 1}/{total})", force=True)
-        target.apply([{"op": "update_shot", "shot": shot_id, "fields": {"status": "rendering"}}], by=by, record=False)
+        fields = {"status": "rendering"}
+        if song_slice and not shot.get("audio_slice"):
+            fields["audio_slice"] = song_slice  # keep the take anchored to its song position for subsequent edits and splits
+        target.apply([{"op": "update_shot", "shot": shot_id, "fields": fields}], by=by, record=False)
         started = time.time()
         try:
             response = ctx.call("wangp_generate", {"settings": settings})
