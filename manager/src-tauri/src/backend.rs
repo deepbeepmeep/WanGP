@@ -33,6 +33,10 @@ struct LaunchOptions {
 impl Default for LaunchOptions {
     fn default() -> Self { Self { listen: false, verbose: false, authentication: false, password_mode: "generated".into(), debug_deepy: false, debug_directory: String::new(), telemetry: false, telemetry_file: String::new() } }
 }
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum AppWindowMode { #[default] Windowed, Maximized, Fullscreen }
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Preferences {
     schema_version: u32,
@@ -43,6 +47,8 @@ struct Preferences {
     launch_options: LaunchOptions,
     #[serde(default)]
     authentication_secret: Option<Vec<u8>>,
+    #[serde(default)]
+    app_window_mode: AppWindowMode,
     /// The App window's web engine draws without the graphics card, leaving its memory to WanGP.
     #[serde(default)]
     app_without_gpu: bool,
@@ -52,7 +58,7 @@ struct Preferences {
     github_opened: bool,
 }
 impl Default for Preferences {
-    fn default() -> Self { Self { schema_version: 1, installations: vec![], selected: None, port: 7860, launch_options: LaunchOptions::default(), authentication_secret: None, app_without_gpu: false, github_opened: false } }
+    fn default() -> Self { Self { schema_version: 1, installations: vec![], selected: None, port: 7860, launch_options: LaunchOptions::default(), authentication_secret: None, app_window_mode: AppWindowMode::default(), app_without_gpu: false, github_opened: false } }
 }
 const PROJECT_PAGE: &str = "https://github.com/deepbeepmeep/WanGP";
 /// WebView2 fixes its browser arguments for every window of the Manager when the first one opens: wry's defaults,
@@ -446,11 +452,12 @@ fn updated_launch_preferences(preferences: &Preferences, data: &Path, mut option
 }
 
 #[tauri::command]
-fn set_launch_options(window: WebviewWindow, state: tauri::State<AppState>, options: LaunchOptions, password: Option<String>, port: Option<u16>, app_without_gpu: Option<bool>) -> Result<Value, String> {
+fn set_launch_options(window: WebviewWindow, state: tauri::State<AppState>, options: LaunchOptions, password: Option<String>, port: Option<u16>, app_without_gpu: Option<bool>, app_window_mode: Option<AppWindowMode>) -> Result<Value, String> {
     authorize(&window)?;
     let mut preferences = state.preferences.lock().unwrap();
     let mut next = updated_launch_preferences(&preferences, &state.data, options, password, port)?;
     if let Some(value) = app_without_gpu { next.app_without_gpu = value; }
+    if let Some(mode) = app_window_mode { next.app_window_mode = mode; }
     save_preferences(&state, &next)?; *preferences = next;
     Ok(preferences_view(&preferences))
 }
@@ -557,7 +564,9 @@ async fn open_server(window: WebviewWindow, app: tauri::AppHandle, state: tauri:
             }
             let origin = parsed.origin().ascii_serialization();
             let title = format!("WanGP App - {installation_name}");
+            let mode = state.preferences.lock().unwrap().app_window_mode;
             let builder = tauri::WebviewWindowBuilder::new(&app, label, WebviewUrl::External(parsed)).title(&title).inner_size(1280.0, 850.0)
+                .maximized(mode == AppWindowMode::Maximized).fullscreen(mode == AppWindowMode::Fullscreen)
                 .disable_drag_drop_handler();  // the web view keeps its own drag and drop: pages drag their items and take dropped files, as in a browser
             #[cfg(windows)]
             let builder = if state.app_without_gpu { builder.additional_browser_args(WITHOUT_GPU_ARGUMENTS) } else { builder };
@@ -618,6 +627,7 @@ mod tests {
     #[test]
     fn existing_preferences_default_to_no_extra_launch_options() {
         let mut preferences: Preferences = serde_json::from_value(json!({"schema_version":1,"installations":[],"selected":null,"port":7866})).unwrap();
+        assert!(preferences.app_window_mode == AppWindowMode::Windowed);
         assert!(!preferences.launch_options.listen && !preferences.launch_options.verbose && !preferences.launch_options.authentication);
         preferences.launch_options = LaunchOptions { listen:true, verbose:true, authentication:true, ..LaunchOptions::default() };
         let restored: Preferences = serde_json::from_slice(&serde_json::to_vec(&preferences).unwrap()).unwrap();
