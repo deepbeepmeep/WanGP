@@ -8738,6 +8738,7 @@ def generate_media(
                     frames_to_inject = {pos: image_refs[i] for i, pos in enumerate(frames_positions_list)}
 
             video_guide_processed = video_mask_processed = video_guide_processed2 = video_mask_processed2 = video_guide_processed3 = sparse_video_image = None
+            _ltx2_inpaint_independent_window = False
             skip_video_guide_preprocess = model_def.get("skip_video_guide_preprocess", False)  # True, or video_prompt_type letters that make the model read the guide itself
             skip_video_guide_preprocess = any_letters(video_prompt_type, skip_video_guide_preprocess) if isinstance(skip_video_guide_preprocess, str) else bool(skip_video_guide_preprocess)
             if video_guide is not None and not skip_video_guide_preprocess:
@@ -8745,8 +8746,19 @@ def generate_media(
                 keep_frames_parsed_full, error = parse_keep_frames_video_guide(keep_frames_video_guide, guide_frames_limit)
                 if len(error) > 0:
                     raise gr.Error(f"invalid keep frames {keep_frames_video_guide}")
+                _ltx2_inpaint_independent_window = (
+                    window_no > 1
+                    and str(base_model_type).lower().startswith("ltx2")
+                    and video_mask is not None
+                    and any_mask
+                )
+                if _ltx2_inpaint_independent_window:
+                    # Later inpaint windows must condition from their complete overlap
+                    # guide. Hard-prefix conditioning shifts LTX2's causal video state
+                    # at the first generated frame and creates a duplicated subject.
+                    extract_guide_from_window_start = True
                 guide_frames_extract_start = 0 if reference_videos else aligned_window_start_frame if extract_guide_from_window_start else aligned_guide_start_frame
-                extra_control_frames = model_def.get("extra_control_frames", 0)
+                extra_control_frames = 0 if _ltx2_inpaint_independent_window else model_def.get("extra_control_frames", 0)
                 if extra_control_frames > 0 and aligned_guide_start_frame >= extra_control_frames: guide_frames_extract_start -= extra_control_frames
                         
                 keep_frames_parsed = [True] * -guide_frames_extract_start if guide_frames_extract_start  <0 else []
@@ -9023,6 +9035,9 @@ def generate_media(
                 input_video_for_model = None if new_shot else pre_video_guide
                 input_video_is_hdr = pre_video_guide_is_hdr
                 prefix_frames_count = 0 if new_shot else source_video_overlap_frames_count if window_no <= 1 else reuse_frames
+                if _ltx2_inpaint_independent_window:
+                    input_video_for_model = None
+                    prefix_frames_count = 0
                 prefix_video_for_model = None if model_def.get("joyai_echo", False) or str(base_model_type).startswith("ltx2") else prefix_video
                 if new_shot:
                     prefix_video_for_model = None
