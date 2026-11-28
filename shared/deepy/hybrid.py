@@ -374,8 +374,8 @@ class HybridService(DeepyService):
         import gradio as gr
         # The revisioned view refresh publishes current state to every browser.
         # A late Gradio callback must not replay an earlier generation's selection.
-        # Gallery tabs, current tab, image/video gallery, 3 values per strip gallery, then 6 generation controls.
-        return (gr.update(),) * (3 + 3 * len(STRIP_SOURCES) + 6)
+        # Gallery tabs, current tab, image/video gallery, 3 values per strip gallery, then 7 generation controls.
+        return (gr.update(),) * (3 + 3 * len(STRIP_SOURCES) + 7)
 
     def close(self):
         plugin_jobs.detach_service(self)

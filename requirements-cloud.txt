@@ -1,0 +1,42 @@
+# Wan2GP Cloud Client Minimal Requirements
+# Designed for lightweight client UI running against remote Cloud GPU workers (Modal, RunPod, HTTP)
+# No PyTorch, CUDA, or local GPU compilation required on the client machine.
+
+# UI & Web Server
+gradio==5.29.0
+gradio_rangeslider
+fastapi>=0.110.0
+uvicorn>=0.28.0
+
+# HTTP Client
+requests>=2.31.0
+httpx>=0.25.0
+
+# Serialization, Data & Imaging
+pydantic==2.11.10
+pillow>=10.0.0
+numpy>=1.24.0
+opencv-python-headless>=4.8.0
+piexif
+imageio>=2.30.0
+imageio-ffmpeg
+soundfile>=0.12.0
+xxhash>=3.0.0
+
+# Config, Text & Logging Utilities
+tqdm
+loguru
+omegaconf
+markdown
+regex
+typing-extensions>=4.8.0
+
+# Cloud Providers (RunPod & Modal)
+modal>=0.63.0
+runpod>=1.7.0
+
+# Deepy & Remote LLM Providers (OpenCode, Claude Code, FastMCP)
+# mcp 1.28+ requires pydantic>=2.12 on Python 3.14, but gradio 5.29 requires pydantic<2.12.
+mcp==1.27.2
+claude-agent-sdk==0.1.66
+

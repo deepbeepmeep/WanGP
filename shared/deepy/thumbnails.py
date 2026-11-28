@@ -26,11 +26,14 @@ async def render_thumbnail(path):
 
 
 def thumbnail(path):
-    path = os.path.normcase(os.path.abspath(path))
-    stat = Path(path).stat()
-    preview = Path(path).with_suffix('.png') if has_mesh_file_extension(path) else None
-    preview_stat = preview.stat() if preview and preview.is_file() else None
-    return _thumbnail(path, stat.st_mtime_ns, stat.st_size, (preview_stat.st_mtime_ns, preview_stat.st_size) if preview_stat else None)
+    try:
+        path = os.path.normcase(os.path.abspath(path))
+        stat = Path(path).stat()
+        preview = Path(path).with_suffix('.png') if has_mesh_file_extension(path) else None
+        preview_stat = preview.stat() if preview and preview.is_file() else None
+        return _thumbnail(path, stat.st_mtime_ns, stat.st_size, (preview_stat.st_mtime_ns, preview_stat.st_size) if preview_stat else None)
+    except Exception:
+        return None
 
 
 @lru_cache(maxsize=256)
