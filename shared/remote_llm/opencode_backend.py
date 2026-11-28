@@ -96,7 +96,13 @@ class OpenCodeBackend:
 
     def __init__(self, profile: dict[str, Any], toolbox: Any | None = None) -> None:
         self.profile = dict(profile or {})
-        self.base_url = str(self.profile.get("base_url", "http://127.0.0.1:4096") or "").rstrip("/")
+        base_url = (
+            self.profile.get("base_url")
+            or os.environ.get("OPENCODE_SERVER_URL")
+            or os.environ.get("OPENCODE_URL")
+            or "http://127.0.0.1:4096"
+        )
+        self.base_url = str(base_url).rstrip("/")
         self.toolbox = toolbox
         self._process: subprocess.Popen[str] | None = None
         self._api = 1  # the server's API, read by _ensure_server
@@ -109,11 +115,13 @@ class OpenCodeBackend:
         self._temp_dir = tempfile.TemporaryDirectory(prefix="wangp-opencode-", ignore_cleanup_errors=True)
 
     def _auth(self, api: int | None = None):
+        profile_password = str(self.profile.get("password") or self.profile.get("server_password") or "")
         if (api or self._api) == 2:  # its user is always opencode
-            password = os.environ.get("OPENCODE_PASSWORD", "") or os.environ.get("OPENCODE_SERVER_PASSWORD", "") or _wangp_server_password()
+            password = os.environ.get("OPENCODE_PASSWORD", "") or os.environ.get("OPENCODE_SERVER_PASSWORD", "") or profile_password or _wangp_server_password()
             return ("opencode", password) if password else None
-        password = os.environ.get("OPENCODE_SERVER_PASSWORD", "")
-        return (os.environ.get("OPENCODE_SERVER_USERNAME", "opencode"), password) if password else None
+        password = os.environ.get("OPENCODE_SERVER_PASSWORD", "") or profile_password
+        username = os.environ.get("OPENCODE_SERVER_USERNAME", "") or str(self.profile.get("username") or self.profile.get("server_username") or "opencode")
+        return (username, password) if password else None
 
     def _request(self, method: str, path: str, **kwargs):
         request_payload = {"method": method, "path": path}
@@ -280,7 +288,8 @@ class OpenCodeBackend:
                 raise
 
     def _model(self) -> dict[str, str] | None:
-        provider, model = str(self.profile.get("provider", "") or "").strip(), str(self.profile.get("model", "") or "").strip()
+        model = str(self.profile.get("model", "") or os.environ.get("OPENCODE_MODEL", "")).strip()
+        provider = str(self.profile.get("provider", "") or os.environ.get("OPENCODE_PROVIDER", "opencode" if model else "")).strip()
         return {"providerID": provider, "modelID": model} if provider and model else None
 
     def _context_window(self, info: dict[str, Any] | None = None) -> int:
@@ -494,6 +503,12 @@ class OpenCodeBackend:
         if error_box and not self._abort:
             self._call_tool = None
             raise error_box[0]
+        info_err = result_box.get("info", {}).get("error") if isinstance(result_box, dict) else None
+        if info_err and not self._abort:
+            self._call_tool = None
+            err_data = info_err.get("data", {}) if isinstance(info_err, dict) else {}
+            msg = err_data.get("message") or info_err.get("message") or str(info_err)
+            raise RuntimeError(f"OpenCode API error: {msg}")
         answer = self._answer_text(result_box)
         final_parts = [part for part in result_box.get("parts", []) if isinstance(part, dict) and part.get("type") == "text"]
         if final_parts:

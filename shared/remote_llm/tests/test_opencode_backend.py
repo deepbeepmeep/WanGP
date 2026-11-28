@@ -173,5 +173,42 @@ class OpenCodeBackendTests(unittest.TestCase):
         self.assertEqual(backend._session_id, "session-1")
 
 
+    def test_env_and_profile_fallbacks(self):
+        with patch.dict("os.environ", {
+            "OPENCODE_SERVER_URL": "http://127.0.0.1:4097/",
+            "OPENCODE_MODEL": "big-pickle",
+            "OPENCODE_PROVIDER": "opencode",
+            "OPENCODE_SERVER_PASSWORD": "",
+            "OPENCODE_SERVER_USERNAME": "",
+        }, clear=False):
+            backend = OpenCodeBackend({"username": "u1", "password": "p1"})
+            self.addCleanup(backend.close)
+            self.assertEqual(backend.base_url, "http://127.0.0.1:4097")
+            self.assertEqual(backend._model(), {"providerID": "opencode", "modelID": "big-pickle"})
+            self.assertEqual(backend._auth(api=1), ("u1", "p1"))
+            self.assertEqual(backend._auth(api=2), ("opencode", "p1"))
+
+    def test_info_error_raises_runtime_error(self):
+        backend = OpenCodeBackend({"model_catalog": [{"provider": "opencode", "model": "free"}]})
+        self.addCleanup(backend.close)
+        backend._session_id = "ses_err"
+        backend._ensure_session = lambda *_args: None
+
+        def request(_method, path, **_kwargs):
+            if path.endswith("/message"):
+                return {"info": {"error": {"data": {"message": "FreeTier error"}}}, "parts": []}
+            return True
+
+        class Events:
+            encoding = ""
+            def raise_for_status(self): pass
+            def close(self): pass
+            def iter_lines(self, *, decode_unicode=False): return iter(())
+
+        backend._request = request
+        with patch("shared.remote_llm.opencode_backend.requests.get", return_value=Events()), self.assertRaisesRegex(RuntimeError, "OpenCode API error: FreeTier error"):
+            backend.run_turn("hi", system_prompt="sys", tools=[], images=[], on_event=lambda _e: None, call_tool=lambda *_a: {}, should_stop=lambda: False)
+
+
 if __name__ == "__main__":
     unittest.main()
