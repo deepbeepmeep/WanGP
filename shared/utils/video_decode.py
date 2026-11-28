@@ -86,15 +86,21 @@ def _resample_frame_indices(video_fps, video_frames_count, max_target_frames_cou
     return frame_ids[:max_target_frames_count]
 
 
+def _is_executable_file(path: str) -> bool:
+    if not path or not os.path.isfile(path):
+        return False
+    return True if os.name == "nt" else os.access(path, os.X_OK)
+
+
 def _media_binary_candidates(binary_name: str):
     env_map = {"ffmpeg": "FFMPEG_BINARY", "ffprobe": "FFPROBE_BINARY", "ffplay": "FFPLAY_BINARY"}
     binary_path = os.environ.get(env_map.get(binary_name, ""), "")
-    if os.path.isfile(binary_path):
+    if _is_executable_file(binary_path):
         yield os.path.abspath(binary_path)
     repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     executable = binary_name + (".exe" if os.name == "nt" else "")
     candidate = os.path.join(repo_root, "ffmpeg_bins", executable)
-    if os.path.isfile(candidate):
+    if _is_executable_file(candidate):
         yield candidate
     if candidate := shutil.which(executable) or shutil.which(binary_name):
         yield os.path.abspath(candidate)
@@ -111,6 +117,25 @@ def _resolve_media_binary(binary_name: str):
 
 def resolve_media_binary(binary_name: str):
     return _resolve_media_binary(binary_name)
+
+
+_FFMPEG_PASSTHROUGH_CACHE: dict[str, list[str]] = {}
+
+
+def ffmpeg_passthrough_args(ffmpeg_path: str) -> list[str]:
+    """Return -fps_mode passthrough on FFmpeg 5.1+ or -vsync passthrough on FFmpeg 4.x."""
+    cached = _FFMPEG_PASSTHROUGH_CACHE.get(ffmpeg_path)
+    if cached is not None:
+        return cached
+    args = ["-vsync", "passthrough"]
+    try:
+        res = subprocess.run([ffmpeg_path, "-h", "long"], stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=5)
+        if "-fps_mode" in (res.stdout or "") + (res.stderr or ""):
+            args = ["-fps_mode", "passthrough"]
+    except Exception:
+        pass
+    _FFMPEG_PASSTHROUGH_CACHE[ffmpeg_path] = args
+    return args
 
 
 def _hdr_ffmpeg_candidates():
@@ -542,7 +567,7 @@ def _decode_contiguous_video_frames_ffmpeg(video_path, start_frame, max_frames, 
     if len(video_filter) > 0:
         cmd += ["-vf", video_filter]
     out_pix_fmt = "gbrpf32le" if hdr_linear else "rgb24"
-    cmd += ["-fps_mode", "passthrough", "-frames:v", str(requested_frames), "-f", "rawvideo", "-pix_fmt", out_pix_fmt, "pipe:1"]
+    cmd += [*ffmpeg_passthrough_args(ffmpeg_path), "-frames:v", str(requested_frames), "-f", "rawvideo", "-pix_fmt", out_pix_fmt, "pipe:1"]
     process = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**7)
     frame_bytes = metadata["display_width"] * metadata["display_height"] * 3 * (4 if hdr_linear else 1)
     frame_dtype = np.float32 if hdr_linear else np.uint8
@@ -625,7 +650,7 @@ def decode_video_frame_indices_ffmpeg(video_path, frame_indices, bridge="torch",
         cmd += ["-ss", f"{float(metadata.get('start_time') or 0.0) + (actual_start / fps_float):.12g}"]
     cmd += ["-i", decode_path, "-an", "-sn", "-vf", video_filter]
     out_pix_fmt = "gbrpf32le" if hdr_linear else "rgb24"
-    cmd += ["-fps_mode", "passthrough", "-frames:v", str(len(unique_indices)), "-f", "rawvideo", "-pix_fmt", out_pix_fmt, "pipe:1"]
+    cmd += [*ffmpeg_passthrough_args(ffmpeg_path), "-frames:v", str(len(unique_indices)), "-f", "rawvideo", "-pix_fmt", out_pix_fmt, "pipe:1"]
     process = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10**7)
     frame_bytes = metadata["display_width"] * metadata["display_height"] * 3 * (4 if hdr_linear else 1)
     frame_dtype = np.float32 if hdr_linear else np.uint8
