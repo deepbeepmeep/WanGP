@@ -105,6 +105,7 @@ def _collect_specs(state_dict, metadata=None):
         if correction is not None and tuple(correction.shape) != (logical_k // group_size, weight.shape[0]):
             raise ValueError(f"Invalid W4A8 correction shape for '{base}': {tuple(correction.shape)}")
         specs.append({"name": base, "weight": weight, "s_rel": s_rel, "s_channel": s_channel, "codebook": codebook,
+                      "byte_scale_is_fp8": base in layers and config.get("format") == HANDLER_NAME and s_rel.dtype == torch.uint8,
                       "correction": correction, "group_size": group_size, "convrot_group_size": convrot_group_size})
     return specs
 
@@ -123,7 +124,9 @@ def convert_to_quanto(state_dict, default_dtype, verboseLevel=1, detection=None,
     for spec in specs:
         base = spec["name"]
         state_dict[base + ".weight._data"] = state_dict.pop(base + ".weight")
-        state_dict[base + ".weight._s_rel"] = state_dict.pop(base + ".weight_s_rel")
+        scale = state_dict.pop(base + ".weight_s_rel")
+        # Comfy's asym_w4a8_int8 stores E4M3FN bits in byte scales. Shape-only matches are ambiguous.
+        state_dict[base + ".weight._s_rel"] = scale.view(torch.float8_e4m3fn) if spec["byte_scale_is_fp8"] else scale
         state_dict[base + ".weight._s_channel"] = state_dict.pop(base + ".weight_s_channel")
         if spec["codebook"] is not None:
             state_dict[base + ".weight._codebook"] = state_dict.pop(base + ".weight_codebook")
