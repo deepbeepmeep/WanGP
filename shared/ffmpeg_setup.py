@@ -109,20 +109,28 @@ def download_ffmpeg(bin_directory: typing.Optional[typing.Union[str, Path]] = No
         if str(bin_dir) not in ld_parts:
             os.environ["LD_LIBRARY_PATH"] = os.pathsep.join([str(bin_dir)] + ld_parts) if current_ld else str(bin_dir)
 
+    def _is_executable(path: Path) -> bool:
+        if not path.is_file():
+            return False
+        if os.name == "nt":
+            return True
+        return os.access(path, os.X_OK)
+
     _quarantine_root_ffmpeg()
-    _ensure_bin_dir_on_path()
+    if _is_executable(bin_dir / _candidate_name("ffmpeg")):
+        _ensure_bin_dir_on_path()
+        _ensure_library_path()
     _ensure_decord_dll_directory()
-    _ensure_library_path()
 
     def _resolve_path(name: str) -> typing.Optional[Path]:
-        # Check ffmpeg_bins folder first
+        # Check ffmpeg_bins folder first (skip if non-executable, e.g. noexec mount)
         candidate = bin_dir / _candidate_name(name)
-        if candidate.exists():
+        if _is_executable(candidate):
             return candidate
         # Check repo root folder (some users put ffmpeg there)
         repo_root = bin_dir.parent
         candidate_root = repo_root / _candidate_name(name)
-        if candidate_root.exists():
+        if _is_executable(candidate_root):
             return candidate_root
         # Fall back to system PATH
         resolved = shutil.which(name)
