@@ -19,7 +19,7 @@ class VideoConditionByReferenceLatent(ConditioningItem):
         positions = get_pixel_coords(
             latent_coords=latent_tools.patchifier.get_patch_grid_bounds(output_shape=latent_shape, device=self.latent.device),
             scale_factors=latent_tools.scale_factors,
-            causal_fix=latent_tools.causal_fix if self.frame_idx == 0 else False,
+            causal_fix=latent_tools.causal_fix,
         ).to(dtype=torch.float32)
 
         frame_idx = self.frame_idx
