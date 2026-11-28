@@ -163,7 +163,16 @@ def _run_tasks_worker(session, wgp, tasks: list[dict[str, Any]], stream: AsyncSt
                     if 'workspace_outputs' in task_summary:
                         wgp.generate_media.prepare_workspace(task, session._state)
                         workspace_counts = session._gallery_counts()
-                    success = wgp.generate_media(task, send_cmd, plugin_data=plugin_data, **filtered_params)
+                    from shared.execution import dispatch_generation
+                    result = dispatch_generation(
+                        task,
+                        send_cmd,
+                        state=session._state,
+                        filtered_params=filtered_params,
+                        plugin_data=plugin_data,
+                        local_generator_fn=wgp.generate_media,
+                    )
+                    success = result.success
                 except BaseException as exc:
                     if not task_errors:
                         task_errors.append(session._make_generation_error(exc, task_index=task_index, task_id=task_id, stage="generation"))

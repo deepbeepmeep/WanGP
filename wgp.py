@@ -27,13 +27,21 @@ if p not in sys.path:
     sys.path.insert(0, p)
 from shared import startup_imports; startup_imports.install()  # before any library: parts of them WanGP does not use at startup load on first use
 import logging; logging.basicConfig()  # libraries log warnings and above to the console: one configuring INFO logging of its own (mcp's server) then leaves it as it is
-from shared.native_runtime import preload_preferred_libstdcxx
-preload_preferred_libstdcxx()
-from shared.default_device import set_default_cuda_device_from_arg; set_default_cuda_device_from_arg("gpu")
-from shared.utils.power_throttling import apply_startup_power_throttling; apply_startup_power_throttling(sys.argv, "wgp_config.json")  # before the imports below, which a background console would run throttled
-# # os.environ.pop("TORCH_LOGS", None)  # make sure no env var is suppressing/overriding
-# os.environ["TORCH_LOGS"]= "recompiles"
-import torch._logging as tlog
+from shared.shims import install_cloud_shims, is_cloud_mode_active
+IS_CLOUD_MODE = is_cloud_mode_active()
+if IS_CLOUD_MODE:
+    install_cloud_shims(force=True)
+    os.environ["WAN2GP_MODE"] = "cloud"
+if not IS_CLOUD_MODE:
+    from shared.native_runtime import preload_preferred_libstdcxx
+    preload_preferred_libstdcxx()
+    from shared.default_device import set_default_cuda_device_from_arg; set_default_cuda_device_from_arg("gpu")
+    from shared.utils.power_throttling import apply_startup_power_throttling; apply_startup_power_throttling(sys.argv, "wgp_config.json")  # before the imports below, which a background console would run throttled
+    # # os.environ.pop("TORCH_LOGS", None)  # make sure no env var is suppressing/overriding
+    # os.environ["TORCH_LOGS"]= "recompiles"
+    import torch._logging as tlog
+else:
+    tlog = None
 # tlog.set_logs(recompiles=True, guards=True, graph_breaks=True)
 # from shared.utils.crash_diagnostics import install_wgp_crash_diagnostics; install_wgp_crash_diagnostics(__file__)
 # Ensure plugin-side `import wgp` resolves to this live module instance.
@@ -45,13 +53,21 @@ from shared.asyncio_utils import silence_proactor_connection_reset, use_selector
 use_selector_event_loop()
 silence_proactor_connection_reset()
 
-# ── Apple Silicon MPS patch: MUST come before mmgp import ──
-import torch
-is_mps = sys.platform == 'darwin' and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
-if is_mps:
-    from shared.mps.device_patch import apply_mps_patch
-    apply_mps_patch()
-from shared.cuda_memory import apply_startup_settings, write_vram_debug_report, write_ram_debug_report, ram_debug_mark, release_ram_cache; apply_startup_settings(sys.argv, "wgp_config.json") # VRAM allocator and CUDA stack reserve, before anything initializes CUDA
+if not IS_CLOUD_MODE:
+    import torch
+    is_mps = sys.platform == 'darwin' and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+    if is_mps:
+        from shared.mps.device_patch import apply_mps_patch
+        apply_mps_patch()
+    from shared.cuda_memory import apply_startup_settings, write_vram_debug_report, write_ram_debug_report, ram_debug_mark, release_ram_cache; apply_startup_settings(sys.argv, "wgp_config.json") # VRAM allocator and CUDA stack reserve, before anything initializes CUDA
+else:
+    import torch
+    is_mps = False
+    def write_vram_debug_report(*a, **k): pass
+    def write_ram_debug_report(*a, **k): pass
+    def ram_debug_mark(*a, **k): pass
+    def release_ram_cache(*a, **k): pass
+
 
 import time
 import threading
@@ -65,11 +81,23 @@ from shared.utils.config_store import config_lock, read_config, write_config, wr
 import warnings
 warnings.filterwarnings('ignore', message='Failed to find.*', module='triton')
 warnings.filterwarnings("ignore", message=r"Failed to launch Triton kernels, likely due to missing CUDA toolkit; falling back to a slower .* implementation\.\.\.", category=UserWarning, module=r"whisper\.timing")
-from mmgp import offload, safetensors2, profile_type , quant_router, cuda_graphs, transfer, memory_pressure
-try:
-    import triton
-except ImportError:
-    pass
+if not IS_CLOUD_MODE:
+    from mmgp import offload, safetensors2, profile_type, quant_router, cuda_graphs, transfer, memory_pressure
+    try:
+        import triton
+    except ImportError:
+        pass
+else:
+    class _MockMmgp:
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+    offload = safetensors2 = quant_router = cuda_graphs = transfer = memory_pressure = _MockMmgp()
+    class profile_type:
+        VerylowRAM_LowVRAM = "VerylowRAM_LowVRAM"
+        LowRAM_LowVRAM = "LowRAM_LowVRAM"
+        LowRAM_HighVRAM = "LowRAM_HighVRAM"
+        HighRAM_LowVRAM = "HighRAM_LowVRAM"
+        HighRAM_HighVRAM = "HighRAM_HighVRAM"
 from pathlib import Path
 from shared.tinyvae.media import VideoPreview
 from datetime import datetime
@@ -143,6 +171,14 @@ from shared.deepy import session_store as deepy_session_store
 from shared import extra_settings
 from shared import config_groups as model_config_groups
 from shared import resolutions as resolution_utils
+from shared.execution import (
+    ExecutionMode,
+    GenerationRequest,
+    ExecutionResult,
+    get_execution_adapter,
+    dispatch_generation,
+    CloudConfigurationError,
+)
 import torch
 import gc
 import psutil
@@ -251,24 +287,36 @@ loaded_config = ""
 loaded_compile = "disabled"
 loaded_quantization = None
 reload_needed = True
-_HANDLER_MODULES = [
-    "shared.qtypes.scaled_fp8",
-    "shared.qtypes.nvfp4",
-    "shared.qtypes.mxfp8",
-    "shared.qtypes.bnb_nf4",
-    "shared.qtypes.nunchaku_int4",
-    "shared.qtypes.nunchaku_fp4",
-    "shared.qtypes.asym_w4a8_int8",
-    "shared.qtypes.int8_convrot",
-    "shared.qtypes.gptq_int4",
-    "shared.qtypes.gguf",
-]
-for handler in _HANDLER_MODULES:
-    quant_router.register_handler(handler)
-from shared.qtypes import gguf as gguf_handler
-quant_router.register_file_extension("gguf", gguf_handler)
-from shared.kernels import fp8_backend, int8_backend, kernel_policy, rowmap_linear, scaled_fp16  # rowmap_linear: MMGP row views keep interleaved fused weights uncopied
-from shared import attention_kit
+if not IS_CLOUD_MODE:
+    _HANDLER_MODULES = [
+        "shared.qtypes.scaled_fp8",
+        "shared.qtypes.nvfp4",
+        "shared.qtypes.mxfp8",
+        "shared.qtypes.bnb_nf4",
+        "shared.qtypes.nunchaku_int4",
+        "shared.qtypes.nunchaku_fp4",
+        "shared.qtypes.asym_w4a8_int8",
+        "shared.qtypes.int8_convrot",
+        "shared.qtypes.gptq_int4",
+        "shared.qtypes.gguf",
+    ]
+    for handler in _HANDLER_MODULES:
+        quant_router.register_handler(handler)
+    from shared.qtypes import gguf as gguf_handler
+    quant_router.register_file_extension("gguf", gguf_handler)
+    from shared.kernels import fp8_backend, int8_backend, kernel_policy, rowmap_linear, scaled_fp16  # rowmap_linear: MMGP row views keep interleaved fused weights uncopied
+    from shared import attention_kit
+else:
+    import types
+    fp8_backend = types.SimpleNamespace(configure=lambda *a, **k: False, revision=0)
+    int8_backend = types.SimpleNamespace(configure=lambda *a, **k: False, revision=0)
+    kernel_policy = types.SimpleNamespace(configure=lambda *a, **k: False, precision="fast")
+    attention_kit = types.SimpleNamespace(
+        configure=lambda *a, **k: False,
+        CHUNKER_CONFIG_KEY="inputs_chunker",
+        CHUNKER_DEFAULT="auto",
+        chunker=None,
+    )
 
 
 def apply_int8_kernel_setting(selection: str, notify_disabled=False, resolved=None) -> bool:
@@ -855,6 +903,232 @@ def process_prompt_and_add_tasks(state, current_gallery_tab, model_choice):
     state["validate_success"] = 1
     queue= gen.get("queue", [])
     return update_queue_data(queue), gr.update(open=True) if new_prompts_count > 1 else gr.update()
+
+
+def process_run_beside(state, current_gallery_tab, model_choice):
+    """
+    Executes the prompt currently configured in the form concurrently alongside
+    the active generation in a separate Cloud GPU container.
+    """
+    exec_mode = "cloud" if IS_CLOUD_MODE else (state.get("execution_mode", "local") if isinstance(state, dict) else "local")
+    if exec_mode != "cloud":
+        gr.Warning("Run Beside: Local GPU is already executing a task. To run multiple jobs simultaneously, switch Execution to 'Cloud', or use 'Add New Prompt To Queue'.")
+        return gr.update()
+
+    model_type = get_state_model_type(state)
+    inputs = get_model_settings(state, model_type)
+    if inputs is None or model_choice != model_type:
+        gr.Warning("Form inputs could not be retrieved. Please refresh the page.")
+        return gr.update()
+
+    inputs["state"] = state
+    inputs["model_type"] = model_type
+    inputs.pop("lset_name", None)
+
+    validated_inputs, prompts, image_start, image_end, val_err = validate_settings(state, model_type, False, inputs)
+    if validated_inputs is None or val_err:
+        gr.Warning(f"Validation error: {val_err or 'Invalid settings'}")
+        return gr.update()
+
+    gen = get_gen_info(state)
+
+    beside_task_id = str(int(time.time() * 1000) % 1000000)
+    gpu_type = os.environ.get("MODAL_DEFAULT_GPU", "L40S")
+    from shared.execution.beside_tracker import beside_tracker
+    beside_tracker.register_job(
+        job_id=beside_task_id,
+        prompt=validated_inputs.get("prompt", ""),
+        model_type=model_type,
+        gpu_type=gpu_type,
+        origin="ui",
+    )
+
+    beside_task = {
+        "id": int(beside_task_id),
+        **({"workspace_id": workspace_storage.current_binding(state)[1]} if workspace_storage.current_binding(state) else {}),
+        "params": validated_inputs.copy(),
+        "plugin_data": {},
+        "execution_mode": "cloud",
+        "repeats": validated_inputs.get("repeat_generation", 1),
+        "length": validated_inputs.get("video_length", 0) or 0,
+        "steps": validated_inputs.get("num_inference_steps", 0) or 0,
+        "prompt": validated_inputs.get("prompt", ""),
+    }
+
+    def beside_worker():
+        print(f"[Run Beside] Starting parallel container generation for task #{beside_task_id}: {beside_task['prompt'][:60]}...")
+        beside_tracker.update_job(beside_task_id, status="packaging")
+
+        def beside_send_cmd(cmd, data=None):
+            if cmd == "status":
+                status_str = str(data or "").lower()
+                if "running" in status_str or "executing" in status_str:
+                    beside_tracker.update_job(beside_task_id, status="running")
+                elif "downloading" in status_str or "transfer" in status_str:
+                    beside_tracker.update_job(beside_task_id, status="downloading")
+                print(f"[Run Beside #{beside_task_id}] {data}")
+            elif cmd == "info":
+                print(f"[Run Beside #{beside_task_id}] {data}")
+
+        try:
+            beside_tracker.update_job(beside_task_id, status="running")
+            res = dispatch_generation(
+                beside_task,
+                beside_send_cmd,
+                state=state,
+                filtered_params=validated_inputs,
+                plugin_data={},
+                local_generator_fn=generate_media,
+                execution_mode="cloud",
+            )
+            if res.success and res.output_files:
+                beside_tracker.update_job(beside_task_id, status="downloading")
+                for out_f in res.output_files:
+                    if not os.path.exists(out_f) or out_f.endswith(".json") or out_f.endswith(".log"):
+                        continue
+                    try:
+                        workspace_storage.register_gallery_metadata(
+                            state,
+                            out_f,
+                            prompt=beside_task.get("prompt", ""),
+                            metadata={"provider": getattr(res, "provider", "modal")},
+                            notify_generation=True,
+                            write_metadata=True,
+                            record_notification=True,
+                        )
+                    except Exception as reg_err:
+                        print(f"[Run Beside] Error registering gallery metadata: {reg_err}")
+
+                host = workspace_storage.host_for_gen(gen)
+                if host is not None:
+                    host.save_workspace()
+                beside_tracker.update_job(beside_task_id, status="completed", output_files=res.output_files)
+                print(f"[Run Beside] Completed parallel task #{beside_task_id}: {res.output_files}")
+            else:
+                beside_tracker.update_job(beside_task_id, status="failed", error=str(res.error))
+                print(f"[Run Beside] Task #{beside_task_id} failed: {res.error}")
+        except Exception as e:
+            beside_tracker.update_job(beside_task_id, status="failed", error=str(e))
+            print(f"[Run Beside] Exception in worker: {e}")
+            traceback.print_exc()
+
+    import threading
+    thread = threading.Thread(target=beside_worker, name=f"run_beside_{beside_task_id}", daemon=True)
+    thread.start()
+
+    prompt_display = beside_task["prompt"][:40] if beside_task["prompt"] else "Job"
+    gr.Info(f"Launched '{prompt_display}...' in parallel on Modal Cloud container!")
+    return update_queue_data(gen.get("queue", []))
+
+
+def process_run_staged_batch(state):
+    """
+    Takes all tasks currently in gen["queue"], bundles them into a single multi-task
+    ZIP package, and dispatches them to 1 warm Modal GPU container to execute sequentially
+    without cold starts or reloading the model.
+    Progressive downloads stream each completed video into the gallery in real time.
+    """
+    gen = get_gen_info(state)
+    queue = gen.get("queue", [])
+    if len(queue) == 0:
+        gr.Warning("No tasks in the staged batch queue. Use 'Stage to Batch' to add prompts first.")
+        return gr.update()
+
+    from shared.execution.packaging import package_tasks_to_batch_zip
+    from shared.execution.providers.modal_provider import ModalProvider
+
+    tasks_to_run = list(queue)
+    queue.clear()
+    update_global_queue_ref(queue)
+
+    batch_task_id = str(int(time.time() * 1000) % 1000000)
+    gpu_type = os.environ.get("MODAL_DEFAULT_GPU", "L40S")
+    first_prompt = tasks_to_run[0].get("prompt", "") or "Batch"
+    model_type = tasks_to_run[0].get("params", {}).get("model_type", "wan2.1")
+
+    from shared.execution.beside_tracker import beside_tracker
+    beside_tracker.register_job(
+        job_id=batch_task_id,
+        prompt=f"[Batch of {len(tasks_to_run)} tasks] {first_prompt[:40]}...",
+        model_type=model_type,
+        gpu_type=gpu_type,
+        origin="ui_batch",
+    )
+
+    try:
+        batch_zip = package_tasks_to_batch_zip(tasks_to_run, state=state)
+    except Exception as pkg_err:
+        beside_tracker.update_job(batch_task_id, status="failed", error=str(pkg_err))
+        gr.Warning(f"Batch packaging error: {pkg_err}")
+        return update_queue_data(queue)
+
+    def batch_worker():
+        print(f"[Cloud Batch] Starting warm 1-GPU container for {len(tasks_to_run)} tasks (#{batch_task_id})...")
+        provider = ModalProvider()
+
+        def batch_send_cmd(cmd, data=None):
+            if cmd == "status":
+                status_str = str(data or "").lower()
+                if "running" in status_str or "executing" in status_str:
+                    beside_tracker.update_job(batch_task_id, status="running")
+                elif "downloading" in status_str or "downloaded" in status_str or "ready" in status_str:
+                    beside_tracker.update_job(batch_task_id, status="downloading")
+                print(f"[Batch 1-GPU #{batch_task_id}] {data}")
+            elif cmd == "output":
+                if data and os.path.exists(data):
+                    try:
+                        workspace_storage.register_gallery_metadata(
+                            state,
+                            data,
+                            prompt=first_prompt,
+                            metadata={"provider": "modal", "batch": True},
+                            notify_generation=True,
+                            write_metadata=True,
+                            record_notification=True,
+                        )
+                        host = workspace_storage.host_for_gen(gen)
+                        if host is not None:
+                            host.save_workspace()
+                    except Exception as reg_err:
+                        print(f"[Batch 1-GPU] Metadata registration error: {reg_err}")
+
+        try:
+            beside_tracker.update_job(batch_task_id, status="running")
+            res = provider.execute_batch(
+                batch_zip_bytes=batch_zip,
+                send_cmd=batch_send_cmd,
+                gpu_type=gpu_type,
+            )
+            if res.success and res.output_files:
+                for out_f in res.output_files:
+                    if os.path.exists(out_f) and not out_f.endswith(".json") and not out_f.endswith(".log"):
+                        try:
+                            workspace_storage.register_gallery_metadata(
+                                state,
+                                out_f,
+                                prompt=first_prompt,
+                                metadata={"provider": "modal", "batch": True},
+                                notify_generation=True,
+                                write_metadata=True,
+                                record_notification=True,
+                            )
+                        except Exception:
+                            pass
+                host = workspace_storage.host_for_gen(gen)
+                if host is not None:
+                    host.save_workspace()
+                beside_tracker.update_job(batch_task_id, status="completed", output_files=res.output_files)
+                print(f"[Cloud Batch] Successfully finished {len(res.output_files)} outputs!")
+            else:
+                beside_tracker.update_job(batch_task_id, status="failed", error=str(res.error))
+        except Exception as e:
+            beside_tracker.update_job(batch_task_id, status="failed", error=str(e))
+            traceback.print_exc()
+
+    threading.Thread(target=batch_worker, name=f"cloud_batch_{batch_task_id}", daemon=True).start()
+    gr.Info(f"Dispatched batch of {len(tasks_to_run)} jobs to 1 Modal GPU container with warm VRAM!")
+    return update_queue_data(queue)
+
 
 def get_custom_setting_key(index):
     return f"custom_setting_{index + 1}"
@@ -1872,12 +2146,15 @@ def add_video_task(**inputs):
 
     start_image_data, end_image_data, start_image_labels, end_image_labels = get_preview_images(inputs)
     plugin_data = inputs.pop('plugin_data', {})
+    exec_mode = "cloud" if IS_CLOUD_MODE else (state.get("execution_mode", "local") if isinstance(state, dict) else "local")
+    inputs["execution_mode"] = exec_mode
     
     queue.append({
         "id": current_task_id,
         **({"workspace_id": workspace_storage.current_binding(state)[1]} if workspace_storage.current_binding(state) else {}),
         "params": inputs.copy(),
         "plugin_data": plugin_data,
+        "execution_mode": exec_mode,
         "repeats": inputs.get("repeat_generation",1),
         "length": inputs.get("video_length",0) or 0, 
         "steps": inputs.get("num_inference_steps",0) or 0,
@@ -2025,7 +2302,11 @@ def _save_queue_to_zip(queue, output):
             else:
                 params_copy['base_model_type'] = get_base_model_type(params_copy["model_type"])
 
-            manifest_entry = {"id": task.get('id'), "params": params_copy}
+            manifest_entry = {
+                "id": task.get('id'),
+                "params": params_copy,
+                "execution_mode": task.get('execution_mode', params_copy.get('execution_mode', 'local')),
+            }
             if task.get('workspace_id'):
                 manifest_entry['workspace_id'] = task['workspace_id']
             if task.get('mcp_agent_id'):
@@ -2486,6 +2767,93 @@ def load_queue_action(filepath, state, evt:gr.EventData):
                 gr.Warning(f"Failed to load queue: {error[:200]}")
                 return update_queue_data(original_queue)
 
+        # Cloud Parallel Container Dispatch:
+        # When Cloud mode is active with MAX_CONCURRENT_CLOUD_JOBS > 1,
+        # peel off additional independent tasks to run concurrently in parallel containers!
+        max_concurrent = int(os.environ.get("MAX_CONCURRENT_CLOUD_JOBS", "3"))
+        is_cloud_active = bool(
+            IS_CLOUD_MODE
+            or (isinstance(state, dict) and state.get("execution_mode") == "cloud")
+            or os.environ.get("MODAL_ENDPOINT")
+        )
+        if is_cloud_active and max_concurrent > 1 and len(newly_loaded_queue) > 1:
+            from shared.execution.beside_tracker import beside_tracker
+            num_parallel = min(len(newly_loaded_queue) - 1, max_concurrent - 1)
+            parallel_tasks = newly_loaded_queue[1:1 + num_parallel]
+            newly_loaded_queue = [newly_loaded_queue[0]] + newly_loaded_queue[1 + num_parallel:]
+
+            for p_task in parallel_tasks:
+                p_id = str(p_task.get("id") or int(time.time() * 1000) % 1000000)
+                p_prompt = p_task.get("prompt") or p_task.get("params", {}).get("prompt", "")
+                p_model = p_task.get("params", {}).get("model_type", "")
+                p_gpu = os.environ.get("MODAL_DEFAULT_GPU", "L40S")
+                beside_tracker.register_job(
+                    job_id=p_id,
+                    prompt=p_prompt,
+                    model_type=p_model,
+                    gpu_type=p_gpu,
+                    origin="deepy" if not verbose_output else "ui",
+                )
+
+                def make_parallel_runner(task_to_run, task_id_str):
+                    def runner():
+                        beside_tracker.update_job(task_id_str, status="packaging")
+                        def p_send_cmd(cmd, data=None):
+                            if cmd == "status":
+                                st_text = str(data or "").lower()
+                                if "running" in st_text or "executing" in st_text:
+                                    beside_tracker.update_job(task_id_str, status="running")
+                                elif "downloading" in st_text or "transfer" in st_text:
+                                    beside_tracker.update_job(task_id_str, status="downloading")
+                                print(f"[Sideways Container #{task_id_str}] {data}")
+                        try:
+                            import inspect
+                            expected_args = set(inspect.signature(generate_media).parameters.keys())
+                            filtered = {k: v for k, v in task_to_run.get("params", {}).items() if k in expected_args}
+                            beside_tracker.update_job(task_id_str, status="running")
+                            res = dispatch_generation(
+                                task_to_run,
+                                p_send_cmd,
+                                state=state,
+                                filtered_params=filtered,
+                                plugin_data=task_to_run.get("plugin_data", {}),
+                                local_generator_fn=generate_media,
+                                execution_mode="cloud",
+                            )
+                            if res.success and res.output_files:
+                                beside_tracker.update_job(task_id_str, status="downloading")
+                                for out_f in res.output_files:
+                                    if not os.path.exists(out_f) or out_f.endswith(".json") or out_f.endswith(".log"):
+                                        continue
+                                    try:
+                                        workspace_storage.register_gallery_metadata(
+                                            state,
+                                            out_f,
+                                            prompt=task_to_run.get("prompt", ""),
+                                            metadata={"provider": getattr(res, "provider", "modal")},
+                                            notify_generation=True,
+                                            write_metadata=True,
+                                            record_notification=True,
+                                        )
+                                    except Exception as reg_err:
+                                        print(f"[Sideways Container] Error registering gallery metadata: {reg_err}")
+                                host = workspace_storage.host_for_gen(gen)
+                                if host is not None:
+                                    host.save_workspace()
+                                beside_tracker.update_job(task_id_str, status="completed", output_files=res.output_files)
+                                print(f"[Sideways Container #{task_id_str}] Finished: {res.output_files}")
+                            else:
+                                beside_tracker.update_job(task_id_str, status="failed", error=str(res.error))
+                                print(f"[Sideways Container #{task_id_str}] Failed: {res.error}")
+                        except Exception as exc:
+                            beside_tracker.update_job(task_id_str, status="failed", error=str(exc))
+                            print(f"[Sideways Container #{task_id_str}] Crash: {exc}")
+                            traceback.print_exc()
+                    return runner
+
+                import threading
+                threading.Thread(target=make_parallel_runner(p_task, p_id), name=f"sideways_task_{p_id}", daemon=True).start()
+
         # Merge with existing queue: renumber task IDs to avoid conflicts
         # IMPORTANT: Modify list in-place to preserve references held by process_tasks
         if original_queue:
@@ -2667,14 +3035,18 @@ def finalize_generation_with_state(current_state):
          return (*service.finalized_updates(), gr.update(), current_state)
      if not isinstance(current_state, dict) or 'gen' not in current_state:
          # gallery tabs, current tab, image/video gallery and the strip galleries, then the generation buttons
-         return (*[gr.update()] * (3 + 3 * len(STRIP_SOURCES)), gr.update(interactive=True), gr.update(interactive=True), gr.update(visible=True), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False, value=""), gr.update(), current_state)
+         return (*[gr.update()] * (3 + 3 * len(STRIP_SOURCES)), gr.update(interactive=True), gr.update(interactive=True), gr.update(visible=True), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False, value=""), gr.update(), current_state)
      accordion_update = gr.Accordion(open=False) if len(get_gen_info(current_state).get("queue", [])) <= 1 else gr.update()
      return (*finalize_generation(current_state), accordion_update, current_state)
 
 def generate_queue_html(queue):
+    from shared.execution.beside_tracker import render_beside_jobs_html
+    beside_html = render_beside_jobs_html()
+
     if len(queue) <= 1:
         message = "Generation in progress. No additional items queued." if len(queue) == 1 and is_generation_in_progress() else "Queue is empty."
-        return f"<div style='text-align: center; color: grey; padding: 20px;'>{message}</div>"
+        empty_msg = f"<div style='text-align: center; color: grey; padding: 20px;'>{message}</div>"
+        return beside_html + empty_msg if beside_html else empty_msg
 
     top_button_html = ""
     bottom_button_html = ""
@@ -2736,7 +3108,9 @@ def generate_queue_html(queue):
         task_id = item['id']
         full_prompt = html.escape(item['prompt'])
         truncated_prompt = (html.escape(item['prompt'][:97]) + '...') if len(item['prompt']) > 100 else full_prompt
-        prompt_cell = f'<div class="prompt-cell" title="{full_prompt}">{truncated_prompt}</div>'
+        exec_mode = str(item.get('execution_mode') or item.get('params', {}).get('execution_mode', 'local')).lower()
+        badge_html = ' <span class="wangp-badge-cloud">Cloud</span>' if "cloud" in exec_mode else ''
+        prompt_cell = f'<div class="prompt-cell" title="{full_prompt}">{truncated_prompt}{badge_html}</div>'
         
         start_img_data = item.get('start_image_data_base64') or [None]
         start_img_uri = start_img_data[0]
@@ -2790,7 +3164,7 @@ def generate_queue_html(queue):
     table_html = table_header + "".join(table_rows) + table_footer
     scrollable_div = f'<div id="queue-scroll-container" style="max-height: 650px; overflow-y: auto;">{table_html}</div>'
 
-    return top_button_html + scrollable_div + bottom_button_html
+    return (beside_html or "") + top_button_html + scrollable_div + bottom_button_html
 
 def update_queue_data(queue):
     update_global_queue_ref(queue)
@@ -2868,14 +3242,26 @@ attention_modes_supported = get_supported_attention_modes()
 override_attention_modes_installed = get_override_attention_modes()
 override_attention_modes_supported = get_supported_override_attention_modes()
 args = parse_wgp_args(CONFIG_FILENAME)
+if args.prevent_power_throttling: prevent_power_throttling()
+if args.mode == "cloud":
+    IS_CLOUD_MODE = True
+    os.environ["WAN2GP_MODE"] = "cloud"
 migrate_loras_layout()
 
-gpu_major, gpu_minor = torch.cuda.get_device_capability(args.gpu if len(args.gpu) > 0 else None)
-if  gpu_major < 8:
-    print("Switching to FP16 models when possible as GPU architecture doesn't support optimed BF16 Kernels")
-    bfloat16_supported = False
-else:
+if IS_CLOUD_MODE or not (hasattr(torch, "cuda") and torch.cuda.is_available()):
+    gpu_major, gpu_minor = (0, 0)
     bfloat16_supported = True
+else:
+    try:
+        gpu_major, gpu_minor = torch.cuda.get_device_capability(args.gpu if len(args.gpu) > 0 else None)
+        if gpu_major < 8:
+            print("Switching to FP16 models when possible as GPU architecture doesn't support optimed BF16 Kernels")
+            bfloat16_supported = False
+        else:
+            bfloat16_supported = True
+    except Exception:
+        gpu_major, gpu_minor = (0, 0)
+        bfloat16_supported = True
 
 args.flow_reverse = True
 processing_device = args.gpu
@@ -3050,9 +3436,21 @@ temporal_upsampler_api.register_temporal_upsamplers(server_config, fl)
 migrate_extension_defaults(server_config, server_config_filename, workspace_root=args.workspaces_dir or server_config.get('workspaces_dir') or os.path.join(wgp_root, 'workspaces'), family_handlers=family_handlers)
 
 def _normalize_profile_defaults(config):
+    profile_name_to_no = {
+        "HighRAM_HighVRAM": 1,
+        "HighRAM_LowVRAM": 2,
+        "LowRAM_HighVRAM": 3,
+        "VeryLowRAM_HighVRAM": 3.5,
+        "LowRAM_LowVRAM": 4,
+        "LowRAM_LowVRAM+": 4.5,
+        "VerylowRAM_LowVRAM": 5,
+    }
+    for k in ("profile", "video_profile", "image_profile"):
+        if k in config and isinstance(config[k], str) and config[k] in profile_name_to_no:
+            config[k] = profile_name_to_no[config[k]]
     if "profile" not in config:
-        config["profile"] = profile_type.LowRAM_LowVRAM
-    base_profile = config.get("profile", profile_type.LowRAM_LowVRAM)
+        config["profile"] = 4
+    base_profile = config.get("profile", 4)
     config.setdefault("video_profile", base_profile)
     config.setdefault("image_profile", base_profile)
     config.setdefault("audio_profile", 3)
@@ -3625,13 +4023,19 @@ def get_factory_settings(model_type):
 
 def get_default_settings(model_type):
     defaults_filename = get_settings_file_name(model_type)
-    if not Path(defaults_filename).is_file():
+    file_path = Path(defaults_filename)
+    if not file_path.is_file() or file_path.stat().st_size == 0:
         ui_defaults = get_factory_settings(model_type)
         with open(defaults_filename, "w", encoding="utf-8") as f:
             json.dump(ui_defaults, f, indent=4)
     else:
-        with open(defaults_filename, "r", encoding="utf-8") as f:
-            ui_defaults = json.load(f)
+        try:
+            with open(defaults_filename, "r", encoding="utf-8") as f:
+                ui_defaults = json.load(f)
+        except Exception:
+            ui_defaults = get_factory_settings(model_type)
+            with open(defaults_filename, "w", encoding="utf-8") as f:
+                json.dump(ui_defaults, f, indent=4)
         fix_settings(model_type, ui_defaults)            
     
     default_seed = args.seed
@@ -4785,7 +5189,8 @@ def generate_attention_header(model_type, compile, attention_mode, overrides="",
     else:
         header += ", Data Type <B>BF16</B>"
 
-    quant_label = quant_router.detect_quantization_label_from_filename(fl.get_local_model_filename(full_filename))
+    detect_fn = getattr(quant_router, "detect_quantization_label_from_filename", None)
+    quant_label = detect_fn(fl.get_local_model_filename(full_filename)) if callable(detect_fn) else ""
     if quant_label:
         header += f", Quantization <B>{quant_label}</B>"
     if server_config.get("enable_4k_resolutions", 0) == 1 and not (model_def.get("audio_only") or model_def.get("mesh_outputs") or model_def.get("lock_resolutions")):
@@ -5189,7 +5594,7 @@ def refresh_gallery(state): #, msg
         last_source = VIDEO.id  # Synchronize the visual selection even while displaying another gallery.
 
     if not in_progress or len(queue) == 0:
-        return *output_tabs, gallery_update(file_list, choice), choice if last_source == VIDEO.id else gr.update(), *pack_strip_galleries(gen), gr.HTML("", visible= False),  gr.Button(visible=True), gr.Button(visible=False), gr.Row(visible=False), gr.update(), update_queue_data(queue), gr.Button(interactive=  abort_interactive), gr.Button(interactive=  early_stop_interactive, visible= early_stop_visible), gr.Button(visible= False), gr.update(visible=False)
+        return *output_tabs, gallery_update(file_list, choice), choice if last_source == VIDEO.id else gr.update(), *pack_strip_galleries(gen), gr.HTML("", visible= False),  gr.Button(visible=True), gr.Button(visible=False), gr.Button(visible=False), gr.Row(visible=False), gr.update(), update_queue_data(queue), gr.Button(interactive=  abort_interactive), gr.Button(interactive=  early_stop_interactive, visible= early_stop_visible), gr.Button(visible= False), gr.update(visible=False)
     else:
         task = queue[0]
         prompt =  task["prompt"]
@@ -5260,7 +5665,7 @@ def refresh_gallery(state): #, msg
         table = f'<div class="generation-table-wrap"><table id="PINFO"><tbody><tr><td class="generation-prompt-cell">{details}</td>{thumbnails}</tr></tbody></table></div>' if details or thumbnails else ""
         html_content = f'<div class="wangp-generation-info">{table}</div>'
         html_output = gr.HTML(html_content, visible= True)
-        return *output_tabs, gallery_update(file_list, choice), choice if last_source == VIDEO.id else gr.update(), *pack_strip_galleries(gen), html_output, gr.Button(visible=False), gr.Button(visible=True), gr.Row(visible=True), gr.update(), update_queue_data(queue), gr.Button(interactive=  abort_interactive), gr.Button(interactive=  early_stop_interactive, visible= early_stop_visible), gr.Button(visible= onemorewindow_visible), gr.update(label=summary, visible=True)
+        return *output_tabs, gallery_update(file_list, choice), choice if last_source == VIDEO.id else gr.update(), *pack_strip_galleries(gen), html_output, gr.Button(visible=False), gr.Button(visible=True), gr.Button(visible=True), gr.Row(visible=True), gr.update(), update_queue_data(queue), gr.Button(interactive=  abort_interactive), gr.Button(interactive=  early_stop_interactive, visible= early_stop_visible), gr.Button(visible= onemorewindow_visible), gr.update(label=summary, visible=True)
 
 
 
@@ -5282,7 +5687,7 @@ def _finalize_generation(state):
     release_ram_cache()  # the queue is done: the RAM a next generation of the same model would have reused goes back to the system
     gen["early_stop"] = False
     gen["early_stop_forwarded"] = False
-    return *gallery_tab_updates(last_source), gallery_update(gen.get("file_list", []), gallery_choice(gen, VIDEO)) if last_source == VIDEO.id else gr.update(), *pack_strip_galleries(gen), gr.Button(interactive=  True), gr.Button(interactive=  True, visible= False), gr.Button(visible= True), gr.Button(visible= False), gr.Column(visible= False), gr.HTML(visible= False, value="")
+    return *gallery_tab_updates(last_source), gallery_update(gen.get("file_list", []), gallery_choice(gen, VIDEO)) if last_source == VIDEO.id else gr.update(), *pack_strip_galleries(gen), gr.Button(interactive=  True), gr.Button(interactive=  True, visible= False), gr.Button(visible= True), gr.Button(visible= False), gr.Button(visible= False), gr.Column(visible= False), gr.HTML(visible= False, value="")
 
 def get_default_video_info():
     return "Please Select a Video / Image"    
@@ -7317,20 +7722,25 @@ def exec_prompt_enhancer_engine(state, model_type, model_def, prompt_enhancer_mo
         return _deepy.run_assistant_prompt_turn(state, model_def, prompt_enhancer_modes, original_prompts, seed, override_profile=override_profile, send_cmd=send_cmd, tools=tools)
 
     if "W" in prompt_enhancer_modes:
-        from shared.prompt_enhancer.transcription import transcribe_source_audio
+        if IS_CLOUD_MODE:
+            prompt_enhancer_modes = prompt_enhancer_modes.replace("W", "")
+        else:
+            from shared.prompt_enhancer.transcription import transcribe_source_audio
 
-        wait_for_model_unload()
-        acquire_GPU_ressources(state, "prompt_enhancer_transcription", "Source Audio Transcription")
-        try:
-            transcription_gen = get_gen_info(state) if send_cmd is not None else progress.gen
-            enhancer_kwargs["source_audio_transcript"] = transcribe_source_audio(enhancer_kwargs["audio_guide"], gen=transcription_gen, report_status=lambda text: progress((0, 1), desc=text, total=1), duration_seconds=enhancer_kwargs["duration_seconds"] if model_def.get("prompt_enhancer_transcription_use_duration", False) else None)
-            if enhancer_kwargs["source_audio_transcript"] is None:
-                prompt_enhancer_modes = prompt_enhancer_modes.replace("W", "")
-        finally:
-            release_GPU_ressources(state, "prompt_enhancer_transcription")
+            wait_for_model_unload()
+            acquire_GPU_ressources(state, "prompt_enhancer_transcription", "Source Audio Transcription")
+            try:
+                transcription_gen = get_gen_info(state) if send_cmd is not None else progress.gen
+                enhancer_kwargs["source_audio_transcript"] = transcribe_source_audio(enhancer_kwargs["audio_guide"], gen=transcription_gen, report_status=lambda text: progress((0, 1), desc=text, total=1), duration_seconds=enhancer_kwargs["duration_seconds"] if model_def.get("prompt_enhancer_transcription_use_duration", False) else None)
+                if enhancer_kwargs["source_audio_transcript"] is None:
+                    prompt_enhancer_modes = prompt_enhancer_modes.replace("W", "")
+            finally:
+                release_GPU_ressources(state, "prompt_enhancer_transcription")
 
     local_runtime = not is_remote_engine(resolve_role_engine(server_config, "prompt_enhancer"))
     if local_runtime:
+        if IS_CLOUD_MODE:
+            raise gr.Error("Local Prompt Enhancer requires a local GPU. Switch Prompt Enhancer to 'Same as Deepy' or a remote LLM in Settings.")
         wait_for_model_unload()
         acquire_GPU_ressources(state, "prompt_enhancer", "Prompt Enhancer", parks=True)
         try:
@@ -9759,14 +10169,14 @@ def generate_media(
 def prepare_generate_media(state):
 
     if state.get("validate_success",0) != 1:
-        return gr.Button(visible= True), gr.Button(visible= False), gr.Column(visible= False), gr.Button(visible=False), gr.Button(visible=False)
+        return gr.Button(visible= True), gr.Button(visible= False), gr.Button(visible= False), gr.Column(visible= False), gr.Button(visible=False), gr.Button(visible=False)
     else:
         if not get_gen_info(state).get("in_progress", False):
             clear_status(state)
         params = get_gen_info(state)["queue"][0]["params"]
         extend_visible = can_extend_sample(params)
         early_stop_visible = not _is_edit_task_params(params) and bool(get_model_def(params["model_type"]).get("supports_early_stop", False))
-        return gr.Button(visible= False), gr.Button(visible= True), gr.Column(visible= True), gr.Button(visible=extend_visible), gr.Button(visible=early_stop_visible, interactive=True)
+        return gr.Button(visible= False), gr.Button(visible= True), gr.Button(visible= True), gr.Column(visible= True), gr.Button(visible=extend_visible), gr.Button(visible=early_stop_visible, interactive=True)
 
 
 def generate_preview(model_type, payload):
@@ -9903,25 +10313,80 @@ def _process_tasks(state):
                 try:
                     import inspect
                     model_type = params.get('model_type')
-                    if model_type and not _is_edit_task_params(params):
-                        default_settings = get_factory_settings(model_type)
-                        expected_args = set(inspect.signature(generate_media).parameters.keys())
-                        for arg_name in expected_args:
-                            if arg_name not in params and arg_name in default_settings:
+                    sig = inspect.signature(generate_media)
+                    expected_args = set(sig.parameters.keys())
+                    default_settings = get_factory_settings(model_type) if (model_type and not _is_edit_task_params(params)) else {}
+                    for arg_name, param in sig.parameters.items():
+                        if arg_name not in params:
+                            if arg_name in default_settings:
                                 params[arg_name] = default_settings[arg_name]
-                    else:
-                        expected_args = set(inspect.signature(generate_media).parameters.keys())
+                            elif param.default is inspect.Parameter.empty and arg_name not in ("task", "send_cmd", "plugin_data"):
+                                params[arg_name] = None
                     filtered_params = {k: v for k, v in params.items() if k in expected_args}
                     if _is_edit_task_params(params):
                         filtered_params.setdefault("model_type", "")
                     plugin_data = task.pop('plugin_data', {})
-                    gpu_acquired = gpu_acquired or acquire_main_GPU_ressources(state)
-                    if gpu_acquired:
-                        success = generate_media(task, send_cmd, plugin_data=plugin_data,  **filtered_params)
+                    def _local_generate(**kwargs):
+                        nonlocal gpu_acquired
+                        gpu_acquired = gpu_acquired or acquire_main_GPU_ressources(state)
+                        if not gpu_acquired:
+                            return None
+                        return generate_media(task, send_cmd, plugin_data=plugin_data, **filtered_params)
+
+                    exec_result = dispatch_generation(
+                        task,
+                        send_cmd,
+                        state=state,
+                        filtered_params=filtered_params,
+                        plugin_data=plugin_data,
+                        local_generator_fn=_local_generate,
+                    )
+                    success = exec_result.success
+
+                    is_cloud = (
+                        IS_CLOUD_MODE
+                        or task.get("execution_mode") == "cloud"
+                        or params.get("execution_mode") == "cloud"
+                        or getattr(exec_result, "provider", None) == "modal"
+                        or (isinstance(getattr(exec_result, "metadata", None), dict) and exec_result.metadata.get("provider") == "modal")
+                    )
+
+                    # If cloud execution produced downloaded files, register them in gallery and metadata
+                    if success and exec_result.output_files and is_cloud:
+                        for out_f in exec_result.output_files:
+                            if not os.path.exists(out_f) or out_f.endswith(".json") or out_f.endswith(".log"):
+                                continue
+                            try:
+                                is_img = out_f.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
+                                is_aud = out_f.lower().endswith((".wav", ".mp3", ".flac", ".ogg", ".aac"))
+                                media_configs = prepare_inputs_dict("metadata", params, params.get("model_type", ""))
+                                media_configs["generation_time"] = round(exec_result.execution_time or 0)
+                                media_configs["creation_date"] = datetime.now().isoformat(timespec="seconds")
+                                media_configs["creation_timestamp"] = int(time.time())
+                                media_configs["provider"] = "modal"
+                                record_file_metadata(
+                                    out_f,
+                                    media_configs,
+                                    is_img,
+                                    is_aud,
+                                    gen,
+                                    notify_generation=True,
+                                    write_metadata=True,
+                                    record_notification=True,
+                                )
+                            except Exception as reg_err:
+                                print(f"[Cloud] Warning registering gallery metadata for {out_f}: {reg_err}")
+
+                        host = workspace_storage.host_for_gen(gen)
+                        if host is not None:
+                            host.save_workspace()
+
+                        # Trigger gallery UI refresh to show new media
+                        send_cmd("output", exec_result.output_files[0])
+
+                    if not IS_CLOUD_MODE and not is_cloud and gpu_acquired:
                         write_vram_debug_report(save_path, params.get("model_type"))
                         write_ram_debug_report(save_path, params.get("model_type"))
-                    else:
-                        success = True  # aborted while waiting for the GPU: dropped below like any aborted task
 
                 except DownloadCancelled:
                     success = True
@@ -10205,9 +10670,17 @@ def process_tasks_cli(queue, state):
                         filtered_params.setdefault("model_type", "")
                     filtered_params.setdefault("client_id", "")
                     plugin_data = task.get('plugin_data', {})
-                    generate_media(task, send_cmd, plugin_data=plugin_data, **filtered_params)
-                    write_vram_debug_report(save_path, params.get("model_type"))
-                    write_ram_debug_report(save_path, params.get("model_type"))
+                    exec_result = dispatch_generation(
+                        task,
+                        send_cmd,
+                        state=state,
+                        filtered_params=filtered_params,
+                        plugin_data=plugin_data,
+                        local_generator_fn=generate_media,
+                    )
+                    if not IS_CLOUD_MODE:
+                        write_vram_debug_report(save_path, params.get("model_type"))
+                        write_ram_debug_report(save_path, params.get("model_type"))
                 except Exception as e:
                     print(f"\n  [ERROR] {e}")
                     traceback.print_exc()
@@ -11038,6 +11511,8 @@ def mesh_to_custom_guide(state, input_file_list, choice, video_prompt_type, audi
 def explore_world_outside_queue(state, model_type, world_path):
     """An exploration started while a generation runs: it takes the GPU (the generation pauses at its next step, its models unloaded from
     VRAM) instead of waiting in the queue. The paused generation's own model serves it when it is the world's model."""
+    if IS_CLOUD_MODE:
+        raise gr.Error("Interactive World Exploration requires a local GPU and is not available in Cloud Client mode. Use the generation queue to generate worlds on the cloud.")
     from shared.attention import attention_shared_state
     acquire_GPU_ressources(state, "world_exploration", "World Exploration", gr=gr)
     explore_offloadobj = None
@@ -12475,7 +12950,7 @@ def init_process_queue_if_any(state):
         state["validate_success"] = 1
         return prepare_generate_media(state)
     else:
-        return gr.Button(visible=True), gr.Button(visible=False), gr.Column(visible=False), gr.Button(visible=False), gr.Button(visible=False)
+        return gr.Button(visible=True), gr.Button(visible=False), gr.Button(visible=False), gr.Column(visible=False), gr.Button(visible=False), gr.Button(visible=False)
 
 def get_modal_image(image_base64, label):
     return f"""
@@ -14269,6 +14744,49 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                                 config_group_help.append(gr.HTML(config_help_html, elem_classes=["wangp-field-help-inline-host"]))
                         config = gr.Text(value=config_value, interactive=False, visible=False)
 
+                    if IS_CLOUD_MODE:
+                        with gr.Column():
+                            gr.Markdown("<B>☁️ Cloud Execution Provider</B><BR>Select where remote cloud generations run:")
+                            current_prov = os.environ.get("WAN2GP_CLOUD_PROVIDER", os.environ.get("WAN2GP_DEFAULT_PROVIDER", "modal")).lower()
+                            cloud_provider_selector = gr.Radio(
+                                choices=[
+                                    ("Modal Cloud (1-Click Serverless, L40S/A100/H100) [Stable]", "modal"),
+                                    ("RunPod Serverless (RTX 4090 / L40S, 70 GB Container Disk) [Beta]", "runpod"),
+                                ],
+                                value="runpod" if current_prov == "runpod" else "modal",
+                                label="Active Cloud Provider",
+                                interactive=True
+                            )
+                            if not update_form:
+                                def _on_cloud_provider_change(val):
+                                    os.environ["WAN2GP_CLOUD_PROVIDER"] = val
+                                    return val
+                                cloud_provider_selector.change(_on_cloud_provider_change, inputs=[cloud_provider_selector], outputs=[])
+
+                            with gr.Row():
+                                sync_cloud_btn = gr.Button("🔄 Update Cloud Worker", size="sm", variant="secondary")
+                            sync_cloud_status = gr.Markdown(value="", visible=False)
+                            if not update_form:
+                                def _on_sync_cloud_click():
+                                    try:
+                                        import urllib.request
+                                        from shared.execution.providers.modal_provider import ModalCloudProvider
+                                        provider = ModalCloudProvider()
+                                        endpoint = provider._resolve_endpoint_url()
+                                        if not endpoint:
+                                            return gr.Markdown(value="❌ **Modal endpoint not configured.** Set `MODAL_ENDPOINT` or run `cloud/modal/setup_modal.py`.", visible=True)
+                                        headers = {"Content-Type": "application/json"}
+                                        if provider.api_key:
+                                            headers["X-API-Key"] = provider.api_key
+                                        req = urllib.request.Request(f"{endpoint}/admin/update-wan2gp", data=b"{}", headers=headers, method="POST")
+                                        with urllib.request.urlopen(req, timeout=120.0) as resp:
+                                            res = json.loads(resp.read().decode("utf-8"))
+                                        modal_c = str(res.get("commit", "ok"))[:8]
+                                        return gr.Markdown(value=f"✅ **Cloud Worker Updated!**<br>• Remote Commit: `{modal_c}`", visible=True)
+                                    except Exception as e:
+                                        return gr.Markdown(value=f"❌ **Sync Error:** {e}", visible=True)
+                                sync_cloud_btn.click(_on_sync_cloud_click, inputs=[], outputs=[sync_cloud_status])
+
             if not update_form:
                 with gr.Row(visible=(tab_id == 'edit'), elem_classes=["wangp-settings-actions"] if floating_generate_button else None):
                     edit_btn = gr.Button("Apply Edits", elem_id="edit_tab_apply_button")
@@ -14441,10 +14959,34 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
             if not update_form:
                 generate_trigger = gr.Text(visible = False) 
                 add_to_queue_trigger = gr.Text(visible = False)
+                stage_to_batch_trigger = gr.Text(visible = False)
+                run_beside_trigger = gr.Text(visible = False)
                 js_trigger_index = gr.Text(visible=False, elem_id="js_trigger_for_edit_refresh")
 
                 with gr.Column(elem_classes=["wangp-settings-actions"] if floating_generate_button else None):
-                    generate_btn = gr.Button("Generate")
+                    with gr.Row(elem_classes=["wangp-execution-mode-row"]):
+                        if IS_CLOUD_MODE:
+                            execution_mode = gr.Radio(
+                                choices=["Cloud"],
+                                value="Cloud",
+                                label="Execution",
+                                show_label=False,
+                                interactive=True,
+                                elem_classes=["wangp-execution-mode-radio"]
+                            )
+                        else:
+                            initial_exec_mode = "Cloud" if (isinstance(state_dict, dict) and state_dict.get("execution_mode") == "cloud") else "Local GPU"
+                            execution_mode = gr.Radio(
+                                choices=["Local GPU", "Cloud"],
+                                value=initial_exec_mode,
+                                label="Execution",
+                                show_label=False,
+                                interactive=True,
+                                elem_classes=["wangp-execution-mode-radio"]
+                            )
+                    with gr.Row():
+                        generate_btn = gr.Button("Generate", scale=2)
+                        stage_to_batch_btn = gr.Button("Stage to Batch Queue", scale=1, variant="secondary")
                     with gr.Column(visible=False, elem_id=f"wangp-{tab_id}-current-actions" if floating_generate_button else None) as current_gen_column:
                         with gr.Row() as current_gen_buttons_row:
                             onemoresample_btn = gr.Button("One More", visible = True, size='md', min_width=1)
@@ -14453,7 +14995,9 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                             resume_btn = gr.Button("Resume", visible = False, size='md', min_width=1)
                             abort_btn = gr.Button("Abort", visible = True, size='md', min_width=1)
                             earlystop_btn = gr.Button("Early Stop", visible = False, size='md', min_width=1)
-                    add_to_queue_btn = gr.Button("Add New Prompt To Queue", visible=False)
+                    with gr.Row() as active_gen_options_row:
+                        add_to_queue_btn = gr.Button("Add New Prompt To Queue", visible=False)
+                        run_beside_btn = gr.Button("Run Beside", visible=False, variant="secondary")
                 with gr.Column(elem_classes=["wangp-generation-details"]) if floating_generate_button else current_gen_column:
                     with gr.Accordion("Preview", open=False):
                         preview = gr.HTML(value=refresh_preview(state_dict), label="Preview", show_label= False)
@@ -14473,6 +15017,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                         save_queue_btn = gr.DownloadButton("Save Queue", size="sm")
                         load_queue_btn = gr.UploadButton("Load Queue", file_types=[".zip", ".json"], size="sm")
                         clear_queue_btn = gr.Button("Clear Queue", size="sm", variant="stop")
+                        run_queue_cloud_btn = gr.Button("🚀 Run Queue on 1 Cloud GPU", size="sm", variant="primary")
                         quit_button = gr.Button("Save and Quit", size="sm", variant="secondary")
                         with gr.Row(visible=False) as quit_confirmation_row:
                             confirm_quit_button = gr.Button("Confirm", elem_id="comfirm_quit_btn_hidden", size="sm", variant="stop")
@@ -14584,14 +15129,14 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
 
             if tab_id == 'generate':
                 from shared.deepy.hybrid_ui import bind_gallery_sync
-                shared_selection = bind_gallery_sync(_deepy_hybrid, state, refresh_gallery, [gallery_tabs, current_gallery_tab, output, last_choice, *strip_states, gen_info, generate_btn, add_to_queue_btn, current_gen_column, current_gen_buttons_row, queue_html, abort_btn, earlystop_btn, onemorewindow_btn, gen_info_accordion], gallery=output, strip_states=strip_states, main=main)
+                shared_selection = bind_gallery_sync(_deepy_hybrid, state, refresh_gallery, [gallery_tabs, current_gallery_tab, output, last_choice, *strip_states, gen_info, generate_btn, add_to_queue_btn, run_beside_btn, current_gen_column, current_gen_buttons_row, queue_html, abort_btn, earlystop_btn, onemorewindow_btn, gen_info_accordion], gallery=output, strip_states=strip_states, main=main)
                 shared_selection.change(fn=select_shared_media, inputs=[shared_selection, state, current_gallery_tab, output, last_choice, PP_spatial_upsampling, PP_spatial_postprocessing_parameters, PP_temporal_postprocessing_parameters, PP_spatial_upsampler_help_target, PP_temporal_upsampling, video_info_tab], outputs=select_media_outputs, show_progress="hidden").then(fn=None, inputs=None, outputs=None, js=PROMPT_TOOLS_ATTACH_JS)
                 from shared.gradio import world_explorer
                 world_explorer.bind(state, lambda state_value: workspace_storage.output_config(server_config, state=state_value)['save_path'], get_model_def, get_model_handler, explore_world_outside_queue,
                                     server_config, lambda choices: update_config(server_config, server_config_filename, {"world_explorer": choices}), world_memory_profile)
                 output_trigger.change(refresh_gallery_outside_view,
                     inputs = [state], 
-                    outputs = [gallery_tabs, current_gallery_tab, output, last_choice, *strip_states, gen_info, generate_btn, add_to_queue_btn, current_gen_column, current_gen_buttons_row, queue_html, abort_btn, earlystop_btn, onemorewindow_btn, gen_info_accordion],
+                    outputs = [gallery_tabs, current_gallery_tab, output, last_choice, *strip_states, gen_info, generate_btn, add_to_queue_btn, run_beside_btn, current_gen_column, current_gen_buttons_row, queue_html, abort_btn, earlystop_btn, onemorewindow_btn, gen_info_accordion],
                     show_progress="hidden"
                     )
 
@@ -14970,6 +15515,21 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
 
                 model_choice.select(fn=change_model_choice_target, outputs=[model_choice_target], show_progress="hidden", queue=False)
             
+                def update_state_execution_mode(choice, s):
+                    choice_str = str(choice).lower()
+                    mode_val = "cloud" if (IS_CLOUD_MODE or "cloud" in choice_str) else "local"
+                    if isinstance(s, dict):
+                        s["execution_mode"] = mode_val
+                    return choice
+
+                execution_mode.change(
+                    fn=update_state_execution_mode,
+                    inputs=[execution_mode, state],
+                    outputs=[execution_mode],
+                    show_progress="hidden",
+                    queue=False,
+                )
+
                 generate_btn.click(fn = init_generate, inputs = [state, output, last_choice, *strip_selected], outputs=[generate_trigger, mode])
                 add_to_queue_btn.click(fn = lambda : (get_unique_id(), ""), inputs = None, outputs=[add_to_queue_trigger, mode])
                 # gr.on(triggers=[add_to_queue_btn.click, add_to_queue_trigger.change],fn=validate_wizard_prompt, 
@@ -14989,6 +15549,43 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                     inputs = [state],
                 )
 
+                stage_to_batch_btn.click(fn = lambda : (get_unique_id(), ""), inputs = None, outputs=[stage_to_batch_trigger, mode])
+                stage_to_batch_trigger.change(fn=validate_wizard_prompt,
+                    inputs =[state, wizard_prompt_activated_var, wizard_variables_var,  prompt, wizard_prompt, *prompt_vars],
+                    outputs= [prompt],
+                    show_progress="hidden",
+                ).then(fn=save_inputs,
+                    inputs =[target_state] + gen_inputs,
+                    outputs= None
+                ).then(fn=process_prompt_and_add_tasks,
+                    inputs = [state, current_gallery_tab, model_choice],
+                    outputs=[queue_html, queue_accordion],
+                    show_progress="hidden",
+                ).then(
+                    fn=update_status,
+                    inputs = [state],
+                )
+
+                run_queue_cloud_btn.click(
+                    fn=process_run_staged_batch,
+                    inputs=[state],
+                    outputs=[queue_html],
+                )
+
+                run_beside_btn.click(fn = lambda : (get_unique_id(), ""), inputs = None, outputs=[run_beside_trigger, mode])
+                run_beside_trigger.change(fn=validate_wizard_prompt,
+                    inputs =[state, wizard_prompt_activated_var, wizard_variables_var,  prompt, wizard_prompt, *prompt_vars],
+                    outputs= [prompt],
+                    show_progress="hidden",
+                ).then(fn=save_inputs,
+                    inputs =[target_state] + gen_inputs,
+                    outputs= None
+                ).then(fn=process_run_beside,
+                    inputs = [state, current_gallery_tab, model_choice],
+                    outputs= [queue_html],
+                    show_progress="hidden",
+                )
+
                 generate_trigger.change(fn=validate_wizard_prompt,
                     inputs= [state, wizard_prompt_activated_var, wizard_variables_var,  prompt, wizard_prompt, *prompt_vars] ,
                     outputs= [prompt],
@@ -15002,7 +15599,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                     show_progress="hidden",
                 ).then(fn=prepare_generate_media,
                     inputs= [state],
-                    outputs= [generate_btn, add_to_queue_btn, current_gen_column, onemorewindow_btn, earlystop_btn]
+                    outputs= [generate_btn, add_to_queue_btn, run_beside_btn, current_gen_column, onemorewindow_btn, earlystop_btn]
                 ).then(fn=activate_status,
                     inputs= [state],
                     outputs=None,
@@ -15012,7 +15609,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                     show_progress="hidden",
                 ).then(finalize_generation,
                     inputs= [state], 
-                    outputs= [gallery_tabs, current_gallery_tab, output, *strip_states, abort_btn, earlystop_btn, generate_btn, add_to_queue_btn, current_gen_column, gen_info]
+                    outputs= [gallery_tabs, current_gallery_tab, output, *strip_states, abort_btn, earlystop_btn, generate_btn, add_to_queue_btn, run_beside_btn, current_gen_column, gen_info]
                 ).then(
                     fn=lambda s: gr.Accordion(open=False) if len(get_gen_info(s).get("queue", [])) <= 1 else gr.update(),
                     inputs=[state],
@@ -15038,7 +15635,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                 ).then(
                     fn=init_process_queue_if_any,
                     inputs=[state],
-                    outputs=[generate_btn, add_to_queue_btn, current_gen_column, onemorewindow_btn, earlystop_btn]
+                    outputs=[generate_btn, add_to_queue_btn, run_beside_btn, current_gen_column, onemorewindow_btn, earlystop_btn]
                 ).then(fn=activate_status,
                     inputs= [state],
                     outputs=None,
@@ -15050,7 +15647,7 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                 ).then(
                     fn=finalize_generation_with_state,
                     inputs=[state],
-                    outputs=[gallery_tabs, current_gallery_tab, output, *strip_states, abort_btn, earlystop_btn, generate_btn, add_to_queue_btn, current_gen_column, gen_info, queue_accordion, state],
+                    outputs=[gallery_tabs, current_gallery_tab, output, *strip_states, abort_btn, earlystop_btn, generate_btn, add_to_queue_btn, run_beside_btn, current_gen_column, gen_info, queue_accordion, state],
                     trigger_mode="always_last"
                 ).then(
                     unload_model_if_needed,
@@ -15332,7 +15929,17 @@ def create_ui():
         stats_app = None
 
     with ui_studio.Blocks(css=css, js=js, theme=theme, title="WanGP", fill_width=True) as main:
-        gr.Markdown(f'<div align=center><H1>Wan<SUP style="color: #2563eb;">GP</SUP> v{WanGP_version} <FONT SIZE=4>by <I>DeepBeepMeep</I></FONT> <FONT SIZE=3>') # (<A HREF='https://github.com/deepbeepmeep/Wan2GP'>Updates</A>)</FONT SIZE=3></H1></div>")
+        cloud_badge = ""
+        if IS_CLOUD_MODE:
+            raw_prov = os.environ.get("WAN2GP_CLOUD_PROVIDER", os.environ.get("WAN2GP_DEFAULT_PROVIDER", "modal")).lower()
+            if raw_prov == "runpod":
+                prov = "RunPod (Beta)"
+                cloud_gpu = os.environ.get("RUNPOD_DEFAULT_GPU", "RTX 4090 / L40S")
+            else:
+                prov = raw_prov.capitalize()
+                cloud_gpu = os.environ.get("MODAL_DEFAULT_GPU", "L40S")
+            cloud_badge = f' <span style="background: linear-gradient(135deg, #2563eb, #7c3aed); color: white; padding: 3px 10px; border-radius: 12px; font-size: 13px; font-weight: 600; vertical-align: middle; box-shadow: 0 2px 4px rgba(0,0,0,0.15);">☁️ Cloud Mode: {prov} ({cloud_gpu})</span>'
+        gr.Markdown(f'<div align=center><H1>Wan<SUP style="color: #2563eb;">GP</SUP> v{WanGP_version} <FONT SIZE=4>by <I>DeepBeepMeep</I></FONT>{cloud_badge} <FONT SIZE=3>') # (<A HREF='https://github.com/deepbeepmeep/Wan2GP'>Updates</A>)</FONT SIZE=3></H1></div>")
         global model_list
 
         tab_state = gr.State({ "tab_no":0 }) 

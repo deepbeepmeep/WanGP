@@ -115,13 +115,16 @@ def apply_startup_settings(argv, config_filename):
     if ram_allocator not in RAM_ALLOCATOR_CHOICES:
         raise ValueError(f"Unknown RAM allocator {ram_allocator!r}: expected one of {RAM_ALLOCATOR_CHOICES}")
     if ram_allocator == "mmgp":
-        from mmgp.allocator import ram
         try:
-            ram.install()
-        except RuntimeError as error:  # a platform or PyTorch it does not support: the default must not stop WanGP
+            from mmgp.allocator import ram
+            try:
+                ram.install()
+            except RuntimeError as error:  # a platform or PyTorch it does not support: the default must not stop WanGP
+                print(f"[RAM] MMGP RAM Allocator not available ({error}): PyTorch's CPU allocator is used")
+            else:
+                print("[RAM] MMGP RAM Allocator: the RAM of freed CPU tensors goes back to the system")
+        except (ImportError, ModuleNotFoundError) as error:
             print(f"[RAM] MMGP RAM Allocator not available ({error}): PyTorch's CPU allocator is used")
-        else:
-            print("[RAM] MMGP RAM Allocator: the RAM of freed CPU tensors goes back to the system")
     # before the VRAM allocator, which takes the emulated card's limit when it installs, and before WanGP allocates VRAM
     if max_vram is not None and torch.cuda.is_available():
         from mmgp import virtual_gpu
@@ -143,12 +146,15 @@ def apply_startup_settings(argv, config_filename):
     debug_value = _argv_value(argv, "--ram-debug")
     debug_mb = float(debug_value) if debug_value and not debug_value.startswith("-") else 16 if "--ram-debug" in argv else 0
     if debug_mb > 0:
-        from mmgp.allocator import ram_debug
-        ram_debug.start(min_mb=debug_mb)
-        global _ram_debug
-        _ram_debug = True
-        print(f"[RAM] Debug mode: a report of where the RAM goes is written after each generation and after each model release in <outputs>/ram_debug "
-              f"(allocations of {debug_mb:g} MB and more traced to their source)")
+        try:
+            from mmgp.allocator import ram_debug
+            ram_debug.start(min_mb=debug_mb)
+            global _ram_debug
+            _ram_debug = True
+            print(f"[RAM] Debug mode: a report of where the RAM goes is written after each generation and after each model release in <outputs>/ram_debug "
+                  f"(allocations of {debug_mb:g} MB and more traced to their source)")
+        except (ImportError, ModuleNotFoundError) as error:
+            print(f"[RAM] Debug mode not available ({error})")
 
 
 def _apply_cuda_settings(argv, config_filename, torch):

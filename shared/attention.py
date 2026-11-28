@@ -16,14 +16,15 @@ from importlib.metadata import version
 from .sageattention_patch import sageattention_version
 
 _is_mps = sys.platform == 'darwin' and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+_has_cuda = hasattr(torch, "cuda") and torch.cuda.is_available()
 
-major, minor = torch.cuda.get_device_capability(None) if torch.cuda.is_available() else (0, 0)
+major, minor = torch.cuda.get_device_capability(None) if _has_cuda else (0, 0)
 bfloat16_supported =  major >= 8
 _HEAD_DIM_SDPA_WARNED = False
 _MISSING = object()
 from . import sol_core, sparge_core, sparse_kernels
 
-sparsegp_backend = sol_core.backend_for(torch.device("cuda", torch.cuda.current_device())) if torch.cuda.is_available() else None
+sparsegp_backend = sol_core.backend_for(torch.device("cuda", torch.cuda.current_device())) if _has_cuda else None
 
 
 def sol3_mode(mode):
@@ -147,14 +148,14 @@ except ImportError:
 
 try:
     import flash_attn_interface
-    FLASH_ATTN_3_AVAILABLE = True
-except ModuleNotFoundError:
+    FLASH_ATTN_3_AVAILABLE = _has_cuda
+except (ModuleNotFoundError, ImportError, Exception):
     FLASH_ATTN_3_AVAILABLE = False
 
 try:
     import flash_attn
-    FLASH_ATTN_2_AVAILABLE = True
-except ModuleNotFoundError:
+    FLASH_ATTN_2_AVAILABLE = _has_cuda
+except (ModuleNotFoundError, ImportError, Exception):
     FLASH_ATTN_2_AVAILABLE = False
     flash_attn = None
 

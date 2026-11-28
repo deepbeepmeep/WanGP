@@ -60,7 +60,7 @@ def log_compilation_tuning(function):
 
 def _install_autotune_logger(triton):
     autotuner = getattr(getattr(getattr(triton, "runtime", None), "autotuner", None), "Autotuner", None)
-    if autotuner is None or getattr(autotuner.run, _LOGGER_MARKER, False):
+    if autotuner is None or not hasattr(autotuner, "run") or getattr(autotuner.run, _LOGGER_MARKER, False):
         return
     original = autotuner.run
 

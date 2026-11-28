@@ -858,6 +858,36 @@ user-select: text;
 .toast-wrap .toast-text, .toast-wrap .toast-text *, .gradio-container [role="alert"] * { overflow-wrap: anywhere !important; word-break: break-word !important; }
 .toast-wrap .toast-text, .gradio-container [role="alert"] .toast-text { white-space: pre-wrap !important; }
 .toast-wrap .toast-close, .gradio-container [role="alert"] button { position: sticky !important; top: 0 !important; align-self: flex-start !important; flex: 0 0 auto !important; }
+/* Wan2GP Execution Mode Selector & Badges */
+.wangp-execution-mode-row {
+    margin-bottom: 6px !important;
+    display: flex !important;
+    justify-content: center !important;
+}
+.wangp-execution-mode-radio {
+    width: 100% !important;
+    border: none !important;
+    background: transparent !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+}
+.wangp-execution-mode-radio .wrap {
+    display: flex !important;
+    flex-direction: row !important;
+    justify-content: center !important;
+    gap: 16px !important;
+}
+.wangp-badge-cloud {
+    font-size: 0.72em;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: rgba(99, 102, 241, 0.2);
+    color: #818cf8;
+    font-weight: 600;
+    vertical-align: middle;
+    display: inline-block;
+}
+
 .resolution-picker-row { gap: 2px !important; align-items: center !important; padding-left: 4px !important; background: var(--block-background-fill); border-radius: var(--block-radius); overflow: visible !important; }
 .resolution-picker-toggle { position: relative; flex: 0 0 24px !important; width: 24px !important; min-width: 24px !important; height: 28px !important; padding: 3px !important; font-size: 0 !important; background: transparent !important; border: 0 !important; outline: none !important; box-shadow: none !important; color: #175a79 !important; overflow: visible !important; }
 .resolution-picker-toggle::before { content: ""; display: block; width: 18px; height: 18px; background: currentColor; mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 7h16m-4-4 4 4-4 4M20 17H4m4-4-4 4 4 4'/%3E%3C/svg%3E") center / contain no-repeat; }
