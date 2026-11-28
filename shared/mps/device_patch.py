@@ -56,7 +56,10 @@ def apply_mps_patch():
         def __init__(self, *a, **kw): pass
         def record(self, *a, **kw): pass
         def elapsed_time(self, *a, **kw): return 0.0
-        def synchronize(self, *a, **kw): pass
+        def synchronize(self, *a, **kw):
+            # mmgp reuses CPU staging buffers after this fence. A no-op lets
+            # the CPU overwrite weights while Metal is still copying them.
+            _torch.mps.synchronize()
         def query(self): return True
 
     class _DummyDeviceContext:
@@ -336,59 +339,24 @@ if not hasattr(_torch.mps, 'device_count'):
 if not hasattr(_torch.mps, 'set_device'):
     _torch.mps.set_device = lambda device: None
 
-# Force SDPA math backend on MPS to avoid Metal command buffer double-commit crash
-# Reference: [IOGPUMetalCommandBuffer validate]:214: failed assertion `commit an already committed command buffer'
-#
-# Root cause: MPS fallback ops (CPU fallback from PYTORCH_ENABLE_MPS_FALLBACK=1)
-# corrupt Metal command buffers when mixed with native MPS SDPA. This affects:
-#   - Wan 2.2 5B (quanto mbf16 quantization)
-#   - Wan 2.1 1.3B (standard safetensors, but ops still fallback)
-#   - Any model where CPU-fallback ops precede an SDPA call
-#
-# Fix strategy (defense in depth):
-#   1. Synchronize MPS before SDPA to flush pending fallback ops
-#   2. Force MATH backend (avoids MPS-native SDPA bugs on some macOS versions)
-#   3. If SDPA fails with Metal error, fall back to manual attention (matmul + softmax)
-#   4. Periodic empty_cache to prevent memory fragmentation
+# Bound math-attention score allocations independently of projection/head splitting.
+# Keep the MATH backend used by this Mac compatibility layer. An OOM/Metal error
+# must propagate, rather than retrying the same allocation through manual attention.
 if _is_mps:
+    from shared.mps.bounded_attention import bounded_sdpa
     _orig_sdpa = _torch.nn.functional.scaled_dot_product_attention
     _sdpa_call_count = [0]
 
-    def _manual_sdpa_fallback(query, key, value, attn_mask=None, is_causal=False, scale=None):
-        """Manual attention fallback: matmul + softmax, no Metal SDPA."""
-        # query: (B, H, L, D) or (B, L, H, D) after sdpa_kernel wrap
-        L = query.size(-2)
-        D = query.size(-1)
-        if scale is None:
-            scale = D ** -0.5
-
-        attn_weights = _torch.matmul(query, key.transpose(-2, -1)) * scale
-        if attn_mask is not None:
-            attn_weights = attn_weights + attn_mask
-        if is_causal:
-            causal_mask = _torch.triu(
-                _torch.ones(L, L, device=query.device, dtype=_torch.bool), diagonal=1
-            )
-            attn_weights = attn_weights.masked_fill(causal_mask, float('-inf'))
-        attn_weights = _torch.nn.functional.softmax(attn_weights, dim=-1)
-        return _torch.matmul(attn_weights, value)
-
-    def _patched_sdpa(*args, **kwargs):
-        # Flush pending MPS fallback ops before SDPA
+    def _patched_sdpa(query, key, value, *args, **kwargs):
+        if query.device.type != 'mps':
+            return _orig_sdpa(query, key, value, *args, **kwargs)
         _torch.mps.synchronize()
-
-        # Periodic cache cleanup every 256 SDPA calls
         _sdpa_call_count[0] += 1
         if _sdpa_call_count[0] % 256 == 0:
             _torch.mps.empty_cache()
-
-        try:
-            with _torch.nn.attention.sdpa_kernel([_torch.nn.attention.SDPBackend.MATH]):
-                return _orig_sdpa(*args, **kwargs)
-        except Exception:
-            # Metal command buffer corruption caught — fall back to manual attention
-            # This handles cases where synchronize isn't sufficient (e.g. macOS 26.x bugs)
-            return _manual_sdpa_fallback(*args, **kwargs)
+        with _torch.nn.attention.sdpa_kernel([_torch.nn.attention.SDPBackend.MATH]):
+            return bounded_sdpa(_orig_sdpa, query, key, value, *args,
+                                synchronize=_torch.mps.synchronize, **kwargs)
 
     _torch.nn.functional.scaled_dot_product_attention = _patched_sdpa
 
